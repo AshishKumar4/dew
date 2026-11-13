@@ -409,16 +409,6 @@ def _timings(entries: object) -> Timings:
     return Timings(measured)
 
 
-def dumps_launches(launches: list[tokamax.BoundArguments]) -> str:
-    """`launches` as JSON, which `loads_launches` reads back."""
-    return json.dumps([_launch_json(ba) for ba in launches])
-
-
-def loads_launches(text: str) -> list[tokamax.BoundArguments]:
-    """The launches `dumps_launches` wrote."""
-    return [_launch(entry) for entry in json.loads(text)]
-
-
 def dumps_picks(device_kind: str, picks) -> str:
     """`picks`, `(launch, Timings)` pairs measured on GPUs of `device_kind`, as the JSON Dew stores
     them (`_read`): each launch with its derived config (`gaps`) and the configs that ran, in its jax's
@@ -1127,10 +1117,9 @@ def seen() -> Iterator[Seen]:
 
 
 def tune(lower: Callable[[], jax.stages.Lowered], *,
-         measure: bool = False) -> tuple[jax.stages.Lowered, str]:
+         measure: bool = False) -> jax.stages.Lowered:
     """An opt-in tuning run's program (bible §6: off by default): what `lower()`
-    lowers with every launch's config settled across the pool, and its distinct
-    launches as JSON, which `settled` settles again without a lowering. The
+    lowers with every launch's config settled across the pool. The
     lowering records its launches as it traces them (`seen`); process 0 takes
     its stored pick for each, with `measure` measuring and storing one for a
     launch without where it has its GPU to itself, and every process takes
@@ -1139,7 +1128,7 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     with no launch of Dew's whose Triton kernels are another library's measures nothing it asked for, and is
     refused (`Untunable`)."""
     if not generation.triton_runs():
-        return lower(), "[]"
+        return lower()
     with reading():
         tuned = _cache.KERNEL_TUNES.get_global()
         with seen() as found:
@@ -1150,7 +1139,7 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
         _settle(distinct, measure=measure)
         if _cache.KERNEL_TUNES.get_global() != tuned:
             lowered = lower()
-    return lowered, dumps_launches([ba for _, ba in distinct])
+    return lowered
 
 
 def _foreign_kernels(lowered: jax.stages.Lowered) -> tuple[str, ...]:
@@ -1170,18 +1159,6 @@ def _distinct(found: list[Launch]) -> list[Launch]:
     for op, ba in found:
         distinct.setdefault((_identity(ba.op), ba.autotuning_cache_key), (op, ba))
     return list(distinct.values())
-
-
-def settled(launches: str) -> bool:
-    """Whether every launch of `launches` (`tune`'s) has a stored pick, with
-    every process taking process 0's: what a compile whose launches are
-    recorded settles instead of lowering for `tune`."""
-    if not generation.triton_runs():
-        return True
-    found = [(op, ba) for ba in loads_launches(launches)
-             if isinstance(op := ba.op, KernelOp)]
-    with reading():
-        return _settle(found, measure=False) == 0
 
 
 def _settle(found: list[Launch], *, measure: bool) -> int:

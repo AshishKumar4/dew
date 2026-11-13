@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.typing import DTypeLike
 
 from dew.batch import Variables
@@ -107,13 +108,17 @@ class Registration:
     (an AutoencoderKL's, where it states none: `nameless`), and the loader that builds it from a pipeline's
     directory or a repo, which a standalone load reads from its config's subfolder, or, where the
     autoencoder `finds` its own (an AutoencoderKL's, whose SD1-era flax layouts live on their own
-    revisions: `load_kl_vae` with no subfolder), where it lives."""
+    revisions: `load_kl_vae` with no subfolder), where it lives. `metadata_tensors` are the small stored
+    tensors a load reads as metadata even without the weights (FLUX.2's latent statistics), which
+    `stored_metadata` gives back from the built autoencoder, by name, for an export to write as stored
+    (`written_metadata`)."""
     wrapper: Callable[..., AutoEncoder]
     published: tuple[str, ...]
     load: Loader
     nameless: bool = False
     finds: bool = False
     metadata_tensors: tuple[str, ...] = ()
+    stored_metadata: Callable[[AutoEncoder], Mapping[str, np.ndarray]] | None = None
 
 
 REGISTRATIONS: tuple[Registration, ...] = (
@@ -121,9 +126,8 @@ REGISTRATIONS: tuple[Registration, ...] = (
     Registration(DCAutoencoder, dc_ae.PUBLISHED, load_dc_ae),
     Registration(WanAutoencoder, wan.PUBLISHED, load_wan_vae),
     Registration(RAEAutoencoder, rae.PUBLISHED, load_rae),
-    Registration(
-        Flux2Autoencoder, flux2.PUBLISHED, load_flux2_vae, metadata_tensors=flux2.LATENT_STATISTICS
-    ),
+    Registration(Flux2Autoencoder, flux2.PUBLISHED, load_flux2_vae, metadata_tensors=flux2.LATENT_STATISTICS,
+                 stored_metadata=flux2.latent_statistics),
     Registration(QwenImageAutoencoder, qwen_image.PUBLISHED, load_qwen_image_vae),
 )
 """Every built-in autoencoder a source loads: one registration each."""
@@ -132,6 +136,14 @@ LOADERS: Mapping[str, Loader] = MappingProxyType({
     name: entry.load for entry in REGISTRATIONS for name in entry.published})
 """Every published autoencoder's loader, by each `_class_name` its config may state: what a pipeline's load
 (`dew.interop.pipeline_assembly`) builds from, a config naming none taken as an AutoencoderKL's."""
+
+
+def written_metadata(autoencoder: AutoEncoder) -> dict[str, np.ndarray]:
+    """The metadata tensors `autoencoder`'s registration reads at its load (`Registration.metadata_tensors`),
+    as its source stores them (`Registration.stored_metadata`): what an export writes back beside its
+    weights; none for an autoencoder no registration reads metadata of."""
+    entry = next((entry for entry in REGISTRATIONS if entry.wrapper is type(autoencoder)), None)
+    return {} if entry is None or entry.stored_metadata is None else dict(entry.stored_metadata(autoencoder))
 
 
 def registration(class_name: str | None) -> Registration | None:

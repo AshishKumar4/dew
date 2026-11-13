@@ -271,20 +271,20 @@ class SelectedGeneration(View[Source]):
         return self.source.supports(self.placing)
 
     def can_provision(self, read: Read) -> bool:
-        from dew.data.analysis import _provisioner
+        from dew.data.sources.provisioning import provisioner
 
-        return _provisioner(self.source, self.placing) is not None
+        return provisioner(self.source, self.placing) is not None
 
     def preparation_bytes(self) -> int | None:
-        from dew.data.analysis import _provisioner
+        from dew.data.sources.provisioning import provisioner
 
-        preparer = _provisioner(self.source, self.placing)
+        preparer = provisioner(self.source, self.placing)
         return None if preparer is None else preparer.preparation_bytes()
 
     def provision(self) -> SelectedGeneration:
-        from dew.data.analysis import _provisioner
+        from dew.data.sources.provisioning import provisioner
 
-        preparer = _provisioner(self.source, self.placing)
+        preparer = provisioner(self.source, self.placing)
         if preparer is None:
             raise ValueError(f"{self.source.describe()} can't prepare the {self.placing} read that places "
                              "its inputs")

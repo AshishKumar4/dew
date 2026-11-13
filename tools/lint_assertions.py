@@ -21,6 +21,7 @@ from typing import Protocol
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lint_scopes as scopes
+import lint_texts as texts
 
 Found = tuple[int, int, str, str]
 """A finding: its line, column, code and message."""
@@ -315,8 +316,9 @@ def _worded(node: ast.AST, caught: Set[str], raised: Set[str]) -> bool:
 def wording(module: Parsed, parent: Sequence[str]) -> Iterator[Found]:
     """SLOP011: a test that checks wording or source text instead of behaviour: an error's or a
     warning's text matched, a sentence looked for in captured output, in a caught error's text or
-    in a process's output, or source text read. A name is read through the imports of its own
-    scope, so `pytest.raises` imported under another name is `pytest.raises`."""
+    in a process's output, source text read, or an assertion on production source or a program's IR
+    text (`lint_texts.texts`). A name is read through the imports of its own scope, so
+    `pytest.raises` imported under another name is `pytest.raises`."""
     named = list(scopes.scoped(module.tree.body, {}, parent))
     raises = {id(node) for node, table in named
               if isinstance(node, ast.Call) and scopes.resolved(node.func, table) == "pytest.raises"}
@@ -335,6 +337,13 @@ def wording(module: Parsed, parent: Sequence[str]) -> Iterator[Found]:
                     yield (node.lineno, node.col_offset + 1, "SLOP011",
                            "freezes a rendering's spacing; assert its words, numbers and column "
                            "ends")
+    tables = {id(node): table for node, table in named}
+    for function in ast.walk(module.tree):
+        if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            for node in texts.texts(function, tables, module.package):
+                yield (node.lineno, node.col_offset + 1, "SLOP011",
+                       "asserts on production source or a program's IR text; test what the code does, "
+                       "reading a program's structure as objects")
     held = _held(module.tree)
     for node, table in named:
         if isinstance(node, ast.expr) and _spelled_in_captured(node, held.get(id(node), frozenset())):

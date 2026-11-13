@@ -488,16 +488,13 @@ class DiffusionRunConfig(RunConfig):
         reference = SourceReference.parse(self.pretrained)
         # An adapter keeps the pipeline's weights as they are: they load where the start keeps them.
         # The pipeline reads its weights on a resume too, which binds the checkpoint over them.
-        placement = self.source_keywords(frozen=self.lora is not None)
+        keywords = self.source_keywords(frozen=self.lora is not None)
         return load_diffusion_source(
             reference.name, revision=reference.revision,
-            dtype=dtype_name(jax.numpy.dtype(self.compute_dtype())),
-            param_dtype=placement["param_dtype"], attention_impl=self.source_attention(),
-            size=self.sample_field().shape[:-1],
-            variables=variables, mesh=placement.get("mesh"), layout=placement.get("layout"),
-            text_only=placement.get("text_only", False), prediction_depths=placement.get("prediction_depths"),
-            modeling_overrides=placement.get("modeling_overrides"), step=placement.get("step"),
-            ema=placement.get("ema"))
+            dtype=dtype_name(jax.numpy.dtype(self.compute_dtype())), param_dtype=keywords["param_dtype"],
+            attention_impl=self.source_attention(), size=self.sample_field().shape[:-1],
+            variables=variables, mesh=keywords.get("mesh"), layout=keywords.get("layout"),
+            **self.source.keywords())
 
     def _process(self, convention: Process | None) -> Process:
         """The preset's process, which must be of the kind the pretrained

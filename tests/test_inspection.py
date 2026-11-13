@@ -95,6 +95,28 @@ def test_a_sampled_steps_summaries_are_its_commits_arrays():
         name: float(value) for name, value in expected.items()}
 
 
+def test_a_step_of_two_commits_reports_its_latest_sample_and_sums_its_telemetry():
+    """A split step can commit twice (a window a rejection left part filled, then the closing part of a
+    run's last batch): its parts' counts, tokens and norms add, and its inspection is the last part's
+    that committed, as the run's interval keeps its latest sampled commit (`interval.latest`), never the
+    two summaries added; a part after it that committed nothing keeps it, and a committed sample holding
+    zeros is a sample."""
+    from dew.training.inspection import Summaries
+    from dew.training.planning import whole_step
+    from dew.training.transaction import Committed
+
+    def part(count: int, values: list[float]):
+        committed = Committed(jnp.float32(count), jnp.int32(count), jnp.asarray([count, 0], jnp.uint32),
+                              Summaries(jnp.asarray(values, jnp.float32), ("params/l2", "params/w/mean")))
+        return jnp.float32(0.0), {}, jnp.ones((), bool), jnp.ones((), bool), committed
+
+    parts = (part(1, [3.0, 1.0]), part(0, [0.0, 0.0]), part(1, [5.0, 0.0]), part(0, [0.0, 0.0]))
+    total = whole_step(parts)[-1]
+    assert (float(total.norm), int(total.count), total.tokens.tolist()) == (2.0, 2, [2, 0])
+    assert total.inspected.names == ("params/l2", "params/w/mean")
+    assert total.inspected.values.tolist() == [5.0, 0.0]
+
+
 def test_a_run_logs_each_sample_once_at_its_cadence():
     """Sampled every second step and logged every step, a run's logs carry a sample at the second and
     fourth steps alone."""

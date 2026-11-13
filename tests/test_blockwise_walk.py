@@ -260,3 +260,41 @@ def test_confident_reveals_as_llada2s_release_over_a_block(threshold):
             masked = before[row] == mask
             expected = _release_reveal(np.where(masked, probability[row], -np.inf), quota, threshold)
             assert np.array_equal(np.asarray(x)[row] != before[row], expected & masked), (row, index)
+
+
+def test_blockwise_denoiser_traces_its_model_once_and_skips_execution_when_unmasked():
+    """A blockwise `DiscreteDenoiser` traces its model once per call (sharing that trace across shape
+    discovery and `lax.cond`) and executes no model forward when no masked slot remains in `mutable_mask`."""
+    from flax import linen as nn
+
+    traced: list[int] = []
+    executed: list[int] = []
+
+    class CountingMaskLM(nn.Module):
+        vocab: int = 8
+
+        @nn.compact
+        def __call__(self, tokens):
+            traced.append(1)
+            scale = self.param("scale", nn.initializers.ones, (self.vocab,))
+            jax.debug.callback(lambda: executed.append(1))
+            return jax.nn.one_hot(tokens % self.vocab, self.vocab, dtype=jnp.float32) * scale
+
+    model = CountingMaskLM()
+    variables = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    traced.clear()
+    executed.clear()
+    process = MDLM(mask_id=7)()
+    block = jnp.ones((1, 4), bool)
+    denoise = replace(process.denoiser(model, variables, mutable_mask=block), block=block)
+    step_fn = jax.jit(lambda x: denoise(x, jnp.float32(0.5)))
+    filled, scores = step_fn(jnp.asarray([[1, 7, 2, 3]], jnp.int32))
+    jax.block_until_ready((filled, scores))
+    assert len(traced) == 1 and len(executed) == 1
+    executed.clear()
+    unmasked = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+    skipped_filled, skipped_scores = step_fn(unmasked)
+    jax.block_until_ready((skipped_filled, skipped_scores))
+    assert len(traced) == 1 and executed == []
+    np.testing.assert_array_equal(np.asarray(skipped_filled), np.asarray(unmasked))
+    np.testing.assert_array_equal(np.asarray(skipped_scores), np.zeros((1, 4, 8), np.float32))

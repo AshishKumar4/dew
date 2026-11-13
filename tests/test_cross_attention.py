@@ -610,14 +610,22 @@ def test_a_served_request_reads_its_own_context(options):
 def test_served_requests_score_their_draws_from_their_own_contexts(options):
     """Requests of their own contexts, one with none, served together as
     `test_a_served_request_reads_its_own_context` serves them, over a dense cache, a pool of pages, pieces
-    of three tokens and a prefix cache, greedily to their budgets: each draws what it draws alone, and
-    scores each drawn token on par with a full forward over its prompt, its context and the tokens drawn
-    before it (check 1), truth float64's."""
+    of three tokens and a prefix cache, greedily to their budgets, then a repeat of one and the same prompt
+    under another context in rounds of their own: each draws what it draws alone, and scores each drawn
+    token on par with a full forward over its prompt, its context and the tokens drawn before it (check 1),
+    truth float64's."""
     requests = [Served(len(prompt), conditioning=functools.partial(drawn_context, index))
                 for index, prompt in enumerate(PROMPTS)]
+    # A repeat of the third request in a round of its own, its prefix pages shared under its context, and
+    # the same prompt reading one token of it in the next, whose pages it shares none of: each scored from
+    # its own context, so a restored prefix that moved a likelihood and kept the greedy tokens fails.
+    repeated = [Served(len(PROMPTS[2]), conditioning=functools.partial(drawn_context, 2)),
+                Served(len(PROMPTS[2]), conditioning=lambda row: {
+                    **drawn_context(2, row), CONTEXT_LENGTHS: np.asarray([1], np.int32)})]
     label = f"served contexts {', '.join(options) or 'dense'}"
-    assert_served_as_exact(served_task(eos_token_ids=None), requests, label,
-                           serving={"slots": 4, "capacity": 128, "admission": 2, **options})
+    assert_served_as_exact(served_task(eos_token_ids=None), [*requests, *repeated], label,
+                           serving={"slots": 4, "capacity": 128, "admission": 2, **options},
+                           rounds=(len(requests), 1, 1))
 
 
 def test_a_server_refuses_a_context_its_layers_cannot_read():

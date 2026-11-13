@@ -185,8 +185,7 @@ def _footprinted(footprint: Footprint | None) -> Hashable:
 
 def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
                                    schedule: Schedule, placement, replicated, split: int, narrow: bool,
-                                   launches: str | None, lowering: bool = True, *,
-                                   mesh: Mesh | AbstractMesh | None = None,
+                                   lowering: bool = True, *, mesh: Mesh | AbstractMesh | None = None,
                                    platforms: tuple[str, ...] | None = None, capacity: int | None = None,
                                    footprint: Footprint | None = None, derived: bool = True,
                                    floored: bool = False) -> Candidate:
@@ -199,10 +198,8 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
     # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
     key = None if stated is None else (
-        stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow,
-        # No launch record lowers as an empty one (`_candidate`'s untuned lowering).
-        launches or "[]",
-        lowering, mesh, platforms, capacity, _footprinted(footprint), derived, floored, stepping.shape.rows,
+        stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow, lowering, mesh,
+        platforms, capacity, _footprinted(footprint), derived, floored, stepping.shape.rows,
         stepping.shape.split, stepping.shape.prefetch, stepping.shape.examples, report.refused_launches(),
         trace_context())
     if key is not None:
@@ -211,7 +208,7 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
                 _CANDIDATES.move_to_end(key)
                 sampled = _sampled(stepping, kept, batch, placement, replicated, split, platforms)
                 return dataclasses.replace(kept, sampled=sampled)
-    candidate = _candidate(stepping, state, batch, schedule, placement, replicated, split, narrow, launches,
+    candidate = _candidate(stepping, state, batch, schedule, placement, replicated, split, narrow,
                            lowering, mesh=mesh, platforms=platforms, capacity=capacity, footprint=footprint,
                            derived=derived, floored=floored)
     if key is not None:
@@ -244,16 +241,15 @@ def _sampled[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], candidate: Ca
 
 def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
                                 schedule: Schedule, placement, replicated, split: int, narrow: bool,
-                                launches: str | None, lowering: bool = True, *,
-                                mesh: Mesh | AbstractMesh | None = None,
+                                lowering: bool = True, *, mesh: Mesh | AbstractMesh | None = None,
                                 platforms: tuple[str, ...] | None = None, capacity: int | None = None,
                                 footprint: Footprint | None = None, derived: bool = True,
                                 floored: bool = False, ready: Prepared | None = None) -> Candidate:
     """The step reading `batch` in `split` microbatches, lowered at the objective's current rung (traced
     alone where not `lowering`, for its derived footprint), with what the fit check holds beside it.
-    `launches` are its kernel launches where a record holds them, which settle their configs before it
-    lowers; otherwise, or where the run measures configs (`tune_kernels`), its lowering records them
-    (`tune`). `mesh` and `platforms` lower it for other devices, untuned (`lowered_for`). `capacity` is
+    Each launch takes its derived config, but where the run measures configs (`tune_kernels`), whose
+    lowering settles them (`tune`). `mesh` and `platforms` lower it for other devices, untuned
+    (`lowered_for`). `capacity` is
     the bytes a device that states none holds (`FitSearch.capacity`), at which its footprint is judged;
     `footprint`, the one its derivation traced, which it keeps (`FitSearch.footprints`). One whose
     executable is a step compiled ahead derives none (not `derived`): its compile judged the
@@ -309,11 +305,11 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
         kernels = KernelReport((), ())
         if tuned and lowering:
             # The configs it measures are not the ones a derivation traced: its footprint is traced again.
-            lowered, launches, footprint = *tuning.tune(lower, measure=True), None
+            lowered, footprint = tuning.tune(lower, measure=True), None
             kernels = lower.report()
         else:
             # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
-            lowered, launches = None, launches or "[]"
+            lowered = None
             if lowering:
                 lowered, kernels = lowers()
         if staging_measured and not lowering:
@@ -327,17 +323,17 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
              if flooring and forward is not None else None)
     if floor is not None:
         traces = functools.partial(_candidate, stepping, state, batch, schedule, placement, replicated, split,
-                                   narrow, launches, lowering, mesh=mesh, platforms=platforms,
+                                   narrow, lowering, mesh=mesh, platforms=platforms,
                                    capacity=capacity, derived=derived, ready=ready)
-        return Candidate(micro, shapes, copies, shardings, prepared, held, built, None, launches or "[]",
-                         KernelReport((), ()), floor, floored=True, traces=traces)
+        return Candidate(micro, shapes, copies, shardings, prepared, held, built, None, KernelReport((), ()),
+                         floor, floored=True, traces=traces)
     if derived and footprint is None and shapes is not None and mesh is None:
         footprint = candidate_footprint(
             settings.objective, stepping.model_shapes(micro), window, prepared, held,
             (local_devices(settings.device_mesh) or [*settings.device_mesh.devices.flat])[0], split,
             functools.partial(consumes_where_made, stepping, prepared, micro, window, shapes),
             max(cuts, default=0), capacity)
-    candidate = Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches, kernels,
+    candidate = Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, kernels,
                           footprint, lowers=None if lowering or tuned else lowers)
     return dataclasses.replace(candidate, sampled=_sampled(stepping, candidate, batch, placement, replicated,
                                                            split, platforms))
@@ -445,5 +441,5 @@ def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tra
         state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
         split = splits(stepping.shape.rows, batch, mesh, settings.microbatches, stepping.shape.split)[0]
         placement, replicated = batch_shardings(mesh, batch), NamedSharding(mesh, P())
-        return candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow, None,
-                               mesh=mesh, platforms=('cuda',)).lowered
+        return candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow,
+                             mesh=mesh, platforms=('cuda',)).lowered

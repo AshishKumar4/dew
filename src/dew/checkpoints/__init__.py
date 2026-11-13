@@ -432,7 +432,7 @@ def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
     """Return the placement of each array leaf of `tree` as a string, keyed by path:
     its sharding and which slice of it each of this process's devices holds.
 
-    A local checkpoint restores onto this placement and no other. The sharding's
+    A pool's local checkpoint restores onto this placement and no other (`_check_placement`). The sharding's
     text names its mesh's axes and sizes but not the order of its devices, and two
     meshes over the same devices in another order give each process other slices."""
     def owned(leaf) -> str:
@@ -541,7 +541,7 @@ def _refuse_lacking(lacking: set[str], where: str, unread: Set[str] = frozenset(
 
 RETIRED_RATE = ("learning_rate_scale", "learning_rate_shape")
 """The hyperparameters Dew's optimizer injected before it held a schedule's own rate fields
-(`dew.optim.RateState`): a rate's scale and its schedule's shape, two scalars side by side in an
+(`dew.optim_schedules.RateState`): a rate's scale and its schedule's shape, two scalars side by side in an
 injected state's hyperparameters, which a resume refuses by name rather than as a mismatched tree."""
 
 
@@ -580,8 +580,9 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
         raise ValueError(
             "the checkpoint's optimizer state holds its rate as a scale times a schedule's shape "
             f"({' and '.join(RETIRED_RATE)}), which Dew's optimizer no longer forms: it holds the "
-            "schedule's own rate fields (dew.optim.RateState), so a run cannot resume it. Resume it "
-            "with the Dew that wrote it, or start a fresh run from its weights in a directory of its own.")
+            "schedule's own rate fields (dew.optim_schedules.RateState), so a run cannot resume it. "
+            "Resume it with the Dew that wrote it, or start a fresh run from its weights in a directory of "
+            "its own.")
     from dew.state import CHECKPOINTED, OPTIONAL
     missing = set(CHECKPOINTED).difference(stored, OPTIONAL)
     if missing:
@@ -653,9 +654,50 @@ def _filled(template, restored: dict, step: int):
     # A field no checkpoint holds (the narrow copies) starts over: the
     # template's are of its own parameters, not the restored ones. An optional one the checkpoint
     # holds none of is None (`OPTIONAL`).
-    return template.replace(**restored, **{field.name: field.default for field in dataclasses.fields(template)
-                                           if field.name not in CHECKPOINTED},
-                            **{name: None for name in OPTIONAL if name not in restored})
+    started = {field.name: field.default for field in dataclasses.fields(template)
+               if field.name not in CHECKPOINTED}
+    state = template.replace(**restored, **started,
+                             **{name: None for name in OPTIONAL if name not in restored})
+    window = state.window
+    if window is None or window.fill is not None:
+        return state
+    return state.with_window(dataclasses.replace(window, fill=_held_occupancy(state, template.window.fill)))
+
+
+def _held_occupancy(state, placed: jax.ShapeDtypeStruct) -> jax.Array:
+    """The occupancy of `state`'s window as the previous format saved it, which kept none
+    (`_occupancy_unsaved`), placed as `placed` says: its windows began where the clock was a multiple of
+    their size, each group's under DiLoCo, but where a commit had emptied it (`transaction.cleared`, every
+    count it holds zero: no microbatch's statistics, mass, tokens or attempt), as a shortened commit closing
+    a run's last window left it at any clock, which the format saved whole."""
+    window = state.window
+    clock = state.microstep if state.inner is None else state.inner.microstep
+    held = jax.tree.leaves((window.statistics, window.mass, window.tokens, window.attempts))
+    # Each group's window its own: a leaf's first axis is the groups' under DiLoCo.
+    kept = 1 if state.inner is not None else 0
+    holds = jnp.zeros(clock.shape, bool)
+    for leaf in held:
+        holds = holds | jnp.any(leaf != 0, axis=tuple(range(kept, leaf.ndim)))
+    fill = jnp.where(holds, clock % state.window_size, 0).astype(jnp.int32)
+    return fill if placed.sharding is None else jax.device_put(fill, placed.sharding)
+
+
+_WINDOWS = (("accumulation",), ("inner", "accumulation"))
+"""Where a step's state tree holds its window: the run's own, or under DiLoCo its groups'."""
+
+
+def _occupancy_unsaved(template, metadata):
+    """A restore's `template`, a train state's, without the occupancy (`Accumulation.fill`) of a window the
+    checkpoint saved in the previous format, which kept none: every branch of the restore reads that tree,
+    and `_filled` derives the occupancy (`_held_occupancy`). Any other template as it is."""
+    from dew.state import TrainState
+
+    if not isinstance(template, TrainState) or template.window is None:
+        return template
+    stored = next((_at(metadata, path) for path in _WINDOWS if _at(metadata, path) is not None), None)
+    if stored is None or "fill" in stored:
+        return template
+    return template.with_window(dataclasses.replace(template.window, fill=None))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -827,9 +869,9 @@ class Checkpoints:
     subdirectory, so the same path works for a pod and for one host running
     several processes. `latest` is the newest step every process can
     read, local or persistent, and `restore` reads it from wherever it is. A
-    local checkpoint restores onto the placement it was written with, because
-    no process holds another process's shards; the persistent checkpoint
-    restores onto any mesh.
+    pool's local checkpoint restores onto the placement it was written with,
+    because no process holds another process's shards (`_check_placement`);
+    one process's, and the persistent checkpoint, restore onto any mesh.
     """
 
     def __init__(self, directory: str, *, keep: int | Keep = Keep.latest,
@@ -1681,10 +1723,8 @@ class Checkpoints:
 
         The new step replaces the previous local step. As with `save`, a state
         with arrays in pinned host memory is written before this returns. The
-        placement is saved with the state, so a resume onto a different
-        placement raises before it reads shards from directories that do not
-        hold them.
-        """
+        placement is saved with the state, which a pool's resume is held to
+        (`_check_placement`)."""
         state_tree = self._item(state, saved, share, rollout)
         written = placement(state_tree)
         grid = Grid.of({name: leaf for name, leaf in state_tree.items() if name != 'position'})
@@ -1767,8 +1807,8 @@ class Checkpoints:
                   unread: tuple[tuple[str, ...], ...] = (), on_host: bool = False) -> Variables:
         """Read the selected step's live or averaged variables onto the requested layout, or with
         `on_host` into host arrays, restored onto this process's CPU device and fetched, no accelerator
-        holding them on the way (no `mesh` or `layout` beside it); a local step, which knows the devices
-        it was written on alone, is refused it.
+        holding them on the way (no `mesh` or `layout` beside it); a pool's local step, each process
+        holding its own shards of it, is refused it (`_check_placement`).
 
         Parameter storage conversion applies only to the owner's parameter
         roots; other collections retain their recorded dtypes and placement.
@@ -1795,10 +1835,10 @@ class Checkpoints:
         if with_ema:
             template["ema"] = without(stored["ema"], unread)
         host_or_placed(on_host, mesh, layout)
-        if on_host and step == self._local_latest():
-            raise ValueError(f"step {step} is held locally, on the devices that wrote it, which its read "
-                             "places it on (`_check_placement`), so it reads onto no host; read a persistent "
-                             "step, or read this one without on_host")
+        if on_host and step == self._local_latest() and jax.process_count() > 1:
+            raise ValueError(f"step {step} is held locally, each process holding its own shards of it, so no "
+                             "process reads it whole onto its host; read a persistent step, or read this one "
+                             "without on_host, placed as it was written")
         # On the host, restored onto this process's CPU device, every collection as a placed read restores
         # it, then fetched as host arrays: no accelerator holds them on the way.
         device_mesh = resolve_mesh(DefaultMesh().build(_host_devices()) if on_host
@@ -1901,6 +1941,10 @@ class Checkpoints:
             arrays["batch_statistics"] = tuple(arrays["batch_statistics"])
         if arrays.get("replayed_statistics") is not None:
             arrays["replayed_statistics"] = tuple(arrays["replayed_statistics"])
+        if "fill" not in arrays:
+            # The previous format kept no occupancy, which `_filled` derives from the clock, at its shape.
+            clock = metadata["microstep"] if metadata.get("inner") is None else metadata["inner"]["microstep"]
+            arrays["fill"] = jax.ShapeDtypeStruct(clock.shape, jnp.int32)
         return Accumulation(**arrays)
 
     def position(self, step: int, share: DataPartition) -> bytes | None:
@@ -1961,8 +2005,9 @@ class Checkpoints:
         template holds it as a concrete array, which is then kept as it is.
 
         A step that is the local one every process holds is read from the
-        local directory, onto the placement it was written with; any other
-        step is read from the persistent directory. The data position is
+        local directory, a pool's onto the placement it was written with
+        (`_check_placement`); any other step is read from the persistent
+        directory. The data position is
         returned as the bytes the reader of `share` resumes from (see
         `read_position`). Without a share, as for a caller that reads weights
         and no data, it is None.
@@ -1989,20 +2034,12 @@ class Checkpoints:
         metadata = _item_metadata(snapshot)
         stored = metadata.keys()
         _check_template(template, metadata, stored, mapping=mapping)
+        placed = template
+        template = _occupancy_unsaved(template, metadata)
         frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
         held: dict[str, dict] | None = None
         if template is None:
-            untyped = _host_read(from_local=from_local)
-            restored = self._restored(step, None, jax.tree.map(lambda _: untyped, dict(metadata)),
-                                      local=from_local, partial=False)
-            if from_local:
-                restored = jax.tree.map(np.asarray, restored)
-            restored = dict(restored)
-            for path, deltas in _ema_deltas(snapshot).items():
-                weights = _by_path(_at(restored, _averaged(path)))
-                restored = _with(restored, path, jax.tree_util.tree_map_with_path(
-                    lambda keys, leaf, deltas=deltas, weights=weights: _from_delta_planes(leaf, weights[keys])
-                    if keys in deltas else leaf, _at(restored, path)))
+            restored = self._host_restored(step, snapshot, metadata, local=from_local)
         elif from_local and self._lost(step):
             restored, held = self._lost_shards(step, template, frozen, snapshot, metadata, where)
         else:
@@ -2059,8 +2096,22 @@ class Checkpoints:
         restored = self._with_frozen(dict(restored), frozen, held)
         table = None if mapping else restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)
-        restored = _filled(template, restored, step)
+        restored = _filled(placed, restored, step)
         return restored, saved
+
+    def _host_restored(self, step: int, snapshot, metadata, *, local: bool) -> dict:
+        """Every leaf `step` holds as a host array (`restore` with no template), each EMA stored as its
+        planes' differences from the weights read back into the average it holds (`_from_delta_planes`)."""
+        untyped = _host_read(from_local=local)
+        restored = self._restored(step, None, jax.tree.map(lambda _: untyped, dict(metadata)), local=local,
+                                  partial=False)
+        restored = dict(jax.tree.map(np.asarray, restored) if local else restored)
+        for path, deltas in _ema_deltas(snapshot).items():
+            weights = _by_path(_at(restored, _averaged(path)))
+            restored = _with(restored, path, jax.tree_util.tree_map_with_path(
+                lambda keys, leaf, deltas=deltas, weights=weights: _from_delta_planes(leaf, weights[keys])
+                if keys in deltas else leaf, _at(restored, path)))
+        return restored
 
     def _averages(self, step: int, metadata, restored, path: TreePath, targets: dict, deltas: dict, *,
                   local: bool) -> Variables:
@@ -2139,12 +2190,17 @@ class Checkpoints:
         return read if by_payload else _from_payloads(read, at)
 
     def _check_placement(self, step: int, state_tree: Mapping[str, StateLeaf]) -> None:
-        """Refuse a local step written for another placement of the state."""
+        """Refuse a pool's local step written for another placement of the state: each process holds its
+        own shards of it, so another placement would read a shard no process's directory holds. A step one
+        process wrote holds every shard in its directory, and restores onto any placement of this one
+        process's devices (its host's included: `variables(on_host=True)`)."""
         with region("checkpoint.validate"):
             written = self._open_local().metadata(step).custom_metadata or {}
+            processes = written.get('processes')
+            if processes == jax.process_count() == 1:
+                return
             wanted = placement(state_tree)
             moved = [path for path in wanted if written.get('placement', {}).get(path) != wanted[path]]
-            processes = written.get('processes')
             if processes == jax.process_count() and not moved:
                 return
             if processes != jax.process_count():

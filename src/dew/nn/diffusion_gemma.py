@@ -93,6 +93,17 @@ class DiffusionGemma(DecoderWrapper):
     canvas_length: int
     conditioner: VisionConditioner | None = None
 
+    @property
+    def replaced_ids(self) -> frozenset[int]:
+        """No id it replaces wherever it occurs (`dew.nn.protocols.ReplacesTokens`)."""
+        return frozenset()
+
+    @property
+    def replaces_media(self) -> bool:
+        """It replaces the id at each slot an image fills with its conditioner's embedding before its
+        table reads it (`_clean_inputs`, `dew.nn.protocols.ReplacesTokens`)."""
+        return True
+
     def setup(self):
         if not self.text.causal:
             raise ValueError("DiffusionGemma.text is the causal encoder view")

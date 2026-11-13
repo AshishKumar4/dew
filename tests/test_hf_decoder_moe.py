@@ -507,11 +507,10 @@ def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
     on a GPU, its experts dequantized as Dew's are (the one-draw rule, ledger 1719). Both are recorded
     by tools/gpt_oss_20b_reference.py: the truth holds the released weights in float64, 168 GB, which
     no test process holds."""
-    from tools.fetched_fixtures import local
     from tools.gpt_oss_20b_reference import FIXTURE, RELEASED
 
-    with np.load(local(FIXTURE)) as recorded:
-        ids, reference, truth = (recorded[name] for name in ("input_ids", "reference", "truth"))
+    recorded = recording(FIXTURE)
+    ids, reference, truth = (recorded[name] for name in ("input_ids", "reference", "truth"))
     repo, revision = RELEASED
     pretrained = Pretrained.load(repo, dtype="bfloat16", param_dtype="auto", attention_impl="xla",
                                  max_seq_len=int(ids.shape[1]), revision=revision)

@@ -9,23 +9,20 @@ from collections.abc import Iterable, Mapping, Sequence
 import grain.python as grain
 import numpy as np
 
-from dew._records import integer
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 from dew.data.sources.base import (
-    _COUNTS,
+    COUNTED,
     Read,
     Shard,
     ShardManifest,
     Source,
     _consumed,
+    counted,
     stated,
     tokenizer_contract,
 )
 from dew.data.steps.text import stated_rules
-
-COUNTED = (*_COUNTS, "held_out")
-"""The facts that count a store's records, which a concatenation's sources add."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -78,6 +75,7 @@ class Concatenate(Dataset):
         contract = tokenizer_contract((source.describe(), facts)
                                       for source, facts in zip(self.sources, stated, strict=True))
         facts: dict[str, object] = dict(contract)
+        sums = counted(stated)
         for key in dict.fromkeys(key for given in stated for key in given):
             values = [given[key] for given in stated if key in given]
             if key == "count_rules":
@@ -86,8 +84,8 @@ class Concatenate(Dataset):
                     rules = {rule for value in values for rule in stated_rules(value)}
                     facts[key] = [list(rule) for rule in sorted(rules, key=repr)]
             elif key in COUNTED:
-                if len(values) == len(stated) and all(isinstance(value, int) for value in values):
-                    facts[key] = sum(integer(value, key) for value in values)
+                if key in sums:
+                    facts[key] = sums[key]
             elif key not in contract and len(values) == len(stated) and all(
                     value == values[0] for value in values):
                 facts[key] = values[0]

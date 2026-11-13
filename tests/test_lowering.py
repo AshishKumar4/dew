@@ -788,7 +788,7 @@ def _mamba2_lowered(generation: str):
 
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
-        return tuning.tune(lower)[0]
+        return tuning.tune(lower)
 
 
 def _mamba1_lowered(generation_name: str, layers: int = 1):
@@ -814,7 +814,7 @@ def _mamba1_lowered(generation_name: str, layers: int = 1):
 
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation_name)
     with assumed(generation_name), jax.sharding.use_abstract_mesh(mesh), chosen(selective_scan="mosaic_gpu"):
-        return tuning.tune(lower)[0]
+        return tuning.tune(lower)
 
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])

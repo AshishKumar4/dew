@@ -980,9 +980,9 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
     they read no shards; Diffusers' PyTorch classes read the safetensors beside it, and their
     `from_flax` conversion, which reads the msgpack, takes a folder without them
     (modeling_utils.py:1109-1113, 0.34.0)."""
+    from dew.interop.autoencoders.pretrained import written_metadata
     from dew.interop.decoder_parts import layout_tensors
     from dew.interop.safetensors_io import LazyTensors, save_sharded, tensor_specs
-    from dew.nn.autoencoders.flux2 import Flux2Autoencoder
     written = {path for layout in source.weight_layouts for path in layout.paths}
     leaves = [tuple(str(key.key) for key in path) for path, _ in jax.tree_util.tree_leaves_with_path(values)]
     unwritten = ["/".join(path) for path in leaves if path not in written]
@@ -1016,11 +1016,8 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
     for layout in source.weight_layouts:
         component, _, name = layout.name.partition("/")
         layouts.setdefault(component, {})[name] = layout
-    vae_stats: dict[str, np.ndarray] = {}
-    if isinstance(source.autoencoder, Flux2Autoencoder):
-        norm_rec = source.autoencoder.normalization.record
-        vae_stats["vae/bn.running_mean"] = np.asarray(norm_rec["mean"], np.float32)
-        vae_stats["vae/bn.running_var"] = np.asarray(norm_rec["variance"], np.float32)
+    # The autoencoder's metadata tensors as its source stores them, which its registration reads at load.
+    vae_stats = {f"vae/{name}": value for name, value in written_metadata(source.autoencoder).items()}
     retained: dict[str, dict[str, str]] = {}
     specifications = {**tensor_specs(source.retained_tensors), **tensor_specs(vae_stats)}
     for source_name in specifications:

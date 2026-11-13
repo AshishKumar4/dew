@@ -266,3 +266,49 @@ def test_a_saved_position_is_refused_by_a_run_that_tokenizes_its_captions_otherw
                 resumed.set_state(state)
         finally:
             resumed.close()
+
+
+def _png(red: int) -> bytes:
+    """A 4x4 PNG whose pixels' red is `red`."""
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.fromarray(np.full((4, 4, 3), (red, 10, 20), np.uint8)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+@pytest.mark.parametrize("field", ["jpg", "png", "image"])
+def test_decode_image_reads_an_image_under_any_conventional_field(field):
+    """A record's image under its conventional field (jpg, png or image) is decoded by the step's default,
+    its bytes replaced by the pixels (row 5757): only `jpg` was read; a field the step names outside the
+    convention is read as named, and a record without it raises naming it, rejecting undecodable images
+    or not: a field the chain names wrong drops no record silently."""
+    from dew.data.compile import iterate
+
+    (decoded,) = iterate(Memory([{field: _png(200), "id": 1}]).map(images.DecodeImage(rejects=False)))
+    assert decoded["image"].shape == (4, 4, 3) and int(decoded["image"][0, 0, 0]) == 200
+    assert set(decoded) == {"id", "image"}
+    held = Memory([{field: _png(200)}])
+    for named in (held.map(images.DecodeImage("photo", rejects=False)),
+                  held.filter_map(images.DecodeImage("photo"))):
+        with pytest.raises(KeyError):
+            list(iterate(named))
+
+
+def test_a_malformed_prepared_image_is_refused_as_undecodable_and_raises_where_asked():
+    """A prepared ArrayRecord image whose pixels are fewer than its shape says is dropped as undecodable by
+    a rejecting decode, beside a whole one it reads (row 5758), where it aborted the read; a decode that
+    does not reject raises on it."""
+    from dew.data.compile import iterate
+
+    shape = np.asarray([2, 2], "<i4").tobytes()
+    broken = pack_dict_of_byte_arrays({"shape": shape, "image": b"\x05" * 11})
+    whole = pack_dict_of_byte_arrays({"shape": shape, "image": np.full((2, 2, 3), 42, np.uint8).tobytes(),
+                                      "txt": b"cat"})
+    (kept,) = iterate(Memory([broken, whole]).filter_map(images.DecodeImage()))
+    np.testing.assert_array_equal(kept["image"], np.full((2, 2, 3), 42, np.uint8))
+    assert kept["caption"] == "cat"
+    with pytest.raises(ValueError):
+        list(iterate(Memory([broken]).map(images.DecodeImage(rejects=False))))

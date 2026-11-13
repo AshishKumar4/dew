@@ -25,7 +25,7 @@ import logging
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self, TypeGuard, runtime_checkable
 
-from dew._records import JSON, json_value
+from dew._records import JSON, integer, json_value
 
 if TYPE_CHECKING:
     import grain.python as pygrain
@@ -45,7 +45,9 @@ READS: tuple[Read, ...] = ("memory", "indexed", "streamed")
 
 TOKENIZER_CONTRACT = ("tokenizer", "vocab_size", "eos_id", "tokenizer_revision")
 """The facts of a store of token ids that say what its ids mean, which every corpus a run reads
-together, and every store a concatenation joins, must state alike where they state them."""
+together, and every store a concatenation joins, must state alike where they state them:
+`tokenizer_revision` the identity its tokenizer resolved to as it was written (a hub name's commit and
+each file's digest, `dew.data.text.export_tokens`), which a store written before it stated one leaves out."""
 
 
 def tokenizer_contract(stated: Iterable[tuple[str, Mapping[str, object]]]) -> dict[str, JSON]:
@@ -87,6 +89,16 @@ def preparing(source: Source, size: int | None, into: str) -> None:
 
 _COUNTS = ("rows", "accepted", "accepted_rows", "windows", "valid_targets", "zero_target_windows")
 """The `metadata` facts that count a source's rows and their target tokens."""
+COUNTED = (*_COUNTS, "held_out")
+"""The facts that count a store's records, which records read one after another add (`counted`)."""
+
+
+def counted(stated: Collection[Mapping[str, object]]) -> dict[str, int]:
+    """The counts (`COUNTED`) of records read one after another, a concatenation's stores' or its datasets':
+    each the sum of what every one of `stated` states of its own; a count one of them leaves unstated is no
+    count of the whole."""
+    return {key: sum(integer(given[key], key) for given in stated) for key in COUNTED
+            if all(isinstance(given.get(key), int) for given in stated)}
 
 
 def stated(source: Source) -> Mapping[str, object]:

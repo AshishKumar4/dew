@@ -67,12 +67,14 @@ def served_inputs(row: np.ndarray, request: Served, vocab: int) -> ModelInputs:
                        {name: jnp.asarray(value) for name, value in request.conditioned(row).items()})
 
 
-def to_budgets(generations: list, label: str) -> list:
-    """`generations`, refused where a request ended before its budget: its likelihoods past its end are
-    padding, which no full forward scores, so the check serves a task that stops at its budget alone."""
-    if any(np.asarray(generation.terminated).any() for generation in generations):
-        raise ValueError(f"{label}: a request ended before its budget; serve a task that stops at its "
-                         "budget alone")
+def to_budgets(generations: list, budget: int, label: str) -> list:
+    """`generations`, refused unless each drew its whole `budget`: likelihoods past a request's last drawn
+    token are padding, which no full forward scores, so the check serves a task that stops at its budget
+    alone (a stop id or a length policy ends a request short; one ending on its budget's last token drew
+    it whole)."""
+    if any(np.any(np.asarray(generation.lengths) != budget) for generation in generations):
+        raise ValueError(f"{label}: a request drew fewer tokens than its budget of {budget}; serve a task "
+                         "that stops at its budget alone")
     return generations
 
 
@@ -168,7 +170,7 @@ def served_rounds(server: Server, requests: Sequence[Served], row: np.ndarray, r
         server.run()
         shared.append(server.prefix_hits - before)
     assert hits is None or shared == list(hits), shared
-    return to_budgets([ticket.result().host() for ticket in tickets], label)
+    return to_budgets([ticket.result().host() for ticket in tickets], budget, label)
 
 
 def assert_served_to_the_bit(task: TextGeneration, requests: Sequence[Served], label: str, *, serving: dict,
