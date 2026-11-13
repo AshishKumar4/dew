@@ -432,7 +432,7 @@ def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
     """Return the placement of each array leaf of `tree` as a string, keyed by path:
     its sharding and which slice of it each of this process's devices holds.
 
-    A local checkpoint restores onto this placement and no other. The sharding's
+    A pool's local checkpoint restores onto this placement and no other (`_check_placement`). The sharding's
     text names its mesh's axes and sizes but not the order of its devices, and two
     meshes over the same devices in another order give each process other slices."""
     def owned(leaf) -> str:
@@ -1767,8 +1767,8 @@ class Checkpoints:
                   unread: tuple[tuple[str, ...], ...] = (), on_host: bool = False) -> Variables:
         """Read the selected step's live or averaged variables onto the requested layout, or with
         `on_host` into host arrays, restored onto this process's CPU device and fetched, no accelerator
-        holding them on the way (no `mesh` or `layout` beside it); a local step, which knows the devices
-        it was written on alone, is refused it.
+        holding them on the way (no `mesh` or `layout` beside it); a pool's local step, each process
+        holding its own shards of it, is refused it (`_check_placement`).
 
         Parameter storage conversion applies only to the owner's parameter
         roots; other collections retain their recorded dtypes and placement.
@@ -1795,10 +1795,10 @@ class Checkpoints:
         if with_ema:
             template["ema"] = without(stored["ema"], unread)
         host_or_placed(on_host, mesh, layout)
-        if on_host and step == self._local_latest():
-            raise ValueError(f"step {step} is held locally, on the devices that wrote it, which its read "
-                             "places it on (`_check_placement`), so it reads onto no host; read a persistent "
-                             "step, or read this one without on_host")
+        if on_host and step == self._local_latest() and jax.process_count() > 1:
+            raise ValueError(f"step {step} is held locally, each process holding its own shards of it, so no "
+                             "process reads it whole onto its host; read a persistent step, or read this one "
+                             "without on_host, placed as it was written")
         # On the host, restored onto this process's CPU device, every collection as a placed read restores
         # it, then fetched as host arrays: no accelerator holds them on the way.
         device_mesh = resolve_mesh(DefaultMesh().build(_host_devices()) if on_host
@@ -1961,8 +1961,9 @@ class Checkpoints:
         template holds it as a concrete array, which is then kept as it is.
 
         A step that is the local one every process holds is read from the
-        local directory, onto the placement it was written with; any other
-        step is read from the persistent directory. The data position is
+        local directory, a pool's onto the placement it was written with
+        (`_check_placement`); any other step is read from the persistent
+        directory. The data position is
         returned as the bytes the reader of `share` resumes from (see
         `read_position`). Without a share, as for a caller that reads weights
         and no data, it is None.
@@ -2139,12 +2140,17 @@ class Checkpoints:
         return read if by_payload else _from_payloads(read, at)
 
     def _check_placement(self, step: int, state_tree: Mapping[str, StateLeaf]) -> None:
-        """Refuse a local step written for another placement of the state."""
+        """Refuse a pool's local step written for another placement of the state: each process holds its
+        own shards of it, so another placement would read a shard no process's directory holds. A step one
+        process wrote holds every shard in its directory, and restores onto any placement of this one
+        process's devices (its host's included: `variables(on_host=True)`)."""
         with region("checkpoint.validate"):
             written = self._open_local().metadata(step).custom_metadata or {}
+            processes = written.get('processes')
+            if processes == jax.process_count() == 1:
+                return
             wanted = placement(state_tree)
             moved = [path for path in wanted if written.get('placement', {}).get(path) != wanted[path]]
-            processes = written.get('processes')
             if processes == jax.process_count() and not moved:
                 return
             if processes != jax.process_count():
