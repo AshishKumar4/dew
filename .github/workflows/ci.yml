@@ -252,9 +252,11 @@ jobs:
       cancel-in-progress: false
       queue: max
     # Main's daily whole run, below every lane's, waits for capacity within its suite's and then its release
-    # checks' 6000 s deadlines, one after the other: 210 minutes. Any other's suite runs its deadline (2,700 s
-    # warm, 5,400 s cold) and its judges up to a task's 1,800 s and 600 s more (armada's later waves): 110 minutes.
-    timeout-minutes: ${{ ((github.event_name == 'schedule' || inputs.whole) && 210) || 110 }}
+    # checks' 6000 s deadlines, one after the other: 210 minutes. Any other's suite runs its deadline and then its
+    # judges up to a task's 1,800 s and 600 s more (armada's later waves): a cold one's 5,400 s, 140 minutes; a
+    # warm one's 2,700 s, 90.
+    timeout-minutes: ${{ ((github.event_name == 'schedule' || inputs.whole) && 210)
+      || ((github.ref_name == 'base/kernels' || needs.scope.outputs.policy != 'on') && 140) || 90 }}
     steps:
     - uses: actions/checkout@v4
       with:
