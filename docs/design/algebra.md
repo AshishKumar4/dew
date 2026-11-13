@@ -45,7 +45,8 @@ checked-in output yet. The text stays as the design to resume.
   seam: training steps, and the forwards of evaluation, rollouts, sampling and serving, which gain from it too,
   serving above all. Inside a program, the bodies Dew owns are marked (§6.10): a protected
   body stays as written, a surrogate's and kernel glue's are rewritten within their own marked call, and an
-  algebra span opens into the region around it; the pass rewrites the composition and its autodiff output
+  algebra span with no effects over arrays opens into the region around it (any other is rewritten within its
+  call); the pass rewrites the composition and its autodiff output
   around them. Its rule sets are the ones whose saturation
   is fast and whose rounding class is static, so its cost is bounded by the program's size (§6.6) and it needs no
   sampling.
@@ -61,7 +62,7 @@ checked-in output yet. The text stays as the design to resume.
   greedy DAG extractor by default; Dew's exact extractor is its oracle (§6.5).
 - **Language:** the arithmetic core of a jaxpr:
   - elementwise operations, casts, broadcasts, reshapes and transposes;
-  - reductions (sum, max), `dot_general` and select;
+  - reductions (sum, max, min), `dot_general` and select;
   - rsqrt, sqrt, exp, log, log1p, expm1, abs and sign.
 - **Opaque leaves,** never rewritten: Pallas kernels, collectives, `shard_map`, sharding constraints, random
   numbers, callbacks and effects.
@@ -78,6 +79,9 @@ checked-in output yet. The text stays as the design to resume.
     rule relates it to anything outside it.
   - `KernelGlue`: the XLA glue of a kernel's custom derivative around its Pallas launches, which rules rewrite as
     any other math; the launches stay opaque leaves.
+  - `Algebra`: a derivative written only to restructure algebra (§1.3), which the pass rewrites freely: a span
+    with no effects over arrays opens into the region around it, and any other is rewritten within its call, as
+    a control-flow body is (its constants at hand, its inputs arrays).
 - **Control flow:** the bodies of `scan`, `while`, `cond`, nested `jit` (`pjit`) and checkpoint (remat) are regions
   of their own, rewritten in place and recursively (a body whose constants are not all at hand, or one of
   whose inputs is no array, is left as traced). Bodies are never unrolled, so a step's program depth stays
@@ -136,8 +140,8 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
 - **Rules,** in declared sets in one place, each set tagged with the modes it runs in:
   - **linear algebra** (compile time and dev time): linearity of sums (`joined`), a laid factor hoisted out
     of a sum, distributivity, a product's bilinearity (a shared operand out of two products, a power of two's
-    scale on either operand), a row or column scale moved through a contraction (a dequant's, or
-    `(diag(1/t) E)ᵀ dO ≡ Eᵀ (diag(1/t) dO)`), and a positive scale out of a maximum or a minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign
+    scale on either operand), a row or column scale lifted out of a matrix product along the axis the product
+    keeps (a dequant's: `(diag(s) X) Yᵀ ≡ diag(s) (X Yᵀ)`), and a positive scale out of a maximum or a minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign
     its fact): attention's derived step takes its raw products' maximum and scales it once, as the hand step
     does;
   - **identities** (compile time and dev time): commutativity, a saturation aid. A cast's widening round trip,
@@ -274,15 +278,15 @@ fitted to them, and a rule set ships only with measured receipts.
   point where its selector gives the template the launch, its consumers into the epilogue where fused prices
   less; so a plain JAX program compiled through Dew runs the templates its products match (row 3450).
 - **Recognition (compile time, row 4783):** a region of a program is written as one of Dew's calls (its
-  attention, RMSNorm, stream and gated norms, SwiGLU) only where the e-graph proves the region computes that call
-  (`dew.algebra.recognize`). Each call's math is declared once, as the call itself on its portable path
+  attention, RMSNorm, stream and gated norms, SwiGLU) only where the region is proven to compute that call, by
+  its normal form's identity or in the e-graph (`dew.algebra.recognize`). Each call's math is declared once, as the call itself on its portable path
   (`implementation='xla'`, attention's `'reference'`), the arithmetic its kernels are held to; no account
   of a spelling is written anywhere. Around an equation of the primitive every declaration of a family holds
   (`exp`, `rsqrt`, `logistic`), the family names its candidates: the values the call would read and make,
   its static arguments read from the region's own constants (an epsilon, a softcap, a mask's fill, which the
   kernels take as the program holds it), each choice the call takes tried, within the search's bounds
-  (`REACH` equations from an anchor, `SPAN` a region, no barrier crossed, the first candidate proven equal
-  taken). A body that binds no anchor of the families asked, at any depth of the programs it nests, is
+  (`REACH` equations from an anchor, `SPAN` a region, no barrier crossed, the first region one of whose
+  candidates is proven equal taken). A body that binds no anchor of the families asked, at any depth of the programs it nests, is
   answered at once, before any key of it is built (row 5556). The region's equations and each
   candidate's declaration over the same operands are traced as one program and brought to a normal form
   (`normal_form.canonical`: nested programs inlined, constants of masks and divisors folded, a square a
@@ -318,7 +322,8 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
   (tests/test_algebra_rules_sound.py); and the decoupled set's rules, a derivation's own, are held through
   the forms they derive (tests/algebra_laws.py), not rule by rule.)
 - **Each program site the pass changes,** in one of two ways:
-  - at a site the gate compiles itself: `assert_as_exact(rewritten(fn), fn, draw, truth_fn=fn at float64)`;
+  - at a site the gate compiles itself: `assert_as_exact(rewritten(fn), fn, draw, label, seeds=...)`, its truth
+    `fn` on the inputs widened to float64;
   - at a site running Dew's own programs (`dew_programs`, `as_given` trainer steps): the same arm under
     `dew.algebra.passes(on=True, target=…)` against `passes(on=False)`.
 
@@ -350,8 +355,8 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
   compile (row 5339). Today the compiled step's plan holds the pass's seconds and each probe's compile
   seconds; a probe's `spent` (its traced, lowered and compiled seconds, JAX's own events summed for that
   candidate) joins them with the planner's head on row 5556, and the perf gate's columns are not there yet. It is a reported measurement, not a gate.
-- **Report:** each program's rule classes that fired and the pass's seconds go in the one kernel report
-  (`dew.nn.kernels.templates.report`, `report.compiled`).
+- **Report:** each region's rule sets that fired and each program's whole pass's seconds go in the one kernel
+  report (`dew.nn.kernels.templates.report`: `report.rewrites`, `report.passes`; §6.8).
 
 ## 4. What it replaces, and what it leaves
 
@@ -450,8 +455,8 @@ class Term(Expr):
 ```
 
 - A term's `params` index the region's table of its equation's parameters (`terms.parameter_key`'s structural
-  key, `Region.params`), so a rule reads a parameter as a fact of its own (a product's dimension numbers, a
-  literal's value) and an equation's every parameter rebuilds it as interned: as traced, but a product whose
+  key, `Region.params`), so a rule reads a parameter as a fact of its own (a product's dimension numbers; a
+  literal's value by its own table, `Region.literals`) and an equation's every parameter rebuilds it as interned: as traced, but a product whose
   preferred type is its operands' own held as one of none, and consecutive broadcasts composed.
 - The error-free transformations (`two_sum`, `two_product`, the correctly rounded divide's significand) are
   `Protected` spans (§6.10): one leaf of the region each, no rule touching them, rather than a `semantic`
@@ -484,7 +489,7 @@ class Term(Expr):
   - a checkpoint (remat) boundary;
   - an opaque equation;
   - a marker (§6.10): a `Protected` span is a leaf, and a `Surrogate` or `KernelGlue` span a region of its own
-    (an `Algebra` span is no boundary: it opens into the region around it, §6.10);
+    (an `Algebra` span with no effects over arrays is no boundary: it opens into the region around it, §6.10);
   - a `scan`, `while`, `cond` or `pjit` body (those are regions of their own).
 
 ### 6.3 Facts
@@ -525,11 +530,12 @@ wraps, and at that range for a bitwise operation and where an unsigned result ma
 into a floating dtype from a floating or signed one, or between signed integers no narrower.
 
 A quotient, a root, a logarithm and a power are bounded where the operand they need away from zero is held
-there (`terms.Apart`). Beside each value's bound the region carries four facts, each proven from the program's
+there (`terms.Apart`). Beside each value's bound the region's trace carries four facts (read as it is built,
+`terms._region`; the region keeps the bounds), each proven from the program's
 inputs taken as finite reals within their declared ranges: a floor `2**l <= |x|`, the side of zero `x` lies
 on, that `x` is no NaN, and that it is finite. They come from a constant's elements, a declared interval that
 holds no zero, and each equation's own (`terms._apart`): a sum of values on one side of zero keeps the largest
-floor, a product adds them, a quotient takes its divisor's bound from its dividend's floor, a square and an
+floor, a product adds them, a quotient's is its dividend's less its finite divisor's bound, a square and an
 absolute value are at least 0, an exponential of a bounded value is at least its reciprocal bound, a layout, a
 conversion between floats and a maximum or minimum along an axis of at least one element keep theirs. Each
 floor is a normal power of its dtype, which rounding to nearest keeps, and the powers are exact: a constant's
@@ -541,8 +547,8 @@ less an infinity, a zero times one, a root of a value that may be negative). A v
 operands are and its own bound is under its dtype's largest power; one that may have overflowed is not, nor
 is a value an equation makes by keeping or scaling it, a conversion to a wider float or to an integer among
 them (XLA saturates an infinity to an integer its bound says nothing of), whatever its bound reads there; a
-value is finite again where its operation bounds it whatever its operand is (a comparison, a logistic, a
-zeroth power) or makes a zero of an infinity.
+value is finite again where its operation bounds it whatever its operand is (a comparison, a zeroth power; a
+logistic of any number) or makes a zero of an infinity.
 The bounds these facts prove read an operand's magnitude of a finite one alone, and a divisor, a reciprocal
 root's operand and a negative power's base by their floor, which an infinite one holds too, its result a zero
 (`terms._apart_bound`): `x / y` is at most
@@ -672,13 +678,13 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   measured where it is reached in that order, the form as written never against itself; candidates are
   ordered by their seconds, where every rate of a GPU target is stated (`cost.cheaper`'s rule for work no
   rate prices is the compile-time splice's). No module calls `choose` yet (the generator is parked, §6.11).
-- One choice of this kind is live: a product's dot algorithm for the accuracy its site asks
-  (`dew.algebra.error.product_precision`, row 5473). Its candidates are the algorithms JAX itself states for
+- One choice of this kind is built: a product's dot algorithm for the accuracy its site asks
+  (`dew.algebra.error.product_precision`, row 5473; today its test calls it and no site does). Its candidates are the algorithms JAX itself states for
   the operands' dtype (`dew.nn.programs.dot_algorithms`, by JAX's own conversion of each preset), priced by `cost.product_work` in the mode
   and passes JAX lowers each to, and it takes the cheapest the site's gate admits on its own family (a
   three-pass TF32 product where one pass misses the accuracy and IEEE fp32 costs more); none admitted is
-  refused. A site reads it in place of a hand-picked preset; the recurrence ports, the template's accurate
-  parts and the GEMM's low-precision forms are to (their lanes' rows).
+  refused. A site is to read it in place of a hand-picked preset: the recurrence ports, the template's accurate
+  parts and the GEMM's low-precision forms (their lanes' rows).
 - Extraction is egglog's `greedy-dag` (`dew.algebra.extract.cheapest`), each shared node priced once; its
   exact counterpart (`extract.extracted`) is the oracle (exact as a mixed integer program is: solved to a
   relative gap of zero within the solver's feasibility tolerance, each price level held at its least within
@@ -806,7 +812,7 @@ def rewritten_program(closed: jax.extend.core.Jaxpr, *, saturation: Saturation) 
     # shardings, and `closed` itself where neither changes it (the numerics read from the trace context, the
     # prices from `cost.target`)
 
-def rewritten(fn: Callable, *, saturation: Saturation, static_argnums=(), static_argnames=(),
+def rewritten(fn: Callable, *, saturation: Saturation, static_argnums=None, static_argnames=None,
               kernels: bool = False) -> Callable: ...
     # fn traced over its dynamic arguments, its static ones bound first as jit binds them, rewritten by the
     # rules and evaluated, its outputs' pytree as fn's; with `kernels`, the compile point's own setting, its
@@ -875,7 +881,7 @@ misses, as each program traces; a relowering's rewrites join it only where its r
 step records its search's rewrites with its kernels (`StepCompiled.plan`'s `kernels`: its `rewrites`, and
 beside them `passes`, the seconds of each traced program's whole pass, `report.passes`). It is one record a
 region the pass read (`report.rewrites`), each holding:
-- the region's equations, and the roots whose cheaper form the program took;
+- the count of the region's equations, and of the roots whose cheaper form the program took;
 - the price before and after, none for a region no rule may fire in (`rules.reorderable`), which is never
   built and so never priced: a missing price stays missing, never zero;
 - the rule sets admitted and each one's matches;
@@ -1041,8 +1047,8 @@ class Reduction:                     # attention, and any walk whose state is a 
 
 @dataclass(frozen=True)
 class Scan:                          # a recurrence
-    update: Callable                 # (h, x_t) -> h, read as h <- A_t h + B_t U_t^T by rules
-    readout: Callable                # (h, x_t) -> o_t
+    update: Callable                 # (h, **token) -> h, read as h <- A_t h + B_t U_t^T by rules
+    readout: Callable                # (h, **token) -> o_t, the token's operands by name
     operands: Mapping[str, Axes]
     walked: str                      # "time"
     state: tuple[tuple[int, ...], jnp.dtype]   # the state's shape (keys by values) and dtype
@@ -1129,9 +1135,9 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
   (the residuals among the known one's outputs), its transpose is a marked call of the transposed body, and its
   batching rule a marked call of the batched body. Its lowering inlines the body, so a marked call costs nothing
   with the pass off.
-- A prototype test holds the marker before anything builds on it: a body's forward, tangent and cotangent each
-  arrive as marked calls of their kind through `jax.grad`, `jvp`, `linearize`, `vmap`, `jax.checkpoint` and
-  `shard_map`.
+- A prototype test holds the marker before anything builds on it (tests/test_marked_calls.py): a body's forward,
+  its tangent (`jvp`, `linearize`) and its cotangent (`jax.grad`, under `jax.checkpoint` too) each arrive as
+  marked calls of their kind, as do its batched (`vmap`), sharded (`shard_map`) and checked (`checkify`) forms.
 - The pass reads `kind` as an object (`isinstance`), never a name or a scope string, and the pass opens an
   `Algebra` span where a rewrite across its boundary lands (`dew.nn.programs.inlined`, through
   `program._opened`); every other marked call stays a call in the program the pass returns, and JAX's lowering
