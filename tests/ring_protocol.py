@@ -3,9 +3,9 @@ protocol, model-checked"): a launch's kernel traced as the toolkit's own code bu
 GPU), each warpgroup's program interpreted concretely into its synchronization events, and every
 interleaving of those programs explored under CUDA's mbarrier and asynchronous-copy semantics.
 
-The events are the kernel's own equations: an `mbarrier` wait (`barrier_wait`, with its parity, or without,
-Mosaic's tracked phase), an arrival (`barrier_arrive`), a TMA load (`copy_gmem_to_smem`: an arrival with its
-transaction at issue, its bytes landing later, out of order with other copies), a TMA store
+The events are the kernel's own equations: an `mbarrier` wait (`barrier_wait`, at its named phase, or
+without one, Mosaic's tracked phase), an arrival (`barrier_arrive`), a TMA load (`copy_gmem_to_smem`: an
+arrival with its transaction at issue, its bytes landing later, out of order with other copies), a TMA store
 (`copy_smem_to_gmem`, reading shared memory until `wait_smem_to_gmem` retires it), a generic proxy's fence
 (`commit_smem`), a warpgroup product (`wgmma`, reading shared memory until `wgmma_wait` retires it), and a
 shared-memory read or write (`get`, `swap`). Index arithmetic, loops and branches are evaluated concretely
@@ -14,8 +14,8 @@ shared memory a peer writes.
 
 The semantics assumed (PTX ISA, `mbarrier`, `cp.async.bulk`, `fence.proxy.async`):
 - a barrier's phase completes once its arrivals (its `num_arrivals`) and its pending transactions are all in;
-  a wait of parity `p` passes once the barrier's phase count's parity is not `p` (the phase of parity `p`
-  completed), one without a parity at the parity its thread tracks, flipped as it passes;
+  a wait at phase `k` passes once the barrier's phase count's parity is not `k`'s (a phase of `k`'s parity
+  completed), one without a phase at the parity its thread tracks, flipped as it passes;
 - an arrival releases, a passing wait acquires: everything before the arrivals of a completed phase happens
   before everything after a wait that observes it; a TMA load's bytes are written after its issue and before
   the transaction completes;
@@ -28,9 +28,10 @@ The properties checked in every reachable state of every interleaving, within th
 - no deadlock, and at the end every barrier's phase whole (no arrival left in a phase that never completes)
   and every completed phase observed by each thread that waits on the barrier (a producer's drain: no slot
   freed while a release is unseen);
-- each wait observes the completion it is the thread's next wait for on that barrier: no barrier runs two
-  phases past a thread that still waits on it (a parity wait's aliasing), and no thread arrives twice in one
-  phase of a barrier (an early arrival counted toward a phase it does not belong to);
+- each wait observes the completion it names, or, naming none, the one it is the thread's next wait for on
+  that barrier: no barrier runs two phases past a thread that still waits on it (a parity wait's aliasing),
+  and no thread arrives twice in one phase of a barrier (an early arrival counted toward a phase it does not
+  belong to);
 - with that, every execution synchronizes alike, so its happens-before order is one: every read of shared
   memory (a load's consumer's, a product's, a store's) happens after the write it reads has landed and
   before the next write to the location lands, and a store's source was fenced after its last generic
@@ -66,7 +67,7 @@ class Ref:
 @dataclasses.dataclass(frozen=True)
 class Event:
     """One synchronization event of a warpgroup's program: `kind`, the location it touches (a ref and its
-    slot), and its argument (a wait's parity, a product's or a store's sources, a wait's pending count)."""
+    slot), and its argument (a wait's phase, a product's or a store's sources, a wait's pending count)."""
 
     kind: str
     at: tuple = ()
@@ -197,9 +198,9 @@ def _wait(self: _Interpreter, equation, values) -> list:
     tree = equation.params["transforms_treedef"]
     count = tree.num_leaves
     at = _slot(values[0], tree, values[1:1 + count])
-    parity = (bool(np.asarray(_governing(values[1 + count], "a wait's parity")))
-              if equation.params.get("has_parity") else None)
-    return self.emit("wait", at, parity)
+    phase = (int(np.asarray(_governing(values[1 + count], "a wait's phase")))
+             if equation.params.get("has_phase") else None)
+    return self.emit("wait", at, phase)
 
 
 def _arrive(self: _Interpreter, equation, values) -> list:
@@ -450,14 +451,16 @@ class _State:
         if event.kind == "wait":
             state = self.barrier(event.at, arrivals)
             tracked = event.at in self.tracked[thread]
-            parity = event.argument if event.argument is not None else tracked
+            parity = tracked if event.argument is None else event.argument % 2 == 1
             if state.phases % 2 == int(parity):
                 return None
-            passed = counts[thread][self.positions[thread]].get(event.at, 0)
-            if state.phases != passed + 1:
+            # The completion it waits for: the one it names, or its next.
+            awaited = (counts[thread][self.positions[thread]].get(event.at, 0) if event.argument is None
+                       else event.argument) + 1
+            if state.phases != awaited:
                 raise Violation(
-                    "aliased", f"thread {thread}'s wait {passed + 1} on {event.at} passes at phase "
-                                f"{state.phases}: a parity aliased", trace)
+                    "aliased", f"thread {thread}'s wait for completion {awaited} on {event.at} passes at "
+                                f"phase {state.phases}: a parity aliased", trace)
             if event.argument is None:
                 made.tracked = (*self.tracked[:thread], self.tracked[thread] ^ {event.at},
                                 *self.tracked[thread + 1:])
