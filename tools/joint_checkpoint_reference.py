@@ -210,12 +210,12 @@ def upstream_precision() -> str:
     """What logits_fla.npz records of its run's matmuls (`recorded_matmuls`), fla's two triangular
     solves among them, under `UPSTREAM_DEFAULT`, the mark of an upstream at its own default precision."""
     from fla.ops.gated_delta_rule import chunk_fwd
-    from fla.ops.utils import solve_tril
+    from fla.ops.utils.solve_tril import FLA_TRIL_PRECISION
 
     from _dew_torch.precision import UPSTREAM_DEFAULT, recorded_matmuls
 
     solve = chunk_fwd.SOLVE_TRIL_DOT_PRECISION
-    modes = recorded_matmuls(FLA_TRIL_PRECISION=solve_tril.FLA_TRIL_PRECISION,
+    modes = recorded_matmuls(FLA_TRIL_PRECISION=FLA_TRIL_PRECISION,
                              **{"the intra-chunk solve": str(getattr(solve, "value", solve))})
     return f"{UPSTREAM_DEFAULT}: {modes}"
 
