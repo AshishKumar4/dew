@@ -723,16 +723,19 @@ def hidden(family: "Family", consumers: int) -> Callable[[int, int], tuple[int, 
 
     A family whose producer issues a program's loads and whose products run asynchronously to its consumers'
     warps (warpgroup MMA beside a TMA producer) hides its loads' latency by the bytes it holds in flight, its
-    programs times its stages (a stage's bytes are the launch's own at every plan), ties to fewer programs
-    (a larger raise each, its state held once): an H100 ran the 27B gated delta net's states launch one
-    program five deep (184 KiB in flight), where its most programs, two one deep (74 KiB), slowed the
-    forward 1.4 to 1.5 times (FS-RESIDENT-WINDOW1-h100, FS-INFLIGHT1); Nemotron-H 30B's SSD query/key launch,
-    one stage, two programs at 1.35 times one's rate (FS-SSD-RESIDENT1-h100). A family whose consumers issue
-    their own loads and synchronous products (mma.sync, no producer) hides their issue latency by its
-    resident warps, its programs first, then its ring: an A100 held its states launch at three programs
-    where its deepest ring alone held one (SE-family-a100-8c5b5b16a)."""
+    programs times its stages (a stage's bytes are the launch's own at every plan): an H100 ran the 27B gated
+    delta net's states launch one program five deep (184 KiB in flight), where its most programs, two one
+    deep (74 KiB), slowed the forward 1.4 to 1.5 times (FS-RESIDENT-WINDOW1-h100, FS-INFLIGHT1); Nemotron-H
+    30B's SSD query/key launch, one stage, two programs at 1.35 times one's rate (FS-SSD-RESIDENT1-h100). At
+    as many bytes in flight it takes more programs, whose warps hide the issue latency a deeper ring does not:
+    a B200's 27B gated delta training launches at two programs one deep against one two deep, 1.884 to 1.743
+    ms, its solve 211 to 135 us, Kimi delta attention's output 161 to 99 us, each launch latency-bound (12.5%
+    of its warps active, M-JS-112, row 5720). A family whose consumers issue their own loads and synchronous
+    products (mma.sync, no producer) hides their issue latency by its resident warps, its programs first, then
+    its ring: an A100 held its states launch at three programs where its deepest ring alone held one
+    (SE-family-a100-8c5b5b16a)."""
     if family.warpgroups(consumers) > consumers:
-        return lambda programs, stages: (programs * stages, -programs)
+        return lambda programs, stages: (programs * stages, programs)
     return lambda programs, stages: (programs, stages)
 
 
