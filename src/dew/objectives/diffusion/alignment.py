@@ -29,7 +29,7 @@ from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.norms import cosine
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Objective
+from dew.objectives.base import Objective, Ratio
 
 ALIGNMENT = "alignment_projector"
 """The projector's key in `params`, beside the model's own modules."""
@@ -170,9 +170,13 @@ class Alignment:
         return self.module(features).init(key, jnp.zeros((1, count, width)))
 
     def loss(self, projector: Variables, hidden: jax.Array, targets: jax.Array, batch: Batch) -> jax.Array:
-        """Return REPA's projection loss, the mean of -cos(target, projection) over tokens and examples.
+        """Return REPA's projection loss, the mean of -cos(target, projection) over tokens and examples
+        (`statistics`'s)."""
+        return self.statistics(projector, hidden, targets, batch).mean()[0]
 
-        The examples are `batch`'s rows (`Objective.row_mean`).
+    def statistics(self, projector: Variables, hidden: jax.Array, targets: jax.Array, batch: Batch) -> Ratio:
+        """REPA's projection loss as the ratio its mean is, -cos(target, projection) summed over `batch`'s
+        rows (`Objective.row_mean`) and their mass, which a step read in several microbatches pools.
 
         Raises `ValueError` when the model's token count differs from the
         encoder's patch count.
@@ -182,7 +186,8 @@ class Alignment:
                              f"match the encoder's {targets.shape[1]} patches")
         projected = self.module(targets.shape[-1]).apply(projector, hidden)
         assert isinstance(projected, jax.Array)
-        return -Objective.row_mean(cosine(projected, targets), batch).mean()[0]
+        held = Objective.row_mean(cosine(projected, targets), batch)
+        return Ratio(-held.total, held.mass)
 
     def captures(self, module: nn.Module, method: str) -> bool:
         """Return whether `capture_intermediates` should keep this call: True for `layer`'s output."""

@@ -48,7 +48,7 @@ from dew.nn.moe import (
     sequence_router_moments,
 )
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Objective, Ratio
+from dew.objectives.base import Objective, Pooled, Ratio, Summed
 
 __all__ = ["ExpertBalance", "RoutedStatistics", "UntrainedRouter", "apply_routed",
            "reduce_routed", "refuse_fixed_routers", "router_counts", "router_moments", "router_scores",
@@ -128,7 +128,7 @@ class ExpertBalance:
             balancing(path for marker in (ROUTER_INDICES, ROUTER_LOG_Z)
                       for path, _ in sown_nodes(routing, marker))
         statistics: Ratio | RoutedStatistics = prediction
-        reported: dict[str, jax.Array] = {}
+        reported: dict[str, jax.Array | Pooled] = {}
         if self.aux_loss_alpha is not None:
             statistics, reported["aux_loss"] = self._balance_loss(
                 self.aux_loss_alpha, prediction, routing, batch, queries, fields)
@@ -140,7 +140,7 @@ class ExpertBalance:
                     "(dew.nn.moe.Router); this model's routers sow none")
             statistics = (RoutedStatistics(prediction, (), (), router_z) if isinstance(statistics, Ratio)
                           else dataclasses.replace(statistics, router_z=router_z))
-            reported["router_z_loss"] = jnp.sum(jnp.stack([term.mean()[0] for term in router_z]))
+            reported["router_z_loss"] = Summed(router_z)
         return statistics, reported
 
     def compose(self, params: Variables, prediction: Ratio, routing: Variables, batch: Batch,

@@ -63,6 +63,7 @@ from dew.objectives.base import (
     EMASpec,
     Objective,
     Omitted,
+    Pooled,
     ProgramModule,
     Ratio,
     Step,
@@ -810,12 +811,12 @@ class DiffusionObjective(Objective[Ratio]):
             weighted = weighted * jnp.exp(-logvar) + logvar / 2
         denoising = self.row_mean(weighted, batch)
         total, mass = denoising.total, denoising.mass
-        metrics: dict[str, jax.Array] = {}
+        metrics: dict[str, jax.Array | Pooled] = {}
         if self.alignment is not None and aligned is not None:
             # REPA adds proj_coeff times its mean to the denoising mean; the
             # denoising term here is halved, as Dew's L2 is, and so is this.
             metrics["alignment"] = aligned
-            total = total + self.alignment.weight / 2 * aligned * mass
+            total = total + self.alignment.weight / 2 * aligned.mean()[0] * mass
         if self.end_to_end is None or end_to_end is None:
             return Ratio(total, mass), Aux(metrics=metrics, qk_stats=qk, inspected=inspected)
         # The autoencoder's update: its regularizer and the alignment of its
@@ -831,7 +832,7 @@ class DiffusionObjective(Objective[Ratio]):
                                     Step(step.step, step.key, None))
         assert through is not None
         metrics.update(end_to_end.terms, autoencoder_alignment=through)
-        autoencoder = end_to_end.regularizer + self.end_to_end.align_weight * through
+        autoencoder = end_to_end.regularizer + self.end_to_end.align_weight * through.mean()[0]
         total = total + (autoencoder + end_to_end.hinge) * mass
         updates = {LATENT_STATS: end_to_end.statistics} if step.training else None
         return Ratio(total, mass), Aux(metrics=metrics, variables=updates, qk_stats=qk, inspected=inspected)
@@ -860,8 +861,8 @@ class DiffusionObjective(Objective[Ratio]):
         preds, captured = self.model.apply(*inputs, **call, mutable=opened, capture_intermediates=(
             False if self.alignment is None else self.alignment.captures))
         if self.alignment is not None:
-            aligned = self.alignment.loss({"params": params["params"][ALIGNMENT]}, self._captured(captured),
-                                          targets, batch)
+            aligned = self.alignment.statistics({"params": params["params"][ALIGNMENT]},
+                                                self._captured(captured), targets, batch)
         observed = step.observed(captured)
         preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
         return optax.l2_loss(preds, target), aligned, observed

@@ -33,7 +33,7 @@ from dew.data.preferences import (
 )
 from dew.inputs import Field, InputSpec
 from dew.nn.inspection import watched_positions
-from dew.objectives.base import Aux, EMASpec, Objective
+from dew.objectives.base import Aux, EMASpec, Objective, Pooled
 from dew.objectives.routing import ExpertBalance
 from dew.rl.surrogate import preference_logsigmoid_terms
 
@@ -250,10 +250,10 @@ class DPOObjective(TokenScorer):
         counted = weights.astype(terms.dtype)[None]
         accuracy = self.accuracy((pair_chosen > pair_rejected).astype(jnp.float32)[None], {}, counted)
         statistics = self.row_mean(terms[None], {}, weights=counted)
-        reported = {
-            "rewards/chosen": self.row_mean(pair_chosen[None], {}, weights=counted).mean()[0],
-            "rewards/rejected": self.row_mean(pair_rejected[None], {}, weights=counted).mean()[0],
-            "accuracy": accuracy.mean()[0],
+        reported: dict[str, jax.Array | Pooled] = {
+            "rewards/chosen": self.row_mean(pair_chosen[None], {}, weights=counted),
+            "rewards/rejected": self.row_mean(pair_rejected[None], {}, weights=counted),
+            "accuracy": accuracy,
         }
         effects = None
         if self.balance is not None:

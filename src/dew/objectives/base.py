@@ -19,7 +19,6 @@ import copy
 import enum
 import functools
 import math
-import sys
 import weakref
 import zlib
 from abc import ABC, abstractmethod
@@ -127,7 +126,7 @@ def own_objective(name: str, held: Hashable, objective: Hashable) -> None:
 class Pooled:
     """A statistic a step pools over the microbatches it is read in before reading it (`Aux.metrics`,
     `dew.training.planning.whole_step`): `pooled` combines its parts as the whole batch would have made it,
-    `mean` reads it on the device and `held` on the host."""
+    and `mean` reads it."""
 
     def joined(self, later: Pooled) -> Pooled:
         """This part and a `later` microbatch's of its own kind as one: by default their leaves summed."""
@@ -140,10 +139,6 @@ class Pooled:
 
     def mean(self) -> tuple[jax.Array, jax.Array]:
         """Its value, and whether it has any mass."""
-        raise NotImplementedError
-
-    def held(self) -> float:
-        """Its value read on the host from the parts a step returned."""
         raise NotImplementedError
 
 
@@ -171,12 +166,6 @@ class Ratio(Pooled):
         value = self.total.astype(dtype) / jnp.where(active, mass.astype(dtype), 1)
         return jnp.where(active, value, 0), active
 
-    def held(self) -> float:
-        """`mean`'s value read on the host from the parts a step returned, as its log reads a metric
-        (`Aux.metrics`): zero where the mass is."""
-        mass = float(np.asarray(self.mass))
-        return float(np.asarray(self.total)) / mass if mass > 0 else 0.0
-
 
 @struct.dataclass
 class Exponentiated(Ratio):
@@ -187,12 +176,34 @@ class Exponentiated(Ratio):
         value, active = super().mean()
         return jnp.where(active, jnp.exp(value), 0), active
 
-    def held(self) -> float:
-        if float(np.asarray(self.mass)) <= 0:
-            return 0.0
-        # A cross entropy past a float's range is an infinite perplexity, as `mean`'s exp reads it.
-        mean = super().held()
-        return math.exp(mean) if mean < math.log(sys.float_info.max) else math.inf
+
+type Moment = jax.Array | float
+"""A count, a mean or a summed squared deviation: an array of them by feature, or one number."""
+
+
+def joined_moments(count: Moment, center: Moment, squares: Moment, later_count: Moment, later_center: Moment,
+                   later_squares: Moment) -> tuple[Moment, Moment, Moment, Moment, Moment]:
+    """Two parts' row counts, means and summed squared deviations from them (by feature, arrays or floats)
+    as the whole's, by Chan, Golub and LeVeque's pairwise update, which no part's sum of squares cancels
+    against its mean in; and the means' difference and the weight their outer product joins the parts'
+    co-moments by (`Moments`). The whole holds a row."""
+    whole = count + later_count
+    delta = later_center - center
+    weight = count * later_count / whole
+    joined = squares + later_squares + weight * delta ** 2
+    return whole, center + delta * later_count / whole, joined, delta, weight
+
+
+@struct.dataclass
+class Summed(Pooled):
+    """A metric that is the sum of several ratios' means, each over its own mass (a router z-loss, a term
+    a router), each part pooled as its ratio is (`Pooled.joined`'s sum of their numerators and masses)."""
+
+    parts: tuple[Ratio, ...]
+
+    def mean(self) -> tuple[jax.Array, jax.Array]:
+        values, active = zip(*(part.mean() for part in self.parts), strict=True)
+        return sum(values), functools.reduce(jnp.logical_or, active)
 
 
 @struct.dataclass
@@ -223,14 +234,11 @@ class Moments(Pooled):
     def joined(self, later: Pooled) -> Moments:
         if not isinstance(later, Moments):
             raise TypeError(f"moments join moments, not a {type(later).__name__}")
-        count = self.count + later.count
-        share = jnp.where(count > 0, later.count / jnp.where(count > 0, count, 1), 0)
-        delta = later.center - self.center
-        weight = self.count * share
+        count, center, squares, delta, weight = joined_moments(self.count, self.center, self.squares,
+                                                               later.count, later.center, later.squares)
         products = None if self.products is None or later.products is None else (
             self.products + later.products + weight * jnp.outer(delta, delta))
-        squares = self.squares + later.squares + weight * delta ** 2
-        return Moments(count, self.center + share * delta, squares, products, self.statistic)
+        return Moments(count, center, squares, products, self.statistic)
 
     def mean(self) -> tuple[jax.Array, jax.Array]:
         active = self.count > 0
@@ -245,15 +253,6 @@ class Moments(Pooled):
             off = covariance * (1.0 - jnp.eye(dim, dtype=covariance.dtype))
             value = jnp.sqrt(jnp.sum(off ** 2) / max(dim * (dim - 1), 1))
         return jnp.where(active, value, 0), active
-
-    def held(self) -> float:
-        return float(np.asarray(self.mean()[0]))
-
-
-def held_metric(value: jax.Array | np.ndarray | Pooled | float) -> float:
-    """A step's metric (`Aux.metrics`) read on the host: a `Pooled` statistic's value, anything else as a
-    number."""
-    return value.held() if isinstance(value, Pooled) else float(value)
 
 
 @struct.dataclass
@@ -2159,8 +2158,10 @@ __all__ = [
     "EMASpec",
     "Exponentiated",
     "Metric",
+    "Moments",
     "Objective",
     "Omitted",
+    "Pooled",
     "Prediction",
     "ProgramModule",
     "Ratio",
@@ -2168,9 +2169,9 @@ __all__ = [
     "Shown",
     "Source",
     "Step",
+    "Summed",
     "TrainingScalar",
     "TrainingScalars",
-    "held_metric",
     "joined",
     "model_rngs",
     "traced_update_flops",

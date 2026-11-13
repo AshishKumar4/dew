@@ -53,6 +53,7 @@ from dew.batch import Coordinates, Forks, Variables, coordinates
 from dew.data.forked_rows import ForkedRows, token_keys, windows_needed
 from dew.inference.rollouts import Draw, Routing, routing_rows
 from dew.nn.inputs import local_rows
+from dew.objectives.base import joined_moments
 from dew.rl import group_advantage, rloo_advantage
 
 if TYPE_CHECKING:
@@ -138,15 +139,11 @@ class Moments:
 
 def pooled(shares: Sequence[Moments]) -> tuple[float, float]:
     """The mean and (population) deviation of the members of every share together, joined pairwise in
-    float64 (Chan, Golub and LeVeque's update), so no share's sum of squares cancels against its mean."""
+    float64 (`dew.objectives.base.joined_moments`), so no share's sum of squares cancels against its mean."""
     count, mean, m2 = 0, 0.0, 0.0
     for share in shares:
         if share.count:
-            joined = count + share.count
-            delta = share.mean - mean
-            mean += delta * share.count / joined
-            m2 += share.m2 + delta * delta * count * share.count / joined
-            count = joined
+            count, mean, m2, _, _ = joined_moments(count, mean, m2, share.count, share.mean, share.m2)
     return mean, float(np.sqrt(m2 / count)) if count else 0.0
 CREDITS = ("session", "turn")
 """What an advantage is computed over: `session`, one per session from its
