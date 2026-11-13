@@ -658,7 +658,7 @@ class Trainer(Generic[Loss, Effects]):
             return state
         steps = self._shape.updates
         horizons = config.horizons(steps, clocked=self._shape.examples is not None)
-        schedules = {group: rate for group, rate in config.grouped_rates().items()
+        schedules = {group: rate for group, (rate, _) in config.grouped_rates().items()
                      if isinstance(rate, ScheduleBase)}
         return rates_set(state, lambda held: with_horizons(held, horizons, schedules, steps))
 

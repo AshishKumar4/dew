@@ -1322,8 +1322,7 @@ def with_rates(opt_state: optax.OptState, rates: Mapping[str | None, Mapping[str
     value's dtype and placement."""
     def wanted(path: jax.tree_util.KeyPath, held: Mapping[str, jax.typing.ArrayLike],
                kind: str) -> Mapping[str, float]:
-        return rates[next((entry.key for entry in path
-                           if isinstance(entry, jax.tree_util.DictKey) and entry.key in rates), None)]
+        return rates[_group(path, rates)]
 
     return _rated(opt_state, wanted)
 
@@ -1332,46 +1331,33 @@ def with_horizons(opt_state: optax.OptState, horizons: Mapping[str | None, Mappi
                   schedules: Mapping[str | None, ScheduleBase], steps: int | None) -> optax.OptState:
     """`opt_state` with each scheduled solver's step horizons (`RateState.horizons`) set to `horizons`' for
     its param group, by name, or under None for a solver of no group (`OptimConfig.horizons`), each in its
-    old value's dtype and placement, its shapes' leaves made where it holds shapes alone (a restore's
-    template), and the rate the solver reports until its next update takes it (Optax's injected
-    `learning_rate`) its schedule's at its update under them (`stepped_rate`, `schedules`' for its group,
-    over `steps` updates): a fresh state, built with none, reported the schedule as if it ended at once. A
-    solver an injected wrapper holds is reached through the wrapper's inner state, as `_rated` reaches it.
-    A DiLoCo run's groups hold theirs stacked, each the same."""
-    injected = optax.InjectStatefulHyperparamsState
-
-    def walked(tree, prefix: jax.tree_util.KeyPath):
-        def stated(path: jax.tree_util.KeyPath, node):
-            if not isinstance(node, injected):
-                return node
-            full = (*prefix, *path)
-            node = node._replace(inner_state=walked(node.inner_state,
-                                                    (*full, jax.tree_util.GetAttrKey("inner_state"))))
-            held = node.hyperparams_states.get("learning_rate")
-            return restated(node, held, full) if isinstance(held, RateState) else node
-
-        return jax.tree_util.tree_map_with_path(stated, tree, is_leaf=lambda node: isinstance(node, injected))
-
-    def restated(node, held: RateState, path: jax.tree_util.KeyPath):
-        group = next((entry.key for entry in path
-                      if isinstance(entry, jax.tree_util.DictKey) and entry.key in horizons), None)
-        # Placed as the state's update count is, which a horizon is read beside: a horizon of a reclocked
-        # state comes from a program of the optimizer's alone (`schedule_states`), on one device.
+    old value's dtype, placed as the state's update count is, which it is read beside, its shapes' leaves
+    made where it holds shapes alone (a restore's template); and the rate the solver reports until its next
+    update takes it (Optax's injected `learning_rate`) its schedule's at its update under them
+    (`stepped_rate`, `schedules`' for its group, over `steps` updates): a fresh state, built with none,
+    reported the schedule as if it ended at once. Solvers are reached as `_rated` reaches them
+    (`_injected`)."""
+    def stated(path: jax.tree_util.KeyPath, node):
+        held = node.hyperparams_states.get("learning_rate")
+        if not isinstance(held, RateState):
+            return node
+        group = _group(path, horizons)
+        # A horizon of a reclocked state comes from a program of the optimizer's alone (`schedule_states`),
+        # on one device: it is placed beside the update count instead.
         placed = held.updates.sharding if isinstance(held.updates, jax.Array) else None
-        state = held._replace(horizons={name: jax.device_put(np.broadcast_to(np.asarray(
-            horizons[group][name], like.dtype), like.shape), like.sharding if placed is None else placed)
-            for name, like in held.horizons.items()})
+        state = held._replace(horizons={name: _put(horizons[group][name], like, placed)
+                                        for name, like in held.horizons.items()})
+        states = {**node.hyperparams_states, "learning_rate": state}
         reported = node.hyperparams["learning_rate"]
         if not isinstance(reported, jax.Array):
             # A restore's template, whose restore reads the rate the checkpoint reported.
-            return node._replace(hyperparams_states={**node.hyperparams_states, "learning_rate": state})
+            return node._replace(hyperparams_states=states)
         stepping = functools.partial(stepped_rate, schedules[group], steps)
         rate = jax.vmap(stepping)(state) if reported.ndim else stepping(state)
-        return node._replace(hyperparams_states={**node.hyperparams_states, "learning_rate": state},
-                             hyperparams={**node.hyperparams, "learning_rate": jax.device_put(
-                                 jnp.asarray(rate, reported.dtype), reported.sharding)})
+        return node._replace(hyperparams_states=states,
+                             hyperparams={**node.hyperparams, "learning_rate": _put(rate, reported)})
 
-    return walked(opt_state, ())
+    return _injected(opt_state, stated)
 
 
 def with_bounds(opt_state: optax.OptState, bounds: Mapping[str, tuple[float, float]]) -> optax.OptState:
@@ -1381,14 +1367,10 @@ def with_bounds(opt_state: optax.OptState, bounds: Mapping[str, tuple[float, flo
     def put(path: jax.tree_util.KeyPath, node):
         if not isinstance(node, BoundsState):
             return node
-        group = next((entry.key for entry in path
-                      if isinstance(entry, jax.tree_util.DictKey) and entry.key in bounds), None)
+        group = _group(path, bounds)
         if group is None:
             return node
-        interval = np.asarray(bounds[group])
-        return node._replace(bounds={
-            name: jax.device_put(np.broadcast_to(interval.astype(held.dtype), held.shape), held.sharding)
-            for name, held in node.bounds.items()})
+        return node._replace(bounds={name: _put(bounds[group], held) for name, held in node.bounds.items()})
 
     return jax.tree_util.tree_map_with_path(put, opt_state,
                                             is_leaf=lambda node: isinstance(node, BoundsState))
@@ -1434,18 +1416,24 @@ type Wanted = Callable[[jax.tree_util.KeyPath, Mapping[str, jax.typing.ArrayLike
 what it holds."""
 
 
-def _rated(opt_state: optax.OptState, wanted: Wanted) -> optax.OptState:
-    """`opt_state` with each injected solver's learning rate set to what `wanted` gives for the solver's
-    path, the rate it holds and its kind: `scheduled`, a schedule's rate-valued fields in its
-    `RateState` or `ProgressState`; `constant`, a constant's own value under `CONSTANT`; or `computed`,
-    the value Optax computed at the last update from a schedule function, which it computes again at
-    the next. None leaves it as it is. A solver an injected wrapper holds is reached through the
-    wrapper's inner state. Each keeps the old value's dtype and placement."""
-    injected = optax.InjectStatefulHyperparamsState
+def _put(value, like, placed=None) -> jax.Array:
+    """`value` as `like` holds it, in its dtype and shape, placed where `like` is or at `placed`: a DiLoCo
+    run's groups hold their rates, horizons and bounds stacked, each the same
+    (`dew.training.diloco.rated`)."""
+    return jax.device_put(np.broadcast_to(np.asarray(value, like.dtype), like.shape),
+                          like.sharding if placed is None else placed)
 
-    def put(value, like):
-        # A DiLoCo run's groups hold their rates stacked, each the same (`dew.training.diloco.rated`).
-        return jax.device_put(np.broadcast_to(np.asarray(value, like.dtype), like.shape), like.sharding)
+
+type Injected = optax.InjectStatefulHyperparamsState
+"""The state Optax's `inject_hyperparams` keeps of an injected solver, its hyperparameters beside it."""
+
+
+def _injected(opt_state: optax.OptState, edit: Callable[[jax.tree_util.KeyPath, Injected], Injected]
+              ) -> optax.OptState:
+    """`opt_state` with each injected solver's state that holds a learning rate (Optax's
+    `InjectStatefulHyperparamsState`) as `edit` gives it for the solver's path; a solver an injected wrapper
+    holds is reached through the wrapper's inner state first."""
+    injected = optax.InjectStatefulHyperparamsState
 
     def walked(tree, prefix: jax.tree_util.KeyPath):
         def replaced(path: jax.tree_util.KeyPath, node):
@@ -1454,26 +1442,42 @@ def _rated(opt_state: optax.OptState, wanted: Wanted) -> optax.OptState:
             full = (*prefix, *path)
             node = node._replace(inner_state=walked(node.inner_state,
                                                     (*full, jax.tree_util.GetAttrKey('inner_state'))))
-            if 'learning_rate' not in node.hyperparams:
-                return node
-            schedule = node.hyperparams_states.get('learning_rate')
-            scheduled = isinstance(schedule, RateState | ProgressState)
-            held = schedule.rates if scheduled else {CONSTANT: node.hyperparams['learning_rate']}
-            given = wanted(full, held, "scheduled" if scheduled else "constant" if schedule is None
-                           else "computed")
-            if given is None:
-                return node
-            if scheduled:
-                fields = {name: put(given[name], held) for name, held in schedule.rates.items()}
-                states = {**node.hyperparams_states, 'learning_rate': schedule._replace(rates=fields)}
-                return node._replace(hyperparams_states=states)
-            rate = put(given[CONSTANT], node.hyperparams['learning_rate'])
-            return node._replace(hyperparams={**node.hyperparams, 'learning_rate': rate})
+            return edit(full, node) if 'learning_rate' in node.hyperparams else node
 
         return jax.tree_util.tree_map_with_path(replaced, tree,
                                                 is_leaf=lambda node: isinstance(node, injected))
 
     return walked(opt_state, ())
+
+
+def _group(path: jax.tree_util.KeyPath, named: Mapping) -> str | None:
+    """The param group a solver at `path` steps, by its name among `named`'s, or None for one of no group."""
+    return next((entry.key for entry in path
+                 if isinstance(entry, jax.tree_util.DictKey) and entry.key in named), None)
+
+
+def _rated(opt_state: optax.OptState, wanted: Wanted) -> optax.OptState:
+    """`opt_state` with each injected solver's learning rate set to what `wanted` gives for the solver's
+    path, the rate it holds and its kind: `scheduled`, a schedule's rate-valued fields in its
+    `RateState` or `ProgressState`; `constant`, a constant's own value under `CONSTANT`; or `computed`,
+    the value Optax computed at the last update from a schedule function, which it computes again at
+    the next. None leaves it as it is (`_injected`). Each keeps the old value's dtype and placement."""
+    def rated(path: jax.tree_util.KeyPath, node):
+        schedule = node.hyperparams_states.get('learning_rate')
+        scheduled = isinstance(schedule, RateState | ProgressState)
+        held = schedule.rates if scheduled else {CONSTANT: node.hyperparams['learning_rate']}
+        given = wanted(path, held, "scheduled" if scheduled else "constant" if schedule is None
+                       else "computed")
+        if given is None:
+            return node
+        if scheduled:
+            fields = {name: _put(given[name], held) for name, held in schedule.rates.items()}
+            states = {**node.hyperparams_states, 'learning_rate': schedule._replace(rates=fields)}
+            return node._replace(hyperparams_states=states)
+        rate = _put(given[CONSTANT], node.hyperparams['learning_rate'])
+        return node._replace(hyperparams={**node.hyperparams, 'learning_rate': rate})
+
+    return _injected(opt_state, rated)
 
 
 def _keep_within(lower: float, upper: float) -> optax.GradientTransformation:
@@ -1554,12 +1558,6 @@ class ParamGroup:
             if not lower < upper:
                 raise ValueError(f"param group {self.name!r} bounds its parameters from a lower to a "
                                  f"higher value, got {self.bounds}")
-
-    def rates(self, learning_rate: float | ScheduleBase) -> dict[str, float]:
-        """This group's rate-valued fields (`RateState`): its own `schedule`'s, else the config's
-        `learning_rate`'s, times `learning_rate_multiplier`."""
-        return rates_of(learning_rate if self.schedule is None else self.schedule,
-                      self.learning_rate_multiplier)
 
     def rate[R](self, learning_rate: R) -> R | ScheduleBase:
         """The rate its solver runs at: its own schedule, or the config's `learning_rate` where it
@@ -2479,15 +2477,17 @@ class OptimConfig:
         for the one solver of a config without groups. A resumed run sets
         them over its checkpoint's (`with_rates`), so the configured
         rate is the one it steps at."""
-        if not self.param_groups:
-            return {None: rates_of(self.rate)}
-        return {group.name: group.rates(self.rate) for group in self.param_groups}
+        return {group: rates_of(rate, multiplier)
+                for group, (rate, multiplier) in self.grouped_rates().items()}
 
-    def grouped_rates(self) -> dict[str | None, float | ScheduleBase]:
-        """Each of `build`'s solvers' rate, by param group as `horizons`: the config's, or a group's own."""
+    def grouped_rates(self) -> dict[str | None, tuple[float | ScheduleBase, float]]:
+        """Each of `build`'s solvers' rate and its multiplier, by param group, or under None for the one
+        solver of a config without groups: the config's rate, or a group's own schedule
+        (`ParamGroup.rate`), and the group's `learning_rate_multiplier`."""
         if not self.param_groups:
-            return {None: self.rate}
-        return {group.name: group.rate(self.rate) for group in self.param_groups}
+            return {None: (self.rate, 1.0)}
+        return {group.name: (group.rate(self.rate), group.learning_rate_multiplier)
+                for group in self.param_groups}
 
     def horizons(self, steps: int | None, clocked: bool = False) -> dict[str | None, dict[str, int | float]]:
         """The step horizons each of `build`'s solvers holds in its state (`RateState.horizons`), over a
@@ -2498,7 +2498,7 @@ class OptimConfig:
             if not isinstance(rate, ScheduleBase) or (clocked and rate.run_relative()):
                 return {}
             return rate.horizons(steps)
-        return {group: of(rate) for group, rate in self.grouped_rates().items()}
+        return {group: of(rate) for group, (rate, _) in self.grouped_rates().items()}
 
     def bounds(self) -> dict[str, tuple[float, float]]:
         """Each bounded param group's `[lower, upper]`, by name, which its clamp holds in its state
