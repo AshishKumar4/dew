@@ -161,12 +161,6 @@ def test_pipeline_dduf_single_file_and_composite_loads_without_weights_download_
     unrecorded = _hub_loaded(root, None, "acme/flux-dduf", "unrecorded", offline=True,
                              options={**options, "dduf_file": "unrecorded.dduf"})
     assert unrecorded["refused"] == "FileNotFoundError"
-    # A snapshot the cache holds part of (a metadata file of it gone) is refused offline, as
-    # huggingface_hub answers for it, not read as one without that file.
-    for held in (root / "hub").glob("models--acme--sd3/snapshots/*/scheduler/scheduler_config.json"):
-        held.unlink()
-    partial = _hub_loaded(root, None, "acme/sd3", "sd3-partial", offline=True, options=options)
-    assert "refused" in partial, partial
 
 
 def test_single_file_loads_without_weights_across_storage_dtypes_and_borrowed_shards(
@@ -413,12 +407,23 @@ def test_pack_quantized_compressed_tensors_loads_shapes_without_downloading_weig
 
     from local_hub import LocalHub
 
+    # A decoding policy of the release's own, which its load reads from its generation config.
+    (ct_dir / "generation_config.json").write_text(json.dumps(
+        {"do_sample": True, "temperature": 0.3, "top_k": 5}))
     repos = {"acme/ct-qwen": _files(ct_dir)}
+    options = {"dtype": "float32", "attention_impl": "reference"}
     with LocalHub(repos) as hub:
-        hub_shapes = _hub_loaded(tmp_path / "hub", hub, "acme/ct-qwen", "ct",
-                                 options={"dtype": "float32", "attention_impl": "reference"})
+        hub_shapes = _hub_loaded(tmp_path / "hub", hub, "acme/ct-qwen", "ct", options=options)
     _weightless(hub, "acme/ct-qwen", repos["acme/ct-qwen"], declared=(".weight_shape",))
     assert hub_shapes["shapes"] == _shapes_and_dtypes(expected.variables)
+    # The cache's snapshot without its generation config is refused offline, as huggingface_hub knows it
+    # incomplete, not loaded as a release of no decoding policy.
+    cached = list((tmp_path / "hub" / "hub").glob("models--acme--ct-qwen/snapshots/*/generation_config.json"))
+    assert cached
+    for held in cached:
+        held.unlink()
+    partial = _hub_loaded(tmp_path / "hub", None, "acme/ct-qwen", "ct-partial", offline=True, options=options)
+    assert "refused" in partial, partial
 
 
 def test_sampling_override_governs_beam_admission(tmp_path: Path) -> None:
