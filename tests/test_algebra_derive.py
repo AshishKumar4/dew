@@ -186,6 +186,31 @@ def test_the_derived_walk_computes_the_declared_function(name, walk):
     assert_as_exact(jax.jit(run), jax.jit(whole(function)), draw, f"{name} {walk}", seeds=16)
 
 
+KEYED_SEEDS = 16
+"""A declaration closing over a typed key's declared draws against its whole function (check 1)."""
+
+
+def test_a_declaration_closing_over_a_typed_key_derives():
+    """A declared attention whose logits are scaled by a temperature drawn from a typed PRNG key it closes
+    over (`jax.random.key`): its derivation reads each constant's magnitude, sign and dtype (`terms`), a
+    key's none and JAX's own, so it derives, and its walk over the key tiles is on par with the whole
+    function against the float64 truth (check 1). NumPy reads no typed key's bits, which refused every such
+    declaration (row 5860)."""
+    key = jax.random.key(5860)
+
+    def biased(q, k, v, rows, keys):
+        del rows, keys
+        # A temperature the key draws, which moves every weight: a draw over a walked value (each key's own)
+        # is outside the declaration language, which refuses it.
+        s = (q @ k.T) * WIDTH ** -0.5 * jnp.exp(0.25 * jax.random.normal(key, (), q.dtype))
+        p = jnp.exp(s - jnp.max(s, axis=-1)[:, None])
+        return (p @ v) / jnp.sum(p, axis=-1)[:, None]
+
+    forms = derive.derive(declared(biased), accurate=False, saturation=SATURATION)
+    assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(biased)), draw, "a typed key's bias",
+                    seeds=KEYED_SEEDS)
+
+
 def test_a_walks_sums_added_by_its_mainloop_take_each_tiles_factor_and_sum():
     """A mainloop that makes a walked sum's additions itself (`Derived.step`'s `stepped`, a compensated walk's
     running sums) takes each tile's rescale factor, its tile's sum and the terms it sums (`Added`), the other

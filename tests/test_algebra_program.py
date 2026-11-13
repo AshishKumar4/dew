@@ -308,6 +308,58 @@ def test_a_program_closing_over_a_typed_key_compiles_through_the_pass():
     np.testing.assert_array_equal(np.asarray(drawn), np.asarray(jax.jit(sampled)(x)[1]))
 
 
+ATTENTION_KEY_SEEDS = 8
+"""The captured-key attentions' declared draws against the function under `jax.jit` (check 1)."""
+
+
+def keyed_attention(q, k, v, key):
+    """Multi-head attention `[batch, time, heads, width]` whose logits add a bias `key` draws."""
+    bias = jax.random.normal(key, (q.shape[0], q.shape[2], q.shape[1], k.shape[1]), q.dtype)
+    logits = jnp.einsum("bqhd,bkhd->bhqk", q, k) * 0.25 + bias
+    return jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(logits, axis=-1), v)
+
+
+def attention_draw(salt: int):
+    """`keyed_attention`'s queries, keys and values, drawn from `salt`'s stream."""
+    def draw(seed):
+        rng = np.random.default_rng([salt, seed])
+        return tuple(jnp.asarray(rng.standard_normal((2, 16, 2, 8)), jnp.float32) for _ in range(3))
+    return draw
+
+
+def test_an_attention_closing_over_a_typed_key_compiles_through_the_pass():
+    """A multi-head attention whose logits add a bias drawn from a typed PRNG key the function closes over,
+    compiled through Dew's seam: the pass recognizes the attention, its bias's draw inside the candidate
+    (`recognize`), its normal form taking the key as the constant it is (`normal_form.canonical`), and the
+    program it compiles is on par with the function under `jax.jit` from the function in float64 (check
+    1). NumPy reads no typed key's bits, which refused every such program (row 5860)."""
+    from reference_error import dew_programs
+
+    key = jax.random.key(5861)
+
+    def attended(q, k, v):
+        return keyed_attention(q, k, v, key)
+
+    assert_as_exact(dew_programs(options.program(attended)), attended, attention_draw(5861),
+                    "an attention with a captured key's bias", seeds=ATTENTION_KEY_SEEDS)
+
+
+def test_an_attention_selecting_one_of_two_captured_keys_compiles_through_the_pass():
+    """A multi-head attention whose bias draws from one of two typed PRNG keys it closes over, the key chosen
+    by its query's sign: the key a selection moves is a value of the attention's candidate, which the pass
+    reads as no number (`terms`, its bound and its literals' facts), and the program it compiles is on par
+    with the function under `jax.jit` from the function in float64 (check 1, row 5860)."""
+    from reference_error import dew_programs
+
+    keys = jax.random.key(5862), jax.random.key(5863)
+
+    def attended(q, k, v):
+        return keyed_attention(q, k, v, jax.lax.select(q[0, 0, 0, 0] > 0, *keys))
+
+    assert_as_exact(dew_programs(options.program(attended)), attended, attention_draw(5862),
+                    "an attention with a selected key's bias", seeds=ATTENTION_KEY_SEEDS)
+
+
 def test_every_outer_program_is_rewritten_unless_its_arm_turns_the_pass_off():
     """An outer program (`options.program`) traces its function rewritten, so its lowering, its trace and its
     executable read one program; under `algebra.passes(on=False)`, which the gate opens for a reference arm,

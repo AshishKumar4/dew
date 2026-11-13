@@ -210,16 +210,13 @@ def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, places: tuple[int, ...]
 
 
 def _digest(value) -> Hashable:
-    """A constant by its type and bits; a traced one (a value an enclosing trace closes over), which holds no
-    bits until it runs, by its type alone, as an input is; a typed PRNG key by its implementation and its
-    key data (`jax.random.key_data`), the bits it holds, which NumPy cannot read off the key itself."""
+    """A constant by its type and bits (`terms.held_bits`: a typed PRNG key's its key data); a traced one (a
+    value an enclosing trace closes over), which holds no bits until it runs, by its type alone, as an input
+    is."""
     if isinstance(value, jax_core.Tracer):
         return value.aval
-    dtype = getattr(value, "dtype", None)
-    if dtype is not None and jnp.issubdtype(dtype, jax.dtypes.prng_key):
-        return str(dtype), _digest(jax.random.key_data(value))
-    value = np.asarray(value)
-    return str(value.dtype), value.shape, hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
+    dtype, array = terms.held_bits(value)
+    return dtype, array.shape, hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
 
 
 def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Candidate],
@@ -894,7 +891,8 @@ def _selections(index: fusion.Index, operands: Sequence[jcore.Var], places: Sequ
         if equation.primitive is not jax.lax.select_n_p:
             continue
         for atom in equation.invars:
-            if not isinstance(atom, jcore.Literal):
+            # A mask is boolean and a fill a float: a typed key's literal (a key's selection) is neither.
+            if not isinstance(atom, jcore.Literal) or terms.typed_key(atom.val):
                 continue
             held = np.asarray(atom.val)
             if held.dtype == np.bool_ and held.ndim >= 2:

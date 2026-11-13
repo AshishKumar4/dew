@@ -38,9 +38,10 @@ def canonical(closed: jcore.Jaxpr) -> jcore.Jaxpr:
     flat = jax.make_jaxpr(functools.partial(_evaluated, closed.jaxpr, closed.consts))(
         *(jax.ShapeDtypeStruct(aval(var).shape, aval(var).dtype) for var in closed.jaxpr.invars))
     jaxpr = flat.jaxpr
+    # A typed PRNG key stays the key it is: NumPy holds none (`terms.typed_key`).
     local: dict[jcore.Var, jcore.Var | jcore.Literal] = {
-        var: jcore.Literal(np.asarray(value), var.aval) for var, value in zip(jaxpr.constvars, flat.consts,
-                                                                             strict=True)}
+        var: jcore.Literal(value if terms.typed_key(value) else np.asarray(value), var.aval)
+        for var, value in zip(jaxpr.constvars, flat.consts, strict=True)}
 
     def read(atom):
         return local.get(atom, atom) if isinstance(atom, jcore.Var) else atom
@@ -354,8 +355,8 @@ def _squeeze(value, squeezed: _Made):
     if value in squeezed:
         return squeezed[value]
     target = tuple(size for size in shape if size != 1)
-    made = (np.reshape(np.asarray(value), target) if not isinstance(value, jax_core.Tracer)
-            else jax.lax.reshape(value, target))
+    made = (jax.lax.reshape(value, target) if isinstance(value, jax_core.Tracer) or terms.typed_key(value)
+            else np.reshape(np.asarray(value), target))
     squeezed[value] = made
     return made
 

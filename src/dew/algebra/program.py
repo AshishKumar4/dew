@@ -272,8 +272,8 @@ def structure(window: jcore.Jaxpr) -> Hashable:
 
     def operand(atom) -> Hashable:
         if isinstance(atom, jcore.Literal):
-            value = np.asarray(atom.val)
-            return value.dtype, value.shape, value.tobytes(), atom.aval
+            dtype, value = terms.held_bits(atom.val)
+            return dtype, value.shape, value.tobytes(), atom.aval
         return position[atom]
 
     equations = []
@@ -562,6 +562,9 @@ def _products(region: terms.Region) -> list:
             facts.append(set_(rules.lifted(Vec[i64](*(i64(size) for size in extent)), i64(axis))).to(
                 i64(len(region.params) - 1)))
     for index, value in enumerate(region.literals):
+        # A typed key's literal (a key a selection or a layout moves) states no number.
+        if terms.typed_key(value):
+            continue
         literal = terms.Term.literal(i64(index))
         if _power_of_two(value):
             facts.append(rules.exact_scale(literal))

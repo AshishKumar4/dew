@@ -81,7 +81,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         leaf = key(Term.leaf(args[0]))
         extent = region.extents.get(leaf)
         return Work() if extent is None else Work(
-            device_bytes=math.prod(extent) * np.dtype(region.dtypes[leaf]).itemsize)
+            device_bytes=math.prod(extent) * region.dtypes[leaf].itemsize)
     if (args := get_callable_args(node, Term.reduce)) is not None:
         return Work(operations=made(graph, args[:1], held), kernels=1.0)
     if (args := get_callable_args(node, Term.dot)) is not None:
