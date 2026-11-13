@@ -986,6 +986,47 @@ def test_a_fold_that_moves_a_test_between_groups_runs_each_test_once_in_its_new_
     assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2"]
 
 
+def test_a_fold_that_moves_times_within_the_groups_bounds_keeps_every_groups_tests_and_their_records(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A split file's cut is the one main's CI ran, stored by the durations fold (tests/test_cuts.json): a
+    fold whose times would cut the file otherwise, every group still within its bound, keeps each group's
+    tests, so the next run finds every group's green record and runs none of them (Main, 2026-11-13: 43% of
+    the plan's rows had no record, a split file's groups renamed whenever its times moved, no input changed).
+    """
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
+    (tmp_path / "tests/test_steady.py").write_text(
+        "from pathlib import Path\n"
+        + "".join(f"def test_{index}():\n"
+                  f"    with Path('runs').open('a') as runs: runs.write('{index}')\n" for index in range(3)))
+    nodes = [f"tests/test_steady.py::test_{index}" for index in range(3)]
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict(zip(nodes, [300.0, 100.0, 100.0],
+                                                                           strict=True))))
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+
+    def run() -> dict[str, list[str]]:
+        rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+        assert all(row["exitCode"] == 0 for row in rows)
+        return {row["name"]: sorted(row["tests"]) for row in rows}
+
+    groups = {"3.12:tests/test_steady.py#1/2": nodes[:1], "3.12:tests/test_steady.py#2/2": nodes[1:]}
+    assert run() == groups
+    # Main's CI timed its first test down and its last up: by its times the file cuts as [0, 1] and [2], and
+    # its groups, 50 s and 350 s, stay within half again of the target.
+    main_ci = tmp_path / ".verdict/main.json"
+    main_ci.write_text(json.dumps({"sha": base, "part": "all", "rows": [
+        {"name": "3.12:tests/test_steady.py#1/2", "exitCode": 0, "seconds": 50.0, "tests": {nodes[0]: 50.0}},
+        {"name": "3.12:tests/test_steady.py#2/2", "exitCode": 0, "seconds": 350.0,
+         "tests": {nodes[1]: 50.0, nodes[2]: 300.0}}]}))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(main_ci)])
+    assert ci.main() == 0
+    assert json.loads((tmp_path / "tests/test_cuts.json").read_text()) == {"tests/test_steady.py": [nodes[1]]}
+    commit(tmp_path, "main's CI folded")
+    (tmp_path / "runs").write_text("")
+    assert run() == groups
+    assert (tmp_path / "runs").read_text() == ""
+
+
 def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cuts_them(
         ci, tmp_path, monkeypatch, cache_worker):
     """Tests marked shared_setup with one name, on their own decorators, run in one group of their
