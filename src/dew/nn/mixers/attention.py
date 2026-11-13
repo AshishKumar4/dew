@@ -917,18 +917,21 @@ class CausalSelfAttention(nn.Module):
                    and not (not self.is_initializing() and self.is_mutable_collection(QK)))
         return metadata is not None and metadata.valid is not None and not implied
 
-    def _one_document_a_row(self, metadata: AttentionMetadata | None, causal: bool) -> bool:
-        """Whether a call's own documents are one a row with its padding after it
-        (`Coordinates.max_segments` 1, `AttentionMetadata.right_padded`), so a `causal` call alone keeps
+    def _one_document_a_row(self, metadata: AttentionMetadata | None, causal: bool, prefix,
+                            append: Append | None, decode: bool) -> bool:
+        """Whether an uncached call's own documents are one a row with its padding after it
+        (`Coordinates.max_segments` 1, `AttentionMetadata.right_padded`), so its causality alone keeps
         each real query on its row's document, as it keeps a real query off right padding
         (`_restricts_visibility`): the documents then reach no kernel, and the call takes the plain causal
         form every kernel takes (cuDNN's among them, which takes documents only as their dense mask),
-        where they asked the packed one (row 5916). A layer that sows QK-Clip's logit maxima takes them
-        under the mask, so it keeps them."""
+        where they asked the packed one (row 5916). A call that reads whole blocks drops its causality
+        for its documents (`_reads_whole_blocks`), and a layer that sows QK-Clip's logit maxima takes them
+        under the mask, so both keep them."""
         laid = None if metadata is None else metadata.coordinates
         sowing = not self.is_initializing() and self.is_mutable_collection(QK)
-        return (causal and laid is not None and laid.max_segments == 1 and laid.right_padded
-                and laid.forks is None and not sowing)
+        return (causal and not decode and laid is not None and laid.max_segments == 1 and laid.right_padded
+                and laid.forks is None and not sowing
+                and not self._reads_whole_blocks(metadata, prefix, append, decode))
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL, train: bool = False):
@@ -1294,7 +1297,8 @@ class CausalSelfAttention(nn.Module):
             (query, key, value, history, key_places, mask, starts, cursor, documents, causal,
              window) = self._appended(query, key, value, positions, places, append, kv_store, segment_ids,
                                       attention_metadata, (causal, window))
-        elif segment_ids is not None and not self._one_document_a_row(attention_metadata, causal):
+        elif segment_ids is not None and not self._one_document_a_row(attention_metadata, causal, prefix,
+                                                                      append, decode):
             # Attention stays inside each packed document. The ids travel to
             # the kernel beside the causal flag and the window: splash compares
             # them per block, and every other kernel builds the document mask
