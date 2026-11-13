@@ -577,26 +577,31 @@ on a GPU or a TPU runs it by default, where its cell's declared old route does n
 @dataclasses.dataclass(frozen=True)
 class Timed:
     """The shapes a kind of call's declared receipts timed (`DECLARED`): its queries and keys alike from
-    `shortest` to `longest` tokens, at the head `widths` (any where None)."""
+    `shortest` to `longest` tokens, at the head `widths` and the query heads a key head serves (`groups`),
+    any where None."""
 
     shortest: int
     longest: int
     widths: tuple[int, ...] | None = None
+    groups: tuple[int, ...] | None = None
 
     def holds(self, case: AttentionCase) -> bool:
         """Whether `case` lies within these shapes."""
         return (self.shortest <= min(case.queries, case.keys) and max(case.queries, case.keys) <= self.longest
-                and (self.widths is None or case.head_dim in self.widths))
+                and (self.widths is None or case.head_dim in self.widths)
+                and (self.groups is None or case.heads // case.kv_heads in self.groups))
 
 
 MEASURED: dict[tuple[str | None, CallKind], Timed] = {
     **{(family, CallKind.of(jnp.bfloat16)): Timed(0, 32768) for family in ('mma.sync', 'wgmma')},
     **{(family, CallKind.of(jnp.float32)): Timed(0, 1024) for family in ('mma.sync', 'wgmma')},
-    ('tcgen05', CallKind.of(jnp.bfloat16)): Timed(4096, 16384, (128, 256)),
+    ('tcgen05', CallKind.of(jnp.bfloat16)): Timed(256, 32768, (64, 128, 256), (4,)),
 }
 """The shapes each instruction family's DECLARED receipts hold for a kind of call; a call outside them is a
-cell none declares (`AttentionCase.cell`). On tcgen05 a 16-bit call's: from 4096 to 16384 tokens at widths
-128 and 256, cuDNN against the template at Qwen 3.5's and Qwen3-8B's attention (`DECLARED`). Elsewhere a
+cell none declares (`AttentionCase.cell`). On tcgen05 a 16-bit call's: from 256 to 32768 tokens at widths
+64, 128 and 256, four query heads a key head (8/2, 16/4 and 32/8 timed), cuDNN against the template causal,
+its forward and training step (`DECLARED`); 128 tokens waits for the grid's other rounds, its margins 1.09 to
+1.60 against five-round receipts' spread of up to 1.33. Elsewhere a
 16-bit call's: up to 32768 tokens, from FlashAttention against the template from
 1024 to 32768 tokens at widths 64 and 128, causal and full, its forward and training step, FlashAttention
 faster at every one on an A100 and a GH200 (M-ET-51: W126-a100, W126-sm90), and at width 256 on an RTX PRO
@@ -632,8 +637,15 @@ DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] =
                      "parts faster than xla's for a call no derivative is taken of where `template_infers` "
                      "(M-ET-16, W18-gh200-1)"),
     ('tcgen05', CallKind.of(jnp.bfloat16)): (
-        CUDNN, "cuDNN's fused attention measured faster than the template on a B200 (CUPTI, five rounds, "
-                 "lab-b200-20261113-cudnn-rows against lab-b200-20261113-rung, -att4b and -20261112-fix): "
+        CUDNN, "cuDNN's fused attention measured faster than the template on a B200 at every shape timed: "
+                 "lab-b200-20261113-grid2 (CUPTI, the template's round 0 against cuDNN's five), causal bf16 "
+                 "forwards and training steps at 128 to 32768 tokens, widths 64, 128 and 256, heads 8/2, "
+                 "16/4 and 32/8: cuDNN faster at all 105 cells, by 1.85 times or more from 256 tokens (the "
+                 "template's training 9.15 times at 1 x 32768 8/2 d128). Three cells are no timed win: "
+                 "the training at 1 x 32768 32/8 d128, 16/4 d256 and 32/8 d256, template: did not complete, "
+                 "row 5671 (it wedged at the first), cuDNN the one measured route that runs there, re-timed "
+                 "once the stall is fixed. Earlier, five rounds each (lab-b200-20261113-cudnn-rows "
+                 "against -rung, -att4b and -20261112-fix): "
                  "Qwen 3.5-4B's full attention, 16 query heads over 4 of 256, causal bf16, at 1 x 12288 its "
                  "forward 0.838 against 5.015 ms and a training step's attention 4.504 against 28.60 (the "
                  "template's Triton backward, 30.33 its Mosaic one), at 2 x 4096 0.218 against 1.251 and "
