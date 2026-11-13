@@ -30,7 +30,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
 import jax
@@ -39,15 +39,16 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import _position
-from dew._records import boolean, integer, listed, record, strings, text
-from dew.batch import EXAMPLES_CONSUMED, PHASE, VALID_ROWS, Batch, Phase, padded_rows
+from dew._records import JSON, boolean, integer, integers, json_value, listed, record, strings, text
+from dew.batch import DRAWS, EXAMPLES_CONSUMED, PHASE, VALID_ROWS, Batch, Draws, Phase, padded_rows
 from dew.data import cgroups
 from dew.mesh import LayoutRefused, batch_axes
+from dew.registry import from_record, to_record
 
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from dew.data.mixing import CorpusCounts
+    from dew.data.mixing import CorpusCounts, Left
     from dew.data.pipeline import DeviceStep
     from dew.data.plan import Plan
 
@@ -1349,7 +1350,7 @@ class GlobalStream:
         self._published = published
         self.ends: Ends = "never" if endless else "together"
         self._batch = batch
-        self._order = json.dumps(plan.order, sort_keys=True)
+        self._order = json.dumps(plan.spelled_order(), sort_keys=True)
         self._records = 0
         self._reads: pygrain.DatasetIterator[Batch] | None = None
         self._loading = loading
@@ -1400,11 +1401,7 @@ class GlobalStream:
     def set_state(self, state: bytes) -> None:
         saved = _position.read(state)
         if saved.plan is not None:
-            from dew.data.plan import earlier_plan
-
-            # The saved position's one translation (`earlier_plan`), then its check.
-            translated = earlier_plan(saved.plan, self._plan)
-            self.manifest_changes = self._plan.check(translated, resume=self._resume)
+            self.manifest_changes = self._plan.check(saved.plan, resume=self._resume)
         if saved.completed:
             raise ValueError(
                 f"the saved data position is {saved.records} records into a phased run "
@@ -1659,12 +1656,7 @@ class PhasedStream:
                 raise ValueError(f"the saved run finished {len(saved.completed)} phases, and this run has "
                                  f"{len(self._ends) + 1}")
             finished = self._tokens[:len(saved.completed)]
-            if saved.tokens is None and saved.completed:
-                raise ValueError(f"the saved run finished {len(saved.completed)} phases in a position "
-                                 "written before positions held the committed tokens each ended at, so "
-                                 "nothing says where they ended on this run's clock; resume it with the Dew "
-                                 "that wrote it")
-            if saved.tokens is not None and saved.tokens != finished:
+            if saved.tokens != finished:
                 # Its records end where the saved run's commits reached the phases' tokens, which a phase
                 # ending at other tokens would read on from as though the run had reached them.
                 raise ValueError(f"the saved run finished its phases at {list(saved.tokens)} committed "
@@ -1740,6 +1732,12 @@ class PhasedStream:
 
 
 class StepPhases(Forwarding):
+    CONTINUES: ClassVar[str] = "stamped"
+    """The `phases` rule a read of phases that share a corpus records in its position (docs/design/data.md,
+    the rules): a later phase continues a shared corpus from the stamped draws the run trained
+    (`_Frontier`). A position of a plan of 13, whose phases each read a corpus from its start, records
+    none, and resumes under that plan, which shares nothing (`dew.data.compile`)."""
+
     """Reads phases on the step clock one after another, each its own stream, opened at the step the
     phase before it ends: a read per share among them, cut per share where its order is (a stream batched
     by its tokens after steps that drop rows), whose records no global count places. Phase `p` reads
@@ -1751,10 +1749,20 @@ class StepPhases(Forwarding):
     resumes it as its own; a phase the run completed is refused where this run's ends it elsewhere or
     reads it otherwise. What a phase's reader read ahead of its end is never trained on: the next phase
     reads its own from its first step. Its stages (`stages`, `phase_stages`) state each phase of another
-    batch than the one before it, from its first step, as `PhasedStream`'s do."""
+    batch than the one before it, from its first step, as `PhasedStream`'s do.
+
+    A corpus phases share continues from where the earlier phase left it (`shared`, each phase's mix
+    members later phases read on, by member key, and the corpus each is): every draw of it the run trained
+    is trained once, none lost (`_Frontier`). Each batch says the draws it trains (`DRAWS`), which it reads
+    off and drops; at a boundary each such member's earliest position in the ending phase's (the mix's own,
+    or the copy a packer or shuffle replays from) is its low pull, and the next phase that reads the corpus
+    starts it there, drawing past the pulls the run trained (`dew.data.mixing.Stamping`). Its position holds
+    what it carries to later phases (`carried`) and the draws trained in the phase it stands in
+    (`trained`), each empty in a position saved before phases shared corpora."""
 
     def __init__(self, readers: Sequence[Callable[[], Iterator[Batch]]], ends: Sequence[int | None], *,
-                 batches: Sequence[int], opened: Callable[[int], None] = lambda phase: None):
+                 batches: Sequence[int], opened: Callable[[int], None] = lambda phase: None,
+                 shared: Sequence[Mapping[str, str]] = ()):
         if len(readers) != len(ends) or len(batches) != len(ends):
             raise ValueError(f"phases need one end and one batch each: {len(readers)} phases, {len(ends)} "
                              f"ends, {len(batches)} batches")
@@ -1770,6 +1778,11 @@ class StepPhases(Forwarding):
         self._steps = 0
         self._current: int | None = None
         self._source: Iterator[Batch] | None = None
+        self._shared = [dict(members) for members in shared] or [{} for _ in readers]
+        # By corpus, each mix read's position of it as the phase before left it, its low pull and the pulls
+        # past it the run trained; and the draws trained by mix read and member in the phase it stands in.
+        self._carried: dict[str, list[Left]] = {}
+        self._trained: dict[tuple[str, str], _Frontier] = {}
 
     def __iter__(self) -> Iterator[Batch]:
         return self
@@ -1779,23 +1792,84 @@ class StepPhases(Forwarding):
             self._readers[phase] = self._make[phase]()
         return self._readers[phase]
 
-    def _stream(self, phase: int) -> Iterator[Batch]:
-        """Phase `phase`'s reader, read from here on, the one read before it closed."""
+    def _stream(self, phase: int, *, carry: bool = True) -> Iterator[Batch]:
+        """Phase `phase`'s reader, read from here on, the one read before it closed: the corpora the phase
+        before left that it reads on carried into it (`carry`; a restore's own position holds them)."""
         if phase != self._current:
             if self._current is not None:
                 closing = self._readers.pop(self._current)
+                self._carry_from(self._current)
                 if isinstance(closing, Closeable):
                     closing.close()
             self._source, self._current = self._reader(phase), phase
+            if carry:
+                self._carry_into(phase, self._source)
+                self._started(phase, self._source)
             self._opened(phase)
         assert self._source is not None
         return self._source
 
     def __next__(self) -> Batch:
         phase = phase_at(self._ends, self._steps)
-        batch = next(self._stream(phase))
+        batch = dict(next(self._stream(phase)))
         self._steps += 1
+        draws = batch.pop(DRAWS, None)
+        if self._shared[phase]:
+            if not isinstance(draws, Draws):
+                raise ValueError(f"phase {phase}'s batch holds no draws ({DRAWS!r}), which the phase "
+                                 "after it continues its shared corpora from: a host step that rebuilds "
+                                 "batches keeps the field")
+            for node, member, pull, position in draws.draws:
+                frontier = self._trained.get((node, member))
+                if frontier is None:
+                    raise ValueError(f"phase {phase} trained a draw of mix read {node}, which its position "
+                                     "at its start names not: read the phases that share a corpus in the "
+                                     "same loading workers")
+                frontier.add(pull, position)
         return {**batch, PHASE: Phase(phase)}
+
+    def _carry_from(self, phase: int) -> None:
+        """Each corpus phase `phase` shares with a later phase, as the run left it (`_Frontier.left`), by mix
+        read in the order the phase's position named them, carried to the phase that reads it next
+        (`carried`)."""
+        members = self._shared[phase]
+        for member, corpus in members.items():
+            self._carried[corpus] = [frontier.left() for (_, held), frontier in self._trained.items()
+                                     if held == member]
+        self._trained.clear()
+
+    def _started(self, phase: int, reader: Iterator[Batch]) -> None:
+        """The draws phase `phase`, opening, continues each corpus it shares from (`trained`), by mix read
+        and member: each read's position of it at the start (`dew.data.mixing.mix_reads`)."""
+        from dew.data.mixing import mix_reads
+
+        members = self._shared[phase]
+        if not members:
+            return
+        if not isinstance(reader, Checkpointable):
+            raise TypeError(f"phase {phase}'s stream keeps no position, which its shared corpora "
+                            "continue from")
+        own = reader.get_state()
+        state = json_value(json.loads(own) if isinstance(own, bytes) else own, "a phase's position")
+        self._trained = {(node, member): _Frontier.started(left)
+                         for node, held in mix_reads(state, members).items() for member, left in held.items()}
+
+    def _carry_into(self, phase: int, reader: Iterator[Batch]) -> None:
+        """Phase `phase`'s reader with each corpus it shares with an earlier phase where that phase left it
+        (`dew.data.mixing.continued`)."""
+        from dew.data.mixing import continued
+
+        members = self._shared[phase]
+        if not any(corpus in self._carried for corpus in members.values()):
+            return
+        if not isinstance(reader, Checkpointable):
+            raise TypeError(f"phase {phase}'s stream keeps no position, which its shared corpora "
+                            "continue into")
+        own = reader.get_state()
+        held = json_value(json.loads(own) if isinstance(own, bytes) else own, "a phase's position")
+        state = continued(held, members, self._carried)
+        reader.set_state(json.dumps(state).encode() if isinstance(own, bytes)
+                         else record(state, "a phase's position"))
 
     def get_state(self) -> bytes:
         # The phase of the last step read: at a boundary nothing of the next phase is read yet.
@@ -1804,8 +1878,14 @@ class StepPhases(Forwarding):
         if not isinstance(stream, Checkpointable):
             raise TypeError(f"phase {phase}'s stream keeps no position")
         own = stream.get_state()
+        from dew.data.mixing import Left
+
+        carried = {corpus: [to_record(left, Left) for left in held] for corpus, held in self._carried.items()}
+        trained = [[node, member, frontier.record()] for (node, member), frontier in self._trained.items()]
+        shared = ({"phases": self.CONTINUES, "carried": carried, "trained": trained}
+                  if any(self._shared) else {})
         return json.dumps({_position.STEP_PHASES: {
-            "steps": self._steps, "phase": phase, "ends": self._ends[:phase],
+            "steps": self._steps, "phase": phase, "ends": self._ends[:phase], **shared,
             "identities": [self._identity(index) for index in range(phase + 1)],
             "position": base64.b64encode(own if isinstance(own, bytes)
                                          else json.dumps(own).encode()).decode(),
@@ -1827,8 +1907,35 @@ class StepPhases(Forwarding):
         if end is not None and steps > end:
             raise ValueError(f"the saved run has read {steps} steps, past this run's end of phase {phase} "
                              f"at {end}")
+        rule = saved.get("phases")
+        if (rule == self.CONTINUES) != any(self._shared):
+            raise ValueError(f"the saved run's phases continue a corpus they share by the phases rule "
+                             f"{rule!r}, and this run's by {self.CONTINUES if any(self._shared) else None!r} "
+                             "(docs/design/data.md, the rules): resume it by the data plan version it was "
+                             "saved under, as a run config's resume does")
         own = base64.b64decode(text(saved["position"], "the saved phase's position"))
-        stream = self._stream(phase)
+        # What a position saved before phases shared corpora holds of them: none.
+        from dew.data.mixing import Left
+
+        self._carried = {corpus: [from_record(Left, entry) for entry in listed(
+            entries, f"carried corpus {corpus}", read=json_value, what="a list of mix reads")]
+            for corpus, entries in record(saved.get("carried", {}), "carried corpora").items()}
+        self._trained = {}
+        trained = listed(saved.get("trained", []), "trained draws", read=json_value, what="a list of draws")
+        for entry in trained:
+            match entry:
+                case [str(node), str(member), dict() as frontier]:
+                    self._trained[(node, member)] = _Frontier.of(frontier)
+                case _:
+                    raise ValueError(f"a phase's trained draws are a mix read, a member and its frontier, "
+                                     f"got {entry!r}")
+        if self._current is not None and self._current != phase:
+            # The phase it read until now, left without carrying: the saved position holds what it carries.
+            closing = self._readers.pop(self._current)
+            if isinstance(closing, Closeable):
+                closing.close()
+            self._current, self._source = None, None
+        stream = self._stream(phase, carry=False)
         if not isinstance(stream, Checkpointable):
             raise TypeError(f"phase {phase}'s stream keeps no position")
         encoded = boolean(saved["encoded"], "the saved position's encoding")
@@ -1857,6 +1964,64 @@ class StepPhases(Forwarding):
                 reader.close()
         self._readers.clear()
         self._source, self._current = None, None
+
+
+@dataclasses.dataclass
+class _Frontier:
+    """Where the run stands on one member of one mix read in a phase (`StepPhases`): from `low`, the pull
+    after the last the run trained before one it did not, and the member's position there (`at`), the
+    pulls at or past it the run trained (`trained`: those an earlier phase did, or this one did out of
+    order behind a packer or a shuffle), and the member's position after each this phase trained
+    (`positions`), which moves `low` on as the run trains every pull before one."""
+
+    low: int
+    at: JSON
+    trained: set[int] = dataclasses.field(default_factory=set)
+    positions: dict[int, JSON] = dataclasses.field(default_factory=dict)
+
+    @classmethod
+    def started(cls, left: Left) -> _Frontier:
+        """The frontier of a member a phase starts at `left` (`dew.data.mixing.mix_reads`)."""
+        return cls(left.low, left.position, set(left.past))
+
+    def add(self, pull: int, position: JSON) -> None:
+        """A pull the run trained, the member's `position` after it."""
+        self.trained.add(pull)
+        self.positions[pull] = position
+        moved, at = self.low, self.low
+        while at in self.trained:
+            at += 1
+            if at - 1 in self.positions:
+                moved = at
+        if moved > self.low:
+            self.at = self.positions[moved - 1]
+            self.low = moved
+            self.trained = {held for held in self.trained if held >= moved}
+            self.positions = {held: where for held, where in self.positions.items() if held >= moved}
+
+    def left(self) -> Left:
+        """Where a phase continuing the member starts it (`dew.data.mixing.Left`)."""
+        from dew.data.mixing import Left
+
+        return Left(self.at, self.low, tuple(sorted(self.trained)))
+
+    def record(self) -> dict[str, JSON]:
+        trained: list[JSON] = [*sorted(self.trained)]
+        positions: list[JSON] = [[pull, where] for pull, where in sorted(self.positions.items())]
+        return {"low": self.low, "at": self.at, "trained": trained, "positions": positions}
+
+    @classmethod
+    def of(cls, saved: Mapping[str, JSON]) -> _Frontier:
+        positions = listed(saved["positions"], "trained positions", read=json_value, what="a list of pulls")
+        held: dict[int, JSON] = {}
+        for entry in positions:
+            match entry:
+                case [int(pull), where]:
+                    held[pull] = where
+                case _:
+                    raise ValueError(f"a trained pull's position is its pull and the position, got {entry!r}")
+        return cls(integer(saved["low"], "a frontier's low pull"), json_value(saved["at"], "its position"),
+                   set(integers(saved["trained"], "its trained pulls")), held)
 
 
 @runtime_checkable

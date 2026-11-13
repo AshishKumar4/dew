@@ -716,17 +716,32 @@ def fork_runs(metadata: AttentionMetadata, batch: int, queries: int, anchor=None
     if anchor is None:
         return runs
     first, start = (jnp.asarray(x, jnp.int32)[:, None, None] for x in anchor)
-    valid = (jnp.ones((batch, queries), bool) if coordinates.valid is None
-             else jnp.asarray(coordinates.valid, bool))
-    # Each call slot's count of the real tokens before it: the cache stores the next real one that far past
-    # `first`.
-    before = jnp.concatenate([jnp.zeros((batch, 1), jnp.int32), prefix_sum(valid, dtype=jnp.int32)], axis=1)
+    before = _stored_before(metadata, batch, queries)
     stored = jax.vmap(lambda counts, bounds: counts[bounds])(before, runs) + first[..., None]
     moved = jnp.where((stored[..., 1] > stored[..., 0])[..., None], stored, 0)
     real = (segments > 0)[:, :, None]
     cache = jnp.where(real[..., None], jnp.stack([jnp.broadcast_to(start, (batch, queries, 1)),
                                                   jnp.broadcast_to(first, (batch, queries, 1))], -1), 0)
     return jnp.concatenate([cache, moved], axis=2)
+
+
+def _stored_before(metadata: AttentionMetadata | None, batch: int, queries: int) -> jax.Array:
+    """Each call slot's count of the real tokens before it, `[B, queries + 1]`: a cached call's cache stores
+    its next real token that far past the slot its first is stored at (`fork_runs`' `anchor`)."""
+    valid = coordinates_of(metadata, batch, queries).valid
+    # A call that states no validity holds real tokens alone.
+    real = jnp.ones((batch, queries), bool) if valid is None else jnp.asarray(valid, bool)
+    return jnp.concatenate([jnp.zeros((batch, 1), jnp.int32), prefix_sum(real, dtype=jnp.int32)], axis=1)
+
+
+def fork_slots(metadata: AttentionMetadata | None, batch: int, queries: int, first) -> jax.Array:
+    """The slots `[B, queries]` a cached call's tokens are stored at, its real tokens after `first` `[B]`
+    (`fork_anchor`'s) in their order, -1 for a padding token, which no slot holds: the queries' own keys,
+    whose blocks they read whole (`scaled_dot_product_attention`'s `query_slots`)."""
+    before = _stored_before(metadata, batch, queries)
+    # A token the cache stores is one its count of real tokens passes.
+    stored = before[:, 1:] > before[:, :-1]
+    return jnp.where(stored, before[:, :-1] + jnp.asarray(first, jnp.int32)[:, None], -1)
 
 
 def intersected_runs(first, second):

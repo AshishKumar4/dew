@@ -538,7 +538,7 @@
    "lane": "Training"
   },
   "tests/test_samplers.py": {
-   "comparisons": 9,
+   "comparisons": 8,
    "lane": "Models, Serving & RL"
   },
   "tests/test_sd3_source.py": {

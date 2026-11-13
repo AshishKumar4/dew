@@ -77,6 +77,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     layouts,
     loads_parts,
     most_consumers,
+    placed_draws,
     query_rows,
     reducing,
     refused,
@@ -965,7 +966,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                                queries=queries if padded_queries > queries else None,
                                walked_keys=padded_keys if padded_keys > spans.keys else None)
         launch = functools.partial(_launch_backward, spec=spec, accurate=self.accurate, tiles=config,
-                                   family=family, interpret=interpret, drop=drop, rounded=self.rounded,
+                                   family=family, interpret=interpret,
+                                   drop=placed_draws(drop, padded_queries, padded_keys), rounded=self.rounded,
                                    registered=self.registered(query, value, score_params, drop, config))
         return gradients(launch, query, key, value, spans, hooks, dout, residuals,
                          block=_block(config), scale=self.scale, rounded=self.rounded), None

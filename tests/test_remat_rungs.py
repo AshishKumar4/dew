@@ -38,16 +38,19 @@ def _call(model, variables, inputs, **apply) -> jax.Array:
     return model.apply(variables, *inputs, **apply)
 
 
-def _saved(model, variables, inputs, **apply) -> int:
-    """The device bytes `model`'s forward keeps for its backward: the residuals its linearization holds
-    (`jax.linearize`) in device memory, traced abstractly. A remat rung recomputes what it does not keep
-    and an offloading one holds it on the host, so a stronger rung keeps fewer."""
-    def forward(params):
-        return _call(model, {**variables, "params": params}, inputs, **apply)
-
-    kept = jax.eval_shape(lambda params: jax.linearize(forward, params)[1], variables["params"])
+def _kept(forward, params) -> int:
+    """The device bytes `forward` keeps of `params` for its backward: the residuals its linearization
+    holds (`jax.linearize`) in device memory, traced abstractly."""
+    kept = jax.eval_shape(lambda params: jax.linearize(forward, params)[1], params)
     return sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(kept)
                if jax.typeof(leaf).memory_space == jax.memory.Space.Device)
+
+
+def _saved(model, variables, inputs, **apply) -> int:
+    """The device bytes `model`'s forward keeps for its backward (`_kept`). A remat rung recomputes what
+    it does not keep and an offloading one holds it on the host, so a stronger rung keeps fewer."""
+    return _kept(lambda params: _call(model, {**variables, "params": params}, inputs, **apply),
+                 variables["params"])
 
 
 def _stepped(model, variables, inputs, **apply) -> dict:
@@ -385,6 +388,40 @@ def test_an_architectures_top_rung_steps_its_forward_as_it_does(case):
 @pytest.mark.parametrize("case", COVERED, ids=[case.name for case in COVERED])
 def test_a_covering_architectures_top_rung_steps_its_gradient_as_it_does(case):
     _steps_its_gradient(case.name, *_built(case))
+
+
+@pytest.mark.parametrize("kind", ["kimi_delta_attention", "mamba", "mamba2", "gated_delta_net"])
+def test_each_residual_a_recurrent_mixer_names_is_one_a_policy_keeps(kind):
+    """A decoder skips the remat rungs that keep none of its mixers' names (`MixerBase.marks`), so a kind
+    may name only what its layer marks: under `jax.checkpoint` a policy saving each name alone keeps more
+    device bytes for a tiny decoder's backward (`_kept`) than a policy saving nothing. A recurrence's
+    output is both its 'context' and its 'scan', either of which keeps it. A delta rule's decay and
+    inverse are its port's (`row_names_port`, interpreted off a GPU), named within its rule's declared
+    span (`derivatives.declared_derivative`), whose saved residuals are the span's outputs."""
+    from port_support import row_names_port
+    from test_mixers import KIND_FIELDS, tiny
+
+    from dew.nn.backbones.decoder_block import RematPolicy
+    from dew.registry import mixers
+
+    fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
+    mixer = mixers.build(kind, **fields)
+    model = tiny(mixer=mixer, max_seq_len=64, **overrides)
+    tokens = jax.random.randint(jax.random.key(3), (1, 64), 0, model.vocab_size)
+    variables = model.init(jax.random.key(4), tokens)
+
+    def forward(params):
+        with row_names_port("gated_delta_rule", "fla"):
+            return model.apply({**variables, "params": params}, tokens)
+
+    def kept(names: tuple[str, ...]) -> int:
+        policy = RematPolicy(save=names).checkpoint_policy()
+        return _kept(jax.checkpoint(forward, policy=policy), variables["params"])
+
+    nothing, names = kept(()), mixer.marks()
+    assert names
+    held = {name: kept((name,)) for name in names}
+    assert all(bytes_ > nothing for bytes_ in held.values()), (nothing, held)
 
 
 def test_the_gradient_covering_names_tested_models():

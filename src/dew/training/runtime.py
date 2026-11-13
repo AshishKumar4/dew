@@ -34,6 +34,7 @@ from dew._devices import (
     flags_set,
     preallocate_gpu_pool,
     refuse_cpu_only_jax,
+    refuse_unsafe_cublas,
     xla_flag,
 )
 from dew._logging import configure as configure_logging
@@ -137,13 +138,15 @@ def ready_process() -> None:
     (`dew._logging.configure`), the persistent compilation cache under the user's cache directory
     (`dew._cache.persist_compilations`), which a run's own directory, a pool whose processes do not
     share it, or JAX_ENABLE_COMPILATION_CACHE=false leaves alone, and the refusal of a machine with
-    an NVIDIA GPU whose JAX opened with none (`dew._devices.refuse_cpu_only_jax`), which
-    opens the backend, so the cache's flags come first. `prepare_process` readies the process once
+    an NVIDIA GPU whose JAX opened with none (`dew._devices.refuse_cpu_only_jax`) and of a GPU holding
+    tensor memory under a cuBLAS that frees it twice (`dew._devices.refuse_unsafe_cublas`), which open the
+    backend, so the cache's flags come first. `prepare_process` readies the process once
     its flags are set and its pool joined, and `Trainer.fit` readies one no `prepare_process` did;
     each step is idempotent."""
     configure_logging()
     persist_compilations()
     refuse_cpu_only_jax()
+    refuse_unsafe_cublas()
 
 
 def _set_environment(wandb: Wandb | None, xla_flags: str | None,

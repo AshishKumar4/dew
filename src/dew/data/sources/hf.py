@@ -99,7 +99,7 @@ class HF(Dataset):
         rows = arrow_rows(self.dataset)
         return tuple(rows[index] for index in range(len(rows))) if read == "memory" else rows
 
-    def manifest(self, version: int) -> ShardManifest:
+    def manifest(self) -> ShardManifest:
         from datasets import Dataset as Arrow
 
         if isinstance(self.dataset, Arrow):
