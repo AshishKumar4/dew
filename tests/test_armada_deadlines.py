@@ -261,6 +261,8 @@ def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci,
     assert (aborted["exitCode"], aborted.get("signal")) == (1, 6)
     [kept] = aborted["artifacts"]
     where = tmp_path / "artifacts" / kept
-    assert "before the abort" in (where / "output.txt").read_text()
+    # pytest's own output whole (its capture of the test's prints dies with the process): faulthandler's stacks.
+    output = (where / "output.txt").read_text()
+    assert "Fatal Python error: Aborted" in output and "test_any.py" in output
     stacks = (where / "native-stacks.txt").read_text()
     assert "ended by signal 6" in stacks and "abort" in stacks
