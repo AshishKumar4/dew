@@ -322,6 +322,49 @@ def test_restore_best_without_checkpoints_returns_the_best_state_it_held(tmp_pat
             np.testing.assert_array_equal(leaf_values(left), leaf_values(right))
 
 
+def test_a_run_ranks_and_stops_by_its_validation_loss_by_name_with_no_metric(tmp_path):
+    """A run that validates with no metric records the objective's validation loss (`val/loss`), which
+    `best=` and a `Plateau` name as they name a metric, lower better: ranked and stopped by it, the run
+    ends two evaluations past its best, the earlier state that its default ranking keeps, and restores
+    it. An objective defining no validation loss refuses that selector before it trains."""
+    run = trainer(tmp_path / 'named')
+    restored = run.fit(data(), steps=8, log_every=1, eval_every=1, checkpoint_every=1, best='val/loss',
+                       stop=Plateau('val/loss', evals=2), restore_best=True)
+    run.checkpoints.wait()
+    default = trainer(tmp_path / 'default').fit(data(), steps=8, log_every=1, eval_every=1,
+                                                checkpoint_every=1, restore_best=True)
+    assert int(restored.step) == int(default.step) == run.checkpoints.resolve('best:val/loss') == 3
+    assert run.checkpoints.latest == 5
+    for left, right in zip(jax.tree.leaves(restored.variables), jax.tree.leaves(default.variables),
+                           strict=True):
+        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+
+    class Unscored(Overfit):
+        validation_loss_refusal = "it scores held-out rows another way"
+
+    with pytest.raises(ValueError):
+        Trainer(Unscored(), optax.sgd(0.1), key=jax.random.key(0)).fit(
+            data(), steps=2, log_every=1, eval_every=1, best='val/loss')
+
+
+def test_an_episodic_split_declares_no_loss_beside_a_split_of_batches():
+    """A split scored by its episodes reads no batches, so it records no loss: beside a split of batches,
+    which declares its loss (`SplitLoss`), it declares its episodes' scores alone, and a selector naming its
+    loss is refused, never ranking a score no evaluation records."""
+    from dew.training import EvalSuite
+    from dew.training._fit import declarations
+    from dew.training.evaluation import Episodes, SplitLoss
+
+    flown = Episodes(lambda variables, key: {"return": 1.0}, {"return": Shown(better="higher")})
+    declared = declarations({"val": EvalSuite(data().val, (), 1), "play": EvalSuite(flown, flown.metrics, 1)},
+                            (), (), loss=True)
+    assert [type(metric) for metric in declared["val"]] == [SplitLoss]
+    assert not any(isinstance(metric, SplitLoss) for metric in declared["play"])
+    assert Best("val/loss").resolved(declared).mode == "min"
+    with pytest.raises(ValueError):
+        Best("play/loss").resolved(declared)
+
+
 def test_restore_best_without_checkpoints_ranks_by_the_training_loss_without_validation(tmp_path):
     """Without validation a run ranks its states by the training loss, as a checkpointed run's best
     does, and returns the state that ranked best though a later step ended the run."""

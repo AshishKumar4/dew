@@ -82,7 +82,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_block_sft.py": {
-   "comparisons": 18,
+   "comparisons": 17,
    "lane": "Models, Serving & RL"
   },
   "tests/test_capability_matrix.py": {

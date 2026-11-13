@@ -11,10 +11,12 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from dew._coordination import collective_host
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import CLOSES_WINDOW, Batch
 from dew.distributed.batches import batch_layout, batch_shardings
@@ -23,7 +25,7 @@ from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective
-from dew.state import TrainState, apart, together
+from dew.state import TrainState, apart, occupancy, together
 from dew.telemetry.instrumentation import StepFlops
 from dew.training._candidates import Stepping, candidate_for, lowered_for
 from dew.training._lowering import Lowered, routed
@@ -48,10 +50,10 @@ from dew.training.planning import (
     held_objects,
     settled,
     splits,
-    whole_step,
+    whole_step_program,
 )
 from dew.training.profiling import pgle_runs
-from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
+from dew.training.rungs import keep_rung, plan_flops, recorded_rung
 from dew.training.transaction import Transaction, outcome
 
 if TYPE_CHECKING:
@@ -67,11 +69,11 @@ def laid_out(state: TrainState, window: int) -> TrainState:
     which the next window's first microbatch replaces unread) for the step to lay out its own
     (`builds_window`), its count of accepted microbatches read in the new window's (`microstep`, whose
     windows and steps the transaction counts by it: the same updates and steps). A state inside an update
-    is refused another window: its open window is laid out for the one it pools."""
+    is refused another window: its open window is laid out for the one it pools (`occupancy`)."""
     size = int(state.window_size)
     if size == window:
         return state
-    if int(state.microstep) % size:
+    if int(jnp.max(occupancy(state.window))):
         raise ValueError(f"the state pools an open window of {size} microbatches, and the step it is handed "
                          f"to reads {window} an update: a step of another split begins at an update's end")
     # Counted on the host and placed as the counts were: an operation on the device arrays would compile a
@@ -283,8 +285,9 @@ class StepCompiler[L, E]:
             raise Lowered(target, *routed(lambda: lowered_for(stepping, state, batch, target, self.narrow)))
         split, unaligned = divmod(int(state.window_size), settings.accumulation)
         # A state pools its window's microbatches where it holds one part filled: the window, laid out for
-        # its split, binds it.
-        pools = state.window is not None and int(state.microstep) % int(state.window_size) != 0
+        # its split, binds it. Read on the host: a reduction on the devices compiles a program of the
+        # occupancy's placement, a restored one's another than a fresh one's, which a resume compiles anew.
+        pools = bool(np.max(collective_host(occupancy(state.window), phase="accumulation occupancy")))
         held = state.window is not None or split > 1
         # DiLoCo's replicas, once they have stepped, each count their microbatches in their split's windows,
         # which no other split reads: it binds the split, a stated other refused.
@@ -343,6 +346,8 @@ class StepCompiler[L, E]:
         # state another program's step returned, a cooldown's restored, a public caller's) is laid out for
         # this step's window first (`laid_out`).
         returned: list[jax.Array | None] = [None]
+        # A split step's whole from its microbatches' outputs, its loss as an unsplit step logs it.
+        whole = whole_step_program(self.objective)
 
         def run(current, batch, sampled: bool = False):
             # A sampled step summarizes what the run inspects (`Planned.sampled`); every other, the plan's.
@@ -379,7 +384,7 @@ class StepCompiler[L, E]:
                     outputs.append(tuple(output))
                 stepped = together(moving, frozen)
                 returned[0] = stepped.window_size
-                return (stepped, *(outputs[0] if split == 1 else whole_step(outputs)))
+                return (stepped, *(outputs[0] if split == 1 else whole(outputs)))
         return run
 
     def _planned(self, stepping: Stepping, state: TrainState, batch: Batch,
@@ -398,9 +403,8 @@ class StepCompiler[L, E]:
 
         def lower(split: int, narrow: bool, footprint: Footprint | None = None, *, derived: bool = True,
                   lowering: bool = True, floored: bool = False) -> Candidate:
-            rung = {**self.rung(), 'narrow': narrow, 'split': split}
             return candidate_for(stepping, state, batch, schedule, placement, replicated, split,
-                                 narrow, recorded_launches(recorded, rung), lowering=lowering,
+                                 narrow, lowering=lowering,
                                  capacity=capacity, footprint=footprint, derived=derived, floored=floored)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
@@ -444,7 +448,7 @@ class StepCompiler[L, E]:
         chosen = {**self.rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
-            keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
+            keep_rung(record_path, key, {**chosen, 'flops': counted})
         plan = settled(planned, probes, search, above)
         if stepping.staging.read_whole:
             # A transformation given built that kept every layer whole on every stage (`StageLocal.of`).

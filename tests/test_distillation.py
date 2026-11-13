@@ -184,6 +184,13 @@ def student_pullback(*, wide: bool):
 # --------------------------------------------------------------------------
 
 
+def means(metrics):
+    """A loss's metrics as their values: each `Ratio` its mean (`Aux.metrics`)."""
+    from dew.objectives.base import Ratio
+
+    return {name: value.mean()[0] if isinstance(value, Ratio) else value for name, value in metrics.items()}
+
+
 @pytest.mark.parametrize("kind", ["cosine", "l2"])
 def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
     """Loss and every reported term on par with the reference's own float32
@@ -201,7 +208,7 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
     @jax.jit
     def dew(params):
         loss, aux = objective.scalar_loss(params, fixture_batch(arrays), step_at())
-        return {metric: {**aux.metrics, "loss": loss}[metric] for metric in named}
+        return {metric: {**means(aux.metrics), "loss": loss}[metric] for metric in named}
 
     @as_given
     def reference(params, dtype="float32"):
@@ -241,7 +248,7 @@ def test_a_float64_distillation_computes_its_terms_in_float64(kind):
                                           temperature=META["temperature"], beta=META["beta"],
                                           features=[tuple(pair) for pair in META["pairs"]], feature_loss=kind)
         loss, aux = jax.jit(objective.scalar_loss)(wide, fixture_batch(arrays), step_at())
-        ran = {metric: np.float64({**aux.metrics, "loss": loss}[metric]) for metric in named}
+        ran = {metric: np.float64({**means(aux.metrics), "loss": loss}[metric]) for metric in named}
         outputs = student_forward(wide=True)(wide["params"], ids)
         logits, states = dew_outputs(teacher_model, wide[TEACHER], ids, [layer for layer, _ in META["pairs"]])
         held = (np.asarray(logits), np.stack([np.asarray(state) for state in states]))
@@ -552,7 +559,7 @@ def test_the_student_tree_is_what_a_plain_student_run_reads():
     batch = fixture_batch(arrays)
     _, aux = objective.scalar_loss(params, batch, step_at())
     loss, _ = objective.student.scalar_loss(own, batch, step_at())
-    assert float(loss) == pytest.approx(float(aux.metrics["ce"]), rel=1e-6)
+    assert float(loss) == pytest.approx(float(aux.metrics["ce"].mean()[0]), rel=1e-6)
     assert objective.ema is None
 
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
@@ -28,9 +28,12 @@ class Accumulation:
     """Holds the microbatches pooled so far, until the optimizer commits them.
 
     It keeps only sums, with no forward residuals and no Jacobians of the
-    statistics, so it can be saved in a checkpoint. `gradient` is the
-    window's from its first microbatch (`microstep % accumulation == 0`),
-    which replaces what the last window left there. `statistics` and
+    statistics, so it can be saved in a checkpoint. `fill` is the
+    microbatches it holds, int32: its occupancy, which a commit, a shortened
+    one closing a run's last window among them, empties to 0, apart from
+    the accepted-microbatch clock (`TrainState.microstep`) that objectives
+    and draws read. `gradient` is the window's from its first microbatch
+    (`fill == 0`), which replaces what the last window left there. `statistics` and
     `effects` hold their array leaves in canonical tree order, and the
     objective's traced result supplies their tree structure.
 
@@ -55,6 +58,9 @@ class Accumulation:
     batch_statistics: tuple[jax.Array, ...] | None = None
     replayed_statistics: tuple[jax.Array, ...] | None = None
     statistics_stamp: jax.Array | None = None
+    fill: jax.Array | None = None
+    """None only as a window the previous checkpoint format saved part filled is restored, whose
+    occupancy its clock states (`dew.checkpoints._held_occupancy` derives it)."""
 
     def replays(self, other: Accumulation | None) -> bool:
         """Whether this window's replay slots hold batches of the shapes `other`'s do, so a step
@@ -67,14 +73,23 @@ class Accumulation:
             for mine, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(compiled), strict=True))
 
 
-def kept_window(held: Accumulation | None, pending: Accumulation, filled: Callable[[], int] | None) -> bool:
+def occupancy(window: Accumulation | None) -> jax.Array:
+    """The microbatches `window` holds (`Accumulation.fill`), 0 where a run keeps none (a window of one
+    microbatch): where a step's microbatch takes its slot, whether it closes the window, and whether a
+    checkpoint keeps it."""
+    if window is None:
+        return jnp.zeros((), jnp.int32)
+    assert window.fill is not None, "a run's window states its occupancy (`dew.checkpoints._held_occupancy`)"
+    return window.fill
+
+
+def kept_window(held: Accumulation | None, pending: Accumulation, read: bool) -> bool:
     """Whether a state's window (`held`) is the one a step compiled for `pending`'s shapes reads.
-    One that replays other shapes is replaced by an empty one where `filled`, the microbatches it
-    holds, read only then, is 0 or unread (None, a step's shapes alone), and refused while it holds
-    any."""
+    One that replays other shapes is replaced by an empty one where its `fill`, read only then (`read`,
+    not for a step's shapes alone), is 0 in every group, and refused while it holds any."""
     if held is None or held.replays(pending):
         return held is not None
-    if filled is not None and (count := filled()):
+    if read and held.fill is not None and (count := int(jnp.max(held.fill))):
         raise ValueError(f"the state's part-filled accumulation window ({count} in) holds batches of "
                          f"other shapes than the step's, which it cannot replay")
     return False
@@ -200,8 +215,9 @@ class TrainState:
 
 
 def without_empty_window(state: TrainState) -> TrainState:
-    """`state` as a checkpoint holds it: its window (`window`) left out where it holds no microbatch, at
-    an update's boundary, under DiLoCo every group's. A commit clears every field of the window but its
+    """`state` as a checkpoint holds it: its window (`window`) left out where it holds no microbatch (its
+    `fill`), at an update's boundary, a shortened one closing a run's last window among them, under
+    DiLoCo every group's. A commit clears every field of the window but its
     gradient sum and batch statistics, which the next window's first microbatch replaces unread
     (`dew.training.transaction`),
     so the empty window a resume allocates (`Trainer._initialize_accumulation`) is the same window, and
@@ -211,11 +227,9 @@ def without_empty_window(state: TrainState) -> TrainState:
         return state
     from dew._coordination import collective_host
 
-    size = int(state.window_size)
-    # The groups' clocks are stacked over the groups, which a pool's processes split.
-    clocks = collective_host(state.microstep if state.inner is None else state.inner.microstep,
-                             phase="checkpoint window")
-    return state.with_window(None) if int(jnp.max(jnp.asarray(clocks) % size)) == 0 else state
+    # The groups' windows are stacked over the groups, which a pool's processes split.
+    filled = collective_host(occupancy(state.window), phase="checkpoint window")
+    return state.with_window(None) if int(jnp.max(jnp.asarray(filled))) == 0 else state
 
 
 CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)

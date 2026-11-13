@@ -10,12 +10,16 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - Dew requires optax 0.2.8 or later (was 0.2.6): Muon iterates Newton-Schulz in Dew's own form, on the matrices
   as they are stored (no transposes), held to optax's iteration as its oracle; its layout, shape scalings,
   coefficient presets and preconditionings (AOL, Schatten), which 0.2.8 first ships, are optax's.
+
+- Dew requires its JAX build 0.12.0.1.post85 (Python alone; the CUDA and PJRT plugins stay post81's): the
+  GPU interpreter checks a barrier wait that names its phase at its waits alone, so consumers that take
+  alternate tiles of one ring over several rotations, warps among them, are checked rather than refused.
+
 - `dew.optim_schedules` holds a solver's learning rate as operands of its state: `ScheduleBase`, `RateState`
   and `ProgressState`, `scheduled_solver`, `rates_of`, `with_rates`, `with_horizons`, `learning_rate`,
   `held_rates`, `scaled_rates`, `settable_rates`, `schedule_states`, `reclocked` and `stepped_rate` are
   imported from there, where `dew.optim` held them; the schedule kinds (`Cosine`, `Linear`, `Power`,
   `OneCycle`, `Exponential`) and `OptimConfig` stay in `dew.optim`.
-
 - Dew requires its JAX build 0.12.0.1.post84 (Python alone; the CUDA and PJRT plugins stay post81's): the
   toolkit's ring waits name their phase, so the interpreter checks two consumers that take alternate tiles
   of one ring; a tcgen05 pair's step block over a partial depth lowers; the lowering cache keys a program

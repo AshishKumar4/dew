@@ -53,7 +53,7 @@ def test_assistant_token_accuracy_is_trls_count_over_uneven_batches():
         assert int(np.sum(scores.correct * scores.weights)) == int(reference[f"{index}/correct"])
         assert int(np.sum(scores.weights)) == int(reference[f"{index}/total"])
         _, aux = objective.loss(variables, batch, step)
-        np.testing.assert_allclose(float(aux.metrics["token_accuracy"]),
+        np.testing.assert_allclose(float(aux.metrics["token_accuracy"].mean()[0]),
                                    int(reference[f"{index}/correct"]) / int(reference[f"{index}/total"]),
                                    rtol=1e-6)
         partials.append(metric(scores, batch))

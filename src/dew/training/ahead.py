@@ -1330,7 +1330,7 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     from dew.distributed.placement import placed_shapes
     from dew.state import apart, together
     from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest
-    from dew.training.planning import whole_step
+    from dew.training.planning import whole_step_program
 
     candidate, split = planned.candidate, planned.split
     placed = placed_shapes(start.abstract, start.shardings)
@@ -1344,7 +1344,7 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
         for step in steps:
             moving, loss, aux, finite, accepted, committed = shapes_of(step.out_info)
             if split > 1:
-                loss, aux, finite, accepted, committed = whole_step(
+                loss, aux, finite, accepted, committed = whole_step_program(trainer.objective)(
                     [(loss, aux, finite, accepted, committed)] * split)
             book = book_shapes(loss)
             counted = bookkeep(*booked(book, book, loss, finite, committed, aux or {}))

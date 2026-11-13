@@ -234,6 +234,13 @@ class _PerShare(Forwarding):
         owns the iterator states it, as the global reader does."""
         return self._stop_seconds
 
+    @property
+    def in_process(self) -> bool:
+        """Whether it reads in the training process, its order its workers' count's and that count none
+        (its plan's topology, row 5852): a run states its workers (`.workers(n)`) or reads `.elastic()`."""
+        topology = self._plan.topology
+        return not topology.get("elastic") and topology.get("workers") == 0
+
     def __init__(
         self,
         open_reader: Callable[[], pygrain.DatasetIterator[Batch]],
