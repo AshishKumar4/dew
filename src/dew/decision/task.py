@@ -24,7 +24,7 @@ from PIL import Image
 from dew import _records
 from dew._files import write_atomically
 from dew._records import JSON, json_value, record
-from dew.batch import Batch, Variables
+from dew.batch import Batch, Coordinates, Variables
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.mixing import CorpusCounts
@@ -1746,7 +1746,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
     questions: dict[str, Any] = {field.name: array(field.name) if field.when == "always"
                                  else given(field.name) for field in QUESTION_FIELDS}
     declared = batch.get("tokens_coordinates")
-    if declared is not None and declared.max_segments is not None:
+    if isinstance(declared, Coordinates):
         max_segments = declared.max_segments
     return DecisionInputs(tokens=array("tokens"), segments=array("segments"), **questions,
                           positions=array("positions"), slots=given("slots"),
