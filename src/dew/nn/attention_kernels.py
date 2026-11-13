@@ -668,13 +668,13 @@ DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] =
                      "(M-ET-16, W18-gh200-1)"),
     ('tcgen05', CallKind.of(jnp.bfloat16)): (
         CUDNN, "cuDNN's fused attention measured faster than the template on a B200 at every shape timed: "
-                 "lab-b200-20261113-grid2 (CUPTI, the template's round 0 against cuDNN's five), causal bf16 "
+                 "ET-GRID2-b200 (CUPTI, the template's round 0 against cuDNN's five), causal bf16 "
                  "forwards and training steps at 128 to 32768 tokens, widths 64, 128 and 256, heads 8/2, "
                  "16/4 and 32/8: cuDNN faster at all 105 cells, by 1.85 times or more from 256 tokens (the "
                  "template's training 9.15 times at 1 x 32768 8/2 d128). Three cells are no timed win: "
                  "the training at 1 x 32768 32/8 d128, 16/4 d256 and 32/8 d256, template: did not complete, "
                  "row 5671 (it wedged at the first), cuDNN the one measured route that runs there, re-timed "
-                 "once the stall is fixed. Earlier, five rounds each (lab-b200-20261113-cudnn-rows "
+                 "once the stall is fixed. Earlier, five rounds each (ET-CUDNNROWS-b200 "
                  "against -rung, -att4b and -20261112-fix): "
                  "Qwen 3.5-4B's full attention, 16 query heads over 4 of 256, causal bf16, at 1 x 12288 its "
                  "forward 0.838 against 5.015 ms and a training step's attention 4.504 against 28.60 (the "
@@ -683,14 +683,14 @@ DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] =
                  "Qwen3-8B's, 32 over 8 of 128, 2 x 4096, 0.284 against 0.911 and 1.136 against 7.626, and "
                  "1 x 16384 its forward 1.411 against 4.212. A call of packed documents runs cuDNN's "
                  "packed sequences (`attention._cudnn_packed`), faster than the template at every cell "
-                 "timed: lab-b200-20261113-packed, Qwen3.5-4B's decision call, 16/4 d256 causal bf16, 12288 "
+                 "timed: ET-PACKED-b200, Qwen3.5-4B's decision call, 16/4 d256 causal bf16, 12288 "
                  "tokens a row (CUPTI, four rounds or five), one document a row its training 5.071 against "
                  "30.033 ms at one row and 19.222 against 116.469 at four, its forward 1.197 against 5.613 "
                  "and 3.115 against 19.837; twelve documents a row its training 1.510 against 4.841 and "
                  "5.133 against 16.909, its forward 0.249 against 1.035 and 0.724 against 3.338; its "
                  "backward's workspace B·H·S²·4 bytes, 9.59 GiB a row's call (temp 38.35 GiB at four rows, "
                  "plain cuDNN's 2.26), the whole 4B step's peak 95.3 GiB against the template's 61.4 at four "
-                 "rows (lab-b200-20261113-step85); rows 4839 and 5368 retire it"),
+                 "rows (LF-STEP85-b200); rows 4839 and 5368 retire it"),
     ('mma.sync', CallKind.of(jnp.bfloat16)): (
         FLASH, "FlashAttention-2 measured faster than the template on an A100: a training step's attention "
                  "at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "

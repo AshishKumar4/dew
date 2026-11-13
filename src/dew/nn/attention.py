@@ -62,6 +62,7 @@ from .documents import (
     cross_document_mask,
     document_ids,
     document_offsets,
+    own_runs,
     packed_runs,
     query_order,
     with_documents,
@@ -267,10 +268,9 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
         flat = (query.reshape(rows * length, *query.shape[2:]),
                 *(x.reshape(-1, *x.shape[2:]) for x in (key, value)))
         if key_segment_ids is None:
-            # A call's own documents are its runs, whatever their ids.
-            changes = segment_ids[:, 1:] != segment_ids[:, :-1]
-            begins = jnp.concatenate([jnp.ones((rows, 1), bool), changes], axis=1)
-            offsets, own_keys = cu_seqlens(begins, rows * (max_segments + 1)), {}
+            # A call's own documents are its runs, whatever their ids (`own_runs`).
+            begins, firsts = own_runs(segment_ids, max_segments + 1)
+            offsets, own_keys = cu_seqlens(begins, rows * (max_segments + 1), firsts=firsts), {}
         else:
             # Another sequence's documents pair with the queries' by id, sequence i each side's
             # document i. FA3 takes a positive bound on the keys' lengths, which an empty key array
