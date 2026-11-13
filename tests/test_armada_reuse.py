@@ -53,9 +53,9 @@ def planned_checkout(ci, root: Path, monkeypatch, cache_worker,
 
 def test_a_plan_counts_why_each_row_it_did_not_keep_was_not_kept(ci, tmp_path, monkeypatch, cache_worker):
     """The plan's lookup counts why each row it did not keep was not, by its first pinned class's lookup: no
-    green run on these shared inputs, or an input its last run executed changed, so a train's log states its
-    reuse and no one reconstructs it after (Main, 2026-11-13: a count made hours after train 795 read the
-    cache as it stood then, not as the plan did)."""
+    green run on these shared inputs, an input its last run executed changed, or a red run, so a train's log
+    states its reuse and no one reconstructs it after (Main, 2026-11-13: a count made hours after train 795
+    read the cache as it stood then, not as the plan did)."""
     verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     rows = [(f"tests/test_{name}.py", "") for name in ("a", "b", "c")]
 
@@ -67,6 +67,11 @@ def test_a_plan_counts_why_each_row_it_did_not_keep_was_not_kept(ci, tmp_path, m
     armada_task(ci, monkeypatch, verdict)
     (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\nCHANGED = 1\n")
     assert looked_up() == (2, {"an executed input changed": 1})
+    # A red run is counted as one, never as a changed input (train 797's review, F2).
+    armada_task(ci, monkeypatch, verdict)
+    (tmp_path / "tests/test_b.py").write_text("def test_b():\n    assert False\n")
+    armada_task(ci, monkeypatch, verdict)
+    assert looked_up() == (2, {"a red run since its green one": 1})
 
 
 def test_a_run_plans_only_the_files_whose_inputs_changed_and_its_verdict_names_every_file(
