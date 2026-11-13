@@ -152,6 +152,21 @@ GPU_STEPS = {
 }
 
 
+def adam_step(objective, optimizer):
+    """A fine-tune's step over its variables and a batch: the objective's loss, its gradient and the
+    optimizer's update applied to the parameters."""
+    def step(variables, batch):
+        def loss(params):
+            at = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
+            return objective.scalar_loss({**variables, "params": params}, batch, at)[0]
+
+        params = variables["params"]
+        updates, _ = optimizer.update(jax.grad(loss)(params), optimizer.init(params), params)
+        return optax.apply_updates(params, updates)
+
+    return step
+
+
 @pytest.mark.parametrize("case", list(GPU_STEPS))
 def test_a_gpu_step_runs_the_collectives_its_layout_plans(case):
     """A fine-tune's step (its forward, backward and Adam update over the placed state, under the
@@ -172,14 +187,7 @@ def test_a_gpu_step_runs_the_collectives_its_layout_plans(case):
     rows = NamedSharding(mesh, P(report.batch_axes))
     batch = {"text": jax.ShapeDtypeStruct((BATCH, SEQ_LEN + 1), jnp.int32, sharding=rows)}
 
-    def step(variables, batch):
-        def loss(params):
-            at = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
-            return objective.scalar_loss({**variables, "params": params}, batch, at)[0]
-
-        params = variables["params"]
-        updates, _ = optimizer.update(jax.grad(loss)(params), optimizer.init(params), params)
-        return optax.apply_updates(params, updates)
+    step = adam_step(objective, optimizer)
 
     with assumed(generation), jax.set_mesh(mesh), nn.logical_axis_rules(layout.axis_rules):
         options = step_compiler_options(objective, BATCH * SEQ_LEN, frozen=False, devices=mesh.size)
@@ -217,14 +225,7 @@ def test_a_gpu_step_over_fsdp_combines_its_parameter_gathers_a_layer_at_a_time()
     rows = NamedSharding(mesh, P(layout.validate(mesh, placed, capacity=GPU_BYTES).batch_axes))
     batch = {"text": jax.ShapeDtypeStruct((BATCH, SEQ_LEN + 1), jnp.int32, sharding=rows)}
 
-    def step(variables, batch):
-        def loss(params):
-            at = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
-            return objective.scalar_loss({**variables, "params": params}, batch, at)[0]
-
-        params = variables["params"]
-        updates, _ = optimizer.update(jax.grad(loss)(params), optimizer.init(params), params)
-        return optax.apply_updates(params, updates)
+    step = adam_step(objective, optimizer)
 
     layer = gathered_layer_bytes(objective, placed)
     assert layer is not None
