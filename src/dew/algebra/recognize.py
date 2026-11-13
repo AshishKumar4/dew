@@ -211,9 +211,13 @@ def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, places: tuple[int, ...]
 
 def _digest(value) -> Hashable:
     """A constant by its type and bits; a traced one (a value an enclosing trace closes over), which holds no
-    bits until it runs, by its type alone, as an input is."""
+    bits until it runs, by its type alone, as an input is; a typed PRNG key by its implementation and its
+    key data (`jax.random.key_data`), the bits it holds, which NumPy cannot read off the key itself."""
     if isinstance(value, jax_core.Tracer):
         return value.aval
+    dtype = getattr(value, "dtype", None)
+    if dtype is not None and jnp.issubdtype(dtype, jax.dtypes.prng_key):
+        return str(dtype), _digest(jax.random.key_data(value))
     value = np.asarray(value)
     return str(value.dtype), value.shape, hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
 

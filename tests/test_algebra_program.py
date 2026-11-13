@@ -293,6 +293,21 @@ def test_factoring_products_keeps_finite_cancellation(shared, compiled, overflow
         np.testing.assert_array_equal(rewritten(a, z, z), expected)
 
 
+def test_a_program_closing_over_a_typed_key_compiles_through_the_pass():
+    """A user's function compiled through Dew's seam (`dew.jit`, `options.program`) that closes over a typed
+    PRNG key and binds an exponential, so the pass keys its body by its constants' bits (the attention
+    family's anchor, `recognize._body_key`): it compiles, and its draw is the key's, bit for bit, as
+    `jax.jit` draws it. NumPy reads no typed key's bits, which refused every such program (row 5860)."""
+    key = jax.random.key(7)
+
+    def sampled(x):
+        return jnp.exp(x), jax.random.normal(key, x.shape)
+
+    x = jnp.linspace(-1.0, 1.0, 16)
+    _, drawn = options.program(sampled)(x)
+    np.testing.assert_array_equal(np.asarray(drawn), np.asarray(jax.jit(sampled)(x)[1]))
+
+
 def test_every_outer_program_is_rewritten_unless_its_arm_turns_the_pass_off():
     """An outer program (`options.program`) traces its function rewritten, so its lowering, its trace and its
     executable read one program; under `algebra.passes(on=False)`, which the gate opens for a reference arm,
