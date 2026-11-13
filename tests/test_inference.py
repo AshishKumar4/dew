@@ -766,6 +766,28 @@ def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
         np.asarray(objective.inputs.conditions["textcontext"].encoder.params["table"]))
 
 
+def test_a_pipeline_continues_a_conversation_its_processors_chat_template_renders(tmp_path):
+    """`dew.pipeline`'s text task given a conversation (`[{"role": "user", "content": "Hi"}]`, training.md's
+    example) renders it through its processor's chat template with the assistant's turn opened
+    (`Processor.chat`) and continues it from there, where the conversation was read as token rows and
+    refused (spec T1)."""
+    import shutil
+
+    source = tmp_path / "source"
+    shutil.copytree(Path(__file__).parent / "fixtures/hf/deepseek-v41-tiny", source)
+    config = json.loads((source / "tokenizer_config.json").read_text())
+    config["chat_template"] = ("{% for message in messages %}{{ message['role'] }}: "
+                               "{{ message['content'] }}\n{% endfor %}"
+                               "{% if add_generation_prompt %}assistant:{% endif %}")
+    (source / "tokenizer_config.json").write_text(json.dumps(config))
+    pipe = dew.pipeline(str(source))
+    messages = [{"role": "user", "content": "Hi"}]
+    prompt = np.asarray(pipe.processor.chat(messages).tokens)
+    drawn = pipe(messages, 3, key=1).host().tokens
+    assert drawn.shape == (1, prompt.shape[1] + 3)
+    np.testing.assert_array_equal(drawn[:, :prompt.shape[1]], prompt)
+
+
 def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
     """An LM run directory becomes a `TextGeneration` over the rebuilt model
     and restored weights, decoding through the run's tokenizer, budgeted by

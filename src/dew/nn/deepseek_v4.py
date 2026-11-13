@@ -41,7 +41,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import ClassVar, NamedTuple
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -55,6 +55,7 @@ from dew.nn.attention import reference_attention
 from dew.nn.attention_masks import causal_attention_mask, visibility_mask
 from dew.nn.cross_attention import context_mask
 from dew.nn.dense import Dense, DenseGeneral
+from dew.nn.documents import DocumentWindows, document_windows
 from dew.nn.fake_quant import FakeQuantizing
 from dew.nn.flops import cross_attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places
@@ -104,74 +105,6 @@ def gated_sum(kv, gate, axis: int):
     compressor), cached or uncached alike."""
     weights = jax.nn.softmax(gate.astype(at_least_fp32(gate.dtype)), axis=axis).astype(kv.dtype)
     return jnp.sum(kv * weights, axis=axis)
-
-
-class DocumentWindows(NamedTuple):
-    """A packed row's compressed windows document by document (`document_windows`): each document's
-    complete windows of `rate` of its real tokens from its first, as the document alone pools them,
-    one entry after another, `S // rate` entries a row whatever its documents hold."""
-
-    sources: jax.Array
-    """`[B, T, rate]`: the row's index of each entry's tokens."""
-    first: jax.Array
-    """`[B, T]`: the entry is its document's first window, which overlaps no earlier one."""
-    live: jax.Array
-    """`[B, T]`: the entry is a document's complete window, not a slot past the row's last."""
-    document: jax.Array
-    """`[B, T]`: the entry's document."""
-    window: jax.Array
-    """`[B, T]`: the entry's index among its document's windows."""
-    query_document: jax.Array
-    """`[B, S]`: each token's document."""
-    query_rank: jax.Array
-    """`[B, S]`: each token's rank among its document's real tokens."""
-
-    def gathered(self, x):
-        """`x` `[B, S, F]` at each entry's tokens, `[B, T, rate, F]`."""
-        batch, entries, rate = self.sources.shape
-        return gather_positions(x, self.sources.reshape(batch, entries * rate)).reshape(
-            batch, entries, rate, x.shape[-1])
-
-    def origins(self, places):
-        """Each entry's rotary origin `[B, T]`: its window's first token's place (`Coordinates.places`),
-        where its document's queries that read it rotate."""
-        held = jnp.broadcast_to(jnp.asarray(places), self.query_rank.shape)
-        return jnp.take_along_axis(held, self.sources[:, :, 0], axis=1)
-
-    def visible(self, rate: int):
-        """Which entries each query may attend, `[B, S, T]`: its own document's whose window closed at
-        or before it, by its rank there, as `entries_visible` reads a document alone."""
-        closed = self.window[:, None, :] < (self.query_rank[:, :, None] + 1) // rate
-        return self.live[:, None, :] & (self.document[:, None, :] == self.query_document[:, :, None]) & closed
-
-
-def document_windows(segments, valid, rate: int) -> DocumentWindows:
-    """The compressed windows of a row of `segments` `[B, S]`, its real tokens where `valid` marks them,
-    each document's pooled from its own first real token on (`DocumentWindows`): the row's real tokens
-    in document order, each document's in its own, each window opening at a multiple of `rate` among
-    its document's and closed by a real token of it `rate - 1` later; a document's partial last window
-    pools nothing, as the stateless path drops a row's."""
-    segments = jnp.asarray(segments)
-    batch, length = segments.shape
-    real = jnp.ones(segments.shape, bool) if valid is None else jnp.asarray(valid, bool)
-    held = jnp.where(real, segments, jnp.iinfo(segments.dtype).max)
-    order = jnp.argsort(held, axis=1, stable=True)
-    held, kept = (jnp.take_along_axis(field, order, axis=1) for field in (held, real))
-    slots = jnp.arange(length)
-    previous = jnp.concatenate([jnp.full((batch, 1), -1, held.dtype), held[:, :-1]], axis=1)
-    rank = slots - jax.lax.cummax(jnp.where(kept & (held != previous), slots, 0), axis=1)
-    last = jnp.minimum(slots + rate - 1, length - 1)
-    closes = (slots + rate - 1 < length) & kept[:, last] & (held[:, last] == held)
-    opens = kept & (rank % rate == 0) & closes
-    # The row's openings in order, an entry each; slots past its last are no window (`live`).
-    picked = jnp.argsort(~opens, axis=1, stable=True)[:, :length // rate]
-    spans = jnp.minimum(picked[:, :, None] + jnp.arange(rate), length - 1)
-    sources = jnp.take_along_axis(order, spans.reshape(batch, -1), axis=1).reshape(spans.shape)
-    opened = jnp.take_along_axis(rank, picked, axis=1)
-    # Each token's rank back at its place in the row.
-    ranks = jnp.zeros_like(rank).at[jnp.arange(batch)[:, None], order].set(rank)
-    return DocumentWindows(sources, opened == 0, jnp.take_along_axis(opens, picked, axis=1),
-                           jnp.take_along_axis(held, picked, axis=1), opened // rate, segments, ranks)
 
 
 def pool_windows(kv, gate, position_bias, rate: int, overlap: bool, windows: DocumentWindows | None = None):

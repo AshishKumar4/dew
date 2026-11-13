@@ -201,10 +201,10 @@ def pulled(forward, variables, cotangent):
     return with_gradients(lambda variables: forward(variables).astype(cotangent.dtype))(variables, cotangent)
 
 
-def packed_forward(model, tokens, *, documents=DOCUMENTS, segmented=True):
+def packed_forward(model, tokens, *, documents=DOCUMENTS):
     """The forward of the documents' `tokens` `[1, sum(documents)]` packed in one row (positions
     restarting per document, then PADDING slots whose logits the loss ignores), their segment ids
-    given, or with `segmented` False the same row and positions without them."""
+    given."""
     total = sum(documents)
     assert tokens.shape == (1, total)
     segments = [jnp.full((1, length), i + 1, jnp.int32) for i, length in enumerate(documents)]
@@ -212,22 +212,12 @@ def packed_forward(model, tokens, *, documents=DOCUMENTS, segmented=True):
     positions = jnp.concatenate([*(jnp.arange(length)[None] for length in documents),
                                  jnp.zeros((1, PADDING), jnp.int32)], axis=1)
     row = jnp.concatenate([tokens, jnp.zeros((1, PADDING), tokens.dtype)], axis=1)
-    tokens_at = (coordinates(segments=segments, positions=positions, max_segments=len(documents) + 1)
-                 if segmented else coordinates(positions=positions))
+    tokens_at = coordinates(segments=segments, positions=positions, max_segments=len(documents) + 1)
 
     def forward(variables):
         return model.apply(variables, row, coordinates=tokens_at)[:, :total]
 
     return forward
-
-
-def packed_and_alone(model, variables, tokens, cotangent):
-    """Logits and parameter gradients of the documents' `tokens` run packed (`packed_forward`) and
-    of each document run alone, the latter concatenated (`documents_alone`)."""
-    def run(forward):
-        return jax.jit(functools.partial(pulled, forward))(variables, cotangent)
-
-    return run(packed_forward(model, tokens)), run(documents_alone(model, tokens))
 
 
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
@@ -257,12 +247,10 @@ KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm"
 recurrent kinds default to their models' heads (Kimi Linear's 64 of 128, Qwen3.5's 32 of 128), whose
 per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
 
-REFUSED = {"kpool_sparse_attention"}
-"""Kinds that refuse packed rows."""
-
 SEEDS = {"attention": 64, "deepseek_v4": 256, "deepseek_v4 csa": 256, "deepseek_v4 csa2": 256,
          "deepseek_v4 hca": 256, "gated_delta_net": 512, "kimi_delta_attention": 64,
-         "lightning_attention": 64, "llama4": 128, "mamba": 32, "mamba2": 256, "mamba3": 512, "memory": 256,
+         "kpool_sparse_attention": 16, "kpool_sparse_attention notail": 16, "lightning_attention": 64,
+         "llama4": 128, "mamba": 32, "mamba2": 256, "mamba3": 512, "memory": 256,
          "mla": 64,
          "mlp": 64, "parallel": 64, "qsa_attention": 128, "short_conv": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` per kind (on armada): the
@@ -338,13 +326,6 @@ def assert_packs_as_alone(kind):
     model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=max(128, total + PADDING), **overrides)
     tokens = jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB)
     variables = model.init(jax.random.key(4), tokens)
-    cotangent = jax.random.normal(jax.random.key(5), (1, total, VOCAB))
-    if kind in REFUSED:
-        unsegmented = functools.partial(pulled, packed_forward(model, tokens, segmented=False))
-        jax.block_until_ready(jax.jit(unsegmented)(variables, cotangent))
-        with pytest.raises(ValueError):
-            packed_and_alone(model, variables, tokens, cotangent)
-        return
     assert_packed_as_alone(model, variables, f"packed {kind}", SEEDS[kind])
 
 
@@ -372,6 +353,21 @@ def test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does(c
     variables = model.init(jax.random.key(4), jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB))
     assert_packed_as_alone(model, variables, f"packed deepseek_v4 {compressor}",
                            SEEDS[f"deepseek_v4 {compressor}"])
+
+
+def test_a_packed_row_of_kpool_attention_without_tails_computes_what_its_documents_compute_alone():
+    """The k-pool layer selecting whole pools alone (`index_kpool_always_select_tail=False`): a document's
+    first queries, before its first pool completes, select nothing and read every key of their own
+    document alike, as the document alone reads its row's, so a row packing documents gives each
+    document's logits and the parameters' gradients its documents give run one at a time (check 1);
+    those queries read the whole packed row's keys alike, other documents' and the padding's among them
+    (the spec pass's review of T2)."""
+    total = sum(DOCUMENTS)
+    model = tiny(mixer=mixers.build("kpool_sparse_attention", index_kpool_always_select_tail=False),
+                 max_seq_len=max(128, total + PADDING))
+    variables = model.init(jax.random.key(4), jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB))
+    assert_packed_as_alone(model, variables, "packed kpool_sparse_attention without tails",
+                           SEEDS["kpool_sparse_attention notail"])
 
 
 def assert_packed_as_alone(model, variables, what: str, seeds: int):
@@ -421,8 +417,6 @@ def test_no_token_reaches_another_document(kind):
     adds each position's by a scatter, which a GPU's deterministic XLA (`--xla_gpu_deterministic_ops`)
     sums in an order every id in the row decides, so new ids in the first document reorder the
     second's sums though nothing crosses."""
-    if kind in REFUSED:
-        pytest.skip(f"{kind} refuses packed rows")
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
     model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=128, **overrides)
     first, second = DOCUMENTS[:2]
