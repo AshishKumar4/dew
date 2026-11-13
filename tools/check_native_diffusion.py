@@ -583,11 +583,11 @@ def regress(directory, case):
             source.save(saved)
             np.testing.assert_array_equal(bundle(saved).text_to_image()(["cat"], **options).host().images, expected)
     elif case == "negative-policy":
-        prepared = task.prepare(["cat"], key=key, steps=2)
-        encoder = source.inputs.conditions["conditioning"].encoder
-        negative = encoder.encode(source.variables["encoders"]["conditioning"],
-                                   encoder.tokenize([{"text": "", "negative": True}]))
-        expected = task(prepared.replace(unconditional={"conditioning": negative}), **options).host().images
+        # The empty negative prompt encoded as the task encodes a caller's negatives (`prepare`'s
+        # `unconditional`), the program a saved bundle encodes its own unconditional row by, so the two
+        # agree to the bit; an encoding apart compiles another program, whose sums may round apart.
+        prepared = task.prepare(["cat"], key=key, steps=2, unconditional=[{"text": "", "negative": True}])
+        expected = task(prepared, **options).host().images
         with tempfile.TemporaryDirectory(prefix="dew-native-policy-") as saved:
             source.save(saved)
             index = json.loads((Path(saved) / "model_index.json").read_text())
