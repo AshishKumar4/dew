@@ -303,4 +303,5 @@ def test_a_thread_with_no_python_state_that_aborts_keeps_its_own_native_stack(ci
     [kept] = red["artifacts"]
     # The worker's own frame, by its source line (the unwinder names a frame by its debug line where the
     # library's symbols are sparse): line 4, the worker's abort.
-    assert 'aborting.c", line 4' in (tmp_path / "artifacts" / kept).read_text().split("== native stacks", 1)[1]
+    record = (tmp_path / "artifacts" / kept).read_text()
+    assert 'aborting.c", line 4' in record.split("== native stacks", 1)[1]
