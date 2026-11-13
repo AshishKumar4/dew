@@ -411,7 +411,8 @@ class MosaicForward(_Mainloop[Tiles]):
         # common op's is the step's (`_launch_flops`).
         form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret,
                 "counts": not self.scaled,
-                "registered": self.registered(query, value, score_params, residuals, table, sources, scales)}
+                "registered": self.registered(query, value, score_params, residuals, table, sources, scales,
+                                              initial)}
         scaled = self.scaled or (self.cached(table, sources, scales) and not self.bounded)
 
         def launched():
@@ -743,13 +744,16 @@ class MosaicForward(_Mainloop[Tiles]):
         arguments = ba.arguments
         registered = self.registered(arguments["query"], arguments["value"], arguments["score_params"],
                                      arguments.get("residuals"), arguments.get("table"),
-                                     arguments.get("sources"), arguments.get("scales"))
+                                     arguments.get("sources"), arguments.get("scales"),
+                                     arguments.get("initial"))
         return registered.at(bundle_of(config, arguments["query"].dtype), config, peaks=peaks,
                              columns=columns)
 
     def registered(self, query, value, score_params, residuals, table=None, sources=None,
-                   scales=None) -> ForwardRegisters:
-        """The call's facts its launches' registers read (`ForwardRegisters`)."""
+                   scales=None, initial=None) -> ForwardRegisters:
+        """The call's facts its launches' registers read (`ForwardRegisters`): an `initial` state merges past
+        an inference walk's keys (`attention_mosaic_forward._started`), a split training walk starting from
+        it."""
         params = tuple(zip(self.score_kinds, (kept_dtype(param.dtype) for param in score_params),
                            strict=True))
         computed = query.dtype if scales is not None else value.dtype
@@ -757,7 +761,9 @@ class MosaicForward(_Mainloop[Tiles]):
                                 self._natural(query), params, self.parts,
                                 self._scales(table, sources, scales, computed), codes=scales is not None,
                                 positions=math.ceil(query.shape[1] / self.per_span)
-                                if self.form == "spans" and self.per_span > 1 else 0, per_span=self.per_span)
+                                if self.form == "spans" and self.per_span > 1 else 0, per_span=self.per_span,
+                                merged=initial is not None and residuals is not Kept.SPLIT,
+                                started=initial is not None and residuals is Kept.SPLIT)
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:

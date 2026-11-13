@@ -15,7 +15,7 @@ from generation_support import INTERPRETS
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
 
 TILE = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
 """A legal tcgen05 tile of every product `_on_tcgen05` pins (`tuning.pinned`): a CTA's 128 rows by 128
@@ -328,11 +328,11 @@ def pairs_dense_kernel_gradient_holds_check_1_on_blackwell(out_dtype, k_major):
 
 def test_a_pairs_tile_is_twice_a_ctas_and_takes_only_what_its_views_read():
     """A pair's tile (`PAIRED`, `mosaic.Transport.pairs_product`): its accumulators hold both CTAs' columns
-    (`mosaic_gpu.tile_columns`); a tile of 256 columns a CTA, past its half of one product, or of one CTA is
+    (`pricing.tile_columns`); a tile of 256 columns a CTA, past its half of one product, or of one CTA is
     none of the pair's (`mosaic_gpu.pair_takes`); and its product takes no prologue (its step views are its
     rows' and matrix's alone)."""
-    family = mosaic_gpu.family_of(PAIRED, jnp.bfloat16)
-    assert mosaic_gpu.tile_columns(PAIRED, family) == 2 * PAIRED.block_n
+    family = pricing.family_of(PAIRED, jnp.bfloat16)
+    assert pricing.tile_columns(PAIRED, family) == 2 * PAIRED.block_n
     assert mosaic_gpu.pair_takes(PAIRED, family)
     for refused in (dataclasses.replace(PAIRED, block_n=256), dataclasses.replace(PAIRED, cluster=1)):
         assert not mosaic_gpu.pair_takes(refused, family), refused

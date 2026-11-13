@@ -240,6 +240,9 @@ def mosaic_cells() -> list[Cell]:
         *cells_of(inplace.a_span_calls_one_launch_is_on_par_on_an_h100, "sm90",
                   fault=lambda name: "row 3171's packed windowed call, its dK and dV wrong and unrepeatable "
                                      "on an H100 before row 3180"),
+        *cells_of(mosaic.the_forward_runs_back_to_back_at_128_key_tiles_on_a_b200, "sm100",
+                  fault=lambda: "row 5671's wedge: a consumer's tensor-core barrier committed again before "
+                                "a lagging warp saw its phase"),
     ]
 
 

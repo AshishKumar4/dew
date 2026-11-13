@@ -45,6 +45,7 @@ from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block
 from dew.nn.kernels.templates import axes as side_axes_of, mosaic_sm100
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, scattered
+from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed, parts, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products
 from dew.nn.programs import read_by
@@ -307,7 +308,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
         parted = declared(jnp.bfloat16, precision, outputs=(jnp.float32,))
         sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
         # A prologue rewrites the rows as they are, so the rows run whole, one part: their own 16 bits.
-        hooked = grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast)
+        hooked = Hooks(prologue, axes, prologue_broadcast=broadcast)
         if (counts is not None and (prologue is None or counts[0] == 1) and _parts_launched(
                 grouped_matmul.tgmm_call(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), group_sizes,
                                          sides, tables if tabled else None, out_dtype=jnp.float32,
@@ -332,7 +333,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
         # (as the portable program's: `prologue(lhs).astype(lhs.dtype)`, then the product).
         rewrite = (prologue if prologue is None or compute == jnp.dtype(lhs.dtype)
                    else functools.partial(_in_dtype, prologue, jnp.dtype(lhs.dtype)))
-        hooks = grouped_matmul.Hooks(rewrite, axes, prologue_broadcast=broadcast)
+        hooks = Hooks(rewrite, axes, prologue_broadcast=broadcast)
         product = declared(compute, precision, outputs=(out_dtype,), operands=(lhs.dtype, rhs.dtype))
         call = grouped_matmul.tgmm_call(lhs.astype(compute), rhs.astype(compute), group_sizes, sides,
                                         tables if tabled else None, out_dtype=out_dtype,
@@ -883,7 +884,7 @@ def _gemm_call(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, 
     of which launch a call would run (`_keeps_launch`)."""
     before_sides, before_axes, before_broadcast = _launchable(prologue_arrays, prologue_axes)
     after_sides, after_axes, after_broadcast = _launchable(epilogue_arrays, epilogue_axes)
-    hooks = grouped_matmul.Hooks(prologue, before_axes, epilogue, after_axes,
+    hooks = Hooks(prologue, before_axes, epilogue, after_axes,
                                  tuple(dtype.name for dtype in dtypes) if several else None,
                                  prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast)
     product = declared(lhs.dtype, precision, outputs=summed_as or dtypes, operands=(lhs.dtype, rhs.dtype))
@@ -1112,8 +1113,8 @@ def _prologue_keeps_launch(lhs, rhs, group_sizes, prologue, prologue_arrays, pro
     product = declared(lhs.dtype, options['precision'], outputs=(out_dtype,), operands=(lhs.dtype, rhs.dtype))
     sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
     kernels = []
-    for hooks, after in ((grouped_matmul.NO_HOOKS, ()),
-                         (grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast), sides)):
+    for hooks, after in ((NO_HOOKS, ()),
+                         (Hooks(prologue, axes, prologue_broadcast=broadcast), sides)):
         call = grouped_matmul.tgmm_call(lhs, rhs.astype(lhs.dtype), sizes, after, None, out_dtype=out_dtype,
                                         hooks=hooks, interpret=interpret, promoted=product.promoted,
                                         dense=dense)
@@ -1438,7 +1439,7 @@ def _rows(arrays: tuple, axes_of: tuple, group_sizes: jax.Array, rows: int) -> t
 
 def _launchable(arrays: tuple, axes_of: tuple) -> tuple[tuple, tuple, tuple]:
     """The side operands and axes a launch takes, each dimension of one squeezed out, and each one's
-    positions of them, which the launch gives the hook back (`grouped_matmul.Hooks`)."""
+    positions of them, which the launch gives the hook back (`Hooks`)."""
     positions = tuple(tuple(i for i, axis in enumerate(axes) if axis is None) for axes in axes_of)
     squeezed = tuple(jnp.squeeze(array, where) if where else array
                      for array, where in zip(arrays, positions, strict=True))

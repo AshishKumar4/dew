@@ -1059,11 +1059,13 @@ def _model(launch: mainloop.Launch, family: mosaic.Family,
     `kernel_compile.decisions`): its stated registers (`Launch.registers`) at its consumer roles
     (`Launch.consumers`, a walk's `Tiles.walkers`), by the bundle it issues by (`Launch.family`; the solve
     launch's warpgroup MMA layout without a producer), `family` where it names none; its producer lowered as
-    its schedule lowers it (`Launch.producer`), bounded by the launch's shared-memory allocation."""
+    its schedule lowers it (`Launch.producer`), bounded by the launch's shared-memory allocation, and moving
+    registers where its plan's residency does (`Launch.resident`, `RegisterModel.moves`)."""
     facts = generation.gpu_target() if target is None else target
     with generation.assumed(facts):
         model = resources.register_model(launch.family or family, launch.consumers, launch.registers,
-                                         producer=launch.producer, shared=launch.shared, target=facts)
+                                         producer=launch.producer, shared=launch.shared, target=facts,
+                                         programs=launch.resident or 1)
     # The plan reserves an upper bound, including reduction scratch a lowering can omit.
     # `planned_failures` checks that bound; RegisterModel.shared declares an exact allocation.
     return dataclasses.replace(model, shared=None)
@@ -1083,7 +1085,7 @@ def _models(launches: tuple[mainloop.Launch, ...], family: mosaic.Family,
             raise ValueError(f"{launch.name} names incompatible launch layouts")
         combined[launch.name] = dataclasses.replace(
             previous, registers=max(previous.registers, launch.registers),
-            shared=max(previous.shared, launch.shared))
+            shared=max(previous.shared, launch.shared), resident=min(previous.resident, launch.resident))
     return {name: _model(launch, family, target) for name, launch in combined.items()}
 
 

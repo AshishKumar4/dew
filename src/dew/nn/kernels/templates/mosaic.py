@@ -128,7 +128,8 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
                             kernel_name=report.named(name, model=model), cost_estimate=cost, **clustered)
     # Its settled operands are checked where its programs read them before their wait (`waits`): a launch
     # that does not wait is ordered after the one before it, whatever it reads first.
-    return checked(built, name or family, resident, model_flops, settled if bodies.waits(interpret) else ())
+    return checked(built, name or family, resident, model_flops, settled if bodies.waits(interpret) else (),
+                   moves=model is None or model.moves)
 
 
 def _is_ref(operand) -> bool:
@@ -137,9 +138,10 @@ def _is_ref(operand) -> bool:
 
 
 def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | None = None,
-            settled: tuple[int, ...] = ()) -> Callable:
+            settled: tuple[int, ...] = (), *, moves: bool = True) -> Callable:
     """The launch `built` (`launches.kernel`, which holds each call per shard), each call traced at its
-    residency (`bodies.RESIDENT`) under the name `kernel`: a launch built once for every call of its facts
+    residency (`bodies.RESIDENT`) and moving its roles' registers where it `moves` them (`bodies.MOVES`,
+    `resources.RegisterModel.moves`) under the name `kernel`: a launch built once for every call of its facts
     checks each call's own; and refused at its trace where two of the refs it adds into in place share a shape
     and a dtype, which `stacked_zeros` makes one ref (row 3180). Its call declares `model_flops`, the model's
     share of the work its cost states (the rest its own recomputation), where given, as its custom call's
@@ -161,10 +163,11 @@ def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | 
             raise ValueError(f"{kernel} adds into two refs of one shape and dtype ({kinds}): XLA may take "
                              "their zeros for one value and pass one buffer for both (row 3180); stack them "
                              "into one ref (`stacked_zeros`)")
-        token = bodies.RESIDENT.set(resident)
+        token, moving = bodies.RESIDENT.set(resident), bodies.MOVES.set(moves)
         try:
             return built(*operands)
         finally:
+            bodies.MOVES.reset(moving)
             bodies.RESIDENT.reset(token)
 
     return launch
@@ -1441,7 +1444,8 @@ class Transport[Allocated, Opened](abc.ABC):
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                ahead: Callable | None = None, settled: tuple[int, ...] = (),
                prefetched: Callable | None = None, registers: int | None = None,
-               producer: int | None = None) -> Callable:
+               producer: int | None = None, shared: int | None = None,
+               moves: bool | None = None) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own,
         `resident` programs a multiprocessor at once (its plan's, `resources.LaunchPlan.programs`: its
         compile fits its registers to them, `compiler_params`, and its roles raise to their share), with
@@ -1457,8 +1461,10 @@ class Transport[Allocated, Opened](abc.ABC):
         of the program's wait for the launch before it, and its `prefetched` views prefetched into L2
         before it, where given (`dependent`); its consumer thread's `registers`, where the launch states
         them, its register decision recorded on the launch tracing it (`resources.register_model`, its
-        producer lowered to `producer` where the family has one, `roles`; `report.Launch.kernels`), which the
-        compile point checks its kernel against."""
+        producer lowered to `producer` where the family has one, `roles`, and its residency bounded by the
+        `shared` bytes it stages where stated; `report.Launch.kernels`), which the compile point checks its
+        kernel against; and whether its program moves registers between its roles where the launch states
+        it (`moves`; else its model decides, `resources.moves_registers`)."""
 
     def scoped(self, body, *allocations, streams, after_walks: tuple = ()):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
@@ -1959,7 +1965,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                ahead: Callable | None = None, settled: tuple[int, ...] = (),
                prefetched: Callable | None = None, registers: int | None = None,
-               producer: int | None = None) -> Callable:
+               producer: int | None = None, shared: int | None = None,
+               moves: bool | None = None) -> Callable:
         # Its programs read a table from global memory as any operand.
         del scalars
         if cluster > self.cluster:
@@ -1970,7 +1977,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                       model_flops=model_flops, resident=resident, ahead=ahead, settled=settled,
                       prefetched=prefetched,
                       model=(None if registers is None
-                             else resources.register_model(self, consumers, registers, producer=producer)),
+                             else resources.register_model(self, consumers, registers, producer=producer,
+                                                           programs=resident, shared=shared, moves=moves)),
                       # The issuer's own reductions across warps (mma.sync's column sums take the kernel's
                       # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
                       reduction_scratch=(self.reduction_scratch

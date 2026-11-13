@@ -800,7 +800,7 @@ def test_a_row_scales_gradient_reads_the_accumulator_summed_at_its_own_width(ker
 
 def test_a_kernel_gradient_of_no_rows_on_a_hopper_is_its_groups_zeros():
     """A kernel gradient contracting no rows on an H100 (a step whose experts received no tokens): its
-    selection derives no split of an empty contraction (`mosaic_gpu.split_count`, which took the least of
+    selection derives no split of an empty contraction (`pricing.split_count`, which took the least of
     no counts) and the gradient is its group's zero block."""
     lhs, rhs = jnp.ones((0, 128), jnp.bfloat16), jnp.ones((0, 128), jnp.bfloat16)
     with generation.assumed("sm90"):

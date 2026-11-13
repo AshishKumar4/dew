@@ -46,6 +46,8 @@ pytestmark = pytest.mark.kernel
 
 ON_HOPPER = pytest.mark.skipif(generation.device_generation() != "sm90",
                                reason="runs the sm90 mainloop compiled, on an H100")
+ON_BLACKWELL = pytest.mark.skipif(generation.device_generation() != "sm100",
+                                  reason="runs the sm100 mainloop compiled, on a B200")
 CALLS = {"full": {}, "causal": {"causal": True}}
 """The call forms the mainloop takes."""
 SHAPES = {"interpreted": (1, 160, 2, 1), "compiled": (2, 400, 4, 2)}
@@ -1918,6 +1920,32 @@ def the_natural_forward_is_on_par_on_an_h100(call, dtype):
 def the_forward_is_on_par_over_every_call_form_on_an_h100(form):
     """The forward over each of the template core's call forms compiled on an H100."""
     _check_call_form(form, interpret=False)
+
+
+WEDGED = attention_mosaic.Tiles(block_q=64, block_k=128, stages=2, consumers=2, family="tcgen05.chunks",
+                                relaunch_k=64, relaunch_consumers=2)
+"""The forward's config a B200 wedged at (row 5671): its consumers' tensor-core commits."""
+
+
+@ON_BLACKWELL
+def the_forward_runs_back_to_back_at_128_key_tiles_on_a_b200():
+    """The forward of Qwen3-8B's attention (2 x 4096, 32 query heads over 8, 128 wide, causal bf16) at
+    `WEDGED`, called 4,000 times back to back, every call's output bitwise its first's (each compared on the
+    device as the calls run, none waited for): a consumer whose warps stood two of its tensor-core barrier's
+    phases apart (one committed it again right behind its wait, before a lagging warp had seen the phase)
+    wedged the launch within 800 to 7,000 calls (row 5671)."""
+    rows, tokens, heads, kv_heads = 2, 4096, 32, 8
+    spans = template.spans(tokens, tokens, rows, causal=True)
+    query, key, value, _ = _drawn((rows, tokens, heads, kv_heads), jnp.bfloat16)(0)
+    with _pinned(WEDGED):
+        forward = jax.jit(lambda q, k, v: attention_mosaic.forward(q, k, v, spans, None))
+        first = forward(query, key, value)
+        differs = jax.jit(lambda seen, out, first: seen | jnp.any(out.view(jnp.uint16)
+                                                                   != first.view(jnp.uint16)))
+        seen = jnp.zeros((), bool)
+        for _ in range(4000):
+            seen = differs(seen, forward(query, key, value), first)
+    assert not bool(seen), "a call's output differed from the first's"
 
 
 @ON_HOPPER

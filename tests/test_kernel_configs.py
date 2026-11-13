@@ -25,7 +25,8 @@ from kernel_compile import Uncounted, compile_kernels, failures, gate_generation
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
 from dew.nn.kernels.templates import bundles, report, resources
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
+from dew.nn.kernels.templates.gemm.hooks import Hooks
 
 
 def rule_launches(module) -> list:
@@ -238,7 +239,7 @@ def _spilling_forward(launch, rows: int, devices):
                                    ((8, 2048, 4096), jnp.bfloat16), ((8,), jnp.int32))]
 
     def forward(x, gate, up, sizes):
-        return launch(x, gate, sizes, paired=up, hooks=grouped_matmul.Hooks(
+        return launch(x, gate, sizes, paired=up, hooks=Hooks(
             epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16", trans_rhs=False, interpret=False)
 
     return forward, shapes
@@ -441,7 +442,7 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
     # An FP8 product's operands (E4M3), its matrix K-major as Hopper's FP8 tensor cores read it (row 3620).
     x8, w8 = (jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn)
               for shape in ((rows, depth), (groups, width, depth)))
-    gmm, tgmm, hooks = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm(), grouped_matmul.Hooks
+    gmm, tgmm, hooks = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm(), Hooks
     norm = hooks(normed, (("rows",), ("depth",)))
     forward = {"interpret": False, "out_dtype": "bfloat16", "trans_rhs": False}
     backward = {"interpret": False, "out_dtype": "float32"}
@@ -547,7 +548,7 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
             configs = {(f"{name} {config}", False, None): config,
                        **{(f"{name} refused {tile}", True, None): tile for tile in refused}}
             if every_consumer_count:
-                family = mosaic_gpu.family_of(config, jnp.bfloat16)
+                family = pricing.family_of(config, jnp.bfloat16)
                 configs = {}
                 for consumers in sorted({1, min(family.consumers, mosaic_gpu.CONSUMERS)}):
                     # Each consumer keeps its share of the derived tile's rows, else the tile's rows split
@@ -593,15 +594,17 @@ def _replaced(config, **changes):
 
 
 def _model(launch, ba, config) -> resources.RegisterModel:
-    """What a launch's model decides at `config` for the call `ba`, as the gate holds it to the compiled
-    kernel (`resources.register_model`, `kernel_compile.decisions`), and the shared memory the planner
-    sized it by (`resources.shared_bytes` of `launch_of`'s allocations, including barriers), against the
-    kernel's own."""
-    family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+    """What a launch's model decides at `config` for the call `ba` at its residency (`Tiles.programs`, where
+    the launch's own model, `mosaic_gpu.gmm`'s `registers`, decides its register moves), as the gate holds
+    it to the compiled kernel (`resources.register_model`, `kernel_compile.decisions`), and the shared
+    memory the planner sized it by (`resources.shared_bytes` of `launch_of`'s allocations, including
+    barriers), against the kernel's own."""
+    family = pricing.family_of(config, ba.arguments['tokens'].dtype)
     planned = launch.launch_of(ba, config)
     shared = resources.shared_bytes(family, planned.scope(config.stages))
     return resources.register_model(family, config.warpgroups, launch.registers(ba, config), shared=shared,
-                                    producer=planned.producer)
+                                    producer=planned.producer, programs=config.programs,
+                                    moves=mosaic_gpu.MOVES)
 
 
 def _derived_and_refused(launch, ba, target) -> tuple:
@@ -1203,7 +1206,7 @@ def test_an_mx_products_tile_holds_its_block_scale_rings_in_tensor_memory_too():
                    for op, config, ba in taken)
         # Its rings' tensor memory, as the layout they are allocated in takes it: a's 8 columns and b's two
         # 128-row tiles' 16.
-        family = mosaic_gpu.family_of(wide, jnp.float8_e4m3fn)
+        family = pricing.family_of(wide, jnp.float8_e4m3fn)
         op, _, ba = taken[0]
         assert family.stream_tensor_columns(op._allocations(ba, wide, family).blocks, wide.stages) == 24
 
@@ -1448,10 +1451,27 @@ def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
         reports({}, binaries)
     module = f"//\n{PTX_MODULE}\n.visible .entry k__l0123456789_mosaic_gpu_kernel(\n)\n{{\n}}\n"
     with tempfile.TemporaryDirectory() as directory:
-        write_modules(module, directory)
+        write_modules(module, "", directory, {"k__l0123456789"})
         assert [path.name for path in Path(directory).iterdir()] == ["k__l0123456789.ptx"]
     with tempfile.TemporaryDirectory() as directory, pytest.raises(ValueError):
-        write_modules(module * 2, directory)
+        write_modules(module * 2, "", directory, {"k__l0123456789"})
+
+
+def test_the_resource_gate_reads_the_ptx_its_program_runs():
+    """A kernel certification assembled as its program lowered (`report.certified`) and its program's compile
+    assembled again (a gradient's forward, another kernel of its name and launch) has the compile's PTX as its
+    evidence; a module of no kernel of the program (a config certification refused) is none."""
+    from kernel_compile import PTX_MODULE, write_modules
+
+    def module(entry: str, body: str) -> str:
+        return f"//\n{PTX_MODULE}\n.visible .entry {entry}_mosaic_gpu_kernel(\n)\n{{\n{body}\n}}\n"
+
+    lowering = module("k__l0123456789", "certified") + module("r__l0123456789", "refused")
+    with tempfile.TemporaryDirectory() as directory:
+        write_modules(lowering, module("k__l0123456789", "ran"), directory, {"k__l0123456789"})
+        written = {path.name: path.read_text() for path in Path(directory).iterdir()}
+    assert list(written) == ["k__l0123456789.ptx"]
+    assert "ran" in written["k__l0123456789.ptx"] and "certified" not in written["k__l0123456789.ptx"]
 
 
 @COMPILES_FOR_TPU

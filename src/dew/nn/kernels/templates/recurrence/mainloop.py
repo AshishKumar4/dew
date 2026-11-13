@@ -900,11 +900,14 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
         laid = ({"grid": (programs,), "grid_names": ("programs",)} if persistent
                 else {"grid": grid, "grid_names": grid_names})
         # At its plan's residency (`resources.LaunchPlan.programs`), which its registers fit and its roles
-        # raise to the share of (two query/key programs where one held, FS-WHY3-h100).
+        # raise to the share of (two query/key programs where one held, FS-WHY3-h100), its registers and its
+        # producer's stated: its schedule moves registers where its model does (`RegisterModel.moves`), the
+        # residency its plan took one fact with the registers its program holds.
         return family.kernel(entry, out_type=out_type, **laid, consumers=consumers, interpret=call.interpret,
                              name=name, cost=_stated(work, tiles, hardware, arrays, out_type),
                              model_flops=int(work.flops * tiles),
-                             resident=found.programs if found else 1)(*arrays)
+                             resident=found.programs if found else 1, registers=registers,
+                             producer=producer)(*arrays)
 
     return launched
 

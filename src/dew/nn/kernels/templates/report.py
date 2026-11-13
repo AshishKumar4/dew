@@ -14,6 +14,7 @@ import contextvars
 import dataclasses
 import hashlib
 import importlib.util
+import json
 import logging
 import re
 import shutil
@@ -27,10 +28,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, overload
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 import tokamax
 from google.protobuf import empty_pb2
 from google.protobuf.message import DecodeError
 from google.protobuf.unknown_fields import UnknownFieldSet
+from jax._src import config as jax_config, core as jax_core, mesh as mesh_lib
+from jax._src.thunky import thunky
 from jax.extend.mlir import ir
 
 from dew import communicators
@@ -324,6 +329,232 @@ def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kerne
     spilling refuses it (`settled`), so its derivation takes the next config: a compile gate's, which
     compiles a launch apart from `compiled`, stepping as a run's compile steps (row 4727)."""
     _record((_identity(op, arguments), config), None, frozenset(kernels))
+
+
+_CERTIFYING: contextvars.ContextVar = contextvars.ContextVar("certifying_device", default=None)
+"""The device a launch's derived config is certified on (`certified`) where a block names one
+(`certifying`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Certification:
+    """A launch's config certified (`certified`): its op's name and config, whether as reverse mode runs it
+    (`pulled`), each Mosaic GPU kernel it compiled alone, by its name and launch (`launch_name`): its module
+    (the kernel hash a lowered call states, `KernelCall.config`, by which the program's compile reuses it,
+    Mosaic compiling a module once a process) and its binary, and whether its verdict was read back from the
+    picks' store (`stored`), compiled by an earlier process, rather than compiled here."""
+    op: str
+    config: Hashable
+    pulled: bool
+    kernels: dict[str, tuple[str, "Binary"]]
+    stored: bool
+
+    @property
+    def spilling(self) -> tuple["Binary", ...]:
+        """Its kernels that spill as the GPU assembles them."""
+        return tuple(binary for _, binary in self.kernels.values() if binary.frame)
+
+
+_CERTIFIED: dict[tuple, Certification] = {}
+"""Each launch certified (`certified`), by its identity, config, device and product."""
+
+_UNCERTIFIED: dict[tuple, str] = {}
+"""Each launch certification could not compile alone (`certified`), by its identity, config, device and
+product: why."""
+
+
+_PULLED: contextvars.ContextVar = contextvars.ContextVar("certified_pulled", default=False)
+"""Whether a launch traced here runs as reverse mode runs it (`pulled`)."""
+
+
+@contextlib.contextmanager
+def pulled() -> Iterator[None]:
+    """Within the block, a gradient's product is traced: a launch whose call carries its own derivative
+    (`tuning.KernelOp.CARRIES_DERIVATIVE`, the recurrence template's) is certified as reverse mode runs it,
+    its forward and its pullback (`certified`), the kernels a gradient runs where they are not its call's
+    without one (`recurrence_chunk._per_product`). A launch whose derivative is its caller's (a port's raw
+    launch inside its rule's custom VJP) is certified as it is called."""
+    token = _PULLED.set(True)
+    try:
+        yield
+    finally:
+        _PULLED.reset(token)
+
+
+@contextlib.contextmanager
+def certifying(device) -> Iterator[None]:
+    """Within the block, launches' derived configs are certified on `device` (`certified`): a compile-only
+    GPU's, which a process attached to no GPU names for the target it compiles for."""
+    token = _CERTIFYING.set(device)
+    try:
+        yield
+    finally:
+        _CERTIFYING.reset(token)
+
+
+def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple["Binary", ...]:
+    """`op`'s kernels at `config` for `arguments` that spill as the GPU assembles them, each launch compiled
+    alone before its program is: its kernels' binaries (`binaries`) as the plugin's own compiler makes them
+    for the device the process compiles for (`_certifying_device`: its own GPU, or a compile-only one a
+    block names), which the program's compile then reuses (Mosaic compiles a module once a process). A
+    launch's derivation refuses a config that spills and takes its next (`tuning`'s `_chosen`), with no
+    program retraced, where a compile's refusal retraces the whole program (`settled`): a B200's 4B step
+    stepped its attention forward 19 times that way, 42 minutes, every rewalk a step's trace. None on a
+    process compiling for no GPU or an interpreted launch; none for a launch XLA does not compile alone (a
+    collective's, a block past its shared memory), which its program's compile reads as before (`settled`)
+    and `uncertified` names. Once a process, by launch (`certifications`), and once a GPU model a machine:
+    each verdict, an accepted config's and a refused one's, is stored with the kernel picks
+    (`_verdict_key`), so a warm start traces and compiles nothing to certify."""
+    device = _certifying_device()
+    if device is None or arguments.arguments.get("interpret"):
+        return ()
+    from dew.nn.kernels import tuning
+
+    reverse = _PULLED.get() and op.CARRIES_DERIVATIVE
+    key = (_identity(op, arguments), config, device.id, device.device_kind, reverse)
+    with _GUARD:
+        if key in _CERTIFIED:
+            return _CERTIFIED[key].spilling
+    stored = _verdict_key(op, arguments, config, reverse)
+    verdict = None if stored is None else tuning.stored_verdict(device.device_kind, stored)
+    if isinstance(verdict, dict):
+        kernels = verdict
+    else:
+        try:
+            kernels = _compiled_launch(op, arguments, config, device, reverse)
+        except jax.errors.JaxRuntimeError as error:
+            # XLA refuses the launch alone (its block's shared memory, a collective's devices): its program's
+            # compile refuses it as it did before certification (`settled`), and the gate names it
+            # (`uncertified`).
+            _log.warning("launch %s at %s is not certified: XLA does not compile it alone (%s)",
+                         type(op).__name__, config, str(error)[:200])
+            with _GUARD:
+                _UNCERTIFIED[key] = str(error)[:400]
+            return ()
+        if stored is not None:
+            tuning.store_verdict(device.device_kind, stored, kernels)
+    found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None)
+    with _GUARD:
+        _CERTIFIED[key] = found
+    return found.spilling
+
+
+def _verdict_key(op, arguments: tokamax.BoundArguments, config: Hashable, reverse: bool) -> str | None:
+    """What decides a launch's certification on a GPU model before it traces, as its stored verdict's key
+    (`tuning.stored_verdict`): the launch's identity (`_identity`, the same in every process), its config,
+    whether reverse mode runs it, Dew's code (`package_digest`: a Dew edit certifies again), the installed
+    JAX, jaxlib and CUDA plugins, whose compiler assembles it (the Pallas lowering cache's seal of them), and
+    the environment a kernel's lowering and compile read (that cache's policy); the store's file names the
+    GPU model. None where the installation has no seal (an edited or a source install of JAX), whose code
+    no key states: its verdicts are not stored."""
+    from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
+    from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
+
+    from dew._cache import package_digest
+    from dew.nn.kernels.tuning import encoded
+
+    installed = seal().digest
+    if installed is None:
+        return None
+    stated = [package_digest(), installed.hex(), _identity(op, arguments), encoded(config), reverse,
+              _keyed_environment()]
+    return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
+
+
+def certifications() -> tuple[Certification, ...]:
+    """Each launch certified in this process (`certified`)."""
+    with _GUARD:
+        return tuple(_CERTIFIED.values())
+
+
+def uncertified() -> dict[tuple, str]:
+    """Each launch certification did not compile alone in this process (`certified`), and why."""
+    with _GUARD:
+        return dict(_UNCERTIFIED)
+
+
+def refuse_spilling(op, arguments: tokamax.BoundArguments, config: Hashable,
+                    spilling: Sequence["Binary"]) -> None:
+    """`op`'s launch of `arguments` at `config` refused as certification found `spilling` (`certified`):
+    refused as a compile's spill refuses it (`refuse_launch`), each kernel's miss recorded, its launch
+    stepped down (`misses`), as `settled` records a compile's."""
+    refuse_launch(op, arguments, config, {binary.kernel for binary in spilling})
+    launch = Launch(_identity(op, arguments), type(op).__name__, config)
+    _recorded([(None, binary, launch) for binary in spilling], stepped=True)
+
+
+def _certifying_device():
+    """The device a launch is certified on (`certified`): a block's (`certifying`), else this process's GPU
+    where it compiles for that GPU's generation, else none."""
+    named = _CERTIFYING.get()
+    if named is not None:
+        return named
+    if jax.default_backend() != "gpu":
+        return None
+    if generation.device_generation() != generation.gpu_target().generation:
+        return None
+    return jax.local_devices()[0]
+
+
+def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, device,
+                     reverse: bool) -> dict[str, tuple[str, "Binary"]]:
+    """`op`'s launch of `arguments` at `config` as a resource derivation lowers it (`KernelOp.lowering`),
+    compiled alone on `device`, as a call without a gradient runs it or, `reverse`, as reverse mode does (its
+    forward and its pullback of a unit cotangent): its Mosaic GPU kernels' modules and binaries, by name and
+    launch, none for a launch of none. A launch that does not trace alone raises: certification is no
+    optional pass."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.lowered import kernel_calls
+    from dew.nn.kernels.options import owned_program
+
+    mesh = Mesh([device], ("launch",))
+    placed = NamedSharding(mesh, PartitionSpec())
+    # A program of its own on one device (`_standalone`): none of the enclosing trace's mesh nor its axes (a
+    # checked shard_map's body, whose abstract values the launch's own must not vary over), its operands' too.
+    with _standalone(), jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+        launch, shapes = op.lowering(arguments, config)
+        specs = [jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=placed) for shape in shapes]
+
+        def pulled_back(*operands):
+            out, pullback = jax.vjp(launch, *operands)
+            return pullback(jax.tree.map(_unit_cotangent, out))
+
+        lowered = owned_program(pulled_back if reverse else launch).trace(*specs).lower()
+    # A Mosaic GPU kernel compiled alone is the one its program loads (Mosaic compiles a module once a
+    # process); a Triton kernel compiles again with each executable, so its program's compile reads it.
+    modules = {launch_name(call.name, call.launch): call.config
+               for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"}
+    if not modules:
+        return {}
+    return {name: (modules[name], binary)
+            for binary in binaries(lowered.compile(targeted(lowered, None)))
+            if (name := launch_name(binary.kernel, binary.launch)) in modules}
+
+
+@contextlib.contextmanager
+def _standalone() -> Iterator[None]:
+    """A program of its own, traced within another's trace (a launch certified as a shard_map's body traces):
+    no mesh in context, abstract or concrete, nor its axes bound or checked (a checked shard_map's manual axes
+    bound, and its values asked to state their variance over them, `check_vma`), as outside every trace.
+    `jax.set_mesh(None)` does the mesh's swaps but refuses to run under a trace."""
+    abstract = mesh_lib.abstract_mesh_context_manager.swap_local(mesh_lib.empty_abstract_mesh)
+    concrete = mesh_lib.device_context.swap_local(mesh_lib.empty_concrete_mesh)
+    axes = jax_core.axis_env_state.swap_local(jax_core.top_axis_env)
+    try:
+        with jax_config._check_vma(new_val=False):
+            yield
+    finally:
+        jax_core.axis_env_state.set_local(axes)
+        mesh_lib.device_context.set_local(concrete)
+        mesh_lib.abstract_mesh_context_manager.set_local(abstract)
+
+
+def _unit_cotangent(out: jax.Array) -> jax.Array | np.ndarray:
+    """A cotangent of ones for `out`, float0's zeros for an integer output."""
+    if jnp.issubdtype(out.dtype, jnp.inexact):
+        return jnp.ones_like(out)
+    return np.zeros(out.shape, jax.dtypes.float0)
 
 
 @generation.traced_fact
@@ -934,8 +1165,10 @@ def _thunk_protos(serialized: bytes) -> list[tuple[str, bytes]]:
     reader of the serialized form, which its public `jax_executable_to_mlir` reads from a
     `jax.stages.Compiled`, where a kernel's compiled alone is a backend's `LoadedExecutable`), by its
     kernel's name, with its serialized proto."""
-    from jax._src.thunky import thunky
-
+    # thunky is imported with this module, not at a first reading: its import registers a discharge rule
+    # (`call_thunky_nested`) the Pallas lowering cache keys every lowering after it by, so a process that
+    # certified a launch before its step lowered keyed the step's lowerings apart from a warm start's, which
+    # reads none (FS-CERTREG: a warm start's first process lowered 26 kernels afresh).
     found: list[tuple[str, bytes]] = []
     thunky._check_thunky_available()
     context = thunky.make_ir_context()

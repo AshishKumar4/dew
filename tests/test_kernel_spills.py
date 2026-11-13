@@ -26,6 +26,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.options import Fetched, compiled_with, owned_program, program
 from dew.nn.kernels.templates import report
+from dew.nn.kernels.templates.gemm.hooks import Hooks
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
 from dew.telemetry.compiles import Compiles
@@ -55,7 +56,7 @@ class Experts(nn.Module):
         sizes = jnp.full((EXPERTS,), x.shape[0] // EXPERTS, jnp.int32)
         projected = Uncounted()(
             jax.lax.stop_gradient((x + self.nonce).astype(jnp.bfloat16)), gate, sizes, paired=up,
-            hooks=grouped_matmul.Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16",
+            hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16",
             trans_rhs=False, interpret=False)
         return projected * scale
 
@@ -567,7 +568,7 @@ def _paired_step(launch):
         def stepped(x, gate, up):
             sizes = jnp.full((EXPERTS,), ROWS // EXPERTS, jnp.int32)
             return launch(x, gate, sizes, paired=up, out_dtype="bfloat16", trans_rhs=False,
-                          hooks=grouped_matmul.Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u),
+                          hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u),
                           interpret=False)
         return jax.jit(stepped).trace(*operands).lower()
 

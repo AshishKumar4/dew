@@ -108,7 +108,7 @@ def promoted(*, above: bool, outputs: tuple) -> bool:
     float64 at 8192 tokens and at depths of 128 to 2048 on an A100 and an H100 (M-EM-3), where its exact
     sums, 40 to 60 times closer to float64 than the reference, cost an H100 1.10-2.06x their time (W124) and
     an A100 the 128 x 128 tile; row 4331's premise (M-NS-1: 1.661x XLA's error at depth 128, 3.88x at 512)
-    did not reproduce. An underfilled wave's split of the contraction (`gemm.mosaic_gpu.split_count`)
+    did not reproduce. An underfilled wave's split of the contraction (`gemm.pricing.split_count`)
     shortens each sum as cuBLAS's split-K does. An FP8 product promotes apart whatever its outputs
     (`declared`)."""
     return above and jnp.dtype(jnp.float32) in {jnp.dtype(dtype) for dtype in outputs}

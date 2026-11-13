@@ -101,7 +101,7 @@ def test_a_per_group_prologue_side_operand_and_its_gradients_hold_check_1(genera
 @pytest.mark.parametrize("generation_name", generations("sm90", "v5e"))
 def test_a_side_operand_of_a_dimension_of_one_runs_on_the_template(generation_name):
     """Side operands with a dimension of one (a `[rows, 1]` mean square on the prologue, a `[1, width]` bias
-    on the epilogue), squeezed and given back broadcast across the hook's tile (`grouped_matmul._unsqueezed`):
+    on the epilogue), squeezed and given back broadcast across the hook's tile (`hooks._unsqueezed`):
     the template's launch named, its output and every gradient on par with the plain program over the draws
     (check 1), truth in float64, where Mosaic's layouts took no dimension of one and Triton's ran them."""
     sizes = jnp.asarray(SIZES)

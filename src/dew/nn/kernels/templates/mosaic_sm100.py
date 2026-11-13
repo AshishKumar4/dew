@@ -279,12 +279,14 @@ class Accumulator:
     """A tile in tensor memory, the tcgen05 bundle's walk's and `products`' value: an fp32 accumulator, or a
     product's left operand a role wrote there (`Tcgen05Issuer.write`: FlashAttention 4's narrowed weights,
     16-bit, two to a column); its columns (`ref`; None for a tile that multiplies nothing, whose chunks are
-    zeros), its shape and dtype, and whether a product adds onto it (not at a tile's first step: tensor
-    memory starts unset)."""
+    zeros), its shape and dtype, whether a product adds onto it (not at a tile's first step: tensor
+    memory starts unset), and whether every product issued into it is committed and awaited (`awaited`:
+    `Tcgen05ChunksIssuer.register_products`', read as it lies)."""
     ref: Ref | None
     shape: tuple[int, int]
     accumulate: jax.Array | bool = False
     dtype: Any = jnp.float32
+    awaited: bool = False
 
 
 class CommittedRing(rings.Ring):
@@ -1064,22 +1066,48 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         return _addressed_here(found["tmem"][width][role], axis=1), found["done"].at[role]
 
     def summed(self, shape: tuple[int, int], issue) -> jax.Array:
+        return self._summed(shape, issue)
+
+    def _summed(self, shape: tuple[int, int], issue, carried: jax.Array | None = None) -> jax.Array:
+        """`summed`'s products issued into the building role's fresh accumulator and read, onto the sum a walk
+        `carried` in registers where given. Committed and awaited first, but where `issue` awaited its own
+        (the accumulator it returns `awaited`): a commit with nothing pending right behind the role's wait
+        completed its barrier's next phase before a lagging warp of the role had polled the last; the warp
+        read that phase as the last again and waited for a third, which its role never committed (row 5671:
+        a B200's forward wedged within 800 back-to-back calls). A carried sum at least `PADDED` wide is
+        written into the accumulator first and the products accumulate onto it (the tensor core's `D = A·B +
+        D`, a warpgroup MMA's own order), so the read holds one sum, not the carried one beside the
+        products': both, with no wait before the read that ptxas schedules no load across, took a
+        3-consumer forward at its deepest ring to 158 of its 160 registers and spilled its role index (12
+        bytes, et-ringspill3)."""
         tmem, done = self._scratch(shape[1])
-        issue(Accumulator(tmem, (shape[0], max(shape[1], PADDED))))
-        found = _awaited(tmem, done)
-        return found if shape[1] >= PADDED else found[:, :shape[1]]
+        onto = carried is not None and shape[1] >= PADDED
+        if onto:
+            plgpu.async_store_tmem(tmem, carried)
+            plgpu.commit_tmem()
+        issued = issue(Accumulator(tmem, (shape[0], max(shape[1], PADDED)), accumulate=onto))
+        if not (isinstance(issued, Accumulator) and issued.awaited):
+            plgpu.tcgen05_commit_arrive(done)
+            plgpu.barrier_wait(done)
+        found = _read(tmem)
+        found = found if shape[1] >= PADDED else found[:, :shape[1]]
+        return found if carried is None or onto else carried + found
 
     def products(self, acc: Accumulator | jax.Array, lhs, rhs, *, accumulate: bool = True
                  ) -> Accumulator | jax.Array:
         if not isinstance(acc, Accumulator):
             # A sum the walk carries in registers: the product in a fresh accumulator, added to it.
-            return acc + self.summed((acc.shape[0], acc.shape[1]),
-                                     lambda fresh: self.products(fresh, lhs, rhs))
+            return self._summed((acc.shape[0], acc.shape[1]), lambda fresh: self.products(fresh, lhs, rhs),
+                                carried=acc)
+        return self._issued(acc, lhs, rhs, accumulate=accumulate)
+
+    def _issued(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True) -> Accumulator:
+        """`lhs @ rhs` issued into tensor memory's `acc` (`products`), not yet awaited."""
         left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
         if rhs.shape[1] < PADDED:
             rhs = self._padded(rhs)
         plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, accumulate=acc.accumulate if accumulate else False)
-        return dataclasses.replace(acc, accumulate=True)
+        return dataclasses.replace(acc, accumulate=True, awaited=False)
 
     def _padded(self, rhs):
         """A right operand of fewer than `PADDED` columns in the building role's padded tile, zeros past
@@ -1105,16 +1133,17 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         # tensor core reads it as it runs). A sum the walk carries in registers takes the parts' products
         # in a fresh accumulator, added to it (`summed`).
         if not isinstance(acc, Accumulator):
-            return acc + self.summed((acc.shape[0], acc.shape[1]), lambda fresh: self.register_products(
-                fresh, parts, rhs))
+            return self._summed((acc.shape[0], acc.shape[1]), lambda fresh: self.register_products(
+                fresh, parts, rhs), carried=acc)
         _, done = self._scratch(acc.shape[1])
         for part in parts:
             tile = self._left(part)
             plgpu.store(tile, part, optimized=False)
             plgpu.commit_smem()
-            acc = self.products(acc, tile, rhs)
+            acc = self._issued(acc, tile, rhs)
             plgpu.tcgen05_commit_arrive(done)
             plgpu.barrier_wait(done)
+            acc = dataclasses.replace(acc, awaited=True)
         return acc
 
     def _left(self, part: jax.Array):
@@ -1150,7 +1179,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         plgpu.barrier_wait(done)
         plgpu.async_store_tmem(_tensor_memory(acc), _read(_tensor_memory(acc)) + value)
         plgpu.commit_tmem()
-        return dataclasses.replace(acc, accumulate=True)
+        return dataclasses.replace(acc, accumulate=True, awaited=True)
 
     def rescaled_products(self, acc: Accumulator | jax.Array, scale, parts, rhs, interpret: bool
                           ) -> Accumulator | jax.Array:
@@ -1161,7 +1190,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         plgpu.barrier_wait(done)
         plgpu.async_store_tmem(_tensor_memory(acc), scale(_read(_tensor_memory(acc))))
         plgpu.commit_tmem()
-        return self.register_products(dataclasses.replace(acc, accumulate=True), parts, rhs)
+        return self.register_products(dataclasses.replace(acc, accumulate=True, awaited=True), parts, rhs)
 
     def settled(self, pending: int = 0) -> None:
         # A product reads its shared-memory operands after its issue returns, until its commit arrives (PTX
@@ -1236,13 +1265,6 @@ def _read(tmem) -> jax.Array:
     value = plgpu.async_load_tmem(tmem, layout=plgpu.Layout.WGMMA)
     plgpu.wait_load_tmem()
     return value
-
-
-def _awaited(tmem, done) -> jax.Array:
-    """The products issued into `tmem` committed to `done`, awaited, and their sum read (`_read`)."""
-    plgpu.tcgen05_commit_arrive(done)
-    plgpu.barrier_wait(done)
-    return _read(tmem)
 
 
 def _tensor_memory(acc: Accumulator) -> Ref:

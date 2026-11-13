@@ -51,7 +51,7 @@ from .chunked_launch import AlignedDocuments, Forked, zero_padded
 from .generation import INHERENT, Choice, triton_runs
 from .selection import Kernel, KernelRefused, Op, Refusal, Requirement, select, selected
 from .ssd import _chunk_scan, ssd_kernel_platform
-from .templates import base, scan as block_scan
+from .templates import base, report as launch_report, scan as block_scan
 
 CHUNK_SIZE = 64
 """Tokens per chunk of the chunked form, the reference's default
@@ -963,7 +963,11 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
     else:
         if forward == trained == 'xla':
             return run(forward, *operands)
-        training = functools.partial(run, trained)
+
+        def training(*operands):
+            # Certified as reverse mode runs it: its forward and pullback (`launch_report.pulled`).
+            with launch_report.pulled():
+                return run(trained, *operands)
     primal = functools.partial(run, forward)
 
     def portable(*operands):

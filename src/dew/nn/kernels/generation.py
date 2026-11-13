@@ -727,10 +727,11 @@ TARGETS = {target.generation: target for target in (
                         'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6,
                                                        loaded_clock=1.496e9),
                         'NVIDIA H200': Measured(2.81e-6, 4.617e12)}),
-    # Datasheet facts and a B200's measured steps and L2, no routes: what a compile-only sm100 device needs
-    # (`tests/kernel_compile.py`), its peaks the scoreboard's MFU; a B200 run states its own clock and
-    # bandwidth (`runtime_facts`). Its clock is the busy SM's under NVML, 1965 MHz at every sample (60), and
-    # its steps and L2 a B200's (2026-11-12: the step probes' two rounds, tools/device_facts.py).
+    # Datasheet facts and a B200's measured steps, L2, stream, launch and hand-off, no routes: what a
+    # compile-only sm100 device needs (`tests/kernel_compile.py`), its peaks the scoreboard's MFU; a B200
+    # run states its own clock and bandwidth (`runtime_facts`). Its clock is the busy SM's under NVML, 1965
+    # MHz at every sample (60), and its steps and L2 a B200's (2026-11-12: the step probes' two rounds,
+    # tools/device_facts.py).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
               dense_peaks={'NVIDIA B200': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=148,
               # HGX B200's 1,440 GB of HBM3e over its 8 GPUs.
@@ -742,12 +743,16 @@ TARGETS = {target.generation: target for target in (
               step_seconds=5.41e-6,
               # In-kernel: a dependent lane reduction's 144.0 ns (its two rounds 144.05 and 144.04).
               kernel_step_seconds=144.0e-9,
-              # Its multiprocessors' clock under a step's large products: 1.549 GHz, the time-weighted mean of
-              # sm__cycles_elapsed.avg.per_second over the 15 GEMM launches of 0.1 ms or more in the 4B's
-              # one-row Muon step under ncu (1.520 to 1.600; the driver's software power capping counter
-              # running at the default 1,000 W limit; lab-b200-20261112-bundle2/ncu-muon-raw.csv), where
-              # its idle-sampled 1965 MHz above stands.
-              measured={'NVIDIA B200': Measured(loaded_clock=1.549e9)},
+              # tools/device_facts.py on a B200 (lab-b200-20261113-facts2): its stream's line over 1 MiB to
+              # 1 GiB, 6.43 TB/s read at 1 GiB, as HS-CAL-b200's dram read of its 1.07 GB (6.40); its
+              # launch HS-CAL-b200's, a kernel after another with no programmatic dependent launch (1.20 us);
+              # its hand-off device_facts' (0.651 us a round trip). Its multiprocessors' clock under a
+              # step's large products: 1.549 GHz, the time-weighted mean of sm__cycles_elapsed.avg.per_second
+              # over the 15 GEMM launches of 0.1 ms or more in the 4B's one-row Muon step under ncu (1.520 to
+              # 1.600; the driver's software power capping counter running at the default 1,000 W limit;
+              # lab-b200-20261112-bundle2/ncu-muon-raw.csv), where its idle-sampled 1965 MHz above stands.
+              measured={'NVIDIA B200': Measured(4.29e-6, 6.593e12, launch=1.20e-6, handoff=0.651e-6,
+                                                loaded_clock=1.549e9)},
               # Qwen3.5-0.8B's step at 8 x 3072 tokens under 'full', its head tiled and unfused, compiled for
               # a B200 holds 22.9 GiB of temporaries, against 5.6 with the head fused: some of its weight
               # gradients run after the backward, which the derivation bounds from above by running all

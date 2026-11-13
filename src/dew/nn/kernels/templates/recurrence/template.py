@@ -352,6 +352,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     name: ClassVar[str] = "mosaic_gpu"
     config_cls: ClassVar[type[mainloop.Tiles]] = mainloop.Tiles
+    CARRIES_DERIVATIVE: ClassVar[bool] = True
 
     def _fwd(self, query: jax.Array, key: jax.Array, value: jax.Array, g: jax.Array, beta: jax.Array,
              state: jax.Array | None = None, starts: jax.Array | None = None, *,

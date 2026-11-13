@@ -13,7 +13,7 @@ import pytest
 from generation_support import INTERPRETS
 
 from dew.nn.kernels import gemm, generation, grouped_matmul
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
 
 WIDTHS = [(96, 100), (200, 72)]
 """Depths and widths no tile of any family divides: on a TMA family 96 x 100's depth runs partial and its
@@ -50,11 +50,11 @@ def test_a_tma_family_runs_a_partial_step_and_column_tile_where_its_rows_are_who
     for depth, width in ((200, 136), (1000, 1400)):
         (depth_ran, width_ran), tile, padded = ran(depth, width)
         assert tile == padded and tile is not None
-        family = mosaic_gpu.family_of(tile, jnp.bfloat16)
+        family = pricing.family_of(tile, jnp.bfloat16)
         # A pair's tile (a B200's, `paired_first`) is padded yet: each CTA's copy of its half of the pair's
         # block is not partitioned under a partial extent until the fork's partitioned untiling (row 5727).
         alone = not family.pairs_product
-        assert (width_ran == width) is (alone and mosaic_gpu.tile_columns(tile, family) <= width)
+        assert (width_ran == width) is (alone and pricing.tile_columns(tile, family) <= width)
         assert (depth_ran == depth) is (alone and tile.block_k == step)
     assert ran(1000, 1400)[0] == ((1000, 1400) if generation_name == "sm90" else (1024, 1408))
     assert ran(200, 100)[0][1] == 128

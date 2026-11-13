@@ -591,7 +591,8 @@ class RegisterModel:
     allocator's step (`Family.register_step`), a producer warpgroup's registers a thread (0 without one),
     the scratch its planner sized (`scratch_bytes`, None where unstated) and the registers of the
     multiprocessor it runs on (`file`, `Multiprocessor.registers`), its own fact: no residency it states
-    reads another device's."""
+    reads another device's; and whether its program moves registers between its roles (`moves`,
+    `moves_registers`), every warpgroup at the program's entry share where it does not."""
     registers: int | None
     budget: int
     consumers: int
@@ -601,22 +602,24 @@ class RegisterModel:
     shared: int | None = None
     family: "Family | None" = dataclasses.field(default=None, compare=False, repr=False)
     file: int = dataclasses.field(kw_only=True)
+    moves: bool = dataclasses.field(default=True, kw_only=True)
 
     def resident(self, registers: int, *, honored: bool = RAISES_HONORED) -> int:
         """Residency at this consumer allocation, bounded by the launch's other resources."""
-        producer = self.producer if honored or not self.producer else registers
+        producer = self.producer if (honored and self.moves) or not self.producer else registers
         allocated = _register_allocation(registers, self.consumers, producer, self.step)
         return min(self.most, self.file // allocated) if allocated else self.most
 
     def cap(self, programs: int, *, honored: bool = RAISES_HONORED) -> int:
         """The consumer cap that leaves room for `programs` copies of this launch: the registers the launch
-        gives a consumer thread there, its raise (`raised_registers`) where the compile honors raises, its
-        program's entry share otherwise (`entry_registers`, every warpgroup's alike), and without a producer
-        its consumers' share. A cap of the multiprocessor's share less the producer's passed a kernel past
-        its launch's raise (144 against 136, one consumer at three programs)."""
+        gives a consumer thread there, its raise (`raised_registers`) where the compile honors raises and
+        the program moves them (`moves`), its program's entry share otherwise (`entry_registers`, every
+        warpgroup's alike), and without a producer its consumers' share. A cap of the multiprocessor's share
+        less the producer's passed a kernel past its launch's raise (144 against 136, one consumer at three
+        programs)."""
         if not self.producer:
             return entry_registers(self.consumers, programs)
-        if honored:
+        if honored and self.moves:
             return raised_registers(self.consumers, programs, self.producer)
         return entry_registers(self.consumers + 1, programs)
 
@@ -626,9 +629,23 @@ class RegisterModel:
                 if field.name != "family"}
 
 
+def moves_registers(registers: int | None, warpgroups: int, consumers: int, programs: int = 1) -> bool:
+    """Whether a program of `warpgroups` warpgroups, `consumers` of them its compute roles and `programs` of
+    it a multiprocessor at once, moves registers from its producer to its consumers (setmaxnreg,
+    `handoffs.Schedule.run`): where it has a producer and its consumer thread's `registers` pass the
+    program's entry share (`entry_registers`), or are unstated. A move that buys nothing holds the values
+    formed both sides of the producer's drop across it: a B200's d256 forward over two rows, its consumers
+    needing 154 of the 168 a thread launches with, spilled its row's 64-bit offset at the drop under ptxas
+    12.9 and held it with no register moved."""
+    if warpgroups <= consumers:
+        return False
+    return registers is None or registers > entry_registers(warpgroups, programs)
+
+
 def register_model(family: "Family", consumers: int, registers: int | None, *,
                    shared: int | None = None, target: "GpuTarget | None" = None,
-                   tmem: int = 0, producer: int | None = None) -> RegisterModel:
+                   tmem: int = 0, producer: int | None = None, programs: int = 1,
+                   moves: bool | None = None) -> RegisterModel:
     """`family`'s register decision for a launch of `consumers` whose consumer thread holds `registers`
     (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`), lowered to
     `producer` (`producer_floor` where None), and the most programs a multiprocessor holds of it at those
@@ -636,7 +653,8 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
     its plan's: on `target`,
     else the target its launches derive for (`facts`'). A residency its staging forbids is no launch's (a
     B200's gathered input gradient staging 230,580 bytes runs one program, where its registers held three
-    and its gathering producer spilled at three's raise, row 5523)."""
+    and its gathering producer spilled at three's raise, row 5523); and whether its program moves registers
+    at its plan's residency, `programs` (`moves_registers`), or as its launch states (`moves`, if given)."""
     warpgroups = family.warpgroups(consumers)
     most = family.programs(consumers, registers, producer)
     if shared is not None or tmem:
@@ -650,7 +668,9 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
     return RegisterModel(registers, family.registers(consumers, producer=producer), consumers, most,
                          family.register_step,
                          producer_registers(consumers, producer=producer) if warpgroups > consumers else 0,
-                         shared, family, file=facts().registers)
+                         shared, family, file=facts().registers,
+                         moves=(moves_registers(registers, warpgroups, consumers, programs) if moves is None
+                                else moves))
 
 
 @dataclasses.dataclass(frozen=True)

@@ -20,7 +20,8 @@ from tuned import each_config
 
 from dew.nn.kernels import fused_gemm, gemm, generation, grouped_matmul, low_rank, projections, tuning
 from dew.nn.kernels.templates import cost, mosaic_sm90, product, resources, tail
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
+from dew.nn.kernels.templates.gemm.hooks import Hooks
 
 pytestmark = pytest.mark.kernel
 
@@ -709,7 +710,7 @@ def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs)
 def test_an_amperes_decode_product_splits_its_depth_over_the_wave(rows, transpose_rhs):
     """An A100 decode step's dense product over a 2048 x 2048 matrix (row 483's input gradient), the matrix
     lying either way, derives a swapped tile of at most `SWAPPED_ROWS` rows whose depth splits until its
-    programs fill most of the wave (`mosaic_gpu.split_count` pricing the matrix's stream): its steps priced
+    programs fill most of the wave (`pricing.split_count` pricing the matrix's stream): its steps priced
     at their MMA alone, it walked 12 programs on 108 multiprocessors at 2.8-3.0x XLA's time (M-NS-12)."""
     launch = grouped_matmul.MosaicGmm()
     bound = launch.bind(jax.ShapeDtypeStruct((rows, 2048), jnp.bfloat16),
@@ -1012,7 +1013,7 @@ def test_the_planar_snake_walks_every_tile_once_in_its_bands(major, minor, width
 
 
 def test_a_step_is_priced_at_the_longer_of_its_products_and_its_shared_traffic():
-    """A step's price (`mosaic_gpu.step_seconds`) is the longer of its products at the tensor rate and its
+    """A step's price (`pricing.step_seconds`) is the longer of its products at the tensor rate and its
     operands' bytes through shared memory (`step_shared_bytes`), read as each issuer reads them
     (`Issuer.shared_reads`):
     - warpgroup MMA reads the matrix's block once an m64 instruction, so one consumer of 128 rows passes as
@@ -1023,23 +1024,23 @@ def test_a_step_is_priced_at_the_longer_of_its_products_and_its_shared_traffic()
     - a pair's walk covers the product's output once: its output tiles, each a CTA's rows by the pair's
       columns, tile the product exactly."""
     b200, h100 = generation.gpu_target("sm100"), generation.gpu_target("sm90")
-    wgmma = mosaic_gpu.family_of(COOPERATIVE, jnp.bfloat16)
+    wgmma = pricing.family_of(COOPERATIVE, jnp.bfloat16)
     alone = dataclasses.replace(COOPERATIVE, warpgroups=1)
-    assert (mosaic_gpu.step_shared_bytes(alone, wgmma, (2, 2))
-            == mosaic_gpu.step_shared_bytes(COOPERATIVE, wgmma, (2, 2)))
+    assert (pricing.step_shared_bytes(alone, wgmma, (2, 2))
+            == pricing.step_shared_bytes(COOPERATIVE, wgmma, (2, 2)))
     one_cta = mosaic_gpu.Tiles(128, 128, 64, 6, 8, warpgroups=1, family="tcgen05")
     pair = mosaic_gpu.Tiles(128, 128, 64, 5, 8, warpgroups=1, cluster=2, family="tcgen05.pair")
 
     def per_flop(tiles, target):
-        family = mosaic_gpu.family_of(tiles, jnp.bfloat16)
-        flops = 2 * tiles.block_m * mosaic_gpu.tile_columns(tiles, family) * tiles.block_k
-        return mosaic_gpu.step_seconds(tiles, target, (2, 2)) / flops
+        family = pricing.family_of(tiles, jnp.bfloat16)
+        flops = 2 * tiles.block_m * pricing.tile_columns(tiles, family) * tiles.block_k
+        return pricing.step_seconds(tiles, target, (2, 2)) / flops
 
     assert per_flop(pair, b200) < per_flop(one_cta, b200)
     cooperative = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, family="wgmma")
     tensor = cost.rates(h100, device=False)[0]
-    assert mosaic_gpu.step_seconds(cooperative, h100, (2, 2)) == 2 * 128 * 256 * 64 / tensor
-    walk = mosaic_gpu.split_walk(pair, groups=1, rows=24576, depth=9216, width=2560, itemsizes=(2, 2),
+    assert pricing.step_seconds(cooperative, h100, (2, 2)) == 2 * 128 * 256 * 64 / tensor
+    walk = pricing.split_walk(pair, groups=1, rows=24576, depth=9216, width=2560, itemsizes=(2, 2),
                                  multiprocessors=148, step_seconds=1.0, bandwidth=1.0, launch_seconds=None)
     assert walk.output * pair.block_m * 2 * pair.block_n == 9216 * 2560
 
@@ -1049,9 +1050,10 @@ def test_a_parts_units_are_priced_at_the_clock_it_holds_under_load():
     are priced at the clock its part holds under a step's tensor-core load (`Measured.loaded_clock`): a
     B200's measured 1.549 GHz, so each is slower than at its 1.965 GHz boost, the clock's own units exactly as
     a part stating 1.549 GHz, and a device's memory, which that clock does not drive, streams as fast; a
-    part no one measured keeps the clock it states."""
+    part whose measurement states no loaded clock keeps the clock it states."""
     b200 = generation.gpu_target("sm100")
-    unmeasured = dataclasses.replace(b200, measured={})
+    unmeasured = dataclasses.replace(b200, measured={
+        kind: dataclasses.replace(measured, loaded_clock=None) for kind, measured in b200.measured.items()})
     restated = dataclasses.replace(unmeasured, clock_hz=1.549e9)
     loaded, stated = cost.rates(b200, device=False), cost.rates(unmeasured, device=False)
     # The CUDA cores, the special-function units and shared memory: the clock's alone.
@@ -1069,12 +1071,12 @@ def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiproc
     times too short)."""
     h100 = generation.gpu_target("sm90")
     few, more = (dataclasses.replace(h100, multiprocessors=count) for count in (8, 64))
-    assert (mosaic_gpu.step_seconds(COOPERATIVE, few, (2, 2))
-            == mosaic_gpu.step_seconds(COOPERATIVE, more, (2, 2)))
-    assert (mosaic_gpu.handoff_steps(COOPERATIVE, few, (2, 2))
-            == mosaic_gpu.handoff_steps(COOPERATIVE, more, (2, 2)))
+    assert (pricing.step_seconds(COOPERATIVE, few, (2, 2))
+            == pricing.step_seconds(COOPERATIVE, more, (2, 2)))
+    assert (pricing.handoff_steps(COOPERATIVE, few, (2, 2))
+            == pricing.handoff_steps(COOPERATIVE, more, (2, 2)))
     for steps in (2, 4, 16, 64):
-        decided = {mosaic_gpu.balanced_tail(COOPERATIVE, (1, 11), steps, (2, 2), target, 8) is not None
+        decided = {pricing.balanced_tail(COOPERATIVE, (1, 11), steps, (2, 2), target, 8) is not None
                    for target in (few, more)}
         assert len(decided) == 1, steps
 
@@ -1089,7 +1091,7 @@ multiprocessors' last wave at most half full: at rows a step does not divide, an
 @pytest.mark.parametrize(("rows", "depth", "width"), BALANCED_TAILS)
 def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width, out_dtype):
     """A dense kernel gradient on a Hopper part of 8 multiprocessors whose 11 output tiles leave its last
-    wave at most half full (`mosaic_gpu.balanced_tail`, its hand-off unmeasured, so the tail is taken at
+    wave at most half full (`pricing.balanced_tail`, its hand-off unmeasured, so the tail is taken at
     these few steps a tile): its tail's steps balanced over the programs, a program's range crossing a tile's
     boundary, each tile fixed up across them, on par with XLA's over the draws (check 1), truth float64's;
     at rows a step does not divide, and at a tile of 256 x 128; into fp32 at the highest precision too, its
@@ -1112,7 +1114,7 @@ def a_dense_kernel_gradients_balanced_tail_holds_check_1(rows: int, depth: int, 
                              interpret=False, out_dtype=jnp.dtype(out_dtype).name, dense=True,
                              exact_sums=exact)
         tile = gradient.derived(call, target)
-    assert mosaic_gpu.balanced_tail(tile, (depth // tile.block_m, width // tile.block_n),
+    assert pricing.balanced_tail(tile, (depth // tile.block_m, width // tile.block_n),
                                     -(-rows // tile.block_k), (2, 2), target, 8) is not None
 
     def dew(x, w, dy):
@@ -1133,7 +1135,7 @@ def a_dense_kernel_gradients_balanced_tail_holds_check_1(rows: int, depth: int, 
 @pytest.mark.parametrize(("rows", "depth", "width"), [(1408, 128, 128), (200, 256, 640)])
 def test_a_dense_forwards_balanced_tail_holds_check_1_through_its_hooks(rows, depth, width):
     """A dense forward product on a Hopper part of 8 multiprocessors whose 11 or 10 output tiles leave its
-    last wave at most half full (`mosaic_gpu.balanced_tail`, `gmm`'s dense tail): its tail's steps
+    last wave at most half full (`pricing.balanced_tail`, `gmm`'s dense tail): its tail's steps
     balanced over the programs, each program's partial fixed up across them, through an RMS norm's prologue
     and a bias's epilogue, on par with the plain program over the draws (check 1), truth float64's; at rows a
     tile does not divide. The template's interpreted route launches one program, so this calls the kernel
@@ -1142,7 +1144,7 @@ def test_a_dense_forwards_balanced_tail_holds_check_1_through_its_hooks(rows, de
     target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
     grid = (-(-rows // COOPERATIVE.block_m), width // COOPERATIVE.block_n)
     steps = depth // COOPERATIVE.block_k
-    assert mosaic_gpu.balanced_tail(COOPERATIVE, grid, steps, (2, 2), target, 8) is not None
+    assert pricing.balanced_tail(COOPERATIVE, grid, steps, (2, 2), target, 8) is not None
 
     def draw(seed):
         rng = np.random.default_rng(seed)
@@ -1171,14 +1173,14 @@ def test_a_dense_forwards_balanced_tail_holds_check_1_through_its_hooks(rows, de
 @INTERPRETS
 def test_a_dense_depth_split_whose_last_wave_would_balance_walks_its_runs():
     """A dense product split in two (`Tiles.splits`) on the Hopper part of 8 multiprocessors whose last wave
-    of 11 output tiles a balanced tail takes unsplit (`mosaic_gpu.balanced_tail`, its hand-off unmeasured):
+    of 11 output tiles a balanced tail takes unsplit (`pricing.balanced_tail`, its hand-off unmeasured):
     the split walks its runs, each into its own slice of the partials (no tail beside it, which left the
     runs unscheduled and stored a run's slices through a 2-D store), and over small integers sums bitwise
     the unsplit launch's."""
     rows, depth, width = 1408, 128, 128
     target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
     grid = (-(-rows // COOPERATIVE.block_m), width // COOPERATIVE.block_n)
-    assert mosaic_gpu.balanced_tail(COOPERATIVE, grid, depth // COOPERATIVE.block_k, (2, 2), target,
+    assert pricing.balanced_tail(COOPERATIVE, grid, depth // COOPERATIVE.block_k, (2, 2), target,
                                     8) is not None
     keys = jax.random.split(jax.random.key(6))
     x = jax.random.randint(keys[0], (rows, depth), -3, 4).astype(jnp.bfloat16)
@@ -1693,11 +1695,11 @@ def test_the_hooked_mosaic_launches_lower_for_an_h100(launch):
     prologue = (normed, (f32((rows,)), f32((depth,))), (("rows",), ("depth",)))
     if isinstance(launch, grouped_matmul.MosaicTgmm):
         args = (bf16((rows, depth)), bf16((rows, width)), sizes, prologue[1])
-        hooks = grouped_matmul.Hooks(prologue[0], prologue[2])
+        hooks = Hooks(prologue[0], prologue[2])
         options = {"out_dtype": "float32", "hooks": hooks, "interpret": False}
     else:
         args = (bf16((rows, depth)), bf16((groups, depth, width)), sizes, prologue[1], (f32((width,)),))
-        hooks = grouped_matmul.Hooks(prologue[0], prologue[2], biased, (("columns",),))
+        hooks = Hooks(prologue[0], prologue[2], biased, (("columns",),))
         options = {"out_dtype": "bfloat16", "trans_rhs": False, "hooks": hooks, "interpret": False}
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
@@ -1720,7 +1722,7 @@ def test_a_mosaic_launchs_epilogue_holding_a_marked_span_lowers_for_an_h100():
     launch = grouped_matmul.MosaicGmm()
     args = (bf16((rows, depth)), bf16((groups, depth, width)), sizes, (),
             (jax.ShapeDtypeStruct((width,), jnp.float32),))
-    hooks = grouped_matmul.Hooks(epilogue=marked(Protected(), biased), epilogue_axes=(("columns",),))
+    hooks = Hooks(epilogue=marked(Protected(), biased), epilogue_axes=(("columns",),))
     options = {"out_dtype": "bfloat16", "trans_rhs": False, "hooks": hooks, "interpret": False}
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
@@ -1774,11 +1776,11 @@ def test_the_hooked_tpu_launches_lower_for_a_v5e(launch, side_dtype):
     prologue = (normed, (sides((rows,)), sides((depth,))), (("rows",), ("depth",)))
     if isinstance(launch, grouped_matmul.MosaicTgmm):
         args = (bf16((rows, depth)), bf16((rows, width)), sizes, prologue[1])
-        hooks = grouped_matmul.Hooks(prologue[0], prologue[2])
+        hooks = Hooks(prologue[0], prologue[2])
         options = {"out_dtype": "float32", "hooks": hooks, "interpret": False}
     else:
         args = (bf16((rows, depth)), bf16((groups, depth, width)), sizes, prologue[1], (sides((width,)),))
-        hooks = grouped_matmul.Hooks(prologue[0], prologue[2], biased, (("columns",),))
+        hooks = Hooks(prologue[0], prologue[2], biased, (("columns",),))
         options = {"out_dtype": "bfloat16", "trans_rhs": False, "hooks": hooks, "interpret": False}
     assumed, mesh = _on_a_v5e()
     with assumed, mesh:
@@ -1861,12 +1863,12 @@ def test_the_hooked_dense_launches_lower_for_cuda(launch, trans_rhs, generation_
     prologue = (normed, (f32((rows,)), f32((depth,))), (("rows",), ("depth",)))
     if isinstance(launch, grouped_matmul.Tgmm):
         args = (bf16((rows, depth)), bf16((rows, width)), sizes, prologue[1])
-        hooks = grouped_matmul.Hooks(prologue[0], prologue[2])
+        hooks = Hooks(prologue[0], prologue[2])
         options = {"out_dtype": "float32", "hooks": hooks, "interpret": False}
     else:
         matrix = bf16((1, width, depth) if trans_rhs else (1, depth, width))
         args = (bf16((rows, depth)), matrix, sizes, prologue[1], (f32((width,)),))
-        hooks = grouped_matmul.Hooks(prologue[0], prologue[2], biased, (("columns",),),
+        hooks = Hooks(prologue[0], prologue[2], biased, (("columns",),),
                                      out_dtypes=("float32",))
         options = {"out_dtype": "float32", "trans_rhs": trans_rhs, "hooks": hooks, "interpret": False}
     options |= {"dense": True, "exact_sums": True}
@@ -2185,7 +2187,7 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
         # the registers its layout gives a consumer (`Family.registers`). The generated tile holds them; a
         # tile that does not is no legal pin.
         [tile] = launch.fitting(exact, target)
-        budget = mosaic_gpu.family_of(tile, jnp.bfloat16).registers(tile.warpgroups)
+        budget = pricing.family_of(tile, jnp.bfloat16).registers(tile.warpgroups)
         assert 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups) < budget
         narrow, wide = (mosaic_gpu.Tiles(128, width, 64, 2, 1, warpgroups=2, family='wgmma')
                         for width in (128, 256))
@@ -2397,7 +2399,7 @@ def test_each_familys_deepest_ring_compiles_within_its_resources(generation_name
     target = generation.gpu_target(generation_name)
     with generation.assumed(generation_name):
         bound = launch.bind(*shapes, interpret=False, **options)
-        planned = resources.plan([launch.launch_of(bound, tiles)], mosaic_gpu.family_of(tiles, jnp.bfloat16),
+        planned = resources.plan([launch.launch_of(bound, tiles)], pricing.family_of(tiles, jnp.bfloat16),
                                  target, programs=1)
     assert planned is not None, f"no plan of {tiles} on {generation_name}"
     stages = planned[0].stages

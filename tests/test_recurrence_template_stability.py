@@ -267,24 +267,43 @@ def test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_inter
     the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, 'forward', forms)
 
 
-@COMPILES_ON_CPU
-def test_the_narrow_gated_delta_gradient_compiles_for_an_h100():
-    """The gated delta rule's bf16 gradient at the suite's narrow widths (16-wide keys, 8-wide values, its
-    gradient arms' heads), compiled for an H100 on this CPU (`kernel_compile.compile_mosaic_kernels`) with no
-    kernel failing: its values' backward, 8 programs a multiprocessor at its model, launched each thread
-    at 32 registers, under the 34 its 16-column warpgroup MMAs assemble at (`Issuer.entry_floor`, M-JS-63)."""
+def compiled_gradient(hooks, name: str) -> list[dict]:
+    """The template's bf16 gradient under `hooks` at the suite's narrow widths, compiled for a compile-only
+    H100 as a start compiles it (`kernel_compile.compile_mosaic_kernels`: each launch's derived config
+    certified as it traces, `report.certified`), its records."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+    from kernel_compile import compile_mosaic_kernels
 
-    operands, (d_out, d_final) = cotangents(HOOKS, 'decays near one', 0)
-    operands = bf16(operands, HOOKS)
+    operands, (d_out, d_final) = cotangents(hooks, 'decays near one', 0)
+    operands = bf16(operands, hooks)
 
     def loss(operands):
-        out, final = chunk_on('mosaic_gpu', HOOKS, operands)
+        out, final = chunk_on('mosaic_gpu', hooks, operands)
         return jnp.sum(out * d_out) + jnp.sum(final * d_final)
 
     def call():
         return jax.grad(loss), (jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), operands),)
 
-    found = compile_mosaic_kernels([KernelCase('the narrow gated delta gradient', call)], 'sm90')
-    assert mosaic_failures(found) == []
+    return compile_mosaic_kernels([KernelCase(name, call)], 'sm90')
+
+
+@COMPILES_ON_CPU
+def test_a_gradients_kernels_are_each_certified_as_its_program_lowers():
+    """The gated delta net's bf16 gradient compiled for a compile-only H100 as a start compiles it
+    (`compiled_gradient`): every Mosaic GPU kernel its program runs, its training forward's and its fast
+    backward's, is one certification compiled alone, its launch certified as reverse mode runs it
+    (`report.pulled`), so a spilling kernel of it refuses its config there, not in a retrace of the whole
+    program (row 5905)."""
+    record, = compiled_gradient(SITES['gated'], 'the gated delta net gradient')
+    assert record["modules"] and set(record["modules"]) <= set(record["certified"]), record
+
+
+@COMPILES_ON_CPU
+def test_the_narrow_gated_delta_gradient_compiles_for_an_h100():
+    """The gated delta rule's bf16 gradient at the suite's narrow widths (16-wide keys, 8-wide values, its
+    gradient arms' heads), compiled for an H100 on this CPU (`compiled_gradient`) with no kernel failing: its
+    values' backward, 8 programs a multiprocessor at its model, launched each thread at 32 registers, under
+    the 34 its 16-column warpgroup MMAs assemble at (`Issuer.entry_floor`, M-JS-63)."""
+    from kernel_compile import mosaic_failures
+
+    assert mosaic_failures(compiled_gradient(HOOKS, 'the narrow gated delta gradient')) == []

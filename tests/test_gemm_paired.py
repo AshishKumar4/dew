@@ -206,7 +206,7 @@ def test_the_templates_paired_product_without_an_epilogue_holds_check_1(generati
 @lowers("sm90")
 def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper():
     """A side operand given back with its dimension of one, broadcast across its tile
-    (`grouped_matmul._unsqueezed`), which Mosaic's layout inference lays out where it found no layout for the
+    (`hooks._unsqueezed`), which Mosaic's layout inference lays out where it found no layout for the
     dimension of one itself (GMMGATE-h100-8): a Hopper call's forward and kernel gradient with such a
     prologue lower on the template's launch, named."""
     drawn = [jax.ShapeDtypeStruct(array.shape, array.dtype) for array in _draw(0)]

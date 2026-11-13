@@ -1504,7 +1504,7 @@ def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
                        natural: bool = False, params: tuple = (), width: int | None = None,
                        parts: int = 1, scaled: bool = False, codes: bool = False, positions: int = 0,
-                       per_span: int = 1) -> int:
+                       per_span: int = 1, merged: bool = False, started: bool = False) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -1605,8 +1605,8 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
         if residuals:
             phases.append([logits, weights, weights, bits, bits])
     if scopes_products(family):
-        phases = _read_back(phases, logits, (block_q, value_width, jnp.float32),
-                            parted=parts > 1 and not scaled)
+        phases = _scoped_phases(phases, logits, (block_q, value_width, jnp.float32),
+                                parted=parts > 1 and not scaled, merged=merged)
     depth = value_width if width is None else width
     products = _products(
         family, dtype,
@@ -1618,22 +1618,44 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     if codes:
         phases += _converted(block_k, value_width if width is None else width, value_width)
     walked = (max(resources.live_registers(family, carried, *phases, *products), scored)
-              + _held_registers(family, block_q, params, residuals=residuals))
+              + _held_registers(family, block_q, params, residuals=residuals)
+              + (_started_rows(family, block_q) if started else 0))
     return max(walked, _reach_registers(family, block_q, positions, per_span)) if positions else walked
+
+
+def _started_rows(family: mosaic.Family, block_q: int) -> int:
+    """The registers a training walk started from an initial state (sinks, a resumed call's) holds beside its
+    own: the state's peak and total rows, carried across the walk (priced none, an H100's 64-wide split
+    training forward under sinks or resumed priced 126 and spilled 8 bytes at the 128 its entry share leaves,
+    where its plain one held)."""
+    return 2 * family.row_registers(block_q, jnp.float32)
+
+
+def _scoped_phases(phases: list[list[tuple]], logits: tuple, sums: tuple, *, parted: bool,
+                   merged: bool) -> list[list[tuple]]:
+    """A forward's `phases` on a family that scopes its products in tensor memory (`scopes_products`): its
+    products read back beside them (`_read_back`), and where an initial state is `merged` past the walk
+    (`attention_mosaic_forward._started`), its sums and the merged sums beside the walk's (`algebra.merge`;
+    priced as the walk's alone, a B200's 64 x 64 forward on three consumers, width 128, under sinks priced
+    156 and spilled 16 bytes at 160). A register family's merge takes the walk's sums in place."""
+    phases = _read_back(phases, logits, sums, parted=parted)
+    return [*phases, [sums] * 2] if merged else phases
 
 
 def _read_back(phases: list[list[tuple]], logits: tuple, sums: tuple, *, parted: bool) -> list[list[tuple]]:
     """A forward's `phases` where its products are read back from tensor memory in their layout and converted
     to the walk's, both live at once (tcgen05's chunks, `Tcgen05ChunksIssuer.summed`): the `logits` a second
-    time in each phase holding them, and the weighted values' product beside the `sums` it adds into (a B200's
-    64 x 64 forward on three consumers, width 64, priced 126 of 160 and spilled 20 bytes; 64 x 128 132 and
-    184, et-h1need). An unscaled fp32 call's (`parted`) parts each read back from a fresh accumulator into
+    time in each phase holding them (a B200's 64 x 64 forward on three consumers, width 64, priced 126 of 160
+    and spilled 20 bytes; 64 x 128 132 and 184, et-h1need), and the weighted values' product beside the sums
+    it adds into, read in the sums' own layout (`mosaic_sm100._read`'s WGMMA layout), so once (priced twice, a
+    B200's 64 x 64 forward on two consumers over 128 of 256 columns 204, where ptxas held it in 154 with no
+    register moved). An unscaled fp32 call's (`parted`) parts each read back from a fresh accumulator into
     the walk's registers beside its step: an sm103's 64 x 64 decode priced 188 spilled 60 bytes at 248, so
     252 (bounded-removal)."""
     phases = [[*phase, logits] for phase in phases]
     if parted:
         phases[0] += [sums] * 2
-    return [*phases, [sums] * 2]
+    return [*phases, [sums]]
 
 
 def _reach_registers(family: mosaic.Family, block_q: int, positions: int, per_span: int) -> int:
@@ -1681,9 +1703,9 @@ class ForwardRegisters:
     widths, whether it keeps a training walk's split sums (`residuals`), whether its logits stay natural
     (`natural`, beside a config's own natural form), its score hook's parameters' kinds and kept dtypes,
     whether its walk scales in its kernel (`scaled`, `MosaicForward.scales_in_kernel`), converts its keys'
-    and values' quantized codes (`codes`, `attention_mosaic_forward._Codes`), and a packed call's intervals
+    and values' quantized codes (`codes`, `attention_mosaic_forward._Codes`), a packed call's intervals
     and their queries each (`positions`, `per_span`; none unpacked), whose reach its walk reads first
-    (`_reach_registers`)."""
+    (`_reach_registers`), and whether its walk merges an initial state past its keys (`merged`)."""
     dtype: Any
     width: int
     value_width: int
@@ -1695,6 +1717,8 @@ class ForwardRegisters:
     codes: bool = False
     positions: int = 0
     per_span: int = 1
+    merged: bool = False
+    started: bool = False
 
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
            columns: int | None = None) -> int | None:
@@ -1710,7 +1734,8 @@ class ForwardRegisters:
         return forward_registers(family, tiles, value_width, self.dtype, self.residuals,
                                  natural=tiles.natural_form or self.natural, params=self.params,
                                  width=width, parts=self.parts, scaled=self.scaled, codes=self.codes,
-                                 positions=self.positions, per_span=self.per_span)
+                                 positions=self.positions, per_span=self.per_span, merged=self.merged,
+                                 started=self.started)
 
 
 DQ_ROWS = 7
