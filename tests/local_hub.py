@@ -101,11 +101,39 @@ _DATE = "2024-01-01T00:00:00.000Z"
 """The date every discussion and commit states."""
 
 
+_CHUNK = 1 << 20
+"""The bytes the Hub reads a file in: a weight file of a gigabyte is never held whole, however many
+requests read it at once."""
+
+
+def _chunks(path: Path, start: int = 0, stop: int | None = None):
+    """`path`'s bytes from `start` to `stop` (its end where None), `_CHUNK` at a time."""
+    with path.open("rb") as file:
+        file.seek(start)
+        left = (path.stat().st_size if stop is None else stop) - start
+        while left > 0:
+            chunk = file.read(min(_CHUNK, left))
+            if not chunk:
+                return
+            left -= len(chunk)
+            yield chunk
+
+
+def _sha1(path: Path) -> str:
+    """A file's SHA-1, read a chunk at a time: its oid and ETag as the Hub states them."""
+    digest = hashlib.sha1()
+    for chunk in _chunks(path):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _hashed(files: Mapping[str, Path], parent: str = "") -> str:
     """A commit's hash: its files' names and bytes, after its parent's."""
     digest = hashlib.sha1(parent.encode())
     for name, path in sorted(files.items()):
-        digest.update(name.encode() + b"\0" + path.read_bytes())
+        digest.update(name.encode() + b"\0")
+        for chunk in _chunks(path):
+            digest.update(chunk)
     return digest.hexdigest()
 
 
@@ -160,7 +188,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._missing("EntryNotFound", head=head, commit=commit)
             else:
                 self._json([{"type": "file", "path": name, "size": files[name].stat().st_size,
-                             "oid": hashlib.sha1(files[name].read_bytes()).hexdigest()}
+                             "oid": _sha1(files[name])}
                             for name in sorted(files) if name.startswith(f"{folder}/" if folder else "")],
                            head=head)
             return
@@ -172,22 +200,23 @@ class _Handler(BaseHTTPRequestHandler):
             self.hub.served.append(Served(self.command, repo, name, None, 0))
             self._missing("EntryNotFound", head=head, commit=commit)
             return
-        body = files[name].read_bytes()
+        path = files[name]
+        size = path.stat().st_size
         asked = _RANGE.fullmatch(self.headers.get("range", "")) if not head else None
-        start, stop = (0, len(body)) if asked is None else (
-            int(asked[1]), min(len(body), int(asked[2]) + 1 if asked[2] else len(body)))
-        sent = body[start:stop]
+        start, stop = (0, size) if asked is None else (
+            int(asked[1]), min(size, int(asked[2]) + 1 if asked[2] else size))
         self.hub.served.append(Served(self.command, repo, name, None if asked is None else (start, stop),
-                                 0 if head else len(sent)))
+                                 0 if head else stop - start))
         self.send_response(200 if asked is None else 206)
         self.send_header("X-Repo-Commit", commit)
-        self.send_header("ETag", f'"{hashlib.sha1(body).hexdigest()}"')
-        self.send_header("Content-Length", str(len(body) if head else len(sent)))
+        self.send_header("ETag", f'"{_sha1(path)}"')
+        self.send_header("Content-Length", str(size if head else stop - start))
         if asked is not None:
-            self.send_header("Content-Range", f"bytes {start}-{stop - 1}/{len(body)}")
+            self.send_header("Content-Range", f"bytes {start}-{stop - 1}/{size}")
         self.end_headers()
         if not head:
-            self.wfile.write(sent)
+            for chunk in _chunks(path, start, stop):
+                self.wfile.write(chunk)
 
     def _pulls(self, sent: str, *, head: bool) -> bool:
         """Answer a repo's discussions (its open pull requests) or a revision's commits, the revision's

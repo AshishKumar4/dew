@@ -18,19 +18,15 @@ on:
     branches: [ "main", "base/kernels" ]
   pull_request:
     branches: [ "main" ]
-  # A dispatch runs its ref as a push would; with `whole`, it is the daily run's whole suite, which the land queue
-  # dispatches on main after every fifth publish (bible: the whole suite every fifth publish).
+  # A dispatch runs its ref as a push would; with `whole`, the whole suite, which nothing dispatches on its own: the
+  # daily run stopped (owner, 2026-11-13: trains are the only check), and the whole suite's own cells and release
+  # checks wait on his word (bible line 89).
   workflow_dispatch:
     inputs:
       whole:
         description: "the whole suite, as the daily run's: every file on every Python, the whole_suite cells and the release checks, the test cache off"
         type: boolean
         default: false
-  # Daily, main's every test file runs on every Python, the whole_suite cells and the release checks among them,
-  # the test cache aside (tools/armada/ci.py), so nothing it skipped can hide: the whole suite, which the land
-  # queue reads (its daily runs), each red a P1 of its file's owner.
-  schedule:
-    - cron: "17 9 * * *"
   # The release workflow runs all of this on the release's own commit and
   # publishes only if every job passes.
   workflow_call:

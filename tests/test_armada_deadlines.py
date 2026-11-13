@@ -4,9 +4,11 @@ it holds red, and says where every thread of its pytest stood."""
 import base64
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -249,10 +251,15 @@ def test_a_task_says_each_red_row_last_where_armada_keeps_its_tail(ci, tmp_path,
     assert "the sum is wrong" in said[red + 1] and "  | ..." in said[red:]
 
 
-def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci, tmp_path):
+def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci, tmp_path, monkeypatch):
     """A pytest an abort ends (a native library's, here os.abort) keeps its whole output and its processes'
     native stacks among the task's artifacts, named on its red row, so the cause is read from what it left
-    (row 5801: train 788's abort left faulthandler's Python stacks and no native frame; owner, 2026-11-13)."""
+    (row 5801: train 788's abort left faulthandler's Python stacks and no native frame; owner, 2026-11-13).
+    The capture's own scratch (its pipe and what it read) goes once the stacks are read (review of train 791,
+    F7)."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_any.py": "import os\n\n\ndef test_aborts():\n    print('before the abort')\n"
                                       "    os.abort()\n"})
@@ -265,6 +272,36 @@ def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci,
     # then every signalled process's native stacks, read from outside it.
     assert "Fatal Python error: Aborted" in record and "test_any.py" in record
     assert "ended by signal 6" in record.split("== native stacks", 1)[1]
+    assert not list(scratch.glob("dew-capture-*"))
+    # The row says its capture was armed and the stacks were read: what the land queue publishes a red that
+    # does not repeat on (bible §88).
+    assert (aborted["capture"], aborted["natives"]) == ("armed", "read")
+
+
+def test_a_red_whose_capture_could_not_be_armed_says_why(ci, tmp_path, monkeypatch):
+    """A red row whose task could not arm the native-stack capture says why on its row (`capture`), so the
+    land queue never takes it for a red whose signal would have been read (bible §88: a red that does not
+    repeat publishes only where CI keeps a native backtrace of any task a signal ends)."""
+    interpreter(tmp_path, "3.12")
+    monkeypatch.setattr(ci.natives, "built", lambda: (None, "no C compiler in the container"))
+    written(tmp_path, {"test_any.py": "def test_fails():\n    assert False\n"})
+    ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "unarmed.json", 30.0, cache="off")
+    [red] = json.loads((tmp_path / "unarmed.json").read_text())["rows"]
+    assert red["exitCode"] == 1 and "natives" not in red
+    assert red["capture"] == "no C compiler in the container"
+
+
+def test_a_signalled_process_the_collector_never_read_leaves_its_rows_natives_unread(ci, tmp_path):
+    """A process a signal ends whose word the collector never reads (the collector gone, as one ended with
+    words still queued) marks itself signalled from its own handler, so the row says its native stacks are
+    `unread`: the land queue never takes such a run for one that kept them (review, 2026-11-13)."""
+    capture = ci.natives.Capture(Path(sys.executable).with_name("py-spy"))
+    assert capture.variables, capture.why
+    capture.collector.kill()
+    capture.collector.wait()
+    subprocess.run([sys.executable, "-c", "import os; os.abort()"], env={**os.environ, **capture.variables},
+                   check=False, timeout=60)
+    assert capture.evidence(capture.stacks()) == {"capture": "armed", "natives": "unread"}
 
 
 def test_a_worker_a_signal_ends_keeps_its_native_stacks_though_pytest_exits_red(ci, tmp_path):

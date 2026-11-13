@@ -1579,13 +1579,13 @@ def evidence_name(python: str, tests: list[str], group: str) -> str:
 
 def watched_pytest(command: list[str], environment: dict[str, str], deadline: float, grace: float, pid: Path,
                    python: str, name: str, began: float
-                   ) -> tuple[int, str, bool, str, set[str], set[str], str | None]:
+                   ) -> tuple[int, str, bool, str, set[str], set[str], dict]:
     """pytest run as a task runs it (`ran_pytest`), with the task environment's py-spy reading a stalled run's
     stacks (`stalls.dumped`) and a collector outside it reading those of any process of it a signal ends
     (`natives.Capture`): its exit, output, whether it expired, a stall's stacks, the files it opened and
-    wrote, and the evidence it left among the task's artifacts, named `name`: a stall's record, or a red run's
-    whole output with the native stacks where a signal ended it or a process of it (a worker its test
-    started), as one record (`stalls.kept`)."""
+    wrote, and what a red row of it says of its evidence: its capture's (`Capture.evidence`), and among the
+    task's artifacts, named `name`, a stall's record, or a red run's whole output with the native stacks where
+    a signal ended it or a process of it (a worker its test started), as one record (`stalls.kept`)."""
     spy = Path(f".venv-{python}/bin/py-spy")
     capture = natives.Capture(spy, dict(environment))
     try:
@@ -1593,15 +1593,16 @@ def watched_pytest(command: list[str], environment: dict[str, str], deadline: fl
             command, {**environment, **capture.variables}, deadline, grace, pid, spy)
     finally:
         stacks = capture.stacks()
-    root = armada_dir("ARMADA_ARTIFACTS", ARTIFACTS)
+    root, evidence = armada_dir("ARMADA_ARTIFACTS", ARTIFACTS), capture.evidence(stacks)
     if expired:
         kept = stalls.kept(root, name, dump, time.time() - (time.monotonic() - began))
     elif returncode != 0 and (returncode < 0 or "ended by signal" in stacks):
         kept = stalls.kept(root, f"signalled-{name}", f"{output}\n== native stacks\n{stacks}",
                            time.time() - (time.monotonic() - began))
     else:
-        return returncode, output, expired, dump, opened, wrote, None
-    return returncode, output, expired, dump, opened, wrote, str(kept.relative_to(root))
+        return returncode, output, expired, dump, opened, wrote, evidence
+    return returncode, output, expired, dump, opened, wrote, {**evidence,
+                                                              "artifacts": [str(kept.relative_to(root))]}
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
@@ -1651,7 +1652,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                               **({progress.SET_ASIDE: str(aside)} if resumes else {})})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
-    returncode, output, expired, dump, opened, wrote, stall = watched_pytest(
+    returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
         command, environment, deadline, grace, pid, python, evidence_name(python, tests, group), began)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     # How collection found each file: a file with no row is green only where every test it holds was set aside
@@ -1680,11 +1681,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart; a check-1 site's judge apart from its file, its pooling no part of the file's tasks.
         ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
-                     # A stall's stacks whole, then the end of what pytest wrote; a red's stall's whole record
-                     # among its evidence (`stalls.kept`).
+                     # A stall's stacks whole, then the end of what pytest wrote; a red's capture and its
+                     # stall's or signal's record among its artifacts (`watched_pytest`).
                      "output": "\n".join(red + ([dump[:12000]] if dump else [])
                                          + ([output[-12000:]] if red else [])),
-                     **({"artifacts": [stall]} if stall is not None and red else {}),
+                     **(evidence if red else {}),
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ...").
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      # Where the task ran out of time, a file that never started: no seconds to time it by.
