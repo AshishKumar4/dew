@@ -43,6 +43,9 @@ class DCAEFields(TypedDict):
     decoder_activations: tuple[str, ...]
     unshuffle: bool
     interpolate: bool
+    encoder_shortcut: bool
+    decoder_shortcut: bool
+    decoder_out_activation: str
 
 
 def _per_level(config: Mapping[str, object], name: str, levels: int) -> tuple:
@@ -81,7 +84,11 @@ def dc_ae_fields(config: Mapping[str, object]) -> DCAEFields:
         decoder_norms=_per_level(config, "decoder_norm_types", levels),
         decoder_activations=_per_level(config, "decoder_act_fns", levels),
         unshuffle=config["downsample_block_type"] == "pixel_unshuffle",
-        interpolate=config["upsample_block_type"] == "interpolate")
+        interpolate=config["upsample_block_type"] == "interpolate",
+        # AutoencoderDC's own defaults where a config states none.
+        encoder_shortcut=_records.boolean(config.get("encoder_out_shortcut", True), "encoder_out_shortcut"),
+        decoder_shortcut=_records.boolean(config.get("decoder_in_shortcut", True), "decoder_in_shortcut"),
+        decoder_out_activation=str(config.get("decoder_conv_act_fn", "relu")))
     checks = [
         (
             "block types",
@@ -89,7 +96,8 @@ def dc_ae_fields(config: Mapping[str, object]) -> DCAEFields:
             {"ResBlock", "EfficientViTBlock"},
         ),
         ("decoder norm types", set(fields["decoder_norms"]), {"rms_norm", "batch_norm"}),
-        ("decoder activations", set(fields["decoder_activations"]), set(ACTIVATIONS)),
+        ("decoder activations", {*fields["decoder_activations"], fields["decoder_out_activation"]},
+         set(ACTIVATIONS)),
         ("downsample_block_type", {config["downsample_block_type"]}, {"pixel_unshuffle", "Conv"}),
         ("upsample_block_type", {config["upsample_block_type"]}, {"pixel_shuffle", "interpolate"}),
     ]
