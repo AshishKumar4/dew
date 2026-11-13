@@ -36,10 +36,11 @@ TEXT_FIELDS = ("text", "txt", "caption")
 
 def conventional(held: Collection[str], field: str, convention: Sequence[str]) -> str:
     """The field of `held` a step reads that names `field`: `field` itself where `held` holds it; where
-    `field` is the convention's first, which a step reads by default, the first of `convention` `held` holds
-    (row 5757); else `field`, which the step's read refuses as missing. A field the convention names and a
-    record lacks thus reads by the convention, and any other the step was given is read as it is named."""
-    if field in held or field != convention[0]:
+    `convention` names `field`, the first of `convention` `held` holds (row 5757); else `field`, which the
+    step's read refuses as missing. A field the convention names and a record lacks thus reads by the
+    convention (a prepared record's `jpg` for a step given `image`), and any other the step was given is read
+    as it is named."""
+    if field in held or field not in convention:
         return field
     return next((name for name in convention if name in held), field)
 
