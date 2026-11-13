@@ -651,6 +651,13 @@ def _repeat_promised() -> bool:
     return jax.default_backend() == "cpu" or deterministic_ops_requested()
 
 
+def _arm_name(arm, reference_fn, library_fn, at_arm: int) -> str:
+    """How a refusal names one of a site's arms beside Dew's: the reference, the library arm, or a further
+    reference by its place among the arms."""
+    return ("the reference" if arm is reference_fn else "the library arm" if arm is library_fn
+            else f"reference {at_arm}")
+
+
 def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
     """Raise unless `fn`, `name` of a check's arms, gives `first` again on the same `inputs`: an arm that
     draws a noise of its own, or reads state its last call left, compares Dew with a reference on draws no
@@ -1100,8 +1107,11 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                                                else (mine_at, truth, terms))
                 with summed_as_run():
                     other = dew if dew_fn is arm and here is mine_at else arm(*here)
-                    if not at and arm is reference_fn and arm is not dew_fn and here is ordered[0][1]:
-                        _of_its_inputs(label, "the reference", arm, here, other)
+                    # Every arm whose result enters the verdict is a function of its inputs: the
+                    # reference, the library arm and each further reference, each run again.
+                    if not at and arm is not dew_fn and mine_at is ordered[0][0]:
+                        _of_its_inputs(label, _arm_name(arm, reference_fn, library_fn, at_arm), arm, here,
+                                       other)
                 shared = true_here is truth
                 if weighed is not None:
                     terms_here = weighed[id(true_here)].ones

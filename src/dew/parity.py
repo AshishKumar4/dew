@@ -1021,7 +1021,13 @@ class _Draws:
         Dew on the same draws against the library arm (`assert_as_exact`'s `library_fn`), on the
         exception's `leaves` alone: seed by seed and leaf by leaf, the reference's evidence (its error,
         its worst row, its rows of float64 zero) is whichever of the two arms' error is the larger there,
-        and a value must be finite in both. Every other leaf is the reference's alone."""
+        and a value must be finite in both. Every other leaf is the reference's alone, its examples'
+        evidence with it (a site of stacked examples, `examples`). A covered leaf holds no examples'
+        evidence and is judged without it, by its pooled ratio, its draws' paired ratios and its worst row:
+        the example rules' nulls take Dew and one reference as an exchangeable pair on each example, which
+        neither an arm chosen seed by seed nor the larger of two arms' errors example by example is (the
+        first refuses equal arms by the paired rows, the second by the tails about a draw's median); a rule
+        for the pair of arms is ledger 5707's."""
         if library.names != self.names or len(library.mine) != len(self.mine):
             raise AssertionError("the library arm's draws are not the reference's")
         unknown = sorted(set(leaves) - set(self.names))
@@ -1035,13 +1041,18 @@ class _Draws:
         zero_rows = [[(theirs if chosen else mine)
                       for mine, theirs, chosen in zip(seed, other, picked, strict=True)]
                      for seed, other, picked in zip(self.zero_rows, library.zero_rows, pick, strict=True)]
-        # A library arm's leaves are judged by their pooled ratio alone: their examples are not Dew's against
-        # one reference.
         # A picked cell's worst row is the library arm's, and so is its share.
         shares = self.held_shares().copy()
         shares[..., 1] = np.where(pick, library.held_shares()[..., 1], shares[..., 1])
+
+        def uncovered(field: str):
+            held = getattr(self, field)
+            return None if held is None else [[None if covered[leaf] else examples
+                                               for leaf, examples in enumerate(row)] for row in held]
+
         return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
-                      self.finite & (library.finite | ~covered), self.widths, shares=shares)
+                      self.finite & (library.finite | ~covered), self.widths,
+                      uncovered("examples"), uncovered("example_rows"), shares)
 
 
 def _shares(found: list[list], count: int) -> np.ndarray:
