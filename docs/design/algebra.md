@@ -1304,9 +1304,12 @@ Agreed with the GEMM template's owner (2026-11-03):
 - A declaration names the fragment layout the family's MMA reads, which the family bundle supplies: on sm90
   the wgmma A-operand fragment, the weight taken as A and swapped onto M at decode shapes so the decoder writes
   straight into it; on sm100 the tcgen05 and tensor-memory layouts. A thread's input is the packed words it
-  loads: a 32-bit word holds 8 E2M1 codes.
+  loads: a 32-bit word holds 8 E2M1 codes. (Today a declaration, `bits.BitTransform`, names no layout: the
+  packed GEMM takes the warpgroup MMA's fragment layout itself, `templates/gemm/packed.py`.)
 - Block scales (NVFP4's 1×16, MX's 1×32) are a separate transform of a fixed layout, which feeds the
-  template's promotion and epilogue: a form may re-encode the codes, never the scales.
+  template's promotion and epilogue: a form may re-encode the codes, never the scales. (Today the scales are
+  no declared transform: the packed path reads their E4M3 codes by the format's integer decode,
+  `bits.decoded`.)
 - Each decode a template takes is declared and checked in once, in `dew.algebra.bits`, the one source the
   engine's and the consumer's tests prove: `NVFP4_BFLOAT16`, eight E2M1 codes of a word in their natural
   order (code `i` at bits `4i`, a byte's low nibble the earlier element) into four bfloat16 pairs, each the
@@ -1324,7 +1327,9 @@ Agreed with the GEMM template's owner (2026-11-03):
   the portable path scales it in integer exponent arithmetic, never through a lane that flushes subnormals.
 - The consumer records the form it takes: its encoder and the encoder's version (in the
   checkpoint), the decoder's live registers per thread (which `resources.py` prices before a tile is admitted)
-  and its issues by pipe (`BitForm.issues`). `Work` holds no integer pipe yet: the consumer's head adds the
+  and its issues by pipe (`BitForm.issues`). (Today the packed matrix, `formats.NvFp4`, stores its words in
+  the checked-in form's layout beside its scales, and no encoder or version with them.) `Work` holds no
+  integer pipe yet: the consumer's head adds the
   ALU's and the FMA pipe's integer issues to it, each 64 results a clock per multiprocessor (§7.2), so
   `cost.py` prices a form's mix beside the tile's other work. Its tests prove the form again.
 - The decoder is emitted inline at a matrix-operand hook the GEMM template adds (row 3621): `BitForm.ptx(i)`
