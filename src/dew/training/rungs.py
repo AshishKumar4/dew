@@ -54,8 +54,7 @@ RECORD_VERSION = 3
 
 
 def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
-             mesh: Mesh, step: Callable[..., StepFn] | None = None,
-             capacity: int | None = None) -> dict[str, JSON] | None:
+             mesh: Mesh, step: Callable[..., StepFn] | None = None) -> dict[str, JSON] | None:
     """What a recorded rung was decided for, read before the step traces: the
     configuration of the `modules` its programs run at the rung it starts from
     (`Objective.program_key`) and a custom `step`, as an identity states them
@@ -76,7 +75,7 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
         _log.info("the step keeps no rung record, its rung decided as it compiles: %s", unstated)
         return None
     devices = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    limits = {f"{device.device_kind}, limit {device_memory(device).get('bytes_limit', capacity)}"
+    limits = {f"{device.device_kind}, limit {device_memory(device).get('bytes_limit')}"
               for device in devices}
     devices_seen: list[JSON] = [*sorted(limits)]
     settings = sorted(os.environ.get('XLA_FLAGS', '').split())
@@ -93,8 +92,7 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
 
 
 def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
-                  mesh: Mesh, step: Callable[..., StepFn] | None = None,
-                  capacity: int | None = None,
+                  mesh: Mesh, step: Callable[..., StepFn] | None = None
                   ) -> tuple[Path | None, dict[str, JSON], JSON]:
     """Where the rung of the step over `arguments` on `mesh` is recorded, its key
     (`rung_key`), and the rung the record holds (None if there is none). A
@@ -106,7 +104,7 @@ def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch]
     directory = rung_records()
     if directory is None or jax.process_count() > 1:
         return None, {}, None
-    key = rung_key(modules, arguments, splits, mesh, step, capacity)
+    key = rung_key(modules, arguments, splits, mesh, step)
     if key is None:
         return None, {}, None
     path = directory / f"{hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()}.json"
