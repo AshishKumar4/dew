@@ -173,7 +173,7 @@ _log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from dew.optim import OptimConfig
     from dew.telemetry.profile import Profiler
-    from dew.training.ahead import AheadOfTime
+    from dew.training.ahead import AheadOfTime, LaterPhases
 
 StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
 """A compiled step's body: the state and the global batch in, the new state,
@@ -280,6 +280,9 @@ class Trainer(Generic[Loss, Effects]):
         self.lower_for, self.tune_kernels = lower_for, tune_kernels
         self.inspection, self.param_dtype, self.diloco = inspection, param_dtype, diloco
         self.phase_passes = PhasePasses.of(objective, phase_passes)
+        # A configured run trained again to compile its later phases' steps ahead (`LaterPhases`, set by
+        # `dew.config.RunConfig.train`); none for a trainer used directly.
+        self.later_phases: LaterPhases | None = None
         if diloco is not None:
             diloco.admits(self.layout.host, record)
         # Where the fit ladder stands and the links its traces read (`StepCompiler`), and what the last
@@ -867,6 +870,22 @@ class Trainer(Generic[Loss, Effects]):
             return advanced, loss, aux, None
         return run
 
+    def _warmed(self, plan: FitPlan, run: FitRun, state: TrainState, shardings: Placement[TrainState], *,
+                first: bool) -> None:
+        """The evaluations' programs warmed beside a step's compile (`Evaluator.warm`): the run's first, and
+        one at another rung than they were last warmed at (`FitRun.warmed`)."""
+        if not first and self._compiler.rung() == run.warmed:
+            return
+        with run.startup.phase("warm", "warming the evaluations", when=first), run.held():
+            self._evaluator().warm(plan, state, shardings, self._compiler.links(self.device_mesh),
+                                   first=first)
+        run.warmed = self._compiler.rung()
+
+    def _planned_afresh(self) -> None:
+        """The step planned afresh, as where a phase of other passes begins at an update's end: at the split
+        the run was given, or the planner's for its own passes."""
+        self._shape = dataclasses.replace(self._shape, split=self._given_split)
+
     @ruled
     def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None, *,
                 capacity: int | None = None) -> CompiledStep:
@@ -1027,6 +1046,8 @@ class Trainer(Generic[Loss, Effects]):
                 if plan.restore_best and run.preempted is None:
                     trained = self._best_model(trained, run)
             finally:
+                if self.later_phases is not None:
+                    self.later_phases.stopped()
                 primary = sys.exception()
                 error = self._closed(run, primary, profiler)
                 if primary is None and error is not None:
@@ -1165,9 +1186,7 @@ class Trainer(Generic[Loss, Effects]):
                     run.reads[signature] = step_reads(self.executable, signature)
                 interval.compiles = len(compiled)
                 if len(compiled) > known:
-                    with run.startup.phase("warm", "warming the evaluations", when=not known), run.held():
-                        self._evaluator().warm(plan, state, shardings, self._compiler.links(self.device_mesh),
-                                               first=not known)
+                    self._warmed(plan, run, state, shardings, first=not known)
                 if not known:
                     # Rebound once the step is compiled, so the first tick measures steps, not the compile.
                     interval.last_log_time = time.time()
@@ -1180,6 +1199,9 @@ class Trainer(Generic[Loss, Effects]):
                     state, loss, aux, finite, accepted, committed = train_step(
                         state, device, sampled=self.inspection is not None and self.inspection.samples(
                             run.current + 1, self.accumulation))
+                if not seen and self.later_phases is not None:
+                    # Once the first step is dispatched, its later phases' steps compile ahead off the run.
+                    self.later_phases.started(self, batch)
                 # Written off the loop, which never waits on it (row 2313), its clock the step it sees done.
                 interval.seen()
                 self._read_taken(run, wait=False)
@@ -1882,7 +1904,7 @@ class Trainer(Generic[Loss, Effects]):
             # the run was given or the planner's for its own passes, over the state as a fresh state holds
             # it, no window laid out; one that begins inside an update keeps the run's, the one its open
             # window is laid out for.
-            self._shape = dataclasses.replace(self._shape, split=self._given_split)
+            self._planned_afresh()
             if state.inner is None:
                 state = laid_out(state, self.accumulation)
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.
