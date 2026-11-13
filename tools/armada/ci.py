@@ -1061,8 +1061,9 @@ def site_costs(python: str, name: str, test: str) -> dict[str, float]:
         python_, _, rest = record["site"].partition("::")
         node = rest.rpartition("::")[0]
         if (python_, node.split("::")[0]) == (python, name) and session.site_name(node, held) == test:
-            records.append(costs.Drawn(task_start=record["task_start"], task_stop=record["task_stop"],
-                                       before=record["before"], draws=record["draws"]))
+            # The record's own words, those of what its draws paid once among them where it keeps them.
+            records.append(costs.Drawn(**{word: record[word] for word in costs.Drawn.__annotations__
+                                          if word in record}))
     return costs.timed(site_task(python, name, test), records, held[test].units)
 
 

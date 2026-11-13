@@ -136,6 +136,7 @@ from dew.parity import (
     recorded_kinds,
 )
 from dew.parity_stages import REDRAW, staged_units
+from dew.telemetry.compiles import Compiles
 from dew.training.compiled_program import lowering_platform
 
 PRECISION = "precision"
@@ -1075,9 +1076,21 @@ def _draw_truth(truth_and_terms, prepared, dew_fn, inputs):
     return _followed_truth(prepared, ran, inputs), None, ran
 
 
+def _first_timed(timed: dict, rows_at: Callable, seed):
+    """The first draw's rows (`rows_at(0, seed)`), its seconds and the backend compiles JAX reports within
+    it written to `timed` (a jit compiles at its first call): what the process pays once, whatever it goes
+    on to draw."""
+    began = time.perf_counter()
+    with Compiles(None) as compiles:
+        rows = rows_at(0, seed)
+    timed.update(first=time.perf_counter() - began, compiled=sum(compiles.seconds))
+    return rows
+
+
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
            library_fn=None, library_leaves: Sequence[str] = (), also: Sequence = (), terms_fn=None,
-           label: str = "", examples: bool = False, conditioning=None, followed=None):
+           label: str = "", examples: bool = False, conditioning=None, timed: dict | None = None,
+           followed=None):
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
     the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
@@ -1090,17 +1103,18 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     of the two on `library_leaves` (`_Draws.against_larger`), Dew and the truth evaluated once. With
     `also`, further references run beside it on Dew's own inputs, each held to Dew's truth, Dew and the
     truth evaluated once for them all: the reference's draws, then each further reference's, a list. With
-    `terms_fn`, the truth is that program's with each output's terms (`float64_terms`),
-    every row sized by the larger of its own RMS and its terms' (`_LaidTruths.of`); with a site's own
-    terms program (`_SiteTerms`), the truth is as without and its terms that program's, on the same
-    widened inputs. With `conditioning` (dew.parity's `Conditioning`), every arm's leaves are read as
-    residuals in units of the reference's rounding at its truth's inputs (`Weighed.weighed`). With
-    `followed`, each arm is held to the truth of its own decisions (`_draw_truth`, `_followed_truth`)."""
+    `terms_fn`, the truth is that program's with each output's terms (`float64_terms`), every row sized by
+    the larger of its own RMS and its terms' (`_LaidTruths.of`); with a site's own terms program
+    (`_SiteTerms`), the truth is as without and its terms that program's, on the same widened inputs. With
+    `conditioning` (dew.parity's `Conditioning`), every arm's leaves are read as residuals in units of the
+    reference's rounding at its truth's inputs (`Weighed.weighed`). With `followed`, each arm is held to
+    the truth of its own decisions (`_draw_truth`, `_followed_truth`)."""
     if orders is not None and any(getattr(fn, "recorded", False) for fn in (reference_fn, *also)):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
     arms = [reference_fn] + ([] if library_fn is None else [library_fn]) + list(also)
     evidence: list[list] = [[] for _ in arms]
     names, widths = None, None
+    prepared_followed = None if followed is None else _truth_program(followed)
     # Each arm's per-example ratios of the draw being read, and of every draw read (`examples`).
     stacked: list = [None for _ in arms]
     stacked_rows: list = [None for _ in arms]
@@ -1109,8 +1123,6 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
 
     def truth_and_terms(inputs):
         return _truth_and_terms(truth_fn or reference_fn, terms_fn, inputs)
-
-    prepared_followed = None if followed is None else _truth_program(followed)
 
     def rows_at(at, seed):
         """Every arm's evidence on the draw at `seed`, the `at`th, its orders' worst rows the larger."""
@@ -1186,7 +1198,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         return rows
 
     for at, seed in enumerate(seeds):
-        rows = rows_at(at, seed)
+        rows = rows_at(at, seed) if timed is None or at else _first_timed(timed, rows_at, seed)
         for at_arm, row in enumerate(rows):
             evidence[at_arm].append(row)
             per_example[at_arm].append(stacked[at_arm])
@@ -1290,17 +1302,20 @@ def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn,
 
 
 def _recorded(label: str, drawn_for, references: int, arms, upto: int | None = None,
-              weighed: dict | None = None, offset: int = 0) -> bool:
+              weighed: dict | None = None, offset: int = 0, first: dict | None = None) -> bool:
     """A map task's draws (`record_units`): each of a site's `references` draws over its range, up to
     `upto` where given, with its arms' YNNPACK mode (`_mode_of`) and, weighed, its classes' digest
-    (`Conditioning.digest`), the seconds its weighing took beside its draws'. False where the process is
-    no map task."""
+    (`Conditioning.digest`), the seconds its weighing took beside its draws', and those of its first draw
+    with the backend compiles JAX reported within it (`first`, `compiled`, `_drawn`'s): a site's arms
+    compile at their first call, so a task's first draw holds its compiles, a cost it pays once whatever
+    it draws, which the plan must not read as each draw's (tools/armada/costs.py's `timed`; a site cut to
+    two draws a task paid its compiles 128 times, row 5492). False where the process is no map task."""
     def payload(start, stop):
         draws = [drawn_for(index)(start, stop) for index in range(references)]
         held = (weighed or {}).get("of")
         return {"draws": draws, "refused": _mode_of(arms), "heavy": None if held is None else held.digest()}
     return record_units(label, payload, upto=upto, offset=offset,
-                        phases=lambda: {"weighing": (weighed or {}).get("seconds", 0.0)})
+                        phases=lambda: {"weighing": (weighed or {}).get("seconds", 0.0), **(first or {})})
 
 
 def _pooled_draws(label: str, references: int, arms):
@@ -1568,6 +1583,8 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     ranges: dict[tuple[int, int], list[_Draws]] = {}
     # The site's weighing where it draws (`weighing`), built once, and the seconds that took.
     weighed: dict[str, object] = {}
+    # The seconds of the first draw this process takes of the site and of its compiles (`_drawn`'s `timed`).
+    first: dict[str, float] = {}
 
     def conditioning_now():
         if weighing is not None and "of" not in weighed:
@@ -1583,7 +1600,7 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
                 draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
                                library_fn=library_fn, library_leaves=library_leaves, also=further,
                                terms_fn=terms_fn, label=label, examples=examples,
-                               conditioning=conditioning_now(), followed=followed)
+                               conditioning=conditioning_now(), timed=first, followed=followed)
                 ranges[start, stop] = draws if further else [draws]
                 narrow_leaves[:] = _narrow(ranges[start, stop][0])
             return ranges[start, stop][index]
@@ -1591,7 +1608,7 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
 
     arms = [dew_fn, reference_fn, *([] if library_fn is None else [library_fn]), *further]
     # A map task of the site's draws, or their judge (DRAWS, POOL).
-    if _recorded(label, drawn_for, 1 + len(further), arms, upto, weighed, offset):
+    if _recorded(label, drawn_for, 1 + len(further), arms, upto, weighed, offset, first):
         return
     pooled = _pooled_draws(label, 1 + len(further), arms)
     if pooled is not None:
