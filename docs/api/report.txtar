@@ -978,7 +978,7 @@ dew.optim.PowerTail
   start: int
   steps: int | None = None
   end_value: float = 0.0
-dew.optim.ScheduleBase
+dew.optim_schedules.ScheduleBase
   every: int = 1  [keyword-only]
 dew.quantization.Quantization
   dtype: QuantizedDtype = 'int8'

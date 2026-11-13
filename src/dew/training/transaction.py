@@ -735,7 +735,7 @@ class Transaction:
         placement, which the commit's gradient is constrained to (`placed_as`). `examples`
         is a run's bound in source examples, where it counts no updates ahead: each update hands its
         optimizer the run's progress, the share of them its state has consumed (`TrainState.consumed`),
-        which a schedule over the run reads (`dew.optim.ScheduleBase.progressed`).
+        which a schedule over the run reads (`dew.optim_schedules.ScheduleBase.progressed`).
         """
         self.resting = dict(resting or {})
         self.placed = placed

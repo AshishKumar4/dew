@@ -28,7 +28,7 @@ from dew.batch import CONSUMED_COUNT, Batch, ConsumedCount
 from dew.data.dataset import rows_of
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32
-from dew.optim import learning_rate
+from dew.optim_schedules import learning_rate
 from dew.state import TrainState
 from dew.telemetry.instrumentation import (
     NO_FLOPS,
@@ -425,9 +425,9 @@ def held(rate: jax.typing.ArrayLike | None, scale: jax.Array | None,
 
 
 def copied(state: TrainState) -> tuple[jax.Array | None, jax.Array | None]:
-    """`held`'s copies of the learning rate `state`'s optimizer state holds (`dew.optim.learning_rate`,
-    under DiLoCo its groups') and its loss scale, which a log reads: the run's call and a run compiled
-    ahead's alike (`dew.training.ahead.started`)."""
+    """`held`'s copies of the learning rate `state`'s optimizer state holds
+    (`dew.optim_schedules.learning_rate`, under DiLoCo its groups') and its loss scale, which a log reads:
+    the run's call and a run compiled ahead's alike (`dew.training.ahead.started`)."""
     rate, scale = learning_rate(rated(state)), None if state.scale is None else state.scale.scale
     if rate is None and scale is None:
         return None, None
