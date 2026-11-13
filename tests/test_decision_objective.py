@@ -202,6 +202,46 @@ def test_a_held_pass_scores_a_soft_target_as_its_training_charges_it(rule):
                     f"a soft target's held-out {rule.name}", seeds=SOFT_SEEDS[f"held {rule.name}"])
 
 
+DOCUMENTS_SEEDS = 8
+"""Check 1's declared seeds for the loss at a read's declared documents against the objective's bound."""
+
+
+def test_a_step_reads_its_windows_at_the_documents_its_read_declares():
+    """A window's rows are its read's packer documents: a memory read measures the most a window holds and
+    declares it (`tokens_coordinates`, `dew.data.steps.generic.Coordinated`), and the step lays its
+    windows out at that bound, the objective's own (`DecisionObjective.segments`) a cap above it: rows
+    longer than half a window one document a window, the plain form a sequence kernel takes, short rows
+    as many as the read's windows took. At the declared bound the loss is on par (check 1) with the same
+    batch's at the objective's bound (row 5916)."""
+    from dew.decision.task import laid_out
+    from dew.objectives.base import Step
+
+    layout = replace(LAYOUT, max_len=192)
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout, shuffle_options=False)
+    cap = objective.bounds.segments
+    long = [replace(example, state=f"{example.state} " + "x" * 120) for example in EXAMPLES]
+    read = {}
+    for name, examples in (("long", long), ("short", EXAMPLES)):
+        data = decision_rows(examples, 4, examples, objective=objective.data())
+        (batch, *_) = list(data.val(DataPartition()))
+        declared = batch["tokens_coordinates"].max_segments
+        assert int(np.asarray(batch["segments"]).max()) <= declared <= cap
+        assert laid_out(batch, cap).max_segments == declared
+        read[name] = (batch, declared)
+    assert read["long"][1] == 1 < read["short"][1] <= cap
+    batch = read["long"][0]
+    capped = {name: value for name, value in batch.items() if name != "tokens_coordinates"}
+    assert laid_out(capped, cap).max_segments == cap
+    step = Step(jnp.asarray(0), jax.random.key(0), None)
+
+    def loss(read_batch):
+        return lambda variables: objective.scalar_loss(variables, read_batch, step)[0]
+
+    assert_as_exact(loss(batch), loss(capped), drawn_variables(objective), "the loss at a read's documents",
+                    seeds=DOCUMENTS_SEEDS)
+
+
 HELD = [Example(f"{index}" if index % 3 == 0 else f"{index} " + "x" * (12 + index),
                 {"team": INTENT, "urgent": Noul("Is it urgent?")},
                 {"team": ("billing", "technical", "sales")[index // 3 % 3]}
@@ -236,7 +276,7 @@ def test_a_held_pass_packs_its_rows_and_scores_every_row_once():
     seen, windows_seen = {}, set()
     shared, repeats = False, 0
     for batch in data.val(DataPartition()):
-        batch = {name: np.asarray(value) for name, value in batch.items()}
+        batch = jax.tree.map(np.asarray, dict(batch))
         found = np.asarray(objective.evaluate(variables, batch, step).probabilities)
         # A batch that repeats windows to fill itself marks its real ones.
         real = batch.get(VALID_ROWS, np.ones(len(batch["tokens"]), bool))
@@ -301,7 +341,7 @@ def test_a_decision_window_states_the_most_tokens_its_rows_score_from_its_shape(
                                   specials=SPECIALS, layout=layout, shuffle_options=False)
     data = decision_rows(HELD, 4, HELD, objective=objective.data())
     for batch in itertools.islice(data.val(DataPartition()), 3):
-        batch = {name: np.asarray(value) for name, value in batch.items()}
+        batch = jax.tree.map(np.asarray, dict(batch))
         width = objective.row_tokens(batch)
         assert width == batch["tokens"].shape[-1]
         assert 0 < objective.scored_tokens(batch).max() <= width
