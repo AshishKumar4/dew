@@ -51,7 +51,8 @@ from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_p
 from dew.distributed.placement import MeshSpec, Placement
 from dew.held_updates import waiting
 from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
-from dew.optim import OptimConfig, reclocked
+from dew.optim import OptimConfig
+from dew.optim_schedules import reclocked
 from dew.state import TrainState
 from dew.telemetry.profile import Profiler, region
 from dew.training.budget import Pause, Plateau, every_step, recorded
@@ -362,6 +363,8 @@ class FitRun:
     last_local_saved: int | None = None
     stopped: bool = False
     training: dict[str, jax.Array] = dataclasses.field(default_factory=dict)
+    update_flops: float | None = None
+    """One update's optimizer work beyond the model's (`OptimConfig.update_flops`), which its logs report."""
     source: Iterator[Batch] | None = None
     train: DevicePrefetchIterator | None = None
     partition: DataPartition | None = None
@@ -650,8 +653,8 @@ def restored(state: TrainState, resume: int, examples: int | None) -> TrainState
 def afresh(initial: TrainState, made: optax.OptState, examples: int | None) -> TrainState:
     """A state supplied to a fit, which reads its data afresh: its clock of examples at none consumed
     where the run is on that clock (`examples`), none on another, and its schedules in the form the run's
-    own optimizer makes (`made`, its init's shapes; `dew.optim.reclocked`), a DiLoCo run's in each group's
-    inner state, its outer optimizer's as it is."""
+    own optimizer makes (`made`, its init's shapes; `dew.optim_schedules.reclocked`), a DiLoCo run's in each
+    group's inner state, its outer optimizer's as it is."""
     consumed = None if examples is None else jnp.zeros((), jnp.int32)
     if initial.inner is not None:
         return dataclasses.replace(initial, consumed=consumed, inner=regrouped(
