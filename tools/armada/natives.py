@@ -53,7 +53,24 @@ static size_t digits(char *out, long value) {
     return count;
 }
 
+/* done_dir/<name><this process's id>: the path a signalled process's marks are at. */
+static size_t marked(char *out, const char *name) {
+    size_t at = strlen(done_dir), named = strlen(name);
+    memcpy(out, done_dir, at);
+    memcpy(out + at, name, named);
+    at += named;
+    at += digits(out + at, (long)getpid());
+    out[at] = '\0';
+    return at;
+}
+
 static void caught(int signum) {
+    /* Seen first, whatever comes of its read: one never read (its word left in the pipe as the collector
+       ended) counts as unread (review, 2026-11-13). */
+    char seen[4200];
+    marked(seen, "/seen.");
+    int mark = open(seen, O_CREAT | O_WRONLY, 0644);
+    if (mark >= 0) close(mark);
     int fd = open(pipe_path, O_WRONLY | O_NONBLOCK);
     if (fd >= 0) {
         char line[64], done[4200];
@@ -64,12 +81,7 @@ static void caught(int signum) {
         ssize_t ignored = write(fd, line, length);
         (void)ignored;
         close(fd);
-        size_t at = strlen(done_dir);
-        memcpy(done, done_dir, at);
-        memcpy(done + at, "/done.", 6);
-        at += 6;
-        at += digits(done + at, (long)getpid());
-        done[at] = '\0';
+        marked(done, "/done.");
         struct timespec pause = {0, 100000000};
         struct stat held;
         for (int wait = 0; wait < armed_waits && stat(done, &held) != 0; wait++) nanosleep(&pause, NULL);
@@ -173,7 +185,7 @@ class Capture:
                 self.collector.kill()
         read = self.stacks_file.read_text(errors="replace") if self.stacks_file.is_file() else (
             f"no native stacks were captured: {self.why}\n" if self.why else "")
-        # Each process that told the collector a signal ended it, read or not (`collect`'s `seen.<pid>`).
+        # Each process a signal ended, read or not: its handler marks it first (`SHIM`).
         self.signalled = len(list(self.done.glob("seen.*"))) if self.done.is_dir() else 0
         shutil.rmtree(self.where, ignore_errors=True)
         return read
@@ -233,8 +245,6 @@ def collect(pipe: Path, done: Path, stacks: Path, spy: Path) -> None:
             if len(parts) != 2 or not all(part.isdigit() for part in parts):
                 continue
             pid, signum = parts
-            # Seen before it is read: one the collector is ended while reading counts as unread (review).
-            (done / f"seen.{pid}").touch()
             frames, held = read(pid, spy, began)
             with stacks.open("a") as out:
                 at = time.strftime("%H:%M:%SZ", time.gmtime())

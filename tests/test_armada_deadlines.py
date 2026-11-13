@@ -4,6 +4,7 @@ it holds red, and says where every thread of its pytest stood."""
 import base64
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -290,16 +291,17 @@ def test_a_red_whose_capture_could_not_be_armed_says_why(ci, tmp_path, monkeypat
     assert red["capture"] == "no C compiler in the container"
 
 
-def test_native_stacks_count_as_read_only_where_every_signalled_process_was_read(ci):
-    """Two processes a signal ended, one read and the other not (the collector ended while it read it: no
-    record of it beyond its word that it was signalled), are `unread`: the land queue never takes a run
-    whose signal-ended process left no native stacks for one that kept them (review, 2026-11-13)."""
-    capture = object.__new__(ci.natives.Capture)
-    capture.variables, capture.why, capture.signalled = {"LD_PRELOAD": "x"}, "", 2
-    one = f"== process 7 ended by signal 6 (00:00:00Z): {ci.natives.HELD}\nframes\n"
-    assert capture.evidence(one) == {"capture": "armed", "natives": "unread"}
-    capture.signalled = 1
-    assert capture.evidence(one) == {"capture": "armed", "natives": "read"}
+def test_a_signalled_process_the_collector_never_read_leaves_its_rows_natives_unread(ci, tmp_path):
+    """A process a signal ends whose word the collector never reads (the collector gone, as one ended with
+    words still queued) marks itself signalled from its own handler, so the row says its native stacks are
+    `unread`: the land queue never takes such a run for one that kept them (review, 2026-11-13)."""
+    capture = ci.natives.Capture(Path(sys.executable).with_name("py-spy"))
+    assert capture.variables, capture.why
+    capture.collector.kill()
+    capture.collector.wait()
+    subprocess.run([sys.executable, "-c", "import os; os.abort()"], env={**os.environ, **capture.variables},
+                   check=False, timeout=60)
+    assert capture.evidence(capture.stacks()) == {"capture": "armed", "natives": "unread"}
 
 
 def test_a_worker_a_signal_ends_keeps_its_native_stacks_though_pytest_exits_red(ci, tmp_path):
