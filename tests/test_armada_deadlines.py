@@ -251,8 +251,8 @@ def test_a_task_says_each_red_row_last_where_armada_keeps_its_tail(ci, tmp_path,
 
 def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci, tmp_path):
     """A pytest an abort ends (a native library's, here os.abort) keeps its whole output and its processes'
-    native stacks among the task's artifacts, named on its red row, so the cause is read from what it left (row
-    5801: train 788's abort left faulthandler's Python stacks and no native frame; owner, 2026-11-13)."""
+    native stacks among the task's artifacts, named on its red row, so the cause is read from what it left
+    (row 5801: train 788's abort left faulthandler's Python stacks and no native frame; owner, 2026-11-13)."""
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_any.py": "import os\n\n\ndef test_aborts():\n    print('before the abort')\n"
                                       "    os.abort()\n"})
@@ -261,7 +261,7 @@ def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci,
     assert (aborted["exitCode"], aborted.get("signal")) == (1, 6)
     [kept] = aborted["artifacts"]
     where = tmp_path / "artifacts" / kept
-    # pytest's own output whole (its capture of the test's prints dies with the process): faulthandler's stacks.
+    # pytest's own output whole (its capture of the test's prints dies with the process): its Python stacks.
     output = (where / "output.txt").read_text()
     assert "Fatal Python error: Aborted" in output and "test_any.py" in output
     stacks = (where / "native-stacks.txt").read_text()
