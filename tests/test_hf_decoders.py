@@ -557,6 +557,10 @@ _YARN_SOURCES = (
     # sliding rotary at 1e4 for an absent or null record, and GELU by default.
     ("gemma4-moe-tiny", _without("rope_parameters", "hidden_activation")),
     ("gemma4-moe-tiny", lambda config: {**config, "rope_parameters": None}),
+    # A whole-head factor of 1 on the sliding layers' plain record, which the family reads.
+    ("gemma4-moe-tiny", lambda config: {**config, "rope_parameters": {
+        **config["rope_parameters"], "sliding_attention": {
+            **config["rope_parameters"]["sliding_attention"], "partial_rotary_factor": 1.0}}}),
     # Phi3Config replaces rope_parameters with a legacy rope_scaling whole, and
     # its own original_max_position_embeddings replaces the record's.
     ("phi3-tiny", lambda config: {**config, "rope_parameters": {"rope_type": "default", "rope_theta": 500.0},

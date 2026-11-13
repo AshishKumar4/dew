@@ -7,7 +7,7 @@ Design record, 2026-10-12. This is the binding design for Dew's training and mod
 A `Trainer` runs an `Objective` (the loss and metrics for one kind of training: language modelling, diffusion, decision, preference, RL) with an Optax optimizer on a device mesh. `fit` takes a data chain and a budget. Everything between (sharding, micro-batches, rematerialization, kernels, compilation, checkpoints, resume) is chosen by Dew from the model, the mesh and the hardware, and every one of those choices can be overridden. The model is a plain Flax module, the optimizer is plain Optax, checkpoints are plain Orbax, and the mesh can be a plain `jax.Mesh`.
 
 ```python
-model = CausalTransformer(vocab=50_257, width=768, depth=12, heads=12)
+model = CausalTransformer(vocab_size=50_257, emb_features=768, num_layers=12, num_heads=12)
 trainer = Trainer(LMObjective(model, seq_len=1024), optax.adamw(3e-4), key=0)
 state = trainer.fit(train, validation=val, tokens=10e9)
 ```
@@ -118,10 +118,10 @@ On any mesh, the layout reports what it is about to do before the first step, as
 
 ## 3. Memory and speed are chosen for you
 
-Before it places the state it starts from, `fit` refuses a mesh whose devices cannot hold it (`Layout.validate`, §2). The memory planner then picks, per model, mesh and GPU, the cheapest combination that fits: micro-batch size, rematerialization policy and LM-head tiling. The ladder holds no host offload. XLA:GPU holds the optimizer state and the EMA whole on the device for the update wherever they rest between steps, so keeping them in host memory frees nothing at a step's peak (a decoder's step on an A100 peaked at 8.427 GB either way). A run keeps them there by its layout (`Layout.host`), which saves only the device memory they would take between steps; the step reads them past its gradient, so the forward and backward run without them. A remat policy that keeps its residuals in pinned host memory (`minimal_offloaded`) keeps as many on the device as `full` does, so it fits nowhere `full` does not; a run takes it by its own remat, and timing it against `full` is tracked in the roadmap. Parameter offload is the layout's too, and choosing it automatically is tracked in the [roadmap](../roadmap.md#training-and-parallelism). The planner's first candidate is derived from shapes before anything compiles (`dew.training.footprint`): the least-recomputation rung whose gradient program, traced, holds at its peak (its residuals as the target's fusion keeps them, the backward's cotangents and the gradient) less than the GPU has beside the state and the GEMM workspace XLA hands each cuBLAS matmul (32 MiB from Hopper on, 4 MiB before). Its compile decides: the planner checks each candidate against its compiled program's memory analysis, steps one rung where it misses, and logs each compile the derivation judged otherwise as a model miss, every plan record holding the derived headroom beside the measured one. A gate holds the derivation to the compile at 0.6 and 1.6 times a step's need over dense, hybrid and expert decoders on Ampere and Hopper. Where none fits, `fit` raises naming the split, rematerialization and head options it tried, and the closest candidate's temporary and argument bytes where the analysis gave them. The same `batch(1024)` works on one GPU or 256. You override any one of them:
+Before it places the state it starts from, `fit` refuses a mesh whose devices cannot hold it (`Layout.validate`, §2). The memory planner then picks, per model, mesh and GPU, the cheapest combination that fits: micro-batch size, rematerialization policy and LM-head tiling. The ladder holds no host offload. A run keeps the optimizer state and the EMA in host memory by its layout (`Layout.host`): the update stages them to the device a bounded chunk at a time (`dew.training.staging`; row 3526, where a whole fetch of them had peaked a decoder's step on an A100 at 8.427 GB either way), and the step reads them past its gradient, so the forward and backward run without them. A remat policy that keeps its residuals in pinned host memory (`minimal_offloaded`) keeps as many on the device as `full` does, so it fits nowhere `full` does not; a run takes it by its own remat, and timing it against `full` is tracked in the roadmap. Parameter offload is the layout's too, and choosing it automatically is tracked in the [roadmap](../roadmap.md#training-and-parallelism). The planner's first candidate is derived from shapes before anything compiles (`dew.training.footprint`): the least-recomputation rung whose gradient program, traced, holds at its peak (its residuals as the target's fusion keeps them, the backward's cotangents and the gradient) less than the GPU has beside the state and the GEMM workspace XLA hands each cuBLAS matmul (32 MiB from Hopper on, 4 MiB before). Its compile decides: the planner checks each candidate against its compiled program's memory analysis, steps one rung where it misses, and logs each compile the derivation judged otherwise as a model miss, every plan record holding the derived headroom beside the measured one. A gate holds the derivation to the compile at 0.6 and 1.6 times a step's need over dense, hybrid and expert decoders on Ampere and Hopper. Where none fits, `fit` raises naming the split, rematerialization and head options it tried, and the closest candidate's temporary and argument bytes where the analysis gave them. The same `batch(1024)` works on one GPU or 256. You override any one of them:
 
 ```python
-Trainer(objective, opt, key=0, accumulation=4)                    # fix the micro-batch split
+Trainer(objective, opt, key=0, split=4)                           # fix the micro-batch split
 Trainer(objective, opt, key=0, layout=Layout(host=("opt_state",)))  # keep optimizer state in host memory
 ```
 
@@ -137,7 +137,7 @@ state = trainer.fit(
     eval_every=1000,
     checkpoint_every=datetime.timedelta(minutes=30),
     best="validation/web/loss", restore_best=True,
-    stop=Plateau(patience=5),
+    stop=Plateau("validation/web/loss", evals=5),
 )
 ```
 
@@ -190,7 +190,7 @@ A step compiled ahead holds the kernels the target's GPU runs, or it is refused,
 
 Every run logs canonical MFU (analytic model FLOPs on real tokens over wall time) and where step time goes. A model reports its FLOPs through `model_flops`; a model without them reports no MFU rather than an estimate. Each kernel dispatch records which kernel it chose and why (`dew.nn.kernels.generation.routes`), and the admitted step's plan reports them: its kernels, routes, launches, configurations and FLOPs, logged as it settles and recorded under `kernels` in its `StepCompiled` record (`KernelReport`). Trackers (W&B, MLflow) take the same metrics; the local metric journal is JSONL. `dew profile run.py --warmup 20 --steps 10` (`RunConfig.profile`) trains the run afresh in a directory of its own, with no checkpoint or validation, traces a window of steps after the warmup, and prints where the window's steps spent their time (`ProfileReport`): the step, the input wait, the compile, the device time XProf attributes to collectives and to the rest or why it attributes none, and the analytic work with its MFU, never a compiled count in its place. A model Dew holds no count for declares its work by `Supervised(work=)`. Collecting the chosen kernels and the top three losses into that report is not built yet. Every run also traces a short window of its own steps by default (`TrainerConfig.run_profile`, `RunProfile`: two steps once ten have run past its first compile), its trace and manifest kept with its local records and reported as its `ProfileTraced` record, where the process can take a capture (none under AutoPGLE or inside another capture; no XProf asked); a `profile` the run names replaces it, and `run_profile=None` traces none of its own.
 
-A run inspects what its training does where `TrainerConfig.inspection` names it (`dew.training.Inspection`): parameter paths by glob and the trees summarized at them (the parameters, the gradient the optimizer is handed, its update and the parameters' change), every how many windows of the run's accumulation steps (the update committing in each), and modules whose outputs a sampled step summarizes, named by class-name glob or by their path as the log names it (`layers_3/*`), over a language model's real tokens, with the loss's cotangent at each watched output where `cotangents` asks and each summary's share of magnitudes a decade where `histogram` asks. The summaries are reduced inside the step over the global arrays and ride its commit, logged under `inspect/` off the step loop; a run that inspects nothing compiles its step unchanged, and one that does compiles a sampled step beside it, admitted by the same memory plan. A sampled step summarizes the very forward its loss trains, never a second one: an objective's model call opens what the step sows (`Step.sown`, the watched modules' `inspected` collection where `Step.watched` names them), a diffusion denoiser opens it through its calls (`Denoiser.opened`), and a guidance returns it through its own transforms as the `Guidance` protocol's `observed` prediction. `dew inspect run.json --set trainer.inspection=...` views one sampled update of a saved run offline, from its latest checkpoint or its start, over the batch its first step takes, and writes nothing (`RunConfig.inspected`, `dew.training.inspected`).
+A run inspects what its training does where `TrainerConfig.inspection` names it (`dew.training.Inspection`): parameter paths by glob and the trees summarized at them (the parameters, the gradient the optimizer is handed, its update and the parameters' change), every how many windows of the run's accumulation steps (the update committing in each), and modules whose outputs a sampled step summarizes, named by class-name glob or by their path as the log names it (`layers_3/*`): a model applied in parts, a decision run's backbone and head or a PPO run's policy and critic, names each module by its path in the model's variables (`backbone/layers_3/attn`, `head/...`, `critic/...`), fixed by the model whatever a run watches, and a glob may name a part's module by that path or its path within the part, over a language model's real tokens, with the loss's cotangent at each watched output where `cotangents` asks and each summary's share of magnitudes a decade where `histogram` asks. The summaries are reduced inside the step over the global arrays and ride its commit, logged under `inspect/` off the step loop; a run that inspects nothing compiles its step unchanged, and one that does compiles a sampled step beside it, admitted by the same memory plan. A sampled step summarizes the very forward its loss trains, never a second one: an objective's model call opens what the step sows (`Step.sown`, the watched modules' `inspected` collection where `Step.watched` names them), a diffusion denoiser opens it through its calls (`Denoiser.opened`), and a guidance returns it through its own transforms as the `Guidance` protocol's `observed` prediction. `dew inspect run.json --set trainer.inspection=...` views one sampled update of a saved run offline, from its latest checkpoint or its start, over the batch its first step takes, and writes nothing (`RunConfig.inspected`, `dew.training.inspected`).
 
 ## 8. After training
 
@@ -226,22 +226,27 @@ Each seam requires one standing end-to-end test that runs every implementation r
 ### LoRA fine-tuning a chat model, exported for vLLM
 
 ```python
-bundle = Pretrained.load("Qwen/Qwen3.5-0.8B")
-adapted, adapter = bundle.adapt(LoRA(rank=16), key=0)
-chats = Hub("HuggingFaceH4/ultrachat_200k", split="train_sft").map(chat.template(bundle.processor)).pack(seq_len=4096)
-trainer = Trainer(LMObjective(adapted, seq_len=4096, loss_role=Role.ASSISTANT), optax.adamw(1e-4), key=0)
-trainer.fit(chats.shuffle(seed=0).batch(64), epochs=2)
-adapter.save("out/lora")
+model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+bundle = Pretrained.load(model_id).adapt(LoRA(rank=16, modules=("q_proj", "v_proj")), key=0)
+chats = Hub("HuggingFaceH4/ultrachat_200k", split="train_sft").shuffle(seed=0).repeat().pipe(
+    presets.sft, model_id, seq_len=1024, batch=4)
+objective = LMObjective(bundle, seq_len=1024, loss_role=Role.ASSISTANT)
+state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(chats, steps=100)
+bundle.adapter.save(state.variables, "out/lora")   # PEFT's directory, which vLLM's LoRA loads
 ```
 
 ### A diffusion model, then samples
 
 ```python
-model = DiT.preset("dit-b/2")
-data = Files("gs://data/laion/*.array_record").filter_map(images.DecodeImage()).map(images.Resize(256)).batch(256)
-trainer = Trainer(DiffusionObjective(model, process=FlowMatching(), vae="stabilityai/sd-vae-ft-ema"), optax.adamw(1e-4), key=0)
-state = trainer.fit(data, steps=400_000)
-images = dew.pipeline(trainer)("a red fox in snow", steps=50, guidance=4.0, key=0)
+vae = load_autoencoder("pcuenq/sd-vae-ft-mse-flax")
+model = SimpleDiT(patch_size=2, emb_features=128, num_layers=4, num_heads=4, output_channels=4)
+inputs = InputSpec(Field("image", (64, 64, 3)),
+                   conditions={"textcontext": Condition(CLIPText.from_pretrained("openai/clip-vit-large-patch14"))})
+data = TFDS("oxford_flowers102", split="train").shuffle(seed=0).repeat().pipe(
+    presets.images, 64, batch=16, caption=images.caption("a photo of a {label}"))
+objective = DiffusionObjective(model, Flow(), inputs, autoencoder=vae, solver=Euler())
+state = Trainer(objective, OptimConfig(learning_rate=2e-4), key=0).fit(data, steps=1000)
+pictures = objective.pipeline(state)("a red rose", steps=50, guidance=3.0, key=1).host().images
 ```
 
 ### The same LM script on 64 GPUs

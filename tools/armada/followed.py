@@ -35,6 +35,8 @@ checkout's code or hold the GPU."""
 SPAWNS = {"subprocess.Popen", "_posixsubprocess.fork_exec", "os.posix_spawn", "os.spawn", "os.exec",
           "os.fork", "os.forkpty"}
 """Audit events of a process start; a multiprocessing child's is executed.py's `CHILD_START`'s."""
+TAKEN = "object.__getattr__"
+"""The audit event of an attribute `object.__getattr__` takes, a function's `__code__` among them."""
 HIDDEN_INPUTS = (".github", ".armada.json", ".python-version", ".gitattributes", ".thresh")
 """The checkout's hidden entries a test may read as any of its files (a workflow, the run's settings,
 thresh's annotations), each the input of the files that read it alone; any other hidden entry (.git, an
@@ -105,7 +107,7 @@ def code_unit(code: types.CodeType, root: str) -> str:
     any function, whose text the module's top level holds. A conftest's fixture or hook is so the input of the
     files whose runs ran it alone (row 4385: every file's key held the whole of tests/conftest.py)."""
     name = code.co_filename[len(root):]
-    if Path(name).name.startswith("test_"):
+    if os.path.basename(name).startswith("test_"):
         return f"{name}{CODE}{WHOLE}"
     unit = code.co_qualname.split(".<locals>", 1)[0]
     body = not code.co_flags & OPTIMIZED
@@ -118,7 +120,7 @@ def coded(event: str, args: tuple, root: str) -> str | None:
     `inspect`'s for a signature, a code flag or a file (`SIGNED`), which pytest's collection makes of every
     fixture a conftest defines, taken or not, reads what the module's top level holds alone: the function's
     `def` line, its generator's or coroutine's mark (digests.py's `digested`) and its file (row 4385)."""
-    if event != "object.__getattr__" or args[1] != "__code__" or getattr(taking, "code", False):
+    if event != TAKEN or args[1] != "__code__" or getattr(taking, "code", False):
         return None
     taking.code = True
     try:
@@ -151,9 +153,15 @@ taking = threading.local()
 
 def reads_backend(code: types.CodeType) -> bool:
     """Whether `code` calls `default_backend` (jax's), by any name table, or reads a device's
-    `platform`: an attribute of anything but the `sys` and `platform` modules."""
+    `platform`: an attribute of anything but the `sys` and `platform` modules. Its instructions are read only
+    where one of its tables holds either name: disassembling every code object a run entered was 6.7% of a
+    short file's task (py-spy, tests/test_config.py, 2026-11-12)."""
     if code not in decided:
-        steps = list(dis.get_instructions(code))
+        tables = (code.co_names, code.co_varnames, code.co_cellvars, code.co_freevars)
+        # A constant is compared as an instruction's argument is, whatever its type.
+        named = "platform" in code.co_names or any("default_backend" in table for table in tables) or any(
+            constant == "default_backend" for constant in code.co_consts)
+        steps = list(dis.get_instructions(code)) if named else []
         decided[code] = any(
             step.argval == "default_backend"
             or (step.opname == "LOAD_ATTR" and step.argval == "platform" and not (
@@ -364,22 +372,39 @@ def _this_python(program) -> bool:
         os.path.realpath(sys.executable)
 
 
+@functools.lru_cache(maxsize=1 << 14)
+def absolute(path: str, root: str) -> str | None:
+    """Absolute path `path` placed in the checkout at `root` (`placed`): a function of its text alone, kept
+    for the paths probed most lately, however many a run probes."""
+    return placed(os.path.abspath(path), root)
+
+
 def probed(probe: Callable[..., object], recorded: Callable[[str], None], root: str) -> Callable[..., object]:
     """`probe` (`PROBES`), which passes the path it is asked about to `recorded`, as `PROBED` and that path,
     before it answers: but a listing tool's (`listing_tool`), whose probes, as its listings, look for what
     it then records as it runs, and one a probe makes in answering (pathlib's `is_dir` asks `stat`), whose
-    caller's probe is already recorded."""
+    caller's probe is already recorded. An absolute path's place is the same whoever asks and wherever
+    from, so it is kept (`absolute`), and its asker's frame is read only where it is the checkout's: most
+    probes are of the environment's packages, and placing each was 1.3-1.9% of a task (py-spy,
+    2026-11-12)."""
 
     @functools.wraps(probe)
     def asked(path, *arguments, **keywords):
         if getattr(placing, "probing", False):
             return probe(path, *arguments, **keywords)
-        # A path relative to a directory descriptor (os.stat's dir_fd) is placed in the directory it names.
-        at = keywords.get("dir_fd")
-        base = os.readlink(f"/proc/self/fd/{at}") if at is not None else ""
-        if not isinstance(path, int) and not listing_tool(sys._getframe(1).f_code.co_filename) and (
-                name := placed(os.path.abspath(os.path.join(base, os.fsdecode(os.fspath(path)))),
-                               root)) is not None:
+        if type(path) is str and path.startswith(os.sep):
+            name = absolute(path, root)
+            if name is not None and listing_tool(sys._getframe(1).f_code.co_filename):
+                name = None
+        else:
+            # A path relative to a directory descriptor (os.stat's dir_fd) is placed in the directory it
+            # names.
+            at = keywords.get("dir_fd")
+            base = os.readlink(f"/proc/self/fd/{at}") if at is not None else ""
+            listed = isinstance(path, int) or listing_tool(sys._getframe(1).f_code.co_filename)
+            name = None if listed else placed(
+                os.path.abspath(os.path.join(base, os.fsdecode(os.fspath(path)))), root)
+        if name is not None:
             recorded(PROBED + name)
         placing.probing = True
         try:
@@ -465,6 +490,7 @@ def follow() -> None:
     if holder == FOLLOWER:
         return
     directory, root = Path(os.environ[CHILDREN]), os.environ["DEW_EXECUTED_ROOT"]
+    where = str(directory)
     log = (directory / f"{os.getpid()}.log").open("a", buffering=1)
     logged: set[str] = set()
     seen: set[str] = set()
@@ -510,19 +536,20 @@ def follow() -> None:
         write("peak", memory[1])
 
     def audited(event, args):
+        # Every audit event of the process arrives here: one of no kind the recorder keeps calls nothing.
         if event in READS:
             name = read(event, args, root)
             if name is not None:
                 write("file", name)
-            return
-        if (taken := coded(event, args, root)) is not None:
-            recorded(taken)
-            return
-        kind = start(event, args, str(directory))
-        if kind == "followed":
-            log.write("start\tfollowed\n")
-        elif kind == "unfollowed":
-            write("unfollowed", 1)
+        elif event == TAKEN:
+            if (taken := coded(event, args, root)) is not None:
+                recorded(taken)
+        elif event in SPAWNS:
+            kind = start(event, args, where)
+            if kind == "followed":
+                log.write("start\tfollowed\n")
+            elif kind == "unfollowed":
+                write("unfollowed", 1)
 
     def closing() -> None:
         write("ended", time.time())

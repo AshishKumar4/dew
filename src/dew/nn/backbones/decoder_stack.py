@@ -16,7 +16,7 @@ import functools
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
-from typing import Concatenate, NamedTuple
+from typing import ClassVar, Concatenate, NamedTuple
 
 import jax
 import jax.extend
@@ -259,6 +259,13 @@ class Loop:
     implicit: bool = False
     exit_threshold: float | None = None
     exits: bool = False
+
+    PASSED: ClassVar[tuple[str, ...]] = ("steps", "backprop_steps", "remat", "implicit", "exit_threshold",
+                                         "exits")
+    """The fields a run sets as it runs the loop's passes over the same parameters, a phase of its data its
+    own (`dew.nn.protocols.Looping.with_passes`, `dew.training.phase_passes`): how many passes run, train,
+    recompute, are taken implicitly and exit, none of which makes the parameters mean another thing, so a
+    resume compares none of them (`dew.training.startup.computation_differs`)."""
 
     @property
     def exiting(self) -> bool:

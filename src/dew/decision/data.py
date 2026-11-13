@@ -78,8 +78,9 @@ class Example:
         _checked_groups([(group.name, group.members) for group in self.groups], question)
 
     @classmethod
-    def of(cls, row: "Example | Mapping[str, object]") -> "Example":
-        """Return an example as it is, or build one from a row with `state`, `questions` and `answers`.
+    def of(cls, row: "Example | Mapping[str, object]", *, groups: bool = True) -> "Example":
+        """Return an example as it is, or build one from a row with `state`, `questions` and `answers`,
+        and its `groups` where asked: a run with no consistency term reads none of them (row 5734).
 
         The questions may be `Question`s or in Jev's wire format.
         """
@@ -106,7 +107,7 @@ class Example:
         context = row.get("context")
         return cls(json_value(row.get("state"), "state"), questions, answers, targets,
                    None if context is None else json_value(context, "context"),
-                   groups_of(json_value(row.get("groups"), "groups")))
+                   groups_of(json_value(row.get("groups"), "groups")) if groups else ())
 
     def group_of(self, name: str) -> tuple[int, Group] | None:
         """The index and group question `name` stands in, or None."""
@@ -211,9 +212,9 @@ class GroupedExamples:
         return None if found is None else (number + found[0], found[1].members[name])
 
     @classmethod
-    def of(cls, row: "GroupedExamples | Mapping[str, object]") -> "GroupedExamples":
+    def of(cls, row: "GroupedExamples | Mapping[str, object]", *, groups: bool = True) -> "GroupedExamples":
         """Return grouped examples as they are, or build them from a row with `examples` (each as
-        `Example.of` reads one) and `groups` (`groups_of`), its members named
+        `Example.of` reads one) and, where asked, `groups` (`groups_of`), its members named
         `"<example index>.<question>"`."""
         if isinstance(row, GroupedExamples):
             return row
@@ -222,9 +223,9 @@ class GroupedExamples:
             raise ValueError(f"examples is a list of examples, got {type(held).__name__}")
         # Each example as `Example.of` reads one: its questions `Question`s or in the wire format.
         examples = [Example.of(example if isinstance(example, Example)
-                               else record(example, f"examples.{index}"))
+                               else record(example, f"examples.{index}"), groups=groups)
                     for index, example in enumerate(held)]
-        return cls(tuple(examples), groups_of(json_value(row.get("groups"), "groups")))
+        return cls(tuple(examples), groups_of(json_value(row.get("groups"), "groups")) if groups else ())
 
 
 def groups_of(value: JSON) -> tuple[Group, ...]:
@@ -280,14 +281,35 @@ def _slots(stated: Mapping[str, object]) -> dict[str, int]:
 @dataclass(frozen=True)
 class ParseExample(pygrain.MapTransform):
     """A row of an example's fields as its `Example`, a row of grouped examples' fields (`examples`) as
-    its `GroupedExamples`, or a row that holds either already as it is. A Grain transform, so a chain
-    that parses its rows by it is recorded and read back (`dew.data.records`)."""
+    its `GroupedExamples`, or a row that holds either already as it is. Its `groups` stay as the row states
+    them (`GROUPS`), which an objective that weighs consistency reads (`grouped_by`) and any other never
+    does (row 5734). A Grain transform, so a chain that parses its rows by it is recorded and read back
+    (`dew.data.records`)."""
 
     def map(self, element: Batch) -> Batch:
         held = element.get("example")
         if isinstance(held, (Example, GroupedExamples)):
-            return {"example": held}
-        return {"example": GroupedExamples.of(element) if "examples" in element else Example.of(element)}
+            return {"example": held, **({GROUPS: element[GROUPS]} if GROUPS in element else {})}
+        grouped = "examples" in element
+        parsed = GroupedExamples.of(element, groups=False) if grouped else Example.of(element, groups=False)
+        stated = element.get("groups") or (grouped and any(
+            isinstance(example, Mapping) and example.get("groups") for example in element["examples"]))
+        return {"example": parsed, **({GROUPS: dict(element)} if stated else {})}
+
+
+GROUPS = "_dew_grouped_row"
+"""A parsed row whose groups its row states, as the row stated it (`ParseExample`), beside its example: read
+again with its groups where a run weighs consistency (`grouped_by`)."""
+
+
+def grouped_by(element: Batch, held: "Example | GroupedExamples") -> "Example | GroupedExamples":
+    """`held`, a row's parsed example, or, where the row stated groups (`GROUPS`), the row read with them,
+    each checked as an example's own are."""
+    row = element.get(GROUPS)
+    if row is None:
+        return held
+    stated = record(row, "a grouped row")
+    return GroupedExamples.of(stated) if "examples" in stated else Example.of(stated)
 
 
 @dataclass(frozen=True)
@@ -425,9 +447,9 @@ class _DecisionSource(View[Source]):
             held = row if held is None else held
             # Grouped examples train as one unit, whose questions a window holds together.
             if isinstance(held, GroupedExamples) or (isinstance(held, Mapping) and "examples" in held):
-                examples = GroupedExamples.of(held).examples
+                examples = GroupedExamples.of(held, groups=False).examples
             else:
-                examples = (Example.of(held),)
+                examples = (Example.of(held, groups=False),)
             asked = [question for example in examples for question in example.questions.values()]
             self._facts["questions"] = max(self._facts.get("questions", 0), len(asked))
             self._facts["options"] = max(self._facts.get("options", 0),

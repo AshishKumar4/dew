@@ -96,9 +96,10 @@ def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, elastic: bool
     there too, a view of them as any shuffle is (`lowering._reordered`); and hands on before a repeat after a
     step that may drop, which a read in none repeats as the stream of the rows it kept, each pass alike,
     where indexed inputs would be drawn again each pass (Grain's shuffle). A read that `spread`s each input
-    (`_Spread`) runs its expansion and the record steps after it in its workers too, each draw keyed by
-    its input and its row in it, and hands on before the first stage after its expansion that is no
-    record step, or before a window shuffle or a Grain step."""
+    (`_Spread`) runs its expansion and the record steps after it in its workers too, and hands on before
+    the first stage after its expansion that is no record step or that draws, which the reading process
+    keys by the row's place among the rows handed on, as every read keys a draw (Grain's `random_map`), or
+    before a window shuffle or a Grain step."""
     def windowed(stage: Stage, streamed: bool) -> bool:
         return isinstance(stage, Shuffle) and stage.window is not None and (elastic or streamed)
 
@@ -110,8 +111,9 @@ def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, elastic: bool
             # A step of each row's index reads a row's place in the stream, which an input's rows share.
             placed = expanded and isinstance(stage, MapWithIndex)
             grain = isinstance(stage, Native) and (elastic or expanded)
-            # Before the expansion, a draw after a drop is keyed by its place among the rows kept.
-            drawn = not expanded and marked and isinstance(stage, kept)
+            # Before the expansion, a draw after a drop is keyed by its place among the rows kept; after it,
+            # by its place among the rows the expansion made, which only the reading process counts.
+            drawn = isinstance(stage, RandomMap) if expanded else marked and isinstance(stage, kept)
             # An expansion whose counts the reading process keeps (a cut into chunks, `Chunked`; a later
             # objective's of the source examples it makes rows of, `FlatMap.examples`) runs there.
             counted = isinstance(stage, FlatMap) and (
@@ -153,12 +155,6 @@ class _Spread(tuple):
     order."""
 
     __slots__ = ()
-
-
-def _input_draws(seed: int | None, index: int, row: int) -> np.random.Generator | None:
-    """A spread input's random stage's draws for its `row`th row there (`lowering._PerInput`), from the
-    stage's seed and the input's `index`; none for a stage that draws none."""
-    return None if seed is None else np.random.default_rng((seed, index, row))
 
 
 @dataclasses.dataclass(frozen=True)

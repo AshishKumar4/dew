@@ -407,3 +407,11 @@ def running(pid: int) -> bool:
     except (FileNotFoundError, ProcessLookupError):
         return False
     return status.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+def refusal(error: BaseException) -> dict:
+    """A pool's refusal as its type states it (`dew._coordination`): its type, the agreement it was made
+    at, and the process it names (the rank that failed, the one that found otherwise, how many ran out)."""
+    kind = type(error).__name__
+    named = {"PeerFailure": "rank", "PoolDiffers": "process", "StreamsEnded": "ended"}.get(kind)
+    return {"type": kind, "phase": getattr(error, "phase", None), "named": named and getattr(error, named)}

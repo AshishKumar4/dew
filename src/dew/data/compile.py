@@ -13,13 +13,14 @@ canonical order and the derived order facts.
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
 import functools
 import itertools
 import json
 import os
 import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, Literal, Protocol, runtime_checkable
 
@@ -82,6 +83,7 @@ from dew.data.dataset import (
     take_batch,
 )
 from dew.data.facts import merge_facts
+from dew.data.handoff import record_stage_of
 from dew.data.lowering import (
     _as_iter,
     _Build,
@@ -90,13 +92,16 @@ from dew.data.lowering import (
     _member_key,
     _order_records,
     _Present,
+    _repeated,
     _split_spans,
     _tail,
     _weights,
     _workers,
+    mixed_indexed,
 )
 from dew.data.materialize import _materialize, _Memory
 from dew.data.mixing import CorpusCounts, Proportions
+from dew.data.ordering import place_of
 from dew.data.pipeline import (
     Artifact,
     Batched,
@@ -143,6 +148,7 @@ from dew.data.pipeline import (
 from dew.data.plan import (
     PLAN_VERSIONS,
     STRUCTURED,
+    DataResume,
     Plan,
     StepIdentity,
     fingerprint,
@@ -776,7 +782,7 @@ def compile(
     loading: Loading | None = None,
     seed: int = 0,
     rejections: Literal["drop", "mask"] = "drop",
-    resume: Literal["exact", "non-exact"] = "exact",
+    resume: DataResume = "relaxed",
     examples: int | None = None,
     widths: Mapping[str, object] | None = None,
     measured: _TrainingMeasured | None = None,
@@ -805,7 +811,7 @@ def compile(
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _TRAINING_LOADING
     if isinstance(train.source, Phases) and examples is None:
-        return _compile_phases(
+        phased = _compile_phases(
             train,
             validation=validation,
             host=host,
@@ -820,11 +826,13 @@ def compile(
             steps=steps,
             budget=tokens,
         )
+        return dataclasses.replace(phased, resume=resume)
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
                      seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured,
                      epochs=epochs, version=plan_version)
     batches = _run_batches(staged, steps=steps, examples=examples, epochs=epochs, tokens=tokens)
-    loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume, batches=batches)
+    compiled = _compiled(staged, _coordinated(staged.train), host=host, resume=resume, batches=batches)
+    loader = dataclasses.replace(compiled, resume=resume)
     if staged.passes is not None and epochs is not None:
         return dataclasses.replace(loader, examples=epochs * staged.passes, epochs=epochs,
                                    pass_examples=staged.passes, bound_ends=_bound_ends(staged.original))
@@ -1117,7 +1125,7 @@ def _compiled(
     packed: tuple[Coordinated, ...],
     *,
     host: tuple[HostStep, ...],
-    resume: Literal["exact", "non-exact"],
+    resume: DataResume,
     batches: int | None = None,
 ) -> Loader:
     """The readers of `staged`, each training batch's packed windows laid out
@@ -1331,18 +1339,137 @@ def _phase_batches(source: Phases, index: int, phase: _Staged, *, steps: int | N
                         tokens=span(budget) if tokens else budget)
 
 
-def _consumed_by(phases: Sequence[_Staged], ends: Sequence[int]) -> dict[str, int]:
-    """What `phases` read of each corpus, each ending at its record end of `ends`: its members a memory read
-    kept, at the shares the lowering mixes."""
-    consumed: dict[str, int] = {}
+@dataclasses.dataclass(frozen=True)
+class _Trained:
+    """What the phases before one trained of a corpus, by its places, where its chain's first repeat reads
+    it (its rows where it repeats nothing): every place before `low`, and `past`, each past it."""
+
+    low: int = 0
+    past: frozenset[int] = frozenset()
+
+    def drawn(self, count: int) -> _Trained:
+        """These and the next `count` places not among them, as a phase that reads on in order draws them."""
+        skipped = sorted(place - self.low for place in self.past)
+        # The fewest places from `low` that hold `count` not trained already.
+        reach = count
+        while (moved := count + bisect.bisect_left(skipped, reach)) != reach:
+            reach = moved
+        return _Trained(self.low + reach).joined(place for place in self.past if place >= self.low + reach)
+
+    def joined(self, places: Iterable[int]) -> _Trained:
+        """These and `places` (none before `low`)."""
+        held, low = set(self.past).union(places), self.low
+        while low in held:
+            held.discard(low)
+            low += 1
+        return _Trained(low, frozenset(held))
+
+    def skipped(self) -> tuple[int, ...]:
+        """The places past `low` a phase continuing the corpus draws past, counted from `low`
+        (`_Build.skipped`)."""
+        return tuple(sorted(place - self.low for place in self.past))
+
+
+def _consumed_by(phases: Sequence[_Staged], ends: Sequence[int], version: int) -> dict[str, _Trained]:
+    """What `phases` trained of each corpus, each ending at its record end of `ends`: where its order moves
+    rows past where a corpus is placed (`_reorders`: a shuffle after a mix) and the plan is 14's or later, the
+    places its order's twin of draws (`_Build.drawn_order`) holds in its records up to its end; else the
+    counts the lowering's mix draws its members by in that many records, each read on in order from where
+    the phases before left it (a plan of 13 reads so whatever the order moves, row 5522)."""
+    consumed: dict[str, _Trained] = {}
     for phase, (start, end) in zip(phases, itertools.pairwise((0, *ends)), strict=True):
-        _delivered(phase.train, end - start, consumed)
+        if version >= STRUCTURED and _reorders(phase.train):
+            order = _drawn_order(phase.build, phase.train)
+            places: dict[str, list[int]] = {}
+            for index in range(end - start):
+                match order(index):
+                    case (str() as name, int() as place):
+                        places.setdefault(name, []).append(place)
+                    case drawn:
+                        raise TypeError(f"a twin of draws holds a corpus and its place, not {drawn!r}")
+            for name, held in places.items():
+                consumed[name] = consumed.get(name, _Trained()).joined(held)
+        else:
+            _delivered(phase.train, end - start, consumed)
     return consumed
+
+
+def _drawn_order(build: _Build, pipeline: Pipeline) -> Callable[[int], tuple[str, int]]:
+    """The twin of draws of the global order a training read of `pipeline` by `build` counts its records in
+    (`_Build.batch_order`), by index: the corpus and the place its `index`th record was drawn at,
+    where the corpus's chain first repeats (`place_of`); batched and through the stages after its batch
+    that hold a place in it as its batches are (`_Build.placed`), each record its batch's."""
+    places = _drawn_records(build, pipeline)
+    if build.lowering.rooted:
+        places = _repeated(places, None, _name(pipeline), build.loading)
+    stage = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage))
+    batched = pipeline.stages.index(stage)
+    after = tuple(range(batched + 1, len(pipeline.stages)))
+    batches = build.placed(places.batch(stage.size, batch_fn=list), pipeline, DataPartition(), after)
+
+    def record(index: int) -> tuple[str, int]:
+        held = batches[index // stage.size]
+        if held is None:
+            raise IndexError(f"record {index} lies past the order's last batch")
+        return held[index % stage.size]
+    return record
+
+
+def _drawn_records(build: _Build, pipeline: Pipeline) -> pygrain.MapDataset:
+    """`pipeline`'s rows before its batch as their twin of draws: a corpus's rows read to where its places are
+    (`place_of`), each its place from there, and a mix's draws of its corpora's twins as its read draws them
+    (`mixed_indexed`), each through the steps after that move rows (`_drawn_after`)."""
+    source = pipeline.source
+    if isinstance(source, Mixture):
+        members = [_drawn_records(build.child(index), child) for index, child in enumerate(source.pipelines)]
+        return _drawn_after(build, mixed_indexed(members, source), pipeline, 0)
+    repeat = place_of(pipeline)
+    placed = len(pipeline.stages) if repeat is None else repeat + 1
+    if build.lowering.cache is not None and build.lowering.cache >= placed:
+        raise ValueError(f"{_name(pipeline)} is cached after its first repeat, where a phase that continues "
+                         "it places its records; a phase of one global order continues a corpus cached "
+                         "before it repeats, as a cache of a corpus's own rows is written")
+    rows = build.records(dataclasses.replace(pipeline, stages=pipeline.stages[:placed]), DataPartition())
+    if not isinstance(rows, pygrain.MapDataset):
+        raise TypeError(f"{_name(pipeline)} is no global order, whose records a twin of draws follows")
+    name = _name(pipeline)
+    return _drawn_after(build, pygrain.MapDataset.range(len(rows)).map(lambda place: (name, place)), pipeline,
+                        placed)
+
+
+def _drawn_after(build: _Build, places: pygrain.MapDataset, pipeline: Pipeline, start: int
+                 ) -> pygrain.MapDataset:
+    """`places`, a global order's twin of draws where `pipeline`'s stage `start` reads it, through the stages
+    from there to its batch that move rows as `build`'s read runs them (`_reordered`, `_repeated`, and a
+    continued corpus's `_Build.skipping`); a step that makes rows moves none."""
+    for index, stage in enumerate(pipeline.stages[start:], start=start):
+        if isinstance(stage, (BatchStage, MapBatch)):
+            break
+        if record_stage_of(stage) or isinstance(stage, (Prefetch, Workers)):
+            continue
+        moved = build.stage(places, stage, pipeline, DataPartition(), index)
+        if not isinstance(moved, pygrain.MapDataset):
+            raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} moves the rows of a global order "
+                             "in no way its twin of draws follows")
+        places = moved
+    return places
+
+
+def _reorders(pipeline: Pipeline) -> bool:
+    """Whether `pipeline`'s order moves its rows past the places its corpora are drawn at (`_Trained`): a
+    shuffle, slice, take or repeat after a mix, or a shuffle after a corpus's first repeat, where the records
+    it read hold no prefix of each corpus's draws."""
+    source = pipeline.source
+    if isinstance(source, Mixture):
+        return (any(isinstance(stage, (Shuffle, Slice, Limit, Repeat)) for stage in pipeline.stages)
+                or any(_reorders(child) for child in source.pipelines))
+    repeat = place_of(pipeline)
+    return repeat is not None and any(isinstance(stage, Shuffle) for stage in pipeline.stages[repeat + 1:])
 
 
 def _built_phases(source: Phases, staged: Sequence[tuple[_Staged, int | None]],
                   packed: tuple[Coordinated, ...], *,
-                  host: tuple[HostStep, ...], resume: Literal["exact", "non-exact"], steps: int | None,
+                  host: tuple[HostStep, ...], resume: DataResume, steps: int | None,
                   budget: int | None, tokens: bool) -> list[tuple[Loader, int | None]]:
     """Each staged phase compiled (`_compiled`) at the batches it reads (`_phase_batches`), beside its end:
     every phase of a run runs the first's device steps, so a phase whose own differ is refused."""
@@ -1370,7 +1497,7 @@ def _compile_phases(
     loading: Loading,
     seed: int,
     rejections: Literal["drop", "mask"],
-    resume: Literal["exact", "non-exact"],
+    resume: DataResume,
     plan_version: int = PLAN_VERSIONS[-1],
     steps: int | None = None,
     budget: int | None = None,
@@ -1381,37 +1508,29 @@ def _compile_phases(
 
     _tokenizer_contract((train,) if validation is None else (train, validation))
 
-    def staged_at(index: int, consumed: Mapping[str, int], members: Mapping[str, str] | None = None
+    def staged_at(index: int, consumed: Mapping[str, _Trained], members: Mapping[str, str] | None = None
                   ) -> _Staged:
-        """Phase `index`, each corpus it reads continued past what the phases before it read of it: on its
-        own stream, those it shares with other phases stamped (`members`, `_stamped`)."""
-        phase = _continued(source.pipelines[index], consumed)
-        return _stamped(_staged(phase._then(*train.stages), validation if index == 0 else None,
-                                objective=objective, read=read, provision=provision, loading=loading,
-                                seed=seed, rejections=rejections, version=plan_version), members or {})
+        """Phase `index`, each corpus it reads continued past what the phases before it trained of it
+        (`_continued`, `_skipping`): on its own stream, those it shares with other phases stamped (`members`,
+        `_stamped`)."""
+        phase = _staged(_continued(source.pipelines[index], consumed)._then(*train.stages),
+                        validation if index == 0 else None, objective=objective, read=read,
+                        provision=provision, loading=loading, seed=seed, rejections=rejections,
+                        version=plan_version)
+        return _skipping(_stamped(phase, members or {}), consumed, source.pipelines[index])
 
     tokens = source.clock == "tokens"
     first = staged_at(0, {})
     # Phases on the step clock whose first reads per share (its order cut where each share reads it: a
     # stream batched by its tokens after steps that drop rows) read each its own stream (`StepPhases`).
     per_share = not tokens and not first.build.global_order
-    # A plan of 13 read each phase's corpora from their start, which its resume reads again
-    # (`StepPhases.CONTINUES`).
-    shared = (_shared(source) if per_share and plan_version >= STRUCTURED
-              else tuple({} for _ in source.pipelines))
-    staged: list[tuple[_Staged, int | None]] = (
-        _own_streams(source, first, shared, staged_at) if per_share else [])
-    for index, until in () if per_share else enumerate(source.ends):
-        # A phase on the token clock ends where the run reaches it, so it is staged as it reads first,
-        # and again with the ends of the phases before it once the run reaches them (`opened`).
-        ends = [end for _, end in staged if end is not None]
-        phase = _ordered(index, first if not index else staged_at(
-            index, {} if tokens else _consumed_by([phase for phase, _ in staged], ends)))
-        # A phase on the step clock ends at its step's record: the records of the phases before it, and its
-        # own steps in its own rows (row 4812).
-        before, started = (ends[-1] if ends else 0), (source.ends[index - 1] or 0) if index else 0
-        staged.append((phase, None if tokens or until is None
-                       else before + (until - started) * phase.build.batch))
+    # A plan of 13 read no phases on their own streams that share a corpus (`_apart`): no Dew of 13 read
+    # them, which this one continues by stamps (`StepPhases.CONTINUES`).
+    if per_share and plan_version < STRUCTURED:
+        _apart(source)
+    shared = _shared(source) if per_share else tuple({} for _ in source.pipelines)
+    staged = (_own_streams(source, first, shared, staged_at) if per_share
+              else _in_one_order(source, first, staged_at, version=plan_version))
     # Every phase declares the most documents a window of any phase holds, so the run steps one program.
     packed = _coordinated(*(phase.train for phase, _ in staged))
     built = _built_phases(source, staged, packed, host=host, resume=resume, steps=steps, budget=budget,
@@ -1432,16 +1551,25 @@ def _compile_phases(
 
     @functools.cache
     def opened(index: int, ends: tuple[int, ...]) -> Loader:
-        """Phase `index` as it reads where the phases before it ended at `ends`, in records: as staged,
-        unless a corpus it reads continues from theirs."""
-        loader = built[index][0]
-        if tokens and index:
-            consumed = _consumed_by([phase for phase, _ in staged[:index]], ends)
-            if any(consumed.get(_name(chain), 0) for chain, _ in _leaves(source.pipelines[index])):
-                phase = staged_at(index, consumed)
-                batches = _phase_batches(source, index, phase, steps=steps, budget=budget, tokens=tokens)
-                loader = _compiled(phase, packed, host=host, resume=resume, batches=batches)
-        return counted(loader)
+        """Phase `index` as it reads where the phases before it ended at `ends`, in records (`resolved`)."""
+        phase = resolved(index, ends)
+        if phase is staged[index][0]:
+            return counted(built[index][0])
+        batches = _phase_batches(source, index, phase, steps=steps, budget=budget, tokens=tokens)
+        return counted(_compiled(phase, packed, host=host, resume=resume, batches=batches))
+
+    @functools.cache
+    def resolved(index: int, ends: tuple[int, ...]) -> _Staged:
+        """Phase `index` staged where the phases before it ended at `ends`, in records: as staged, unless a
+        corpus it reads continues from what those phases, each resolved alike, trained of it."""
+        if not tokens or not index:
+            return staged[index][0]
+        consumed = _consumed_by([resolved(before, ends[:before]) for before in range(index)], ends,
+                                plan_version)
+        if all(consumed.get(_name(chain), _Trained()) == _Trained()
+               for chain, _ in _leaves(source.pipelines[index])):
+            return staged[index][0]
+        return staged_at(index, consumed)
 
     batches = tuple(phase.build.batch for phase, _ in staged)
     stages = () if tokens or per_share else phase_stages(
@@ -1479,6 +1607,26 @@ def _compile_phases(
                                widths=merge_facts(loaded.widths for loaded, _ in built))
 
 
+def _in_one_order(source: Phases, first: _Staged, staged_at: Callable[[int, Mapping[str, _Trained]], _Staged],
+                  *, version: int) -> list[tuple[_Staged, int | None]]:
+    """Each phase of `source` read in one global order, staged beside its end in records: `first` for phase
+    0, the rest by `staged_at` past what the phases before them trained of each corpus (`_consumed_by`). A
+    phase on the token clock ends where the run reaches it, so it is staged as it reads first, and again with
+    the ends of the phases before it once the run reaches them (`_compile_phases`' `opened`)."""
+    tokens = source.clock == "tokens"
+    staged: list[tuple[_Staged, int | None]] = []
+    for index, until in enumerate(source.ends):
+        ends = [end for _, end in staged if end is not None]
+        phase = _ordered(index, first if not index else staged_at(
+            index, {} if tokens else _consumed_by([phase for phase, _ in staged], ends, version)))
+        # A phase on the step clock ends at its step's record: the records of the phases before it, and its
+        # own steps in its own rows (row 4812).
+        before, started = (ends[-1] if ends else 0), (source.ends[index - 1] or 0) if index else 0
+        staged.append((phase, None if tokens or until is None
+                       else before + (until - started) * phase.build.batch))
+    return staged
+
+
 def _ordered(index: int, phase: _Staged) -> _Staged:
     """Phase `index` of phases read in one global order, refused where it reads in none: a phase after it
     continues each corpus past the records it read by its order's shares (`consumed_by`), which a read
@@ -1494,6 +1642,21 @@ def _ordered(index: int, phase: _Staged) -> _Staged:
 def _corpus_key(corpus: Source) -> str:
     """A corpus as phases share it: its store's content (`Source.fingerprint`), whatever a chain names it."""
     return fingerprint(json.loads(json.dumps(corpus.fingerprint(), sort_keys=True, default=str)))
+
+
+def _apart(phases: Phases) -> None:
+    """Refuse phases read each on its own stream (`StepPhases`) where two read one corpus, under a plan of
+    13, which no Dew read such a chain by: the later would open it at its first record again and train what
+    the earlier read twice; a plan of 14 continues it by stamps (`_shared`)."""
+    seen: dict[str, tuple[int, str]] = {}
+    for index, pipeline in enumerate(phases.pipelines):
+        for chain, corpus in _leaves(pipeline):
+            earlier, named = seen.setdefault(_corpus_key(corpus), (index, _name(chain)))
+            if earlier != index:
+                raise ValueError(f"phases {earlier} and {index} both read one corpus ({named}, "
+                                 f"{_name(chain)}) each on its own stream, which a plan of 13 reads by no "
+                                 "rule; read it under this Dew's plan, which continues it where the run "
+                                 "left it, or in one phase")
 
 
 def _shared(phases: Phases) -> tuple[dict[str, str], ...]:
@@ -1536,7 +1699,7 @@ def _shared(phases: Phases) -> tuple[dict[str, str], ...]:
 
 
 def _own_streams(source: Phases, first: _Staged, shared: Sequence[Mapping[str, str]],
-                 staged_at: Callable[[int, Mapping[str, int], Mapping[str, str]], _Staged]
+                 staged_at: Callable[[int, Mapping[str, _Trained], Mapping[str, str]], _Staged]
                  ) -> list[tuple[_Staged, int | None]]:
     """Each phase of `source` read on its own stream (`StepPhases`), staged beside its end, its step's:
     `first` for phase 0 where it shares nothing, the rest by `staged_at` with the corpora each shares
@@ -1571,15 +1734,19 @@ def _updates_aligned(ends: Sequence[int | None], batches: Sequence[int], window:
                              f"one batch's microbatches; end phase {index} at a multiple of {window} steps")
 
 
-def _continued(pipeline: Pipeline, consumed: Mapping[str, int]) -> Pipeline:
+def _continued(pipeline: Pipeline, consumed: Mapping[str, _Trained]) -> Pipeline:
+    """`pipeline` reading each corpus on from where the phases before left it (`consumed`): from the first
+    place they did not train (a slice after its chain's first repeat), the places past it they did drawn past
+    by its build (`_skipping`)."""
     if isinstance(pipeline.source, Phases):
         raise ValueError("nested phases are not an indexed record order")
     if isinstance(pipeline.source, Mixture):
         return with_children(pipeline, functools.partial(_continued, consumed=consumed))
-    offset = consumed.get(_name(pipeline), 0)
-    if not offset:
+    trained = consumed.get(_name(pipeline), _Trained())
+    offset = trained.low
+    if not offset and not trained.past:
         return pipeline
-    at = next((index + 1 for index, stage in enumerate(pipeline.stages) if isinstance(stage, Repeat)), None)
+    at = None if (repeat := place_of(pipeline)) is None else repeat + 1
     if at is None:
         pipeline = pipeline.repeat()
         at = len(pipeline.stages)
@@ -1588,7 +1755,17 @@ def _continued(pipeline: Pipeline, consumed: Mapping[str, int]) -> Pipeline:
     )
 
 
-def _delivered(pipeline: Pipeline, count: int, consumed: dict[str, int]) -> None:
+def _skipping(staged: _Staged, consumed: Mapping[str, _Trained], pipeline: Pipeline) -> _Staged:
+    """`staged`, the phase `pipeline` continued past `consumed` (`_continued`), drawing past the places of its
+    corpora the run trained already (`_Build.skipped`); a corpus it does not read it records nothing of."""
+    reads = {_name(chain) for chain, _ in _leaves(pipeline)}
+    skipped = {name: held.skipped() for name, held in consumed.items() if held.past and name in reads}
+    if not skipped:
+        return staged
+    return dataclasses.replace(staged, build=dataclasses.replace(staged.build, skipped=skipped))
+
+
+def _delivered(pipeline: Pipeline, count: int, consumed: dict[str, _Trained]) -> None:
     source = pipeline.source
     if isinstance(source, Phases):
         raise ValueError("nested phases have no single corpus share")
@@ -1599,7 +1776,7 @@ def _delivered(pipeline: Pipeline, count: int, consumed: dict[str, int]) -> None
             _delivered(child, taken, consumed)
     else:
         name = _name(pipeline)
-        consumed[name] = consumed.get(name, 0) + count
+        consumed[name] = consumed.get(name, _Trained()).drawn(count)
 
 
 def _training_reader(
@@ -1610,7 +1787,7 @@ def _training_reader(
     plan: Plan,
     planned: Callable[[int], Plan],
     host: tuple[HostStep, ...],
-    resume: Literal["exact", "non-exact"],
+    resume: DataResume,
     statistics: _Statistics,
 ) -> Iterator[Batch]:
     partition.rows(build.batch)
@@ -1849,12 +2026,12 @@ def iterate(
     plan_version: int = PLAN_VERSIONS[-1],
 ) -> pygrain.IterDataset:
     """A finite record pass through the same lowering, for publication and export, read by data plan
-    `plan_version` (`compile`'s), automatic workers read in the process (`Loading.unsized`)."""
+    `plan_version` (`compile`'s), in the process: automatic workers (`Loading.unsized`) and those the chain
+    names (row 5735), whose turns would interleave the records out of the order the pass publishes."""
     read_by(plan_version)
     loading = loading.unsized()
-    if any(
-        isinstance(stage, (RandomMap, BatchStage, MapBatch, Workers, Repeat)) for stage in _steps(pipeline)
-    ):
+    pipeline = _in_process(pipeline)
+    if any(isinstance(stage, (RandomMap, BatchStage, MapBatch, Repeat)) for stage in _steps(pipeline)):
         raise ValueError("publication needs deterministic, unbatched pipelines without repeat")
     (pipeline,) = _made(_prepared((pipeline,), read, provision=provision, counts=({},)), read, ({},),
                         training=False)
@@ -1862,6 +2039,13 @@ def iterate(
     build = _build(pipeline, read, loading, batch=1, training=False, version=plan_version)
     rows = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
+
+
+def _in_process(pipeline: Pipeline) -> Pipeline:
+    """`pipeline` and each chain it mixes without the loading workers they name (`Workers`)."""
+    held = with_children(pipeline, _in_process)
+    kept = tuple(stage for stage in held.stages if not isinstance(stage, Workers))
+    return dataclasses.replace(held, stages=kept)
 
 
 type Handed = pygrain.MapDataset | pygrain.IterDataset | Mapping[str, np.ndarray]
@@ -2001,6 +2185,7 @@ def fitted[Entry](
     plan_version: int = PLAN_VERSIONS[-1],
     steps: int | None = None,
     tokens: int | None = None,
+    resume: DataResume = "relaxed",
 ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
     """`dataset` and each validation dataset as `Trainer.fit` reads them,
     compiled with the objective's own stages and the run's data `seed`,
@@ -2010,7 +2195,8 @@ def fitted[Entry](
     length is its steps, epochs or tokens, or with `examples` reads that many
     records before they are packed and ends (`compile`'s `examples`); a
     validation dataset without a batch takes the
-    training batch, and is read and loaded as it asks. A Loader is already
+    training batch, and is read and loaded as it asks. A resume reads its position as `resume` says
+    (`dew.data.plan.DataResume`), the run's. A Loader is already
     compiled, and an entry that is no Dataset (a reader, an evaluation suite)
     is passed on as it is. A run of `epochs` over a chain whose read has no
     record count, but states the source examples a pass holds
@@ -2056,10 +2242,16 @@ def fitted[Entry](
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
                          widths=widths, read=read, measured=measured,
                          epochs=epochs if examples is None else None, plan_version=plan_version,
-                         steps=steps, tokens=tokens)
+                         steps=steps, tokens=tokens, resume=resume)
     else:
         widths = run_widths(list(scored.values()), objective) if scored else {}
         loader = dataset
+        # A loader compiled already resumes as it was compiled to (`Loader.resume`): the run's own mode,
+        # one statement of how its resume treats its data.
+        if loader.resume is not None and loader.resume != resume:
+            raise ValueError(f"the run resumes its data {resume}, and the loader it is given was compiled to "
+                             f"resume {loader.resume}; compile it with resume={resume!r}, or hand the run "
+                             "its chain")
     if named is None:
         return loader, None
     # Validation reads by the version training does: a loader handed compiled already reads by its own,

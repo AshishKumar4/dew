@@ -37,6 +37,7 @@ from process_support import run_pool
 from test_multiprocess import assert_identical_parameters, assert_same_parameters, dumped_params
 
 from dew.data.dataset import DataPartition
+from dew.data.plan import PlanChanged
 from dew.training import Checkpoints
 
 pytestmark = [pytest.mark.mesh, pytest.mark.distributed]
@@ -119,17 +120,21 @@ def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, tr
     directory = tmp_path / f"resumed{processes}" / "run"
     saved_at_third_step(run, directory)
     if not elastic and processes != saved_by:
-        # The checkpoint resumes the shares that saved it and refuses another count's.
+        # The checkpoint resumes the shares that saved it and refuses another count's position, which a
+        # pool resumed relaxed (the default) on another count names, its data started again: every
+        # process trains on from the step it saved, reading what a pool of its count reads first.
         checkpoints = Checkpoints(str(directory / "matrix"))
         checkpoints.restore(share=DataPartition(0, saved_by))
-        with pytest.raises(ValueError):
+        with pytest.raises(PlanChanged):
             checkpoints.restore(share=DataPartition(0, processes))
-        # A pool of another count refuses it on every process, at the checkpoint it restored, no step taken.
-        refused = run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
-                           cell=cell, name="matrix", steps=2 * STEPS, refusal=True, **prepared(cell))
-        assert all(report["refused"] == "ValueError" for report in refused), refused
-        assert all(report["written_steps"] == [STEPS] and not report["batches"]
-                   for report in refused), refused
+        restarted = run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
+                             cell=cell, name="matrix", steps=2 * STEPS, **prepared(cell))
+        fresh, _, _ = trained(cell, processes)
+        # The run's records, which process 0 writes, name what differed.
+        assert restarted[0]["restarted"] == ["topology"], restarted[0]["restarted"]
+        for report, whole in zip(restarted, fresh, strict=True):
+            assert report["step"] == 2 * STEPS
+            assert report["batches"] == whole["batches"][:len(report["batches"])]
         return
     resumed = run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
                        cell=cell, name="matrix", steps=2 * STEPS, **prepared(cell))

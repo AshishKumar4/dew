@@ -50,7 +50,7 @@ _log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from dew.data.mixing import CorpusCounts, Left
     from dew.data.pipeline import DeviceStep
-    from dew.data.plan import Plan
+    from dew.data.plan import DataResume, Plan
 
 
 @dataclasses.dataclass(frozen=True)
@@ -803,6 +803,9 @@ class Loader:
     counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
     validation_counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
     plan: Plan | None = None
+    resume: DataResume | None = None
+    """How its readers treat a resumed position (`dew.data.plan.DataResume`), the one a run that reads it
+    resumes by (`dew.training.Trainer.data_resume`); None for data handed as it is read."""
     statistics: Callable[[], Mapping[str, float]] = dataclasses.field(default=_data_statistics, repr=False)
     batch_tokens: int | None = None
     device: tuple[DeviceStep, ...] = ()
@@ -1340,7 +1343,7 @@ class GlobalStream:
         plan: Plan,
         loading: Loading,
         *,
-        resume: Literal["exact", "non-exact"] = "exact",
+        resume: DataResume = "exact",
         endless: bool = True,
         published: Callable[[Mapping[str, object] | None], None] | None = None,
     ):
@@ -1355,7 +1358,7 @@ class GlobalStream:
         self._reads: pygrain.DatasetIterator[Batch] | None = None
         self._loading = loading
         self._plan = plan
-        self._resume: Literal["exact", "non-exact"] = resume
+        self._resume: DataResume = resume
         self.manifest_changes: tuple[str, ...] = ()
         self.stop_seconds = loading.stop_seconds
 
@@ -1560,10 +1563,17 @@ class PhasedStream:
             self._stream(index)
         self._records = 0
         self._current: int | None = None
+        # The phase whose order a restart opened partway through it, at its own start, and the records of
+        # it the run had read then (`_position.Global.origin`); none for orders opened where they start.
+        self._origin: tuple[int, int] | None = None
         self.stop_seconds = stop_seconds
 
     def __iter__(self) -> Iterator[Batch]:
         return self
+
+    def _shift(self, phase: int) -> int:
+        """The records of `phase` its order's own reader was opened past (`_origin`), 0 for most."""
+        return self._origin[1] if self._origin is not None and self._origin[0] == phase else 0
 
     def _stream(self, phase: int) -> GlobalReader:
         """Phase `phase`'s reader, opened with the ends of the phases before it."""
@@ -1602,7 +1612,8 @@ class PhasedStream:
             stream = self._stream(phase)
             stream.set_state(
                 _position.encode(
-                    _position.Global(records=self._records - self._start(phase), order=stream.order)
+                    _position.Global(records=self._records - self._start(phase) - self._shift(phase),
+                                     order=stream.order)
                 )
             )
             self._current = phase
@@ -1644,6 +1655,7 @@ class PhasedStream:
                 plan={"phases": plans} if any(plan is not None for plan in plans) else None,
                 tokens=() if self._tokens is None else tuple(int(end) for end in self._tokens[:phase]
                                                              if end is not None),
+                origin=self._shift(phase),
             )
         )
 
@@ -1653,15 +1665,17 @@ class PhasedStream:
 
         if self._tokens is not None:
             if len(saved.completed) > len(self._ends):
-                raise ValueError(f"the saved run finished {len(saved.completed)} phases, and this run has "
+                raise _position.PlanChanged(("phases",), f"the saved run finished {len(saved.completed)} "
+                                            "phases, and this run has "
                                  f"{len(self._ends) + 1}")
             finished = self._tokens[:len(saved.completed)]
             if saved.tokens != finished:
                 # Its records end where the saved run's commits reached the phases' tokens, which a phase
                 # ending at other tokens would read on from as though the run had reached them.
-                raise ValueError(f"the saved run finished its phases at {list(saved.tokens)} committed "
-                                 f"tokens, and this run's end at {list(finished)}; a phase the run has read "
-                                 "cannot change under it")
+                raise _position.PlanChanged(("phases.tokens",),
+                                  f"the saved run finished its phases at {list(saved.tokens)} committed "
+                                  f"tokens, and this run's end at {list(finished)}; a phase the run has read "
+                                  "cannot change under it")
             # The ends the saved run reached, and none past them, which this run reaches as it reads.
             for index in range(len(self._ends)):
                 self._resolve(index, saved.completed[index][1] if index < len(saved.completed) else None)
@@ -1671,38 +1685,80 @@ class PhasedStream:
                 raise ValueError("saved phase plans do not cover the completed and current phases")
             for index, plan in enumerate(plans):
                 if index >= len(self._open) or (plan is not None and not isinstance(plan, Mapping)):
-                    raise ValueError("saved phase plan is not part of this run")
+                    raise _position.PlanChanged(("phases",), "a saved phase is not part of this run")
                 end = saved.completed[index][1] if index < len(saved.completed) else saved.records
+                shift = saved.origin if index == len(saved.completed) else 0
                 stream = self._stream(index)
                 stream.set_state(
                     _position.encode(
-                        _position.Global(records=end - self._start(index), order=stream.order, plan=plan)
+                        _position.Global(records=end - self._start(index) - shift, order=stream.order,
+                                         plan=plan)
                     )
                 )
 
         for index, (order, end) in enumerate(saved.completed):
             if (index >= len(self._ends) or not same_order(order, self._stream(index).order)
                     or self._ends[index] != end):
-                raise ValueError(
+                raise _position.PlanChanged(
+                    (f"phases.{index}",),
                     f"the saved run finished phase {index} reading {order} to record "
                     f"{end}, and this run's phase {index} is not that; a phase the "
                     f"run has read cannot change under it"
                 )
         phase = len(saved.completed)
         if phase >= len(self._open) or not same_order(saved.order, self._stream(phase).order):
-            raise ValueError(
+            raise _position.PlanChanged(
+                (f"phases.{phase}",),
                 f"the saved position is {saved.records} records into phase {phase}, "
                 f"reading {saved.order}, and this run's phase {phase} reads something "
                 f"else; resume with the order the checkpoint was written in"
             )
         end = self._ends[phase] if phase < len(self._ends) else None
         if end is not None and saved.records > end:
-            raise ValueError(
+            raise _position.PlanChanged(
+                (f"phases.{phase}",),
                 f"the saved run has read {saved.records} records, past this run's end "
                 f"of phase {phase} at {end}"
             )
         self.close()
         self._records = saved.records
+        self._origin = (phase, saved.origin) if saved.origin else None
+
+    def restarted(self, steps: int, saved: bytes | None) -> bytes:
+        """This run's position where a resume starts its data again at step `steps`, the run's, from `saved`,
+        its position under another data plan where it is readable: the phase the run's progress
+        stands in opened at its own start, its order's reader shifted by the records the run had
+        read of it (`_position.Global.origin`), so every boundary falls where the run's progress
+        places it. On the step clock the progress is `steps`, the records this stream's own batches
+        make of them; on the token clock the phases the run's commits ended, at the records `saved`
+        states, or none where nothing of `saved` is readable, its committed tokens then ending them
+        from the start (`dew.training._fit.stage_reached`)."""
+        if self._tokens is None:
+            records, phase = 0, 0
+            for phase, batch in enumerate(self.batches):
+                end = self._ends[phase] if phase < len(self._ends) else None
+                held = steps if end is None else min(steps, (end - self._start(phase)) // batch)
+                records, steps = records + held * batch, steps - held
+                if not steps:
+                    break
+            completed = tuple((self._stream(index).order, self._start(index + 1)) for index in range(phase))
+            tokens: tuple[int, ...] = ()
+        else:
+            try:
+                place = None if saved is None else _position.read(saved)
+            except ValueError:
+                place = None
+            if place is None:
+                return self.get_state()
+            phase, records = min(len(place.completed), len(self._ends)), place.records
+            for index in range(len(self._ends)):
+                self._resolve(index, place.completed[index][1] if index < phase else None)
+            completed = tuple((self._stream(index).order, place.completed[index][1])
+                              for index in range(phase))
+            tokens = tuple(int(end) for end in self._tokens[:phase] if end is not None)
+        return _position.encode(_position.Global(
+            records=records, order=self._stream(phase).order, completed=completed, tokens=tokens,
+            origin=records - self._start(phase)))
 
     def ending(self, state: bytes) -> bytes:
         """`state`, a position of this run on the committed-token clock, with the phase it stands in
@@ -1732,12 +1788,6 @@ class PhasedStream:
 
 
 class StepPhases(Forwarding):
-    CONTINUES: ClassVar[str] = "stamped"
-    """The `phases` rule a read of phases that share a corpus records in its position (docs/design/data.md,
-    the rules): a later phase continues a shared corpus from the stamped draws the run trained
-    (`_Frontier`). A position of a plan of 13, whose phases each read a corpus from its start, records
-    none, and resumes under that plan, which shares nothing (`dew.data.compile`)."""
-
     """Reads phases on the step clock one after another, each its own stream, opened at the step the
     phase before it ends: a read per share among them, cut per share where its order is (a stream batched
     by its tokens after steps that drop rows), whose records no global count places. Phase `p` reads
@@ -1759,6 +1809,11 @@ class StepPhases(Forwarding):
     starts it there, drawing past the pulls the run trained (`dew.data.mixing.Stamping`). Its position holds
     what it carries to later phases (`carried`) and the draws trained in the phase it stands in
     (`trained`), each empty in a position saved before phases shared corpora."""
+
+    CONTINUES: ClassVar[str] = "stamped"
+    """The `phases` rule a read of phases that share a corpus records in its position (docs/design/data.md,
+    the rules): a later phase continues a shared corpus from the stamped draws the run trained
+    (`_Frontier`). A plan of 13 reads no such phases (`dew.data.compile`)."""
 
     def __init__(self, readers: Sequence[Callable[[], Iterator[Batch]]], ends: Sequence[int | None], *,
                  batches: Sequence[int], opened: Callable[[int], None] = lambda phase: None,
@@ -1891,6 +1946,13 @@ class StepPhases(Forwarding):
                                          else json.dumps(own).encode()).decode(),
             "encoded": isinstance(own, bytes)}}).encode()
 
+    def restarted(self, steps: int) -> bytes:
+        """This run's position where a resume starts its data again at step `steps`, the run's: the phase
+        that step stands in, its own stream opened at its start, and the run's steps, so each later phase
+        ends at the step it was written to."""
+        self._steps = steps
+        return self.get_state()
+
     def set_state(self, state: bytes) -> None:
         saved = record(record(json.loads(state), "saved phases' position").get(_position.STEP_PHASES),
                        "saved phases' position")
@@ -1899,20 +1961,24 @@ class StepPhases(Forwarding):
         identities = list(strings(saved["identities"], "saved phase identities"))
         if phase >= len(self._make) or ends != self._ends[:phase] or identities[:phase] != [
                 self._identity(index) for index in range(phase)]:
-            raise ValueError(f"the saved run finished phases ending at steps {ends}, and this run's phases "
-                             f"end at {self._ends[:phase]}, or read them otherwise; a phase the run has read "
-                             "cannot change under it")
+            raise _position.PlanChanged(
+                ("phases",), f"the saved run finished phases ending at steps {ends}, and this run's phases "
+                f"end at {self._ends[:phase]}, or read them otherwise; a phase the run has read cannot "
+                "change under it")
         steps = integer(saved["steps"], "the saved steps")
         end = self._ends[phase] if phase < len(self._ends) else None
         if end is not None and steps > end:
-            raise ValueError(f"the saved run has read {steps} steps, past this run's end of phase {phase} "
-                             f"at {end}")
+            raise _position.PlanChanged(
+                (f"phases.{phase}",), f"the saved run has read {steps} steps, past this run's end of phase "
+                f"{phase} at {end}")
         rule = saved.get("phases")
         if (rule == self.CONTINUES) != any(self._shared):
-            raise ValueError(f"the saved run's phases continue a corpus they share by the phases rule "
-                             f"{rule!r}, and this run's by {self.CONTINUES if any(self._shared) else None!r} "
-                             "(docs/design/data.md, the rules): resume it by the data plan version it was "
-                             "saved under, as a run config's resume does")
+            raise _position.PlanChanged(("rules.phases",),
+                              f"the saved run's phases continue a corpus they share by the phases rule "
+                              f"{rule!r}, and this run's by "
+                              f"{self.CONTINUES if any(self._shared) else None!r} "
+                              "(docs/design/data.md, the rules): resume it by the data plan version it was "
+                              "saved under, as a run config's resume does")
         own = base64.b64decode(text(saved["position"], "the saved phase's position"))
         # What a position saved before phases shared corpora holds of them: none.
         from dew.data.mixing import Left
@@ -2107,6 +2173,9 @@ class RampedStream(Forwarding):
         self._ramp = Ranges.ending(tuple(stage.records for stage in stages[1:]))
         self._partition = partition
         self._records = 0
+        # The records the run had handed over where its source was opened at its start, a restart's
+        # (`_position.Global.origin`): the ramp's count less the source's own position at its restore.
+        self._origin = 0
         self._held: Batch | None = None
         # Over an elastic read: its position before the ramp's last read of it, the records handed over
         # before that read, and the records of the next read a restore skips.
@@ -2184,7 +2253,8 @@ class RampedStream(Forwarding):
             return _position.encode_ramped(_position.Ramped(self._mark, self._records - self._marked,
                                                             self._records))
         place = _position.read(_global_position(self._source.get_state()))
-        return _position.encode(dataclasses.replace(place, records=self._records))
+        # The source's own count lags the ramp's where a restart opened it at its start (`origin`).
+        return _position.encode(dataclasses.replace(place, records=self._records, origin=self._origin))
 
     def set_state(self, state: bytes) -> None:
         self._held, self._mark = None, None
@@ -2199,8 +2269,10 @@ class RampedStream(Forwarding):
             self._source.set_state(place.source)
             self._records, self._skip = place.records, place.skip
         else:
-            self._source.set_state(state)
-            self._records = _position.read(state).records
+            place = _position.read(state)
+            self._source.set_state(_position.encode(dataclasses.replace(
+                place, records=place.records - place.origin, origin=0)))
+            self._records, self._origin = place.records, place.origin
         stage = self._stage()
         if (self._records - stage.records) % stage.batch:
             raise ValueError(
@@ -2209,6 +2281,18 @@ class RampedStream(Forwarding):
                 f"{stage.records} on, so no step of it ends there: the checkpoint "
                 f"was written by a run that ramped differently"
             )
+
+    def restarted(self, steps: int) -> bytes:
+        """This ramp's position where a resume starts its data again at step `steps`, the run's: the records
+        its own stages hand over in that many steps, which place its stage, its source opened at its start
+        (`_position.Global.origin`; an elastic read's own position beside the ramp's count)."""
+        records = 0
+        for _ in range(steps):
+            records += self._stages[self._ramp.holding(records)].batch
+        if self._elastic:
+            return _position.encode_ramped(_position.Ramped(self._elastic_state(), 0, records))
+        place = _position.read(_global_position(self._source.get_state()))
+        return _position.encode(dataclasses.replace(place, records=records, origin=records - place.records))
 
     def close(self) -> None:
         self._held = None
