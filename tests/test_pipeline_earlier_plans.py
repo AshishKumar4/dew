@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from saved_positions_support import named
 
 from dew.data import Memory
 from dew.data.compile import compile
@@ -115,7 +116,7 @@ def _edited(state: bytes, edit) -> bytes:
 def test_a_position_read_by_another_rule_is_refused_naming_it():
     """A position whose plan read by a rule this Dew reads otherwise (a mix's schedule) is refused, the
     refusal naming the rule (docs/design/data.md, the rules); the position as saved resumes."""
-    chain = mix([_named("a", 1), _named("b", 2)], seed=4).batch(2)
+    chain = mix([named("a", 1), named("b", 2)], seed=4).batch(2)
     saved, after = _saved(chain)
 
     def other_mix(decoded):
@@ -138,7 +139,7 @@ def test_a_position_another_grain_wrote_resumes_where_its_iterators_read_it():
     """A consumed mixture's position whose iterator state another Grain wrote (its `grain` rule) is restored
     through the iterators that own it, and resumes onto the rows read next where they read it; one they
     cannot read (a state of another shape) is refused when it is restored."""
-    chain = mix([_named("a", 1), _named("b", 2)], seed=4).batch(2)
+    chain = mix([named("a", 1), named("b", 2)], seed=4).batch(2)
     saved, after = _saved(chain)
 
     def other_grain(decoded):
@@ -193,9 +194,3 @@ def test_a_stream_its_store_cuts_into_other_shards_is_refused():
                 assert _ids(stream, 2) == after
         finally:
             stream.close()
-
-
-def _named(name: str, tag: int) -> Pipeline:
-    """A corpus of 16 ids named `name`, each the `tag`th corpus's, read on without end."""
-    return Pipeline(Memory({"id": np.arange(tag * 100, tag * 100 + 16, dtype=np.int32)}, shard_rows=4),
-                    name=name).repeat()

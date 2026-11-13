@@ -581,22 +581,24 @@ def referenced(order: JSON, steps: Sequence[Mapping[str, JSON]]) -> JSON:
 
     def placed(part: JSON) -> JSON:
         nonlocal found
-        if isinstance(part, list):
-            return [placed(entry) for entry in part]
-        if not isinstance(part, dict):
-            return part
-        held = {name: placed(entry) for name, entry in part.items() if name != "stages"}
-        stages = part.get("stages")
-        if isinstance(stages, list):
-            places: list[JSON] = []
-            for stage in stages:
-                text = json.dumps(stage, sort_keys=True)
-                at = next((place for place in range(found, len(configurations))
-                           if configurations[place] == text), None)
-                places.append(stage if at is None else at)
-                found = found if at is None else at + 1
-            held["stages"] = places
-        return {name: held[name] for name in part}
+        match part:
+            case list():
+                return [placed(entry) for entry in part]
+            case dict():
+                # Its corpora's orders first, whose steps the manifest lists before its own stages'.
+                held = {name: placed(entry) for name, entry in part.items() if name != "stages"}
+                match part.get("stages"):
+                    case list(stages):
+                        places: list[JSON] = []
+                        for stage in stages:
+                            text = json.dumps(stage, sort_keys=True)
+                            at = next((place for place in range(found, len(configurations))
+                                       if configurations[place] == text), None)
+                            places.append(stage if at is None else at)
+                            found = found if at is None else at + 1
+                        held["stages"] = places
+                return {name: held[name] for name in part}
+        return part
 
     return placed(order)
 
@@ -605,28 +607,41 @@ def _resolved(order: JSON, steps: Sequence[Mapping[str, JSON]]) -> JSON:
     """`order` as a plan's record holds it (`referenced`), each stage held by its step's place described
     again by that step's configuration: the order `described` gives, which a plan compares. An order of
     `STRUCTURED` holds every stage described, as it is."""
-    if isinstance(order, list):
-        return [_resolved(entry, steps) for entry in order]
-    if not isinstance(order, dict):
-        return order
-    resolved = {name: _resolved(entry, steps) for name, entry in order.items() if name != "stages"}
-    if "stages" in order:
-        stages = order["stages"]
-        if not isinstance(stages, list):
+    match order:
+        case list():
+            return [_resolved(entry, steps) for entry in order]
+        case {"stages": list(stages)}:
+            return {name: [_described_at(stage, steps) for stage in stages] if name == "stages"
+                    else _resolved(entry, steps) for name, entry in order.items()}
+        case {"stages": stages}:
             raise ValueError(f"{stages!r}: a saved order's stages are a list")
-        resolved["stages"] = [_described_at(stage, steps) for stage in stages]
-    return {name: resolved[name] for name in order}
+        case dict():
+            return {name: _resolved(entry, steps) for name, entry in order.items()}
+    return order
 
 
 def _described_at(stage: JSON, steps: Sequence[Mapping[str, JSON]]) -> JSON:
     """An order's stage as its record holds it, described: the configuration of the step at its place
     where it is one (`referenced`), else as held."""
-    if not isinstance(stage, int) or isinstance(stage, bool):
+    place = _place(stage)
+    if place is None:
         return stage
-    if not 0 <= stage < len(steps) or not isinstance(configuration := steps[stage].get("config"), str):
-        raise ValueError(f"a saved order's stage is step {stage}, which its manifest's {len(steps)} steps do "
-                         "not describe")
-    return json_value(json.loads(configuration), "saved stage")
+    match steps[place].get("config") if 0 <= place < len(steps) else None:
+        case str(configuration):
+            return json_value(json.loads(configuration), "saved stage")
+    raise ValueError(f"a saved order's stage is step {place}, which its manifest's {len(steps)} steps do "
+                     "not describe")
+
+
+def _place(stage: JSON) -> int | None:
+    """The place among its manifest's steps an order's stage is held by (`referenced`), None where it is held
+    described."""
+    match stage:
+        case bool():
+            return None
+        case int(place):
+            return place
+    return None
 
 
 COUNTERS = 3
@@ -681,11 +696,11 @@ def _is_stage(stage: JSON, kind: str) -> bool:
 
 def _held_steps(order: JSON, places: frozenset[int]) -> frozenset[int]:
     """The steps a plan's record holds the run's own chain's stages at `places` by (`referenced`)."""
-    stages = order.get("stages") if isinstance(order, dict) else None
-    if not isinstance(stages, list):
-        return frozenset()
-    return frozenset(stage for at, stage in enumerate(stages)
-                     if at in places and isinstance(stage, int) and not isinstance(stage, bool))
+    match order:
+        case {"stages": list(stages)}:
+            return frozenset(place for at, stage in enumerate(stages)
+                             if at in places and (place := _place(stage)) is not None)
+    return frozenset()
 
 
 def _differing_steps(saved: Sequence[Mapping[str, JSON]], current: Sequence[Mapping[str, JSON]]
@@ -971,9 +986,13 @@ class Plan:
         compile's host steps or the rest of the order changed."""
         members = record(saved.get("members", {}), "saved members")
         before = {name: str(value) for name, value in members.items()}
-        if (self.lowering != "per-share" or not before or not self.members or not isinstance(order, dict)
-                or (before == dict(self.members) and order.get("weights") == self.order.get("weights"))):
+        if self.lowering != "per-share" or not before or not self.members:
             return None
+        match order:
+            case dict() if before != dict(self.members) or order.get("weights") != self.order.get("weights"):
+                pass
+            case _:
+                return None
         if before.get("") != self.members.get(""):
             raise PlanChanged(("members",), "saved data plan mixture stages changed")
         kept = (set(before) & set(self.members)) - {""}
