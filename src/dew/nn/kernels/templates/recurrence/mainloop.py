@@ -1375,13 +1375,17 @@ def _intra_summed(call: Call, found: jax.Array, at, *, first) -> None:
 
 
 def intra_sums_stored(call: Call, products: tuple[str, ...], totals: tuple, sums, landing: dict, *, row,
-                       head) -> None:
+                       head, summed=None) -> None:
     """The intra walk's sums at its last step, each output's in its form: the scores as the held operand's,
-    the system as `systems`'."""
+    the system as `systems`' (fp32, as the sums are), through its landing, or a merged walk's own sum's slot
+    of `summed` (`_intra_staged`), which holds it already."""
     chunk = call.chunk
     held = dataclasses.replace(call.held, rows=call.rows)
-    for name, total, ref in zip(products, totals, sums, strict=True):
-        form, smem = ((held, landing["square"]) if name == "scores" else (systems(call), landing["system"]))
+    for index, (name, total, ref) in enumerate(zip(products, totals, sums, strict=True)):
+        if name == "scores":
+            form, smem = held, landing["square"]
+        else:
+            form, smem = systems(call), landing["system"] if summed is None else summed.at[index]
         form.store(ref, total, row, chunk, head * chunk, chunk, family=call.family, smem=smem)
 
 
@@ -1457,7 +1461,7 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                     mosaic.synced(call.interpret)
                 found = (totals if summed_at is None
                          else tuple(family.tile_of(summed_at.at[o]) for o in range(outputs)))
-                intra_sums_stored(call, products, found, sums, landing, row=row, head=h)
+                intra_sums_stored(call, products, found, sums, landing, row=row, head=h, summed=summed_at)
 
             return totals, accumulators
 
@@ -1542,11 +1546,15 @@ def _intra_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
     (`_pairing`), the prefix scan's halves below as many zero rows (`algebra.scanned_prefix`'s shifts), each
     output's sum across the key blocks, and the stores' landings: the
     scores' square and a block of the prefix halves where it forms the scores, the system's where it forms the
-    system."""
+    system alone; a merged walk's system lands through its own sum's slot, fp32 as the system is
+    (`intra_sums_stored`): its own 16 KB tile held a B200's merged walk 2.6 KB past two programs' share
+    (118,844 bytes at a 16-column key block)."""
     chunk = call.chunk
+    merged = len(products) > 1
     landing = {**({"square": dataclasses.replace(call.held, rows=call.rows).landing(chunk, chunk),
                    "prefix": call.gates.landing(chunk, keys)} if "scores" in products else {}),
-               **({"system": systems(call).landing(chunk, chunk)} if "system" in products else {})}
+               **({"system": systems(call).landing(chunk, chunk)}
+                  if "system" in products and not merged else {})}
     # Read at row offsets no tiling divides (the scan's shifts, the sub-chunks' references), so plain.
     # Unpadded: a tile read in the accumulator's layout takes a row stride a whole number of its tiling's
     # columns (Mosaic GPU's layout inference refused 24 at a 16-column tiling and 80 at a 64-column one,
@@ -1556,8 +1564,7 @@ def _intra_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
     # A merged walk's sums in shared memory, each read and written whole, so in swizzled 8-row tiles: plain,
     # rows a multiple of 32 words apart put a fragment's 8 rows in the same banks (41.3M bank conflicts in a
     # GH200's Kimi Linear intra launch at ceb64ccc5d, M-JS-17); a lone output's in registers (`_intra_held`).
-    sums = ((swizzling.staged((len(products), chunk, chunk), jnp.float32, 128),) if len(products) > 1
-            else ())
+    sums = (swizzling.staged((len(products), chunk, chunk), jnp.float32, 128),) if merged else ()
     # Each product's columns put into a tile read whole once (`algebra.key_block_pairs`' `placed`).
     placing = swizzling.plain((chunk, chunk), jnp.float32)
     return (_pairing(call, keys), scanned, placing, *sums), landing
