@@ -118,7 +118,8 @@ def polar_express_reference(matrix: np.ndarray, steps: int, dtype) -> np.ndarray
     x = xp.asarray(matrix, dtype)
     tall = x.shape[0] > x.shape[1]
     x = x.T if tall else x
-    x = x / (xp.linalg.norm(x.astype(np.float32)).astype(dtype) * 1.01 + 1e-7)
+    norm_dtype = np.float64 if dtype == np.float64 else jnp.float32
+    x = x / (xp.linalg.norm(x.astype(norm_dtype)).astype(dtype) * 1.01 + 1e-7)
     for a, b, c in triples:
         gram = x @ x.T
         x = a * x + (b * gram + c * gram @ gram) @ x

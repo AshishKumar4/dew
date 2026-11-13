@@ -146,7 +146,9 @@ def assert_biases_sum_as_torch(name):
             with precision():
                 model(tokens, labels=tokens).loss.backward()
                 parameters = dict(model.named_parameters())
-                return {layout.name: parameters[layout.name].grad.float().numpy() for layout in biases}
+                return {layout.name: (grad.float() if (grad := parameters[layout.name].grad).dtype
+                                      == torch.bfloat16 else grad).detach().numpy()
+                        for layout in biases}
         return run
 
     def loss(variables, ids):
