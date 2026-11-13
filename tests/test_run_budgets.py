@@ -1105,6 +1105,66 @@ def test_a_clocked_fit_from_a_supplied_state_reads_its_bound_afresh_and_another_
     assert int(thin_fit(x, examples=CLOCKED_RECORDS, state=stepped).consumed) == CLOCKED_RECORDS
 
 
+def test_a_shortened_last_update_leaves_its_window_empty_for_the_next_fit_and_a_resume(tmp_path):
+    """A streamed run bounded to five batches' examples, four batches an update, commits its fifth batch
+    alone as its last update, closing its window (`CLOSES_WINDOW`): the window it leaves is empty, apart
+    from its clock of five accepted microbatches. A fit handed that state pools its next four batches into
+    one update, its window empty again, as does a run resuming the checkpoint the shortened update ended
+    at, which holds no window, to a bound four batches on; and a fit pooling windows of another size
+    takes it."""
+    import optax
+
+    from dew.state import occupancy
+
+    x = np.random.default_rng(0).normal(size=(9 * BATCH, FEATURES)).astype(np.float32)
+
+    def stream():
+        return Pipeline(Memory({"x": x})).read("streamed").batch(BATCH)
+
+    def pulled(directory=None) -> Trainer:
+        return Trainer(Pulled(), optax.sgd(0.1), key=0, accumulation=4,
+                       checkpoints=None if directory is None else Checkpoints(str(directory)))
+
+    def clocks(state) -> tuple[int, int, int]:
+        return int(state.microstep), int(state.updates), int(occupancy(state.window))
+
+    first = pulled(tmp_path / "run").fit(stream(), examples=5 * BATCH, log_every=1)
+    assert clocks(first) == (5, 2, 0)
+    # A fit donates the state it is given.
+    assert clocks(pulled().fit(stream(), steps=9, log_every=1, state=first)) == (9, 3, 0)
+    # The resume reads on to a larger bound, on the clock it saved on.
+    assert clocks(pulled(tmp_path / "run").fit(stream(), examples=9 * BATCH, log_every=1)) == (9, 3, 0)
+    # Its emptied window holds nothing, so a fit pooling another window takes the state, where one that
+    # read the window's place off the clock refused it as an open window.
+    shortened = pulled().fit(stream(), examples=5 * BATCH, log_every=1)
+    pairs = Trainer(Pulled(), optax.sgd(0.1), key=0, accumulation=2, split=1).fit(
+        stream(), steps=7, log_every=1, state=shortened)
+    assert int(pairs.updates) == 3 and int(occupancy(pairs.window)) == 0
+
+
+def test_a_window_the_previous_format_saved_restores_the_occupancy_its_contents_hold():
+    """The previous checkpoint format saved a window with no occupancy of its own (`Accumulation.fill`),
+    and saved it whole wherever the clock was off a window's boundary, an emptied one too: restored, its
+    occupancy is its clock's place in its window where it holds a microbatch (three of four after three
+    steps), and none where a shortened commit emptied it, at five accepted microbatches all the same."""
+    import jax
+    import optax
+
+    from dew.checkpoints import _held_occupancy
+
+    x = np.random.default_rng(0).normal(size=(9 * BATCH, FEATURES)).astype(np.float32)
+
+    def unsaved(**fit):
+        state = Trainer(Pulled(), optax.sgd(0.1), key=0, accumulation=4).fit(
+            Pipeline(Memory({"x": x})).read("streamed").batch(BATCH), log_every=1, **fit)
+        return state.with_window(dataclasses.replace(state.window, fill=None))
+
+    placed = jax.ShapeDtypeStruct((), np.int32)
+    assert int(_held_occupancy(unsaved(steps=3), placed)) == 3
+    shortened = unsaved(examples=5 * BATCH)
+    assert int(shortened.microstep) == 5 and int(_held_occupancy(shortened, placed)) == 0
+
+
 @pytest.mark.parametrize("accumulation", [1, 2])
 def test_a_run_of_steps_resumes_a_checkpoint_that_kept_no_count_and_a_clocked_run_refuses_it(tmp_path,
                                                                                            accumulation):

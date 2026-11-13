@@ -47,6 +47,7 @@ from dew.telemetry.profile import Profiler, active_profile
 from dew.training.ahead import handed
 from dew.training.distributed import batch_divisor
 from dew.training.footprint import Footprint
+from dew.training.interval import latest
 from dew.training.memory import (
     climbed,
     compiled_if_it_fits,
@@ -133,8 +134,8 @@ class Candidate:
     """A step a plan compiles: the shapes of the microbatch it reads, the
     loss's shapes, the narrow copies, the state's placement and shapes as it
     traces them, the bytes held beside it, the program lowered, None once its plan is admitted
-    (`Planned.released`), its kernel launches (`dew.nn.kernels.tuning.tune`) and its kernel report
-    (`dew.training._lowering.KernelReport`: its dispatches' routes and lowered launches)."""
+    (`Planned.released`), and its kernel report (`dew.training._lowering.KernelReport`: its dispatches'
+    routes and lowered launches)."""
     micro: Batch
     shapes: object
     copies: dict
@@ -144,7 +145,6 @@ class Candidate:
     built: int
     """The bytes of `held` the step's arguments hold: the copies and accumulator its first call builds."""
     program: jax.stages.Lowered | None
-    launches: str
     kernels: KernelReport
     footprint: Footprint | None
     """Its derived device footprint; None for a custom step not differentiating the objective."""
@@ -217,10 +217,13 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]]):
     """A step's outputs from those of the microbatches it was read in: its loss as an unsplit step logs it,
     whatever the split (docs/design/training.md, the logged loss): where its last microbatch commits, the
     update's, pooled over the window; elsewhere its own batch's, its microbatches' own statistics pooled
-    (`Committed.own`) and reduced by `reduce` (`Objective.reduce_loss`); the last microbatch's report, as
-    each step of an accumulating run reports its own microbatch's; finite and accepted where every
-    microbatch was; and the commits summed, their statistics let go. A pure function, which a step compiles
-    as a program of its own (`dew.training.compiler`) or traces within its own (`dew.training.ahead`)."""
+    (`Committed.own`) and reduced by `reduce` (`Objective.reduce_loss`); its metrics pooled by their own
+    statistics (`_pooled`); finite and accepted where every microbatch was; and the commits' counts,
+    tokens and norms summed, its inspection the latest part's that committed (`interval.latest`), as a
+    run's interval keeps the latest sampled commit: a step of two commits (a window a rejection left part
+    filled, then the closing part of a run's last batch) reports its second's summaries, never the two
+    added. A pure function, which a step compiles as a program of its own (`dew.training.compiler`) or
+    traces within its own (`dew.training.ahead`)."""
     losses, metrics, finite, accepted, committed = zip(*outputs, strict=True)
     report = {name: _pooled(name, [part[name] for part in metrics]) for name in metrics[-1]}
     if len(metrics) > 1:
@@ -229,7 +232,7 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]]):
                    or isinstance(value, Ratio) else f"{name}/last_microbatch"): value
                   for name, value in report.items()}
     loss = losses[-1]
-    if committed[-1] is not None and committed[-1].own is not None:
+    if committed[-1].own is not None:
         owns = [part.own for part in committed]
         # Pooled as a window pools them (`Transaction.prepare_attempt`): a loss stated as one scalar as the
         # mean of its equal microbatches', statistics by their sums.
@@ -237,9 +240,15 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]]):
         own = reduce(jax.tree.map(lambda *values: sum(values), *owns))[0]
         own = own / len(owns) if scalar else own
         loss = jnp.where(committed[-1].count > 0, loss, own.astype(loss.dtype))
-    summed = jax.tree.map(lambda *values: sum(values), *(
-        part if part is None else dataclasses.replace(part, own=None) for part in committed))
-    return (loss, report, jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)), summed)
+    summed = jax.tree.map(lambda *values: sum(values),
+                          *(dataclasses.replace(part, inspected=None, own=None) for part in committed))
+    sample = None
+    for part in committed:
+        if part.inspected is not None:
+            sample = (part.count, part.inspected) if sample is None else latest(
+                (part.count, part.inspected), sample)
+    return (loss, report, jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)),
+            dataclasses.replace(summed, inspected=None if sample is None else sample[1]))
 
 
 def _pooled(name: str, values: list):

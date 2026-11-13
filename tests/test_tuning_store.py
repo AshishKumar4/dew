@@ -27,16 +27,22 @@ from dew.nn.precision import Numerics
 from dew.telemetry import compiles
 
 
+def stored(launches: list) -> list:
+    """`launches` written as JSON as the picks store writes each (`tuning._launch_json`), and read
+    back."""
+    return [tuning._launch(json.loads(json.dumps(tuning._launch_json(ba)))) for ba in launches]
+
+
 def test_a_steps_launches_and_their_timings_round_trip_through_dews_json():
-    """Each launch of a norm seam and SwiGLU step, written as JSON (`dumps_launches`, `dumps_picks`)
-    and read back (`loads_launches`, `_read`), is the same op at the same key, with its configs'
-    times; tokamax's own BoundArguments key them, so a read launch looks its pick up as a traced one
-    does."""
+    """Each launch of a norm seam and SwiGLU step, written as JSON as the picks store writes it
+    (`_launch_json`, `dumps_picks`) and read back (`_launch`, `_read`), is the same op at the same key,
+    with its configs' times; tokamax's own BoundArguments key them, so a read launch looks its pick up
+    as a traced one does."""
     from test_tuning import operands, step
 
     keyed = recorded(step(), *operands(15))
     assert keyed
-    again = tuning.loads_launches(tuning.dumps_launches(keyed))
+    again = stored(keyed)
     assert [(ba.op, ba.autotuning_cache_key) for ba in again] == [
         (tuning._identity(ba.op), ba.autotuning_cache_key) for ba in keyed]
     timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=2.0, evaluation_times_ms=(3.0, 4.0),
@@ -138,7 +144,7 @@ def test_a_launch_of_numpy_descriptors_keys_and_round_trips_as_jaxs():
     # which JSON has no form for unless they key as shapes.
     keyed = [ba for _, ba in found]
     assert keyed
-    again = tuning.loads_launches(tuning.dumps_launches(keyed))
+    again = stored(keyed)
     assert [(ba.op, ba.autotuning_cache_key) for ba in again] == [
         (tuning._identity(ba.op), ba.autotuning_cache_key) for ba in keyed]
 
@@ -218,7 +224,7 @@ def test_a_hooked_launch_keys_by_what_its_hooks_compute_and_round_trips():
 
     first, again_alike = keyed(closure(2.0), closure(3.0), (0,)), keyed(closure(2.0), closure(3.0), (0,))
     assert key(first) == key(again_alike)
-    [again] = tuning.loads_launches(tuning.dumps_launches([first]))
+    [again] = stored([first])
     assert (again.op, again.autotuning_cache_key) == key(first)
     added = functools.partial(lambda combine, tile: combine(tile, tile), jnp.add)
     multiplied = functools.partial(lambda combine, tile: combine(tile, tile), jnp.multiply)
