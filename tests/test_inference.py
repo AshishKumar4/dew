@@ -675,6 +675,10 @@ LAYOUT_SEEDS = 128
 """The layout sites' declared seeds, sized by `seeds_for` paired with each layout's draw on armada's CPUs:
 128 for every layout (fsdp-stage's on two machines, the others' on one), a sizing that took 17 to 55 s of
 each case's run when the case sized itself (row 4341)."""
+PLACED_IMAGES_SEEDS = 8
+"""The declared seeds of a run's images on each trainer layout, paired with the one-device run's: sized
+by `seeds_for` on armada's CPUs (2026-11-12, eg-sized2 at 0aed05577f7), 8 for every layout, where each run
+sized them again."""
 
 
 @pytest.mark.mesh(devices=4)
@@ -1074,7 +1078,7 @@ def test_a_run_draws_images_on_every_trainer_layout_as_one_device_does(tmp_path,
     (`TextToImage.scoring`), on par with one device against its float64 twin over the same prepared noise
     and conditions (check 1) (ledger 1817)."""
     from arm_arithmetic import widened
-    from reference_error import as_given, assert_as_exact, seeds_for
+    from reference_error import as_given, assert_as_exact
 
     from dew.inference import ImageRequest, ScoringServer
     from dew.training import Layout, MeshSpec
@@ -1112,9 +1116,8 @@ def test_a_run_draws_images_on_every_trainer_layout_as_one_device_does(tmp_path,
             return wide(held, steps=3, key=int(keys[0])).host().images
 
     label = f"images on {spec}"
-    count = seeds_for(drawn(alone), draw, label, truth_fn=truth, dew_fn=drawn(placed))
-    assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=count, truth_fn=truth)
-    assert_as_exact(served, drawn(alone), draw, label, seeds=count, truth_fn=truth)
+    assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=PLACED_IMAGES_SEEDS, truth_fn=truth)
+    assert_as_exact(served, drawn(alone), draw, label, seeds=PLACED_IMAGES_SEEDS, truth_fn=truth)
 
 
 def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajectory(tmp_path):

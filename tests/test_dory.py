@@ -27,7 +27,6 @@ from reference_error import (
     equations,
     indexed_recording,
     recording,
-    seeds_for,
     widened,
 )
 from residual_orders import model_axes
@@ -637,6 +636,10 @@ def peft_merged(checkpoint: Path, adapter: Path) -> dict[str, np.ndarray]:
 
 MERGED_SEEDS = 8
 """The merged-adapter site's declared draws (`seeds_for`)."""
+PEFT_MERGED_SEEDS = 8
+"""The declared draws of the adapter held to PEFT's own merge, another reference than `MERGED_SEEDS`' and
+sized apart, the reference compared with itself: sized by `seeds_for` on armada's CPUs (2026-11-12,
+eg-sized2 at 0aed05577f7), where each run sized it again."""
 
 
 def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
@@ -696,10 +699,8 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     def adapted_logits(drawn):
         return adapted.model.apply(resumed, drawn)
 
-    seeds = seeds_for(peft_logits(torch.float32), draw, 'the adapter as PEFT merges it',
-                      truth_fn=peft_logits(torch.float64))
     assert_as_exact(adapted_logits, peft_logits(torch.float32), draw, 'the adapter as PEFT merges it',
-                    seeds=seeds, truth_fn=peft_logits(torch.float64))
+                    seeds=PEFT_MERGED_SEEDS, truth_fn=peft_logits(torch.float64))
     adapted.save(tmp_path / 'merged', variables=resumed)
     merged = Pretrained.load(tmp_path / 'merged', dtype='float32', attention_impl='xla')
     # Merging folds each adapter into its projection's weight, a rounding of its own: the merged
