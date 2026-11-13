@@ -3,8 +3,8 @@
 Each stage kind has one definition here, which every read applies and the
 memory executor (`dew.data.materialize`) calls for the stages it runs over
 the whole source: `_outputs` for a record step, `_reordered` for an order
-stage over indexed rows, `_TokenSplit` for a token split, `_packed` for
-a pack's packer, and `_fill` with `_CachedOutputs` for opening a cache and
+stage over indexed rows, `_TokenSplit` for a token split, `dew.data.packing.packed_documents`
+for a pack's packer, and `_fill` with `_CachedOutputs` for opening a cache and
 reading what it holds.
 
 `_Build` lowers a pipeline's stages in the order they are written, as the
@@ -98,7 +98,7 @@ from dew.data.mixing import (
     token_weights,
 )
 from dew.data.ordering import Skipping, place_of
-from dew.data.packing import FirstFitPacked, LastPieces, _Concatenated, _OverlappedCuts, window_fields
+from dew.data.packing import packed_documents
 from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
@@ -878,24 +878,6 @@ class _Inputs(pygrain.MapDataset):
         return outputs[0] if self._single and isinstance(outputs, tuple) else outputs
 
 
-def _packed(documents: pygrain.IterDataset, stage: Pack, *, consumed: bool = False
-            ) -> pygrain.IterDataset:
-    """`documents` packed for the stage's policy: first-fit as an indexed read's plan places them
-    (`FirstFitPacked`), each example's counts where its last piece is emitted where the documents carry them
-    (`consumed`, `LastPieces`), the rest by Grain's own packers."""
-    if stage.policy == "first-fit":
-        return FirstFitPacked(documents, stage, LastPieces(stage.fields[0]) if consumed else None)
-    sizes, _ = window_fields(stage)
-    if stage.policy == "concat":
-        cut = _OverlappedCuts(documents, stage) if stage.overlap else documents
-        return _Concatenated(gx.ConcatThenSplitIterDataset(cut, length_struct=sizes))
-    # Fields cut alike with the first share its segments and positions, as the indexed planner's
-    # windows do (`packed_window`), so Grain writes no copy of them for the rest.
-    return gx.BestFitPackIterDataset(documents, length_struct=sizes, num_packing_bins=stage.bins,
-                                     shuffle_bins=False, max_sequences_per_bin=stage.segments,
-                                     meta_features=stage.fields[1:])
-
-
 class _Ruled(pygrain.IterDataset):
     """The windows a pack or windows stage makes of `documents`, each counted by the one rule its
     documents' targets were counted by (`counted_window`), as a memory read counts them
@@ -922,7 +904,7 @@ class _Ruled(pygrain.IterDataset):
             documents = documents.map(_ConsumedAt(stage.fields[0], held))
             laid = (*ACCOUNTS, *(() if held is None else (DOCUMENT,)))
             stage = dataclasses.replace(stage, fields=(*stage.fields, *laid))
-        windows = (_packed(documents.map(stage.document), stage, consumed=self._consumed)
+        windows = (packed_documents(documents.map(stage.document), stage, consumed=self._consumed)
                    if isinstance(stage, Pack) else CausalWindows(documents, stage, held))
         return _RuledIterator(iter(windows), seen, stage.fields[0], consumed=self._consumed, documents=held,
                               drawn=self._drawn)

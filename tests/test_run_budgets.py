@@ -844,7 +844,9 @@ def test_an_example_first_fit_lays_apart_completes_in_the_window_emitted_after_i
     try:
         for batch in stream:
             held = np.asarray(batch["text"])
-            segments = np.asarray(batch["text_segment_ids"])
+            # The documents each window holds, numbered from 1 (a window of one states none: its tokens).
+            laid = batch["text_coordinates"].segments
+            segments = (held > 0).astype(np.int32) if laid is None else np.asarray(laid)
             for segment in set(segments[segments > 0].tolist()):
                 seen[int(held[segments == segment][0])] += 1
             done = {example for example, pieces in seen.items() if pieces == 3} - counted

@@ -15,6 +15,7 @@ import functools
 from collections.abc import Callable, Mapping, Sequence
 from typing import ClassVar
 
+import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
@@ -579,3 +580,21 @@ class _OverlappedCutsIterator(pygrain.DatasetIterator):
     def set_state(self, state: Mapping[str, object]) -> None:
         restore_parent(self._documents, state, "documents", "packed documents")
         self._room = integer(state["room"], "packed window room")
+
+
+def packed_documents(documents: pygrain.IterDataset, stage: Pack, *, consumed: bool = False
+                     ) -> pygrain.IterDataset:
+    """`documents` packed for the stage's policy: first-fit as an indexed read's plan places them
+    (`FirstFitPacked`), each example's counts where its last piece is emitted where the documents carry them
+    (`consumed`, `LastPieces`), the rest by Grain's own packers."""
+    if stage.policy == "first-fit":
+        return FirstFitPacked(documents, stage, LastPieces(stage.fields[0]) if consumed else None)
+    sizes, _ = window_fields(stage)
+    if stage.policy == "concat":
+        cut = _OverlappedCuts(documents, stage) if stage.overlap else documents
+        return _Concatenated(gx.ConcatThenSplitIterDataset(cut, length_struct=sizes))
+    # Fields cut alike with the first share its segments and positions, as the indexed planner's
+    # windows do (`packed_window`), so Grain writes no copy of them for the rest.
+    return gx.BestFitPackIterDataset(documents, length_struct=sizes, num_packing_bins=stage.bins,
+                                     shuffle_bins=False, max_sequences_per_bin=stage.segments,
+                                     meta_features=stage.fields[1:])
