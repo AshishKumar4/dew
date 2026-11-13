@@ -222,7 +222,8 @@ Each form is priced in time from the device facts Dew already owns, never from f
   (`joined`; `linear`'s shared operand out of two products), which the device price already prefers, so a
   collective's bytes over `dew.training.distributed.link_figure` would only agree with it. A rule that moves a
   reduction onto or off a sharded axis brings that price with it;
-- the kernel model is the templates' own (`dew.nn.kernels.templates.cost.walked`);
+- the kernel model is the templates' own (`dew.nn.kernels.templates.cost.walked`), a template kernel's work read
+  from its body (docs/design/kernel-templates.md §6);
 - a fact a price needs and no owner holds, such as a reduction's latency, is added to `GpuTarget` or its
   `Architecture`.
 
@@ -370,11 +371,9 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
   - the templates' schedules, the toolkit and the families;
   - custom derivatives that implement kernels, and numerics and surrogate bodies except as §1.3 allows;
   - the planner's contract and the precision policy's meaning;
-  - JAX, jaxlib and XLA, unchanged: the pass reads a fact a library states from the library, through its
-    designed interfaces where it has one, and where it has none composes it from the library's own methods,
-    public or private (`program`'s static arguments by JAX's own inference, `nn.programs`' precision presets by
-    JAX's own conversion), never from a list of Dew's that restates it; a fact or hook that fits the fork goes
-    there at its source.
+  - JAX, jaxlib and XLA, unchanged: the pass reads a fact a library states from the library (bible §5):
+    `program`'s static arguments by JAX's own inference, `nn.programs`' precision presets by JAX's own
+    conversion.
 - **XLA keeps** fusion and code generation; it does not reassociate floating-point math by default, so chosen forms
   reach it intact.
 
@@ -715,7 +714,8 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   its mode, from its operands' dtypes and its precision as the product declaration reads them, a dot
   algorithm's passes counted, and its operand bytes; a reduction's operations; a special function's
   exponentials, a conversion's conversions, any other elementwise node's operations, a layout change nothing;
-  a leaf's bytes, read once). A template's instructions price through the same record. No per-operation price
+  a leaf's bytes, read once). A template kernel's issued work is read from its body into the same record
+  (docs/design/kernel-templates.md §6; today stated by hand, row 5895). No per-operation price
   exists anywhere else. Today one does: a bit form's own price (`bits.BitForm.price`, its instructions' ALU and
   FMA issues, §7) stands beside `Work`, which holds no integer or packed pipe yet (row 5386).
 - A schedule turns summed work into seconds over `GpuTarget`'s facts, the one source of device facts, each
@@ -724,7 +724,8 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   takes fewer seconds and no more of that work (`cost.cheaper`), so it is cheaper whatever the rate. A process
   of no accelerator prices as the interpreted templates' H100 (or the device an interpreted check assumes), a GPU no row names by its family's and its
   runtime's facts (`cost.target`):
-  - XLA's fusion (`cost.fused`), for the compile-time pass over a program, error-aware extraction and the
+  - XLA's fusion (`cost.fused`; a fact XLA holds is read from XLA, §4: today `fused` restates XLA's fusion
+    rather than reading it, row 5897), for the compile-time pass over a program, error-aware extraction and the
     derived scan's carry split (`carry.split`, whose carry runs as a loop XLA lowers, a chunk an iteration, its
     span priced at that loop's step; today the split's work states no span, so only its work is priced: the
     loop's step latency is in no rate `Fused` reads, an open gap). A program's operands are read from device memory once, however many
@@ -764,7 +765,8 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   pass and the derived scan's carry split price them through XLA's fusion. Each shared term is priced once either way.
 - The tile walk reads no registers or rings when pricing a candidate: both are properties of a whole chosen DAG
   at a tile size the derivation does not yet know. The template's register model (`MosaicForward.registers`,
-  `_hook_live`) sizes its tiles to the form chosen, and its compile gate refuses a spill. (Today the gate
+  `_hook_live`) sizes its tiles to the form chosen, and its compile gate refuses a spill (the model proposing
+  and ptxas certifying is kernel-templates.md §7's, pending row 5896). (Today the gate
   refuses a template launch's spill by relowering it at another config; where no config is left it logs that
   and keeps the program before it, spill and all, recorded as a miss, and a kernel no template derived is
   recorded, never refused: `report.settled`.)
