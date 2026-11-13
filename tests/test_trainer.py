@@ -189,6 +189,22 @@ def test_a_runs_start_reports_each_phase_it_took_once():
     assert sorted(started) == ["startup/compile_seconds", "startup/data_seconds", "startup/warm_seconds"]
 
 
+@pytest.mark.parametrize("split", [2, None], ids=["two-microbatches", "planned"])
+def test_a_steps_logged_loss_is_its_rows_whatever_its_split(split):
+    """A run accumulating two steps an update logs at each step the loss of the rows that step consumed:
+    read in two microbatches a step, or in the split its plan chooses, it logs every step's loss as the run
+    read whole logs it, its commit steps' the update's and its others' their own batch's (docs/design/
+    training.md, the logged loss), where a split step once logged its last microbatch's alone."""
+    def logged(**kwargs) -> list[float]:
+        tracker = RecordingTracker()
+        make_trainer(tracker=tracker, accumulation=2, **kwargs).fit(dataset(), steps=6, log_every=1)
+        return [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
+
+    whole = logged(split=1)
+    assert len(whole) == 6
+    np.testing.assert_allclose(logged(split=split), whole, rtol=1e-6)
+
+
 def test_a_run_given_steps_and_tokens_is_refused_as_a_budget_named_twice():
     """One budget (row 5725): a fit given both `steps` and `tokens` is refused before it reads, as one given
     steps and epochs is; tokens alone bound it."""

@@ -37,9 +37,9 @@ from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
-from dew.nn.kernels.options import compiler_options, program, program_digest
+from dew.nn.kernels.options import OuterProgram, compiler_options, owned_program, program_digest
 from dew.nn.kernels.templates import report
-from dew.objectives.base import RECORD, Objective
+from dew.objectives.base import RECORD, Objective, Ratio
 from dew.state import TrainState, apart, together
 from dew.telemetry.compiles import EVENTS, Compiles
 from dew.telemetry.instrumentation import compiled_memory
@@ -205,19 +205,32 @@ class SampledStep(NamedTuple):
     executable: jax.stages.Compiled
 
 
-@program
-def whole_step(outputs):
-    """A step's outputs from those of the microbatches it was read in: the
-    last one's loss, pooled over the window where it commits, and its
-    report, as each step of an accumulating run reports its own
-    microbatch's; finite and accepted where every microbatch was; and the
-    commits summed."""
+def whole_step_program(objective: Objective) -> OuterProgram:
+    """`whole_step` over `objective`'s statistics (`Objective.reduce_loss`), the one program a split step
+    runs on its microbatches' outputs, compiled under its towers' options, which a run compiled ahead
+    compiles with its step (`dew.training.ahead`)."""
+    return owned_program(functools.partial(whole_step, reduce=objective.reduce_loss), *objective.towers())
+
+
+def whole_step(outputs, reduce: Callable[[Ratio | jax.Array | float], tuple[jax.Array, jax.Array]]):
+    """A step's outputs from those of the microbatches it was read in: its loss as an unsplit step logs it,
+    whatever the split (docs/design/training.md, the logged loss): where its last microbatch commits, the
+    update's, pooled over the window; elsewhere its own batch's, its microbatches' own statistics pooled
+    (`Committed.own`) and reduced by `reduce` (`Objective.reduce_loss`); the last microbatch's report, as
+    each step of an accumulating run reports its own microbatch's; finite and accepted where every
+    microbatch was; and the commits summed, their statistics let go. A pure function, which a step compiles
+    as a program of its own (`dew.training.compiler`) or traces within its own (`dew.training.ahead`)."""
     losses, metrics, finite, accepted, committed = zip(*outputs, strict=True)
     # A recording step's evaluations are every microbatch's, in the order they ran (`RECORD`).
     report = {name: jnp.concatenate([part[name] for part in metrics]) if name.startswith(RECORD) else value
               for name, value in metrics[-1].items()}
-    return (losses[-1], report, jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)),
-            jax.tree.map(lambda *values: sum(values), *committed))
+    loss = losses[-1]
+    if committed[-1] is not None and committed[-1].own is not None:
+        own = jax.tree.map(lambda *values: sum(values), *(part.own for part in committed))
+        loss = jnp.where(committed[-1].count > 0, loss, reduce(own)[0].astype(loss.dtype))
+    summed = jax.tree.map(lambda *values: sum(values), *(
+        part if part is None else dataclasses.replace(part, own=None) for part in committed))
+    return (loss, report, jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)), summed)
 
 
 TRACING_COLLECTIONS = 50_000

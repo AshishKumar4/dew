@@ -48,7 +48,7 @@ from dew.training.planning import (
     held_objects,
     settled,
     splits,
-    whole_step,
+    whole_step_program,
 )
 from dew.training.profiling import pgle_runs
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
@@ -339,6 +339,8 @@ class StepCompiler[L, E]:
         # state another program's step returned, a cooldown's restored, a public caller's) is laid out for
         # this step's window first (`laid_out`).
         returned: list[jax.Array | None] = [None]
+        # A split step's whole from its microbatches' outputs, its loss as an unsplit step logs it.
+        whole = whole_step_program(self.objective)
 
         def run(current, batch, sampled: bool = False):
             # A sampled step summarizes what the run inspects (`Planned.sampled`); every other, the plan's.
@@ -375,7 +377,7 @@ class StepCompiler[L, E]:
                     outputs.append(tuple(output))
                 stepped = together(moving, frozen)
                 returned[0] = stepped.window_size
-                return (stepped, *(outputs[0] if split == 1 else whole_step(outputs)))
+                return (stepped, *(outputs[0] if split == 1 else whole(outputs)))
         return run
 
     def _planned(self, stepping: Stepping, state: TrainState, batch: Batch,

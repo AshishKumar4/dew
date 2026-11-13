@@ -117,6 +117,9 @@ class Committed:
     inspected: Summaries | None = None
     """A sampled step's summaries as one vector (`dew.training.inspection.Summaries`), zero where it
     committed nothing; None in a step that samples nothing."""
+    own: Ratio | jax.Array | float | None = None
+    """The microbatch's own loss statistics, which a step read in several pools into its batch's loss
+    (`dew.training.planning.whole_step`) and lets go; None past the step."""
 
 
 def _chosen(take, taken, kept):
@@ -583,6 +586,9 @@ class PendingAttempt(Generic[Loss]):
     gradient: Variables
     applied: Applied | None = None
     """What the runs that updated in their backward leave for the commit (`Transaction.planned`)."""
+    own: Loss | None = None
+    """This microbatch's own statistics, which a step read in several pools into its batch's loss
+    (`dew.training.planning.whole_step`)."""
 
 
 _GROUPS: contextvars.ContextVar[tuple[int, int | jax.Array] | None] = contextvars.ContextVar(
@@ -873,7 +879,7 @@ class Transaction:
                 replay_required = due & local_ok
             loss = jnp.where(due, value, loss)
         return PendingAttempt(fill, due, active, loss, local_finite, replay_required,
-                              pooled, effects, qk, candidate, gradient)
+                              pooled, effects, qk, candidate, gradient, own=stats)
 
     def pooled_cotangent(self, pooled, current_stats, factor):
         """Seed the pooled statistics' cotangent, in the live leaves' dtypes.
@@ -1184,7 +1190,8 @@ class Transaction:
             advanced = dataclasses.replace(advanced, deferred=waiting.astype(jnp.uint32))
         return advanced, loss, aux, Committed(
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
-            jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted))
+            jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted),
+            own=pending.own if self.split > 1 else None)
 
     def planned(self, state: TrainState) -> _Planned | None:
         """The plan by which the runs a one-stage scanned state holds stacked update in their backward
