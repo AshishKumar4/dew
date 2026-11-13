@@ -103,10 +103,10 @@ def test_a_run_records_the_data_plan_it_reads_by_and_one_saved_before_names_eigh
     assert RunConfig.load(str(directory)).data_plan_version == 8
 
 
-def test_a_run_trained_on_a_compiled_loader_records_this_dews_version(tmp_path):
-    """A run handed a loader already compiled (`RunConfig.train` of a `Loader`), one compiled for a run of
-    the version before this Dew's, records this Dew's data plan version, which every version it reads reads
-    by (`dew.data.plan.read_by`), so rebuilding the run reads the order the loader read."""
+def test_a_run_naming_the_version_before_this_dews_records_this_dews(tmp_path):
+    """A run that names the data plan version before this Dew's, as one saved under it records, reads it as
+    its own (`dew.data.plan.read_by`), and records this Dew's, the version its positions are saved under
+    (train 801's F2)."""
     import numpy as np
     from affine_run import FEATURES
 
@@ -115,13 +115,11 @@ def test_a_run_trained_on_a_compiled_loader_records_this_dews_version(tmp_path):
     from dew.data.plan import PLAN_VERSIONS
 
     rows = np.random.default_rng(0).normal(size=(16, FEATURES)).astype(np.float32)
-    earlier = PLAN_VERSIONS[0]
-    loader = compile(Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat(),
-                     plan_version=earlier)
+    loader = compile(Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat())
     config = TrainerConfig(name="loaded", checkpoint_dir=str(tmp_path / "runs"), steps=1, eval_every=None,
-                           checkpoint_every=None)
-    RunConfig(trainer=config).train(Regression(), loader, name="loaded")
-    assert RunConfig.load(str(tmp_path / "runs" / "loaded")).data_plan_version == PLAN_VERSIONS[-1] != earlier
+                           checkpoint_every=None, data_resume="exact")
+    RunConfig(trainer=config, data_plan_version=PLAN_VERSIONS[0]).train(Regression(), loader, name="loaded")
+    assert RunConfig.load(str(tmp_path / "runs" / "loaded")).data_plan_version == PLAN_VERSIONS[-1]
 
 
 def test_a_run_naming_a_version_this_dew_reads_none_of_is_refused_with_a_compiled_loader(tmp_path):

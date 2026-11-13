@@ -765,9 +765,9 @@ def saved_identity(identity: str) -> str:
 
 
 def read_by(version: int) -> int:
-    """The version a read of a run saved under `version` reads by, this Dew's, refused where this Dew reads
-    none of it (`PLAN_VERSIONS`): what every read (`dew.data.compile`'s `compile`, `iterate` and `publish`)
-    asks before it prepares anything."""
+    """The version a run saved under `version` reads by, this Dew's, refused where this Dew reads none of it
+    (`PLAN_VERSIONS`): what a run asks before its data compiles (`dew.config.RunConfig.compiled`), the one
+    place a version is refused."""
     if version not in PLAN_VERSIONS:
         raise PlanChanged(("version",), f"this Dew reads data plans by version "
                                         f"{', '.join(map(str, PLAN_VERSIONS))}, not {version}: {_RESUMED}")

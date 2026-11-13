@@ -61,8 +61,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   its own, and refuses 8 to 13, naming both ways on: resume with the Dew that wrote it, or go on from its
   weights as a new run that reads its data afresh; a relaxed resume of one starts its data again.
   `Objective.bind_plan`, `dew.data.pipeline.earlier`, `Pipeline.at` and `ObjectiveData.earlier` are gone,
-  `Source.manifest` takes no version, and a run handed a compiled loader records the version the run it
-  resumes saved, or this Dew's.
+  `Source.manifest` takes no version, and the data layer reads by this Dew's alone: `compile`, `iterate`,
+  `validation`, `publish`, `fitted`, `held` and `text.export_tokens` take no `plan_version`, nor `dew data
+  export` and `dew data publish` a `--plan-version`. A run resolves its version once
+  (`RunConfig.data_plan_version`): one it reads it reads as its own and records as this Dew's, the version
+  its positions are saved under; one it reads none of is refused resumed exactly and started again relaxed.
 
 - A schedule's step horizons (its warmup's and decay's lengths in steps) are operands of its solver's state
   (`RateState.horizons`) where a run builds it stated (`OptimConfig.build(stated=True)`), so a rehearsed run
