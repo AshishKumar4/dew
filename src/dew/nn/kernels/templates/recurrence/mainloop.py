@@ -54,6 +54,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
@@ -394,6 +395,28 @@ def vector_blocks(call: Call, *names) -> dict:
 def _down(step) -> tuple:
     """A view's block indices at `step`: its `step`-th row tile, from its first column."""
     return step, 0
+
+
+def halves_tiled(family: mosaic.Family, staging):
+    """`staging`'s tiles, each a product may read as its right operand staged where its family's products
+    split their columns between two halves of whole tiles (`Family.right_swizzle`): one wider than a tile of
+    the swizzle its rows fill whose halves are no whole tiles of it, at the right operand's swizzle, the rest
+    as layout inference stages them. A 96-column value block staged at its rows' 64 bytes, 32 bf16 columns a
+    tile, failed to lower on tcgen05 at either dtype ("The M or N MMA instruction size was chosen to be 48,
+    which is not a multiple of the tiling of the non-contracting dimension 32", Nemotron-H 4B's SSD forward
+    at a value block of 96, armada jsf-lower96b), as its streams were capped (`Tcgen05Chunks.streams`). It
+    restages by a tile's shape, not by the product reading it: a left operand or a tile read into registers
+    that meets the condition takes the narrower swizzle too, correct at some of its bandwidth."""
+    def tiled(tile: plgpu_core.GPUMemoryRef):
+        if tile.transforms or len(tile.shape) != 2:
+            return tile
+        columns = tile.shape[-1]
+        widest = swizzling.swizzle_columns(tile.dtype, resources.widest_swizzle(tile.dtype, columns))
+        if columns <= widest or columns // 2 % widest == 0:
+            return tile
+        return swizzling.staged(tile.shape, tile.dtype, family.right_swizzle(tile.dtype, columns))
+
+    return jax.tree.map(tiled, staging, is_leaf=lambda leaf: isinstance(leaf, plgpu_core.GPUMemoryRef))
 
 
 def staging_tiles(operand: Operand, *shapes) -> tuple:
@@ -785,6 +808,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     family = call.family
     if persistent and producer is None:
         producer = stated_producer(call, PERSISTENT_PRODUCER)
+    staging = halves_tiled(family, staging)
     registers = held.registers(family, addressed(staging, landing or {}))
     allocations, scope, staging, landing = shared_allocation(call, blocks, staging, landing or {}, once=once,
                                                              consumers=consumers, swizzles=swizzles,
