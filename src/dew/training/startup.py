@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import flax.linen as nn
 
+from dew._records import JSON
 from dew.data.compile import Handed, fitted
 from dew.data.dataset import DataPartition, Loader
 from dew.data.pipeline import Dataset, ObjectiveData
@@ -120,3 +121,34 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader
         data_resumed(loader, trainer._stream_partition(),
                      functools.partial(checkpoints.position, step, DataPartition.of(trainer.device_mesh)),
                      resume=trainer.data_resume, step=step)
+
+
+def computation_differs(saved: JSON, now: JSON) -> list[str]:
+    """Where the computation a checkpoint trained, its inference record (`Objective.inference_record`, which
+    every step carries), and this run's differ: each path of the objective's class or its model's record where
+    both state it and they disagree, the fields that say how layers execute aside (the configured path's own
+    `RunConfig.EXECUTED`) and a loop's passes (`Loop.PASSED`, which a phase sets), and a field one of them
+    predates. Nothing where either records none (an unrecordable model's, or a step that predates the
+    record): only positive evidence refuses (row 5723)."""
+    from dew._records import without_fields
+    from dew.config import RunConfig
+    from dew.nn.backbones.decoder_stack import Loop
+
+    def differing(before: JSON, after: JSON, path: str) -> list[str]:
+        # A loop's passes are the run's to set, a phase's own (`Loop.PASSED`).
+        passed = Loop.PASSED if path.endswith(".loop") else ()
+        match before, after:
+            # A field one record holds and the other predates is no evidence: only fields both state compare.
+            case dict(), dict():
+                return [found for key in sorted((before.keys() & after.keys()) - set(passed))
+                        for found in differing(before[key], after[key], f"{path}.{key}")]
+            case _:
+                return [] if before == after else [path]
+
+    match saved, now:
+        case dict(), dict() if "unrecorded" not in {*saved, *now}:
+            return [found for name in ("objective", "model") if name in saved and name in now
+                    for found in differing(without_fields(saved[name], RunConfig.EXECUTED),
+                                           without_fields(now[name], RunConfig.EXECUTED), name)]
+        case _:
+            return []

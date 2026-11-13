@@ -108,6 +108,31 @@ def test_a_weight_of_zero_reads_no_groups_and_a_weight_adds_the_term_beside_the_
     assert "consistency" in aux.metrics
 
 
+def test_a_run_with_no_consistency_term_reads_no_groups_however_its_rows_state_them():
+    """A raw row whose groups name a question it does not ask: a run with no consistency term reads its
+    examples apart and never its groups, so it trains on the row (row 5734), where the row's groups were
+    parsed and refused it; a run that weighs consistency reads them and refuses the row."""
+    backbone = tiny_backbone().clone(max_seq_len=LAYOUT.max_len)
+    row = {"state": NEGATED.state, "questions": dict(NEGATED.questions), "answers": dict(NEGATED.answers),
+           "groups": {"billing": {"billing": {"true": "yes", "false": "no"}, "asked": {"true": "no"}}}}
+
+    def batch(consistency: float):
+        from dew.data import Memory
+        from dew.data.compile import compile
+        from dew.decision import decisions
+
+        head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
+        objective = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                      head=head, consistency=consistency)
+        chain = Memory([row, row]).pipe(decisions).batch(tokens=LAYOUT.max_len)
+        loader = compile(chain, read="memory", objective=objective.data())
+        return next(iter(loader.train(DataPartition())))
+
+    assert batch(0.0)
+    with pytest.raises(ValueError):
+        batch(0.5)
+
+
 def test_a_looped_backbones_exit_gate_trains_under_ouros_exit_objective_over_each_passs_answers():
     """A decision over a backbone whose loop has an exit gate trains the gate under Ouro's exit objective
     (`exit_entropy`): each question's label loss at each pass, its answers read off that pass's states by

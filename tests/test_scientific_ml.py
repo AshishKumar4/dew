@@ -444,6 +444,28 @@ def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoi
         jax.config.update("jax_enable_x64", val=False)
 
 
+@pytest.mark.parametrize("features", [64, 4], ids=["dual", "primal"])
+def test_a_gauss_newton_window_the_stream_ends_inside_commits_a_solve_of_the_rows_it_holds(features):
+    """Gauss-Newton read eight rows a microbatch in windows of four, over five microbatches: the run's last
+    window, which the stream ends inside, holding its fifth microbatch alone, commits a solve of those rows
+    (row 5722), its rows fewer than the weights (the dual's) or more (the normal equations'): its weights
+    move past the first window's, where they once stayed and the update was counted all the same."""
+    generator = np.random.default_rng(5)
+    x = generator.normal(size=(40, features)).astype(np.float32)
+    y = generator.normal(size=40).astype(np.float32)
+
+    def trained(count: int) -> np.ndarray:
+        rows = Memory([{"x": row, "y": target} for row, target in zip(x[:count], y[:count], strict=True)])
+        trainer = Trainer(LeastSquares(features), gauss_newton(damping=1e-6), key=0, layout=LAYOUT,
+                          accumulation=4)
+        # A run of its `count` examples, streamed: its stream ends inside the second window, holding a fifth.
+        state = trainer.fit(rows.read("streamed").batch(8), examples=count)
+        assert int(state.updates) == -(-count // 32)
+        return np.asarray(state.variables["params"]["Dense_0"]["kernel"])[:, 0]
+
+    assert not np.array_equal(trained(40), trained(32))
+
+
 def test_a_gauss_newton_update_held_by_a_wrapper_that_drops_its_statistics_is_refused():
     """A Gauss-Newton update inside `optax.MultiSteps`, which hands its inner update no extra arguments and
     pools no system across the steps it holds, is refused as its step is traced, naming the accumulation
