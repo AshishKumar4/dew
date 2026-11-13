@@ -129,8 +129,11 @@ seams: "port-cells": {
 	paths:   ["src/dew/nn/kernels/recurrence_chunk.py"]
 	entries: "PORT_CELLS"
 	declared: {
-		"(tcgen05, forward)":                          "the gated delta net's forward on a B200, the port's 0.394 ms against the template's 0.724 (M-JS-106)"
-		"(tcgen05, forward, a decay a key dimension)": "Kimi delta attention's forward on a B200, the port's 1.118 ms against the template's 2.507 (M-JS-106)"
+		"(tcgen05, forward at 16x128 keys, 48x128 values)":                           "Qwen3.5-27B's gated delta net's forward on a B200, the port's 0.394 ms against the template's 0.724 (M-JS-106)"
+		"(tcgen05, forward at 16x128 keys, 32x128 values)":                           "Qwen3-Next's gated delta net's forward on a B200, the port's 0.276 ms against the template's 0.399 (M-JS-106)"
+		"(tcgen05, forward, a decay a key dimension at 32x128 keys, 32x128 values)":  "Kimi delta attention's forward on a B200, the port's 1.118 ms against the template's 2.507 (M-JS-106)"
+		"(tcgen05, training at 16x128 keys, 48x128 values)":                          "Qwen3.5-27B's gated delta net's training on a B200, the port's 1.747 ms against the template's 1.889 (js106c)"
+		"(tcgen05, training, a decay a key dimension at 32x128 keys, 32x128 values)": "Kimi delta attention's training on a B200, the port's 4.317 ms against the template's 6.642 (js106c)"
 	}
 }
 
