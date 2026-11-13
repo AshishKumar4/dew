@@ -38,6 +38,7 @@ from dew.data.dataset import (
     Ends,
     Loader,
     PhasedStream,
+    Position,
     RampedStream,
     StepPhases,
     row_field,
@@ -996,25 +997,25 @@ def resumed_on(stream: Iterator[Batch], position: Callable[[], bytes | None], *,
     return restarted(stream, fresh, held[0], step, tuple(differs)), tuple(differs)
 
 
-def restored_or_restarted(stream: Iterator[Batch], saved: bytes, *, resume: DataResume, step: int
+def restored_or_restarted(stream: Checkpointable, saved: bytes, *, resume: DataResume, step: int
                           ) -> tuple[str, ...]:
     """`stream` restored to `saved`, the run's training stream on the worker that reads it, which opens it
     once and restores it there (`Trainer._prefetched`); or, resumed relaxed where its plan differs, started
     afresh (`restarted`): what differs, none where it restored. Each process decides it alike, from one
     saved plan and its own."""
-    fresh = stream.get_state() if isinstance(stream, Checkpointable) else None
+    fresh = stream.get_state()
     try:
-        restore_position(_positioned(stream), saved)
+        restore_position(stream, saved)
         return ()
     except PlanChanged as changed:
         if resume == "exact":
             raise
         differs = tuple(changed.differs)
-    restore_position(_positioned(stream), restarted(stream, fresh, saved, step, differs))
+    restore_position(stream, restarted(stream, fresh, saved, step, differs))
     return differs
 
 
-def restarted(stream: Iterator[Batch], fresh: object, saved: bytes | None, step: int,
+def restarted(stream: object, fresh: Position | None, saved: bytes | None, step: int,
               differs: tuple[str, ...]) -> bytes:
     """Where `stream` starts again where its saved plan differs in `differs`: the beginning of its order
     (`fresh`, its state as it opened), or, for a stream read in stages, the stage the run's progress stands

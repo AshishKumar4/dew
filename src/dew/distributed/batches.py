@@ -357,7 +357,7 @@ class DevicePrefetchIterator:
     def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = PREFETCH_DEPTH,
                  source_state: bytes | None = None, *, prepare: Callable[[Batch], Batch] | None = None,
                  reads: Mapping[Signature, tuple[bool, ...]] | None = None,
-                 restore: Callable[[Checkpointable, bytes], object] = restore_position):
+                 restore: Callable[[Checkpointable, bytes], None] = restore_position):
         if depth <= 0:
             raise ValueError("prefetch depth must be positive")
         self._iterator: Iterator | None = iter(iterator)

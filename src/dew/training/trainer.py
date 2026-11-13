@@ -49,7 +49,7 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.data.pipeline import Dataset
-from dew.data.plan import DataResume
+from dew.data.plan import DataResume, PlanChanged
 from dew.distributed.batches import (
     PREFETCH_DEPTH,
     DevicePrefetchIterator,
@@ -127,6 +127,7 @@ from dew.training._fit import (
     handed_splits,
     pooled_first,
     read_batch,
+    restarted,
     restored,
     restored_or_restarted,
     resumed_on,
@@ -1305,8 +1306,14 @@ class Trainer(Generic[Loss, Effects]):
         if checkpoints is None or start.resume is None:
             return 0, None, lambda: self._placed(start, positioned=False)[:2], start.abstract
         # Its saved position, which the stream the run opens restores, or starts again where its plan
-        # changed (`_prefetched`).
-        position = checkpoints.position(start.resume, DataPartition.of(self.device_mesh))
+        # changed (`_prefetched`); a position saved for other shares is none of this run's to read.
+        try:
+            position = checkpoints.position(start.resume, DataPartition.of(self.device_mesh))
+        except PlanChanged as changed:
+            if self.data_resume == "exact":
+                raise
+            position = None
+            self._restarting(run, tuple(changed.differs))
         return start.resume, position, lambda: self._placed(start, positioned=False)[:2], start.abstract
 
     def _stream_partition(self) -> DataPartition:
@@ -1460,7 +1467,11 @@ class Trainer(Generic[Loss, Effects]):
         """`source`'s batches placed ahead of the step by the prefetch worker, which restores it to
         `position` first, once a pool's processes agree their streams read the same records."""
         assert run.partition is not None
-        if position is not None and isinstance(source, PhasedStream):
+        if position is None and run.restarted is not None and isinstance(
+                source, StepPhases | RampedStream | PhasedStream):
+            # Started again where its saved position was none of this run's: at the stage its step is in.
+            position = restarted(source, None, None, run.current, run.restarted)
+        elif position is not None and isinstance(source, PhasedStream):
             # A schedule's stage opens where the position stands, or where it starts again: the pool
             # agrees on the one it reads.
             position, differs = resumed_on(source, lambda: position, resume=self.data_resume,
