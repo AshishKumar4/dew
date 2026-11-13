@@ -274,6 +274,10 @@ class Coords(NamedTuple):
     into each compare, so a row's bound takes the start once (`seen`; FA3's causal mask, against a key place
     formed whole per entry: 36 bit operations a diagonal tile's trip at width 128 on an H100)."""
     key_offsets: jax.Array | None = None
+    drop_at: tuple[jax.Array, jax.Array] | None = None
+    """Where given, the global places its draw takes its queries and keys at (`DropPlaces`: a sequence
+    exchange's slice), its queries' `[bq]` and its keys' `[bk]` as its walk read them beside the tile, which a
+    Mosaic program cannot gather from its draw's tables a step (`drawn`); its draw then holds none."""
 
     def queries(self, x: jax.Array, like: jax.Array) -> jax.Array:
         """A per-query `x` (`[bq]`) broadcast over the tile `like`."""
@@ -1147,6 +1151,12 @@ def drawn(coords: Coords, queries: jax.Array, keys: jax.Array) -> jax.Array | No
     word once, on its vector (`Draw.words`), its keys entry for entry: the same bits, half the hashing."""
     if coords.drop is None:
         return None
+    if coords.drop_at is not None:
+        # The tile's own entries (a Mosaic program's `q_pos` and `k_pos`, each the tile's) at the places its
+        # walk read (`Coords.drop_at`): each query's word once, on its vector, its keys' entry for entry.
+        query_at, key_at = coords.drop_at
+        words = coords.queries(coords.drop.words(query_at), keys)
+        return coords.drop.multiplied(coords.drop.kept(words, coords.keys(key_at, keys)))
     # A tile whose rows are its queries reduces along its own rows; one whose rows are its keys (the keys
     # first, `Coords.keys_first`) would reduce across its warps, through scratch its launch holds none of.
     if (queries is coords.q_pos and jnp.shape(queries) == jnp.shape(keys) and jnp.ndim(keys) == 2
@@ -1438,8 +1448,7 @@ def _split_tile(keys: Keys, p: jax.Array, dtype, anchor: Argmax, multiplier: jax
     the parts of their product with the values (`dtype`), the other keys' narrowed weights' sum `[bq]` (a
     function, which the step takes after the products) and the anchor's own weight, on a scaled tile
     (`held`) at their rows' scale in two tiers (`at_scale`); under dropout (the tile's draw's `multiplier`)
-    the other keys' dropped weights, the anchor's own weight undropped (it is `own`), and the anchor takes its
-    draw's multiplier, which the forward's output and the backward read."""
+    the other keys' dropped weights, the anchor's own weight undropped (it is `own`)."""
     at_anchor = keys.coords.k_pos == expand(anchor.key, keys.logits)
     small = None
     if held is not None:
@@ -1462,10 +1471,7 @@ def _split_tile(keys: Keys, p: jax.Array, dtype, anchor: Argmax, multiplier: jax
     dropped = jnp.where(at_anchor, 0.0, p) * multiplier
     parts = (dropped_parts(dropped, dtype, drop.bound) if small is None
              else scaled_parts(dropped, small * multiplier, dtype))
-    # The anchor's multiplier by its query's vector and its key's, no unit axis (a Mosaic program's lowers
-    # none beside a tile).
-    anchor_draw = drawn(keys.coords, keys.coords.query_places(), anchor.key)
-    return parts, rest, own_tile, anchor._replace(multiplier=anchor_draw)
+    return parts, rest, own_tile, anchor
 
 
 def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Gathered) -> tuple[Carry, Gathered]:
@@ -1491,6 +1497,12 @@ def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Gathered) -> tu
 
     def split(held: Scaled | None) -> Carry:
         parts, rest, own_tile, anchored = _split_tile(keys, p, value.dtype, anchor, multiplier, held)
+        if multiplier is not None:
+            # The anchor's multiplier, which the output (`joined`) and the backward read, by its query's
+            # vector and its key's, no unit axis. An anchor known before the walk (`anchored_step`) takes its
+            # own after it (`anchor_multipliers`).
+            anchored = anchored._replace(multiplier=drawn(keys.coords, keys.coords.query_places(),
+                                                          anchored.key))
         drop = None if held is None else held.drop
         accumulate = keys.accumulate
         if accumulate is None:
@@ -1632,7 +1644,7 @@ def anchor_multipliers(drop: Dropout, anchors: jax.Array) -> jax.Array:
     (`joined`) and its value in D (a dropping backward's `gradient.split_delta`)."""
     batch, heads, queries = anchors.shape
     draw = Draw((drop.seed[0], drop.seed[1]), drop.rows.reshape(batch, 1, 1), drop.heads.reshape(1, heads, 1),
-                drop.rate)
+                drop.rate, drop.queries, drop.keys)
     return draw(jnp.arange(queries, dtype=jnp.int32), anchors)
 
 

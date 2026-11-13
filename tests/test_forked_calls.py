@@ -735,18 +735,73 @@ def test_a_windowed_block_over_forks_reads_its_block_whole_and_its_window_else()
                 assert found[row, query, key] == (windowed or blocked), (row, query, key)
 
 
-def test_rollouts_share_their_prompts_where_their_scorer_does_from_its_runs_plan():
-    """A rollout scheduler built before its run binds its plan packs a task's samples over one copy of
-    their prompt where the objective that trains on them shares, read at each call (`RolloutScheduler.
-    scorer`, its `shares_prefixes(train=True)`): a GRPO policy over a forked decoder, and a PPO objective
-    whose critic reads forks too; after a plan from before `SHARED_STATE` binds (`TokenScorer.bind_plan`,
-    a run saved before forks resuming) the same call packs every sample whole, as it does where the critic's
-    backbone reads no forks or no scorer is named."""
+def _cached_fork_block():
+    """A windowed layer's cached call over forks reading a block (row 5437): a row's cache holds three keys,
+    the call a block of three tokens continuing it, a padding token, and two tokens of a fork of the block's
+    document, stored from slot three (`fork_anchor`'s `first`) past the padding (`fork_slots`). Its spans'
+    arguments under a window of one, and the keys the dense rule gives each query: a block's token its
+    block's every key (`(window and causal) or block`), the fork's tokens their own key alone, the padding
+    none."""
+    from dew.nn.inputs import AttentionMetadata, fork_runs, fork_slots
+    from dew.nn.mixers.attention import fork_key_places
+
+    segments = jnp.asarray([[1, 1, 1, 0, 2, 2]], jnp.int32)
+    valid = segments > 0
+    parents = np.asarray([[0, 1]], np.int32)
+    forks = Forks(jnp.asarray(parents), depth=Forks.depth_of(parents), held=Forks.held_of(parents))
+    first, start, keys = jnp.asarray([3]), jnp.asarray([0]), 8
+    positions = forks.positions(segments, jnp.asarray([3], jnp.int32), valid)
+    laid = dataclasses.replace(
+        coordinates(segments=segments, valid=valid, max_segments=2, positions=positions), forks=forks)
+    metadata = AttentionMetadata(coordinates=laid,
+                                 block_groups=jnp.asarray([[1, 1, 1, -1, -1, -1]], jnp.int32))
+    spanned = {"key_runs": fork_runs(metadata, 1, 6, (first, start), groups=("block_groups",)),
+               "query_slots": fork_slots(metadata, 1, 6, first),
+               "places": (positions, fork_key_places(metadata, positions, first, 1, 6, keys)),
+               "block_groups": jnp.asarray([[-1, -1, -1, 1, 1, 1, -1, -1]], jnp.int32)}
+    seen = np.zeros((6, keys), bool)
+    seen[:3, 3:6] = True
+    seen[4, 6] = seen[5, 7] = True
+    return spanned, seen
+
+
+def test_a_cached_windowed_block_over_forks_reads_its_block_whole_and_its_window_else():
+    """The spans of a cached call over forks reading a block (`_cached_fork_block`) are the dense rule's:
+    each of the block's tokens sees its block's every key past its window, from the slots its queries are
+    stored at."""
+    from dew.nn.attention_masks import visibility_mask
+
+    spanned, seen = _cached_fork_block()
+    np.testing.assert_array_equal(np.asarray(spanned["query_slots"]), [[3, 4, 5, -1, 6, 7]])
+    found = np.asarray(visibility_mask(6, 8, causal=False, sliding_window=1, **spanned))[0, 0]
+    np.testing.assert_array_equal(found, seen)
+
+
+def test_a_cached_windowed_block_over_forks_attends_as_its_dense_rule():
+    """A cached call over forks reading a block (`_cached_fork_block`) through the public entry, its runs,
+    groups, places and slots, attends exactly as the same call under its dense rule's mask, the reference
+    path computing both: its groups kept past the call's own causality, which its runs hold."""
+    from dew.nn.attention import scaled_dot_product_attention
+
+    spanned, seen = _cached_fork_block()
+    query, key, value = (jax.random.normal(jax.random.key(index), (1, length, 2, 16), jnp.float32)
+                         for index, length in enumerate((6, 8, 8)))
+    spans = scaled_dot_product_attention(query, key, value, sliding_window=1, implementation="reference",
+                                         **spanned)
+    dense = scaled_dot_product_attention(query, key, value, mask=jnp.asarray(seen)[None, None],
+                                         implementation="reference")
+    np.testing.assert_array_equal(np.asarray(spans), np.asarray(dense))
+
+
+def test_rollouts_share_their_prompts_where_their_scorer_does():
+    """A rollout scheduler packs a task's samples over one copy of their prompt where the objective that
+    trains on them shares, read at each call (`RolloutScheduler.scorer`, its `shares_prefixes(train=True)`):
+    a GRPO policy over a forked decoder, and a PPO objective whose critic reads forks too; it packs every
+    sample whole where the critic's backbone reads no forks or no scorer is named."""
     import optax
     from model_support import TINY_DECODER
     from test_rl_methods import Scripted, session
 
-    from dew.data.plan import PLAN_VERSIONS, SHARED_STATE
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl.grpo import GRPOObjective
     from dew.objectives.rl.ppo import PPOObjective, ValueHead
@@ -772,10 +827,6 @@ def test_rollouts_share_their_prompts_where_their_scorer_does_from_its_runs_plan
     policy = GRPOObjective(model, Scripted.width - 1)
     critic = PPOObjective(model, Scripted.width - 1, critic=ValueHead(model))
     for objective in (policy, critic):
-        shares = packed(objective, policy)
-        assert shares()
-        objective.bind_plan(SHARED_STATE - 1)
-        assert not shares()
-        objective.bind_plan(PLAN_VERSIONS[-1])
+        assert packed(objective, policy)()
     assert not packed(PPOObjective(model, Scripted.width - 1, critic=ValueHead(Plain())), policy)()
     assert not packed(None, policy)()

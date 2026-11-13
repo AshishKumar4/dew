@@ -677,7 +677,9 @@ def mode_pool_refusals(args) -> dict:
     runs out after one batch there, and a batch without a field. A resume
     from a newest checkpoint the processes list differently is refused as
     well, and streams that run out after one batch on both end the fit
-    there. Each outcome is the error's text, or None for a fit that trained."""
+    there. Each outcome is what the fit ended in: the error's type it was refused with and the steps it
+    took first, or None and its steps for a fit that trained; then every process passes one more
+    agreement, which a rank left behind would block."""
     import jax
     import optax
     from affine_run import FEATURES, Regression
@@ -724,14 +726,21 @@ def mode_pool_refusals(args) -> dict:
     def reads(fail: bool = False, fields: tuple[str, ...] = ("x", "y"), ends: int | None = None) -> Loader:
         return Loader(lambda partition: Reads(fail, fields, ends), None, batch=BATCH, records=None)
 
-    def trained(data, checkpoints=None, **flags) -> str | None:
+    def trained(data, checkpoints=None, **flags) -> dict:
+        """How the fit ended (the refusal's type, None where it trained) and the steps its tracker heard
+        logged before then, one a step (`log_every=1`)."""
+        from recording import RecordingTracker
+
+        heard = RecordingTracker()
         trainer = Trainer(Regression(), optax.sgd(1e-2), key=jax.random.key(0), mesh=MeshSpec(),
-                          checkpoints=checkpoints)
+                          checkpoints=checkpoints, tracker=heard)
         try:
             trainer.fit(data, steps=2, log_every=1, **flags)
+            refused = None
         except (ValueError, RuntimeError) as error:
-            return f"{type(error).__name__}: {error}"
-        return None
+            refused = type(error).__name__
+        steps = [step for step, scalars in heard.scalars if "train/loss" in scalars]
+        return {"refused": refused, "steps": steps}
 
     other = rank == 1
     outcomes = {
@@ -756,9 +765,10 @@ def mode_pool_refusals(args) -> dict:
     resumed = Trainer(Regression(), optax.sgd(1e-2), key=jax.random.key(0), mesh=MeshSpec(),
                       checkpoints=Checkpoints(str(resumed_from)))
     try:
-        outcomes["stale"] = int(resumed.place()[0].step)
+        outcomes["stale"] = {"refused": None, "restored": int(resumed.place()[0].step)}
     except (ValueError, RuntimeError) as error:
-        outcomes["stale"] = f"{type(error).__name__}: {error}"
+        outcomes["stale"] = {"refused": type(error).__name__, "restored": None}
+    _coordination.agreed("the pool after its refusals", lambda: True)
     return outcomes
 
 
@@ -2290,13 +2300,22 @@ def mode_matrix(args) -> dict:
     cache_dir = Path(args.prepared) if cached == "published" else Path(args.run_dir).parent / "cache"
     data = matrix_data(read, cached, rejecting == "rejecting", packed == "packed", cache_dir)
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
-    restored_step, _ = restored_state(trainer)
     batches = []
     train = tapped(data.train, lambda batch: batches.append(hashlib.sha256(b"".join(
         np.ascontiguousarray(batch[name]).tobytes() for name in sorted(batch))).hexdigest()))
-    state = trainer.fit(Loader(train, None, batch=BATCH, records=MATRIX_RECORDS),
-                        steps=args.steps, log_every=1,
-                        checkpoint_every=args.save_every)
+    try:
+        restored_step, _ = restored_state(trainer)
+        state = trainer.fit(Loader(train, None, batch=BATCH, records=MATRIX_RECORDS),
+                            steps=args.steps, log_every=1,
+                            checkpoint_every=args.save_every)
+    except ValueError as refusal:
+        if not args.refusal:
+            raise
+        # A refusal the cell expects, as its saved position is restored or later: what it refused with,
+        # the checkpoints its directory holds, and the batches it read before.
+        assert trainer.checkpoints is not None
+        return {"refused": type(refusal).__name__, "written_steps": trainer.checkpoints.committed(),
+                "batches": batches}
     dump_params(args.out.with_suffix(".npz"), state.variables)
     _, position = restored_state(trainer)
     return {"step": int(as_numpy(state.step)), "restored_step": restored_step,
