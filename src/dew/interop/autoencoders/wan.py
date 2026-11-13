@@ -13,6 +13,7 @@ import jax.numpy as jnp
 from dew import _records
 from dew.batch import Variables
 from dew.interop.components import bind_component
+from dew.interop.unread import Stored
 from dew.interop.weights import indexed_path
 from dew.nn.autoencoders.wan import WanAutoencoder, WanVAE
 
@@ -76,7 +77,8 @@ def wan_vae_path(name: str, ndim: int) -> tuple[str, ...]:
 
 def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                  subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
-                 lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
+                 lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None,
+                 tensors: Mapping[str, Stored] | None = None
                  ) -> tuple[WanAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published Wan 2.1 VAE, its parameters and their source layouts
     from `subfolder` of a pipeline directory or Hub repo, such as
@@ -86,7 +88,8 @@ def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str 
     Supplied `params` are bound unchanged: only the config is read, and no
     source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
     placement to read (`dew.interop.weights.record_layouts`)."""
-    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=params is None)
+    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED,
+                                         weights=params is None and tensors is None)
     model = WanVAE(**wan_vae_fields(config), dtype=compute)
     video = jax.ShapeDtypeStruct(
         (1, 1 + model.temporal_factor, model.downscale_factor, model.downscale_factor, 3), jnp.float32
@@ -96,5 +99,4 @@ def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str 
         lambda bound: WanAutoencoder(model=model, params=bound, latents_mean=config["latents_mean"],
                                      latents_std=config["latents_std"]),
         prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(video,),
-        shapes=shapes)
-
+        shapes=shapes, tensors=tensors)

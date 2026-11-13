@@ -11,6 +11,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew.batch import Variables
+from dew.interop.unread import Stored
 from dew.interop.weights import record_layouts
 
 if TYPE_CHECKING:
@@ -32,8 +33,8 @@ def bind_component[ComponentT, ConfigT: Mapping[str, object]](
     path_of: Callable[[str, int], tuple[str, ...] | None], wrap: Callable[[Variables], ComponentT], *,
     prefix: tuple[str, ...], param_dtype: str = "float32", params: Variables | None = None,
     lazy: bool = False, inputs: tuple[jax.Array | np.ndarray | jax.ShapeDtypeStruct, ...] = (),
-    tensors: Mapping[str, np.ndarray] | None = None,
-    validate: Callable[[Mapping[str, np.ndarray]], None] | None = None,
+    tensors: Mapping[str, Stored] | None = None,
+    validate: Callable[[Mapping[str, Stored]], None] | None = None,
     state: Callable[[str], bool] | None = None,
     shapes: Mapping[str, tuple[int, ...]] | None = None,
 ) -> tuple[ComponentT, Variables, tuple[WeightLayout, ...], ConfigT]:
