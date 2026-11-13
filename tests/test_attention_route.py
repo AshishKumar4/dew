@@ -1161,6 +1161,26 @@ def test_a_b200s_declared_cell_holds_only_its_receipts_masks(causal, window, dec
     assert (cell in attention_kernels.DECLARED) == declared
 
 
+@pytest.mark.parametrize(("tokens", "width", "declared"),
+                         [(12288, 256, True), (4096, 256, False), (12288, 128, False)],
+                         ids=["timed", "shorter", "d128"])
+def test_a_b200s_packed_documents_take_cudnn_only_where_its_receipt_timed_them(tokens, width, declared):
+    """A bf16 causal call of 16 query heads over 4 packing its own documents (segment ids of at most 16 a
+    row), on a B200: in the cell that names cuDNN, whose packed sequences take it, where their receipt timed
+    such calls (`attention_kernels.MEASURED`: 12288 tokens at width 256, Qwen3.5-4B's decision call); a cell
+    none declares at another length or width, which takes the template."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+
+    query = jax.ShapeDtypeStruct((1, tokens, 16, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, tokens, 4, width), jnp.bfloat16)
+    ids = jax.ShapeDtypeStruct((1, tokens), jnp.int32)
+    with generation.assumed("sm100"):
+        case = attention_case(query, key, causal=True, segment_ids=ids, max_segments=16)
+        taken = attention_kernels.CUDNN.refused(case) is None
+    assert (case.cell in attention_kernels.DECLARED and taken) == declared
+
+
 @pytest.mark.parametrize(("groups", "limits", "least"), [
     ("0::/outer/inner\n", {"sys/fs/cgroup/memory.max": "max", "sys/fs/cgroup/outer/memory.max": "2147483648",
                            "sys/fs/cgroup/outer/inner/memory.max": "4294967296"}, 2147483648),

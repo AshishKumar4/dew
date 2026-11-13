@@ -594,8 +594,9 @@ on a GPU or a TPU runs it by default, where its cell's declared old route does n
 class Timed:
     """The calls a kind of call's declared receipts timed (`DECLARED`): its queries and keys alike from
     `shortest` to `longest` tokens, at the head `widths` and the query heads a key head serves (`groups`),
-    `causal` or full (any of each where None), windowed where `windows`, else no window, and with a call's
-    own packed documents where `documents`, else none."""
+    `causal` or full (any of each where None), windowed where `windows`, else no window; and its calls of
+    packed documents `documents`: these same calls (True), none (False), or the calls those receipts timed
+    (a `Timed` of their own)."""
 
     shortest: int
     longest: int
@@ -603,28 +604,34 @@ class Timed:
     groups: tuple[int, ...] | None = None
     causal: bool | None = None
     windows: bool = True
-    documents: bool = True
+    documents: "bool | Timed" = True
 
     def holds(self, case: AttentionCase) -> bool:
         """Whether `case` lies within these calls."""
+        if case.documents is not None and not isinstance(self.documents, bool):
+            return self.documents.holds(case)
         return (self.shortest <= min(case.queries, case.keys) and max(case.queries, case.keys) <= self.longest
                 and (self.widths is None or case.head_dim in self.widths)
                 and (self.groups is None or case.heads // case.kv_heads in self.groups)
                 and (self.causal is None or case.causal == self.causal)
-                and (self.windows or case.window is None) and (self.documents or case.documents is None))
+                and (self.windows or case.window is None)
+                and (case.documents is None or self.documents is True))
 
 
 MEASURED: dict[tuple[str | None, CallKind], Timed] = {
     **{(family, CallKind.of(jnp.bfloat16)): Timed(0, 32768) for family in ('mma.sync', 'wgmma')},
     **{(family, CallKind.of(jnp.float32)): Timed(0, 1024) for family in ('mma.sync', 'wgmma')},
-    ('tcgen05', CallKind.of(jnp.bfloat16)): Timed(256, 32768, (64, 128, 256), (4,), causal=True,
-                                                  windows=False, documents=False),
+    ('tcgen05', CallKind.of(jnp.bfloat16)): Timed(
+        256, 32768, (64, 128, 256), (4,), causal=True, windows=False,
+        documents=Timed(12288, 12288, (256,), (4,), causal=True, windows=False)),
 }
 """The shapes each instruction family's DECLARED receipts hold for a kind of call; a call outside them is a
 cell none declares (`AttentionCase.cell`). On tcgen05 a 16-bit call's: from 256 to 32768 tokens at widths
 64, 128 and 256, four query heads a key head (8/2, 16/4 and 32/8 timed), causal and unwindowed, cuDNN against
 the template's forward and training step (`DECLARED`); a full or windowed call none timed; 128 tokens waits
-for the grid's other rounds, its margins 1.09 to 1.60 against five-round receipts' spread of up to 1.33.
+for the grid's other rounds, its margins 1.09 to 1.60 against five-round receipts' spread of up to 1.33. Its
+calls of packed documents those of 12288 tokens, 16/4 at width 256, causal (Qwen3.5-4B's decision row), the
+one shape their receipt timed.
 Elsewhere a 16-bit call's: up to 32768 tokens, from FlashAttention against the template from
 1024 to 32768 tokens at widths 64 and 128, causal and full, its forward and training step, FlashAttention
 faster at every one on an A100 and a GH200 (M-ET-51: W126-a100, W126-sm90), and at width 256 on an RTX PRO
@@ -674,7 +681,14 @@ DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] =
                  "template's Triton backward, 30.33 its Mosaic one), at 2 x 4096 0.218 against 1.251 and "
                  "1.204 against 6.913; Qwen 3.5-0.8B's, 8 over 2, 4 x 4096, its forward 0.238 against 1.163; "
                  "Qwen3-8B's, 32 over 8 of 128, 2 x 4096, 0.284 against 0.911 and 1.136 against 7.626, and "
-                 "1 x 16384 its forward 1.411 against 4.212; rows 4839 and 5368 retire it"),
+                 "1 x 16384 its forward 1.411 against 4.212. A call of packed documents runs cuDNN's "
+                 "packed sequences (`attention._cudnn_packed`), faster than the template at every cell "
+                 "timed: lab-b200-20261113-packed, Qwen3.5-4B's decision call, 16/4 d256 causal bf16, 12288 "
+                 "tokens a row (CUPTI, four rounds or five), one document a row its training 5.071 against "
+                 "30.033 ms at one row and 19.222 against 116.469 at four, its forward 1.197 against 5.613 "
+                 "and 3.115 against 19.837; twelve documents a row its training 1.510 against 4.841 and "
+                 "5.133 against 16.909, its forward 0.249 against 1.035 and 0.724 against 3.338; rows 4839 "
+                 "and 5368 retire it"),
     ('mma.sync', CallKind.of(jnp.bfloat16)): (
         FLASH, "FlashAttention-2 measured faster than the template on an A100: a training step's attention "
                  "at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
