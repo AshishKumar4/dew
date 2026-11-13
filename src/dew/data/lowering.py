@@ -3,8 +3,8 @@
 Each stage kind has one definition here, which every read applies and the
 memory executor (`dew.data.materialize`) calls for the stages it runs over
 the whole source: `_outputs` for a record step, `_reordered` for an order
-stage over indexed rows, `_TokenSplit` for a token split, `_packed` for
-a pack's packer, and `_fill` with `_CachedOutputs` for opening a cache and
+stage over indexed rows, `_TokenSplit` for a token split, `dew.data.packing.packed_documents`
+for a pack's packer, and `_fill` with `_CachedOutputs` for opening a cache and
 reading what it holds.
 
 `_Build` lowers a pipeline's stages in the order they are written, as the
@@ -98,7 +98,7 @@ from dew.data.mixing import (
     token_weights,
 )
 from dew.data.ordering import Skipping, place_of
-from dew.data.packing import FirstFitPacked, _Concatenated, _OverlappedCuts, window_fields
+from dew.data.packing import packed_documents
 from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
@@ -147,7 +147,7 @@ from dew.data.pipeline import (
     member_record,
     members_held,
 )
-from dew.data.plan import PLAN_VERSIONS, Manifest
+from dew.data.plan import PLAN_VERSIONS, STRUCTURED, Manifest
 from dew.data.readers import WorkerMirrors, _FillShare
 from dew.data.shards import bounded as shards_bounded, bounded_places, cut, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
@@ -878,22 +878,6 @@ class _Inputs(pygrain.MapDataset):
         return outputs[0] if self._single and isinstance(outputs, tuple) else outputs
 
 
-def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
-    """`documents` packed for the stage's policy: first-fit as an indexed read's plan places them
-    (`FirstFitPacked`), the rest by Grain's own packers."""
-    if stage.policy == "first-fit":
-        return FirstFitPacked(documents, stage)
-    sizes, _ = window_fields(stage)
-    if stage.policy == "concat":
-        cut = _OverlappedCuts(documents, stage) if stage.overlap else documents
-        return _Concatenated(gx.ConcatThenSplitIterDataset(cut, length_struct=sizes))
-    # Fields cut alike with the first share its segments and positions, as the indexed planner's
-    # windows do (`packed_window`), so Grain writes no copy of them for the rest.
-    return gx.BestFitPackIterDataset(documents, length_struct=sizes, num_packing_bins=stage.bins,
-                                     shuffle_bins=False, max_sequences_per_bin=stage.segments,
-                                     meta_features=stage.fields[1:])
-
-
 class _Ruled(pygrain.IterDataset):
     """The windows a pack or windows stage makes of `documents`, each counted by the one rule its
     documents' targets were counted by (`counted_window`), as a memory read counts them
@@ -920,7 +904,7 @@ class _Ruled(pygrain.IterDataset):
             documents = documents.map(_ConsumedAt(stage.fields[0], held))
             laid = (*ACCOUNTS, *(() if held is None else (DOCUMENT,)))
             stage = dataclasses.replace(stage, fields=(*stage.fields, *laid))
-        windows = (_packed(documents.map(stage.document), stage)
+        windows = (packed_documents(documents.map(stage.document), stage, consumed=self._consumed)
                    if isinstance(stage, Pack) else CausalWindows(documents, stage, held))
         return _RuledIterator(iter(windows), seen, stage.fields[0], consumed=self._consumed, documents=held,
                               drawn=self._drawn)
@@ -1271,8 +1255,10 @@ class _Build:
         """The rules deciding which rows come next that a read of `pipeline` by this build reads by, each
         its owner's one statement (docs/design/data.md, the rules): how its steps are named
         (`dew.data.plan.IDENTITY`), a shuffle's key (`SHUFFLE`), a mix's schedule (`dew.data.mixing.MIX`),
-        and, where its loading workers read its inputs in their order, how they are dealt
-        (`dew.data.elastic_order.DEALING`); only those the read uses. A plan records them
+        where its loading workers read its inputs in their order, how they are dealt
+        (`dew.data.elastic_order.DEALING`), how a phase continues a corpus an earlier phase read out of
+        order (`DRAWN`) and how a batched step's empty groups are refused
+        (`dew.data.pipeline.BatchedGroups.REFUSALS`); only those the read uses. A plan records them
         (`dew.data.plan.Plan.rules`) and a resume compares them."""
         from dew.data.elastic_order import DEALING
         from dew.data.mixing import MIX
@@ -1280,9 +1266,11 @@ class _Build:
 
         mixed = any(isinstance(chain.source, Mixture) for chain in chains(pipeline))
         shuffled = any(isinstance(stage, Shuffle) for stage in _steps(pipeline))
+        batched = any(isinstance(stage, Batched) for stage in _steps(pipeline))
         return {"identity": IDENTITY, **({"shuffle": self.SHUFFLE} if shuffled else {}),
                 **({"mix": MIX} if mixed else {}), **({"dealing": DEALING} if self.in_order else {}),
-                **({"phases": self.DRAWN} if self.skipped else {})}
+                **({"phases": self.DRAWN} if self.skipped else {}),
+                **({"batched": BatchedGroups.REFUSALS} if batched else {})}
 
     def counting(self, pipeline: Pipeline) -> bool:
         """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
@@ -1910,8 +1898,14 @@ class _Build:
             rows = stage.function(given.seed(self.stage_seed(pipeline, at, partition)))
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
-            rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage))
-            if self.counting(pipeline):
+            refusing = self.version >= STRUCTURED
+            rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage, refusing=refusing))
+            # A group it makes no rows of is refused and counted here, its examples carried to the next row;
+            # a plan of 13 carried them uncounted, as its positions hold.
+            if refusing:
+                rows = Accepted(rows, _name(pipeline), _label(pipeline), rows=False,
+                                members=self.counted_members(pipeline))
+            elif self.counting(pipeline):
                 rows = Carried(rows)
         else:
             return self.layout_stage(rows, stage, pipeline, at)

@@ -215,10 +215,16 @@ trainer.fit(prep(train).shuffle(seed=0, window=200_000).batch(1024),
 
 A schedule's stages switch on the run's committed-token clock; `phases` switch at the training steps they name.
 
+Each member is tokenized and packed before the mix weighs it by its tokens (the order rule, and packing
+per source).
+
 ```python
-pretrain = mix(sources, weights=[.75, .12, .05, .05, .03], by="tokens").map(text.tokenize(tok)).pack(seq_len=8192)
-anneal   = mix(high_quality, weights=[.40, .25, .15, .15, .05], by="tokens").map(text.tokenize(tok)).pack(seq_len=8192)
-longdocs = long_docs.map(text.tokenize(tok)).pack(seq_len=8192)
+def packed(corpus):
+    return corpus.map(text.tokenize(tok)).pack(seq_len=8192)
+
+pretrain = mix([packed(source) for source in sources], weights=[.75, .12, .05, .05, .03], by="tokens")
+anneal   = mix([packed(source) for source in high_quality], weights=[.40, .25, .15, .15, .05], by="tokens")
+longdocs = packed(long_docs)
 
 data = schedule([
     (pretrain.shuffle(seed=0, window=10**6).batch(1024), 13e12),
@@ -506,6 +512,7 @@ this Dew still reads that value (the version before, 13, below).
 | `dealing` | `input-order-groups` | `dew.data.elastic_order.DEALING` | How loading workers that read inputs in their order are dealt them: consecutive groups in turn. |
 | `grain` | Grain's version | `dew.data.readers.GRAIN` | The Grain whose iterator states a per-share position holds. Another Grain's position is restored at once through the iterators that own its state, and refused, naming both versions, where they cannot read it. |
 | `phases` | `stamped` | `dew.data.dataset.StepPhases.CONTINUES` | How a phase on its own stream continues a corpus an earlier phase shared: from the draws the run trained. Recorded in a read of phases' position. |
+| `batched` | `counted` | `dew.data.pipeline.BatchedGroups.REFUSALS` | How a batched step's group it makes no rows of is treated: refused as an empty expansion and counted where the step stands, its examples carried to the next row. Recorded in the plan of a read through a batched step. |
 | `phases` | `drawn` | `dew.data.lowering._Build.DRAWN` | How a phase of one global order continues a corpus an earlier phase read out of order: past the places its order's twin of draws says the run trained. Recorded in the plan of a phase that draws past any. |
 
 A streamed source's shards, the ids it reads in turn, are recorded as a fact of the plan (`{source}/shards`,
@@ -519,9 +526,9 @@ repeats), and the later phase starts past the first place it did not train and d
 that it did. Each record is then trained once across the boundary, none lost. The trace costs one lookup a
 record the earlier phase read, once as the later phase is compiled or, on the token clock, opened.
 
-A plan of 13 records no rules, and reads by 13's: steps named by their printing, and phases that each read
-their corpora from their start. A run's resume compiles its data at the version it saved (its record's
-`data_plan_version`), and a per-share position of 13 resumes in a read compiled at 14 as 13 read it.
+A plan of 13 records no rules, and reads by 13's: steps named by their printing. No Dew of 13 read phases
+on their own streams that share a corpus, which a plan of 13 refuses. A run's resume compiles its data at
+the version it saved (its record's `data_plan_version`).
 
 #### Resuming data: relaxed or exact
 

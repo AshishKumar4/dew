@@ -1788,12 +1788,6 @@ class PhasedStream:
 
 
 class StepPhases(Forwarding):
-    CONTINUES: ClassVar[str] = "stamped"
-    """The `phases` rule a read of phases that share a corpus records in its position (docs/design/data.md,
-    the rules): a later phase continues a shared corpus from the stamped draws the run trained
-    (`_Frontier`). A position of a plan of 13, whose phases each read a corpus from its start, records
-    none, and resumes under that plan, which shares nothing (`dew.data.compile`)."""
-
     """Reads phases on the step clock one after another, each its own stream, opened at the step the
     phase before it ends: a read per share among them, cut per share where its order is (a stream batched
     by its tokens after steps that drop rows), whose records no global count places. Phase `p` reads
@@ -1815,6 +1809,11 @@ class StepPhases(Forwarding):
     starts it there, drawing past the pulls the run trained (`dew.data.mixing.Stamping`). Its position holds
     what it carries to later phases (`carried`) and the draws trained in the phase it stands in
     (`trained`), each empty in a position saved before phases shared corpora."""
+
+    CONTINUES: ClassVar[str] = "stamped"
+    """The `phases` rule a read of phases that share a corpus records in its position (docs/design/data.md,
+    the rules): a later phase continues a shared corpus from the stamped draws the run trained
+    (`_Frontier`). A plan of 13 reads no such phases (`dew.data.compile`)."""
 
     def __init__(self, readers: Sequence[Callable[[], Iterator[Batch]]], ends: Sequence[int | None], *,
                  batches: Sequence[int], opened: Callable[[int], None] = lambda phase: None,
