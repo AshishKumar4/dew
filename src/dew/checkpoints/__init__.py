@@ -1709,7 +1709,7 @@ class Checkpoints:
             state_tree['position'] = gather_positions(saved, share)
         return state_tree
 
-    def environment(self, step: int) -> Mapping[str, JSON] | None:
+    def environment(self, step: int) -> Mapping[str, object] | None:
         """The code and machine that wrote `step`'s data position (`dew.data.plan.running_environment`), or
         None for a step that holds none, or one written before steps recorded it."""
         held = (self._step_metadata(step).custom_metadata or {}).get("environment")

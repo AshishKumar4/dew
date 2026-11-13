@@ -1,5 +1,5 @@
-"""A saved data position holds what decides the rows a run reads on to, and nothing of the checkout or the
-machine that wrote it (row 5862)."""
+"""A saved data position of the format that held the checkout and the machine that wrote it, read by this
+Dew, which holds them beside it in the checkpoint step (row 5862)."""
 
 import json
 import logging
@@ -20,24 +20,6 @@ def _streamed() -> Pipeline:
 
 def _taken(stream, count: int) -> list[list[int]]:
     return [np.asarray(next(stream)["id"]).tolist() for _ in range(count)]
-
-
-def test_a_position_holds_no_checkout_so_two_runs_on_changed_checkouts_save_one(monkeypatch):
-    """A read three batches in, compiled under one checkout and again under another (another revision, its
-    tree dirty), saves the same position bytes: what it saves decides its rows alone, so two runs of one
-    command compare equal byte for byte wherever their checkouts moved between them."""
-    from dew.data import plan
-
-    def saved() -> bytes:
-        stream = compile(_streamed(), read="streamed", loading=Loading(workers=0)).train(DataPartition())
-        _taken(stream, 3)
-        state = stream.get_state()
-        stream.close()
-        return state
-
-    first = saved()
-    monkeypatch.setattr(plan, "checkout_now", lambda: ("0" * 40, False))
-    assert saved() == first
 
 
 def test_a_position_written_with_its_environment_reads_on_and_warns_of_a_changed_one(caplog):

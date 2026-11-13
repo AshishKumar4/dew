@@ -455,13 +455,12 @@ def _environment(recorded: Mapping[str, object]) -> dict[str, JSON]:
             "modules": [step["modules"] for step in steps]}
 
 
-@functools.cache
 def _saved_code(saved: Mapping[str, object], steps: Sequence[StepIdentity]) -> list[list[JSON] | None]:
     """A saved position's undeclared code by step (`Manifest.code`): its own `code`, or, a position of the
     previous format, its environment's module digests at each of `steps`' code places, where it held as
     many modules as the step does now (None, nothing to compare, where it did not)."""
     if "code" in saved:
-        return [listed(entry, "saved step code", read=json_value, what="module digests")
+        return [list(listed(entry, "saved step code", read=json_value, what="module digests"))
                 for entry in listed(saved["code"], "saved data code", read=json_value,
                                     what="each step's code")]
     environment = record(saved.get("environment", {}), "saved data environment")
@@ -482,6 +481,7 @@ def running_environment() -> dict[str, JSON]:
             "platform": platform.platform(), "clean": clean}
 
 
+@functools.cache
 def _locked() -> str:
     """The fingerprint of the checkout's lock files and installed distributions, read once a process:
     it parses every installed distribution's metadata, most of a second, which no compilation
@@ -950,6 +950,7 @@ class Plan:
                     "and it declares no identity saying it computes the same; declare one "
                     "(identity='name@version') to resume exactly, or resume relaxed "
                     "(`data_resume='relaxed'`)")
+        changes: tuple[str, ...] = ()
         if "environment" in saved:
             # A position of the previous format holds the environment it ran under, which a run's checkpoint
             # step holds now (`running_environment`): warned of where it changed, as the step's is.
