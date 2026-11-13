@@ -889,22 +889,24 @@ def thunk_kernels(proto: bytes, *, decoded: bool = False) -> list[Binary]:
 def custom_kernel(proto: bytes) -> tuple[bytes, int] | None:
     """The cubin of the custom kernel a thunk's serialized proto launches and the shared bytes its launch
     asks for (`CUSTOM_KERNEL_THUNK`), None where the thunk launches no custom kernel's cubin."""
-    kernels = [kernel for thunk in _fields(proto).get(CUSTOM_KERNEL_THUNK, [])
-               for kernel in _fields(thunk).get(3, [])]
+    kernels = [kernel for thunk in proto_fields(proto).get(CUSTOM_KERNEL_THUNK, [])
+               for kernel in proto_fields(thunk).get(3, [])]
     if len(kernels) != 1:
         return None
-    kernel = _fields(kernels[0])
-    cubins = [elf for spec in kernel.get(2, []) for cubin in _fields(spec).get(2, [])
-              for elf in _fields(cubin).get(1, [])]
+    kernel = proto_fields(kernels[0])
+    cubins = [elf for spec in kernel.get(2, []) for cubin in proto_fields(spec).get(2, [])
+              for elf in proto_fields(cubin).get(1, [])]
     if len(cubins) != 1 or cubins[0][:4] != ELF:
         return None
     # proto3 omits a zero.
     return cubins[0], kernel.get(6, [0])[0]
 
 
-def _fields(message: bytes) -> dict[int, list]:
+def proto_fields(message: bytes) -> dict[int, list]:
     """A serialized proto's fields by number, each its values (a varint's int, a length-delimited field's
-    bytes), read without its schema; none where `message` parses as no proto."""
+    bytes), read without its schema; none where `message` parses as no proto. Dew's one reader of XLA's
+    serialized protos: a thunk's (`custom_kernel`, `_kernels`) and a GPU topology's
+    (`dew.training.ahead.topology_memory`)."""
     parsed = empty_pb2.Empty()
     try:
         parsed.ParseFromString(message)
@@ -921,7 +923,7 @@ def _kernels(message: bytes, decoded: bool = False) -> tuple[list[Binary], int]:
     version, field 1, whose binary, 8, is an ELF, whose kernel name, 9, its function's, and whose
     `SHARED_BYTES` its launch's dynamic shared memory), and how many Mosaic GPU custom calls it names
     (`MOSAIC_TARGET`, a custom call thunk's target)."""
-    fields = _fields(message)
+    fields = proto_fields(message)
     binary, name, shared = fields.get(8, []), fields.get(9, []), fields.get(SHARED_BYTES, [])
     if (fields.get(1) == [KERNEL_PROTO_VERSION] and len(binary) == len(name) == 1
             and isinstance(binary[0], bytes) and binary[0][:4] == ELF and isinstance(name[0], bytes)):

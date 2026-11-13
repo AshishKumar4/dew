@@ -407,9 +407,9 @@ def test_a_step_that_fits_only_without_its_copies_drops_them_before_it_recompute
     made, so the copies, two bytes a parameter held all run, are bytes the step gives back: one that
     does not fit with them drops them before it recomputes more, and its plan says so
     (`narrow`), on devices whose free bytes lie between its footprints with and without them."""
-    free = 2 ** 39
+    free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
-                        lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
+                        lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
 
     def trained(*, copies):
         return _trained(optax.adam(1e-3), copies=copies, steps=1, accumulation=2, split=1, remat="full")
@@ -434,16 +434,15 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     same with the copies on as off: the copies are the plan's first rung, dropped where the step does
     not fit with them. On devices of that capacity, whose free bytes lie between the step's footprints
     with and without its copies, fit trains, its plan without them."""
-    from test_layout_validation import capped
     from token_support import repeated_token_batch
 
     from dew.data.dataset import Loader
     from dew.distributed.placement import placed_bytes
     from dew.training import Layout, MeshSpec, Trainer
 
-    free = 2 ** 39
+    free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
-                        lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
+                        lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
     geometry = {"steps": 1, "accumulation": 2, "split": 1, "remat": "full"}
     narrow, _, trainer = _trained(optax.adam(1e-3), copies=True, **geometry)
     with_copies = free - trainer.plan["probes"][0]["headroom"]
@@ -451,10 +450,10 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     copies = placed_bytes(jax.tree.map(
         lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), narrow.compute))
 
-    def built(kind: type[Trainer] = Trainer) -> tuple[Trainer, dict]:
+    def built() -> tuple[Trainer, dict]:
         objective, batch = _decoder(remat="full")
-        return kind(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
-                    layout=Layout(min_shard=1, tolerance=1.0), accumulation=2, split=1), batch
+        return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
+                       layout=Layout(min_shard=1, tolerance=1.0), accumulation=2, split=1), batch
 
     def held(*, copies: bool) -> int:
         run, batch = built()
@@ -463,8 +462,10 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
 
     state = held(copies=False)
     assert copies > 0 and held(copies=True) == state
-    free = (with_copies + without) // 2
-    run, _ = built(capped(state + copies // 2))
+    # Devices whose allocator holds the state and half its copies, its step's free bytes between its needs.
+    free, limit = (with_copies + without) // 2, state + copies // 2
+    assert limit > free, (limit, free)
+    run, _ = built()
     stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
     with chosen(narrow_copies='on'):
         run.fit(stream, steps=2)
@@ -478,9 +479,9 @@ def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_dropped(monkeypatch):
     own rung neither way, the plan climbs past the rung that dropped them, and keeps them dropped at the
     rung and split it reaches: once a plan fits, a run compiles no other (whether the copies would be
     faster there is the offline plan's to weigh, `compile_ahead`)."""
-    free = 2 ** 39
+    free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
-                        lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
+                        lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
 
     def trained(*, copies):
         return _trained(optax.adam(1e-3), copies=copies, steps=1, split=1, rows=64)
