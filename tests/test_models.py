@@ -732,21 +732,24 @@ def test_a_layer_norms_variance_is_its_centered_mean_square():
 TOWER_NORM_SEEDS = 8
 """The tower norms' declared seeds for check 1 (`assert_as_exact`)."""
 
+WIDTH = 64
+"""The towers' width: RAE's encoders take a head of 64 (`HEAD_WIDTH`)."""
+
 
 def _tower_layout(tower):
-    """`tower`'s tiny layout (`ViTLayout`) of one layer 32 wide, as its module builds it; None for CLIP's
-    text tower, whose block is `clip_layer`'s own."""
+    """`tower`'s tiny layout (`ViTLayout`) of one layer `WIDTH` wide, as its module builds it; None for
+    CLIP's text tower, whose block is `clip_layer`'s own."""
     from dew.nn.autoencoders.rae import RepresentationEncoder
     from dew.nn.vision.llama4 import Llama4Vision
     from dew.nn.vision.qwen35 import Qwen35Vision
     from dew.nn.vision.siglip import SiglipVision
 
-    sizes = {"hidden_size": 32, "intermediate_size": 64, "num_heads": 2, "patch_size": 8}
+    sizes = {"hidden_size": WIDTH, "intermediate_size": 2 * WIDTH, "num_heads": 2, "patch_size": 8}
     return {"clip text": lambda: None,
             "siglip": lambda: SiglipVision(num_layers=1, image_size=16, **sizes).layout(),
             "llama4": lambda: Llama4Vision(num_layers=1, image_size=16, **sizes).layout(),
             "qwen35": lambda: Qwen35Vision(depth=1, num_position_embeddings=4, **sizes).layout(),
-            "rae": lambda: RepresentationEncoder("siglip2", width=32, layers=1, patch=8,
+            "rae": lambda: RepresentationEncoder("siglip2", width=WIDTH, layers=1, patch=8,
                                                  input_size=16).layout()}[tower]()
 
 
@@ -763,19 +766,19 @@ def test_a_towers_layer_norms_read_rows_as_torch_s_do(tower):
     from dew.nn.vision.vit import vit_block
 
     layout = _tower_layout(tower)
-    block = (clip_layer(32, 2, 64, 8) if layout is None
+    block = (clip_layer(WIDTH, 2, 2 * WIDTH, 8) if layout is None
              else vit_block(layout, 0, dtype=jnp.float32, precision=None))
     eps = 1e-5 if layout is None else layout.norm_eps
     rotary = layout is not None and layout.rotary is not None
     metadata = AttentionMetadata(rotary_positions=jnp.zeros((2, 8, 2), jnp.int32)) if rotary else None
-    rows = jnp.zeros((2, 8, 32), jnp.float32)
+    rows = jnp.zeros((2, 8, WIDTH), jnp.float32)
     params = block.init(jax.random.key(0), rows, attention_metadata=metadata)["params"]
 
     def draw(seed):
         keys = jax.random.split(jax.random.key(seed), 3)
         return (np.asarray(jax.random.normal(keys[0], rows.shape, jnp.float32) + 100.0),
-                np.asarray(1.0 + 0.1 * jax.random.normal(keys[1], (32,), jnp.float32)),
-                np.asarray(0.1 * jax.random.normal(keys[2], (32,), jnp.float32)))
+                np.asarray(1.0 + 0.1 * jax.random.normal(keys[1], (WIDTH,), jnp.float32)),
+                np.asarray(0.1 * jax.random.normal(keys[2], (WIDTH,), jnp.float32)))
 
     def normalized(x, scale, bias):
         held = {**params, "input_layernorm": {"scale": scale, "bias": bias}}
@@ -785,7 +788,7 @@ def test_a_towers_layer_norms_read_rows_as_torch_s_do(tower):
 
     def torch_s(x, scale, bias):
         x, scale, bias = (torch.from_numpy(np.asarray(each)) for each in (x, scale, bias))
-        return torch.nn.functional.layer_norm(x, (32,), scale, bias, eps=eps).numpy()
+        return torch.nn.functional.layer_norm(x, (WIDTH,), scale, bias, eps=eps).numpy()
 
     def truth(x, scale, bias):
         x = np.asarray(x, np.float64)
