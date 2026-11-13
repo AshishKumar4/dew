@@ -374,7 +374,7 @@ def _correction(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward
         def _():
             turn = scratch.scaled.turn(index - 1)
             scratch.scaled.wait(turn)
-            alpha = plgpu.load(scratch.scales.at[turn.slot], layout=TMEM.reduce(1))
+            alpha = plgpu.load(scratch.scales.at[turn.slot], layout=RINGS.native_row)
             scratch.o_done.wait(scratch.o_done.turn(index - 1))
             for start in range(0, value_width, CHUNK):
                 RINGS.update(output, functools.partial(algebra.rescale, alpha=alpha), first=start,

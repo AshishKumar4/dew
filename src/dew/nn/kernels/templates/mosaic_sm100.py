@@ -354,12 +354,6 @@ def scales_tiled(scales: jax.Array) -> jax.Array:
     return tiled.reshape(*lead, *scale_tiles(rows, columns))
 
 
-def _tmem_aligned(columns: int) -> int:
-    """`columns` of tensor memory as Pallas slices an allocation from a kernel's one base: whole multiples of
-    `TMEM_COL_ALIGNMENT` (jax._src.pallas.mosaic_gpu.core), the base the aligned sum, at most 512."""
-    return -(-columns // plgpu_core.TMEM_COL_ALIGNMENT) * plgpu_core.TMEM_COL_ALIGNMENT
-
-
 def scale_memory(tiles: tuple[int, ...], stages: int) -> tuple[int, int]:
     """The tensor memory a ring of `stages` slots of block-scale tiles `tiles` (`scale_tiles`' shape) is
     copied to: a row a lane, each slot's scales its own columns (`ScaleRing._scales`)."""
@@ -435,6 +429,19 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         return STORED.reduce(0)
 
     @property
+    def native_row(self):
+        """A vector over a tile's rows in tensor memory's own layout (`TMEM`, a row a lane), as a role that
+        reads the tile there (`read`'s `layout`) scales its rows by it (a forward's rescale of its output)."""
+        return TMEM.reduce(1)
+
+    @property
+    def native_column(self):
+        """A vector over a tile's columns in tensor memory's own layout (`TMEM`), each lane holding all of
+        it, as a role that reads the tile there takes it from each row: a keys-first backward's statistic of
+        each query from its transposed scores, whose rows are keys (row 4839)."""
+        return TMEM.reduce(0)
+
+    @property
     def lane_columns(self) -> int:
         raise NotImplementedError(f"{self._HOME}, read out in chunks; no lane holds a column of one")
 
@@ -469,9 +476,11 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         return plgpu.async_load_tmem(column_span(acc.ref, first, count), layout=layout)
 
     def write(self, acc: Accumulator, value: jax.Array, *, first: int = 0) -> None:
-        """`value` into the tile's columns from `first` in tensor memory, in its dtype, visible to a product
-        once a signal publishes it (`Signal.published`): a softmax's narrowed weights for P·V, a state
-        rescaled in place."""
+        """`value` into the tile's columns from `first` in tensor memory, in its dtype (16-bit two to a
+        column), from the layout it was read in, visible to a product once a signal publishes it
+        (`Signal.published`):
+        a softmax's narrowed weights for P·V, a keys-first backward's `Pᵀ` and `dSᵀ` for dV and dK, each the
+        left operand of its product (`products`' TS form), a state rescaled in place."""
         plgpu.async_store_tmem(column_span(_tensor_memory(acc), first, value.shape[-1]),
                                value.astype(jnp.dtype(acc.dtype)))
 
@@ -617,14 +626,11 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         return (self.turns + summed) * columns * accumulators
 
     def stream_tensor_columns(self, blocks: dict, stages: int) -> int:
-        # Each block-scale ring's tensor memory as `streams` allocates it (`scale_memory` in
-        # `SCALES_LAYOUT`): the physical columns that layout takes for its shape (Mosaic's
-        # `TMEMLayout.cols_in_shape`: its rows past 128 and its replication its own columns), aligned as
-        # Pallas slices each allocation from one base (`TMEM_COL_ALIGNMENT`).
-        layout = plgpu.TMEMLayout.SCALES_LAYOUT.to_mgpu()
-        return sum(_tmem_aligned(layout.cols_in_shape(scale_memory(shape, stages),
-                                                      jnp.dtype(dtype).itemsize * 8))
-                   for shape, dtype in blocks.values() if tuple(shape[-2:]) == SCALE_TILE)
+        # Each block-scale ring's tensor memory as `streams` allocates it (`scale_memory` in `SCALES_LAYOUT`,
+        # its rows past 128 and its replication its own columns: `resources.tensor_memory_columns`).
+        return resources.tensor_memory_columns([
+            plgpu.TMEM(scale_memory(shape, stages), dtype, layout=plgpu.TMEMLayout.SCALES_LAYOUT)
+            for shape, dtype in blocks.values() if tuple(shape[-2:]) == SCALE_TILE])
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,

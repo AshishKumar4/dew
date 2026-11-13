@@ -21,6 +21,8 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.kernels import generation
 
 if TYPE_CHECKING:
+    from jax._src.pallas.core import MemoryRef
+
     from dew.nn.kernels.generation import GpuTarget
     from dew.nn.kernels.templates.mosaic import Family
 
@@ -242,6 +244,45 @@ def program_shared(block: int, programs: int) -> int:
         return block
     reserved = facts().reserved_shared
     return (block + reserved) // programs - reserved
+
+
+def tensor_memory_columns(allocations: Sequence["MemoryRef"]) -> int:
+    """The columns of tensor memory a launch's `allocations` take where one scope holds them (its scratch's
+    `plgpu.TMEM`s), as Pallas counts them for the kernel's one allocation (`_ref_group_tmem_col_size`): each
+    its layout's columns for its shape (16-bit elements two to a column, 4-bit eight, a block-scale ring's
+    rows past 128 its own columns), its leading axes laid side by side, aligned to `TMEM_COL_ALIGNMENT`."""
+    from jax._src.pallas.mosaic_gpu import core as plgpu_core
+
+    return plgpu_core._ref_group_tmem_col_size(allocations)
+
+
+def tensor_memory_allocated(columns: int) -> int:
+    """The tensor memory a kernel allocates for `columns` of its scopes' (`tensor_memory_columns`, at most a
+    multiprocessor's): tcgen05.alloc's power of two, 32 at least (Mosaic GPU's `tmem_alloc_exact_ncols`),
+    which bounds the programs a multiprocessor holds of it (`register_model`'s `tmem`); none for none."""
+    from jax.experimental.mosaic.gpu import tcgen05
+
+    return tcgen05.tmem_alloc_exact_ncols(columns, exact=False) if columns else 0
+
+
+def halved_blocks(width: int, unit: int) -> list[int]:
+    """The blocks of `width` columns a launch may walk apart, narrowest last: `width` halved while a block
+    divides it and stays whole `unit`s (a forward's value columns, `Tiles.columns`; a tcgen05 backward's dK
+    and dV columns, `widest_columns`)."""
+    return [width >> halved for halved in range(1, width.bit_length())
+            if width % (1 << halved) == 0 and (width >> halved) % unit == 0]
+
+
+def widest_columns(width: int, unit: int, scoped: Callable[[int], Sequence["MemoryRef"]],
+                   target) -> int | None:
+    """The widest block of `width` columns a launch walks at once, `width` itself or one of its halvings
+    (`halved_blocks`), whose tensor memory fits `target`'s (`tensor_memory_columns` of `scoped(block)`, the
+    allocations a launch at that block holds at once: a tcgen05 attention backward's dK and dV columns beside
+    its scores and their gradients, row 4839); None where none does, or `target` holds no tensor memory."""
+    if target.tmem_columns is None:
+        return None
+    return next((block for block in (width, *halved_blocks(width, unit))
+                 if tensor_memory_columns(scoped(block)) <= target.tmem_columns), None)
 
 
 def shared_programs(most: int, shared: int, block: int) -> int:
@@ -591,7 +632,8 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
     """`family`'s register decision for a launch of `consumers` whose consumer thread holds `registers`
     (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`), lowered to
     `producer` (`producer_floor` where None), and the most programs a multiprocessor holds of it at those
-    registers (`register_programs`), its `shared` bytes and its `tmem` columns, as its plan's: on `target`,
+    registers (`register_programs`), its `shared` bytes and its `tmem` columns (`tensor_memory_columns`), as
+    its plan's: on `target`,
     else the target its launches derive for (`facts`'). A residency its staging forbids is no launch's (a
     B200's gathered input gradient staging 230,580 bytes runs one program, where its registers held three
     and its gathering producer spilled at three's raise, row 5523)."""
@@ -602,7 +644,9 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
         if shared is not None:
             most = shared_programs(most, shared, generation.shared_budget(target))
         if tmem:
-            most = min(most, (target.tmem_columns or 0) // tmem)
+            # A program allocates its columns' power of two (`tensor_memory_allocated`): 160 columns hold two
+            # programs on a B200's 512, not three.
+            most = min(most, (target.tmem_columns or 0) // tensor_memory_allocated(tmem))
     return RegisterModel(registers, family.registers(consumers, producer=producer), consumers, most,
                          family.register_step,
                          producer_registers(consumers, producer=producer) if warpgroups > consumers else 0,

@@ -103,9 +103,7 @@ def _column_blocks_of(family: mosaic.Family, dtype, value_width: int) -> list[in
     staged = jnp.bfloat16 if jnp.dtype(dtype) == jnp.dtype(jnp.float32) else dtype
     unit = (family.column_unit(dtype) if family.operands_in_registers
             else swizzling.swizzle_columns(staged, swizzling.NARROWEST_SWIZZLE_BYTES))
-    blocks = [whole // 2 ** halved for halved in range(1, whole.bit_length())
-              if whole % 2 ** halved == 0 and (whole // 2 ** halved) % unit == 0]
-    return [None, *blocks]
+    return [None, *resources.halved_blocks(whole, unit)]
 
 
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
