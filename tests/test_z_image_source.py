@@ -361,20 +361,21 @@ def test_positions_past_the_published_tables_rotate_at_their_own_places(latent, 
                                   long.apply(params, latents, time, condition))
 
 
-def _holed_safetensors(path: Path, held: dict[str, np.ndarray], holes: dict[str, tuple[int, ...]]) -> None:
-    """A float32 safetensors file of `held`'s tensors and, after them, of `holes`' shapes left as a sparse
-    file's holes, which read as zeros and take no disk."""
-    tags = {np.dtype(np.float32): "F32", np.dtype(np.float16): "F16", np.dtype(np.int64): "I64",
-            np.dtype(np.int32): "I32"}
+def _holed_safetensors(path: Path, held: dict[str, np.ndarray],
+                       holes: dict[str, tuple[tuple[int, ...], np.dtype]]) -> None:
+    """A safetensors file of `held`'s tensors and, after them, of `holes`' shapes and dtypes left as a sparse
+    file's holes, which read as zeros and take no disk; each dtype's tag safetensors' own
+    (`safetensors_io.stored_dtypes`)."""
+    from dew.interop.safetensors_io import stored_dtypes
+
+    tags = {dtype: tag for tag, dtype in stored_dtypes().items()}
     header: dict[str, object] = {"__metadata__": {"format": "pt"}}
     offset = 0
-    for name, array in held.items():
-        header[name] = {"dtype": tags[array.dtype], "shape": list(array.shape),
-                        "data_offsets": [offset, offset + array.nbytes]}
-        offset += array.nbytes
-    for name, shape in holes.items():
-        size = int(np.prod(shape)) * 4
-        header[name] = {"dtype": "F32", "shape": list(shape), "data_offsets": [offset, offset + size]}
+    for name, (shape, dtype) in {**{name: (array.shape, array.dtype) for name, array in held.items()},
+                                 **holes}.items():
+        size = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        header[name] = {"dtype": tags[np.dtype(dtype).newbyteorder("<")], "shape": list(shape),
+                        "data_offsets": [offset, offset + size]}
         offset += size
     encoded = json.dumps(header).encode()
     encoded += b" " * (-len(encoded) % 8)
@@ -410,7 +411,8 @@ def test_supplied_weights_rebind_a_tied_text_encoder_without_reading_its_table(s
     width = stored["model.embed_tokens.weight"].shape[1]
     _holed_safetensors(encoder / "model.safetensors",
                        {name: value for name, value in stored.items() if name != "model.embed_tokens.weight"},
-                       {"model.embed_tokens.weight": (rows, width), "lm_head.weight": (rows, width)})
+                       {name: ((rows, width), np.dtype(np.float32))
+                        for name in ("model.embed_tokens.weight", "lm_head.weight")})
     published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
     tracemalloc.start()
     try:
