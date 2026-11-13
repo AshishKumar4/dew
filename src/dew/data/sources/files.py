@@ -466,7 +466,7 @@ class Files(Dataset):
     @cached_property
     def paths(self) -> tuple[str, ...]:
         kept = self._kept(self._listed)
-        if not kept:
+        if not kept and self.committed is None:
             raise FileNotFoundError(f"source {self.url!r} matched no {self.kind} files")
         return kept
 
@@ -746,6 +746,8 @@ class Files(Dataset):
                 f"{self.describe()} cannot read {read}; provision its offset or accepted "
                 "index with dew data provision, or choose read='streamed'"
             )
+        if not self.paths:
+            return ()
         if self.kind == "files":
             return self._projected(_Paths(self.paths))
         if read == "memory" and self.kind != "array_record":
@@ -1137,6 +1139,8 @@ class Files(Dataset):
         return {}
 
     def lengths(self) -> np.ndarray | None:
+        if not self.paths:
+            return None
         if self.kind in ("parquet", "arrow") and "length" in self.arrow.schema.names:
             with self._versions_held(self.paths):
                 return self.arrow.to_table(columns=["length"])["length"].to_numpy()
@@ -1258,15 +1262,15 @@ class _ParquetRows(grain.DatasetIterator):
         return {"group": self.group, "row": self.row}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        group, row = state.get("group"), state.get("row")
-        if (
-            isinstance(group, bool)
-            or isinstance(row, bool)
-            or not isinstance(group, int)
-            or not isinstance(row, int)
-            or not 0 <= group <= self.groups
-            or row < 0
-        ):
+        try:
+            group = integer(state.get("group"), "Parquet group")
+            row = integer(state.get("row"), "Parquet row")
+        except ValueError as error:
+            raise ValueError(
+                f"invalid Parquet file position {dict(state)!r} for file {self.number} of "
+                f"{self.source.describe()}"
+            ) from error
+        if not 0 <= group <= self.groups or row < 0:
             raise ValueError(f"invalid Parquet file position {dict(state)!r} for file {self.number} of "
                              f"{self.source.describe()}")
         self.group, self.row, self.table = group, row, None
@@ -1482,8 +1486,8 @@ class _LineIterator(grain.DatasetIterator):
         return {"offset": self.file.tell()}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        offset = state.get("offset")
-        if isinstance(offset, bool) or not isinstance(offset, int) or offset < self.shard.start:
+        offset = integer(state.get("offset"), f"file offset for {self.shard.id}")
+        if offset < self.shard.start:
             raise ValueError(f"invalid file reader position for {self.shard.id}")
         if self.compression is not None:
             # Zstandard streams seek forward only; restoration starts from a fresh decoder.

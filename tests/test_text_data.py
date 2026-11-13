@@ -948,3 +948,17 @@ def test_a_one_split_token_export_refuses_a_validation_split_it_does_not_hold(tm
     with pytest.raises(ValueError):
         _, held_out = TokenFiles(str(exported)).holdout(split="val")
         _validated(held_out, 4, 1)
+
+
+@pytest.mark.parametrize("field", ["text", "txt", "caption"])
+def test_tokenize_reads_a_records_text_under_any_conventional_field(field):
+    """A record's text under its conventional field (text, txt or caption) is tokenized by the step's
+    default, its other fields kept and its text field replaced by the ids (row 5757): only `text` was
+    read, and a caption-only record refused."""
+    from dew.data import Memory
+    from dew.data.compile import iterate
+    from dew.data.text import tokenize
+
+    (tokens,) = iterate(Memory([{field: "hi", "tag": 7}]).map(tokenize("byte", eos=False)))
+    assert tokens["text"].tolist() == list(b"hi") and int(tokens["tag"]) == 7
+    assert field == "text" or field not in tokens

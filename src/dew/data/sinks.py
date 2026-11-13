@@ -8,7 +8,7 @@ import io
 import itertools
 import tempfile
 import uuid
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
@@ -23,7 +23,7 @@ from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import Closeable
 from dew.data.sources.base import Source
-from dew.data.sources.codec import encode
+from dew.data.sources.codec import Value, encode
 from dew.data.sources.files import Format, _arrow_filesystem, declared_format
 from dew.data.sources.index import length_index
 from dew.data.steps.text import count_rules, stated_rules
@@ -168,23 +168,53 @@ class _Parquet:
             )
 
 
-def _streamed(chunks: Iterator[list[Batch | bytes | None]]) -> pa.RecordBatchReader | None:
-    """`chunks` of records with named fields as one Arrow stream, typed by the first; None where
-    there is none, which no writer is handed."""
+def _kept(value: Value, kind: pa.DataType, path: str) -> None:
+    """Refuse a record's `value` at `path` holding a field the Arrow `kind` it is written as has none of,
+    which Arrow's conversion would drop (the audit's DC2): every field of a struct, every entry of a list."""
+    match value:
+        case Mapping() if pa.types.is_struct(kind):
+            known = {field.name: field.type for field in kind}
+            for name, entry in value.items():
+                at = f"{path}.{name}" if path else str(name)
+                if name not in known:
+                    raise ValueError(f"an Arrow export is typed by its first chunk, which holds no field "
+                                     f"{at!r}; give that chunk every field, or export with "
+                                     "format='array_record'")
+                _kept(entry, known[name], at)
+        case str() | bytes() | bytearray():
+            return
+        case Sequence() if pa.types.is_list(kind) or pa.types.is_large_list(kind) \
+                or pa.types.is_fixed_size_list(kind):
+            for entry in value:
+                _kept(entry, kind.value_type, f"{path}[]")
 
-    def named() -> Iterator[list[Batch | bytes | None]]:
+
+def _streamed(chunks: Iterator[list[Batch | bytes | None]]) -> pa.RecordBatchReader | None:
+    """`chunks` of records with named fields as one Arrow stream, typed by the first, each record refused
+    where it holds a field that type has none of (`_kept`); None where there is none, which no writer is
+    handed."""
+
+    def named() -> Iterator[list[Batch]]:
         for chunk in chunks:
-            if any(not isinstance(row, Mapping) for row in chunk):
+            rows = [row for row in chunk if isinstance(row, Mapping)]
+            if len(rows) != len(chunk):
                 raise TypeError("an export through an Arrow writer takes records with named fields")
-            yield chunk
+            yield rows
 
     tables = named()
     first = next(tables, None)
     if first is None:
         return None
     schema = pa.Table.from_pylist(first).schema
-    return pa.RecordBatchReader.from_batches(schema, (pa.RecordBatch.from_pylist(chunk, schema=schema)
-                                                      for chunk in itertools.chain([first], tables)))
+    typed = pa.struct(list(schema))
+
+    def batches() -> Iterator[pa.RecordBatch]:
+        for chunk in itertools.chain([first], tables):
+            for row in chunk:
+                _kept(row, typed, "")
+            yield pa.RecordBatch.from_pylist(chunk, schema=schema)
+
+    return pa.RecordBatchReader.from_batches(schema, batches())
 
 
 def _written(target: Store, prefix: str) -> list[Mapping[str, object]]:

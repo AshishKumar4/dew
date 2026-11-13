@@ -2196,3 +2196,61 @@ def test_a_concatenation_of_cold_stores_is_prepared_through_its_own_stores(tmp_p
     finally:
         reader.close()
     assert joined.supports("indexed")
+
+
+def test_a_concatenation_of_unindexed_files_is_provisioned_by_its_stores(tmp_path):
+    """`source(..., provision=True)` over a concatenation of JSON-lines stores that take no indexed read
+    prepares each store's index, so the concatenation reads indexed, in its stores' order (row 5755): the
+    stores it provisioned were a hand-written list of kinds, which a concatenation was not among."""
+    from dew.data import Concatenate, Files
+    from dew.data.sources import source
+
+    parts = []
+    for name, ids in (("a", (1, 2)), ("b", (3, 4))):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "rows.jsonl").write_text("".join(f'{{"id": {index}}}\n' for index in ids))
+        parts.append(Files(str(tmp_path / name), format="jsonl"))
+    joined = Concatenate(tuple(parts))
+    assert not joined.supports("indexed")
+    prepared = source(joined, provision=True)
+    records = prepared.records("indexed")
+    assert [int(records[index]["id"]) for index in range(len(records))] == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("rows", [[{"x": 1}, {"x": 2, "y": 3}],
+                                  [{"meta": {"a": 1}}, {"meta": {"a": 2, "b": 4}}]],
+                         ids=["a-later-field", "a-nested-field"])
+def test_an_arrow_export_refuses_a_field_its_schema_would_drop_and_commits_nothing(tmp_path, rows):
+    """A Parquet export typed by its first chunk, one row a chunk, refuses a later row's field, or a nested
+    struct's, that its schema has none of (the audit's DC2), and commits no export, where Arrow dropped the
+    field and the export committed without it; rows that state every field write them whole."""
+    from dew.data import Files
+    from dew.data.sinks import export
+    from dew.data.storage import EXPORT_MANIFEST
+
+    with pytest.raises(ValueError):
+        export(rows, str(tmp_path / "refused"), format="parquet", rows_per_shard=1)
+    assert not (tmp_path / "refused" / EXPORT_MANIFEST).exists()
+    whole = [{"x": 1, "y": 2}, {"x": 3, "y": None}]
+    export(whole, str(tmp_path / "whole"), format="parquet", rows_per_shard=1)
+    read = Files(str(tmp_path / "whole")).records("memory")
+    assert [dict(read[index]) for index in range(len(read))] == whole
+
+
+@pytest.mark.parametrize("format", ["array_record", "parquet"])
+def test_a_committed_export_of_no_rows_reads_as_empty_and_an_empty_directory_as_missing(tmp_path, format):
+    """An export a filter left no rows commits an empty manifest, which reads as no records indexed, in
+    memory and streamed (the audit's DC6), where it was refused as a source that matched no files; a
+    directory holding no export and no files is still refused as missing."""
+    from dew.data import Files, Memory
+    from dew.data.compile import iterate
+    from dew.data.sinks import export
+
+    none = Memory([{"x": np.int32(1)}]).filter(lambda row: int(row["x"]) < 0, identity="none@1")
+    assert export(none, str(tmp_path / "empty"), format=format)["rows"] == 0
+    empty = Files(str(tmp_path / "empty"))
+    assert len(empty.records("indexed")) == len(empty.records("memory")) == 0
+    assert list(iterate(empty, read="streamed")) == []
+    (tmp_path / "bare").mkdir()
+    with pytest.raises(FileNotFoundError):
+        Files(str(tmp_path / "bare"), format=format).records("indexed")

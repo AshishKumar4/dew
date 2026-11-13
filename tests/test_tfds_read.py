@@ -15,7 +15,7 @@ import pytest
 import tensorflow_datasets as tfds
 
 from dew.data import TFDS, Loading, Memory, images, presets
-from dew.data.compile import compile
+from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
 from dew.data.image_codec import decode_image
 from dew.data.storage import Store
@@ -134,3 +134,40 @@ def test_the_images_preset_over_a_split_a_run_mirrors_provisions_it_before_readi
         assert np.asarray(next(reader)["image"]).shape[0] == 4
     finally:
         reader.close()
+
+
+def _offset(raw, feature, delta=0):
+    """A decoder's function: the image's pixels moved by `delta`."""
+    return (decode_image(raw).astype(np.int32) + delta).astype(np.uint8)
+
+
+_offset.identity = "offset@1"
+offset = tfds.decode.make_decoder()(_offset)
+
+
+def _inverted(raw, feature):
+    """A decoder's function that declares no identity."""
+    return (255 - decode_image(raw)).astype(np.uint8)
+
+
+inverted = tfds.decode.make_decoder()(_inverted)
+
+
+def test_a_cache_keys_a_tfds_decoders_function_and_arguments(tmp_path):
+    """Decoders made by `tfds.decode.make_decoder` over one function, its arguments apart, cached under
+    one root: each reads its own pixels (row 5754), where they shared one source fingerprint and the second
+    read the first's cache; a decoder whose function declares no identity keys no cache, and a plan over it
+    is no exact one, which a resume cannot tell it reads again."""
+    root = str(tmp_path / "cache")
+
+    def pixels(decoder) -> list[int]:
+        decoded = TFDS("dew_images", path=str(FIXTURE), split="test", decoders={"image": decoder})
+        return [int(row["image"][0, 0, 0]) for row in iterate(decoded.cache(root), read="indexed")]
+
+    one, five = pixels(offset(delta=1)), pixels(offset(delta=5))
+    assert len(one) == 4 and [value - 4 for value in five] == one
+    unnamed = TFDS("dew_images", path=str(FIXTURE), split="test", decoders={"image": inverted()})
+    with pytest.raises(ValueError):
+        pixels(inverted())
+    loader = compile(unnamed.batch(2), read="indexed", loading=Loading(workers=0, cache=False), steps=1)
+    assert not loader.plan.manifest.exact

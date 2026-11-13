@@ -8,6 +8,7 @@ from functools import cached_property
 
 import numpy as np
 
+from dew._records import integer
 from dew.batch import Batch
 from dew.data.dataset import Ranges, Records
 from dew.data.declared import Declared
@@ -164,9 +165,8 @@ class TokenFiles(Dataset):
 
     @cached_property
     def tokens(self) -> TokenRecords:
-        eos = self.meta.get("eos_id")
-        if eos is not None and (isinstance(eos, bool) or not isinstance(eos, int)):
-            raise ValueError("token metadata eos_id must be an integer or null")
+        raw_eos = self.meta.get("eos_id")
+        eos = None if raw_eos is None else integer(raw_eos, "token metadata eos_id")
         committed = self.committed
         if committed["format"] != "array_record":
             raise ValueError("token exports must use ArrayRecord")

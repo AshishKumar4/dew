@@ -28,7 +28,7 @@ import itertools
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Literal, Protocol, get_args, runtime_checkable
+from typing import TYPE_CHECKING, Literal, get_args
 
 import grain.python as pygrain
 
@@ -99,64 +99,13 @@ from dew.data.sources.base import (
     beneath,
     materialized,
 )
-from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
+from dew.data.sources.provisioning import provisioner
 
 if TYPE_CHECKING:
     from dew.data.generation import Generation
 
 _STAGES = get_args(Stage.__value__)
-
-
-@runtime_checkable
-class _Provisionable(Protocol):
-    def can_provision(self, read: Read) -> bool: ...
-    def provision(self) -> Source: ...
-    def preparation_bytes(self) -> int | None:
-        """The bytes preparing reads, as the store states them before any read, None where it states none
-        (row 4118)."""
-        ...
-
-
-@dataclasses.dataclass(frozen=True)
-class _ConcatenationPreparers:
-    """A concatenation's stores that cannot take a read, each prepared by its own preparer
-    (`_provisioner`), so the concatenation takes it once they have."""
-
-    concatenation: Concatenate
-    preparers: tuple[_Provisionable, ...]
-
-    def can_provision(self, read: Read) -> bool:
-        return True
-
-    def provision(self) -> Source:
-        for preparer in self.preparers:
-            preparer.provision()
-        return self.concatenation
-
-    def preparation_bytes(self) -> int | None:
-        sizes = [preparer.preparation_bytes() for preparer in self.preparers]
-        return None if None in sizes else sum(size for size in sizes if size is not None)
-
-
-def _provisioner(source: Source, read: Read) -> _Provisionable | None:
-    """The source that can prepare `read`, through the views whose rows are their source's
-    (`SAME_ROWS`) over it, unless one takes no such read; for a concatenation, each of its stores
-    that cannot take `read` yet, all of which must prepare it."""
-    preparing = source
-    for preparing in beneath(source, SAME_ROWS):
-        if isinstance(preparing, _Provisionable):
-            break
-        if isinstance(preparing, View) and read not in preparing.reads:
-            return None
-    source = preparing
-    if isinstance(source, Concatenate):
-        preparers = [_provisioner(member, read) for member in source.sources if not member.supports(read)]
-        if not preparers or any(preparer is None for preparer in preparers):
-            return None
-        ready = tuple(preparer for preparer in preparers if preparer is not None)
-        return _ConcatenationPreparers(source, ready)
-    return source if isinstance(source, _Provisionable) and source.can_provision(read) else None
 
 
 def _store(source: Source) -> Source:
@@ -427,14 +376,14 @@ def _preferred_read(pipelines: Sequence[Pipeline], *, provision: bool) -> Read:
             chosen.append("memory")
         else:
             indexed = source.supports("indexed") or (
-                not source.supports("streamed") and _provisioner(source, "streamed") is None
-                and _provisioner(source, "indexed") is not None
+                not source.supports("streamed") and provisioner(source, "streamed") is None
+                and provisioner(source, "indexed") is not None
             )
             chosen.append("indexed" if indexed else "streamed")
     preferred = READS.index(max(chosen, key=READS.index))
     for read in READS[preferred::-1]:
         missing = _unsupported(promoted, read)
-        provisionable = all(_provisioner(source, read) is not None for source in missing)
+        provisionable = all(provisioner(source, read) is not None for source in missing)
         if read == READS[preferred] and missing and provisionable and not provision:
             return read
         if (not missing or (provision and provisionable)) and _lowers(promoted, read):
@@ -683,7 +632,8 @@ def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read, version
     if manifest is None:
         raise ValueError(f"a cache keys its store's content, which {source.describe()} doesn't "
                          "state: name it (from_grain(..., identity=), from_iter(..., identity=), "
-                         "from_torch(..., identity=))")
+                         "from_torch(..., identity=), or a TFDS decoder's function by its identity "
+                         "attribute, 'name@version')")
     return manifest
 
 
@@ -1216,7 +1166,7 @@ def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) ->
     missing = _unsupported(pipelines, read)
     if provision:
         for source in missing:
-            preparer = _provisioner(source, read)
+            preparer = provisioner(source, read)
             if preparer is not None:
                 preparer.provision()
     refused: dict[str, list[str]] = {}
@@ -1237,7 +1187,7 @@ def _refusal(source: Source, read: Read, *, provision: bool) -> str:
             return view.refusal
     if provision:
         return "its store takes no such read, and provisioning prepared none"
-    preparer = _provisioner(source, read)
+    preparer = provisioner(source, read)
     if preparer is None:
         # Nothing prepares this read of it (a Hub split with no Parquet or JSON files streams none).
         return f"its store holds nothing a {read} read takes, and no preparation makes it: read it otherwise"

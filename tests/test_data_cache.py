@@ -1734,6 +1734,45 @@ def test_a_training_close_waits_out_an_upload_in_flight_which_publishes_its_segm
     assert rows.metrics()["abandoned"] == 0
 
 
+def test_a_training_close_cancels_the_uploads_queued_behind_the_one_in_flight():
+    """A training read closed with one upload in flight and three queued behind it on the writer's one
+    upload thread waits out the first, which publishes its shard, and cancels the rest, which write
+    nothing, counted abandoned, their spooled bytes let go (row 5756): the close drained every queued
+    upload first."""
+    from fsspec.implementations.memory import MemoryFileSystem
+
+    entered, written = threading.Event(), []
+    rows = None
+
+    class Queued(MemoryFileSystem):
+        """Memory objects behind a conditional write whose first shard upload ends only once the reader's
+        close has begun."""
+
+        protocol = "queued"
+
+        @classmethod
+        def _strip_protocol(cls, path):
+            return super()._strip_protocol(path.replace("queued://", "memory://", 1))
+
+        def put_conditional(self, path, payload, version):
+            if "/shards/" in path:
+                written.append(path)
+                entered.set()
+                while len(written) == 1 and not rows.writer.closing:
+                    time.sleep(0.01)
+            self.pipe_file(path, payload)
+            return hashlib.sha256(payload).hexdigest()
+
+    fsspec.register_implementation("queued", Queued, clobber=True)
+    rows = Cache(f"queued://cache-{uuid4().hex}", shard_bytes=1, upload_workers=1, retry=0).mapped(
+        grain.MapDataset.source(Memory([{"id": index} for index in range(4)]).records("indexed")), _key())
+    assert [rows[index] for index in range(4)] == [{"id": index} for index in range(4)]
+    assert entered.wait(5)
+    rows.close()
+    assert len(written) == 1
+    assert rows.metrics()["abandoned"] == 3 and rows.metrics()["spool_bytes"] == 0
+
+
 def test_a_training_close_ends_when_its_store_is_gone():
     """A store that is gone fails an upload in flight by its transport's own timeout, so a close that
     waits out its uploads ends, the upload counted abandoned and nothing of the fill published."""

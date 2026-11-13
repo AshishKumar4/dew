@@ -45,12 +45,29 @@ class _Texts:
 
 
 def _decoder_record(value: object) -> Mapping[str, object] | None:
+    """What a TFDS decoder makes of its feature, as a source's fingerprint records it: a decoder made by
+    `tfds.decode.make_decoder` by its function, its output dtype and the arguments bound to it (TFDS holds
+    them on the decoder's own attributes), which a cache keys only where they state what they compute
+    (`dew.data.plan.by_content`: the function's declared identity, `identity='name@version'`, and arguments
+    described by content), else none (`identified`, row 5754); any other by its class and public settings."""
     if value is None:
         return None
     if isinstance(value, Mapping):
         return {name: _decoder_record(decoder) for name, decoder in value.items()}
-    from dew._records import json_value
+    from tensorflow_datasets.core.decode.base import DecoderFn
 
+    from dew._records import json_value
+    from dew.data.plan import StepIdentity, by_content, structured
+
+    kind = f"{type(value).__module__}.{type(value).__qualname__}"
+    if isinstance(value, DecoderFn):
+        function, dtype = StepIdentity.of(value._fn), value._output_dtype
+        bound = (value._args, value._kwargs)
+        return {"class": kind, "function": function.semantic(),
+                "output_dtype": None if dtype is None else str(getattr(dtype, "name", dtype)),
+                "args": structured(value._args), "kwargs": structured(value._kwargs),
+                "identity_required": True,
+                "identity": function.declared if by_content((value._fn, *bound)) else None}
     try:
         settings = {
             name: json_value(option, f"decoder.{name}")
@@ -59,7 +76,7 @@ def _decoder_record(value: object) -> Mapping[str, object] | None:
         }
     except TypeError as error:
         raise ValueError(f"TFDS decoder {type(value).__name__} has no stable public configuration") from error
-    return {"class": f"{type(value).__module__}.{type(value).__qualname__}", "config": settings}
+    return {"class": kind, "config": settings}
 
 
 @functools.cache

@@ -4,7 +4,7 @@ facts, folded through its stages in the order they run, each step that knows wha
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 
 from dew._records import JSON, integer, record
 from dew.data.pipeline import (
@@ -26,6 +26,23 @@ from dew.data.pipeline import (
     runs,
 )
 from dew.data.sources.base import stated
+
+IMAGE_FIELDS = ("jpg", "png", "image")
+"""The fields a record holds its image in by convention (docs/design/data.md, the steps), the first a step's
+default."""
+TEXT_FIELDS = ("text", "txt", "caption")
+"""The fields a record holds its text in by convention, the first a step's default."""
+
+
+def conventional(held: Collection[str], field: str, convention: Sequence[str]) -> str:
+    """The field of `held` a step reads that names `field`: `field` itself where `held` holds it; where
+    `field` is the convention's first, which a step reads by default, the first of `convention` `held` holds
+    (row 5757); else `field`, which the step's read refuses as missing. A field the convention names and a
+    record lacks thus reads by the convention, and any other the step was given is read as it is named."""
+    if field in held or field != convention[0]:
+        return field
+    return next((name for name in convention if name in held), field)
+
 
 # Stages that order, select, drop, repeat or place records, and change none of them.
 _KEEPS = (Shuffle, Repeat, Slice, Limit, Filter, Prefetch, Workers, Interleave, Artifact, TokenSplit)

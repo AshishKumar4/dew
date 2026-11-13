@@ -430,7 +430,8 @@ def tokenize(tokenizer: str | SavedTokenizer = "byte", *, field: str = "text",
 
 @dataclasses.dataclass(frozen=True)
 class Tokenize(grain.MapTransform):
-    """The text in `field` as token ids under "text", each document ended by
+    """The text in `field` as token ids under "text", the default `text` reading the record's conventional
+    field (`dew.data.facts.conventional`: text, txt or caption), each document ended by
     the tokenizer's EOS with `eos`, or where the tokenizer has one with None."""
 
     tokenizer: str = "byte"
@@ -439,9 +440,12 @@ class Tokenize(grain.MapTransform):
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """Token ids of each document's length under "text", by `tokenizer`, `vocab_size` of them."""
-        from dew.data.facts import unshaped
+        from dew._records import record
+        from dew.data.facts import TEXT_FIELDS, conventional, unshaped
 
-        return {**unshaped(facts, self.field, "text"), "tokenizer": self.tokenizer,
+        fields = record(facts.get("fields", {}), "fields")
+        return {**unshaped(facts, conventional(fields, self.field, TEXT_FIELDS), "text"),
+                "tokenizer": self.tokenizer,
                 "vocab_size": self.vocabulary.vocab_size,
                 "eos_id": self.vocabulary.eos_id if self.ends else None}
 
@@ -469,11 +473,14 @@ class Tokenize(grain.MapTransform):
         return self.tokenizer != "byte"
 
     def map(self, element: Batch) -> Batch:
-        value = element[self.field]
+        from dew.data.facts import TEXT_FIELDS, conventional
+
+        field = conventional(element, self.field, TEXT_FIELDS)
+        value = element[field]
         if not isinstance(value, str):
-            raise ValueError(f"Tokenize field {self.field!r} must contain text")
+            raise ValueError(f"Tokenize field {field!r} must contain text")
         ids = self.vocabulary.document(value, eos=self.ends)
-        kept = {key: value for key, value in element.items() if key != self.field}
+        kept = {key: held for key, held in element.items() if key != field}
         return {**kept, "text": np.asarray(ids, np.int32), "_dew_length": len(ids)}
 
 

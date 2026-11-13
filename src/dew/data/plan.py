@@ -358,6 +358,32 @@ def structured(value) -> JSON:
     return {"text": re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))}
 
 
+def by_content(value) -> bool:
+    """Whether `structured` describes `value` by what it computes, which a later run's equal description
+    shows it computes again: a dataclass whose recorded fields are, a configured object (`dependencies`), a
+    scalar, a container whose entries are, an array, a type, a bound method of such an object, a builtin, or
+    a function whose identity a cache keys (`StepIdentity.keyable`: declared, `identity='name@version'`);
+    not an object it can describe only by its text, which two that compute otherwise can share."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return all(by_content(getattr(value, field.name))
+                   for field in dataclasses.fields(value) if field.repr)
+    if isinstance(value, _Dependencies):
+        return True
+    match value:
+        case None | bool() | int() | str() | float() | Enum() | np.ndarray() | jax.Array() | np.generic() \
+                | np.dtype() | type():
+            return True
+        case list() | tuple():
+            return all(by_content(entry) for entry in value)
+        case Mapping():
+            return all(by_content(key) and by_content(entry) for key, entry in value.items())
+    if inspect.ismethod(value):
+        return by_content(value.__self__)
+    if inspect.isfunction(value):
+        return StepIdentity.of(value).keyable(function=True, external=not value.__module__.startswith("dew."))
+    return inspect.isbuiltin(value)
+
+
 def _printed_config(step: DataclassInstance, config: str, dependent: bool) -> str:
     """A dataclass step's configuration as plans before `STRUCTURED` spelled it (`StepIdentity.printed`):
     its repr, or, where it calls a configured object, holds an array or sets an added field, the JSON of its
