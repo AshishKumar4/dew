@@ -11,7 +11,7 @@ import pytest
 from sampling_gate import FALSE_RED
 from tool_support import run_from
 
-from dew.telemetry.benchmark import CuptiHeld, behind, benchmark, device_time, eviction
+from dew.telemetry.benchmark import EVICTION_KERNEL, CuptiHeld, behind, benchmark, device_time, eviction
 
 
 class Slow:
@@ -302,17 +302,48 @@ def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however
         with pytest.raises(ValueError):
             device.kernels(lambda: None)
         buffer = eviction()
-        evicting = {kernel.name for kernel in device.kernels(jax.jit(jnp.sum), buffer)}
-        # The eviction runs in the program its call is timed in, which the compiler keeps.
-        assert evicting & {kernel.name for kernel in device.kernels(jax.jit(behind(matmul)), buffer, (x,))}
+        # The eviction runs as its own kernel in the program its call is timed in, which the compiler keeps.
+        joined = device.kernels(jax.jit(behind(matmul)), buffer, (x,))
+        assert any(EVICTION_KERNEL in kernel.name for kernel in joined)
         timed = device.kernels(matmul, x, evicted=True)
-        assert timed and not evicting & {kernel.name for kernel in timed}
+        assert timed and not any(EVICTION_KERNEL in kernel.name for kernel in timed)
+        # A sum behind the eviction keeps every kernel it launches alone.
+        summed = jax.jit(jnp.sum)
+        assert len(device.kernels(summed, x, evicted=True)) == len(device.kernels(summed, x))
     profiler = Profiler(tmp_path)
     with profiler, device_time() as device:
         jax.block_until_ready(matmul(x))
         with pytest.raises(CuptiHeld):
             device.kernels(matmul, x)
     assert program_kernels(profiler.captures[-1], ["squared"])["squared"]
+
+
+def test_a_timing_refuses_a_conditional_its_process_may_graph(monkeypatch):
+    """A jitted call holding a conditional is refused a device time (`Ungraphed`) in a process whose XLA may
+    run it as a command buffer's conditional node, whose taken branch's kernels CUPTI does not record (a B32
+    decode on an RTX PRO 6000 read its reduces alone, G4-LF-2), and read in one that keeps conditionals out
+    of command buffers (`UNGRAPHED`), as a call without one is in either."""
+    from dew.telemetry.benchmark import UNGRAPHED, DeviceTime, Ungraphed
+
+    class Read(Exception):
+        """CUPTI's reading reached: the call was not refused."""
+
+    class Cupti:
+        def measure(self, fn, aggregate):
+            raise Read
+
+    branched = jax.jit(lambda x: jax.lax.cond(jnp.max(x) > 0, jnp.sin, jnp.cos, x))
+    plain = jax.jit(jnp.sin)
+    x = jnp.ones(8)
+    session = DeviceTime(Cupti())
+    monkeypatch.delenv("XLA_FLAGS", raising=False)
+    with pytest.raises(Ungraphed):
+        session.kernels(branched, x)
+    with pytest.raises(Read):
+        session.kernels(plain, x)
+    monkeypatch.setenv("XLA_FLAGS", f"--xla_gpu_enable_command_buffer={UNGRAPHED}")
+    with pytest.raises(Read):
+        session.kernels(branched, x)
 
 
 def test_a_projection_benchmark_names_a_grouped_matmul_kernel_and_runs_it(monkeypatch):
