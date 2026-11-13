@@ -1547,6 +1547,7 @@ def test_rows_of_one_document_each_attend_as_unpacked_rows():
     for its packed form, an S-squared backward workspace (row 5916). Their real tokens' states are on par
     (check 1) with the same rows' read as packed documents, both from the packed call's in float64."""
     from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import Unlowerable
 
     model = tiny()
     segments = (jnp.arange(SEQ)[None, :] < jnp.asarray([[7], [SEQ]])).astype(jnp.int32)
@@ -1561,15 +1562,21 @@ def test_rows_of_one_document_each_attend_as_unpacked_rows():
 
     assert_as_exact(states(model, 1), states(model, 2), drawn(model), "one document a row",
                     seeds=SEEDS['one document a row'], truth_fn=states(model.clone(dtype=jnp.float64), 2))
-    # A B200 call of a shape its cuDNN cell timed: 16-bit, 8 query heads over 2 of 64, 128 tokens.
-    narrow = tiny(num_heads=8, num_kv_heads=2, head_dim=64, max_seq_len=128, dtype=jnp.bfloat16)
-    rows = (jnp.arange(128)[None, :] < jnp.asarray([[70], [128]])).astype(jnp.int32)
+    # A B200 call of a shape its cuDNN cell timed (`MEASURED`): 16-bit, 8 query heads over 2 of 64, 256
+    # tokens.
+    narrow = tiny(num_heads=8, num_kv_heads=2, head_dim=64, max_seq_len=256, dtype=jnp.bfloat16)
+    rows = (jnp.arange(256)[None, :] < jnp.asarray([[70], [256]])).astype(jnp.int32)
     ids = jnp.zeros(rows.shape, jnp.int32)
     params = jax.eval_shape(narrow.init, jax.random.key(0), ids)
 
     def routes(given):
-        with generation.assumed("sm100"), generation.routes() as found:
-            jax.jit(lambda params: narrow.apply(params, ids, coordinates=given)).trace(params)
+        """The attention kernels the call takes, each with what refused its preferred one; on a host
+        that loads none of the kernel's library, the kernel it cannot lower (`Unlowerable`)."""
+        try:
+            with generation.assumed("sm100"), generation.routes() as found:
+                jax.jit(lambda params: narrow.apply(params, ids, coordinates=given)).trace(params)
+        except Unlowerable as refused:
+            return refused.kernel
         return [(route.kernel, route.refusal) for route in found
                 if route.choice == generation.Choice.ATTENTION]
 
