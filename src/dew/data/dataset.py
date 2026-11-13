@@ -1242,9 +1242,13 @@ class Unstacked(ValueError):
 def _stacked(value) -> bool:
     """Whether Grain stacks `value` into one array: numbers of any dtype JAX counts as one (bfloat16 and
     the float8s among them, which NumPy kinds as voids), booleans, strings and bytes, and mappings of
-    them; not lists, object arrays, structured records or other records."""
+    them, and a record a registered pytree holds of them (a laid row's `dew.batch.Coordinates`), which
+    Grain stacks leaf by leaf; not lists, object arrays, structured records or other records."""
     if isinstance(value, Mapping):
         return bool(value) and all(_stacked(field) for field in value.values())
+    if not isinstance(value, (list, tuple)) and not jax.tree_util.treedef_is_leaf(jax.tree.structure(value)):
+        leaves = jax.tree.leaves(value)
+        return bool(leaves) and all(_stacked(leaf) for leaf in leaves)
     if not isinstance(value, (np.ndarray, np.generic, jax.Array, int, float, complex, str, bytes)):
         return False
     dtype = np.asarray(value).dtype
