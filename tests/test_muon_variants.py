@@ -8,19 +8,12 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from optim_support import LR, decoder_params, drawn_tree
+from optim_support import LR, decoder_params, drawn_tree, optax_orthogonalized
 from reference_error import as_given, assert_as_exact
 from test_optim import UPDATE_SEEDS, assert_updates_as, muon_solver, stacked_draw
 from torch_layout import node
 
-from dew.newton_schulz import (
-    NEWTON_SCHULZ,
-    POLAR_EXPRESS_TABLE,
-    ns_operands,
-    orthogonalized,
-    orthogonalized_leaf,
-    polar_express,
-)
+from dew.newton_schulz import NEWTON_SCHULZ, POLAR_EXPRESS_TABLE, ns_operands, orthogonalized, polar_express
 
 QUERY = ('params', 'layers_0', 'self_attn', 'q_proj', 'kernel')
 """The decoder's first query projection, `[embed 32, heads 2 * head_dim 16]`."""
@@ -270,9 +263,8 @@ def test_muons_newton_schulz_on_the_stored_layout_is_as_exact_as_optaxs(precondi
     """Dew's orthogonalization of wide, tall, square and 2-D updates, on the matrices as they are stored
     (`newton_schulz`: a tall matrix's Gram product and polynomial taken from its shorter side, where optax
     transposes it), its stacks of one shape joined or each its own (`ns_group`), on par from float64 with
-    optax's
-    own iteration (`orthogonalized_leaf`) of each matrix at `preconditioning`, in the dtype Dew's numerics
-    iterate in (check 1)."""
+    optax's own iteration (`optim_support.optax_orthogonalized`) of each matrix at `preconditioning`, in the
+    dtype Dew's numerics iterate in (check 1)."""
     stacked = optax.contrib.MuonDimensionNumbers((1,), (2,))
     numbers = (stacked, stacked, stacked, optax.contrib.MuonDimensionNumbers(0, 1))
 
@@ -284,12 +276,12 @@ def test_muons_newton_schulz_on_the_stored_layout_is_as_exact_as_optaxs(precondi
         def one(stack, shape):
             given = jnp.asarray(stack)
             work = ns_operands(given.dtype, preconditioning)
-            return orthogonalized_leaf(given.astype(work), 5, shape, coeffs=NEWTON_SCHULZ,
+            return optax_orthogonalized(given.astype(work), 5, shape, coeffs=NEWTON_SCHULZ,
                                        preconditioning=preconditioning).astype(given.dtype)
         return [one(stack, shape) for stack, shape in zip(stacks, numbers, strict=True)]
 
     def truth(*stacks):
-        return [orthogonalized_leaf(jnp.asarray(stack), 5, shape, coeffs=NEWTON_SCHULZ,
+        return [optax_orthogonalized(jnp.asarray(stack), 5, shape, coeffs=NEWTON_SCHULZ,
                                     preconditioning=preconditioning)
                 for stack, shape in zip(stacks, numbers, strict=True)]
 

@@ -2329,23 +2329,19 @@ class OptimConfig:
             solver = power_profiles(solver, self.ema_profiles)
         return solver
 
-    def update_flops(self, params, devices: int = 1) -> float | None:
+    def update_flops(self, params) -> float | None:
         """One update's analytic matrix work over `params` beyond the model's, the FLOPs a run reports as
         `train/update_flops` beside the model's `train/flops`: Muon's Newton-Schulz products over each matrix
-        it orthogonalizes as it runs them over its `devices` (`muon_update_flops`), at the iterations its
-        coefficients hold (a schedule's rows); None for any other optimizer, whose update multiplies no
-        matrices."""
+        it orthogonalizes (`muon_update_flops`), at the iterations its coefficients hold (a schedule's rows);
+        None for any other optimizer, whose update multiplies no matrices."""
         if self.optimizer not in ('muon', 'muonclip'):
             return None
         opts = self.optimizer_opts
-        steps, per_head, group = opts.get('ns_steps', 5), opts.get('per_head'), opts.get('ns_group')
-        if not isinstance(steps, int) or not (per_head is None or isinstance(per_head, Mapping)) or not (
-                group is None or isinstance(group, int)):
-            raise TypeError(f"Muon's ns_steps and ns_group are counts and per_head a mapping, got {steps!r}, "
-                            f"{group!r}, {per_head!r}")
+        steps, per_head = opts.get('ns_steps', 5), opts.get('per_head')
+        if not isinstance(steps, int) or not (per_head is None or isinstance(per_head, Mapping)):
+            raise TypeError(f"Muon's ns_steps is a count and per_head a mapping, got {steps!r}, {per_head!r}")
         table = _coefficients(opts.get('ns_coeffs', NEWTON_SCHULZ), steps)
-        return muon_update_flops(params, steps if table.ndim == 1 else table.shape[0], per_head,
-                                 devices=devices, group=group)
+        return muon_update_flops(params, steps if table.ndim == 1 else table.shape[0], per_head)
 
     def _spares(self, make: Callable[..., optax.GradientTransformation]) -> bool:
         """Whether the optimizer's decay takes timm's split (`weight_decay_mask`): a factory that takes a

@@ -7,8 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
-- Dew requires optax 0.2.8 or later (was 0.2.6): Muon's Newton-Schulz is optax's own iteration, its layout,
-  shape scalings and preconditionings (AOL, Schatten) included, which 0.2.8 first ships.
+- Dew requires optax 0.2.8 or later (was 0.2.6): Muon iterates Newton-Schulz in Dew's own form, on the matrices
+  as they are stored (no transposes), held to optax's iteration as its oracle; its layout, shape scalings,
+  coefficient presets and preconditionings (AOL, Schatten), which 0.2.8 first ships, are optax's.
 
 - A run's fit plan judges a head that keeps its whole logits by their fp32 bytes before it traces the step's
   gradient (`Objective.whole_head_table` names the head's table), and bounds the rung after a traced one

@@ -298,19 +298,6 @@ def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
     return iteration_dtype()
 
 
-def orthogonalized_leaf(update: jax.Array, steps: int,
-                       dimension_numbers: optax.contrib.MuonDimensionNumbers | None, *,
-                       coeffs=NEWTON_SCHULZ, eps: float = 1e-8,
-                       preconditioning: Preconditioning = "frobenius") -> jax.Array:
-    """`update` orthogonalized by Muon's `steps` quintic Newton-Schulz iterations at `coeffs`, one triple
-    or a schedule of them, after `preconditioning`: optax's own iteration (`orthogonalize_via_newton_schulz`,
-    which optax 0.2.8 does not export), in the update's dtype. A leaf with no `dimension_numbers` is one
-    matrix, its rows the reduction axis (a Linen kernel's), its other axes a stack of such matrices."""
-    numbers = optax.contrib.MuonDimensionNumbers() if dimension_numbers is None else dimension_numbers
-    return _muon.orthogonalize_via_newton_schulz(update, jnp.asarray(coeffs), steps, preconditioning, eps,
-                                                 numbers)
-
-
 __all__ = ["NEWTON_SCHULZ", "POLAR_EXPRESS_TABLE", "Preconditioning", "newton_schulz", "newton_schulz_flops",
-           "ns_operands", "orthogonalized", "orthogonalized_leaf", "polar_express", "spread_matrices",
+           "ns_operands", "orthogonalized", "polar_express", "spread_matrices",
            "spread_stacks"]
