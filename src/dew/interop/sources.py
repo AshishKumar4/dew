@@ -16,7 +16,7 @@ import functools
 import json
 import logging
 import os
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import IO, TYPE_CHECKING
@@ -436,22 +436,36 @@ def _hub_sidecar(name: str, revision: str, file: str, tensor_name: str) -> tuple
 
 
 
+def safetensors_header(stream: IO[bytes], *, offset: int = 0) -> tuple[Mapping[str, object], int]:
+    """The header of the safetensors file a seekable `stream` holds at `offset`, and the offset its
+    tensors' data starts at: its first 8 bytes and the header they size read, nothing past them."""
+    stream.seek(offset)
+    header_len = int.from_bytes(stream.read(8), "little")
+    return _records.record(json.loads(stream.read(header_len)), "safetensors header"), offset + 8 + header_len
+
+
+def stored_tensor(stream: IO[bytes], tensor_name: str, *, offset: int = 0) -> tuple[list[int], str, bytes]:
+    """One tensor of the safetensors file a seekable `stream` holds at `offset`, as stored: its header's
+    shape and dtype tag, and its bytes alone, read by their range."""
+    header, start = safetensors_header(stream, offset=offset)
+    entry = _records.record(header[tensor_name], tensor_name)
+    bounds = _records.integers(entry["data_offsets"], "data_offsets")
+    stream.seek(start + bounds[0])
+    raw = stream.read(bounds[1] - bounds[0])
+    return list(_records.integers(entry["shape"], "shape")), _records.text(entry["dtype"], "dtype"), raw
+
+
+def stored_array(tensor_name: str, shape: Sequence[int], tag: str, raw: bytes, filename: str) -> np.ndarray:
+    """A stored tensor's bytes (`stored_tensor`) as the array it reads as (`stored_spec`)."""
+    spec = stored_spec(tensor_name, shape, tag, filename)
+    return np.frombuffer(raw, dtype=spec.dtype).reshape(spec.shape).copy()
+
+
 def read_safetensors_slice(
     stream: IO[bytes], tensor_name: str, filename: str, *, offset: int = 0
 ) -> np.ndarray:
     """Read one small metadata tensor by byte slice from a seekable safetensors `stream` at `offset`."""
-    stream.seek(offset)
-    header_len = int.from_bytes(stream.read(8), "little")
-    header = json.loads(stream.read(header_len))
-    entry = _records.record(header[tensor_name], tensor_name)
-    bounds = _records.integers(entry["data_offsets"], "data_offsets")
-    stream.seek(offset + 8 + header_len + bounds[0])
-    raw = stream.read(bounds[1] - bounds[0])
-    spec = stored_spec(
-        tensor_name, _records.integers(entry["shape"], "shape"), _records.text(entry["dtype"], "dtype"),
-        filename,
-    )
-    return np.frombuffer(raw, dtype=spec.dtype).reshape(spec.shape).copy()
+    return stored_array(tensor_name, *stored_tensor(stream, tensor_name, offset=offset), filename)
 
 def stored_tensors(source: SourceReference, root: Path, *, folder: str = "") -> LazyTensors[Stored] | None:
     """`source`'s weight tensors at the snapshot `root` (`snapshot(weights=False)`) as their shapes and

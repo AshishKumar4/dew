@@ -10,7 +10,6 @@ import json
 import shutil
 import tarfile
 from pathlib import Path
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -32,139 +31,98 @@ JOINT_TINY = FIXTURES / "joint_checkpoint" / "tiny"
 SINGLE_FILE = FIXTURES / "single_file" / "sd"
 
 
-def _hub_without_weight_downloads(
-    monkeypatch: pytest.MonkeyPatch, source_dir: Path, cache_dir: Path, answers_dir: Path
-) -> list[int]:
-    """Stub Hugging Face Hub transport boundaries (`HfFileSystemFile._fetch_range`, `cat_file`,
-    `snapshot_download`, `hf_hub_download`) so full weight/archive downloads fail while safetensors
-    headers and HTTP byte ranges read from `source_dir`."""
-    import huggingface_hub
-    from huggingface_hub import HfApi, HfFileSystem, constants
-    from huggingface_hub.hf_file_system import HfFileSystemFile
+PROBE = Path(__file__).resolve().parent / "interop_hub_probe.py"
 
-    monkeypatch.setenv("DEW_HUB_ANSWERS", str(answers_dir))
-    monkeypatch.setattr(constants, "HF_HUB_OFFLINE", False)
-    rev = "a" * 40
-    streamed_bytes = [0]
-    forbidden = (".safetensors", ".bin", ".pt", ".pth", ".dduf")
 
-    def snapshot_download(
-        repo_id: str, *, revision: str | None = None, ignore_patterns=None, allow_patterns=None, **kwargs
-    ) -> str:
-        from fnmatch import fnmatch
+def _files(directory: Path) -> dict[str, Path]:
+    """A directory's files by their repo-relative names, as a Hub repo of them serves them."""
+    return {path.relative_to(directory).as_posix(): path for path in sorted(directory.rglob("*"))
+            if path.is_file()}
 
-        ignored = tuple(ignore_patterns or ())
-        allowed = None if allow_patterns is None else tuple(allow_patterns)
-        snap = cache_dir / repo_id.replace("/", "--") / rev
-        snap.mkdir(parents=True, exist_ok=True)
-        for candidate in source_dir.rglob("*"):
-            if candidate.is_dir():
-                continue
-            rel = candidate.relative_to(source_dir).as_posix()
-            if any(fnmatch(rel, pat) or fnmatch(candidate.name, pat) for pat in ignored):
-                continue
-            if allowed is not None and not any(
-                fnmatch(rel, pat) or fnmatch(candidate.name, pat) for pat in allowed
-            ):
-                continue
-            if candidate.suffix in forbidden:
-                raise AssertionError(f"weight file downloaded during weights=False: {rel}")
-            target = snap / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(candidate, target)
-        return str(snap)
 
-    def hf_hub_download(repo_id: str, filename: str, *, subfolder: str | None = None, **kwargs) -> str:
-        rel = (Path(subfolder or "") / filename).as_posix()
-        candidate = source_dir / rel
-        if candidate.suffix in forbidden:
-            raise AssertionError(f"weight file downloaded via hf_hub_download: {rel}")
-        target = cache_dir / "files" / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(candidate, target)
-        return str(target)
+def _payloads(path: Path) -> list[tuple[str, int, int]]:
+    """Each stored tensor's name and its bytes' range in `path`: a safetensors file's, from its header as
+    the format lays it (8 bytes of its length, then the header), and a DDUF archive's safetensors
+    entries' at their offsets (huggingface_hub's `read_dduf_file`); none for any other file."""
+    from huggingface_hub import read_dduf_file
 
-    def safetensors_meta(repo_id: str, filename: str, *, revision: str | None = None):
-        candidate = source_dir / filename
-        raw = candidate.read_bytes()
-        hlen = int.from_bytes(raw[:8], "little")
-        header = json.loads(raw[8 : 8 + hlen])
-        tensors = {
-            key: SimpleNamespace(shape=entry["shape"], dtype=entry["dtype"])
-            for key, entry in header.items()
-            if key != "__metadata__"
-        }
-        return SimpleNamespace(tensors=tensors)
+    if path.suffix == ".dduf":
+        places = [entry.offset for name, entry in read_dduf_file(path).items()
+                  if name.endswith(".safetensors")]
+    elif path.suffix == ".safetensors":
+        places = [0]
+    else:
+        return []
+    ranges = []
+    with open(path, "rb") as stream:
+        for offset in places:
+            stream.seek(offset)
+            length = int.from_bytes(stream.read(8), "little")
+            start = offset + 8 + length
+            for tensor, entry in json.loads(stream.read(length)).items():
+                if tensor != "__metadata__":
+                    begin, end = entry["data_offsets"]
+                    ranges.append((tensor, start + begin, start + end))
+    return ranges
 
-    def cat_file(self, path: str, start: int | None = None, end: int | None = None, **kwargs) -> bytes:
-        rel = path.split(f"@{rev}/", 1)[1]
-        raw = (source_dir / rel).read_bytes()
-        sliced = raw[start:end]
-        streamed_bytes[0] += len(sliced)
-        return sliced
 
-    def resolve_path(self, path: str, revision: str | None = None):
-        repo_id, rel = path.split(f"@{rev}/", 1)
-        return SimpleNamespace(
-            repo_type="model", repo_id=repo_id, revision=rev, path_in_repo=rel, unresolve=lambda: path
-        )
+def _weightless(hub, repo: str, files: dict[str, Path], declared: tuple[str, ...] = ()) -> None:
+    """No byte of a stored tensor's payload left the Hub for `repo` but the `declared` metadata tensors'
+    (a sidecar, a latent's statistics): every weight file it served, it served by ranges (`Served.asked`),
+    each clear of every other tensor's payload."""
+    for served in hub.served:
+        if served.repo != repo or served.file is None or served.sent == 0:
+            continue
+        payloads = [(start, stop) for tensor, start, stop in _payloads(files[served.file])
+                    if not tensor.endswith(declared)]
+        if payloads:
+            assert served.asked is not None, served
+            begin, end = served.asked
+            assert not any(begin < stop and start < end for start, stop in payloads), served
 
-    def info_file(self, path: str, **kwargs):
-        rel = path.split(f"@{rev}/", 1)[1]
-        return {"name": path, "size": (source_dir / rel).stat().st_size, "type": "file"}
 
-    def fetch_range(self, start: int, end: int) -> bytes:
-        rel = self.path.split(f"@{rev}/", 1)[1]
-        sliced = (source_dir / rel).read_bytes()[start:end]
-        streamed_bytes[0] += len(sliced)
-        return sliced
+def _hub_loaded(root: Path, hub, repo: str, name: str, *, offline: bool = False, **request) -> dict:
+    """`repo` loaded without its weights from `hub` (None: the Hub gone) in a process of its own
+    (`interop_hub_probe.py`), its Hub caches and recorded answers under `root`, offline where asked: the
+    probe's answer (`shapes`, or `refused`)."""
+    import subprocess
+    import sys
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot_download)
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", hf_hub_download)
-    monkeypatch.setattr(
-        HfApi,
-        "parse_safetensors_file_metadata",
-        lambda self, repo_id, filename, *, revision=None: safetensors_meta(
-            repo_id, filename, revision=revision
-        ),
-    )
-    monkeypatch.setattr(
-        huggingface_hub, "file_exists", lambda repo_id, filename, **kw: (source_dir / filename).is_file()
-    )
-    monkeypatch.setattr(
-        HfApi,
-        "list_repo_files",
-        lambda self, repo_id, **kw: [
-            p.relative_to(source_dir).as_posix() for p in source_dir.rglob("*") if p.is_file()
-        ],
-    )
-    monkeypatch.setattr(HfFileSystem, "cat_file", cat_file)
-    monkeypatch.setattr(HfFileSystem, "resolve_path", resolve_path)
-    monkeypatch.setattr(HfFileSystem, "info", info_file)
-    monkeypatch.setattr(HfFileSystemFile, "_fetch_range", fetch_range)
-    return streamed_bytes
+    from local_hub import hub_environment
+
+    asked = root / name / "request.json"
+    asked.parent.mkdir(parents=True)
+    asked.write_text(json.dumps({"repo": repo, **request}))
+    done = subprocess.run([sys.executable, str(PROBE), str(asked)],
+                          env=hub_environment(hub, root, offline=offline), capture_output=True, text=True,
+                          check=False)
+    assert done.returncode == 0, done.stderr[-4000:]
+    return json.loads(asked.with_name("answer.json").read_text())
 
 
 def _shapes_and_dtypes(variables: object) -> object:
-    return jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), variables)
+    return jax.tree.map(lambda leaf: [list(leaf.shape), str(leaf.dtype)], variables)
 
 
 def test_pipeline_dduf_single_file_and_composite_loads_without_weights_download_no_shards(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A pipeline directory, a DDUF archive and a joint checkpoint load without their weights from a Hub
+    (on the loopback), each variable's shape and dtype the load with weights holds, and no byte of a
+    weight payload leaves the Hub: a safetensors file is read by its header's range, an archive by its
+    directory's, its entries' headers' and its metadata entries' (B1). The archive loads again with the
+    Hub gone from what the first load recorded, and one it never read is refused."""
     from huggingface_hub import export_folder_as_dduf
+    from local_hub import LocalHub
 
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    root = tmp_path / "hub"
 
     sd3_root = tmp_path / "sd3"
     with tarfile.open(FIXTURES / "sd3_source.tar.xz") as archive:
         archive.extractall(sd3_root, filter="data")
     sd3_dir = sd3_root / "pipeline"
     expected_pipe = Pretrained.load(sd3_dir, dtype="float32", attention_impl="xla", on_host=True)
-    _hub_without_weight_downloads(monkeypatch, sd3_dir, tmp_path / "pipe_cache", tmp_path / "pipe_answers")
-    loaded_pipe = Pretrained.load("acme/sd3", dtype="float32", attention_impl="xla", weights=False)
-    assert not [p for p in (tmp_path / "pipe_cache").rglob("*") if p.suffix == ".safetensors"]
-    assert _shapes_and_dtypes(loaded_pipe.variables) == _shapes_and_dtypes(expected_pipe.variables)
 
     flux_root = tmp_path / "flux"
     with tarfile.open(FIXTURES / "flux_source.tar.xz") as archive:
@@ -173,9 +131,8 @@ def test_pipeline_dduf_single_file_and_composite_loads_without_weights_download_
     dduf_repo.mkdir()
     dduf_path = dduf_repo / "pipeline.dduf"
     export_folder_as_dduf(dduf_path, flux_root / "pipeline")
-    expected_dduf = Pretrained.load(
-        flux_root / "pipeline", dtype="float32", attention_impl="xla", on_host=True
-    )
+    expected_dduf = Pretrained.load(flux_root / "pipeline", dtype="float32", attention_impl="xla",
+                                    on_host=True)
     local_dduf = Pretrained.load(
         dduf_repo, dduf_file="pipeline.dduf", dtype="float32", attention_impl="xla", weights=False
     )
@@ -183,42 +140,27 @@ def test_pipeline_dduf_single_file_and_composite_loads_without_weights_download_
     assert not [p for p in (tmp_path / "xdg" / "dew" / "dduf").rglob("*") if p.suffix == ".safetensors"]
     assert _shapes_and_dtypes(local_dduf.variables) == _shapes_and_dtypes(expected_dduf.variables)
 
-    from huggingface_hub import constants
-
-    streamed = _hub_without_weight_downloads(
-        monkeypatch, dduf_repo, tmp_path / "dduf_cache", tmp_path / "dduf_answers"
-    )
-    hub_dduf = Pretrained.load(
-        "acme/flux-dduf", dduf_file="pipeline.dduf", dtype="float32", attention_impl="xla", weights=False
-    )
-    assert streamed[0] < 65536 and dduf_path.stat().st_size > 200_000
-    assert _shapes_and_dtypes(hub_dduf.variables) == _shapes_and_dtypes(expected_dduf.variables)
-
-    monkeypatch.setattr(constants, "HF_HUB_OFFLINE", True)
-    monkeypatch.setattr(
-        "huggingface_hub.file_exists",
-        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("file_exists called offline")),
-    )
-    offline_dduf = Pretrained.load(
-        "acme/flux-dduf", dduf_file="pipeline.dduf", dtype="float32", attention_impl="xla", weights=False
-    )
-    assert _shapes_and_dtypes(offline_dduf.variables) == _shapes_and_dtypes(expected_dduf.variables)
-    with pytest.raises(FileNotFoundError):
-        Pretrained.load(
-            "acme/flux-dduf",
-            dduf_file="unrecorded.dduf",
-            dtype="float32",
-            attention_impl="xla",
-            weights=False,
-        )
-
     expected_joint = Pretrained.load(JOINT_TINY, dtype="float32", attention_impl="xla", on_host=True)
-    _hub_without_weight_downloads(
-        monkeypatch, JOINT_TINY, tmp_path / "joint_cache", tmp_path / "joint_answers"
-    )
-    loaded_joint = Pretrained.load("acme/joint", dtype="float32", attention_impl="xla", weights=False)
-    assert not [p for p in (tmp_path / "joint_cache").rglob("*") if p.suffix == ".safetensors"]
-    assert _shapes_and_dtypes(loaded_joint.variables) == _shapes_and_dtypes(expected_joint.variables)
+    repos = {"acme/sd3": _files(sd3_dir), "acme/flux-dduf": _files(dduf_repo),
+             "acme/joint": _files(JOINT_TINY)}
+    options = {"dtype": "float32", "attention_impl": "xla"}
+    with LocalHub(repos) as hub:
+        loaded_pipe = _hub_loaded(root, hub, "acme/sd3", "sd3", options=options)
+        hub_dduf = _hub_loaded(root, hub, "acme/flux-dduf", "dduf",
+                               options={**options, "dduf_file": "pipeline.dduf"})
+        loaded_joint = _hub_loaded(root, hub, "acme/joint", "joint", options=options)
+    for repo in repos:
+        _weightless(hub, repo, repos[repo])
+    assert loaded_pipe["shapes"] == _shapes_and_dtypes(expected_pipe.variables)
+    assert hub_dduf["shapes"] == _shapes_and_dtypes(expected_dduf.variables)
+    assert loaded_joint["shapes"] == _shapes_and_dtypes(expected_joint.variables)
+
+    offline_dduf = _hub_loaded(root, None, "acme/flux-dduf", "dduf-offline", offline=True,
+                               options={**options, "dduf_file": "pipeline.dduf"})
+    assert offline_dduf["shapes"] == _shapes_and_dtypes(expected_dduf.variables)
+    unrecorded = _hub_loaded(root, None, "acme/flux-dduf", "unrecorded", offline=True,
+                             options={**options, "dduf_file": "unrecorded.dduf"})
+    assert unrecorded == {"refused": "FileNotFoundError"}
 
 
 def test_single_file_loads_without_weights_across_storage_dtypes_and_borrowed_shards(
@@ -247,10 +189,6 @@ def test_single_file_loads_without_weights_across_storage_dtypes_and_borrowed_sh
     assert not [p for p in sf_cache_root.rglob("*") if p.suffix == ".safetensors"]
     assert _shapes_and_dtypes(local_sf.variables) == _shapes_and_dtypes(expected_sf.variables)
 
-    _hub_without_weight_downloads(monkeypatch, sf_repo, tmp_path / "sf_cache", tmp_path / "sf_answers")
-    hub_sf = Pretrained.load("acme/sd-sf", single_file="sd.safetensors", weights=False, **kw)
-    assert not [p for p in (tmp_path / "sf_cache").rglob("*") if p.suffix == ".safetensors"]
-    assert _shapes_and_dtypes(hub_sf.variables) == _shapes_and_dtypes(expected_sf.variables)
 
     sharded_flux_repo = tmp_path / "sharded_flux_sf"
     shutil.copytree(flux_root / "pipeline", sharded_flux_repo)
@@ -319,26 +257,23 @@ def test_single_file_loads_without_weights_across_storage_dtypes_and_borrowed_sh
         | {k: np.ones((head,), np.float16) for k in norm_names}
     )
     write_file(flux_sf_tensors, sharded_flux_repo / "flux_tr.safetensors", {})
-    _hub_without_weight_downloads(
-        monkeypatch, sharded_flux_repo, tmp_path / "sharded_sf_cache", tmp_path / "sharded_sf_ans"
-    )
-    hub_sharded_sf = Pretrained.load(
-        "acme/flux-sharded-sf",
-        single_file="flux_tr.safetensors",
-        dtype="float32",
-        attention_impl="xla",
-        weights=False,
-    )
-    assert _shapes_and_dtypes(hub_sharded_sf.variables["encoders"]) == _shapes_and_dtypes(
-        expected_flux.variables["encoders"]
-    )
-    assert _shapes_and_dtypes(hub_sharded_sf.variables["autoencoder"]) == _shapes_and_dtypes(
-        expected_flux.variables["autoencoder"]
-    )
+    from local_hub import LocalHub
+
+    repos = {"acme/sd-sf": _files(sf_repo), "acme/flux-sharded-sf": _files(sharded_flux_repo)}
+    root = tmp_path / "hub"
+    with LocalHub(repos) as hub:
+        hub_sf = _hub_loaded(root, hub, "acme/sd-sf", "sd", options={**kw, "single_file": "sd.safetensors"})
+        hub_sharded_sf = _hub_loaded(root, hub, "acme/flux-sharded-sf", "flux",
+                                     options={**kw, "single_file": "flux_tr.safetensors"})
+    for repo in repos:
+        _weightless(hub, repo, repos[repo])
+    assert hub_sf["shapes"] == _shapes_and_dtypes(expected_sf.variables)
+    for part in ("encoders", "autoencoder"):
+        assert hub_sharded_sf["shapes"][part] == _shapes_and_dtypes(expected_flux.variables[part])
 
 
 def test_flux2_metadata_only_load_preserves_latent_statistics_on_restore(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path
 ) -> None:
     flux2_root = tmp_path / "flux2"
     with tarfile.open(FIXTURES / "flux2_source.tar.xz") as archive:
@@ -347,19 +282,27 @@ def test_flux2_metadata_only_load_preserves_latent_statistics_on_restore(
     expected = PretrainedPipeline.load(flux2_dir, dtype="float32", attention_impl="xla", on_host=True)
     assert expected.autoencoder is not None
 
-    _hub_without_weight_downloads(monkeypatch, flux2_dir, tmp_path / "flux2_cache", tmp_path / "flux2_ans")
-    loaded = PretrainedPipeline.load("acme/flux2", dtype="float32", attention_impl="xla", weights=False)
-    assert loaded.autoencoder is not None
-    assert not [p for p in (tmp_path / "flux2_cache").rglob("*") if p.suffix == ".safetensors"]
+    from local_hub import LocalHub
+
+    from dew.interop.autoencoders.flux2 import LATENT_STATISTICS
 
     rng = np.random.default_rng(11)
     sample = jnp.asarray(rng.uniform(-1.0, 1.0, (1, 16, 16, 3)).astype(np.float32))
+    np.save(tmp_path / "sample.npy", np.asarray(sample))
     vae_params = expected.variables["autoencoder"]
     expected_latent = np.asarray(expected.autoencoder.encode_batch(vae_params, sample))
-    restored_latent = np.asarray(loaded.autoencoder.encode_batch(vae_params, sample))
-    np.testing.assert_array_equal(restored_latent, expected_latent)
+    repos = {"acme/flux2": _files(flux2_dir)}
+    with LocalHub(repos) as hub:
+        loaded = _hub_loaded(tmp_path / "hub", hub, "acme/flux2", "flux2", pipeline=True,
+                             options={"dtype": "float32", "attention_impl": "xla"},
+                             encode={"directory": str(flux2_dir), "sample": str(tmp_path / "sample.npy")})
+    _weightless(hub, "acme/flux2", repos["acme/flux2"], declared=LATENT_STATISTICS)
+    assert loaded["shapes"] == _shapes_and_dtypes(expected.variables)
+    np.testing.assert_array_equal(np.load(tmp_path / "hub" / "flux2" / "latent.npy"), expected_latent)
 
-    rebound = AutoEncoder.bound(to_record(loaded.autoencoder, AutoEncoder), params=vae_params)
+    local = PretrainedPipeline.load(flux2_dir, dtype="float32", attention_impl="xla", weights=False)
+    assert local.autoencoder is not None
+    rebound = AutoEncoder.bound(to_record(local.autoencoder, AutoEncoder), params=vae_params)
     np.testing.assert_array_equal(np.asarray(rebound.encode_batch(vae_params, sample)), expected_latent)
 
     from huggingface_hub import export_folder_as_dduf
@@ -402,7 +345,7 @@ def test_flux2_metadata_only_load_preserves_latent_statistics_on_restore(
 
 
 def test_pack_quantized_compressed_tensors_loads_shapes_without_downloading_weights(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path
 ) -> None:
     ct_dir = tmp_path / "ct_qwen"
     shutil.copytree(QWEN_TINY, ct_dir)
@@ -458,10 +401,14 @@ def test_pack_quantized_compressed_tensors_loads_shapes_without_downloading_weig
     assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(local_shapes.variables))
     assert _shapes_and_dtypes(local_shapes.variables) == _shapes_and_dtypes(expected.variables)
 
-    _hub_without_weight_downloads(monkeypatch, ct_dir, tmp_path / "ct_cache", tmp_path / "ct_answers")
-    hub_shapes = Pretrained.load("acme/ct-qwen", dtype="float32", attention_impl="reference", weights=False)
-    assert not [p for p in (tmp_path / "ct_cache").rglob("*") if p.suffix == ".safetensors"]
-    assert _shapes_and_dtypes(hub_shapes.variables) == _shapes_and_dtypes(expected.variables)
+    from local_hub import LocalHub
+
+    repos = {"acme/ct-qwen": _files(ct_dir)}
+    with LocalHub(repos) as hub:
+        hub_shapes = _hub_loaded(tmp_path / "hub", hub, "acme/ct-qwen", "ct",
+                                 options={"dtype": "float32", "attention_impl": "reference"})
+    _weightless(hub, "acme/ct-qwen", repos["acme/ct-qwen"], declared=(".weight_shape",))
+    assert hub_shapes["shapes"] == _shapes_and_dtypes(expected.variables)
 
 
 def test_sampling_override_governs_beam_admission(tmp_path: Path) -> None:

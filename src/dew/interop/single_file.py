@@ -51,8 +51,8 @@ from dew._builds import dew_cache_dir
 from dew._files import staged, stat_identity
 from dew._records import JSON
 from dew.interop import sources
-from dew.interop.pickles import host_view
-from dew.interop.safetensors_io import WEIGHT_STEMS, folder_weights, read_file, stored_spec, write_file
+from dew.interop.pickles import host_dtype, host_view
+from dew.interop.safetensors_io import WEIGHT_STEMS, folder_weights, read_file, write_file
 from dew.registry import to_record
 
 if TYPE_CHECKING:
@@ -62,20 +62,6 @@ INSTALL = "pip install 'dewml[diffusers]'"
 
 _CLIP_ENCODERS = ("CLIPTextModel", "CLIPTextModelWithProjection")
 
-_TORCH_STORAGE_TAGS: Mapping[str, str] = {
-    "float32": "F32",
-    "float16": "F16",
-    "bfloat16": "BF16",
-    "float64": "F64",
-    "int64": "I64",
-    "int32": "I32",
-    "int16": "I16",
-    "int8": "I8",
-    "uint8": "U8",
-    "bool": "BOOL",
-    "float8_e4m3fn": "F8_E4M3",
-    "float8_e5m2": "F8_E5M2",
-}
 
 def _torch_view(array: np.ndarray) -> torch.Tensor:
     """A torch tensor sharing `array`'s bytes, bfloat16 and float8 included."""
@@ -439,13 +425,11 @@ def metadata(
         weights_name = (
             "diffusion_pytorch_model.safetensors" if library == "diffusers" else "model.safetensors"
         )
+        # Each tensor's shape and dtype as the read with weights holds it (`host_view`), its dtype the
+        # one owner's of a torch dtype's NumPy one (`host_dtype`).
         entries[f"{name}/{weights_name}"] = {
-            key_name: stored_spec(
-                key_name,
-                [int(dim) for dim in tensor.shape],
-                _TORCH_STORAGE_TAGS[str(tensor.dtype).removeprefix("torch.")],
-                weights_name,
-            )
+            key_name: jax.ShapeDtypeStruct(tuple(int(dim) for dim in tensor.shape),
+                                           host_dtype(tensor, f"{name}'s {key_name}"))
             for key_name, tensor in tensors.items()
         }
     backing: sources.StoredWeights | None = None
