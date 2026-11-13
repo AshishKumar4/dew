@@ -1761,21 +1761,12 @@ def decision_flow():
     assert_computed_as_on_the_host(run, draw, "an int8 decision task's probabilities")
 
 
-def test_an_int8_training_step_moves_the_weights_by_the_hosts_gradient():
-    """One SGD step of the trainer over a decoder quantized to int8 moves its weights by the gradient
-    of its loss that the host computes, from its forward's int8 products. With Triton's GEMMs open
-    to XLA (`with_triton_gemms`)."""
-    with_triton_gemms(training_flow)
-
-
-def training_flow():
-    assert_step_moves_by_the_hosts_gradient()
-
-
 def test_an_int8_training_step_on_xla_default_options_moves_the_weights_by_the_hosts_gradient():
-    """A run whose recorded plan compiles its step under XLA's default options, the planner's half
-    rung, keeps the options its int8 products need to compute right: one SGD step moves the weights
-    by the host's gradient. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    """One SGD step of the trainer over a decoder quantized to int8 moves its weights by the gradient of
+    its loss that the host computes, from its forward's int8 products, on the rung its run plans, and
+    again where its recorded plan compiles the step under XLA's default options, the planner's half
+    rung, which keeps the options its int8 products need to compute right. With Triton's GEMMs open to
+    XLA (`with_triton_gemms`)."""
     with_triton_gemms(training_on_xla_default_options_flow)
 
 
