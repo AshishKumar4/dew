@@ -29,6 +29,7 @@ def main(request_path: Path) -> None:
         loaded = loader.load(request["repo"], weights=False, **request.get("options", {}))
     except FileNotFoundError as missing:
         answer["refused"] = type(missing).__name__
+        answer["reason"] = str(missing)
     else:
         answer["shapes"] = shapes(loaded.variables)
         if "encode" in request:

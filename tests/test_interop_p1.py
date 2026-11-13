@@ -162,10 +162,10 @@ def test_pipeline_dduf_single_file_and_composite_loads_without_weights_download_
 
     offline_dduf = _hub_loaded(root, None, "acme/flux-dduf", "dduf-offline", offline=True,
                                options={**options, "dduf_file": "pipeline.dduf"})
-    assert offline_dduf["shapes"] == _shapes_and_dtypes(expected_dduf.variables)
+    assert offline_dduf.get("shapes") == _shapes_and_dtypes(expected_dduf.variables), offline_dduf
     unrecorded = _hub_loaded(root, None, "acme/flux-dduf", "unrecorded", offline=True,
                              options={**options, "dduf_file": "unrecorded.dduf"})
-    assert unrecorded == {"refused": "FileNotFoundError"}
+    assert unrecorded["refused"] == "FileNotFoundError"
 
 
 def test_single_file_loads_without_weights_across_storage_dtypes_and_borrowed_shards(

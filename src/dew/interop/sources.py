@@ -422,17 +422,13 @@ def _hub_header(name: str, revision: str, file: str) -> dict[str, tuple[list[int
     return {tensor_name: (list(tensor.shape), tensor.dtype) for tensor_name, tensor in header.tensors.items()}
 
 def _hub_sidecar(name: str, revision: str, file: str, tensor_name: str) -> tuple[list[int], str, str]:
-    """Read one tiny metadata sidecar tensor's shape, dtype tag and hex bytes over an HTTP byte range."""
+    """One tiny metadata sidecar tensor's shape, dtype tag and hex bytes, read by its range over HTTP
+    through a stream with no read-ahead (`stored_tensor`), no byte of another tensor fetched."""
     from huggingface_hub import HfFileSystem
 
-    fs = HfFileSystem()
-    ref = f"{name}@{revision}/{file}"
-    header_len = int.from_bytes(fs.cat_file(ref, start=0, end=8), "little")
-    header = json.loads(fs.cat_file(ref, start=8, end=8 + header_len))
-    entry = _records.record(header[tensor_name], tensor_name)
-    offsets = _records.integers(entry["data_offsets"], "data_offsets")
-    raw = fs.cat_file(ref, start=8 + header_len + offsets[0], end=8 + header_len + offsets[1])
-    return list(_records.integers(entry["shape"], "shape")), _records.text(entry["dtype"], "dtype"), raw.hex()
+    with HfFileSystem().open(f"{name}@{revision}/{file}", "rb", cache_type="none") as stream:
+        shape, tag, raw = stored_tensor(stream, tensor_name)
+    return shape, tag, raw.hex()
 
 
 
