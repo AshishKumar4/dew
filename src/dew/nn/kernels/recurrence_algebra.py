@@ -68,6 +68,17 @@ def portable_einsum(subscripts: str, *operands):
     return float32_einsum(subscripts, *operands, precision=STATE_PRECISION)
 
 
+def suffix_sums(x: jax.Array) -> jax.Array:
+    """Each position's sum over its chunk's positions at and after it, along `x`'s second-last axis (a
+    chunk's tokens), in float32: a product with the chunk's upper triangle of ones (`portable_einsum`, its
+    ones exact in every form a product splits `x` into), one dot. As a reversed cumulative sum, XLA's GPU
+    reduce-window summed each position's window apart: Kimi delta attention's decay gradient's, the one
+    cumulative sum its training traces, took 0.336 ms of its 5.806 ms on a B200 (M-JS-114)."""
+    size = x.shape[-2]
+    upper = jnp.triu(jnp.ones((size, size), jnp.float32))
+    return portable_einsum('ij,...jt->...it', upper, x.astype(jnp.float32))
+
+
 LOG2_E = math.log2(math.e)
 """log2(e) to double precision, the prefix's base-2 scale (fla's RCP_LN2 is 1.93e-8 short of it)."""
 

@@ -610,7 +610,7 @@ def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
     # blocks' sums added.
     last = tuple(x.reshape(call.chunks, call.chunk, heads * width)[:, -1] for x in (run.hi, run.lo))
     terms = terms.at[:, -1].add(decayed.sum(0).reshape(call.chunks, -1) * algebra.raised(*last))
-    dg = jnp.flip(jnp.cumsum(jnp.flip(terms, 1), 1), 1).reshape(rows, heads * width)
+    dg = algebra.suffix_sums(terms).reshape(rows, heads * width)
     dg = _first_decays(dg, run, dh0, taken)
 
     def keyed(x):
