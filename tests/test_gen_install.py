@@ -176,3 +176,19 @@ def floored(root: Path, least: str) -> Path:
 def test_an_older_uv_is_replaced_by_the_least_one_which_runs_the_install(tmp_path, have, fetched, running):
     command, asked = installed(floored(tmp_path, "0.14.2"), "NVIDIA L4, 580.82.07, 8.9", uv=have)
     assert asked == fetched and command[:3] == [running, "pip", "install"]
+
+
+def test_a_generation_runs_the_builds_its_sm_meets_and_a_tensor_memory_gpu_cuda13_alone():
+    """A GPU generation runs each CUDA build whose least SM it meets, newest first, and one holding tensor
+    memory (`TENSOR_MEMORY_SMS`: a B200, a B300) the cuda13 build alone, whose cuBLAS its kernels need
+    (`generation_builds`); a consumer Blackwell (sm120), which holds none, runs either; a name that is no
+    generation is refused."""
+    generation_builds = _builds.generation_builds
+    newest_first = tuple(name for name, *_ in _builds.CUDA_BUILDS)
+    assert generation_builds("sm90") == generation_builds("sm_90a") == newest_first
+    assert generation_builds("sm120") == newest_first
+    assert generation_builds("sm100") == generation_builds("sm103") == ("cuda13",)
+    assert generation_builds("sm110") == ("cuda13",)
+    assert generation_builds("sm52") == ("cuda12",)
+    with pytest.raises(ValueError):
+        generation_builds("hopper")
