@@ -76,9 +76,12 @@ def main() -> None:
             return lowered.lowered
         raise AssertionError("a trainer under lower_for raises its lowered step")
 
-    _, launches = tuning.tune(step, measure=True)
+    tuning.tune(step, measure=True)
     print(json.dumps({"kernels": reports[-1].record()}))
-    launches = json.loads(launches)
+    # The step's distinct launches, as its lowering traces them and the pool decides each once.
+    with tuning.reading(), tuning.seen() as traced:
+        step()
+    launches = tuning._distinct(list(traced))
     path = Path(_cache.kernel_picks_path(jax.devices()[0].device_kind))
     # A store exists once a launch has been measured on this GPU model: a step with no Pallas launch
     # there (the dense 1.1B on an RTX PRO 6000 Blackwell) leaves none.
