@@ -499,10 +499,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
           0.095 32 wide five deep (batch-window-h100-0b202f7cc).
         None where no block is legal: the launch refuses the call.
 
-        A compile that refused the joined tiles (`report.spilled`: kernels of the launch spilled) steps the
-        tiles the spilling kernels ran at down to their next narrower value block: the training call's where
-        they are the fast backward's alone, else both, a forward launch running at the training call's tiles
-        and, where they differ, at the forward's (`Tiles.forward`)."""
+        A compile that refused the joined tiles (`report.spilled`: kernels of the launch spilled) refuses the
+        tiles each spilling kernel's product ran at, the training call's or the forward alone's
+        (`Tiles.forward`), and that product's rules take the next they give: its ring a stage shallower, else
+        the next narrower value block, as a refusal of a product's own tiles steps it (`legal`)."""
         family = bundle(target, _dtype(ba))
         if family is None:
             return None
@@ -517,8 +517,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def _chunked(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, chunk: int
                  ) -> mainloop.Tiles | None:
-        """`derived`'s tiles at `chunk`, past the value blocks a compile refused."""
-        refused: dict[bool, set[int]] = {True: set(), False: set()}
+        """`derived`'s tiles at `chunk`, past each product's tiles a compile refused."""
+        refused: dict[bool, set[mainloop.Tiles]] = {True: set(), False: set()}
         while True:
             trained = self._derive(ba, target, chunk, training=True, refused=refused[True])
             if trained is None:
@@ -534,19 +534,32 @@ class Mosaic(base.Template[mainloop.Tiles]):
                     or self._one_wave(ba, trained, target, training=True)) and self._product_holds(
                         ba, trained, target, training=False):
                 alone = None
+            elif alone is None and not self._product_holds(ba, trained, target, training=False):
+                # No tiles at this chunk hold a forward alone, the training call's neither: none serve the
+                # call (a forked Nemotron-H 4B SSD forward on sm100 at the training call's 96-wide block asked
+                # 304,316 bytes of shared memory, its scan holding no program).
+                return None
             joined = trained if alone in (None, trained) else dataclasses.replace(trained, forward=alone)
             spilled = report.spilled(self, ba, joined)
             if not spilled:
                 return joined
-            refused[True].add(trained.block_v)
-            forward = {launch.name for launch in self.launches(ba, joined, target, backward=False)}
-            if alone is not None and any(kernel.startswith(name) for kernel in spilled for name in forward):
-                refused[False].add(alone.block_v)
+            # Each product's tiles refused where a kernel it runs spilled: the training call's launches at its
+            # tiles, a forward alone's at its own (`Tiles.forward`, the training call's where None). A refusal
+            # of the joined tiles is no refusal of either's (`legal`'s), so a forked forward's spilling scan
+            # once refused its whole value block where a shallower ring held (Nemotron-H 4B's on sm100).
+            forward = joined.forward or joined
+            products = ((refused[True], trained, self.launches(ba, joined, target, backward=True)),
+                        (refused[False], forward, self.launches(ba, forward, target, backward=False)))
+            ran = [(tiles_refused, tiles) for tiles_refused, tiles, launches in products
+                   if any(kernel.startswith(launch.name) for kernel in spilled for launch in launches)]
+            assert ran, f"the spilled kernels {sorted(spilled)} are none of the call's launches"
+            for tiles_refused, tiles in ran:
+                tiles_refused.add(tiles)
 
     def _derive(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, chunk: int, *,
-                training: bool, refused: Set[int] = frozenset()) -> mainloop.Tiles | None:
-        """`derived`'s rules at `chunk`, the fast backward's with them where `training`, past the value blocks
-        a compile `refused`."""
+                training: bool, refused: Set[mainloop.Tiles] = frozenset()) -> mainloop.Tiles | None:
+        """`derived`'s rules at `chunk`, the fast backward's with them where `training`, past the tiles a
+        compile `refused` (`_staged`)."""
         family = bundle(target, _dtype(ba))
         if family is None:
             return None
@@ -555,8 +568,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         # tiles staged as a rule first reads them: the widest legal, then the widest at which the fast
         # backward holds where it holds at any narrower, then the narrowest still running the states
         # launch in one wave.
-        staged = functools.cache(lambda index: None if blocks[index] in refused
-                                 else self._staged(ba, blocks[index], target, chunk, training=training))
+        staged = functools.cache(lambda index: self._staged(ba, blocks[index], target, chunk,
+                                                            training=training, refused=refused))
         start = next((index for index in range(len(blocks)) if staged(index) is not None), None)
         if start is None:
             return None
@@ -576,7 +589,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
             held = self.states_held(ba, chosen, target, training=training)
             return self._walked(ba, chosen, target,
                                 self._programs(ba, chosen, target, training=training)
-                                // (target.multiprocessors * held), training=training)
+                                // (target.multiprocessors * held), training=training, refused=refused)
         # Narrower only while the fast backward holds where it held at the block given way from, and only
         # while the block's states ring holds one stage: of one wave, the widest whose ring holds two.
         held = trains(trained)
@@ -605,7 +618,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         return self._programs(ba, tiles, target, training=training) <= held
 
     def _walked(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
-                waves: int, *, training: bool = True) -> mainloop.Tiles:
+                waves: int, *, training: bool = True, refused: Set[mainloop.Tiles] = frozenset()
+                ) -> mainloop.Tiles:
         """`tiles` with the value blocks of one sequence and head a walk program takes (`Tiles.walkers`),
         one a consumer role beside one producer, where its states launch's programs fill `waves` waves of
         the device's: the most roles the family's program takes (`Family.consumers`) that divide the head's
@@ -624,7 +638,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
             if blocks % walkers:
                 continue
             grouped = self._staged(ba, tiles.block_v, target, tiles.chunk, walkers=walkers,
-                                   wide=tiles.block_o or tiles.block_v, training=training)
+                                   wide=tiles.block_o or tiles.block_v, training=training, refused=refused)
             if grouped is not None and (not training or self._backward_holds(ba, grouped, target)
                                         == self._backward_holds(ba, tiles, target)):
                 return grouped
@@ -683,18 +697,19 @@ class Mosaic(base.Template[mainloop.Tiles]):
         return [block for block in range(columns - columns % unit, 0, -unit) if columns % block == 0]
 
     def _staged(self, ba: tokamax.BoundArguments, block: int, target: generation.GpuTarget, chunk: int, *,
-                walkers: int = 1, wide: int | None = None, training: bool = False
-                ) -> mainloop.Tiles | None:
+                walkers: int = 1, wide: int | None = None, training: bool = False,
+                refused: Set[mainloop.Tiles] = frozenset()) -> mainloop.Tiles | None:
         """`block`'s tiles at `chunk` and `walkers` walk roles (`Tiles.walkers`) with the widest output block
         legal beside it (`Tiles.block_o`; `wide` where given), at the ring of the states launch's steps,
         within the GPU's block (`generation.shared_budget`) over a step's bytes, whose plan hides the most
         latency, its programs a multiprocessor running at once (`_running`) and its depth one choice
-        (`resources.hidden`); None where no output block is legal beside it."""
+        (`resources.hidden`), past the tiles a compile `refused` (`_chunked`'s); None where no output block is
+        legal beside it."""
         family = bundle(target, _dtype(ba))
         assert family is not None
         widths = self._blocks(ba, family, training=training) if wide is None else [wide]
         def held(tiles: mainloop.Tiles) -> bool:
-            return self._product_holds(ba, tiles, target, training=training)
+            return tiles not in refused and self._product_holds(ba, tiles, target, training=training)
 
         shallowest = next((tiles for tiles in (mainloop.Tiles(block, 1, None if width == block else width,
                                                               walkers, chunk=chunk)
