@@ -202,6 +202,36 @@ def test_a_held_pass_scores_a_soft_target_as_its_training_charges_it(rule):
                     f"a soft target's held-out {rule.name}", seeds=SOFT_SEEDS[f"held {rule.name}"])
 
 
+@pytest.mark.parametrize("joint", [False, True], ids=["a question a row", "joint"])
+def test_a_training_reads_draws_lay_a_row_out_to_no_fewer_tokens_than_it_states(joint):
+    """A training read draws each row's layout (`LayoutRows`: a choice's options in a fresh order, a "none
+    of the above" beside its options or in place of its right one), and states the fewest tokens any draw
+    lays a row out to (`LayoutRows.shortest`), which bounds the documents a memory read's windows hold: no
+    draw is shorter, and the draws reach it, over rows of one question and joint rows of several, each of
+    whose questions draws on its own."""
+    from dew.decision import JointLayout, JointSchemaHead
+    from dew.decision.rows import ConfigureLayout, QuestionRows
+
+    urgency = Choice("How urgent?", {"low": "it can wait a week", "high": "now"})
+    examples = [Example(example.state, {"team": INTENT, "urgency": urgency},
+                        {"team": example.answers["team"], "urgency": "high" if index % 2 else "low"})
+                for index, example in enumerate(EXAMPLES)] if joint else EXAMPLES
+    layout = JointLayout(max_len=1536) if joint else LAYOUT
+    heads = {"head": JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)}
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout, none_of_the_above=0.5,
+                                  **(heads if joint else {}))
+    fit, *_ = objective.data().train
+    drawing = ConfigureLayout(layout, TOKENIZER, SPECIALS, shuffle=True, none_of_the_above=0.5, train=True)(
+        {"slots": {"questions": 2 if joint else 1, "options": 3}})
+    for example in examples:
+        for row in QuestionRows().flat_map(fit.map({"example": example})):
+            floor = drawing.shortest(row, "tokens")
+            drawn = [len(drawing.random_map(row, np.random.default_rng([7, seed]))["tokens"])
+                     for seed in range(64)]
+            assert min(drawn) == floor, (example.state, sorted(set(drawn)), floor)
+
+
 DOCUMENTS_SEEDS = 8
 """Check 1's declared seeds for the loss at a read's declared documents against the objective's bound."""
 
