@@ -359,3 +359,66 @@ def test_positions_past_the_published_tables_rotate_at_their_own_places(latent, 
                           params)
     np.testing.assert_array_equal(short.apply(params, latents, time, condition),
                                   long.apply(params, latents, time, condition))
+
+
+def _holed_safetensors(path: Path, held: dict[str, np.ndarray],
+                       holes: dict[str, tuple[tuple[int, ...], np.dtype]]) -> None:
+    """A safetensors file of `held`'s tensors and, after them, of `holes`' shapes and dtypes left as a sparse
+    file's holes, which read as zeros and take no disk; each dtype's tag safetensors' own
+    (`safetensors_io.stored_dtypes`)."""
+    from dew.interop.safetensors_io import stored_dtypes
+
+    tags = {dtype: tag for tag, dtype in stored_dtypes().items()}
+    header: dict[str, object] = {"__metadata__": {"format": "pt"}}
+    offset = 0
+    for name, (shape, dtype) in {**{name: (array.shape, array.dtype) for name, array in held.items()},
+                                 **holes}.items():
+        size = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        header[name] = {"dtype": tags[np.dtype(dtype).newbyteorder("<")], "shape": list(shape),
+                        "data_offsets": [offset, offset + size]}
+        offset += size
+    encoded = json.dumps(header).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    with open(path, "wb") as file:
+        file.write(len(encoded).to_bytes(8, "little") + encoded)
+        for array in held.values():
+            file.write(np.ascontiguousarray(array).tobytes())
+        file.truncate(8 + len(encoded) + offset)
+
+
+def test_supplied_weights_rebind_a_tied_text_encoder_without_reading_its_table(source, tmp_path):
+    """Supplied variables rebound over a published pipeline (`load_diffusion_source(variables=...)`) take
+    the text encoder's layouts from its stored tensors' headers alone: its tied head, stored beside its
+    embedding, is checked against it by shape there, as nothing of either is read, where a table of zeros
+    made at each stored shape was compared value by value, a boolean array the table's size (row 5807). A
+    Z-Image whose Qwen3 encoder stores both at a vocabulary of 2**21 rows (their bytes a sparse file's
+    holes) rebinds with less traced memory than that one comparison takes."""
+    import shutil
+    import tracemalloc
+
+    from safetensors.numpy import load_file
+
+    from dew.interop.pretrained import load_diffusion_source
+
+    directory = tmp_path / "pipeline"
+    shutil.copytree(source / "pipeline", directory)
+    encoder = directory / "text_encoder"
+    config = json.loads((encoder / "config.json").read_text())
+    assert config["tie_word_embeddings"]
+    rows = 1 << 21
+    (encoder / "config.json").write_text(json.dumps({**config, "vocab_size": rows}))
+    stored = load_file(encoder / "model.safetensors")
+    width = stored["model.embed_tokens.weight"].shape[1]
+    _holed_safetensors(encoder / "model.safetensors",
+                       {name: value for name, value in stored.items() if name != "model.embed_tokens.weight"},
+                       {name: ((rows, width), np.dtype(np.float32))
+                        for name in ("model.embed_tokens.weight", "lm_head.weight")})
+    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    tracemalloc.start()
+    try:
+        load_diffusion_source(str(directory), dtype="float32", attention_impl="xla",
+                              variables=published.variables)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < rows * width, (peak, rows * width)

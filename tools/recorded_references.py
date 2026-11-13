@@ -18,7 +18,6 @@ too large to keep over the seeds, is summarized from those by `record_distances`
 
 import concurrent.futures
 import dataclasses
-import json
 import sys
 import urllib.parse
 from collections.abc import Mapping, Sequence
@@ -29,7 +28,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from fetched_fixtures import save
+from fetched_fixtures import provenance, save
 from reference_error import FEWEST_SEEDS, REDRAW, as_given, input_digest, seeds_for
 from truth_sketch import truth_sketch
 
@@ -52,18 +51,6 @@ from dew.parity_stages import staged_units
 
 __all__ = ["merge_shards", "provenance", "record_case", "record_distances", "record_logits",
            "record_reference", "record_shard", "save", "with_pilots"]
-
-
-def provenance(reference: str, revision: str, device: str, command: str, **details) -> np.ndarray:
-    """A recording's reference, its revision, the device and the public command that reproduces it,
-    as a JSON string array to save beside the recorded arrays. The command is published with the
-    recording: a path of the recording machine's own (from the root or the home, but a directory under
-    /tmp the command makes itself) is refused, the argument's name standing in its place."""
-    if any(part.startswith(("/", "~")) and not part.startswith("/tmp/")
-           for word in command.split() for part in word.split("=")[-1].split(":")):
-        raise ValueError(f"a recording's command is public, its machine's paths named, not given: {command}")
-    return np.asarray(json.dumps({"reference": reference, "revision": revision, "device": device,
-                                  "command": command, **details}))
 
 
 def record_reference(label: str, draw, evaluate, *, package: str, repo: str, tool: str, out: Path,
@@ -160,12 +147,15 @@ class _Records:
     alone is kept (`rows`): a summarized recording's evidence, where its outputs over (1 + REDRAW) times the
     seeds are gigabytes. With `ahead` above one, `evaluate` is asked that many seeds at a time on threads of
     its own, which the caller says it may run on: a caller's context (x64, a matmul precision) is its
-    thread's."""
+    thread's. With `followed`, an evaluation's third value is the reference's decisions, which its truth
+    followed, each verdict seed's kept (`decisions`) whatever else is dropped."""
 
-    def __init__(self, draw, evaluate, ahead: int, reduced=None, kept: _Kept | None = None):
+    def __init__(self, draw, evaluate, ahead: int, reduced=None, kept: _Kept | None = None,
+                 followed: bool = False):
         self.draw, self.evaluate, self.ahead, self.reduced = draw, evaluate, ahead, reduced
         self.kept = _Kept(None, None, "") if kept is None else kept
         self.records, self.reading, self.rows, self.replayed, self.pending = {}, {}, {}, set(), {}
+        self.followed, self.decisions = followed, {}
         self.asking = concurrent.futures.ThreadPoolExecutor(ahead) if ahead > 1 else None
 
     def evaluated(self, seed: int):
@@ -185,6 +175,10 @@ class _Records:
                     if further not in self.pending and further not in held:
                         self.pending[further] = self.asking.submit(self.evaluated, further)
                 inputs, (reference, truth, *made) = self.pending.pop(seed).result()
+            if self.followed:
+                (decisions,), made = made[:1], made[1:]
+                if verdict:
+                    self.decisions[seed] = jax.tree.map(np.asarray, decisions)
             made = jax.tree.map(np.asarray, made[0] if made else {})
             self.replayed.update(made)
             held[seed] = ({**inputs, **made}, jax.tree.map(np.asarray, reference),
@@ -211,7 +205,8 @@ class _Records:
 def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
                 summary: bool = False, dew=None, start: int = FEWEST_SEEDS,
                 examples: bool = False, scale=None, ahead: int = 1, judged: bool = False,
-                kept_in: Path | None = None, resumed_from: Path | None = None) -> dict[str, np.ndarray]:
+                kept_in: Path | None = None, resumed_from: Path | None = None,
+                followed: bool = False) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
     reference's outputs and their float64 truth (dicts). The recorded reference alone sizes the count
     (`seeds_for`), recording the draws its doublings take, and the recording keeps exactly the confirmed
@@ -252,7 +247,9 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
     is asked that many seeds at a time, the next ones a draw's read reaches beside its own: every reading here
     walks its seeds in order. With `kept_in`, a directory, each seed's evaluation and scale is saved there as
     it is made, and with `resumed_from`, an interrupted run's `kept_in`, found there in place of being made
-    again (`_Kept`): the recording a run resumed makes is the one an uninterrupted run makes."""
+    again (`_Kept`): the recording a run resumed makes is the one an uninterrupted run makes. With `followed`,
+    a quantized computation's summary keeps the reference's decisions too (`_decided`)."""
+    _followed_case(label, followed, dew, scale, summary)
     # The evaluations asked ahead are cancelled or finished on every exit, before the caller's workers close.
     # A summary that weighs nothing keeps each draw's evidence as it is drawn and drops its outputs; a weighed
     # one reads each of its check's draws whole, twice (its sizing, then its heavy elements over them all).
@@ -262,7 +259,7 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
         return _row(seed, _summarized(record, examples))
 
     keeping = _Kept(kept_in, resumed_from, label)
-    with _Records(draw, evaluate, ahead, row if streamed else None, keeping) as held:
+    with _Records(draw, evaluate, ahead, row if streamed else None, keeping, followed) as held:
         record, ensure = held.record, held.ensure
         records, replayed = held.records, held.replayed
 
@@ -302,6 +299,7 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
             kept = max(kept, staged_units(weighed))
         ensure(kept)
         kept_records = [] if streamed else [records[seed] for seed in range(kept)]
+        decided = _decided(label, held.decisions, kept) if followed else {}
         # The weighed check's own entries, the same whether the outputs are kept or summarized.
         weighing = {} if scale is None else {
             f"{label}.conditioning": np.int32(weighed),
@@ -313,6 +311,7 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
         # sketch at every draw of its own, so the evidence covers the further of the two.
         rows = (held.rows[seed] if streamed else row(seed, kept_records[seed]) for seed in range(kept))
         result = _finished(label, _rows_evidence(label, range(kept), rows), confirmed, kept)
+        result.update(decided)
         if scale is not None:
             result.update(weighing)
             result.update(_weighed(label, kept_records[:staged_units(weighed)], scaled))
@@ -323,6 +322,25 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
     result.update(weighing)
     print(f"{label}: declared {confirmed} seeds; recorded {kept} draws", flush=True)
     return result
+
+
+def _followed_case(label: str, followed: bool, dew, scale, summary: bool) -> None:
+    """A followed recording's case (`record_case`'s `followed`, docs/design/testing.md: a quantized
+    computation, each arm held to the float64 computation that rounds where it rounded) refused unless it is a
+    summary sized on the recorded reference alone, whose truth is the one that followed its own decisions."""
+    if followed and (dew is not None or scale is not None or not summary):
+        raise ValueError(f"{label}: a followed recording is a summary sized on the recorded reference alone, "
+                         f"its truth the one that followed its own decisions")
+
+
+def _decided(label: str, decisions: Mapping[int, Mapping[str, np.ndarray]],
+             kept: int) -> dict[str, np.ndarray]:
+    """A followed recording's decisions (`record_case`'s `followed`): an evaluation's third value, the
+    reference's roundings' outputs, which its truth followed, each kept seed's stacked by leaf as
+    `<label>.decisions.<name>`; the test's float64 path follows them to be held to the recorded truth
+    (`indexed_recording`)."""
+    return {f"{label}.decisions.{name}": np.stack([decisions[seed][name] for seed in range(kept)])
+            for name in decisions[0]}
 
 
 def _arms_of(label: str, record, dew, *, judged: bool, weighed: bool) -> tuple:

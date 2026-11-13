@@ -502,6 +502,12 @@ def cache_worker():
             stored[self.path] = body
             self._answer(204, etag=hashlib.md5(body).hexdigest())
 
+        def do_DELETE(self):
+            if not self._authorized():
+                return
+            stored.pop(self.path, None)
+            self._answer(204)
+
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_address[1]}", stored, seen

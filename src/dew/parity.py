@@ -1163,11 +1163,14 @@ def _prepared(dew, truth, terms=None) -> _Prepared:
     return _Prepared(truth, paths, leaves, truths, held, _summaries(leaves, held))
 
 
-def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, their_terms=None) -> list[tuple]:
+def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, their_terms=None,
+              own: bool = False) -> list[tuple]:
     """One draw's `_paired` evidence of every leaf of Dew (`prepared`, read once a draw) and `reference`
     against their truths: the reference's leaves (a recorded one's `RecordedLeaf`) and its truth held to
     Dew's truth's leaves, paths and shapes, so no leaf is paired with another's truth or compared through
-    broadcasting; its truth the same tree as Dew's where `shared`."""
+    broadcasting; its truth the same tree as Dew's where `shared`. With `own`, each arm's truth is its own
+    decisions' (a site of followed roundings), a recorded reference's the recording's recomputed: its rows
+    pair with Dew's only where the two truths are the same values, as a live one's do."""
     their_truth = prepared.truth if shared else their_truth
     paths, leaves, truths = prepared.paths, prepared.leaves, prepared.truths
     for name, tree in (("the reference", reference), ("the reference's truth", their_truth)):
@@ -1201,7 +1204,7 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
             row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True, (0.0, 0.0)))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
-        paired = was or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
+        paired = (was and not own) or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
         row.append(_paired(path, summary, their, paired=paired))
     return row
 

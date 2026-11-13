@@ -9,6 +9,7 @@ from contextlib import ExitStack
 
 import grain.python as grain
 
+from dew._records import integer
 from dew.data.declared import Declared
 from dew.data.storage import Store
 
@@ -82,8 +83,8 @@ class _TarIterator(grain.DatasetIterator):
         return {"position": self.position}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        position = state.get("position")
-        if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+        position = integer(state.get("position"), "WebDataset reader position")
+        if position < 0:
             raise ValueError("invalid WebDataset reader position")
         self.close()
         self.__init__(self.source)

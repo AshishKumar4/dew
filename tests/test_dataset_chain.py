@@ -13,7 +13,19 @@ import pytest
 from data_support import Questioned, WideDraw
 from sampling_gate import assert_draws_as_declared
 
-from dew.data import Dataset, Files, Loading, Memory, from_grain, from_hf, from_iter, mix, text
+from dew.data import (
+    Dataset,
+    Files,
+    Loading,
+    Memory,
+    concat,
+    from_grain,
+    from_hf,
+    from_iter,
+    mix,
+    phases,
+    text,
+)
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition, GlobalStream
@@ -1526,3 +1538,187 @@ def test_the_defaults_a_verb_and_its_stage_take_are_the_same_value():
     assert rows.windows(8).stages[-1] == Windows(8)
     assert rows.prefetch().stages[-1] == Prefetch()
     assert rows.workers(2).stages[-1] == Workers(2)
+
+
+@dataclass(frozen=True)
+class Scaled(grain.MapTransform):
+    """A step of one dataset's own: each record's `i` times `factor`."""
+
+    factor: int
+    identity = "scaled@1"
+
+    def map(self, row):
+        return {**row, "i": row["i"] * self.factor}
+
+
+def _odd(row) -> bool:
+    return row["i"] % 2 == 1
+
+
+def _any(row) -> bool:
+    return row["i"] >= 0
+
+
+class Counted(Memory):
+    """Records whose store states how many it holds without reading them."""
+
+    def stated(self):
+        return {"rows": len(self.records("indexed")), "language": "en"}
+
+
+def joined() -> Pipeline:
+    """Three datasets joined, each with steps of its own: four rows scaled by ten, the odd two of four read
+    twice over, and the first three rows of an endless repeat of two."""
+    return concat([Memory(rows("a", 4)).named("a").map(Scaled(10)),
+                   Memory(rows("b", 4)).named("b").filter(_odd, identity="odd@1").repeat(2),
+                   Memory(rows("c", 2)).named("c").repeat().take(3)])
+
+
+JOINED = [("a", 0), ("a", 10), ("a", 20), ("a", 30), ("b", 1), ("b", 3), ("b", 1), ("b", 3),
+          ("c", 0), ("c", 1), ("c", 0)]
+"""`joined`'s rows, each its origin and `i`, in the order one pass reads them."""
+
+
+def _pairs(batches) -> list[tuple[str, int]]:
+    """Each row of `batches`, its origin and `i`."""
+    return [(str(origin), int(i)) for batch in batches
+            for origin, i in zip(batch["origin"], batch["i"], strict=True)]
+
+
+def _trained(chain: Pipeline, read: str, steps: int, partition: DataPartition | None = None):
+    """The rows the first `steps` steps of a training read of `chain` hold, one reader's or a share's."""
+    reader = compile(chain, read=read, loading=READ).train(partition or DataPartition())
+    try:
+        return _pairs(itertools.islice(reader, steps))
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_concat_reads_each_dataset_through_its_own_steps_one_after_another(read):
+    """Datasets with steps of their own, joined: each is read to its end as its own steps make it (a map, a
+    filter under a counted repeat, a bound on an endless repeat), then the next, by every read, and a
+    training read then reads the join again, never one member again on its own (the member bounded on an
+    endless repeat reads its next three rows by index and the same three as a stream, as that chain does
+    on its own); a pass for publication reads members that repeat nothing the same way."""
+    twice = _trained(joined().batch(1), read, 2 * len(JOINED))
+    first, second = twice[:len(JOINED)], twice[len(JOINED):]
+    assert first == JOINED
+    assert [origin for origin, _ in second] == [origin for origin, _ in JOINED]
+    assert [pair for pair in second if pair[0] != "c"] == [pair for pair in JOINED if pair[0] != "c"]
+    once = concat([Memory(rows("a", 3)).named("a").map(Scaled(10)),
+                   Memory(rows("b", 4)).named("b").filter(_odd, identity="odd@1")])
+    passed = [(str(row["origin"]), int(row["i"])) for row in iterate(once, read=read, loading=READ)]
+    assert passed == [("a", 0), ("a", 10), ("a", 20), ("b", 1), ("b", 3)]
+
+
+@pytest.mark.parametrize("cut", ["one order", "per share"])
+def test_two_shares_of_a_concat_read_each_pass_of_the_join_between_them(cut):
+    """Two shares of a training read of a concatenation: each reads its part of the first member, then of
+    the second, and between them every row of the join once a pass, the pass after it alike; in one order
+    cut at its batch, and cut per share, each member's rows cut where a step that may drop rows reads them."""
+    first = Memory(rows("a", 4)).named("a").map(Scaled(10))
+    first = first.filter(_any, identity="any@1") if cut == "per share" else first
+    chain = concat([first, Memory(rows("b", 6)).named("b").map(Scaled(100))]).batch(2)
+    every = sorted([("a", 10 * index) for index in range(4)] + [("b", 100 * index) for index in range(6)])
+    shares = [_trained(chain, "indexed", 10, DataPartition(index, 2)) for index in range(2)]
+    for start in (0, 5):
+        passes = [share[start:start + 5] for share in shares]
+        assert sorted(passes[0] + passes[1]) == every
+        origins = [[origin for origin, _ in held] for held in passes]
+        assert origins == [sorted(held) for held in origins]
+
+
+def test_a_concat_member_ends_and_holds_no_batch_of_its_own():
+    """A member of a concatenation ends, so the member after it is read: one that repeats without end is
+    read to the bound written on it, and refused without one; a member batched on its own is refused."""
+    first, second = Memory(rows("a", 4)).named("a"), Memory(rows("b", 2)).named("b").map(Scaled(10))
+    bounded = concat([first.repeat().take(6), second]).batch(1)
+    assert _trained(bounded, "indexed", 8) == [("a", 0), ("a", 1), ("a", 2), ("a", 3), ("a", 0), ("a", 1),
+                                              ("b", 0), ("b", 10)]
+    for refused in (concat([first.repeat(), second]), concat([first.batch(2), second])):
+        with pytest.raises(ValueError):
+            compile(refused.batch(2), read="indexed", loading=READ)
+
+
+@pytest.mark.parametrize(("read", "dropping"), [("indexed", False), ("indexed", True), ("streamed", False)])
+@pytest.mark.parametrize("saved_after", [2, 5])
+def test_a_concat_resumes_inside_a_member_and_past_it(read, dropping, saved_after):
+    """A training read of a concatenation saved inside its first member, or inside its second, reads on
+    from there as the read that was not stopped does: by index in one order, by index beside a member
+    that drops rows (read in turn as streams), and streamed."""
+    first, second = Memory(rows("a", 4)).named("a").map(Scaled(10)), Memory(rows("b", 6)).named("b")
+    second = second.filter(_odd, identity="odd@1") if dropping else second.map(Scaled(100))
+    once = [("a", 10 * index) for index in range(4)] + (
+        [("b", index) for index in (1, 3, 5)] if dropping else [("b", 100 * index) for index in range(6)])
+    data = compile(concat([first, second]).batch(1), read=read, loading=READ)
+    reader, resumed = data.train(DataPartition()), data.train(DataPartition())
+    try:
+        assert _pairs(itertools.islice(reader, saved_after)) == once[:saved_after]
+        saved = reader.get_state()
+        expected = _pairs(itertools.islice(reader, 8))
+        resumed.set_state(saved)
+        assert _pairs(itertools.islice(resumed, 8)) == expected == (once * 3)[saved_after:saved_after + 8]
+    finally:
+        reader.close()
+        resumed.close()
+
+
+def test_a_later_phase_reads_a_concat_on_from_inside_the_member_the_last_stopped_in():
+    """Two phases of one concatenation, the first ending inside its first member: the second reads the
+    join on from there (the rest of that member, the next member, then the join again), as one read of
+    the concatenation does."""
+    chain = concat([Memory(rows("a", 6)).named("a").map(Scaled(10)),
+                    Memory(rows("b", 4)).named("b").map(Scaled(100))]).named("joined")
+    phased = phases((chain, 2), (chain, None))
+    assert _trained(phased.batch(2), "memory", 8) == _trained(chain.batch(2), "memory", 8)
+
+
+def test_a_schedules_next_stage_reads_a_concat_on_from_inside_the_member_its_last_ended_in():
+    """Two stages of one concatenation on the token clock, the first ended by the run inside its first
+    member: the second reads the join on from there, as one read of the concatenation does."""
+    from dew.data import schedule
+    from dew.data.dataset import PhasedStream
+
+    def tokens(origin: str, count: int) -> list[dict]:
+        return [{**row, "text": np.full(3, 3, np.int32)} for row in rows(origin, count)]
+
+    chain = concat([Memory(tokens("a", 6)).named("a").map(Scaled(10)),
+                    Memory(tokens("b", 4)).named("b").map(Scaled(100))]).named("joined").repeat()
+    loader = compile(schedule([(chain, 1e9), (chain, None)]).batch(2), read="memory", loading=READ)
+    stream, resumed = loader.train(DataPartition()), loader.train(DataPartition())
+    assert isinstance(stream, PhasedStream) and isinstance(resumed, PhasedStream)
+    try:
+        head = _pairs(itertools.islice(stream, 2))
+        resumed.set_state(stream.ending(stream.get_state()))
+        assert head + _pairs(itertools.islice(resumed, 6)) == _trained(chain.batch(2), "memory", 8)
+    finally:
+        stream.close()
+        resumed.close()
+
+
+def test_a_mix_and_a_concat_inside_a_concat_are_each_read_once_a_pass():
+    """A member of a concatenation is read once through, whatever it holds: a mix of datasets that repeat
+    nothing ends where its first member does and a concatenation inside it at its last member's end, each
+    time the join reads them; streamed, where a training read would else read each again at its root."""
+    mixed = mix([Memory(rows("a", 4)).named("a"), Memory(rows("b", 4)).named("b").map(Scaled(10))])
+    nested = concat([Memory(rows("c", 2)).named("c").map(Scaled(100)), Memory(rows("d", 2)).named("d")])
+    twice = _trained(concat([mixed, nested]).batch(1), "streamed", 24)
+    drawn = twice.index(("c", 0))
+    once = twice[:drawn + 4]
+    for origin, scale in (("a", 1), ("b", 10)):
+        held = [pair for pair in once[:drawn] if pair[0] == origin]
+        assert held and held == [(origin, scale * index) for index in range(len(held))]
+    assert len(once[:drawn]) == len([pair for pair in once if pair[0] in "ab"])
+    assert once[drawn:] == [("c", 0), ("c", 100), ("d", 0), ("d", 1)]
+    again = twice[len(once):2 * len(once)]
+    assert len(again) == len(once) and [origin for origin, _ in again] == [origin for origin, _ in once]
+
+
+def test_a_concat_states_its_datasets_facts_with_their_counts_added():
+    """A concatenation states what its datasets state alike and the sum of the rows each states; a count
+    one of them leaves unstated is none of the join's."""
+    counted = [Counted(rows("a", 4)).map(Scaled(10)), Counted(rows("b", 6)).map(Scaled(100))]
+    facts = concat(counted).facts()
+    assert (facts["rows"], facts["language"]) == (10, "en")
+    assert "rows" not in concat([counted[0], Memory(rows("c", 2)).map(Scaled(2))]).facts()

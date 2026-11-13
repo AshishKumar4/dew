@@ -4,28 +4,51 @@ facts, folded through its stages in the order they run, each step that knows wha
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 
 from dew._records import JSON, integer, record
 from dew.data.pipeline import (
     Artifact,
+    Combined,
+    Concatenated,
     Declares,
     Filter,
     Interleave,
     Limit,
-    Mixture,
-    Phases,
+    Map,
     Pipeline,
     Prefetch,
+    RandomMap,
     Repeat,
     Shuffle,
     Slice,
     Stage,
+    TokenBudget,
+    TokenGeometry,
     TokenSplit,
     Workers,
+    children,
     runs,
 )
-from dew.data.sources.base import stated
+from dew.data.sources.base import COUNTED, beneath, counted, stated
+
+IMAGE_FIELDS = ("jpg", "png", "image")
+"""The fields a record holds its image in by convention (docs/design/data.md, the steps), the first a step's
+default."""
+TEXT_FIELDS = ("text", "txt", "caption")
+"""The fields a record holds its text in by convention, the first a step's default."""
+
+
+def conventional(held: Collection[str], field: str, convention: Sequence[str]) -> str:
+    """The field of `held` a step reads that names `field`: `field` itself where `held` holds it; where
+    `convention` names `field`, the first of `convention` `held` holds (row 5757); else `field`, which the
+    step's read refuses as missing. A field the convention names and a record lacks thus reads by the
+    convention (a prepared record's `jpg` for a step given `image`), and any other the step was given is read
+    as it is named."""
+    if field in held or field not in convention:
+        return field
+    return next((name for name in convention if name in held), field)
+
 
 # Stages that order, select, drop, repeat or place records, and change none of them.
 _KEEPS = (Shuffle, Repeat, Slice, Limit, Filter, Prefetch, Workers, Interleave, Artifact, TokenSplit)
@@ -33,16 +56,53 @@ _KEEPS = (Shuffle, Repeat, Slice, Limit, Filter, Prefetch, Workers, Interleave, 
 
 def folded(pipeline: Pipeline) -> Mapping[str, object]:
     """The facts of `pipeline`'s records: its store's stated facts (`Stated`), or its corpora's
-    merged (`merge_facts`), then each stage's in order. A stage that changes records and doesn't say
-    how (`Declares`) leaves their fields unknown, so `fields` goes; the rest stays."""
+    merged (`merge_facts`; a concatenation's counts added), then each stage's in order. A stage that
+    changes records and doesn't say how (`Declares`) leaves their fields unknown, so `fields` goes; the
+    rest stays."""
     source = pipeline.source
-    if isinstance(source, (Mixture, Phases)):
-        facts = merge_facts(folded(child) for child in source.pipelines)
+    if isinstance(source, Combined):
+        held = [folded(child) for child in source.pipelines]
+        facts = merge_facts(held)
+        if isinstance(source, Concatenated):
+            # A join holds its members' records one after another: each count every member states, added
+            # (`counted`), and none of a count one of them leaves unstated.
+            facts = {**{name: value for name, value in facts.items() if name not in COUNTED}, **counted(held)}
     else:
         facts = dict(stated(source))
     for stage in pipeline.stages:
-        facts = _after(stage, facts)
+        if isinstance(stage, TokenBudget):
+            # Its batch is rows of the one length the chain's rows hold, where it is whole rows of it.
+            lengths = row_lengths(pipeline)
+            length = next(iter(lengths)) if len(lengths) == 1 else None
+            rows = None if length is None else stage.rows(length)
+            facts = facts if rows is None else {**facts, "batch": rows}
+        else:
+            facts = _after(stage, facts)
     return facts
+
+
+def laid_out(pipeline: Pipeline) -> TokenGeometry | None:
+    """The rows `pipeline`'s source reads laid out, a token store's windows or a planned pack's
+    (`TokenGeometry`), through the views that keep its rows as they are (a compile's pinned read, a
+    holdout's selection), or None."""
+    if isinstance(pipeline.source, Combined):
+        return None
+    laid = beneath(pipeline.source, ("read", "selected"))
+    return next((source for source in laid if isinstance(source, TokenGeometry)), None)
+
+
+def row_lengths(pipeline: Pipeline) -> frozenset[int | None]:
+    """The tokens each row of `pipeline` holds: as its last record step or layout declaring them states
+    (`TokenGeometry`), a source that reads them laid out first (`laid_out`), or each of its corpora's, and
+    None for a chain nothing states them of. The one reading of a chain's token geometry, which a token
+    budget's rows are of: the batch its chain states (`folded`) and the one it compiles to
+    (`dew.data.compile._budgeted`)."""
+    steps = (stage.step if isinstance(stage, (Map, RandomMap)) else stage for stage in pipeline.stages)
+    declared = [step for step in (laid_out(pipeline), *steps) if isinstance(step, TokenGeometry)]
+    if declared:
+        return frozenset({declared[-1].max_length})
+    nested = children(pipeline)
+    return frozenset().union(*map(row_lengths, nested)) if nested else frozenset({None})
 
 
 def _after(stage: Stage, facts: Mapping[str, object]) -> Mapping[str, object]:

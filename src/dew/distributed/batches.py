@@ -211,17 +211,11 @@ def shard_batch(mesh: Mesh, batch: Batch, reads: Mapping[Signature, tuple[bool, 
               for index, leaf in enumerate(leaves) if index not in held]
     every: list[NamedSharding] = jax.tree.leaves(batch_shardings(mesh, batch))
     shardings = [sharding for index, sharding in enumerate(every) if index not in held]
-    if jax.process_count() == 1:
-        # The whole batch is this process's share, placed by one device_put
-        # for the tree: 74 us of host time a batch on an RTX 4080, and 174 on
-        # 8 CPU devices, where a call per leaf took 105 and 222.
-        moved = iter(jax.device_put(moving, shardings))
-    else:
-        def place(leaf, sharding: NamedSharding) -> jax.Array:
-            # A device of a sequence or a stage that spans processes picks its own slice out of it.
-            return jax.make_array_from_process_local_data(sharding, leaf, placed(np.shape(leaf)))
-
-        moved = iter([place(leaf, sharding) for leaf, sharding in zip(moving, shardings, strict=True)])
+    # The tree placed by one call: one device_put of it where this process holds the whole batch (74 us of
+    # host time a batch on an RTX 4080, and 174 on 8 CPU devices, where a call per leaf took 105 and 222);
+    # across processes, each device of a sequence or a stage that spans them picks its own slice out of it.
+    moved = iter(jax.make_array_from_process_local_data(
+        shardings, moving, [placed(np.shape(leaf)) for leaf in moving]))
     return tree.unflatten([held[index] if index in held else next(moved) for index in range(len(leaves))])
 
 

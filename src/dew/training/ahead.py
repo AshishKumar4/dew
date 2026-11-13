@@ -1075,18 +1075,21 @@ def phase_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch
 
 
 def later_phases[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> tuple[int, ...]:
-    """The data phases after the one `batch`, the run's first, was read in whose steps are other programs
-    than its and each other's, each by its first phase: a phase's step is the trainer's own key of the
-    batch it delivers (`phase_batch`, `PhasePasses.key` at its pass count); none for a run of no phases."""
+    """The data phases after the one `batch`, the run's first step's as its loop read it (its work counted
+    and its rows marked, `step_batch`'s but for its host fields), was read in whose steps are other
+    programs than its and each other's, each by its first phase: a phase's step is the trainer's own key of
+    the batch it delivers (`phase_batch`, `PhasePasses.key` at its pass count); none for a run of no
+    phases. Its work is counted once, as its loop counted it: counted again, its telemetry columns were
+    refused as reserved, before a 4B run's first step (M-MC-3gB)."""
     from dew.batch import PHASE
-    from dew.distributed.batches import batch_signature
+    from dew.distributed.batches import batch_signature, split_fields
 
     counts = trainer.phase_passes.counts
     if PHASE not in batch or not counts:
         return ()
 
     def program(phase: int) -> Hashable:
-        return batch_signature(step_batch(trainer, phase_batch(trainer, batch, phase))), counts[phase]
+        return batch_signature(split_fields(phase_batch(trainer, batch, phase))[0]), counts[phase]
 
     first = batch[PHASE].index
     firsts: dict[Hashable, int] = {program(first): first}

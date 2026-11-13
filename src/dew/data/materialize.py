@@ -46,6 +46,8 @@ from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
     Artifact,
+    Combined,
+    Concatenated,
     FlatMap,
     Limit,
     Map,
@@ -61,6 +63,7 @@ from dew.data.pipeline import (
     TokenSplit,
     Windows,
     accounts,
+    with_children,
 )
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _uncounted
@@ -136,7 +139,11 @@ def _materialize(
 ) -> Pipeline:
     if isinstance(pipeline.source, Phases):
         raise ValueError("materialize each phase before constructing its global order")
-    if isinstance(pipeline.source, (Mixture, Phases)):
+    if isinstance(pipeline.source, Concatenated):
+        # Each member held as its own read holds it; the join reads them where it stands.
+        return with_children(
+            pipeline, lambda child: _materialize(child, counts, training=training))
+    if isinstance(pipeline.source, Combined):
         return _memory_mixture(pipeline, pipeline.source, counts, training=training)
     source = pipeline.source
     stored = source.records("memory")
@@ -468,7 +475,7 @@ def _memory_mixture(
     kept = tuple(
         (child, weight)
         for child, weight in zip(children, mixture.weights, strict=True)
-        if isinstance(child.source, (Mixture, Phases)) or len(child.source.records("memory"))
+        if isinstance(child.source, Combined) or len(child.source.records("memory"))
     )
     omitted = [_name(child) for child in children if all(child is not accepted for accepted, _ in kept)]
     if omitted:

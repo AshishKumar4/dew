@@ -48,16 +48,7 @@ from dew.batch import (
 )
 from dew.inputs.spec import Field
 from dew.interop.weights import decoding_storage
-from dew.nn.inputs import (
-    ModelInputs,
-    PredictionPhase,
-    Request,
-    host_rows,
-    local_rows,
-    media_slots,
-    mesh_of,
-    next_position,
-)
+from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
 from dew.nn.kernels.options import program
 from dew.nn.kv_cache import (
     gather_cache_rows,
@@ -857,8 +848,9 @@ def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray
     vocab = model.vocab_size if isinstance(model, Bounded) else None
     if np.any(ids < 0):
         raise ValueError("token ids must be non-negative")
-    # A media slot's id is its tower's where its model says so (`Field.media`), never the table's.
-    Field.indexing("tokens", (), model).bounded(ids, spelling, media_slots(fields, ids.shape, xp=np))
+    # A media slot's id is its tower's where its model says so (`TokenTable.media`), never the table's.
+    held = ModelInputs(*jax.tree.map(np.asarray, (ids, fields)))
+    Field.indexing("tokens", (), model).bounded(held, spelling)
     if vocab is not None and (sampling.pad >= vocab or any(token >= vocab for token in sampling.stops)):
         raise ValueError("sampling token ids must be inside the vocabulary")
     return valid

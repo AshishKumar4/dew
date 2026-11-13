@@ -7,9 +7,11 @@ dequantizes them (`Mxfp4Config(dequantize=True)`), as Dew's loader does. The ref
 bf16 the blocks decode to, on a GPU, its matmuls in fp32 (no TF32). The truth is its float64 twin
 (`_dew_torch.precision.float64_twin`), 168 GB, which no GPU holds whole, run on the host inside
 `_dew_torch.precision.float64`: a GH200's 480 GB holds it beside the bf16 load. It imports no Dew; an
-environment of torch, transformers 5.17.0 and accelerate runs it.
+environment of torch, transformers 5.17.0 and accelerate runs it. The recording is saved where the test
+reads it (`FIXTURE`), beside its provenance, by the fetched store's writer (tools/fetched_fixtures.py's
+`save`), which pins it for `upload`.
 
-    python tools/gpt_oss_20b_reference.py OUTPUT.npz
+    python tools/gpt_oss_20b_reference.py
 """
 
 import sys
@@ -56,12 +58,14 @@ def logits(model, ids) -> np.ndarray:
     return out.to(torch.float64 if dtype == torch.float64 else torch.float32).cpu().numpy()
 
 
-def main(destination: str) -> None:
+def main() -> None:
     import torch
     import transformers
     from transformers import AutoTokenizer
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from fetched_fixtures import provenance, save
+
     from _dew_torch.precision import float64, float64_twin
 
     repo, revision = RELEASED
@@ -76,13 +80,16 @@ def main(destination: str) -> None:
     with float64():
         truth = logits(wide, ids)
     gpu = torch.cuda.get_device_name(0)
-    meta = f"transformers {transformers.__version__}, torch {torch.__version__}, {gpu}"
-    np.savez_compressed(destination, input_ids=ids.astype(np.int32), reference=reference, truth=truth,
-                        meta=np.frombuffer(meta.encode(), np.uint8))
+    written = save(FIXTURE, {
+        "input_ids": ids.astype(np.int32), "reference": reference, "truth": truth,
+        "provenance": provenance("transformers", transformers.__version__, gpu,
+                                 "python tools/gpt_oss_20b_reference.py", torch=torch.__version__,
+                                 checkpoint=f"{repo}@{revision}")},
+        reference=f"https://huggingface.co/{repo}/tree/{revision}", license="Apache-2.0")
     rms = float(np.sqrt(np.mean((reference - truth) ** 2)))
-    print(f"{destination}: ids {ids.shape}, reference from truth {rms:.3e} (rms), "
+    print(f"{written}: ids {ids.shape}, reference from truth {rms:.3e} (rms), "
           f"argmax agreeing {float(np.mean(reference.argmax(-1) == truth.argmax(-1))):.2f}, {gpu}")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main()
