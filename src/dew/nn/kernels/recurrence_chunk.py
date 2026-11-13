@@ -250,19 +250,20 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
 class PortCase:
     """A delta rule's call as the port's selector reads it (`GATED_DELTA`): whether a caller's
     `shard_map` that checks varying axes holds operands that vary (`varying`), the operands' common
-    `dtype`, the keys' width (`key_width`), the recurrence template's implementations bound to the call
-    (`call`, `templates.base.Call`; None where the caller asks of the port alone), the
-    instruction family of the device it runs on (`family`, `generation.family`; None off a GPU), and the
-    product it is selected for (`product`: 'forward' where no gradient is taken, 'training' where one is,
-    `_per_product`), and the recurrence's form: whether it is the delta rule (`delta`) and decays
-    (`decayed`), its heads' shape, key heads, value heads and the values' width (`heads`; None where the
-    caller asks of the port alone), the largest entry of its chunk inverse the form proves (`bound`,
-    `recurrence.Hooks.inverse_bound`; None where it proves none), whether its decay is a key dimension's
+    `dtype`, the keys' width (`key_width`), its heads' shape: key heads, value heads and the values' width
+    (`heads`), the recurrence template's implementations bound to the call (`call`, `templates.base.Call`;
+    None where the caller asks of the port alone), the instruction family of the device it runs on
+    (`family`, `generation.family`; None off a GPU), and the product it is selected for (`product`:
+    'forward' where no gradient is taken, 'training' where one is, `_per_product`), and the recurrence's
+    form: whether it is the delta rule (`delta`) and decays (`decayed`), the largest entry of its chunk
+    inverse the form proves (`bound`, `recurrence.Hooks.inverse_bound`; None where it proves none), whether
+    its decay is a key dimension's
     (`per_key`), and whether its documents enter earlier documents' finals (`forked`, `Chunk.loads`)."""
 
     varying: bool
     dtype: np.dtype
     key_width: int
+    heads: tuple[int, int, int]
     call: base.Call | None = None
     family: str | None = None
     product: str = 'forward'
@@ -271,7 +272,6 @@ class PortCase:
     bound: float | None = None
     per_key: bool = False
     forked: bool = False
-    heads: tuple[int, int, int] | None = None
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -280,8 +280,6 @@ class PortCase:
         heads' shape (`heads`): a receipt routes the shapes it timed, the owner's rule (PLAN's Priorities: the
         fastest measured route remains until the template catches up)."""
         kind = f"{self.product}, a decay a key dimension" if self.per_key else self.product
-        if self.heads is None:
-            return self.family, kind
         keys, values, width = self.heads
         return self.family, f"{kind} at {keys}x{self.key_width} keys, {values}x{width} values"
 
@@ -350,18 +348,18 @@ FLA_PORT = Kernel[PortCase]('fla', PORT_SUPPORTS, upstream='fla')
 """Dew's port of fla's kernels (`fla_rule`)."""
 
 B200 = "on a B200, by device time"
-"""Where the tcgen05 cells' receipts measured (M-JS-106 at 690a7e87d85, one round; js106c, five)."""
+"""Where the tcgen05 cells' receipts measured (M-JS-106 at 690a7e87d85: js106 one round, js106c five)."""
 
 PORT_CELLS: dict[tuple[str | None, str], tuple[Kernel[PortCase], str]] = {
     ('tcgen05', 'forward at 16x128 keys, 48x128 values'): (
-        FLA_PORT, f"{B200}, the port's forward 0.394 ms against the template's 0.724 on Qwen3.5-27B's gated "
-                  "delta net (M-JS-106)"),
+        FLA_PORT, f"{B200}, the port's forward 0.394 ms against the template's 0.725 on Qwen3.5-27B's gated "
+                  "delta net (js106c)"),
     ('tcgen05', 'forward at 16x128 keys, 32x128 values'): (
         FLA_PORT, f"{B200}, the port's forward 0.276 ms against the template's 0.399 on Qwen3-Next's gated "
-                  "delta net (M-JS-106)"),
+                  "delta net (js106)"),
     ('tcgen05', 'forward, a decay a key dimension at 32x128 keys, 32x128 values'): (
-        FLA_PORT, f"{B200}, the port's forward 1.118 ms against the template's 2.507 on Kimi Linear's delta "
-                  "attention (M-JS-106)"),
+        FLA_PORT, f"{B200}, the port's forward 1.118 ms against the template's 2.510 on Kimi Linear's delta "
+                  "attention (js106c)"),
     ('tcgen05', 'training at 16x128 keys, 48x128 values'): (
         FLA_PORT, f"{B200}, the port's forward and gradient 1.747 ms against the template's 1.889 on "
                   "Qwen3.5-27B's gated delta net (js106c)"),
@@ -377,7 +375,7 @@ template against that port, not against upstream fla's own kernels or FlashQLA's
 where it takes the call (`Op.declared`, owner, bible da64ae5); the list shrinks as the template wins its
 cells, and no cell is picked or ranked at run time. A Blackwell's forward at each timed shape is the port's;
 its training the port's at Qwen3.5-27B's gated delta net and Kimi Linear's delta attention, the template's at
-Qwen3-Next's gated delta net, 1.196 ms against the port's 1.422 (M-JS-106). Every other cell is the
+Qwen3-Next's gated delta net, 1.196 ms against the port's 1.422 (js106). Every other cell is the
 template's. Warpgroup MMA's forward of Kimi delta attention, the last, is the template's, 1.154 ms against
 the port's 1.571 on a GH200 480GB and 1.647 against 2.412 on an H100 PCIe (M-JS-43b-gh200 and
 -h100pcie at e52d05f558f: exclusive, two rounds alternating the arms; the cell's receipt had the port's
@@ -925,9 +923,10 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                      recomputed=recomputed_memory(), forked=forked)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
-                    dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
-                    family=family, product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4,
-                    forked=forked is not None, heads=(key.shape[-2], value.shape[-2], value.shape[-1]))
+                    dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1],
+                    heads=(key.shape[-2], value.shape[-2], value.shape[-1]), call=call, family=family,
+                    product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4,
+                    forked=forked is not None)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
 
 
