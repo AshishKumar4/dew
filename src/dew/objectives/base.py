@@ -525,7 +525,7 @@ class Aux(Generic[Effects]):
     collections. `effects` are additive observations that the optimizer
     applies once per committed update, not once per microbatch.
     """
-    metrics: dict[str, jax.Array | Ratio]
+    metrics: Mapping[str, jax.Array | Ratio]
     """The step's metrics, each the loss's own report. A `Ratio` (its numerator and its mass; an
     `Exponentiated` one, its exponential) pools over the microbatches a step is read in by its sums, so the
     step logs it as the step read whole would (docs/design/training.md, the logged metrics); an array is
