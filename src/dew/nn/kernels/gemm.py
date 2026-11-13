@@ -706,19 +706,25 @@ class MxCase:
     tile: mosaic_gpu.Tiles | None
 
 
-MXFP8: selection.Op[MxCase] = selection.Op(generation.Choice.MXFP8, (
-    selection.Kernel('mosaic', (
-        selection.Requirement(
-            'planned', lambda case: case.tile is not None, "the template plans no block-scaled tile here: "
-            "an MX product on a family whose products take block scales (tcgen05's), whole 128s of rows, "
-            "columns and depth", MXFP8_ROW),
-        selection.Requirement(
-            'measured', lambda case: False, "no receipt yet has the block-scaled template beat the decoded "
-            "operands' product", MXFP8_ROW, kind='measured'))),
-    selection.Kernel('xla', (), generic=True)))
-"""An MX product's selector (`mxfp8_product`): the template's products scaling each block in the instruction
-(`mosaic_gpu.gmm`'s `mx_scales`) where named (`generation.chosen(mxfp8='mosaic')`) and planned, past the
-measured requirement no receipt has met yet; else the decoded operands' product in XLA."""
+def _block_scaled_op(choice: generation.Choice, product: str) -> selection.Op[MxCase]:
+    """A block-scaled product's selector (`_block_scaled`): the template's products scaling each block in
+    the instruction where named (`generation.chosen(<choice>='mosaic')`) and planned, past the measured
+    requirement no receipt has met yet; else the decoded operands' product in XLA. `product` names the
+    format in its refusal."""
+    return selection.Op(choice, (
+        selection.Kernel('mosaic', (
+            selection.Requirement(
+                'planned', lambda case: case.tile is not None,
+                f"the template plans no block-scaled tile here: {product} on a family whose products take "
+                "block scales (tcgen05's), whole 128s of rows, columns and depth", MXFP8_ROW),
+            selection.Requirement(
+                'measured', lambda case: False, "no receipt yet has the block-scaled template beat the "
+                "decoded operands' product", MXFP8_ROW, kind='measured'))),
+        selection.Kernel('xla', (), generic=True)))
+
+
+MXFP8 = _block_scaled_op(generation.Choice.MXFP8, "an MX product")
+"""An MX product's selector (`mxfp8_product`, `_block_scaled_op`)."""
 
 
 def mxfp8_product(lhs: MxFp8, matrices: MxFp8, group_blocks: jax.Array, *, out_dtype,
@@ -764,19 +770,8 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
     return call()
 
 
-NVFP4_BLOCK_OP: selection.Op[MxCase] = selection.Op(generation.Choice.NVFP4_BLOCK, (
-    selection.Kernel('mosaic', (
-        selection.Requirement(
-            'planned', lambda case: case.tile is not None, "the template plans no block-scaled tile here: "
-            "an NVFP4 product on a family whose products take block scales (tcgen05's), whole 128s of rows, "
-            "columns and depth", MXFP8_ROW),
-        selection.Requirement(
-            'measured', lambda case: False, "no receipt yet has the block-scaled template beat the decoded "
-            "operands' product", MXFP8_ROW, kind='measured'))),
-    selection.Kernel('xla', (), generic=True)))
-"""An NVFP4 block product's selector (`nvfp4_block_product`): the template's products scaling each block in
-the instruction where named (`generation.chosen(nvfp4_block='mosaic')`) and planned, past the measured
-requirement no receipt has met yet; else the decoded operands' product in XLA."""
+NVFP4_BLOCK_OP = _block_scaled_op(generation.Choice.NVFP4_BLOCK, "an NVFP4 product")
+"""An NVFP4 block product's selector (`nvfp4_block_product`, `_block_scaled_op`)."""
 
 
 def nvfp4_block_product(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: jax.Array, *, out_dtype,
