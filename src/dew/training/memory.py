@@ -12,7 +12,6 @@ import json
 import logging
 import math
 import re
-import weakref
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
@@ -72,21 +71,6 @@ def gathered_layer_bytes(objective, variables: Variables) -> int | None:
     Qwen3.5-4B's 1 GiB combined about 4.7 layers' 215 MiB each in its forward and held 5 GiB more at its
     peak than 128 MiB did, in the same time (IG-SCALING-2XH100), and a Llama-3.1-8B's 128 MiB split its 0.44
     GB layers and lost 2.6% (docs/performance.md)."""
-    leaves, structure = jax.tree.flatten(variables)
-    key = (structure, tuple((leaf.shape, jnp.dtype(leaf.dtype), splits_parameter(leaf)) for leaf in leaves))
-    # Once a run: each plan's options read it (`step_compiler_options`), its sizing a trace of its own.
-    held = _GATHERED.setdefault(objective, {})
-    if key not in held:
-        held[key] = _largest_layer_bytes(objective, variables)
-    return held[key]
-
-
-_GATHERED: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-"""By objective, `gathered_layer_bytes` by its variables' structure, shapes, dtypes and splits."""
-
-
-def _largest_layer_bytes(objective, variables: Variables) -> int | None:
-    """`gathered_layer_bytes` sized afresh."""
     def layered(tree):
         # A bank's rows are read where they lie (`StoredRow`): their shapes and dtypes are what is sized.
         return jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype) if isinstance(leaf, StoredRow)
@@ -117,17 +101,28 @@ def splits_parameter(leaf) -> bool:
         for axis in parameter_axes(mesh_axes(assignment)))
 
 
+def layer_gathers(objective, variables: Variables, devices: int) -> int | None:
+    """The bytes a step over `devices` combines its all-gathers up to (`gathered_layer_bytes`) where it
+    takes the collective options (`collects`), None elsewhere: a fact of the run's plan, which its compiles'
+    options read (`step_compiler_options`)."""
+    return gathered_layer_bytes(objective, variables) if collects(devices) else None
+
+
+def collects(devices: int) -> bool:
+    """Whether a step over `devices` takes the collective options (`COLLECTIVES`): a GPU's over several."""
+    return backend() == 'gpu' and devices > 1
+
+
 def step_compiler_options(objective, tokens: float, frozen: bool, devices: int, *,
-                          variables: Variables | None = None) -> jax.stages.CompilerOptions | None:
+                          gathered: int | None = None) -> jax.stages.CompilerOptions | None:
     """Return the XLA options for this objective's training step on this device.
 
     Each option applies unless the run set that flag itself. `tokens` is the
     number of tokens one device steps (`device_tokens`), `frozen` says
     whether the step trains next to frozen weights, and `devices` is how
     many the step spans: over several GPUs it takes `COLLECTIVES`, its
-    all-gathers combined up to the bytes a device gathers for the largest
-    layer of its `variables` (`gathered_layer_bytes`) in whole MiB where it
-    gathers its layers.
+    all-gathers combined up to the `gathered` bytes of its largest layer in
+    whole MiB where it gathers its layers (`layer_gathers`, the plan's).
 
     On a GPU, dots that share an input (q, k and v; gate and up) run separately.
     XLA's dot merger would run them as one GEMM over their weights, concatenated
@@ -159,9 +154,8 @@ def step_compiler_options(objective, tokens: float, frozen: bool, devices: int, 
     """
     generation = device_generation()
     options: dict[str, Option] = {}
-    if backend() == 'gpu' and devices > 1:
+    if collects(devices):
         options.update({name: value for name, value in COLLECTIVES.items() if xla_flag(name) is None})
-        gathered = None if variables is None else gathered_layer_bytes(objective, variables)
         if gathered and xla_flag(GATHER_THRESHOLD) is None:
             options[GATHER_THRESHOLD] = -(-gathered // 2 ** 20) * 2 ** 20
     small = tokens <= 128
@@ -243,13 +237,15 @@ def split_share(params: Variables) -> float:
 
 
 def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: Batch, variables: Variables,
-                                  mesh: Mesh) -> jax.stages.CompilerOptions | None:
+                                  mesh: Mesh, gathered: int | None = None
+                                  ) -> jax.stages.CompilerOptions | None:
     """The options a step over microbatches of `micro` on `mesh` compiles with
     (`step_compiler_options`): by the tokens one device steps of a microbatch split over the
-    mesh's batch axes, and whether `variables` hold frozen weights it trains beside."""
+    mesh's batch axes, whether `variables` hold frozen weights it trains beside, and the plan's
+    `gathered` bytes (`layer_gathers`)."""
     shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
     return step_compiler_options(objective, device_tokens(objective, micro, shards), FROZEN in variables,
-                                 mesh.devices.size, variables=variables)
+                                 mesh.devices.size, gathered=gathered)
 
 
 def device_tokens[LossT, EffectsT](objective: Objective[LossT, EffectsT], batch: Batch, shards: int) -> float:

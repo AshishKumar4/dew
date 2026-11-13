@@ -242,8 +242,10 @@ class HostExecution:
     state of its own between attempts.
     """
     def __init__(self, objective, layout, accelerator, cpu, sites: tuple[DecoderBank, ...],
-                 device: tuple[DeviceStep, ...] = ()):
+                 device: tuple[DeviceStep, ...] = (), gathered: int | None = None):
         self.objective, self.layout = objective, layout
+        # The bytes its step's all-gathers combine up to (`layer_gathers`), its plan's.
+        self.gathered = gathered
         self.accelerator, self.cpu = accelerator, cpu
         # The trainer's banks over the state it owns (`stack_sites`), the runs its frozen banks keep;
         # a gradient reaches the run's own stacks alone, a nested root (a teacher) training nothing.
@@ -269,7 +271,7 @@ class HostExecution:
         shards = math.prod(self.accelerator.shape[axis] for axis in batch_axes(self.accelerator))
         options = step_compiler_options(self.objective, device_tokens(self.objective, batch, shards),
                                         FROZEN in variables, self.accelerator.devices.size,
-                                        variables=variables)
+                                        gathered=self.gathered)
         return dict(options or {})
 
     def snapshot(self, variables):

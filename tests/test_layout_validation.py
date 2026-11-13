@@ -23,7 +23,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from kernel_compile import compile_only_gpus
 from model_support import TINY_DECODER
 from sharded import collective_axes
-from steady_state import steady_state
 from test_parallelism import BoxedReadout
 from token_support import repeated_token_batch, token_rows
 
@@ -212,7 +211,7 @@ def test_a_gpu_step_over_fsdp_combines_its_parameter_gathers_a_layer_at_a_time()
     combines them past it (IG-SCALING-2XH100: 4.7 of Qwen3.5-4B's layers a gather, 5 GiB more held)."""
     from dew.telemetry.instrumentation import hlo_instructions
     from dew.telemetry.trace import collective
-    from dew.training.memory import gathered_layer_bytes
+    from dew.training.memory import layer_gathers
 
     mesh = MeshSpec(fsdp=2).build(compile_only_gpus("sm90", 2))
     layout = Layout(min_shard=TINY_SHARD)
@@ -228,22 +227,20 @@ def test_a_gpu_step_over_fsdp_combines_its_parameter_gathers_a_layer_at_a_time()
 
     step = adam_step(objective, optimizer)
 
-    layer = gathered_layer_bytes(objective, placed)
+    with assumed("sm90"):
+        layer = layer_gathers(objective, placed, mesh.size)
     assert layer is not None
 
-    def largest_gather(variables):
+    def largest_gather(gathered):
         with assumed("sm90"), jax.set_mesh(mesh), nn.logical_axis_rules(layout.axis_rules):
             options = step_compiler_options(objective, BATCH * SEQ_LEN, frozen=False, devices=mesh.size,
-                                            variables=variables)
+                                            gathered=gathered)
             compiled = jax.jit(step, out_shardings=shardings["params"]).trace(placed, batch).lower().compile(
                 compiler_options=options)
         return max(sum(instruction.buffers) for instruction in hlo_instructions(compiled.as_text()).values()
                    if collective(instruction.op) == "all-gather" and not instruction.op.endswith("-start"))
 
-    assert largest_gather(placed) <= -(-layer // 2 ** 20) * 2 ** 20 < largest_gather(None)
-    # Each plan's options read the run's layer sizing once: a later plan's trace nothing.
-    with assumed("sm90"), jax.set_mesh(mesh), steady_state():
-        step_compiler_options(objective, BATCH * SEQ_LEN, frozen=False, devices=mesh.size, variables=placed)
+    assert largest_gather(layer) <= -(-layer // 2 ** 20) * 2 ** 20 < largest_gather(None)
 
 
 @pytest.mark.mesh(devices=8)
