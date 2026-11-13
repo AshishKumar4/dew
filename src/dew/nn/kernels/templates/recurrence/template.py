@@ -454,11 +454,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """Whether one product's forward holds at `tiles` (`legal`'s rules on its launches alone: a training
         call's where `training`, `launches`' `training_forward`, else a forward without a gradient's): the
         tiles a rule stages for one product are held to the launches that product runs. A forward alone walks
-        its states and output in one launch where its family's products read shared memory and its held values
-        are one part (`chunk_forward.walks_once`), which a training call never runs: on a B200 the 4B's gated
-        delta net's walk held no program at two roles where the training call's held every launch (its states
-        launch 121 registers of 240, its reverse 149), and judged by it the training call walked one role, its
-        states launch's 2,304 programs 15.6 waves of one a multiprocessor (row 5668)."""
+        its states and output in one launch where its family's products read shared memory
+        (`chunk_forward.walks_once`), which a training call never runs: on a B200 the 4B's gated delta net's
+        walk held no program at two roles where the training call's held every launch (its states launch 121
+        registers of 240, its reverse 149), and judged by it the training call walked one role, its states
+        launch's 2,304 programs 15.6 waves of one a multiprocessor (row 5668)."""
         family = bundle(target, _dtype(ba))
         if family is None:
             return self.legal(ba, tiles, target)

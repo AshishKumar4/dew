@@ -671,9 +671,9 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     route's fast forms round it unless given (a 16-bit call's keys then take the write gate,
     `mainloop.Call.gated_keys`; unrounded, Lightning's, its values held in parts). An fp32 call's operands and
     passed values are held in parts as the mainloop holds them (`Lane.held`, `Lane.given`), each record their
-    sum. `walked`, the inference forward no gradient follows: a 16-bit call's under a decay a head whose held
-    values are one part runs its fused walk (`mainloop._scan`, `kept_forward` keeping nothing,
-    `chunk_forward.walks_once`), whose records are its inverse, output and final memory (`WALKED`)."""
+    sum. `walked`, the inference forward no gradient follows: a 16-bit call's under a decay a head runs its
+    fused walk (`mainloop._scan`, `kept_forward` keeping nothing), whose records are its inverse, output and
+    final memory (`WALKED`)."""
     import jax
     import jax.numpy as jnp
 
@@ -700,8 +700,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         o, final, tiles, trained = _route_forward(route, operands, walked)
         # The fused walk where the forward runs one (`chunk_forward.walks_once`): an mma.sync family's
         # inference forward runs its states and output launches, whose records it keeps.
-        walked = walked and chunk_forward.walks_once(dtype, per_key=g.ndim == 4, family=family, keeps=False,
-                                                     delta=delta, rounded=rounded)
+        walked = walked and chunk_forward.walks_once(dtype, per_key=g.ndim == 4, family=family, keeps=False)
         chunk = tiles.chunk
 
         def kept(*x, starts=starts):
