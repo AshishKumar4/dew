@@ -1404,6 +1404,7 @@ class Trainer(Generic[Loss, Effects]):
         if not complete and (pending or not plan.ended(current, interval.real_tokens, interval.consumed)):
             partition = self._stream_partition()
             run.source = plan.dataset.train(partition)
+            run.unworked = isinstance(run.source, ReadsInProcess) and run.source.in_process
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None and run.restarted is None else None)
             source = run.source
@@ -2096,11 +2097,9 @@ class Trainer(Generic[Loss, Effects]):
         scalars = {**logged_scalars(read, taken.counts, elapsed, self.device_mesh.devices.size,
                                     rollout=self.rollout is not None, update_flops=run.update_flops),
                    **run.startup.scalars()}
-        # Said once: a per-share stream read in the process starves the step, the stream asked through the
-        # wrappers it reads under (`Forwarding.in_process`), once it reads.
-        if (not run.starved and elapsed > 0 and taken.counts.waited > elapsed / 2
-                and isinstance(run.source, ReadsInProcess) and run.source.in_process):
-            run.starved = True
+        if run.unworked and elapsed > 0 and taken.counts.waited > elapsed / 2:
+            # Said once: a per-share stream read in the process starves the step.
+            run.unworked = False
             _input_log.warning("the step waits on its input for more than half its time, read by a per-share "
                                "stream in the training process: state its loading workers (.workers(n)), or "
                                "read it .elastic(), whose order any count of workers keeps")

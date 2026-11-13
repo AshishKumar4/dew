@@ -1861,6 +1861,12 @@ class StepPhases(Forwarding):
     def __iter__(self) -> Iterator[Batch]:
         return self
 
+    @property
+    def in_process(self) -> bool:
+        """Whether the phase it reads, or reads first, reads in the training process (`ReadsInProcess`)."""
+        source = self._source if self._source is not None else self._reader(phase_at(self._ends, self._steps))
+        return isinstance(source, ReadsInProcess) and source.in_process
+
     def _reader(self, phase: int) -> Iterator[Batch]:
         if phase not in self._readers:
             self._readers[phase] = self._make[phase]()
