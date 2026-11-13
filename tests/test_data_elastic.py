@@ -555,6 +555,26 @@ def test_a_draw_after_an_expansion_is_one_readers_however_its_workers_spread_the
     assert read(worker_reader(drawn.elastic(), 0, 1, 2)) == whole
 
 
+def test_a_draw_in_one_member_after_another_members_expansion_records_no_draw_rule():
+    """A mixture whose one member expands its records and whose other draws records no rule for draws after
+    an expansion (train 792's F11): no record is drawn after it was expanded; one member expanding then
+    drawing records it."""
+    from dew.data import mix
+
+    def rules(chain) -> dict:
+        reader = worker_reader(chain.batch(BATCH), 0, 1, 2)
+        try:
+            return dict(json.loads(reader.get_state())["dew_data_plan"]["rules"])
+        finally:
+            reader.close()
+
+    rows = tuple({"id": np.int64(index)} for index in range(24))
+    expanding = Pipeline(Memory(rows)).flat_map(Pieces(3))
+    drawing = Pipeline(Memory(rows)).random_map(Drawn())
+    assert "expanded_draws" not in rules(mix([expanding.repeat(), drawing.repeat()]))
+    assert "expanded_draws" in rules(mix([expanding.random_map(Drawn()).repeat(), drawing.repeat()]))
+
+
 def test_a_position_its_workers_drew_by_input_is_refused_naming_the_draw_rule():
     """A position a main saved three batches into a read in two workers of a random step after an expansion,
     which its workers drew by each input and its row (tests/fixtures/draws_by_input_position.json, written
