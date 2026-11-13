@@ -1135,7 +1135,7 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
     whatever they read."""
     from reference_error import _interval
 
-    from dew.parity import _status, _typical_status
+    from dew.parity import _status, _typical_status, _Undecided
     def errors(seed):
         return (np.zeros(64, np.float32), np.full(64, 2.0 if seed % 2 == 0 else 0.1, np.float32),
                 np.ones(64, np.float32))
@@ -1154,9 +1154,9 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
 
     mine, theirs = np.asarray([4.0, 0.01] * 20), np.ones(40)
     assert _status(math.sqrt(2.005), *_interval(mine, theirs)) == "inconclusive"
-    # The typical draw's ratio passes, so what leaves the leaf undecided is its draws' spread or tail.
-    status, *typical, _ = _typical_status(mine, theirs)
-    assert status == "inconclusive" and _status(*typical) == "pass"
+    # The typical draw's ratio passes: it is the draws' spread that leaves the leaf undecided.
+    status, *typical, _, undecided = _typical_status(mine, theirs)
+    assert status == "inconclusive" and _status(*typical) == "pass" and undecided is _Undecided.SPREAD
     with pytest.raises(Inconclusive):
         assert_as_exact(dew, reference, errors, "straddling", seeds=8, truth_fn=truth)
     with pytest.raises(Inconclusive):
@@ -2283,7 +2283,7 @@ def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or
     its log ratios spread within QUALIFYING_SPREAD, passes at the count it sizes; a Dew twice off on every
     draw is refused by its typical draw; one ten times off on a tenth of its draws, which the typical
     draw's ratio leaves under PARITY, is refused by the spread its fault adds."""
-    from dew.parity import _interval, _resolves, _status, _typical_status
+    from dew.parity import _interval, _resolves, _status, _typical_status, _Undecided
 
     reference = rounded_apart(1)
     seeds = seeds_for(reference, rounding_apart, "rounding apart", truth_fn=exact_value,
@@ -2308,8 +2308,8 @@ def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or
     # ratio 2.46, unresolved, the typical draw's ratio under PARITY; the spread of its log ratios refuses it.
     mine, theirs = np.where(np.arange(256) < 13, 100.0, 1.0), np.ones(256)
     assert not _resolves(*_interval(mine, theirs))
-    status, *typical, _ = _typical_status(mine, theirs)
-    assert status == "inconclusive" and _status(*typical) == "pass"
+    status, *typical, _, undecided = _typical_status(mine, theirs)
+    assert status == "inconclusive" and _status(*typical) == "pass" and undecided is _Undecided.SPREAD
 
 
 def test_a_leaf_the_second_stage_finds_over_is_over_whatever_its_first_stages_typical_draw():

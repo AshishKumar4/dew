@@ -169,9 +169,9 @@ COMPARISONS = {
     # The gate's one-draw rules, each call a comparison until it judges through check 1 (row 2089).
     "the one-draw rule": ("from one_draw import assert_as_exact_as_the_reference\n"
                           "assert_as_exact_as_the_reference(mine, theirs, truth, 'a site')", 1),
-    "the one-draw rule over leaves": (
+    "the one-draw rule by its module": (
         "import one_draw\n"
-        "one_draw.assert_no_less_exact(mine, theirs, truth, 'a site')", 1),
+        "one_draw.assert_as_exact_as_the_reference(mine, theirs, truth, 'a site')", 1),
     "check 1 over drawn seeds": ("from reference_error import assert_as_exact\n"
                                  "assert_as_exact(dew, reference, draw, 'a site', seeds=8)", 0),
 }

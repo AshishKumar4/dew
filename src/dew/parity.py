@@ -9,6 +9,7 @@ from the arms and the draws that record them.
 """
 
 import dataclasses
+import enum
 import functools
 import hashlib
 import itertools
@@ -388,10 +389,23 @@ def _examples_refuse(examples: list[np.ndarray], scalar: bool, tail: float = LOW
     return None
 
 
+class _Undecided(enum.Enum):
+    """Which of `_typical_status`' rules left a leaf undecided: its draws hold no paired ratio, its typical
+    draw's ratio does not pass, its draws' log ratios spread past QUALIFYING_SPREAD, their tail lies above
+    their median, or its stacked examples do not pass it (`_examples_refuse`: too few for their tail test at
+    their spread, or their own tail above their medians)."""
+
+    UNPAIRED = "unpaired"
+    TYPICAL = "typical"
+    SPREAD = "spread"
+    TAIL = "tail"
+    EXAMPLES = "examples"
+
+
 def _typical_status(mine: np.ndarray, theirs: np.ndarray,
                     tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL),
                     examples: list[np.ndarray] | None = None,
-                    scalar: bool = False) -> tuple[str, float, float, float, str]:
+                    scalar: bool = False) -> tuple[str, float, float, float, str, _Undecided | None]:
     """A leaf's verdict by its draws' paired ratios, asked only where its pooled ratio leaves it
     inconclusive: "pass" where the typical draw's ratio passes (the draws' geometric mean, its interval
     `_status`), the draws' log ratios spread no wider than QUALIFYING_SPREAD (where the tail test sees a
@@ -401,22 +415,25 @@ def _typical_status(mine: np.ndarray, theirs: np.ndarray,
     (`_example_medians`), and the examples' own tail about their draws' medians is asked too
     (`_within_draws`), so a fault on some of each draw's examples is refused. A pass certifies the typical
     draw's (or example's) ratio under PARITY and no fault the tail tests see at that spread; a `scalar` leaf
-    (one value an example) takes the known null's tail test (`_scalar_tail`)."""
+    (one value an example) takes the known null's tail test (`_scalar_tail`). The reason is given in words
+    and as the rule that refused (`_Undecided`), None for a pass."""
     ratios = _log_ratios(mine, theirs) if examples is None else _example_medians(examples)
     if ratios is None or not len(ratios):
-        return "inconclusive", float("nan"), float("nan"), float("nan"), "its draws hold no paired ratio"
+        return ("inconclusive", float("nan"), float("nan"), float("nan"), "its draws hold no paired ratio",
+                _Undecided.UNPAIRED)
     ratio, low, high = _geometric(ratios, tails)
     if _status(ratio, low, high) != "pass":
-        return "inconclusive", ratio, low, high, "the typical draw's ratio does not pass"
+        return "inconclusive", ratio, low, high, "the typical draw's ratio does not pass", _Undecided.TYPICAL
     if (spread := float(np.std(ratios))) > QUALIFYING_SPREAD:
         return ("inconclusive", ratio, low, high,
                 f"its draws' log ratios spread {spread:.2f}, past the {QUALIFYING_SPREAD} the tail test "
-                f"sees at")
+                f"sees at", _Undecided.SPREAD)
     if (tail := _tail_sign(ratios, tails[0])) < tails[0]:
-        return "inconclusive", ratio, low, high, f"its draws' tail lies above their median (p {tail:.1e})"
+        return ("inconclusive", ratio, low, high, f"its draws' tail lies above their median (p {tail:.1e})",
+                _Undecided.TAIL)
     if examples is not None and (reason := _examples_refuse(examples, scalar, tails[0])) is not None:
-        return "inconclusive", ratio, low, high, reason
-    return "pass", ratio, low, high, ""
+        return "inconclusive", ratio, low, high, reason, _Undecided.EXAMPLES
+    return "pass", ratio, low, high, "", None
 
 
 def _sized(mine: np.ndarray, theirs: np.ndarray, typical: bool = False,
