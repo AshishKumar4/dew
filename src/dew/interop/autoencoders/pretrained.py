@@ -9,7 +9,7 @@ import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -115,7 +115,7 @@ class Registration:
     nameless: bool = False
     finds: bool = False
     metadata_tensors: tuple[str, ...] = ()
-    stored_metadata: Callable[[Any], Mapping[str, np.ndarray]] | None = None
+    stored_metadata: Callable[[AutoEncoder], Mapping[str, np.ndarray]] | None = None
 
 
 REGISTRATIONS: tuple[Registration, ...] = (

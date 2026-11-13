@@ -14,6 +14,7 @@ import numpy as np
 from dew.batch import Variables
 from dew.interop.components import bind_component
 from dew.interop.unread import Stored
+from dew.nn.autoencoders.api import AutoEncoder
 from dew.nn.autoencoders.flux2 import Flux2Autoencoder
 
 from .common import published_source
@@ -67,7 +68,7 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
         inputs=(frame,), tensors=loaded)
 
 
-def latent_statistics(autoencoder: Flux2Autoencoder) -> dict[str, np.ndarray]:
+def latent_statistics(autoencoder: AutoEncoder) -> dict[str, np.ndarray]:
     """The batch norm's running statistics `load_flux2_vae` read into `autoencoder`'s latent normalization,
     under the names its source stores them by (`LATENT_STATISTICS`): what an export writes back beside its
     weights (`Registration.stored_metadata`)."""
