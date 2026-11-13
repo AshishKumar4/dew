@@ -509,7 +509,8 @@ def pinned_classes() -> list[str]:
             ([cpu] if isinstance(cpu, dict) else cpu or [])]
 
 
-def reusable(python: str, rows: list[tuple[str, str]], common: str) -> dict[tuple[str, str], str]:
+def reusable(python: str, rows: list[tuple[str, str]], common: str,
+             missed: dict[str, int]) -> dict[tuple[str, str], str]:
     """The rows of `rows` (each a file and its group, "" for the whole file) that ran green on exactly these
     inputs (`common`, and each file's own, `fresh`) on any class the tasks run on (`pinned_classes`), which a
     task of theirs could land on, read at plan time with the cache's read token (`READ_TOKEN`): a task of
@@ -517,10 +518,10 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str) -> dict[tupl
     by its own (2026-10-30: the plan looked up whole files alone, and a docs-only change's 1,034 green groups
     of heavy files each booted a container to read its record). Each with where its green run is kept
     (`green_key`'s class and key, `KEPT_AT`'s token), which the plan hands the task that holds it, so no run
-    of another commit replacing a row's last record between plan and task can hide it (2026-10-30: a kept
-    task found 23 of its 259 files and ran the rest). None where the plan has no token or no class (the
-    maintainer, 2026-10-28: a lane run with most files unchanged booted a container a task; 2026-10-29: the
-    suite pinned to 25/17 and 26/17)."""
+    of another commit replacing a row's last record between plan and task can hide it (2026-10-30: a kept task
+    found 23 of its 259 files and ran the rest). None where the plan has no token or no class (the maintainer,
+    2026-10-28: a lane run with most files unchanged booted a container a task; 2026-10-29: the suite pinned
+    to 25/17 and 26/17). Why each other row was not, counted in `missed` (`green_record`'s word)."""
     token, held = os.environ.get(READ_TOKEN), pinned_classes()
     if not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
         return {}
@@ -541,9 +542,7 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str) -> dict[tupl
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         found = {each: kept for each, kept in zip(rows, pool.map(hit, rows), strict=True) if kept}
-    # Why each other row was not kept, by its first class's word (`green_record`), as a train's log states it.
-    missed = dict(Counter((misses.get(e) or ["no class"])[0] for e in rows if e not in found).most_common())
-    print(f"plan: {python}: kept {len(found)} of {len(rows)} rows; not kept: {missed}", file=sys.stderr)
+    missed.update(Counter((misses.get(e) or ["no class"])[0] for e in rows if e not in found))
     return found
 
 
@@ -623,7 +622,7 @@ def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[st
 
 
 def green_record(python: str, name: str, split: str, common: str, token: str, classes: list[str],
-                 reading: Reading | None = None, why: list[str] | None = None) -> tuple[dict, str] | None:
+                 reading: Reading | None, why: list[str]) -> tuple[dict, str] | None:
     """The record of test file `name`'s row (in `split`'s group) that ran green on exactly these inputs on one
     of `classes`, the first found, with its class; else None. The plan (`reusable`) and a task (`reused`) read
     it alike, from one reading of the inputs (`Reading`). A row's key hashes the inputs its run executed, so
@@ -636,7 +635,6 @@ def green_record(python: str, name: str, split: str, common: str, token: str, cl
     reach of a comment's change planned 7,161 rows). A miss says why in `why`, a class at a time (`MISSED`).
     """
     reading = Reading() if reading is None else reading
-    why = [] if why is None else why
     place = row(python, name, split)
     for each in classes:
         tried: set[str] = set()
@@ -646,10 +644,10 @@ def green_record(python: str, name: str, split: str, common: str, token: str, cl
             why.append("unread")
             continue
         if current is None:
-            why.append("no green epoch")
+            why.append("no green run on these shared inputs")
             continue
         found = recorded(record_key(python, place, each, common), token)
-        why.append("an executed input changed" if found is not None else "no record on these shared inputs")
+        why.append("an executed input changed" if found is not None else "no record of its last run")
         if found is not None and found["depends"] is not None:
             # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of
             # exactly these, kept by that key (`green_key`) whatever ran since.
@@ -703,7 +701,7 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
                 found, current):
             remembered(python, place, kept[0], found["depends"], token)
             return found["row"]
-    hit = green_record(python, name, split, common, token, reused_classes(network), reading)
+    hit = green_record(python, name, split, common, token, reused_classes(network), reading, [])
     if hit is None:
         return None
     # Its executed set the first of its row's list: a set reused stays while other trees' runs come and go.
@@ -1180,7 +1178,9 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
         rows_of = [(name, "") for name in timed if name not in groups] + [
             (name, group) for name, cut in groups.items() for group, _ in cut] + [
             (name, test) for name, held in marked.items() for test in held]
-        found = reusable(python, rows_of, shared(python)) if cache != "off" else {}
+        missed: dict[str, int] = {}
+        found = reusable(python, rows_of, shared(python), missed) if cache != "off" else {}
+        print(f"plan: {python}: kept {len(found)} of {len(rows_of)}; not kept: {missed}", file=sys.stderr)
         # A lookup a row, in seconds: a kept task's weight is its container's start and those lookups.
         tasks: list[tuple[list[tuple[str, str]], float]] = [
             (held, float(len(held))) for held in kept_tasks(python, found, target)]

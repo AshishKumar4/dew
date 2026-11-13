@@ -51,23 +51,22 @@ def planned_checkout(ci, root: Path, monkeypatch, cache_worker,
     return verdict, planned
 
 
-def test_a_plan_states_why_each_row_it_did_not_keep_was_not_kept(
-        ci, tmp_path, monkeypatch, cache_worker, capsys):
-    """The plan says, per Python, how many rows it kept of how many and why each other was not, by its first
-    pinned class's lookup: no record on these shared inputs, no green epoch, or an input its last run
-    executed changed, so a train's log states its reuse and no one reconstructs it after (Main, 2026-11-13:
-    a count made hours after train 795 read the cache as it stood then, not as the plan did)."""
-    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
-    capsys.readouterr()
-    planned()
-    said = capsys.readouterr().err
-    assert "plan: 3.12: kept 0 of 3 rows; not kept: {'no record on these shared inputs': 3}" in said
+def test_a_plan_counts_why_each_row_it_did_not_keep_was_not_kept(ci, tmp_path, monkeypatch, cache_worker):
+    """The plan's lookup counts why each row it did not keep was not, by its first pinned class's lookup: no
+    green run on these shared inputs, or an input its last run executed changed, so a train's log states its
+    reuse and no one reconstructs it after (Main, 2026-11-13: a count made hours after train 795 read the
+    cache as it stood then, not as the plan did)."""
+    verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    rows = [(f"tests/test_{name}.py", "") for name in ("a", "b", "c")]
+
+    def looked_up() -> tuple[int, dict[str, int]]:
+        missed: dict[str, int] = {}
+        return len(ci.reusable("3.12", rows, ci.shared("3.12"), missed)), missed
+
+    assert looked_up() == (0, {"no green run on these shared inputs": 3})
     armada_task(ci, monkeypatch, verdict)
     (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\nCHANGED = 1\n")
-    capsys.readouterr()
-    planned()
-    said = capsys.readouterr().err
-    assert "plan: 3.12: kept 2 of 3 rows; not kept: {'an executed input changed': 1}" in said
+    assert looked_up() == (2, {"an executed input changed": 1})
 
 
 def test_a_run_plans_only_the_files_whose_inputs_changed_and_its_verdict_names_every_file(
