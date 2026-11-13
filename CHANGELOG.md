@@ -7,19 +7,6 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
-- Dew requires optax 0.2.8 or later (was 0.2.6): Muon iterates Newton-Schulz in Dew's own form, on the matrices
-  as they are stored (no transposes), held to optax's iteration as its oracle; its layout, shape scalings,
-  coefficient presets and preconditionings (AOL, Schatten), which 0.2.8 first ships, are optax's.
-
-- Dew requires its JAX build 0.12.0.1.post85 (Python alone; the CUDA and PJRT plugins stay post81's): the
-  GPU interpreter checks a barrier wait that names its phase at its waits alone, so consumers that take
-  alternate tiles of one ring over several rotations, warps among them, are checked rather than refused.
-
-- `dew.optim_schedules` holds a solver's learning rate as operands of its state: `ScheduleBase`, `RateState`
-  and `ProgressState`, `scheduled_solver`, `rates_of`, `with_rates`, `with_horizons`, `learning_rate`,
-  `held_rates`, `scaled_rates`, `settable_rates`, `schedule_states`, `reclocked` and `stepped_rate` are
-  imported from there, where `dew.optim` held them; the schedule kinds (`Cosine`, `Linear`, `Power`,
-  `OneCycle`, `Exponential`) and `OptimConfig` stay in `dew.optim`.
 - A resume treats its data relaxed by default (`TrainerConfig.data_resume`, `--set trainer.data_resume=exact`):
   the run's parameters, optimizer state, step, schedule and random state resume as saved, and its data reads
   on at its saved position where the saved plan makes the same rows; where the plan differs (a rule, a
@@ -32,43 +19,6 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `compile(..., resume=)` takes `"relaxed"` where it took `"non-exact"`, and a plan's refusal is a
   `dew.data.plan.PlanChanged` naming what differs (`differs`).
 
-<<<<<<< ours
-||||||| base
-<<<<<<<<< ours
-- Dew requires its JAX build 0.12.0.1.post85 (Python alone; the CUDA and PJRT plugins stay post81's): the
-  GPU interpreter checks a barrier wait that names its phase at its waits alone, so consumers that take
-  alternate tiles of one ring over several rotations, warps among them, are checked rather than refused.
-- `dew.optim_schedules` holds a solver's learning rate as operands of its state: `ScheduleBase`, `RateState`
-  and `ProgressState`, `scheduled_solver`, `rates_of`, `with_rates`, `with_horizons`, `learning_rate`,
-  `held_rates`, `scaled_rates`, `settable_rates`, `schedule_states`, `reclocked` and `stepped_rate` are
-  imported from there, where `dew.optim` held them; the schedule kinds (`Cosine`, `Linear`, `Power`,
-  `OneCycle`, `Exponential`) and `OptimConfig` stay in `dew.optim`.
-- Dew requires its JAX build 0.12.0.1.post84 (Python alone; the CUDA and PJRT plugins stay post81's): the
-  toolkit's ring waits name their phase, so the interpreter checks two consumers that take alternate tiles
-  of one ring; a tcgen05 pair's step block over a partial depth lowers; the lowering cache keys a program
-  4 to 5 seconds sooner on a 32-layer step.
-- Dew requires its JAX build 0.12.0.1.post83 (Python alone; the CUDA and PJRT plugins stay post81's): a
-  Pallas interpreter's thread map runs its threads on a CPU client of its own, so an interpreted kernel
-  inside a host callback no longer deadlocks when the calling computation's client has a full device queue.
-- Dew requires its JAX build 0.12.0.1.post82 (Python alone; the CUDA and PJRT plugins stay post81's): a
-  Mosaic GPU kernel over operands on a concrete mesh lowers a reshard of a literal, so a bf16 template
-  decode on an Ampere or Ada GPU whose operands sit on a `NamedSharding` lowers, where it failed with
-  "Shaped arrays must be represented by ir.Values, got: 0".
-||||||||| base
-- Dew requires its JAX build 0.12.0.1.post84 (Python alone; the CUDA and PJRT plugins stay post81's): the
-  toolkit's ring waits name their phase, so the interpreter checks two consumers that take alternate tiles
-  of one ring; a tcgen05 pair's step block over a partial depth lowers; the lowering cache keys a program
-  4 to 5 seconds sooner on a 32-layer step.
-- Dew requires its JAX build 0.12.0.1.post83 (Python alone; the CUDA and PJRT plugins stay post81's): a
-  Pallas interpreter's thread map runs its threads on a CPU client of its own, so an interpreted kernel
-  inside a host callback no longer deadlocks when the calling computation's client has a full device queue.
-- Dew requires its JAX build 0.12.0.1.post82 (Python alone; the CUDA and PJRT plugins stay post81's): a
-  Mosaic GPU kernel over operands on a concrete mesh lowers a reshard of a literal, so a bf16 template
-  decode on an Ampere or Ada GPU whose operands sit on a `NamedSharding` lowers, where it failed with
-  "Shaped arrays must be represented by ir.Values, got: 0".
-=========
->>>>>>>>> theirs
-=======
 - Dew requires its JAX build 0.12.0.1.post85 (Python alone; the CUDA and PJRT plugins stay post81's): the
   GPU interpreter checks a barrier wait that names its phase at its waits alone, so consumers that take
   alternate tiles of one ring over several rotations, warps among them, are checked rather than refused.
@@ -100,7 +50,6 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `compile(..., resume=)` takes `"relaxed"` where it took `"non-exact"`, and a plan's refusal is a
   `dew.data.plan.PlanChanged` naming what differs (`differs`).
 
->>>>>>> theirs
 - Data plan version 14, the last global one: a plan describes each step by its structure (its class and
   fields, a callable by its own identity, an array by its fingerprint, a mapping in its order) and records,
   by name, the rules its read takes its next rows by (`identity`, `shuffle`, `mix`, `dealing`, `grain`,
@@ -119,6 +68,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   states them through the new `ScheduleBase.horizons(steps)` hook, and `ScheduleBase.values` takes them
   as `values(horizons, rates)` where it took `values(steps, rates)`: a subclass that read the run's length
   in `values` overrides `horizons` to state the lengths it reads, or reads `{}`.
+
+- Dew requires optax 0.2.8 or later (was 0.2.6): Muon iterates Newton-Schulz in Dew's own form, on the matrices
+  as they are stored (no transposes), held to optax's iteration as its oracle; its layout, shape scalings,
+  coefficient presets and preconditionings (AOL, Schatten), which 0.2.8 first ships, are optax's.
 
 - A run resumes from what the current Dew and the one before it wrote, and refuses an earlier format by
   name with the ways on: a step that holds a decision run's projections packed (`q`, `k` and `v` in one
