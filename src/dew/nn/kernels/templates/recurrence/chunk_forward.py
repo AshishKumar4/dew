@@ -143,16 +143,20 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     return out, final
 
 
-def walks_once(dtype, *, per_key: bool, family: mosaic.Family | None, keeps: bool) -> bool:
+def walks_once(dtype, *, per_key: bool, family: mosaic.Family | None, keeps: bool, delta: bool,
+               rounded: bool) -> bool:
     """Whether a forward of `dtype` runs its states and output in one walk (`_scan`), no memory kept for a
     backward to take: one keeping nothing (`keeps`) under a decay a head, where its `family`'s products read
-    their operands from shared memory (warpgroup MMA's) and a 16-bit call's operands are one part. Where
-    they read registers (mma.sync's), the walk's two phases' operand fragments held its thread past its
-    registers at every tile (an sm87's and an A100's), as the output launch's two phases at once did
-    (`output._output_held`); an fp32 call's parts spilled it at an H100's widest (132 bytes at two roles of 16
-    columns, jsf-scan4 at d54ec6b02)."""
-    return (not keeps and not per_key and jnp.dtype(dtype).itemsize == 2 and family is not None
-            and not family.operands_in_registers)
+    their operands from shared memory (warpgroup MMA's) and the values it holds between launches are one
+    part (`prepared`'s held form: a 16-bit call's under the `delta` rule or `rounded`). Where they read
+    registers (mma.sync's), the walk's two phases' operand fragments held its thread past its registers at
+    every tile (an sm87's and an A100's), as the output launch's two phases at once did
+    (`output._output_held`). Where its values are fp32's three parts, the walk's parts spilled it: an fp32
+    call's at an H100's widest (132 bytes at two roles of 16 columns, jsf-scan4 at d54ec6b02); an exact
+    16-bit write gate's at every tile of a B200 (84 bytes at 32 value columns and seven stages, its
+    derivation refusing twelve tiles to none, jsf-wgscan at 3dc54557fd9)."""
+    return (not keeps and not per_key and jnp.dtype(dtype).itemsize == 2 and (delta or rounded)
+            and family is not None and not family.operands_in_registers)
 
 
 def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None,
@@ -170,7 +174,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     keeps unless a remat rung recomputes them (`recurrence_chunk.RECOMPUTED`), the caller's choice."""
     dtype = jnp.result_type(q, k, v)
     scans = walks_once(dtype, per_key=g.ndim == 4, family=family_of(dtype) if family is None else family,
-                       keeps=keeps)
+                       keeps=keeps, delta=delta, rounded=rounded)
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, keeps=keeps, firsts=firsts,
                    rounded=rounded, ranged=ranged, states=not scans, forked=forked)
