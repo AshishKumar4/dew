@@ -217,7 +217,8 @@ def test_a_training_reads_draws_lay_a_row_out_to_no_fewer_tokens_than_it_states(
     # Right options far longer than a "none of the above" in their place, the others short.
     team = Choice("Which team?", {"billing": "b" * 150, "technical": "t"})
     urgency = Choice("How urgent?", {"low": "l", "high": "h" * 150})
-    examples = ([Example("x" * length, {"team": team, "urgency": urgency}, {"team": "billing", "urgency": "high"})
+    answers = {"team": "billing", "urgency": "high"}
+    examples = ([Example("x" * length, {"team": team, "urgency": urgency}, answers)
                  for length in range(0, 1200, 20)] if joint else EXAMPLES)
     layout = JointLayout(max_len=1536) if joint else LAYOUT
     heads = {"head": JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)}
