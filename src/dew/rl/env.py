@@ -204,32 +204,39 @@ def start(env: Env, key: jax.Array, memory: Memory = None) -> Carry:
     return Carry(state, step.observation, key, memory)
 
 
-def env_rollout(env: Env, policy: Policy, params: Params, carry: Carry, steps: int, *,
-                reset: bool = True) -> tuple[Carry, Transition]:
-    """`steps` steps of `policy` under `params` in `env` from `carry`, as one `lax.scan`: the carry
-    after them and each step's `Transition`, leading with the step axis `[steps, ...]`.
+def env_step(env: Env, policy: Policy, params: Params, carry: Carry, *,
+             reset: bool = True) -> tuple[Carry, Transition]:
+    """One step of `policy` under `params` in `env` from `carry`: the carry after it and the step's
+    `Transition`, the step every rollout takes (`env_rollout`'s scan, a world-model learner's collection).
 
     With `reset`, an environment whose episode ended restarts from a fresh reset of its own before
     the next step, its transition keeping the observation the episode ended at; a learned
-    environment, whose imagined episodes never restart, passes False."""
-    def one(carry: Carry, _):
-        key, act_key, reset_key = jax.random.split(carry.key, 3)
-        action, extras, memory = policy(params, carry.observation, act_key, carry.memory)
-        state, following = env.step(carry.state, action)
-        observation = following.observation
-        if reset:
-            done = following.done
+    environment, whose imagined episodes never restart, and a driven one, which restarts its own, pass
+    False."""
+    key, act_key, reset_key = jax.random.split(carry.key, 3)
+    action, extras, memory = policy(params, carry.observation, act_key, carry.memory)
+    state, following = env.step(carry.state, action)
+    observation = following.observation
+    if reset:
+        done = following.done
 
-            def restart(state, observation):
-                fresh_state, fresh = env.reset(reset_key)
-                return chosen(done, fresh_state, state), chosen(done, fresh.observation, observation)
+        def restart(state, observation):
+            fresh_state, fresh = env.reset(reset_key)
+            return chosen(done, fresh_state, state), chosen(done, fresh.observation, observation)
 
-            # A reset runs only at a step where some episode ended.
-            state, observation = jax.lax.cond(jnp.any(done), restart, lambda *held: held, state, observation)
-        recorded = Transition(carry.observation, action, extras, following)
-        return Carry(state, observation, key, memory), recorded
+        # A reset runs only at a step where some episode ended.
+        state, observation = jax.lax.cond(jnp.any(done), restart, lambda *held: held, state, observation)
+    recorded = Transition(carry.observation, action, extras, following)
+    return Carry(state, observation, key, memory), recorded
 
-    return jax.lax.scan(one, carry, None, length=steps)
+
+def env_rollout(env: Env, policy: Policy, params: Params, carry: Carry, steps: int, *,
+                reset: bool = True) -> tuple[Carry, Transition]:
+    """`steps` steps of `policy` under `params` in `env` from `carry` (`env_step`'s, `reset` as it takes
+    it), as one `lax.scan`: the carry after them and each step's `Transition`, leading with the step axis
+    `[steps, ...]`."""
+    return jax.lax.scan(lambda carry, _: env_step(env, policy, params, carry, reset=reset), carry, None,
+                        length=steps)
 
 
 def driven_step(step: TimeStep, first: jax.Array) -> TimeStep:
