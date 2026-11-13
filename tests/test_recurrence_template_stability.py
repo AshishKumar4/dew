@@ -33,7 +33,16 @@ from map_judge import sharded
 from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import REFUSED, refuses_its_gradient, taken, template_call
-from test_recurrence_stability import GRADIENT_SEEDS, REGIMES, SEEDS, SITES, cotangents, restarting, stressed
+from test_recurrence_stability import (
+    GRADIENT_SEEDS,
+    REGIMES,
+    SEEDS,
+    SITES,
+    bounded,
+    cotangents,
+    restarting,
+    stressed,
+)
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.recurrence_chunk import Chunk
@@ -138,14 +147,6 @@ def runs(fn, hooks, operands: Chunk, drawn, product: str) -> bool:
     return True
 
 
-def documents(starts) -> int | None:
-    """The most documents a row of `starts` `[B, T]` holds (every row's first token begins one), None where
-    the call packs none."""
-    if starts is None:
-        return None
-    return int(np.max(np.sum(np.asarray(starts)[:, 1:], axis=1))) + 1
-
-
 def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, product, forms):
     """Each form's 16-bit forward through the template, or its forward and gradient, under `forms`
     (`forms_of`), finite wherever the float64 recurrence's are on the regime's first draws, and on par with
@@ -165,14 +166,8 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
             return bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
 
     operands = restarting(lambda given: given, regime)(draws(0)[0])
-    # The documents a row holds, a constant of the regime's draws, which a packed call's coordinates bound
-    # (`Coordinates.max_segments`) as every model layer passes it: unbounded, the template lays a row's every
-    # token as a document's possible first (`chunk_forward._layout`), 145 chunks and 142 sequences for resets
-    # on chunk edges' 140 tokens where their 18 documents take 23 and 20; interpreted, that regime's six
-    # cases took 691 s of a five-draw map task, 519 bounded (row 5906).
-    bound = documents(operands.starts)
-    mosaic = functools.partial(chunk_on, 'mosaic_gpu', hooks, max_segments=bound)
-    reference = functools.partial(reference_arm(hooks, forms), max_segments=bound)
+    mosaic = functools.partial(chunk_on, 'mosaic_gpu', hooks, **bounded(regime))
+    reference = functools.partial(reference_arm(hooks, forms), **bounded(regime))
     exact = functools.partial(token_by_token, hooks)
     if product == 'forward':
         dew, truth = mosaic, exact
