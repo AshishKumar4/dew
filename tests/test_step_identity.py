@@ -110,7 +110,7 @@ def test_an_exact_resume_refuses_a_function_step_whose_code_changed(tmp_path, mo
     """A function outside Dew that declares no identity, a step or the factory that configured one, is
     what its code computes, which its module's bytes name: rewritten to make other rows, it refuses an
     exact resume, where the plan names the step and where a memory read's rows name the steps that made
-    them, and reads on under resume='non-exact'; unchanged, it resumes exactly (row 3938)."""
+    them, and reads on under resume='relaxed'; unchanged, it resumes exactly (row 3938)."""
     module = tmp_path / f"shift_{uuid4().hex}.py"
     module.write_text(SHIFT.format(by=1))
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -127,7 +127,7 @@ def test_an_exact_resume_refuses_a_function_step_whose_code_changed(tmp_path, mo
     importlib.reload(shift)
     with pytest.raises(ValueError):
         resumed_changes(reader(), state)
-    assert resumed_changes(reader("non-exact"), state) == ("modules",)
+    assert resumed_changes(reader("relaxed"), state) == ("modules",)
 
 
 def test_a_function_step_that_declares_its_identity_resumes_exactly_over_a_change_to_its_code(

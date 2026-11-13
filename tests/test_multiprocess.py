@@ -1002,7 +1002,7 @@ def test_a_pool_whose_processes_fetched_other_records_is_refused_before_it_train
     # The same pool over a server that answers every url trains (`online_checkpoint`); this one
     # observed no step and saved none.
     assert [(report["refused"], report["observed"], report["written_steps"]) for report in reports] == [
-        ("ValueError", [], [])] * 2
+        ("PoolDiffers", [], [])] * 2
 
 
 @pytest.fixture(scope="module")
@@ -1894,7 +1894,7 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
                        else (("RuntimeError", False), ("PeerFailure", False)))
             assert (failed["error"], failed["own"]) in allowed, (failure, report)
             assert failure in report["closed"]
-        assert report["results"]["mismatched_plan"]["error"] == "ValueError", report
+        assert report["results"]["mismatched_plan"]["error"] == "PoolDiffers", report
 
 
 @pytest.mark.distributed
@@ -2093,15 +2093,25 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
     logged = reports[0]
     assert logged["same"]["steps"] == logged["saved"]["steps"] == [1, 2] and logged["ended"]["steps"] == [1]
     assert logged["eof"]["steps"] in ([], [1]) and all(logged[case]["steps"] == [] for case in before), logged
-    for report in reports:
+    differs = {"type": "PoolDiffers", "phase": "training data", "named": 1}
+    for rank, report in enumerate(reports):
         # The controls train: one corpus, a saved run, and streams that run out together end there.
         assert all(report[case]["refused"] is None for case in ("same", "saved", "ended")), report
         assert report["latest"] == 2, report
-        # What the processes hold apart, every process refuses before any step logs; a stream one process
-        # ends refuses where it ends, past the steps both read; a listing older than the pool's newest
-        # checkpoint restores nothing.
-        assert all(report[case]["refused"] is not None for case in (*before, "eof")), report
-        assert report["stale"]["refused"] is not None and report["stale"]["restored"] is None, report
+        # What the processes hold apart, every process refuses before any step logs, by the agreement it
+        # failed and the process that held otherwise: process 1 differs however its copy is described or
+        # named; its read failed, which it refuses with its own error and process 0 with the rank that failed.
+        assert all(report[case]["refused"] == differs for case in ("content", "named", "count")), report
+        failed = {"type": "PeerFailure", "phase": "training read", "named": 1}
+        own = {"type": "ValueError", "phase": None, "named": None}
+        assert report["first_read"]["refused"] == (failed if rank == 0 else own), report
+        assert report["layout"]["refused"] == {"type": "PoolDiffers", "phase": "training batch layout",
+                                               "named": 1}
+        # A stream one process ends refuses where it ends, past the steps both read; a listing older than
+        # the pool's newest checkpoint restores nothing.
+        assert report["eof"]["refused"] == {"type": "StreamsEnded", "phase": "training read", "named": 1}
+        newest = {"type": "PoolDiffers", "phase": "newest checkpoint", "named": 1}
+        assert report["stale"] == {"refused": newest, "restored": None}, report
 
 
 

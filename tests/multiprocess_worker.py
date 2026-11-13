@@ -32,7 +32,7 @@ from pool_records import (
     online_pipeline,
     replicated_loader,
 )
-from process_support import serve_mode, worker_parser
+from process_support import refusal, serve_mode, worker_parser
 from rl_support import pooled_rollout, rollout_prompts
 
 from dew.data import Loading
@@ -677,9 +677,9 @@ def mode_pool_refusals(args) -> dict:
     runs out after one batch there, and a batch without a field. A resume
     from a newest checkpoint the processes list differently is refused as
     well, and streams that run out after one batch on both end the fit
-    there. Each outcome is what the fit ended in: the error's type it was refused with and the steps it
-    took first, or None and its steps for a fit that trained; then every process passes one more
-    agreement, which a rank left behind would block."""
+    there. Each outcome is what the fit ended in: the refusal it was refused with (its type, the agreement
+    and the process it names: `refusal`) and the steps it took first, or None and its steps for a fit that
+    trained; then every process passes one more agreement, which a rank left behind would block."""
     import jax
     import optax
     from affine_run import FEATURES, Regression
@@ -738,7 +738,7 @@ def mode_pool_refusals(args) -> dict:
             trainer.fit(data, steps=2, log_every=1, **flags)
             refused = None
         except (ValueError, RuntimeError) as error:
-            refused = type(error).__name__
+            refused = refusal(error)
         steps = [step for step, scalars in heard.scalars if "train/loss" in scalars]
         return {"refused": refused, "steps": steps}
 
@@ -767,7 +767,7 @@ def mode_pool_refusals(args) -> dict:
     try:
         outcomes["stale"] = {"refused": None, "restored": int(resumed.place()[0].step)}
     except (ValueError, RuntimeError) as error:
-        outcomes["stale"] = {"refused": type(error).__name__, "restored": None}
+        outcomes["stale"] = {"refused": refusal(error), "restored": None}
     _coordination.agreed("the pool after its refusals", lambda: True)
     return outcomes
 
@@ -2291,20 +2291,26 @@ def mode_decision_publish(args) -> dict:
 def mode_matrix(args) -> dict:
     """Train one cell of the data matrix (`--cell read,cache,rejecting,packed`)
     for `--steps`, from where the run directory's checkpoint left it. `batches`
-    is a digest of each batch this process read, in the order it read them."""
+    is a digest of each batch this process read, in the order it read them;
+    `restarted` what its resume found differing in its saved data plan, where
+    its data started again (`DataRestarted`, which process 0 reports), else None."""
+    from recording import RecordingTracker
+
     from dew.data.dataset import tapped
+    from dew.telemetry.records import DataRestarted
 
     read, cached, rejecting, packed = args.cell.split(",")
     # A published cell reads the generation its test published once (`--prepared`), as every run of a
     # prepared dataset does; a cache the pool fills lives beside its run.
     cache_dir = Path(args.prepared) if cached == "published" else Path(args.run_dir).parent / "cache"
     data = matrix_data(read, cached, rejecting == "rejecting", packed == "packed", cache_dir)
-    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
+    recorded = RecordingTracker()
+    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, tracker=recorded)
+    restored_step = None if trainer.checkpoints.latest is None else trainer.checkpoints.latest
     batches = []
     train = tapped(data.train, lambda batch: batches.append(hashlib.sha256(b"".join(
         np.ascontiguousarray(batch[name]).tobytes() for name in sorted(batch))).hexdigest()))
     try:
-        restored_step, _ = restored_state(trainer)
         state = trainer.fit(Loader(train, None, batch=BATCH, records=MATRIX_RECORDS),
                             steps=args.steps, log_every=1,
                             checkpoint_every=args.save_every)
@@ -2320,7 +2326,8 @@ def mode_matrix(args) -> dict:
     _, position = restored_state(trainer)
     return {"step": int(as_numpy(state.step)), "restored_step": restored_step,
             "lowering": None if data.plan is None else data.plan.lowering, "dataset_state": position,
-            "batches": batches}
+            "batches": batches, "restarted": next((list(value.differs) for _, value in recorded.artifacts
+                                                   if isinstance(value, DataRestarted)), None)}
 
 
 MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit": mode_schedule_fit,

@@ -82,7 +82,7 @@ Library stages are values of these shapes. `images.Resize(256)` is a `RecordFn` 
 | `from_iter(factory, identity=None, state=, load_state=)` | Any resumable iterator: WebDataset, torchdata, Mosaic Streaming, Ray | the library's own state |
 | `from_iter(factory, replay=True)` | An iterator that reads the same records each time `factory()` opens it | replay to the count read, guarded by the last batch's digest |
 
-A torch, Grain or iterator source holds no content version of its own. Given `identity=`, its content version, its plan names it, an exact resume finds the same records, and a cache keys it. Given none, it trains as well, but nothing says a later run reads the same records: resuming its position takes `resume="non-exact"`, and a cache of it is refused.
+A torch, Grain or iterator source holds no content version of its own. Given `identity=`, its content version, its plan names it, an exact resume finds the same records, and a cache keys it. Given none, it trains as well, but nothing says a later run reads the same records: a relaxed resume (the default, below) reads on from its position, an exact one refuses it, and a cache of it is refused.
 
 Preparing a Hub dataset happens on first use, with one log line naming what is prepared and its size. `.read("memory" | "indexed" | "streamed")` overrides how it is read.
 
@@ -515,7 +515,33 @@ A plan of 13 records no rules, and reads by 13's: steps named by their printing,
 their corpora from their start. A run's resume compiles its data at the version it saved (its record's
 `data_plan_version`), and a per-share position of 13 resumes in a read compiled at 14 as 13 read it.
 
-A callable without a stable identity makes exact replay unavailable. A declared identity is required at a persistent cache boundary; opting into non-exact resume is explicit. A newly completed cache never changes a stopped run's saved lowering or order. Reading its generation is a new run's choice.
+#### Resuming data: relaxed or exact
+
+A run chooses how its resume treats its data (`TrainerConfig.data_resume`; on the command line
+`--set trainer.data_resume=exact`). Either way its
+parameters, optimizer state, step, schedule and random state resume as they were saved; the choice is the
+data's alone.
+
+- `relaxed`, the default: the data goes on at its saved position where its plan still makes the same rows
+  (a source or step with no identity is taken as unchanged). Where the plan differs (a rule, a fact, the
+  order, the sources or steps, the topology, or a version this Dew does not read), the stream starts again
+  from the beginning of its order, and the run says so: a warning names each part that differs, and the
+  run's records hold it (`DataRestarted`). It guarantees the model's state, not which rows come next. Data
+  read in stages starts again at the stage the run's progress stands in, opened at that stage's own start,
+  every boundary still where the run's progress places it: phases on the step clock at the run's step,
+  phases of one global order and a batch ramp at the records the run read, a token schedule's at the
+  committed tokens (a global position's `origin` holds how far into its phase the stage's reader opened).
+  A run bounded in examples ends at the step its own count reaches the bound, that step's rows trained whole,
+  so it may count past the bound by part of its last batch.
+- `exact`: any difference refuses the resume, naming it, and a source or step with no identity is refused
+  too, since nothing checks it. It guarantees the rows that come next are the ones the saved run would have
+  read.
+
+`compile(..., resume=)` takes the same two values for a loader compiled by hand: `relaxed` reads on from a
+source with no identity, and a differing plan raises `PlanChanged`, naming what differs, which a run's
+relaxed resume catches.
+
+A callable without a stable identity makes exact replay unavailable. A declared identity is required at a persistent cache boundary. A newly completed cache never changes a stopped run's saved lowering or order. Reading its generation is a new run's choice.
 
 ### Rejection and accounting
 

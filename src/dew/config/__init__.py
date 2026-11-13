@@ -970,6 +970,10 @@ class RunConfig:
                          and now.get(name) != before.get(name))
         if "objective" in changed and _learns_alike(recorded.objective, self.objective):
             changed.remove("objective")
+        # A relaxed resume reads by this Dew's data plan where the saved run's is none it reads, its data
+        # started again (`resumed`): its state resumes as it trained.
+        if "data_plan_version" in changed and self.trainer.data_resume == "relaxed":
+            changed.remove("data_plan_version")
         if recorded.trainer.quantization != self.trainer.quantization:
             changed.append("trainer.quantization")
         if recorded.trainer.precision != self.trainer.precision:
@@ -1115,7 +1119,8 @@ class RunConfig:
         """This run with each field it leaves None for its build to resolve (`BUILT`, or those of them
         `paths` names) at the value the saved run it resumes under its name recorded, read as every
         earlier shape of a saved run is (`earlier_run`), and its data plan version, where it resumes no
-        run that recorded one, this Dew's (`PLAN_VERSIONS`): the one place a run's version is resolved,
+        run that recorded one, or a relaxed resume (`TrainerConfig.data_resume`) one that recorded a version
+        this Dew reads none of, this Dew's (`PLAN_VERSIONS`): the one place a run's version is resolved,
         on each path a run trains by (`prepare`, and `readied`, which a run trained in Python reaches
         alone), before its data compiles or its record is written; and, resolving every field (no
         `paths`), as `prepare` does before it builds them, each class it names, its model's and its
@@ -1140,7 +1145,10 @@ class RunConfig:
                 run = self.override({path: _recorded_at(recorded, path) for path in unset
                                      if _holds(recorded, path)})
                 run = run._defaulted_as(recorded) if defaulting else run
-        if "data_plan_version" in built and run.data_plan_version is None:
+        # A relaxed resume of a run saved under a version this Dew reads none of reads by this Dew's, its
+        # data started again (`dew.training.Trainer._data_resumed`); an exact one is refused by it.
+        if "data_plan_version" in built and (run.data_plan_version is None or (
+                trainer.data_resume == "relaxed" and run.data_plan_version not in PLAN_VERSIONS)):
             run = dataclasses.replace(run, data_plan_version=PLAN_VERSIONS[-1])
         return run
 
@@ -1228,6 +1236,7 @@ class RunConfig:
         assert planned is not None
         trainer = self.trainer
         return fitted(dataset, validation, objective=objective, seed=self.data_seed, plan_version=planned,
+                      resume=trainer.data_resume,
                       examples=trainer.examples, epochs=trainer.epochs, steps=trainer.steps,
                       tokens=trainer.tokens)
 
@@ -1638,7 +1647,7 @@ class RunConfig:
             dynamic_scale=(self.compute_dtype() == "float16" if trainer.dynamic_scale is None
                            else trainer.dynamic_scale), rollout=rollout,
             tune_kernels=trainer.tune_kernels, param_dtype=self.drawn_dtype(), inspection=trainer.inspection,
-            diloco=trainer.diloco, **{"links": trainer.links, **resources})
+            diloco=trainer.diloco, data_resume=trainer.data_resume, **{"links": trainer.links, **resources})
 
     def compute_dtype(self) -> str:
         """The dtype the run's model computes in: the one its record states, else its numerics'
