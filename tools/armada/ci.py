@@ -1168,7 +1168,7 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
         rows_of = [(name, "") for name in timed if name not in groups] + [
             (name, group) for name, cut in groups.items() for group, _ in cut] + [
             (name, test) for name, held in marked.items() for test in held]
-        found = reusable(python, rows_of, shared(python)) if cache == "on" else {}
+        found = reusable(python, rows_of, shared(python)) if cache != "off" else {}
         # A lookup a row, in seconds: a kept task's weight is its container's start and those lookups.
         tasks: list[tuple[list[tuple[str, str]], float]] = [
             (held, float(len(held))) for held in kept_tasks(python, found, target)]
