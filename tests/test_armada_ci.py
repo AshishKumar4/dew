@@ -1019,7 +1019,8 @@ def test_a_split_file_keeps_its_stored_cut_and_its_groups_records_whatever_armad
     (tmp_path / "runs").write_text("")
     assert run(measured) == groups
     assert (tmp_path / "runs").read_text() == ""
-    # Main's CI ran the stored cut green within its bounds: the fold keeps it; run whole, it drops it.
+    # Main's CI ran the stored cut green within its bounds: the fold keeps it; run whole within them, it
+    # drops it.
     main_ci = tmp_path / ".verdict/main.json"
     main_ci.write_text(json.dumps({"sha": base, "part": "all", "rows": [
         {"name": "3.12:tests/test_steady.py#1/2", "exitCode": 0, "seconds": 310.0,
@@ -1030,8 +1031,8 @@ def test_a_split_file_keeps_its_stored_cut_and_its_groups_records_whatever_armad
     assert ci.main() == 0
     assert json.loads((tmp_path / "tests/test_cuts.json").read_text()) == {"tests/test_steady.py": [nodes[1]]}
     main_ci.write_text(json.dumps({"sha": base, "part": "all", "rows": [
-        {"name": "3.12:tests/test_steady.py", "exitCode": 0, "seconds": 500.0,
-         "tests": {nodes[0]: 300.0, nodes[1]: 100.0, nodes[2]: 100.0}}]}))
+        {"name": "3.12:tests/test_steady.py", "exitCode": 0, "seconds": 400.0,
+         "tests": {nodes[0]: 250.0, nodes[1]: 75.0, nodes[2]: 75.0}}]}))
     assert ci.main() == 0
     assert json.loads((tmp_path / "tests/test_cuts.json").read_text()) == {}
 

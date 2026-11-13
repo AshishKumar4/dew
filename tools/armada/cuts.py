@@ -109,25 +109,25 @@ def ran(rows: Mapping[str, list[dict]]) -> dict[str, list[float]]:
 def refolded(session, stored: Mapping[str, list[str]], runs: Mapping[str, list[float]], target: float,
              before: Mapping[str, dict[str, float]],
              after: Mapping[str, dict[str, float]]) -> dict[str, list[str]]:
-    """The stored cuts (session.CUTS) after main's CI ran each file as `runs` says (`ran`). A file it ran as
-    its stored cut's groups keeps that cut while every group took within `KEPT` of `target`, setup and all;
-    past that it is cut anew from the folded record (`after`: each file's own tests, node id to seconds), as
-    `split` cuts a file it has no cut for, and stores that. A file it ran as another count stores the cut that
-    run made from the record it was cut by (`before`). Each group's first test is its boundary; a file it ran
-    whole, or cut into a group that holds none of its recorded tests, stores none; a file it did not run keeps
-    its own. The fold is the one place a cut changes (Main, 2026-11-13: a group's name means the same tests
-    from run to run, so its record is found again)."""
+    """The stored cuts (session.CUTS) after main's CI ran each file as `runs` says (`ran`), every group within
+    `KEPT` of `target`, setup and all: a file it ran as its stored cut keeps it; one it ran as another cut
+    stores that cut, made from the record it was cut by (`before`: each file's own tests, node id to seconds).
+    A group past that cuts the file anew from the folded record (`after`), as `split` cuts a file it has no
+    cut for. Each group's first test is its boundary; a file run whole within its bound, or cut into a group
+    that holds none of its recorded tests, stores none; a file it did not run keeps its own. The fold is the
+    one place a cut changes (Main, 2026-11-13: a group's name means the same tests from run to run, so its
+    record is found again)."""
     kept = dict(stored)
     for name, seconds in runs.items():
         bounds = stored.get(name)
-        if bounds is not None and len(bounds) + 1 == len(seconds):
-            if max(seconds) <= KEPT * target:
+        if max(seconds) <= KEPT * target:
+            if bounds is not None and len(bounds) + 1 == len(seconds):
                 continue
+            own, count = before.get(name, {}), len(seconds)
+        else:
             own = after.get(name, {})
             units = session.unit_seconds(list(own), list(own.values()))
             count = len(split(session, units, sum(seconds), target)) if own else 1
-        else:
-            own, count = before.get(name, {}), len(seconds)
         kept.pop(name, None)
         if count > 1 and own:
             groups = session.cut(list(own), list(own.values()), count)
