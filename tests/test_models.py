@@ -434,9 +434,13 @@ def test_dropout_is_active_in_train_mode(rng, stack):
                   mlp_ratio=2, dropout_rate=0.5)
     x, temb, textcontext = small_inputs(rng)
     params = model.init(rng, x, temb, textcontext)
-    # nudge every param off init: the zero-initialized adaLN gates and final
-    # projection make a fresh DiT output exactly zero, hiding dropout
-    params = jax.tree.map(lambda p: p + 0.02, params)
+    # nudge every param off init by a drawn amount: the zero-initialized adaLN gates and final projection
+    # make a fresh DiT output exactly zero, hiding dropout, and one nudge for every weight leaves each
+    # row's features alike, which a layer norm maps to zero whatever was dropped
+    leaves, tree = jax.tree.flatten(params)
+    keys = jax.random.split(rng, len(leaves))
+    params = jax.tree.unflatten(tree, [leaf + 0.02 * jax.random.normal(key, leaf.shape, leaf.dtype)
+                                       for leaf, key in zip(leaves, keys, strict=True)])
 
     d0 = model.apply(params, x, temb, textcontext, train=True, rngs={"dropout": jax.random.PRNGKey(1)})
     d1 = model.apply(params, x, temb, textcontext, train=True, rngs={"dropout": jax.random.PRNGKey(2)})
