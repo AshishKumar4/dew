@@ -213,7 +213,7 @@ def test_a_quantization_aware_forward_is_on_par_with_the_releases(source, quanti
 
 CACHED_LEAVES = ("prompt_logits", "decode_logits", "draft_logits", "draft_confidence")
 """The recorded cached run's leaves (tools/deepseek_v41_reference.py `cached_evaluated`): its draft ids are
-its draft logits' argmax, which the rows' margins hold apart (`cached_rows`)."""
+its draft logits' argmax, which the rows' margins hold apart (`cleared_cached_run`)."""
 
 
 def cached_leaves(model, variables, ids, prompt: int, captured: list | None = None) -> dict[str, np.ndarray]:
@@ -227,51 +227,50 @@ def cached_leaves(model, variables, ids, prompt: int, captured: list | None = No
     return dict(zip(CACHED_LEAVES, (prompt_logits, steps, draft_logits, confidence), strict=True))
 
 
-@pytest.fixture(scope="module")
-def cached_rows(source):
-    """The rows the recorded cached run drew (recording_rows.npz), each of whose selections and fed argmaxes
-    the release's cleared by twice `selection_margins.MARGIN` when it was recorded (`clearing_cached_rows`),
-    and Dew's own cached run clears MARGIN by: every selection its calls make, the trunk's top-k and each
-    DSpark stage's experts, captured as they run (`cached_run`'s `captured`), the main logits' argmax at the
-    prompt's last position and every step, which DSpark drafts from, and each draft's at every position
-    but its last, which the next position reads. So Dew's float32 run and its float64 one decide alike."""
+def cleared_cached_run(model, variables, config, ids, prompt: int, label: str) -> dict:
+    """Dew's cached run of `ids` (`cached_leaves`), each of whose selections and fed argmaxes clears
+    `selection_margins.MARGIN`: every selection its calls make, the trunk's top-k and each DSpark stage's
+    experts, captured as they run (`cached_run`'s `captured`), the main logits' argmax at the prompt's last
+    position and every step, which DSpark drafts from, and each draft's at every position but its last,
+    which the next position reads. The release's cleared twice MARGIN where it recorded the rows
+    (`clearing_cached_rows`), so Dew's float32 run and its float64 one decide alike; a row Dew's run does
+    not clear is refused, its verdict not one of the release's computation."""
     import selection_margins
 
-    loaded, plain, reference = source
-    prompt = int(reference["decode_prompt"])
-    with np.load(TINY / "recording_rows.npz") as stored:
-        rows = stored["cached_rows"]
-    for index, row in enumerate(rows):
-        captured: list = []
-        leaves = cached_leaves(plain, loaded.variables, row, prompt, captured)
-        label = f"cached row {index}"
-        fed = (np.asarray(leaves["prompt_logits"])[:, -1:], np.asarray(leaves["decode_logits"]),
-               np.asarray(leaves["draft_logits"])[:, :, :-1])
-        smallest = min(min(selection_margins.margin(loaded.model_config, call, label) for call in captured),
-                       *(float(selection_margins.top_margin(logits, 1).min()) for logits in fed))
-        assert smallest > selection_margins.MARGIN, f"{label}: Dew's clear {smallest:.3g}"
-    return rows
+    captured: list = []
+    leaves = cached_leaves(model, variables, ids, prompt, captured)
+    fed = (np.asarray(leaves["prompt_logits"])[:, -1:], np.asarray(leaves["decode_logits"]),
+           np.asarray(leaves["draft_logits"])[:, :, :-1])
+    smallest = min(min(selection_margins.margin(config, call, label) for call in captured),
+                   *(float(selection_margins.top_margin(logits, 1).min()) for logits in fed))
+    assert smallest > selection_margins.MARGIN, f"{label}: Dew's clear {smallest:.3g}"
+    return leaves
 
 
-@pytest.mark.shared_setup("cached_rows")
-def test_a_cached_run_and_its_drafts_are_on_par_with_the_releases(source, cached_rows):
+# The recording's declared 32 seeds, a stage's 32 draws a map task: a draw takes about 4.5 s in the two arms
+# (2026-11-13, cached-cost1) beside a task's 85 s of setup, so a task of 32 draws runs within the plan's site
+# targets (v41-fit2: 226 to 233 s) where 8 a task spent half its seconds on setup (v41-fit1).
+@pytest.mark.check1_shards(seeds=32, per_task=32)
+def test_a_cached_run_and_its_drafts_are_on_par_with_the_releases(source):
     """The release's driver through Dew's cache (`cached_leaves`): the prefill of the prompt, each
     teacher-forced step's logits after it and DSpark's draft after each, fed the step's argmax, its logits
-    and confidence, over drawn rows whose every selection and fed argmax clears, on par with the release's
-    from its float64 run's (check 1, the recording's)."""
+    and confidence, over drawn rows whose every selection and fed argmax clears (`cleared_cached_run`), on
+    par with the release's from its float64 run's (check 1, the recording's)."""
     from model_support import float64_twin, recorded_site
 
     loaded, plain, reference = source
     prompt = int(reference["decode_prompt"])
     wide = float64_twin(plain)
+    with np.load(TINY / "recording_rows.npz") as stored:
+        rows = stored["cached_rows"]
 
     @as_given
     def twin(inputs):
         return cached_leaves(wide, float64_held(loaded.variables), inputs["input_ids"], prompt)
 
     site = "deepseek v41 plain cached"
-    draw, recorded, truth, seeds = recorded_site(RECORDING, site,
-                                                 lambda seed: {"input_ids": cached_rows[int(seed)]}, twin)
-    assert_as_exact(as_given(lambda index, inputs: cached_leaves(plain, loaded.variables, inputs["input_ids"],
-                                                                 prompt)),
-                    recorded, draw, site, seeds=seeds, truth_fn=truth)
+    draw, recorded, truth, seeds = recorded_site(RECORDING, site, lambda seed: {"input_ids": rows[int(seed)]},
+                                                 twin)
+    assert_as_exact(as_given(lambda index, inputs: cleared_cached_run(
+        plain, loaded.variables, loaded.model_config, inputs["input_ids"], prompt, f"cached row {index}")),
+        recorded, draw, site, seeds=seeds, truth_fn=truth)
