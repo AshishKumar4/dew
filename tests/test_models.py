@@ -729,6 +729,73 @@ def test_a_layer_norms_variance_is_its_centered_mean_square():
                     truth_fn=normalized(nn.LayerNorm(epsilon=1e-5, dtype=jnp.float64)))
 
 
+TOWER_NORM_SEEDS = 8
+"""The tower norms' declared seeds for check 1 (`assert_as_exact`)."""
+
+
+def _tower_layout(tower):
+    """`tower`'s tiny layout (`ViTLayout`) of one layer 32 wide, as its module builds it; None for CLIP's
+    text tower, whose block is `clip_layer`'s own."""
+    from dew.nn.autoencoders.rae import RepresentationEncoder
+    from dew.nn.vision.llama4 import Llama4Vision
+    from dew.nn.vision.qwen35 import Qwen35Vision
+    from dew.nn.vision.siglip import SiglipVision
+
+    sizes = {"hidden_size": 32, "intermediate_size": 64, "num_heads": 2, "patch_size": 8}
+    return {"clip text": lambda: None,
+            "siglip": lambda: SiglipVision(num_layers=1, image_size=16, **sizes).layout(),
+            "llama4": lambda: Llama4Vision(num_layers=1, image_size=16, **sizes).layout(),
+            "qwen35": lambda: Qwen35Vision(depth=1, num_position_embeddings=4, **sizes).layout(),
+            "rae": lambda: RepresentationEncoder("siglip2", width=32, layers=1, patch=8,
+                                                 input_size=16).layout()}[tower]()
+
+
+@pytest.mark.parametrize("tower", ["clip text", "siglip", "llama4", "qwen35", "rae"])
+def test_a_towers_layer_norms_read_rows_as_torch_s_do(tower):
+    """Each tower's block normalizes its input as torch's LayerNorm does, every tower's reference being
+    torch's: over rows a hundred from zero at a spread of one, where flax's one-pass E[x^2] - E[x]^2
+    cancels in fp32, the block's first norm's output (`input_layernorm`) is on par (check 1) with torch's
+    float32 LayerNorm of the same rows at that norm's parameters, from their float64."""
+    import torch
+
+    from dew.nn.inputs import AttentionMetadata
+    from dew.nn.text_encoders import clip_layer
+    from dew.nn.vision.vit import vit_block
+
+    layout = _tower_layout(tower)
+    block = (clip_layer(32, 2, 64, 8) if layout is None
+             else vit_block(layout, 0, dtype=jnp.float32, precision=None))
+    eps = 1e-5 if layout is None else layout.norm_eps
+    rotary = layout is not None and layout.rotary is not None
+    metadata = AttentionMetadata(rotary_positions=jnp.zeros((2, 8, 2), jnp.int32)) if rotary else None
+    rows = jnp.zeros((2, 8, 32), jnp.float32)
+    params = block.init(jax.random.key(0), rows, attention_metadata=metadata)["params"]
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 3)
+        return (np.asarray(jax.random.normal(keys[0], rows.shape, jnp.float32) + 100.0),
+                np.asarray(1.0 + 0.1 * jax.random.normal(keys[1], (32,), jnp.float32)),
+                np.asarray(0.1 * jax.random.normal(keys[2], (32,), jnp.float32)))
+
+    def normalized(x, scale, bias):
+        held = {**params, "input_layernorm": {"scale": scale, "bias": bias}}
+        _, state = block.apply({"params": held}, x, attention_metadata=metadata, capture_intermediates=True,
+                               mutable=["intermediates"])
+        return state["intermediates"]["input_layernorm"]["__call__"][0]
+
+    def torch_s(x, scale, bias):
+        x, scale, bias = (torch.from_numpy(np.asarray(each)) for each in (x, scale, bias))
+        return torch.nn.functional.layer_norm(x, (32,), scale, bias, eps=eps).numpy()
+
+    def truth(x, scale, bias):
+        x = np.asarray(x, np.float64)
+        centered = x - x.mean(-1, keepdims=True)
+        return centered / np.sqrt((centered ** 2).mean(-1, keepdims=True) + eps) * scale + bias
+
+    assert_as_exact(normalized, as_given(torch_s), draw, f"{tower} tower norm", seeds=TOWER_NORM_SEEDS,
+                    truth_fn=as_given(truth))
+
+
 def test_a_group_norm_narrower_than_its_input_normalizes_at_its_own_width(rng):
     """A float64 input under a float32 group norm is normalized at the module's width, statistics and
     affine result alike, as flax's GroupNorm of that dtype normalizes it (its centered variance), the
