@@ -951,6 +951,25 @@ def _gpt_oss_projected():
     return step, (shaped((512, 2880)), shaped((4, 2880, 2880)), jax.ShapeDtypeStruct((4,), jnp.int32))
 
 
+@lowers("sm80")
+def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds():
+    """An A100's GEMM, its forward and its gradients at the gate's tiles, issues each cp.async copy without a
+    source size (`cp.async`'s `src-size`, a bounds check a transfer): its launch extends every operand its
+    blocks read past, so its specs promise their copies in bounds (`mosaic_sm80`'s `oob_fill_mode`), where a
+    pipeline that checks a block sliced from a dynamically started view (the fork's zero-fill) would bound
+    every transfer of the sm80 cells, unchanged at their pin otherwise."""
+    from kernel_compile import PTX, compile_mosaic_kernels
+
+    cases = [each.case for form in ("forward", "input gradient", "kernel gradient")
+             for each in _gate_cases("sm80", form)]
+    found = compile_mosaic_kernels(cases, "sm80")
+    modules = [kernel["module"] for record in found for kernel in record.get("kernels", ())]
+    copies = [line for module in modules for line in PTX.get(module, "").splitlines() if "cp.async.c" in line]
+    assert copies, modules
+    bounded = [line.strip() for line in copies if re.search(r"\],\s*\d+,\s*%r", line)]
+    assert not bounded, bounded[:4]
+
+
 def test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it():
     """gpt-oss-120b's 2880-wide expert projection, forward and backward, the template named, compiled for a
     compile-only A100: its program launches the template's grouped product and kernel gradient, a product

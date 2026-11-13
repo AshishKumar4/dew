@@ -659,9 +659,12 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 slots = mosaic.WholeSlots(dict(zip(names, refs[:-1], strict=True)))
                 return step(index + lo, slots, carried, accumulators)
 
-            # A tile's blocks staged swizzled for ldmatrix (`_staging`).
+            # A tile's blocks staged swizzled for ldmatrix (`_staging`), each read inside its operand: its
+            # launch extends every operand its rows read past (`bounded_loads`, `mosaic_gpu._walked_rows`),
+            # so cp.async's copies are promised in bounds, unchecked.
             specs = [plgpu.BlockSpec(blocks[name][0], functools.partial(_at, streams.views[name][1], lo),
-                                     transforms=_staging(blocks[name], streams.pipeline.swizzles.get(name)))
+                                     transforms=_staging(blocks[name], streams.pipeline.swizzles.get(name)),
+                                     oob_fill_mode=plgpu.OOBFillMode.PROMISE_IN_BOUNDS)
                      for name in names]
             pipeline = plgpu.emit_pipeline(body, grid=(hi - lo,), in_specs=specs,
                                            max_concurrent_steps=streams.pipeline.stages, init_carry=carry)
