@@ -1304,6 +1304,8 @@ pyqwest==0.10.0
     # via
     #   connectrpc
     #   e2b
+pystack==1.7.2 ; sys_platform == 'linux'
+    # via dewml (pyproject.toml)
 pytablewriter==1.2.1
     # via lm-eval
 pytest==9.1.1

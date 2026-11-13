@@ -7,6 +7,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -249,10 +250,15 @@ def test_a_task_says_each_red_row_last_where_armada_keeps_its_tail(ci, tmp_path,
     assert "the sum is wrong" in said[red + 1] and "  | ..." in said[red:]
 
 
-def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci, tmp_path):
+def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci, tmp_path, monkeypatch):
     """A pytest an abort ends (a native library's, here os.abort) keeps its whole output and its processes'
     native stacks among the task's artifacts, named on its red row, so the cause is read from what it left
-    (row 5801: train 788's abort left faulthandler's Python stacks and no native frame; owner, 2026-11-13)."""
+    (row 5801: train 788's abort left faulthandler's Python stacks and no native frame; owner, 2026-11-13).
+    The capture's own scratch (its pipe and what it read) goes once the stacks are read (review of train 791,
+    F7)."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_any.py": "import os\n\n\ndef test_aborts():\n    print('before the abort')\n"
                                       "    os.abort()\n"})
@@ -265,6 +271,7 @@ def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci,
     # then every signalled process's native stacks, read from outside it.
     assert "Fatal Python error: Aborted" in record and "test_any.py" in record
     assert "ended by signal 6" in record.split("== native stacks", 1)[1]
+    assert not list(scratch.glob("dew-capture-*"))
 
 
 def test_a_worker_a_signal_ends_keeps_its_native_stacks_though_pytest_exits_red(ci, tmp_path):

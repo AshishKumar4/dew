@@ -7,11 +7,11 @@ only where CI keeps the whole output and a native backtrace of any task a signal
 A collector (`collect`) starts before pytest, outside it. A small library preloaded into every test process
 (`SHIM`) catches those signals after faulthandler has written the Python stacks (faulthandler puts back the
 action it found and raises the signal again) and does only what is safe in a dying process: it writes its id
-to the collector's pipe and waits, bounded, for the collector's word that py-spy has read every thread's
-native and Python frames from outside it; then it dies by the same signal, so the exit is unchanged. Nothing
-runs in the faulting process that could need a lock it holds (no fork, no allocation, no unwinding in it). The
-library is built with the container's C compiler once a process; where none builds it, or no collector runs,
-the task says so and runs as before."""
+to the collector's pipe and waits, bounded, for the collector's word that pystack (py-spy where it reads none)
+has read every thread's native and Python frames from outside it; then it dies by the same signal, so the exit
+is unchanged. Nothing runs in the faulting process that could need a lock it holds (no fork, no allocation, no
+unwinding in it). The library is built with the container's C compiler once a process; where none builds it,
+or no collector runs, the task says so and runs as before."""
 
 import functools
 import os
@@ -102,14 +102,9 @@ __attribute__((constructor)) static void armed(void) {
 """
 """The preloaded library's source: its handler, armed as each process loads it, before Python's faulthandler.
 """
-PYSTACK = ("uv", "tool", "run", "--quiet", "--from", "pystack==1.7.2", "pystack")
-"""Bloomberg's pystack, which unwinds every OS thread of a live process from outside it, native frames and
-Python frames both, a thread with no Python state too (an XLA worker's abort): py-spy's native mode reads only
-the threads Python knows (review, 2026-11-13). Fetched by uv into its cache as a run's collector starts
-(`collect`), so a crash waits on no download."""
 COLLECT_SECONDS = 60
-"""How long a dying process waits for its stacks to be read (`SHIM`), and py-spy has to read them (`collect`).
-"""
+"""How long a dying process waits for its stacks to be read (`SHIM`), and pystack or py-spy has to read them
+(`collect`)."""
 
 
 @functools.cache
@@ -175,26 +170,24 @@ class Capture:
                 self.collector.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.collector.kill()
-        if self.stacks_file.is_file():
-            return self.stacks_file.read_text(errors="replace")
-        return f"no native stacks were captured: {self.why}\n" if self.why else ""
+        read = self.stacks_file.read_text(errors="replace") if self.stacks_file.is_file() else (
+            f"no native stacks were captured: {self.why}\n" if self.why else "")
+        shutil.rmtree(self.where, ignore_errors=True)
+        return read
 
 
-def read(pid: str, spy: Path, warm: subprocess.Popen, began: float) -> str:
+def read(pid: str, spy: Path, began: float) -> str:
     """Every thread's stack of the stopped process `pid`, read from outside it within the time its handler
-    waits (`COLLECT_SECONDS` from `began`): pystack's (`PYSTACK`), each OS thread's native and Python frames,
-    once its fetch (`warm`) has ended, so a first crash's read waits on the download rather than racing it
-    (review, 2026-11-13); py-spy's (`spy`), which reads Python's threads alone, with what time is left where
-    pystack read none."""
+    waits (`COLLECT_SECONDS` from `began`): Bloomberg's pystack's, beside `spy` in the test environment
+    (pyproject.toml's test extra), which unwinds every OS thread, native and Python frames both, a thread with
+    no Python state too (an XLA worker's abort); py-spy's (`spy`), whose native mode reads only the threads
+    Python knows (review, 2026-11-13), with what time is left where pystack read none."""
     def left() -> float:
         return COLLECT_SECONDS - 5 - (time.monotonic() - began)
 
     said = []
-    try:
-        warm.wait(timeout=max(left() - 10, 1))
-    except subprocess.TimeoutExpired:
-        said.append("pystack was not fetched in time")
-    for command in ([*PYSTACK, "remote", "--native-all", pid], [str(spy), "dump", "--native", "--pid", pid]):
+    for command in ([str(spy.with_name("pystack")), "remote", "--native-all", pid],
+                    [str(spy), "dump", "--native", "--pid", pid]):
         if left() < 1:
             said.append(f"no time left to read with {command[0]}")
             break
@@ -212,9 +205,7 @@ def read(pid: str, spy: Path, warm: subprocess.Popen, began: float) -> str:
 def collect(pipe: Path, done: Path, stacks: Path, spy: Path) -> None:
     """The collector: each process that writes `<pid> <signal>` to `pipe` as a signal ends it (`SHIM`) gets
     every thread's stack read (`read`), appended to `stacks`, then `done/done.<pid>`, its word that it may
-    die. Opened for reading and writing, so the pipe never reads its end between writers; pystack fetched as
-    it starts, so a crash rarely waits on it."""
-    warm = subprocess.Popen([*PYSTACK, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    die. Opened for reading and writing, so the pipe never reads its end between writers."""
     with open(os.open(pipe, os.O_RDWR), encoding="ascii", errors="replace") as said:
         (done / "ready").touch()
         for line in said:
@@ -223,7 +214,7 @@ def collect(pipe: Path, done: Path, stacks: Path, spy: Path) -> None:
             if len(parts) != 2 or not all(part.isdigit() for part in parts):
                 continue
             pid, signum = parts
-            frames = read(pid, spy, warm, began)
+            frames = read(pid, spy, began)
             with stacks.open("a") as out:
                 at = time.strftime("%H:%M:%SZ", time.gmtime())
                 out.write(f"== process {pid} ended by signal {signum} ({at}): its threads' native stacks\n"
