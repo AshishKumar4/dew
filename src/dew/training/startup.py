@@ -127,16 +127,20 @@ def computation_differs(saved: JSON, now: JSON) -> list[str]:
     """Where the computation a checkpoint trained, its inference record (`Objective.inference_record`, which
     every step carries), and this run's differ: each path of the objective's class or its model's record where
     both state it and they disagree, the fields that say how layers execute aside (the configured path's own
-    `RunConfig.EXECUTED`), and a field one of them predates. Nothing where either records none (an
-    unrecordable model's, or a step that predates the record): only positive evidence refuses (row 5723)."""
+    `RunConfig.EXECUTED`) and a loop's passes (`Loop.PASSED`, which a phase sets), and a field one of them
+    predates. Nothing where either records none (an unrecordable model's, or a step that predates the
+    record): only positive evidence refuses (row 5723)."""
     from dew._records import without_fields
     from dew.config import RunConfig
+    from dew.nn.backbones.decoder_stack import Loop
 
     def differing(before: JSON, after: JSON, path: str) -> list[str]:
+        # A loop's passes are the run's to set, a phase's own (`Loop.PASSED`).
+        passed = Loop.PASSED if path.endswith(".loop") else ()
         match before, after:
             # A field one record holds and the other predates is no evidence: only fields both state compare.
             case dict(), dict():
-                return [found for key in sorted(before.keys() & after.keys())
+                return [found for key in sorted((before.keys() & after.keys()) - set(passed))
                         for found in differing(before[key], after[key], f"{path}.{key}")]
             case _:
                 return [] if before == after else [path]
