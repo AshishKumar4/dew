@@ -526,9 +526,9 @@ repeats), and the later phase starts past the first place it did not train and d
 that it did. Each record is then trained once across the boundary, none lost. The trace costs one lookup a
 record the earlier phase read, once as the later phase is compiled or, on the token clock, opened.
 
-A plan of 13 records no rules, and reads by 13's: steps named by their printing, and phases that each read
-their corpora from their start. A run's resume compiles its data at the version it saved (its record's
-`data_plan_version`), and a per-share position of 13 resumes in a read compiled at 14 as 13 read it.
+A plan of 13 records no rules, and reads by 13's: steps named by their printing. No Dew of 13 read phases
+on their own streams that share a corpus, which a plan of 13 refuses. A run's resume compiles its data at
+the version it saved (its record's `data_plan_version`).
 
 #### Resuming data: relaxed or exact
 
