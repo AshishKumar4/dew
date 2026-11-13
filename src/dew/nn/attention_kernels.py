@@ -576,33 +576,38 @@ on a GPU or a TPU runs it by default, where its cell's declared old route does n
 
 @dataclasses.dataclass(frozen=True)
 class Timed:
-    """The shapes a kind of call's declared receipts timed (`DECLARED`): its queries and keys alike from
+    """The calls a kind of call's declared receipts timed (`DECLARED`): its queries and keys alike from
     `shortest` to `longest` tokens, at the head `widths` and the query heads a key head serves (`groups`),
-    any where None."""
+    `causal` or full (any of each where None), and windowed where `windows`, else no window."""
 
     shortest: int
     longest: int
     widths: tuple[int, ...] | None = None
     groups: tuple[int, ...] | None = None
+    causal: bool | None = None
+    windows: bool = True
 
     def holds(self, case: AttentionCase) -> bool:
-        """Whether `case` lies within these shapes."""
+        """Whether `case` lies within these calls."""
         return (self.shortest <= min(case.queries, case.keys) and max(case.queries, case.keys) <= self.longest
                 and (self.widths is None or case.head_dim in self.widths)
-                and (self.groups is None or case.heads // case.kv_heads in self.groups))
+                and (self.groups is None or case.heads // case.kv_heads in self.groups)
+                and (self.causal is None or case.causal == self.causal)
+                and (self.windows or case.window is None))
 
 
 MEASURED: dict[tuple[str | None, CallKind], Timed] = {
     **{(family, CallKind.of(jnp.bfloat16)): Timed(0, 32768) for family in ('mma.sync', 'wgmma')},
     **{(family, CallKind.of(jnp.float32)): Timed(0, 1024) for family in ('mma.sync', 'wgmma')},
-    ('tcgen05', CallKind.of(jnp.bfloat16)): Timed(256, 32768, (64, 128, 256), (4,)),
+    ('tcgen05', CallKind.of(jnp.bfloat16)): Timed(256, 32768, (64, 128, 256), (4,), causal=True,
+                                                  windows=False),
 }
 """The shapes each instruction family's DECLARED receipts hold for a kind of call; a call outside them is a
 cell none declares (`AttentionCase.cell`). On tcgen05 a 16-bit call's: from 256 to 32768 tokens at widths
-64, 128 and 256, four query heads a key head (8/2, 16/4 and 32/8 timed), cuDNN against the template causal,
-its forward and training step (`DECLARED`); 128 tokens waits for the grid's other rounds, its margins 1.09 to
-1.60 against five-round receipts' spread of up to 1.33. Elsewhere a
-16-bit call's: up to 32768 tokens, from FlashAttention against the template from
+64, 128 and 256, four query heads a key head (8/2, 16/4 and 32/8 timed), causal and unwindowed, cuDNN against
+the template's forward and training step (`DECLARED`); a full or windowed call none timed; 128 tokens waits
+for the grid's other rounds, its margins 1.09 to 1.60 against five-round receipts' spread of up to 1.33.
+Elsewhere a 16-bit call's: up to 32768 tokens, from FlashAttention against the template from
 1024 to 32768 tokens at widths 64 and 128, causal and full, its forward and training step, FlashAttention
 faster at every one on an A100 and a GH200 (M-ET-51: W126-a100, W126-sm90), and at width 256 on an RTX PRO
 6000 (a gated Qwen3.5 step's attention, 2.72 against 4.55 ms, G4-ET-ATT-SCOREBOARD). A shorter call is
