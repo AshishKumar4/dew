@@ -218,7 +218,7 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, memory, dh, a, beta, taken
                 jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
     products = 2 * chunk * keys * value_width * 3 * steps + 2 * 2 * chunk * chunk * width
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                         grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(11),
+                         grid_names=("chunks", "heads"), blocks=tiles, stages=(1, 2), live=chunk_liveness(11),
                          work=Work(flops=products, span=steps), held=_key_memory_held(call, keys),
                          staging=staging,
                          landing=landing)(
@@ -444,7 +444,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
     out_type = (fp32_rows, fp32_rows, fp32_rows, jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
     products = 2 * 2 * 2 * chunk * chunk * keys * (chunk // algebra.SUB) * steps
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                         grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(7),
+                         grid_names=("chunks", "heads"), blocks=tiles, stages=(1, 2), live=chunk_liveness(7),
                          work=Work(flops=products, span=steps,
                                    exponentials=(chunk // algebra.SUB + 1) * chunk * width),
                          held=_key_pairs_held(call, keys), staging=staging, landing=landing)(

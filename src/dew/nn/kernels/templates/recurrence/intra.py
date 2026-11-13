@@ -322,10 +322,11 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
     work = Work(flops=outputs * 2 * chunk * chunk * width, span=steps,
                 exponentials=2 * chunk * width)
     staging, landing = _intra_staged(call, keys, products=products)
-    # Its rings one deep: two deep, an sm100's system walk at a 32-column key block spilled 8 bytes, where
-    # one deep it needs 232 registers (row 5298); a second program a multiprocessor hides its loads.
+    # Its rings as deep as its residency holds them (`resources.plan`): one deep, a B200's Kimi Linear walk
+    # waited on each key block's loads at two programs a multiprocessor, 24.5% of its warps active and
+    # long_scoreboard 6.2 cycles an issued instruction, 819 us against fla's intra rows' 589 (M-JS-118).
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                         grid_names=("chunks", "heads"), blocks=blocks, stages=1,
+                         grid_names=("chunks", "heads"), blocks=blocks, stages=(1, 2),
                          live=chunk_liveness(4), work=work,
                          hardware=issued_flops(call, work.flops, *(_pairing_operand(call),) * 2),
                          held=_intra_held(call, keys, outputs), staging=staging, landing=landing,

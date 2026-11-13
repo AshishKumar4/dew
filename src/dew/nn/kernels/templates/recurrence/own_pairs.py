@@ -242,7 +242,7 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
     # Each offset's two pairs' terms a key, forward and moved up; the decay's exponentials once an offset.
     terms = 2 * 2 * 3 * chunk * algebra.SUB * width
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                         grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(7),
+                         grid_names=("chunks", "heads"), blocks=tiles, stages=(1, 2), live=chunk_liveness(7),
                          work=Work(flops=terms, span=steps, exponentials=algebra.SUB * chunk * width),
                          held=_key_own_held(call, keys), staging=staging, landing=landing,
                          name="recurrence_key_pairs_own", issues=False)(q, k, hi, lo, beta, d_scores,
