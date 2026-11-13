@@ -703,7 +703,8 @@ def test_group_norm_is_as_exact_as_torch_s_where_a_group_s_mean_dwarfs_its_sprea
 
 
 OFFSET_LAYER_NORM_SEEDS = 64
-"""The offset layer norm's declared seeds for check 1 (`assert_as_exact`)."""
+"""The offset layer norm's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada
+(cfbb134bf)."""
 
 
 def test_a_layer_norms_variance_is_its_centered_mean_square():
