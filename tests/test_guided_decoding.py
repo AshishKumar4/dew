@@ -176,7 +176,7 @@ def _unmasked_raw_scores(model, variables, tokens: jax.Array, prompt_width: int)
 def test_a_served_guided_request_draws_what_it_draws_alone(tokenizer):
     """The server carries each row's grammar state beside its cache, so a batch of mixed-length string
     requests through `Server` draws the exact tokens and termination lengths each request draws on its
-    own, records exact zero raw scores after EOS, and holds check 1 on all 10 continuation columns
+    own, records exact zero raw scores after EOS, and holds check 1 on all BUDGET continuation columns
     against the standalone walk from the float64 unmasked full forward."""
     pattern = r"[0-9]{3}-[a-c]{2,4}"
     grammar = guided.regex(tokenizer, pattern, EOS, vocab_size=EOS + 1)
