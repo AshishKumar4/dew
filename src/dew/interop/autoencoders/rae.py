@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -13,6 +13,7 @@ import jax.numpy as jnp
 from dew import _records
 from dew.batch import Variables
 from dew.interop.components import bind_component, component_source
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.unread import Stored
 from dew.nn.autoencoders.rae import ENCODERS, HEAD_WIDTH, RAE, RAEAutoencoder, RepresentationEncoder
 from dew.nn.blocks import IMAGENET_MEAN, IMAGENET_STD
@@ -29,22 +30,7 @@ PUBLISHED = ("AutoencoderRAE",)
 RAE_ENCODERS = ("dinov2", "siglip2", "mae")
 
 
-class RAEFields(TypedDict):
-    kind: str
-    encoder_width: int
-    encoder_layers: int
-    encoder_patch: int
-    input_size: int
-    decoder_width: int
-    decoder_layers: int
-    decoder_heads: int
-    decoder_intermediate: int
-    patch: int
-    pixel_mean: tuple[float, ...]
-    pixel_std: tuple[float, ...]
-
-
-def rae_fields(config: Mapping[str, object]) -> RAEFields:
+def rae_fields(config: Mapping[str, object]) -> NativeFields[RAE]:
     """Read an `AutoencoderRAE` config into the fields `RAE` takes, refusing
     what the port does not compute."""
     kind = _records.text(config.get("encoder_type", "dinov2"), "encoder_type")
@@ -66,27 +52,30 @@ def rae_fields(config: Mapping[str, object]) -> RAEFields:
             raise ValueError(f"{name}={value!r}: this field is one number per image channel")
         return tuple(_records.number(entry, name) for entry in value)
 
-    fields = RAEFields(
+    input_size = integer("encoder_input_size", 224)
+    encoder_patch = integer("encoder_patch_size", 14)
+    patch = integer("patch_size", 16)
+    if input_size % encoder_patch:
+        raise ValueError(
+            f"encoder_input_size {input_size} is not a multiple of encoder_patch_size {encoder_patch}"
+        )
+    size = config.get("image_size")
+    if size is not None and size != patch * input_size // encoder_patch:
+        raise ValueError(f"image_size {size} is not patch_size times the encoder's grid")
+    return native_fields(RAE)(
         kind=kind,
         encoder_width=integer("encoder_hidden_size", 768),
         encoder_layers=integer("encoder_num_hidden_layers", 12),
-        encoder_patch=integer("encoder_patch_size", 14),
-        input_size=integer("encoder_input_size", 224),
+        encoder_patch=encoder_patch,
+        input_size=input_size,
         decoder_width=integer("decoder_hidden_size", 512),
         decoder_layers=integer("decoder_num_hidden_layers", 8),
         decoder_heads=integer("decoder_num_attention_heads", 16),
         decoder_intermediate=integer("decoder_intermediate_size", 2048),
-        patch=integer("patch_size", 16),
+        patch=patch,
         pixel_mean=per_channel("encoder_norm_mean", IMAGENET_MEAN),
         pixel_std=per_channel("encoder_norm_std", IMAGENET_STD),
     )
-    if fields["input_size"] % fields["encoder_patch"]:
-        raise ValueError(f"encoder_input_size {fields['input_size']} is not a multiple of "
-                         f"encoder_patch_size {fields['encoder_patch']}")
-    size = config.get("image_size")
-    if size is not None and size != fields["patch"] * fields["input_size"] // fields["encoder_patch"]:
-        raise ValueError(f"image_size {size} is not patch_size times the encoder's grid")
-    return fields
 
 
 _LAYER = {
@@ -182,6 +171,7 @@ def load_rae(
     lazy: bool = False,
     shapes: Mapping[str, tuple[int, ...]] | None = None,
     tensors: Mapping[str, Stored] | None = None,
+    read: Mapping[str, object] | None = None,
 ) -> tuple[RAEAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published RAE, its parameters and their source layouts from
     `subfolder` of a directory or Hub repo, such as
@@ -192,8 +182,8 @@ def load_rae(
     source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
     placement to read (`dew.interop.weights.record_layouts`)."""
     directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED,
-                                         weights=params is None and tensors is None)
-    model = RAE(**rae_fields(config), dtype=compute)
+                                         weights=params is None and tensors is None, read=read)
+    model = rae_fields(config).value.clone(dtype=compute)
     image = jax.ShapeDtypeStruct((1, model.input_size, model.input_size, 3), jnp.float32)
     return bind_component(
         directory, "vae", config, model, rae_path,

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -13,6 +13,7 @@ import jax.numpy as jnp
 from dew import _records
 from dew.batch import Variables
 from dew.interop.components import bind_component
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.unread import Stored
 from dew.interop.weights import indexed_path
 from dew.nn.autoencoders.wan import WanAutoencoder, WanVAE
@@ -26,15 +27,7 @@ PUBLISHED = ("AutoencoderKLWan",)
 """The `_class_name` a published AutoencoderKLWan's config states."""
 
 
-class WanVAEFields(TypedDict):
-    base: int
-    latent: int
-    multipliers: tuple[int, ...]
-    blocks: int
-    temporal: tuple[bool, ...]
-
-
-def wan_vae_fields(config: Mapping[str, object]) -> WanVAEFields:
+def wan_vae_fields(config: Mapping[str, object]) -> NativeFields[WanVAE]:
     """Read an `AutoencoderKLWan` config into the fields `WanVAE` takes,
     refusing what the port does not compute."""
     multipliers = _records.integers(config["dim_mult"], "dim_mult")
@@ -51,10 +44,13 @@ def wan_vae_fields(config: Mapping[str, object]) -> WanVAEFields:
     for name in ("is_residual", "patch_size"):
         if config.get(name):
             raise ValueError(f"{name} belongs to Wan 2.2's VAE, which this port does not compute")
-    return WanVAEFields(base=_records.integer(config["base_dim"], "base_dim"),
-                        latent=_records.integer(config["z_dim"], "z_dim"), multipliers=multipliers,
-                        blocks=_records.integer(config["num_res_blocks"], "num_res_blocks"),
-                        temporal=temporal)
+    return native_fields(WanVAE)(
+        base=_records.integer(config["base_dim"], "base_dim"),
+        latent=_records.integer(config["z_dim"], "z_dim"),
+        multipliers=multipliers,
+        blocks=_records.integer(config["num_res_blocks"], "num_res_blocks"),
+        temporal=temporal,
+    )
 
 
 _LEAF_RANK = {"weight": (4, 5), "bias": (1,), "gamma": (3, 4)}
@@ -78,7 +74,8 @@ def wan_vae_path(name: str, ndim: int) -> tuple[str, ...]:
 def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                  subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
                  lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None,
-                 tensors: Mapping[str, Stored] | None = None
+                 tensors: Mapping[str, Stored] | None = None,
+                 read: Mapping[str, object] | None = None
                  ) -> tuple[WanAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published Wan 2.1 VAE, its parameters and their source layouts
     from `subfolder` of a pipeline directory or Hub repo, such as
@@ -89,8 +86,8 @@ def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str 
     source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
     placement to read (`dew.interop.weights.record_layouts`)."""
     directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED,
-                                         weights=params is None and tensors is None)
-    model = WanVAE(**wan_vae_fields(config), dtype=compute)
+                                         weights=params is None and tensors is None, read=read)
+    model = wan_vae_fields(config).value.clone(dtype=compute)
     video = jax.ShapeDtypeStruct(
         (1, 1 + model.temporal_factor, model.downscale_factor, model.downscale_factor, 3), jnp.float32
     )

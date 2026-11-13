@@ -60,19 +60,21 @@ class Loader(Protocol):
     and its config from `subfolder` of a directory or Hub repo. Supplied
     `params` are bound without a weight read, their layouts from the stored
     tensors' `shapes` where given, and `lazy` leaves read ones `SourceLeaf`s
-    for a placement to read (`dew.interop.weights.record_layouts`)."""
+    for a placement to read (`dew.interop.weights.record_layouts`). The
+    config a caller `read` at `revision` already is not read again
+    (`common.published_source`)."""
 
     def __call__(self, name_or_dir: str | Path, compute=..., *, revision: str | None = None,
                  subfolder: str = ..., param_dtype: str = "float32", params: Variables | None = None,
                  lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None,
-                 tensors: Mapping[str, Stored] | None = None
+                 tensors: Mapping[str, Stored] | None = None, read: Mapping[str, object] | None = None
                  ) -> tuple[AutoEncoder, Variables, tuple[WeightLayout, ...], dict]: ...
 
 
 def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                 subfolder: str | None = "vae", param_dtype: str = "float32", params: Variables | None = None,
                 lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None,
-                tensors: Mapping[str, Stored] | None = None
+                tensors: Mapping[str, Stored] | None = None, read: Mapping[str, object] | None = None
                 ) -> tuple[StableDiffusionVAE, Variables, tuple[WeightLayout, ...], dict]:
     """Build an AutoencoderKL, its parameters and their source layouts, as `Loader` does: a pipeline's
     from the torch safetensors in `subfolder`, a standalone one's (`subfolder` None) where its repo or
@@ -84,7 +86,8 @@ def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
         directory, config, weights = located_vae(str(name_or_dir), revision or "bf16", params=params)
     else:
         directory, config = published_source(name_or_dir, revision, subfolder, KL_PUBLISHED,
-                                             weights=params is None and tensors is None, nameless=True)
+                                             weights=params is None and tensors is None, nameless=True,
+                                             read=read)
         weights = TORCH_WEIGHTS
     if weights == FLAX_WEIGHTS and params is None and tensors is None:
         params, shapes = flax_vae(directory / FLAX_WEIGHTS)
@@ -138,32 +141,33 @@ def registration(class_name: str | None) -> Registration | None:
                  if class_name in entry.published or (class_name is None and entry.nameless)), None)
 
 
-def _published(modelname: str, revision: str) -> tuple[str | None, str | None]:
-    """The `_class_name` of the first config of `_PLACES` in `modelname`, and
-    the subfolder it is in; (None, None) where none can name one. A flax
-    layout revision is an SD1-era AutoencoderKL branch, and a repo without
-    either config (a revision it lacks, or, offline, configs the cache does
-    not hold) leaves the AutoencoderKL load to find the checkpoint or to say
-    why it cannot."""
+def _published(modelname: str, revision: str
+               ) -> tuple[str | None, str | None, str, Mapping[str, object] | None]:
+    """The `_class_name` of the first config of `_PLACES` in `modelname`, the
+    subfolder it is in, the revision it was read at (the commit a Hub revision
+    resolved to, its snapshot's name) and the config; (None, None, `revision`,
+    None) where none can name one. A flax layout revision is an SD1-era
+    AutoencoderKL branch, and a repo without either config (a revision it
+    lacks, or, offline, configs the cache does not hold) leaves the
+    AutoencoderKL load to find the checkpoint or to say why it cannot."""
     if revision in FLAX_REVISIONS and not os.path.isdir(modelname):
-        return None, None
-    for subfolder in _PLACES:
-        name = "config.json" if subfolder is None else f"{subfolder}/config.json"
-        if os.path.isdir(modelname):
-            path = Path(modelname) / name
-            if not path.is_file():
-                continue
-        else:
-            from huggingface_hub import hf_hub_download
-            from huggingface_hub.errors import EntryNotFoundError, RevisionNotFoundError
+        return None, None, revision, None
+    from huggingface_hub.errors import EntryNotFoundError, RevisionNotFoundError
 
-            try:
-                path = Path(hf_hub_download(modelname, name, revision=revision))
-            except (EntryNotFoundError, RevisionNotFoundError) as missing:
-                _log.debug("%s has no %s at %s (%s)", modelname, name, revision, missing)
-                continue
-        return json.loads(path.read_text()).get("_class_name"), subfolder
-    return None, None
+    from dew.interop.sources import snapshot
+
+    try:
+        release = snapshot(modelname, revision, weights=False)
+    except (EntryNotFoundError, RevisionNotFoundError) as missing:
+        _log.debug("%s has no metadata at %s (%s)", modelname, revision, missing)
+        return None, None, revision, None
+    for subfolder in _PLACES:
+        path = release / ("config.json" if subfolder is None else f"{subfolder}/config.json")
+        if path.is_file():
+            config = json.loads(path.read_text())
+            read_at = revision if os.path.isdir(modelname) else release.name
+            return config.get("_class_name"), subfolder, read_at, config
+    return None, None, revision, None
 
 
 def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike = jnp.bfloat16,
@@ -183,7 +187,7 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
     statistics records those, so a run rebuilt from its record
     (`AutoEncoder.bound`) would lose the override, and refuses it.
     """
-    class_name, subfolder = _published(modelname, revision)
+    class_name, subfolder, read_at, config = _published(modelname, revision)
     entry = registration(class_name)
     if entry is None:
         raise ValueError(f"{modelname} holds a {class_name}, which no built-in autoencoder registers")
@@ -193,8 +197,9 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
         source = str(Path(modelname) / subfolder) if subfolder and os.path.isdir(modelname) else modelname
         autoencoder, *_ = load_kl_vae(source, dtype, revision=revision, subfolder=None, params=params)
     else:
-        autoencoder, *_ = entry.load(modelname, dtype, revision=revision, subfolder=subfolder or "",
-                                     params=params)
+        # Its loader builds from the config read here, its weights fetched at the commit it was read at.
+        autoencoder, *_ = entry.load(modelname, dtype, revision=read_at, subfolder=subfolder or "",
+                                     params=params, read=config)
     given = {name for name, value in (("latent_shift", latent_shift), ("latent_scale", latent_scale))
              if value is not None}
     if given - autoencoder.record_arguments().keys():

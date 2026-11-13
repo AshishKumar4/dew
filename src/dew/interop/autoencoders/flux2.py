@@ -35,7 +35,8 @@ PUBLISHED = ("AutoencoderKLFlux2",)
 def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                    subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
                    lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None,
-                   tensors: Mapping[str, Stored] | None = None
+                   tensors: Mapping[str, Stored] | None = None,
+                   read: Mapping[str, object] | None = None
                    ) -> tuple[Flux2Autoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published FLUX.2 VAE, its parameters and their source layouts
     from `subfolder` of a pipeline directory or Hub repo. The batch norm's
@@ -47,7 +48,7 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
     from dew.interop.safetensors_io import read_weights
 
     directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED,
-                                         weights=tensors is None)
+                                         weights=tensors is None, read=read)
     if tuple(config.get("patch_size", (2, 2))) != (2, 2):
         raise ValueError(f"FLUX.2's pipeline folds 2x2 latent blocks, not {config.get('patch_size')}")
     model = autoencoder_kl_from_diffusers(config, compute)
