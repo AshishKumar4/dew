@@ -176,6 +176,7 @@ host = _loaded(HERE / "host.py")
 stalls = _loaded(HERE / "stalls.py")
 costs = _loaded(HERE / "costs.py")
 cuts = _loaded(HERE / "cuts.py")
+partition = _loaded(HERE / "partition.py")
 command_line = _loaded(HERE / "arguments.py")
 rows = _loaded(HERE / "rows.py")
 row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_place, rows.key_parts
@@ -717,8 +718,9 @@ def parted_record(path: Path = session.DURATIONS) -> dict[str, dict[str, float]]
 
 
 def own_tests(name: str, tests: dict[str, float]) -> dict[str, float]:
-    """Of file `name`'s recorded `tests`, those but its check-1 sites', which run apart (`sites`)."""
-    return session.own(tests, sites(name))
+    """Of file `name`'s recorded `tests`, those the file still defines (`session.standing`) but its check-1
+    sites', which run apart (`sites`)."""
+    return session.own(session.standing(name, tests), sites(name))
 
 
 def durations_record(path: Path = session.DURATIONS) -> dict[str, float]:
@@ -747,8 +749,15 @@ def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[s
     how much slower armada ran the files measured both ways; else None, for a
     file nothing has timed."""
     recorded = {name: sum(tests) for name, tests in recorded_tests().items()}
-    measured = {name: timings.get("files", {})[row(python, name, "")] for name in files
-                if row(python, name, "") in timings.get("files", {})}
+    # A file armada holds no timing of weighs its rows' sum at the cut they name (`measured_cut`), which is
+    # what its timing would say: armada keeps a plan's rows from run to run, and drops the file timings a run
+    # did not itself measure (ledger 5579).
+    measured = {}
+    for name in files:
+        held = timings.get("files", {}).get(row(python, name, ""))
+        cut = measured_cut(timings, python, name) if held is None else None
+        if held is not None or cut is not None:
+            measured[name] = held if cut is None else cut[0]
     ratios = sorted(measured[name] / recorded[name] for name in files
                     if name in measured and recorded.get(name, 0) > 1)
     slower = ratios[len(ratios) // 2] if ratios else 1.0
@@ -758,11 +767,26 @@ def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[s
 
 def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | None:
     """What `name` took under `python` at the cut its rows in `timings` name, and that cut's count
-    (`cuts.measured_cut`, over its rows by their groups); a map task's seconds are kept under its task's name,
-    no row's."""
-    return cuts.measured_cut({group: seconds for row_name, seconds in timings.get("rows", {}).items()
-                              if ":" in row_name for python_, name_, group in [parsed_row(row_name)]
-                              if (python_, name_) == (python, name)})
+    (`cuts.measured_cut`, over its rows by their groups, `grouped_rows`)."""
+    return cuts.measured_cut(grouped_rows(timings.get("rows", {})).get((python, name), {}))
+
+
+GROUPED: list = [None, {}]
+"""The rows `grouped_rows` last grouped, and their groups: a plan asks of one run's timings for every file."""
+
+
+def grouped_rows(measured: Mapping[str, float]) -> dict[tuple[str, str], dict[str, float]]:
+    """Armada's row timings `measured` by their Python and file, each row's seconds under its group; a map
+    task's seconds are kept under its task's name, no row's. Grouped once for the rows it was last asked
+    of."""
+    if GROUPED[0] is not measured:
+        found: dict[tuple[str, str], dict[str, float]] = {}
+        for row_name, seconds in measured.items():
+            if ":" in row_name:
+                python, name, group = parsed_row(row_name)
+                found.setdefault((python, name), {})[group] = seconds
+        GROUPED[:] = [measured, found]
+    return GROUPED[1]
 
 
 APART = re.compile(r"\bpytest\.mark\.torchax\b")
@@ -2371,6 +2395,14 @@ def main() -> int:
         return flagged(args.verdict, args.new)
     if args.operation in ("release-plan", "release"):
         return releasing(args)
+    if args.operation == "partition":
+        nodes = partition.collected(line for listed in args.collected
+                                    for line in listed.read_text().splitlines())
+        wrong = partition.compared(nodes, json.loads(args.verdict.read_text())["rows"], PYTHONS[0], SKIPPED)
+        print(f"{sum(map(len, nodes.values()))} tests of {len(nodes)} files collected: "
+              + ("each in one row" if not wrong else f"{len(wrong)} lines of rows that are not their tests"),
+              *wrong, sep="\n")
+        return 1 if wrong or not nodes else 0
     if args.operation == "durations":
         target = json.loads(Path(".armada.json").read_text())["target"]
         before = durations_record()
