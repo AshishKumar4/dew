@@ -301,4 +301,6 @@ def test_a_thread_with_no_python_state_that_aborts_keeps_its_own_native_stack(ci
     ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "native.json", 60.0, cache="off")
     [red] = json.loads((tmp_path / "native.json").read_text())["rows"]
     [kept] = red["artifacts"]
-    assert "aborting_worker" in (tmp_path / "artifacts" / kept).read_text().split("== native stacks", 1)[1]
+    # The worker's own frame, by its source line (the unwinder names a frame by its debug line where the
+    # library's symbols are sparse): line 4, the worker's abort.
+    assert 'aborting.c", line 4' in (tmp_path / "artifacts" / kept).read_text().split("== native stacks", 1)[1]
