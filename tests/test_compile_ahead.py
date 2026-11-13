@@ -1779,3 +1779,23 @@ def test_a_flag_given_twice_is_read_by_its_order():
     assert computation_flags(first) != computation_flags(second)
     excess = "--xla_allow_excess_precision"
     assert computation_flags(first) == (f"{excess}=false", f"{excess}=true")
+
+
+@pytest.mark.parametrize(("generation", "capability"),
+                         [("sm100", (10, 0)), ("sm90", (9, 0)), ("sm80", (8, 0))])
+def test_cudnn_attentions_gates_read_the_capability_of_the_gpus_a_program_is_traced_for(generation,
+                                                                                         capability):
+    """The gates of cuDNN's attention (its head dims past 128, packed and latent forms and score functions
+    from Hopper on, a 10.3's cuDNN version) read the capability of the GPUs a program is traced for: in this
+    GPU-free process, those of compile-only GPUs (`compile_only_gpus`) whose mesh it is traced under
+    (`jax.set_mesh`), as a step compiled ahead is, and none outside it, its backend the CPU. JAX read the
+    process's backend alone, so a step compiled ahead for a B200 refused its d256 attention (row 5894)."""
+    from jax._src.cudnn import fused_attention_stablehlo as cudnn
+
+    from dew.training.ahead import compile_only_gpus
+
+    mesh = jax.sharding.Mesh(np.asarray(compile_only_gpus(generation, 1)), ("data",))
+    with jax.set_mesh(mesh):
+        assert cudnn.check_compute_capability("9.0") == (capability >= (9, 0))
+        assert cudnn.is_cuda_compute_capability_equal("10.0") == (capability == (10, 0))
+    assert not cudnn.check_compute_capability("8.0")
