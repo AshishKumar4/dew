@@ -529,6 +529,16 @@ PREFETCH = 64
 
 
 @runtime_checkable
+class Shortest(Protocol):
+    """A record step that states the fewest tokens any of its draws makes of a record along a packed ids
+    field (`shortest`): a random step's floor, which a memory read that holds its inputs bounds the documents
+    a window packs by (`dew.data.compile._coordinated`). A step that can drop a record states the floor of
+    what it keeps."""
+
+    def shortest(self, record: Batch, field: str) -> int: ...
+
+
+@runtime_checkable
 class Volatile(Protocol):
     volatile: bool
 

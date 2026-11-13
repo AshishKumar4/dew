@@ -131,6 +131,7 @@ from dew.data.pipeline import (
     RandomMap,
     RecordStep,
     Repeat,
+    Shortest,
     Shuffle,
     SingleReader,
     Slice,
@@ -1239,9 +1240,11 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
 
     def walk(pipeline: Pipeline, *, packed: bool) -> None:
         nonlocal unseen
-        for stage in pipeline.stages:
+        for at, stage in enumerate(pipeline.stages):
             if isinstance(stage, Pack):
-                declare(stage, stage.segments)
+                floor = _floor(pipeline, at, stage)
+                declare(stage, stage.segments if floor is None else min(
+                    stage.segments or stage.seq_len, max(1, stage.seq_len // floor)))
                 packed = True
         source = pipeline.source
         if isinstance(source, Combined):
@@ -1271,6 +1274,39 @@ def _held_coordinated(validation: Pipeline, training: tuple[Coordinated, ...]) -
     held = _coordinated(validation)
     declared = {step.fields[0] for step in held}
     return held + tuple(Coordinated(step.fields, None) for step in training if step.fields[0] not in declared)
+
+
+_KEEPS_RECORDS = (Shuffle, Repeat, Limit, Slice)
+"""The stages that hand a record on as it is, only ordering, repeating or bounding the records."""
+
+
+def _floor(pipeline: Pipeline, at: int, pack: Pack) -> int | None:
+    """The fewest tokens along `pack`'s ids field of a record the pack at `at` receives, where a memory read
+    holds the records its stages before it read (`_Memory`) and each of those stages hands a record on as it
+    is (`_KEEPS_RECORDS`, a bound's marks) but at most one, a step that states its floor (`Shortest`): each
+    held record's length, or that step's floor of it. A pack's window then holds at most `seq_len` over it
+    documents, the most a memory read that cannot run its pack (a random step before it) declares, a fitting
+    pack cutting no document. None where it cannot be read so: a concatenating pack, which cuts documents
+    where its windows end, a stream, a held record still encoded, or another step between."""
+    source = pipeline.source
+    if pack.policy == "concat" or not isinstance(source, _Memory) or not source.held:
+        return None
+    stating: Shortest | None = None
+    for stage in pipeline.stages[:at]:
+        if isinstance(stage, _KEEPS_RECORDS) or (isinstance(stage, Map)
+                                                  and isinstance(stage.step, MarkConsumed)):
+            continue
+        ran = runs(stage)
+        if stating is not None or ran is None or not isinstance(ran.step, Shortest):
+            return None
+        stating = ran.step
+    field = pack.fields[0]
+    floors = []
+    for row in source.held:
+        if not isinstance(row, Mapping) or field not in row:
+            return None
+        floors.append(len(row[field]) if stating is None else stating.shortest(row, field))
+    return max(1, min(floors))
 
 
 def _packed_documents(source: Source) -> int | None:
