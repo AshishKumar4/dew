@@ -736,6 +736,43 @@ def test_a_quantized_window_cache_decodes_what_dequantizing_in_the_own_basis_com
     np.testing.assert_array_equal(decoded, own)
 
 
+def test_a_cached_documents_tokens_read_its_own_cached_keys_alone():
+    """A V4 layer's cached prefill of a packed row, documents 1 and 2 two tokens each in a cache of 8
+    slots, then a step continuing document 2: the second document's prefill outputs and the step's are
+    the same, bit for bit, whatever the first document's tokens, since each token reads its own
+    document's cached keys alone, as the cache numbers them (`Append.documents`); and a prefill naming
+    its one document (`max_segments=1`) is the prefill naming none. The call's square document mask met
+    the cache's rectangle of slots and raised."""
+    from dew.nn.inputs import AttentionMetadata
+
+    module = DeepseekV4Attention(emb_features=32, num_heads=2, head_dim=16, q_lora_rank=8, o_groups=1,
+                                 o_lora_rank=8, rope_dim=8, sliding_window=4, max_seq_len=8)
+    hidden = jax.random.normal(jax.random.key(7), (1, 5, 32))
+    variables = {"params": module.init(jax.random.key(3), hidden[:, :4], MixerCall(decode=True))["params"]}
+
+    def named(segments, positions, max_segments):
+        return MixerCall(metadata=AttentionMetadata(coordinates=coordinates(
+            segments=jnp.asarray([segments], jnp.int32), positions=jnp.asarray([positions], jnp.int32),
+            max_segments=max_segments)), decode=True)
+
+    packed = named([1, 1, 2, 2], [0, 1, 0, 1], 2)
+
+    def decoded(hidden):
+        _, made = module.apply(variables, hidden[:, :4], packed, mutable=["cache"])
+        prefill, made = module.apply({**variables, **made}, hidden[:, :4], packed, mutable=["cache"])
+        step, _ = module.apply({**variables, **made}, hidden[:, 4:], named([1], [2], 1), mutable=["cache"])
+        return np.concatenate([np.asarray(prefill)[:, 2:], np.asarray(step)], axis=1)
+
+    other = hidden.at[:, :2].set(jax.random.normal(jax.random.key(8), (1, 2, 32)))
+    np.testing.assert_array_equal(decoded(hidden), decoded(other))
+
+    def prefilled(call):
+        _, made = module.apply(variables, hidden[:, :2], call, mutable=["cache"])
+        return np.asarray(module.apply({**variables, **made}, hidden[:, :2], call, mutable=["cache"])[0])
+
+    np.testing.assert_array_equal(prefilled(named([1, 1], [0, 1], 1)), prefilled(MixerCall(decode=True)))
+
+
 DRAFTING = DSparkAttention(emb_features=32, num_heads=2, head_dim=16, q_lora_rank=8, o_groups=1,
                            o_lora_rank=8, rope_dim=8, sliding_window=4, max_seq_len=16)
 """A small DSpark stage's attention, its window shorter than the context it drafts after."""

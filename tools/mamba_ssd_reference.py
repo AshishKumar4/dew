@@ -47,9 +47,9 @@ SEEDED_CASES = {
 """The seeded recording's cases (`write_seeded`): `CASES`' with more heads (three a group where
 `CASES` has three, one group where it has one) and the wide state over two rows, where `CASES`' own
 did not resolve: `D`'s gradient is a head's one sum, and a few heads' per-head decays are each
-draw's shared factors, so the reference compared with itself needed 512 seeds or more on the XLA
-proxy (`seeds_for`), mamba_ssm's own more than 512 for ragged-documents; these take 64 to 128 on the
-proxy (2026-10-21, on armada)."""
+draw's shared factors, so the reference compared with itself needed 512 seeds or more on Dew's
+XLA path (`seeds_for`), mamba_ssm's own more than 512 for ragged-documents; these take 64 to 128 on that
+path (2026-10-21, on armada)."""
 
 
 def operands(rng, batch, tokens, heads, width, groups, state, cast, documents) -> dict[str, np.ndarray]:
@@ -160,10 +160,7 @@ def write_seeded(scan, minimal, version, revision):
             held_to_the_oracle(exact_run, arrays, truth, roundings, "mamba_ssm")
             return reference, truth
 
-        stored.update(record_case(
-            case, draw, evaluate,
-            lambda arrays, chunk=chunk, dtype=narrow_dtype: mamba_ssd_xla(arrays, chunk, dtype),
-            truth_proxy=exact_run, store_inputs=False, summary=True))
+        stored.update(record_case(case, draw, evaluate, store_inputs=False, summary=True))
         stored[f"{case}.chunk"] = np.int32(chunk)
         stored[f"{case}.dtype"] = np.asarray(str(narrow_dtype))
         stored[f"{case}.shape"] = np.asarray(shape, np.int32)

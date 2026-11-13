@@ -20,7 +20,7 @@ import optax
 import pytest
 from block_support import VOCAB, block_causal, model, wrapped
 from model_support import TINY_DECODER, model_draw
-from reference_error import as_given, assert_as_exact, seeds_for
+from reference_error import as_given, assert_as_exact
 from serving_support import Served, assert_served_as_exact
 
 from dew.batch import BLOCKS_FIELD, TEXT_KEY, coordinates, prefix_blocks
@@ -42,6 +42,16 @@ PREFIX = 3
 BATCH = 2
 PROMPT = 5
 NEW = 3
+SEEDS = {
+    "prefix run loss": 32, "wrapped prefix run loss": 32,
+    "served prefix 3 run": 256, "served prefix prompt run": 256,
+    "served blocks": 256, "served blocks-in-pieces": 256, "served blocks-over-a-prefix-run": 256,
+    "served scattered-in-pieces": 128, "served images-and-blocks": 128,
+    "shared pages (0, 0, 4)": 128, "shared pages (0, 0, 8)": 256, "shared pages (0, 8)": 256,
+    "prefix 3 harness likelihood": 256, "prefix prompt harness likelihood": 128}
+"""Each site's declared seeds by its label, the served sites' paired with the full forward
+(`assert_served_as_exact`) and the others' the reference compared with itself: sized by `seeds_for` on
+armada's CPUs (2026-11-12, eg-sized2 at 0aed05577f7), where each run sized it again (5 to 44 s a site)."""
 
 SEGMENTS = np.asarray([[1, 1, 1, 1, 1, 2, 2, 2, 0], [1, 1, 1, 1, 1, 1, 2, 2, 2]], np.int32)
 POSITIONS = np.asarray([[0, 1, 2, 3, 4, 0, 1, 2, 0], [0, 1, 2, 3, 4, 5, 0, 1, 2]], np.int32)
@@ -116,8 +126,7 @@ def test_a_prefix_run_trains_the_block_mask_on_par_with_float64():
 
     def dew(params, tokens):
         return trained(objective, params, tokens)
-    seeds = seeds_for(reference, draw, "prefix run loss", truth_fn=truth)
-    assert_as_exact(dew, reference, draw, "prefix run loss", seeds=seeds, truth_fn=truth)
+    assert_as_exact(dew, reference, draw, "prefix run loss", seeds=SEEDS["prefix run loss"], truth_fn=truth)
 
 
 def test_the_counted_targets_leave_out_exactly_the_in_block_ones():
@@ -462,7 +471,8 @@ def test_a_served_prefix_run_scores_what_each_request_scores_alone(prefix, servi
     over those blocks does (check 1). A server prefilling in pieces shorter than a block prefills that block
     in one longer piece (`Server._piece_end`), as a layer reads it whole, and the rest of the prompt in
     pieces."""
-    assert_served_as_exact(served_blocky(prefix), THREE, f"served prefix {prefix} run", serving=serving)
+    label = f"served prefix {prefix} run"
+    assert_served_as_exact(served_blocky(prefix), THREE, label, serving=serving, seeds=(SEEDS[label],) * 2)
 
 
 @pytest.mark.parametrize("requests, serving, prefix, images", [
@@ -476,8 +486,9 @@ def test_a_served_prompt_carrying_its_groups_scores_what_it_scores_alone(request
     in its row's cache with its keys: requests queued past the slots draw what the lone task draws and score
     it as a full forward over those groups does (check 1). A piece never splits a group, its members
     adjacent or not, and a prompt's own blocks stand over a prefix run's, as `generate` keeps them."""
-    assert_served_as_exact(served_blocky(prefix, images), requests, f"served {request.node.callspec.id}",
-                           serving=serving)
+    label = f"served {request.node.callspec.id}"
+    assert_served_as_exact(served_blocky(prefix, images), requests, label, serving=serving,
+                           seeds=(SEEDS[label],) * 2)
 
 
 
@@ -508,7 +519,9 @@ def test_a_prefix_page_is_shared_only_between_prompts_whose_groups_agree(request
     a later member reads, while one that agrees through its last grouped token reads the first's full pages,
     a prefix run's prompts of several lengths alike, its resumed piece starting inside a group. Each scores
     what it scores alone (check 1)."""
-    assert_served_as_exact(served_blocky(prefix), requests, f"shared pages {hits}", serving=SHARED, hits=hits)
+    label = f"shared pages {hits}"
+    assert_served_as_exact(served_blocky(prefix), requests, label, serving=SHARED, hits=hits,
+                           seeds=(SEEDS[label],) * 2)
 
 
 def chunked(size: int, *, unchunked: bool = False):
@@ -618,8 +631,8 @@ def test_a_prefix_run_trains_and_serves_through_a_wrapper_of_a_block_reading_dec
 
     def dew(variables, tokens):
         return scored(objective, variables, tokens)
-    seeds = seeds_for(reference, draw, "wrapped prefix run loss", truth_fn=truth)
-    assert_as_exact(dew, reference, draw, "wrapped prefix run loss", seeds=seeds, truth_fn=truth)
+    assert_as_exact(dew, reference, draw, "wrapped prefix run loss", seeds=SEEDS["wrapped prefix run loss"],
+                    truth_fn=truth)
     variables = wrapper.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
     prompt = np.asarray([[3, 1, 4, 1, 5]])
     sampling = Sampling(temperature=0, pad_token_id=0)
@@ -723,6 +736,5 @@ def test_a_prefix_runs_harness_scores_a_continuation_as_its_generation_reads_it(
                       [(None, context.tolist(), rest.tolist()) for context, rest in batch])]
         return np.asarray([value for value, _ in scores], np.float32)
 
-    seeds = seeds_for(explicit(decoder), draw, f"prefix {prefix} harness likelihood", truth_fn=explicit(wide))
-    assert_as_exact(harness, explicit(decoder), draw, f"prefix {prefix} harness likelihood", seeds=seeds,
-                    truth_fn=explicit(wide))
+    label = f"prefix {prefix} harness likelihood"
+    assert_as_exact(harness, explicit(decoder), draw, label, seeds=SEEDS[label], truth_fn=explicit(wide))

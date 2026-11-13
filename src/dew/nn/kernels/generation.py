@@ -384,7 +384,9 @@ def architecture(generation: str) -> Architecture | None:
         return {0: _AMPERE, 9: _ADA}.get(minor, _AMPERE_CONSUMER)
     if (major, minor) == (9, 0):
         return _HOPPER
-    if major in (10, 11):
+    from dew._builds import TENSOR_MEMORY_SMS
+
+    if major in TENSOR_MEMORY_SMS:
         return _BLACKWELL
     return _BLACKWELL_CONSUMER if major >= 9 else None
 

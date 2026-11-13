@@ -409,10 +409,12 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
 
 
 def _captions(figure: Figure, captions: Sequence[str], times: Sequence[float], x: float, y: float) -> None:
-    """Each frame's caption, right-aligned at (x, y), shown while its frame is."""
+    """Each frame's caption, right-aligned at (x, y), shown while its frame is; a still figure's (no loop,
+    its one frame) drawn as it is."""
     shapes = [figure.text(x, y, caption, size=SMALL, color="muted", mono=True, anchor="end")
               for caption in captions]
-    figure.show_in_turn(shapes, times)
+    if figure.seconds:
+        figure.show_in_turn(shapes, times)
 
 
 def _frame_times(count: int, seconds: float) -> list[float]:

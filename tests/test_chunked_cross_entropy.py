@@ -28,7 +28,7 @@ import pytest
 from confident_support import confident, label_derivative, log_partition, log_softmax
 from flax import linen as nn
 from float64_terms import float32_values
-from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, seeds_for, with_gradients
+from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients
 from residual_orders import order
 from sharded import collectives
 
@@ -1356,6 +1356,11 @@ def test_a_fused_heads_overflowed_column_gradient_stays_infinite():
 
 CONFIDENT_SEEDS = 8
 """Check 1's declared seeds for a confident target's gradient, as `test_categorical`'s are."""
+UNCONFIDENT_SEEDS = {"tiled": 32, "whole": 32, "fused": 32, "logits": 8}
+SPLIT_UNCONFIDENT_SEEDS = 32
+"""Check 1's declared seeds for an unconfident target's gradient, by the head's path and, split over the
+vocabulary, whole or tiled alike, each paired with autodiff's: sized by `seeds_for` on armada's CPUs
+(2026-11-12, eg-sized2 at 0aed05577f7), where each run sized it again."""
 
 
 def identity_head() -> OutputTable:
@@ -1600,8 +1605,7 @@ def test_an_unconfident_targets_logit_gradient_is_on_par_with_autodiffs(path):
     reference = written_gradient(targets)
     label = f"{path} at an unconfident target"
     with jax.default_matmul_precision("highest"):
-        seeds = seeds_for(reference, unconfident, label, dew_fn=gradient)
-        assert_as_exact(gradient, reference, unconfident, label, seeds=seeds)
+        assert_as_exact(gradient, reference, unconfident, label, seeds=UNCONFIDENT_SEEDS[path])
 
 
 @pytest.mark.mesh(devices=2)
@@ -1621,8 +1625,7 @@ def test_a_vocabulary_split_heads_unconfident_target_gradient_is_on_par_with_aut
         return unconfident(seed, width=8, count=4)
 
     with jax.default_matmul_precision("highest"):
-        seeds = seeds_for(reference, draw, label, dew_fn=split)
-        assert_as_exact(split, reference, draw, label, seeds=seeds)
+        assert_as_exact(split, reference, draw, label, seeds=SPLIT_UNCONFIDENT_SEEDS)
 
 
 PROJECTED = CausalTransformer(vocab_size=97, emb_features=32, num_layers=1, num_heads=2, mlp_features=32,

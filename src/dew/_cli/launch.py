@@ -36,7 +36,7 @@ from typing import Annotated, TextIO
 
 import tyro
 
-from dew._cleanup import exit_code, groups_ended, signal_group
+from dew._cleanup import exit_code, groups_ended, signal_group, start, stop
 from dew._cli import tpu_setup
 from dew._cli.gcloud import emit
 from dew._cli.tpu import reach
@@ -277,8 +277,9 @@ class Launch:
         """Where every process reaches process 0: this machine's name when it
         is one of several hosts and named as itself. A name that is loopback
         in itself is refused, since every other host would reach itself at
-        it."""
-        host = self.coordinator or hosts[0]
+        it. A host given as an ssh destination with a login (`user@host`) is
+        reached over ssh at that, and joined at its network name alone."""
+        host = self.coordinator or hosts[0].rpartition("@")[2]
         if host in LOCAL_HOSTS and any(name not in LOCAL_HOSTS for name in hosts):
             host = socket.getfqdn()
             if names_loopback(host):
@@ -513,13 +514,14 @@ def _stop(running: Sequence[subprocess.Popen], grace: float, forced: threading.E
     service, and a rank that outlives it aborts in XLA's error polling, with
     a Check failure that reads as a crash of its own.
     """
-    # Each rank leads a session of its own (`supervise`), whose group its pid names.
+    # Each rank leads a session of its own (`supervise`, `dew._cleanup.start`), whose group its pid names.
     for child in running:
         if not (child.stdin is not None and _interrupted(child)):
             signal_group(child, signal.SIGTERM)
     groups_ended(running, grace, forced)
+    # Each rank's group killed and its lifeline let go (`stop`), then its leader reaped.
     for child in (*running[1:], *running[:1]):
-        signal_group(child, signal.SIGKILL)
+        stop(child)
         child.wait()
 
 
@@ -558,7 +560,8 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
     last lines are printed again after the others' shutdown output.
 
     Every rank runs in a session of its own, so no signal meant for the
-    launcher's terminal or process group reaches it. The launcher stops the
+    launcher's terminal or process group reaches it, and ends with the
+    launcher however that goes (`dew._cleanup.start`'s lifeline). The launcher stops the
     pool itself on SIGINT, SIGTERM (a scheduler's cancel) and SIGHUP (its
     terminal or ssh session closing), giving the ranks PREEMPTION_GRACE to
     checkpoint where a training run agrees, or until a second signal, and
@@ -573,7 +576,10 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
     forced = threading.Event()
     try:
         for process in processes:
-            child = subprocess.Popen(
+            # Started with a lifeline (`dew._cleanup.start`), which ends the rank's group when this launcher
+            # goes however it goes: one killed outright runs no `_stop`, and its ranks, silent in a
+            # collective, kept their accelerators with no one left to stop them.
+            child = start(
                 process.argv, cwd=cwd if process.local else None,
                 # Unbuffered, so a local Python rank's prints reach the relay
                 # when they happen and in order with its warnings; a remote
@@ -584,7 +590,7 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
                 # A rank over ssh is stopped through its terminal, which its ssh's input feeds.
                 stdin=subprocess.DEVNULL if process.local else subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace", start_new_session=True)
+                text=True, encoding="utf-8", errors="replace")
             running.append(child)
             stdout = child.stdout
             if stdout is None:

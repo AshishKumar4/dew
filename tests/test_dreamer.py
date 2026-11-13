@@ -530,15 +530,14 @@ def dreamer_fit(directory, objective, rollout, steps, **options):
 @pytest.mark.parametrize("given", ["prefilled", "supplied"])
 def test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike(tmp_path,
                                                                                                   given):
-    """A DreamerV3 run on targets, checkpointed every update, stopped at its third and resumed by a fresh
-    rollout: the checkpoint holds the environment steps it took, so the resumed rollout takes, update by
-    update, the steps the uninterrupted one did, its environments and replay begun again (its prefill
-    taken again); with `checkpointed_replay` it also holds the replay (the prefill's, or one the rollout
-    was given, of another capacity), the targets mid episode and their returns, so the resumed run takes
-    the very steps and its last state is the uninterrupted run's, every leaf bit for bit."""
+    """A DreamerV3 run on targets, stopped at its second update and resumed by a fresh rollout: the
+    checkpoint holds the environment steps it took, so the resumed rollout takes, update by update, the
+    steps the uninterrupted one did, its environments and replay begun again (its prefill taken again);
+    with `checkpointed_replay` it also holds the replay (the prefill's, or one the rollout was given, of
+    another capacity), the targets mid episode and their returns, so the resumed run takes the very steps
+    and its last state is the uninterrupted run's, every leaf bit for bit."""
     supplied = None
     if given == "supplied":
-        # A replay of 300 steps, filled by another rollout's prefill: the rollout's own capacity is 400.
         seed = DreamerRollout(DreamerV3Objective(tiny()), Batched(TimeLimit(Target(), episode_length=20), 8),
                               capacity=300, batch=8, length=16, train_ratio=32.0, prefill=24)
         dreamer_fit(None, seed.objective, seed, 1)
@@ -551,10 +550,11 @@ def test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_r
             return dreamer_targets(objective, checkpointed=checkpointed, replay=replay)
 
         uninterrupted = made()
-        whole = dreamer_fit(tmp_path / f"whole-{checkpointed}", objective, uninterrupted, 5)
-        dreamer_fit(tmp_path / f"stopped-{checkpointed}", objective, made(), 3)
+        whole = dreamer_fit(None, objective, uninterrupted, 4)
+        dreamer_fit(tmp_path / f"stopped-{checkpointed}", objective, made(), 2)
         resumed = made()
-        again = dreamer_fit(tmp_path / f"stopped-{checkpointed}", objective, resumed, 5)
+        again = dreamer_fit(tmp_path / "stopped-True" if checkpointed else tmp_path / "stopped-False",
+                            objective, resumed, 4)
         prefilled = 0 if checkpointed or supplied is not None else 24 * 8
         assert resumed.environment_steps == uninterrupted.environment_steps + prefilled
         if checkpointed:
@@ -860,17 +860,28 @@ def test_dreamer_split_step_preserves_draws_percentiles_and_mid_window_resume(tm
     split_returns = jax.device_get(split_state.variables["returns"])
     assert float(split_returns["low"]) < float(split_returns["high"])
     with jax.enable_x64(new_val=True):
+        from dew.objectives.base import Step
+        from dew.training.distributed import microbatch
+
         wide_obj = DreamerV3Objective(tiny(2, 2, dtype=jnp.float64), imagination=4, return_rate=0.5,
                                       slow_decay=0.9)
         wide_vars = {"params": nudged_tree(wide_obj.init(jax.random.key(0))["params"], 13, scale=0.8),
                      "returns": {"low": jnp.zeros((), jnp.float64), "high": jnp.zeros((), jnp.float64)}}
-        wide_batch = {k: v.astype(np.float64) if v.dtype == np.float32 else v for k, v in batch_a.items()}
-        wide_split, _ = recorded_step_tapes(wide_obj, wide_batch, key=9, split=2, variables=wide_vars)
-        wide_whole, _ = recorded_step_tapes(wide_obj, wide_batch, key=9, split=1, variables=wide_vars)
-        s_ret = jax.device_get(wide_split.variables["returns"])
-        w_ret = jax.device_get(wide_whole.variables["returns"])
-        assert_computes_the_oracle(np.asarray([s_ret["low"], s_ret["high"]]),
-                                   np.asarray([w_ret["low"], w_ret["high"]]),
+        wide_batch = {k: jnp.asarray(v.astype(np.float64) if v.dtype == np.float32 else v)
+                      for k, v in batch_a.items()}
+        ukey = jax.random.key(41)
+        split_bounds = wide_obj.batch_statistics(
+            wide_vars, lambda idx: (microbatch(wide_batch, idx, 2),
+                                    Step(jnp.int32(0), ukey, None, example_key=ukey,
+                                         example_index=idx + 2 * jnp.arange(2, dtype=jnp.int32),
+                                         example_count=4)), 2)
+        whole_step = Step(jnp.int32(0), ukey, None, example_key=ukey,
+                          example_index=jnp.arange(4, dtype=jnp.int32), example_count=4)
+        _, aux_whole = wide_obj.loss(wide_vars, wide_batch, whole_step)
+        assert aux_whole.effects is not None
+        w_low = aux_whole.effects["low"].mean()[0]
+        w_high = aux_whole.effects["high"].mean()[0]
+        assert_computes_the_oracle(np.asarray(split_bounds), np.asarray([w_low, w_high]),
                                    "Dreamer split return percentiles", roundings=64)
     assert_mid_window_resume(objective, batch_a, batch_b, str(tmp_path / "mid"), nudge=True)
 

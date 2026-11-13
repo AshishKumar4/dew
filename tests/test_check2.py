@@ -1225,3 +1225,20 @@ def test_the_recurrence_step_witness_refuses_rounded_cumulative_sums_and_an_off_
     (`rw.assert_step_faults_refused`): decays from a difference of fp32 cumulative sums (row 2066's defect)
     and each chunk's boundary a token early."""
     rw.assert_step_faults_refused(rw.interpreted_lane())
+
+
+def test_a_sort_and_a_top_k_are_certified_over_an_integer_types_whole_range():
+    """Check 2 orders an integer over its type's whole range: an unsigned 2^63 above every smaller value,
+    and the least int64 below every other, in a sort and in a top-k's greatest first. Its order keys were
+    signed (an unsigned 2^63 read negative) and a top-k's the keys' negation (the least int64 its own), so
+    these correct programs failed their certificates and their wrong orderings matched the oracle."""
+    with jax.enable_x64(new_val=True):
+        unsigned = np.asarray([0, 2 ** 63, 5, 2 ** 63 + 1, 5], np.uint64)
+        ends = np.asarray([np.iinfo(np.int64).min, 0, np.iinfo(np.int64).max, -1, 0], np.int64)
+        for values in (unsigned, ends):
+            assert ct.certified(jnp.sort, values)[1] == []
+            assert ct.certified(lambda a: jax.lax.top_k(a, 3), values)[1] == []
+            # An order's payload moves with its keys, equal keys in their places' order.
+            assert ct.certified(lambda a, b: jax.lax.sort((a, b), num_keys=1), values,
+                                np.arange(len(values), dtype=np.int32))[1] == []
+

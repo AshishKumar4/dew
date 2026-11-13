@@ -1698,7 +1698,7 @@ def test_stated_horizons_reach_a_solver_inside_an_injected_wrapper_and_its_repor
                                                                optax.scale(gain)))(gain=2.0)
     built = optax.inject_hyperparams(lambda gain: optax.chain(config.build(10), optax.scale(gain)))(gain=2.0)
     params, grads = {"w": jnp.ones(3)}, {"w": jnp.ones(3)}
-    rates = dict(config.grouped_rates())
+    rates = {group: rate for group, (rate, _) in config.grouped_rates().items()}
     state = with_horizons(stated.init(params), config.horizons(10), rates, 10)
     want = built.init(params)
     np.testing.assert_array_equal(learning_rate(state), learning_rate(want))

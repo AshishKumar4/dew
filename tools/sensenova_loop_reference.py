@@ -114,9 +114,9 @@ def write_recording(modeling) -> None:
         return {'input_ids': np.random.default_rng(seed).integers(0, vocabulary, SHAPE).astype(np.int32)}
 
     command = 'PYTHONPATH=src:tools:tests .venv-3.12/bin/python tools/sensenova_loop_reference.py --recording'
-    record_logits(TINY, model, truth, command, reference='SenseNovaLoopForConditionalGeneration (remote code)',
-                  revision=f'{REPO}@{REVISION}', license='Apache-2.0', transformers=transformers.__version__,
-                  draw=draw, planned=False)
+    record_logits(TINY, model, truth, command, draw=draw,
+                  reference='SenseNovaLoopForConditionalGeneration (remote code)',
+                  revision=f'{REPO}@{REVISION}', license='Apache-2.0', transformers=transformers.__version__)
 
 
 if __name__ == '__main__':
