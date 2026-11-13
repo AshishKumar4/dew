@@ -344,7 +344,6 @@ kept while each group's recorded tests stay within it (`planned`, cuts.py's `wei
 ran as while its heaviest group, setup included, does (cuts.py's `split`, `refolded`)."""
 
 
-@functools.cache
 def held_seconds() -> float:
     """The most a stored cut's group may weigh by its recorded tests (`KEPT` of .armada.json's target)."""
     return KEPT * json.loads(Path(".armada.json").read_text())["target"]

@@ -75,12 +75,12 @@ def weighed(session, tests: list[float], seconds: float, target: float,
     armada sized the run by its longest tasks, gave the sites' 874 map tasks 20 of its 688 containers, and
     train 772's CI ran out its deadline). A file with a stored cut (`stored`: each of its groups' recorded
     seconds, session.CUTS) runs as that cut, each group its tests plus the setup each paid, while every
-    group's tests stay within `session.KEPT` of `target` (`session.planned`'s test, so its tasks cut it
-    alike): the durations fold alone keeps or replaces a cut (`refolded`), so a group's name means the same
-    tests from run to run and its record is found again (Main, 2026-11-13); one outgrown is cut afresh, so a
-    group past its deadline, which no green run would fold away, is not run as it is again (train 793's
-    review)."""
-    if stored and max(stored) <= session.KEPT * target:
+    group's tests stay within `session.held_seconds` (`session.planned`'s test, whatever target a plan is
+    asked for, so its tasks cut it alike: review): the durations fold alone keeps or replaces a cut
+    (`refolded`), so a group's name means the same tests from run to run and its record is found again (Main,
+    2026-11-13); one outgrown is cut afresh, so a group past its deadline, which no green run would fold away,
+    is not run as it is again (train 793's review)."""
+    if stored and max(stored) <= session.held_seconds():
         setup = max((measured[0] if measured is not None else seconds) - sum(stored), 0.0) / len(stored)
         return [weight + setup for weight in stored]
     if measured is not None:
