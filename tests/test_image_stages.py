@@ -283,15 +283,18 @@ def _png(red: int) -> bytes:
 def test_decode_image_reads_an_image_under_any_conventional_field(field):
     """A record's image under its conventional field (jpg, png or image) is decoded by the step's default,
     its bytes replaced by the pixels (row 5757): only `jpg` was read; a field the step names outside the
-    convention is read as named, and a record without it refused."""
+    convention is read as named, and a record without it raises naming it, rejecting undecodable images
+    or not: a field the chain names wrong drops no record silently."""
     from dew.data.compile import iterate
 
     (decoded,) = iterate(Memory([{field: _png(200), "id": 1}]).map(images.DecodeImage(rejects=False)))
     assert decoded["image"].shape == (4, 4, 3) and int(decoded["image"][0, 0, 0]) == 200
     assert set(decoded) == {"id", "image"}
-    named = Memory([{field: _png(200)}]).map(images.DecodeImage("photo", rejects=False))
-    with pytest.raises(KeyError):
-        list(iterate(named))
+    held = Memory([{field: _png(200)}])
+    for named in (held.map(images.DecodeImage("photo", rejects=False)),
+                  held.filter_map(images.DecodeImage("photo"))):
+        with pytest.raises(KeyError):
+            list(iterate(named))
 
 
 def test_a_malformed_prepared_image_is_refused_as_undecodable_and_raises_where_asked():
