@@ -687,8 +687,10 @@ DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] =
                  "tokens a row (CUPTI, four rounds or five), one document a row its training 5.071 against "
                  "30.033 ms at one row and 19.222 against 116.469 at four, its forward 1.197 against 5.613 "
                  "and 3.115 against 19.837; twelve documents a row its training 1.510 against 4.841 and "
-                 "5.133 against 16.909, its forward 0.249 against 1.035 and 0.724 against 3.338; rows 4839 "
-                 "and 5368 retire it"),
+                 "5.133 against 16.909, its forward 0.249 against 1.035 and 0.724 against 3.338; its "
+                 "backward's workspace B·H·S²·4 bytes, 9.59 GiB a row's call (temp 38.35 GiB at four rows, "
+                 "plain cuDNN's 2.26), the whole 4B step's peak 95.3 GiB against the template's 61.4 at four "
+                 "rows (lab-b200-20261113-step85); rows 4839 and 5368 retire it"),
     ('mma.sync', CallKind.of(jnp.bfloat16)): (
         FLASH, "FlashAttention-2 measured faster than the template on an A100: a training step's attention "
                  "at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
