@@ -1,15 +1,16 @@
 from .base import (
-           Aux,
-           EMASpec,
-           Exponentiated,
-           Moments,
-           Objective,
-           Pooled,
-           Prediction,
-           Ratio,
-           Shown,
-           Step,
-           Weighted,
+    Aux,
+    EMASpec,
+    Exponentiated,
+    Moments,
+    Objective,
+    Pooled,
+    Prediction,
+    Ratio,
+    Shown,
+    Step,
+    Summed,
+    Weighted,
 )
 from .distillation import DistillationObjective
 
