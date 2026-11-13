@@ -148,6 +148,14 @@ class Capture:
             [sys.executable, str(Path(__file__).resolve()), "collect", str(self.pipe), str(self.done),
              str(self.stacks_file), str(spy)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, start_new_session=True)
+        # Armed only once the collector reads its pipe: a dying process finds no reader before then, and dies
+        # unread (a process aborting at once raced a collector still starting).
+        ready = time.monotonic() + 10
+        while not (self.done / "ready").exists() and time.monotonic() < ready and self.collector.poll() is None:
+            time.sleep(0.02)
+        if not (self.done / "ready").exists():
+            self.why = "the collector did not start"
+            return
         given = (environment or os.environ).get("LD_PRELOAD", "")
         self.variables = {"LD_PRELOAD": " ".join(part for part in (given, str(library)) if part),
                           "DEW_NATIVE_PIPE": str(self.pipe), "DEW_NATIVE_DONE": str(self.done),
@@ -172,6 +180,7 @@ def collect(pipe: Path, done: Path, stacks: Path, spy: Path) -> None:
     its word that it may die. Opened for reading and writing, so the pipe never reads its end between writers.
     """
     with open(os.open(pipe, os.O_RDWR), encoding="ascii", errors="replace") as said:
+        (done / "ready").touch()
         for line in said:
             parts = line.split()
             if len(parts) != 2 or not all(part.isdigit() for part in parts):
