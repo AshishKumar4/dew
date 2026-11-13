@@ -745,13 +745,13 @@ def test_a_b200s_gathered_input_gradient_fits_its_derived_resources():
     assert not failed, "\n".join(failed)
 
 
-def test_a_b200s_split_dense_kernel_gradient_runs_no_rewriting_role():
+def test_a_b200s_dense_kernel_gradient_runs_no_rewriting_role():
     """The 4B's up projection's dense kernel gradient (24,576 rows of 2560 by 9216, fp32) on a compile-only
-    B200 derives a tile whose contraction splits (`Tiles.splits`), and its kernel runs the threads its
-    planning prices for a stage read as loaded (`grouped_matmul._Mosaic.unstaged`): its producer's and its
-    consumers' warpgroups (`.maxntid` 256), no third warpgroup rewriting each step (em35d: 384 threads,
-    6.7x cuBLAS's instructions in that role's predicated LDSM, PRMT and SEL), compiled within its
-    resources."""
+    B200 derives a tile legal for its call (a pair's among its candidates, `mosaic_sm100.PAIR`), and its
+    kernel runs the threads its planning prices for a stage read as loaded
+    (`grouped_matmul._Mosaic.unstaged`): its producer's and its consumers' warpgroups (`.maxntid` 256), no
+    third warpgroup rewriting each step (em35d: 384 threads, 6.7x cuBLAS's instructions in that role's
+    predicated LDSM, PRMT and SEL), compiled within its resources."""
     import kernel_compile as kc
 
     from dew.nn.kernels import gemm
@@ -767,7 +767,10 @@ def test_a_b200s_split_dense_kernel_gradient_runs_no_rewriting_role():
         kc.PTX.clear()
         found = kc.compile_mosaic_kernels([support.KernelCase("up kernel gradient",
                                                               lambda: (kernel_gradient, operands))], "sm100")
-    assert [config.splits > 1 for config, _ in seen.taken] == [True], seen.taken
+    with generation.assumed("sm100"):
+        target = generation.gpu_target()
+        assert seen.taken and all(op.legal(ba, config, target) for (op, _), (config, ba)
+                                  in zip(seen, seen.taken, strict=True)), seen.taken
     threads = {int(each) for ptx in kc.PTX.values() for each in re.findall(r"\.maxntid (\d+),", ptx)}
     assert threads == {256}, threads
     failed = kc.mosaic_failures(found)

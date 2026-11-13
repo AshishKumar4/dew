@@ -271,6 +271,61 @@ def test_an_eight_slot_kernel_gradient_compiles_within_its_predicates():
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
+def _pair_gradient(out_dtype, *, k_major: bool = False, rows: int = 4096, depth: int = 1024,
+                   width: int = 1024):
+    """The dense kernel gradient (`mosaic_gpu.tgmm`, x^T dy over `rows`) on a pair's tile (`PAIRED`): each
+    CTA its 128 of the pair's 256 depth rows by the pair's 256 columns, loading its share of both
+    operands' blocks along their features (`rings.Paired`), as cuBLASLt runs a B200's (cta_group::2);
+    `k_major`, its operands rows-contiguous (`[depth, rows]`, `[width, rows]`), as blockwise FP8's lie."""
+    def product(lhs, rhs):
+        return mosaic_gpu.tgmm(lhs, rhs, jnp.asarray([rows], jnp.int32), tiles=PAIRED, out_dtype=out_dtype,
+                               multiprocessors=generation.gpu_target("sm100").multiprocessors, dense=True,
+                               k_major=k_major)[0]
+
+    shapes = tuple(jax.ShapeDtypeStruct((extent, rows) if k_major else (rows, extent), jnp.bfloat16)
+                   for extent in (depth, width))
+    return product, shapes
+
+
+def test_a_pairs_dense_kernel_gradient_compiles_for_a_b200_within_its_resources():
+    """The dense kernel gradient on a pair (`_pair_gradient`), into fp32 and bf16, its operands laid
+    rows-major and rows-contiguous, compiled by Mosaic for a
+    compile-only B200 through ptxas: within the multiprocessor's shared memory and tensor memory, no
+    register spilled, where `tgmm` took no pair (its tiles one CTA's, row 5671's 1.12-1.25x cuBLASLt's time
+    on the 4B's kernel gradients, M-EM-42)."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    def case(out_dtype, k_major):
+        return support.KernelCase(f"tcgen05 pair tgmm {jnp.dtype(out_dtype).name} k_major={k_major}",
+                                  lambda: _pair_gradient(out_dtype, k_major=k_major))
+
+    cases = [case(dtype, k_major) for dtype in (jnp.float32, jnp.bfloat16) for k_major in (False, True)]
+    found = compile_mosaic_kernels(cases, "sm100")
+    assert len(found) == len(cases) and all(record.get("kernels") for record in found), found
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def pairs_dense_kernel_gradient_holds_check_1_on_blackwell(out_dtype, k_major):
+    """The dense kernel gradient on a pair (`_pair_gradient`, a 4096-row step, its operands rows-major or
+    rows-contiguous), run on a B200 or a B300: as exact as XLA's x^T dy from float64 truth (check 1;
+    tests/test_gpu_gemm.py's cell)."""
+    product, shapes = _pair_gradient(out_dtype, k_major=k_major)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 2)
+        return tuple(jax.random.normal(key, shape.shape).astype(shape.dtype)
+                     for key, shape in zip(keys, shapes, strict=True))
+
+    def plain(lhs, rhs, wide=jnp.float32):
+        lhs, rhs = (lhs.T, rhs.T) if k_major else (lhs, rhs)
+        return jnp.dot(lhs.T.astype(wide), rhs.astype(wide),
+                       precision=jax.lax.Precision.HIGHEST).astype(wide if wide == jnp.float64 else out_dtype)
+
+    assert_as_exact(jax.jit(product), jax.jit(plain), draw, f"a pair's dense kernel gradient into "
+                    f"{jnp.dtype(out_dtype).name} on Blackwell", seeds=SEEDS,
+                    truth_fn=functools.partial(plain, wide=jnp.float64))
+
+
 def test_a_pairs_tile_is_twice_a_ctas_and_takes_only_what_its_views_read():
     """A pair's tile (`PAIRED`, `mosaic.Transport.pairs_product`): its accumulators hold both CTAs' columns
     (`mosaic_gpu.tile_columns`); a tile of 256 columns a CTA, past its half of one product, or of one CTA is

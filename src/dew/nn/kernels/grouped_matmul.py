@@ -996,10 +996,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         """Whether `config` is a tile of the call on `target` apart from its resources: of the launch's
         family there (a layout of it, `bundles.layouts`), in its granularity (whole roles of rows for each
         consumer, exactly the family's accumulator rows where it fixes them, whole column units, one of
-        its depths, at most its consumers, at most the programs its registers hold, a pair's tile on a family
-        whose products span one, `mosaic_gpu.pair_takes`), its accumulators and its streams' tensor memory
-        held in the tensor memory a family keeps them in (`mosaic.Issuer.tensor_columns`,
-        `stream_tensor_columns`), with a ring of two
+        its depths, at most its consumers, at most the programs its registers hold, a compiled pair's tile on
+        a family whose products span one, `mosaic_gpu.pair_takes`, none interpreted), its accumulators and
+        its streams' tensor memory held in the tensor memory a family keeps them in
+        (`mosaic.Issuer.tensor_columns`, `stream_tensor_columns`), with a ring of two
         stages at least (a walk keeping one step's products in flight holds its slot while the next step's
         loads fill another), its blocks dividing the call's extents, its cluster at most the family's
         (`mosaic.Family.cluster`), and a one-dimensional side operand's block, copied untiled, at most one
@@ -1007,6 +1007,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         spilling (`report.refused`), so the derivation takes the next tile by its own rule."""
         family = next((bundle for bundle in self._families(ba, target) if bundle.name == config.family), None)
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
+                or (family.pairs_product and ba.arguments['interpret'])
                 or self._pair_refuses(ba, config, family)
                 or not self._divides(ba, config) or report.refused(self, ba, config)):
             return False
@@ -1046,11 +1047,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def _pair_refuses(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> bool:
         """Whether a pair's product refuses the call at `config` (`mosaic_gpu.pair_refuses`, the statement
-        `gmm` refuses it by): its prologue, second matrix, scales and gathered rows, its exact sums."""
+        `gmm`, `tgmm` refuse by): its prologue, second matrix, scales, gathered rows, exact sums, rewrite."""
         return mosaic_gpu.pair_refuses(config, family, transpose_lhs=False,
                                        exact_sums=bool(ba.arguments.get('exact_sums')), scaled=self._scaled,
                                        parts=(ba.arguments['hooks'].prologue, ba.arguments.get('paired'),
-                                              ba.arguments.get('gather')))
+                                              ba.arguments.get('gather')),
+                                       rewritten=self.rewritten(ba, family))
 
     def _ran(self, ba, config: mosaic_gpu.Tiles) -> tuple:
         """The call and tile a launch at `config` runs, which its legality, registers and launch read: the
@@ -1742,13 +1744,14 @@ class MosaicTgmm(_Mosaic):
     def _split_tile(self, ba, target, below: int | None = None) -> mosaic_gpu.Tiles | None:
         """The derived tile (narrower than `below` columns where given), its contraction split where its
         output tiles underfill a wave (`mosaic_gpu.split_count`) at the tile the split's own call, writing
-        fp32 partials, derives."""
+        fp32 partials, derives, one a split runs on (a pair's refuses one, `mosaic_gpu.pair_refuses`)."""
         admits = None if below is None else (lambda tile: tile.block_n < below)
         tile = self._derived(ba, target, admits)
         if tile is None or self._balances(ba, tile, target) or self._splits(ba, tile, target) == 1:
             return tile
-        partials = self._partials(ba)
-        sliced = self._derived(partials, target, admits)
+        partials, d = self._partials(ba), ba.arguments['tokens'].dtype
+        sliced = self._derived(partials, target, lambda each: (admits is None or admits(each)) and not (
+            self._pair_refuses(partials, dataclasses.replace(each, splits=2), mosaic_gpu.family_of(each, d))))
         if sliced is None or (splits := self._splits(partials, sliced, target)) == 1:
             return tile
         split = dataclasses.replace(sliced, splits=splits)
@@ -1807,9 +1810,11 @@ class MosaicTgmm(_Mosaic):
         return self._partials(ba), dataclasses.replace(config, splits=1)
 
     def _divides(self, ba, config: mosaic_gpu.Tiles) -> bool:
-        rows, _, width = self._generated_extents(ba)
+        rows, _, width = self._generated_extents(ba)  # a pair's tile both CTAs' (`mosaic_gpu.tile_rows`)
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-        return (rows % config.block_m == 0 or self._ragged(ba, family)) and width % config.block_n == 0
+        whole = (rows % mosaic_gpu.tile_rows(config, family) == 0
+                 or (self._ragged(ba, family) and not family.pairs_product))
+        return whole and width % mosaic_gpu.tile_columns(config, family) == 0
 
     def _ragged(self, ba, family: mosaic.Family) -> bool:
         # A depth no cooperative tile's rows divide takes a partial last row tile where the family's loads
@@ -1829,13 +1834,14 @@ class MosaicTgmm(_Mosaic):
         return (config.block_k,)
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
-        """`_Mosaic.candidate` on one multiprocessor a tile (`mosaic_gpu.tgmm` takes no pair), a family
+        """`_Mosaic.candidate` on one multiprocessor a tile or a pair (`tgmm` multicasts nothing), a family
         whose products read registers loading its transposed stage in whole row atoms of its products (the
         step, `block_k`, in `Family.transposed_rows`)."""
-        if config.cluster != 1 or not super().candidate(ba, config, target):
+        if not super().candidate(ba, config, target):
             return False
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-        return not (family.operands_in_registers and config.block_k % family.transposed_rows)
+        return ((config.cluster == 1 or family.pairs_product)
+                and not (family.operands_in_registers and config.block_k % family.transposed_rows))
 
     BLOCKS: ClassVar[dict[str, str]] = {'rows': 'block_k', 'depth': 'block_m'}
 
