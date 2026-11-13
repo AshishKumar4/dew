@@ -78,8 +78,8 @@ def scopes_products(family: mosaic.Family) -> bool:
 def qualified(family: mosaic.Family) -> bool:
     """Whether the attention mainloop runs on `family`: one whose consumers issue their products
     (`Family.issues_in_consumers`), whose walk's softmax and its rescales run between them in the registers
-    that hold them (wgmma's, mma.sync's, a TPU core's MXU); not tcgen05's, one warp issuing them into tensor
-    memory, which the Blackwell template walks (`attention_blackwell`)."""
+    that hold them (wgmma's, mma.sync's, tcgen05's chunks, a TPU core's MXU); not a bundle whose one warp
+    issues them into tensor memory (`mosaic_sm100.RINGS`)."""
     return family.issues_in_consumers
 
 

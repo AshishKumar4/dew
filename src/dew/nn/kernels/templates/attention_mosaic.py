@@ -871,7 +871,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     `[B, Hk, K]` fp32, one a key and key head in its row's key order: the call reads the keys and values they
     dequantize to, each converted to the query's dtype in its program (`_Codes`). `scaled` launches the
     scaled op whatever the call's values (`MosaicForward.scaled`: a mainloop whose own kernel holds no scale
-    gives it a call some row of which can be scaled, `attention_blackwell.forward`); `bounded` the unscaled
+    gives it a call some row of which can be scaled); `bounded` the unscaled
     one, a cache's call too, where its caller bounded its values (`MosaicForward.bounded`).
     """
     if residuals is Kept.SPLIT:

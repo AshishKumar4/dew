@@ -10,7 +10,6 @@ its own gate's; these are the attention's and the recurrence's, whose producers 
 import dataclasses
 import functools
 
-import jax
 import jax.numpy as jnp
 import pytest
 from fla_gdn_support import KernelCase
@@ -20,12 +19,7 @@ from test_attention_mosaic import _residuals
 from test_recurrence_mosaic import resource_operands
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import (
-    attention as template,
-    attention_blackwell,
-    attention_mosaic,
-    attention_mosaic_program,
-)
+from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_mosaic_program
 from dew.nn.kernels.templates.recurrence import template as recurrence
 
 pytestmark = pytest.mark.kernel
@@ -131,40 +125,4 @@ def test_a_launch_at_its_deepest_ring_compiles_within_its_resources(cell, genera
         case = KernelCase(f"{cell} at {at.stages} stages", lambda: op.lowering(ba, at))
         found = compile_mosaic_kernels([case], generation_name)
     failed = mosaic_failures(found)
-    assert not failed, "\n".join(failed)
-
-
-STAGES = range(2, 11)
-"""The Blackwell forward's rings a cell lowers: from the least to past what its block holds."""
-
-
-@COMPILES_ON_CPU
-@pytest.mark.parametrize("width", [64, 128])
-@pytest.mark.parametrize("generation_name", gate_generations(
-    stated=True, needs=lambda family, architecture: "tcgen05" in architecture.issuers))
-def test_a_blackwell_attention_at_its_deepest_ring_compiles_within_its_resources(generation_name, width):
-    """The Blackwell forward (tcgen05's, one warp issuing into tensor memory) of a causal call `width` wide
-    at each ring of `STAGES`, lowered for each GPU issuing tcgen05 on this CPU: those its block's shared
-    memory holds compiled by ptxas within its resources and spilling nothing, the deepest of them among them,
-    the rest refused at their lowering by the bytes they ask past the block's."""
-    spans = template.spans(QUERIES, QUERIES, 1, causal=True)
-
-    def case(stages: int) -> KernelCase:
-        tiles = attention_blackwell.Tiles(stages=stages)
-
-        def call():
-            def forward(query, key, value):
-                return attention_blackwell.forward(query, key, value, spans, tiles=tiles)
-
-            return forward, (jax.ShapeDtypeStruct((1, QUERIES, 4, width), jnp.bfloat16),
-                             jax.ShapeDtypeStruct((1, QUERIES, 2, width), jnp.bfloat16),
-                             jax.ShapeDtypeStruct((1, QUERIES, 2, width), jnp.bfloat16))
-
-        return KernelCase(f"blackwell attention {width} at {stages} stages", call)
-
-    with generation.assumed(generation_name):
-        found = compile_mosaic_kernels([case(stages) for stages in STAGES], generation_name)
-    held = [record for record in found if "error" in record or record.get("shared", 0) <= record["limit"]]
-    assert len(held) < len(found), f"{generation_name} holds every ring to {STAGES[-1]} stages"
-    failed = mosaic_failures(held)
     assert not failed, "\n".join(failed)
