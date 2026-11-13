@@ -109,14 +109,25 @@ class DecodeImage(grain.MapTransform):
             object.__setattr__(self, name, value)
 
     def map(self, element: Batch | bytes) -> Batch | Rejected:
+        if isinstance(element, bytes):
+            try:
+                # A prepared ArrayRecord payload is undecodable alike where it is malformed (row 5758).
+                field, row = self._prepared(element)
+            except (KeyError, ValueError, UnicodeDecodeError):
+                if not self.rejects:
+                    raise
+                return Rejected("undecodable")
+        else:
+            # A record's own fields: one missing is the chain's mistake, which the read raises, naming it.
+            field, row = conventional(element, self.field, IMAGE_FIELDS), element
+            if field not in row:
+                raise KeyError(f"{type(self).__name__} reads {field!r}, which a record holding "
+                               f"{sorted(row)} has none of; name its image's field (field=)")
         try:
-            # A prepared ArrayRecord payload is undecodable alike where it is malformed (row 5758).
-            field, row = self._prepared(element) if isinstance(element, bytes) else (
-                conventional(element, self.field, IMAGE_FIELDS), element)
             image = _payload(row[field])
             pixels = decode_image(image, at_least=self.at_least) if isinstance(image, bytes) \
                 else as_rgb(np.asarray(image))
-        except (KeyError, ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError):
             if not self.rejects:
                 raise
             return Rejected("undecodable")

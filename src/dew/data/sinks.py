@@ -183,11 +183,22 @@ def _kept(value: Value, kind: pa.DataType, path: str) -> None:
                 _kept(entry, known[name], at)
         case str() | bytes() | bytearray():
             return
-        case Sequence() | np.ndarray() if pa.types.is_list(kind) or pa.types.is_large_list(kind) \
-                or pa.types.is_fixed_size_list(kind):
-            # An array is a list column as Arrow converts it, an object array's entries its structs.
+        case Sequence() | np.ndarray() if (pa.types.is_list(kind) or pa.types.is_large_list(kind)
+                                           or pa.types.is_fixed_size_list(kind)) and _nests(kind.value_type):
+            # An array is a list column as Arrow converts it, an object array's entries its structs: walked
+            # only where its entries hold fields of their own, not per token or pixel.
             for entry in value:
                 _kept(entry, kind.value_type, f"{path}[]")
+
+
+def _nests(kind: pa.DataType) -> bool:
+    """Whether a list's entries of `kind` can hold fields Arrow's conversion would drop: structs, or lists
+    of them."""
+    if pa.types.is_struct(kind):
+        return True
+    if pa.types.is_list(kind) or pa.types.is_large_list(kind) or pa.types.is_fixed_size_list(kind):
+        return _nests(kind.value_type)
+    return False
 
 
 def _streamed(chunks: Iterator[list[Batch | bytes | None]]) -> pa.RecordBatchReader | None:
