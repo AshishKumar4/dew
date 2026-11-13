@@ -372,6 +372,24 @@ def test_a_call_over_requests_scores_in_a_servers_passes_over_its_programs(decid
         assert discrete(answers) == discrete(declared(state, questions))
 
 
+def test_a_tasks_later_calls_trace_and_compile_nothing(decide):
+    """A task's calls score over one scoring plan (`RowScoring`: its passes' shapes, window bounds and
+    packs, and the programs compiled for them), which its first call builds and the rest read: a later
+    call of a request the first one shaped traces no program and compiles none (`Compiles`; ledger 4807),
+    and answers as the first did."""
+    from dew.decision import Question
+    from dew.telemetry.compiles import Compiles
+
+    questions = {name: Question.from_wire(wire) for name, wire in REQUEST["questions"].items()}
+    first = decide(REQUEST["state"], questions)
+    for _ in range(2):
+        with Compiles(None) as compiles:
+            again = decide(REQUEST["state"], questions)
+        assert compiles.programs == [], [program.name for program in compiles.programs]
+        for name, answer in again.items():
+            np.testing.assert_array_equal(answer.probabilities, first[name].probabilities)
+
+
 def test_a_scoring_pass_looks_at_every_waiting_request(decide):
     """A pass takes rows from every waiting request while its plan takes them, not from a bounded few: a
     hundred short requests one pass's windows hold are answered in one step, where a pass of 64 requests
