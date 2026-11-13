@@ -1607,17 +1607,22 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     # The task environment's py-spy (the test extra), which reads a stalled pytest's stacks (`stalls.dumped`)
-    # and a signal-ended one's native stacks (`natives`).
-    spy, stacks = Path(f".venv-{python}/bin/py-spy"), out.with_name(f"{out.name}.native")
-    capture, uncaptured = natives.armed(spy, stacks, dict(environment))
-    returncode, output, expired, dump, opened, wrote = ran_pytest(command, {**environment, **capture},
-                                                                  deadline, grace, pid, spy)
+    # and, from a collector outside it, those of a process of its a signal ends (`natives.Capture`).
+    spy = Path(f".venv-{python}/bin/py-spy")
+    capture = natives.Capture(spy, dict(environment))
+    try:
+        returncode, output, expired, dump, opened, wrote = ran_pytest(
+            command, {**environment, **capture.variables}, deadline, grace, pid, spy)
+    finally:
+        stacks = capture.stacks()
     stall = stall_evidence(python, tests, group, dump, began) if expired else None
-    # A pytest a signal ended: its whole output and its processes' native stacks kept (`natives.kept`).
-    if returncode < 0 and not expired:
-        said = f"\nnative stacks not captured: {uncaptured}\n" if uncaptured else ""
-        stall = natives.kept(armada_dir("ARMADA_ARTIFACTS", ARTIFACTS), evidence_name(python, tests, group),
-                             output + said, stacks)
+    # A red run that a signal ended, or a process of it (a worker its test started): its whole output and the
+    # native stacks kept as one record, as a stall's is (`stalls.kept`).
+    if not expired and returncode != 0 and (returncode < 0 or "ended by signal" in stacks):
+        root = armada_dir("ARMADA_ARTIFACTS", ARTIFACTS)
+        kept = stalls.kept(root, f"signalled-{evidence_name(python, tests, group)}",
+                           f"{output}\n== native stacks\n{stacks}", time.time() - (time.monotonic() - began))
+        stall = str(kept.relative_to(root))
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.

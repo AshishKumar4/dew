@@ -260,9 +260,23 @@ def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci,
     [aborted] = json.loads((tmp_path / "aborted.json").read_text())["rows"]
     assert (aborted["exitCode"], aborted.get("signal")) == (1, 6)
     [kept] = aborted["artifacts"]
-    where = tmp_path / "artifacts" / kept
-    # pytest's own output whole (its capture of the test's prints dies with the process): its Python stacks.
-    output = (where / "output.txt").read_text()
-    assert "Fatal Python error: Aborted" in output and "test_any.py" in output
-    stacks = (where / "native-stacks.txt").read_text()
-    assert "ended by signal 6" in stacks and "abort" in stacks
+    record = (tmp_path / "artifacts" / kept).read_text()
+    # pytest's own output whole (its capture of the test's prints dies with the process): its Python stacks,
+    # then every signalled process's native stacks, read from outside it.
+    assert "Fatal Python error: Aborted" in record and "test_any.py" in record
+    assert "ended by signal 6" in record.split("== native stacks", 1)[1]
+
+
+def test_a_worker_a_signal_ends_keeps_its_native_stacks_though_pytest_exits_red(ci, tmp_path):
+    """A process a test starts (a worker, here in another directory) that a signal ends keeps its native stacks
+    with the run's whole output, though pytest itself exits red rather than by the signal (review, 2026-11-13: the
+    capture kept a signal-ended pytest's alone, and a worker's paths were relative to where it ran)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_any.py": "import subprocess\nimport sys\n\n\ndef test_worker_aborts():\n"
+                                      "    done = subprocess.run([sys.executable, '-c', 'import os; os.abort()'],"
+                                      " cwd='/')\n    assert done.returncode == 0\n"})
+    ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "worker.json", 30.0, cache="off")
+    [red] = json.loads((tmp_path / "worker.json").read_text())["rows"]
+    assert red["exitCode"] == 1 and "signal" not in red
+    [kept] = red["artifacts"]
+    assert "ended by signal 6" in (tmp_path / "artifacts" / kept).read_text().split("== native stacks", 1)[1]
