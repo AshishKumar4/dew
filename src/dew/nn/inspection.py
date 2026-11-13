@@ -13,7 +13,7 @@ import contextlib
 import contextvars
 import dataclasses
 import fnmatch
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 
 import flax.linen as nn
 import jax
@@ -22,7 +22,7 @@ import numpy as np
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.custom_derivatives import zero_from_primal
 
-from dew.batch import PROBES
+from dew.batch import PARTS, PROBES
 from dew.nn.backbones.layer_names import any_layer
 from dew.nn.derivatives import Surrogate, contracted, declared_derivative
 from dew.nn.sharding import in_pipeline_stage
@@ -107,6 +107,42 @@ def watched_positions(positions: jax.Array | None) -> Iterator[None]:
 def current_positions() -> jax.Array | None:
     """The positions a watched summary reads where the call runs (`watched_positions`), None for every."""
     return _POSITIONS.get()
+
+
+_COMPONENT: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("watched_component", default=())
+
+
+@contextlib.contextmanager
+def component(name: str) -> Iterator[None]:
+    """Within the block, one part of a model applied in parts, each over its own part of the variables
+    (a decision run's backbone and head, a PPO run's policy and critic), which its caller nests by its
+    name (`in_parts`): a glob names its modules by their path in the model's variables too (`head/*`,
+    `policy/layers_3/*`), as the log names them."""
+    token = _COMPONENT.set((*_COMPONENT.get(), name))
+    try:
+        yield
+    finally:
+        _COMPONENT.reset(token)
+
+
+def in_parts(trees: Mapping[str, Mapping]) -> dict:
+    """A sown collection's trees of a model applied in parts (`component`), each by its part's name in the
+    model's variables, under `PARTS`: the log names each module by its path in the variables
+    (`backbone/layers_3/attn`, `head/...`), fixed by the model whatever a run watches, no two parts'
+    alike, and a step's cotangent probes nest so for each part's call (`dew.batch.probed`)."""
+    return {PARTS: dict(trees)}
+
+
+def _logged(path: Sequence[str]) -> tuple[str, ...]:
+    """A sown module path as the log names it: its path less the `PARTS` keys, its path in the model's
+    variables."""
+    return tuple(key for key in path if key != PARTS)
+
+
+def _within(path: Sequence[str]) -> str:
+    """A sown module path within its innermost part (`in_parts`), as that part's apply gives it."""
+    after = max((index + 2 for index, key in enumerate(path) if key == PARTS), default=0)
+    return "/".join(path[after:])
 
 
 PROBE = "__probe__"
@@ -275,14 +311,17 @@ def watching(modules: tuple[str, ...], *, histogram: bool = False,
         output = next_fun(*args, **kwargs)
         module = context.module
         path = "/".join(module.path)
+        # A model applied in parts (`component`) names its modules by their path in its variables too.
+        part = _COMPONENT.get()
+        paths = (path, "/".join((*part, *module.path))) if part else (path,)
         named = any(fnmatch.fnmatchcase(name, glob)
-                    for glob in modules for name in (type(module).__name__, path))
+                    for glob in modules for name in (type(module).__name__, *paths))
         # A stacked run of layers (`layers_3_7`, a pipeline stage's `stages/layers_j`) is any of the layers
         # the log names its entries by: a glob over one of them takes the run, and the log keeps that layer's
         # entries alone (`flattened`).
-        widened = any_layer(path)
-        candidate = widened != path and any(
-            fnmatch.fnmatchcase(widened, any_layer(glob, pattern=True)) for glob in modules)
+        candidate = any(any_layer(each) != each
+                        and fnmatch.fnmatchcase(any_layer(each), any_layer(glob, pattern=True))
+                        for each in paths for glob in modules)
         if context.method_name != "__call__" or not (named or candidate):
             return output
         if not module.is_mutable_collection(INSPECTED):
@@ -336,7 +375,8 @@ def kept(inspected: Mapping, modules: tuple[str, ...]) -> set[tuple[str, ...]]:
         if not isinstance(tree, Mapping):
             return
         if SOWN in tree and (BY_PATH not in tree or any(
-                fnmatch.fnmatchcase("/".join(path), glob) for glob in modules)):
+                fnmatch.fnmatchcase(name, glob) for name in ("/".join(_logged(path)), _within(path))
+                for glob in modules)):
             found.add(path)
         for key, value in tree.items():
             walk(value, (*path, str(key)))
@@ -354,11 +394,11 @@ def flattened(inspected: Mapping, modules: tuple[str, ...] = ()) -> dict[str, ja
     found: dict[str, jax.Array] = {}
     for path, leaf in jax.tree_util.tree_flatten_with_path(inspected)[0]:
         keys = [str(entry.key) if isinstance(entry, jax.tree_util.DictKey) else str(entry) for entry in path]
-        statistic, module = keys[-1], [key for key in keys[:-1] if key != SOWN]
-        if statistic in (PROBE, STAGED_PROBE, BY_PATH) or tuple(module) not in logged:
+        statistic, module = keys[-1], tuple(key for key in keys[:-1] if key != SOWN)
+        if statistic in (PROBE, STAGED_PROBE, BY_PATH) or module not in logged:
             continue
         for index in np.ndindex(*leaf.shape):
-            found["/".join(["activations", *module, *map(str, index), statistic])] = leaf[index]
+            found["/".join(["activations", *_logged(module), *map(str, index), statistic])] = leaf[index]
     return found
 
 
@@ -371,12 +411,12 @@ def cotangent_summaries(gradients: Mapping, histogram: bool,
     found: dict[str, jax.Array] = {}
     for path, leaf in jax.tree_util.tree_flatten_with_path(gradients)[0]:
         keys = [str(entry.key) if isinstance(entry, jax.tree_util.DictKey) else str(entry) for entry in path]
-        module = [key for key in keys if key != PROBE]
-        if logged is not None and tuple(module) not in logged:
+        module = tuple(key for key in keys if key != PROBE)
+        if logged is not None and module not in logged:
             continue
         for index in np.ndindex(*leaf.shape[:-1]):
             for statistic, value in summarized(leaf[index], histogram=histogram).items():
-                found["/".join(["cotangents", *module, *map(str, index), statistic])] = value
+                found["/".join(["cotangents", *_logged(module), *map(str, index), statistic])] = value
     return found
 
 

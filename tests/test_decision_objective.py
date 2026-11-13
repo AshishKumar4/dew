@@ -782,8 +782,8 @@ def test_the_abstract_state_draws_a_missing_head_at_the_shapes_init_draws(joint)
 
 
 def test_the_joint_heads_bfloat16_cosine_is_an_fp32_cosine_in_every_process_on_a_cpu():
-    """The joint head's cosine of its fields and options (`option_cosine`) of bfloat16 operands on a CPU,
-    at the `[32, 128, 24]` whose 16-bit cosine XLA's CPU compiler fused into one YNNPACK reduction that
+    """The joint head's cosine of its fields and options (`dew.nn.norms.cosine`) of bfloat16 operands on a
+    CPU, at the `[32, 128, 24]` whose 16-bit cosine XLA's CPU compiler fused into one YNNPACK reduction that
     came back different in each process, NaNs among them (row 5495): two fresh processes give it alike,
     and within two float32 evaluations' distance of the cosine of the same values given in float32
     (`reduction_bound`). Each evaluation's product of a field's and an option's entry carries at most
@@ -794,12 +794,12 @@ def test_the_joint_heads_bfloat16_cosine_is_an_fp32_cosine_in_every_process_on_a
     script = """
 import json
 import jax, jax.numpy as jnp, numpy as np
-from dew.decision.head import option_cosine
+from dew.nn.norms import cosine
 shape = (32, 128, 24)
 z = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
 fields, options = (jnp.asarray(np.sin(z) * 2, jnp.bfloat16), jnp.asarray(np.cos(z) * 2, jnp.bfloat16))
-cosines = (jax.jit(option_cosine)(fields, options),
-           jax.jit(option_cosine)(fields.astype(jnp.float32), options.astype(jnp.float32)))
+joint = jax.jit(lambda a, b: cosine(a, b, 1e-8))
+cosines = (joint(fields, options), joint(fields.astype(jnp.float32), options.astype(jnp.float32)))
 a, b = (np.asarray(v, np.float64) for v in (fields, options))
 magnitudes = np.abs(a * b).sum(-1) / (np.linalg.norm(a, axis=-1) * np.linalg.norm(b, axis=-1))
 print(json.dumps({"dtypes": [str(c.dtype) for c in cosines],

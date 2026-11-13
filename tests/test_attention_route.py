@@ -1105,20 +1105,42 @@ def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_l
 
 @pytest.mark.parametrize(("generation_name", "tokens", "width", "declared"), [
     ("sm80", 4096, 128, True), ("sm90", 32768, 64, True), ("sm80", 256, 128, True), ("sm80", 4096, 256, True),
-    ("sm90", 65536, 128, False), ("sm80", 65536, 64, False)],
-    ids=["a100-measured", "h100-longest", "shorter", "wider", "longer", "longer-narrower"])
+    ("sm90", 65536, 128, False), ("sm80", 65536, 64, False), ("sm100", 4096, 256, True),
+    ("sm100", 32768, 128, True), ("sm100", 256, 64, True), ("sm100", 128, 128, False),
+    ("sm100", 4096, 32, False), ("sm100", 65536, 256, False)],
+    ids=["a100-measured", "h100-longest", "shorter", "wider", "longer", "longer-narrower", "b200-measured",
+         "b200-longest", "b200-shortest", "b200-shorter", "b200-narrower", "b200-longer"])
 def test_a_16_bit_calls_declared_cell_holds_only_within_its_receipts_shapes(generation_name, tokens, width,
                                                                              declared):
     """A bf16 causal call over 8 key heads on an A100 or an H100, whose declared cell names FlashAttention
     (`attention_kernels.DECLARED`), its receipts holding up to 32768 tokens (`MEASURED`: their lead growing
     as the calls shorten): a call within them, a shorter or a wider one among them, is in that cell; a
-    longer one is a cell none declares, which takes the template (row 5285)."""
+    longer one is a cell none declares, which takes the template (row 5285). On a B200, whose cell names
+    cuDNN, its receipts' shapes alone: 256 to 32768 tokens at widths 64, 128 and 256, four query heads a key
+    head."""
     from dew.nn import attention_kernels
     from dew.nn.attention import attention_case
 
     query = jax.ShapeDtypeStruct((1, tokens, 32, width), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, tokens, 8, width), jnp.bfloat16)
     with generation.assumed(generation_name):
+        cell = attention_case(query, key, causal=True).cell
+    assert (cell in attention_kernels.DECLARED) == declared
+
+
+@pytest.mark.parametrize(("heads", "kv_heads", "declared"), [
+    (32, 8, True), (16, 4, True), (32, 32, False), (64, 8, False)], ids=["32/8", "16/4", "mha", "8-group"])
+def test_a_b200s_declared_cell_holds_only_its_receipts_head_layouts(heads, kv_heads, declared):
+    """A bf16 causal call of 4096 tokens, 128 wide, on a B200, whose cell names cuDNN at the head layouts its
+    receipts timed (`attention_kernels.MEASURED`: four query heads a key head): a call of those is in that
+    cell; one whose key heads serve one query head or eight is a cell none declares, which takes the
+    template."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+
+    query = jax.ShapeDtypeStruct((1, 4096, heads, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 4096, kv_heads, 128), jnp.bfloat16)
+    with generation.assumed("sm100"):
         cell = attention_case(query, key, causal=True).cell
     assert (cell in attention_kernels.DECLARED) == declared
 

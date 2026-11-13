@@ -231,6 +231,12 @@ def _source_identity(name: str) -> tuple[str, str]:
     return ("directory", str(path.resolve())) if path.is_dir() else ("hub", name)
 
 
+def trusted_packages() -> tuple[str, ...]:
+    """The packages outside Dew this process trusts beyond Flax's (`import_trusted`): what a run of its
+    record in another process is told to trust (`dew train --trust`)."""
+    return tuple(sorted(_TRUSTED - {"flax"}))
+
+
 def trusts_source(name: str) -> bool:
     """Whether the process trusts the source `name`, a Hub repository or a directory, to run its own
     code where a load reads it (`trust_remote_code`): as `trust=(name,)` and `--trust name` say where a

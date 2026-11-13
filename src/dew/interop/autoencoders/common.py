@@ -1,5 +1,5 @@
-"""What every published autoencoder's loader shares: its release's directory and config, its class checked
-before any weight is read (`check_class`, `published_source`)."""
+"""What every published autoencoder's loader shares: its release's directory and config, resolved once, its
+class checked before any weight is read (`check_class`, `published_source`)."""
 
 from __future__ import annotations
 
@@ -17,15 +17,23 @@ def check_class(config: Mapping[str, object], names: tuple[str, ...], where, *,
 
 
 def published_source(name_or_dir, revision, subfolder: str, names: tuple[str, ...], *, weights: bool,
-                     nameless: bool = False):
-    """A published autoencoder's directory and config (`dew.interop.components.component_source`), its
-    config checked first (`check_class`) and its weights fetched only after, so a foreign checkpoint is
-    refused by name before any of its weights is read."""
-    from dew.interop.components import component_source
+                     nameless: bool = False, read: Mapping[str, object] | None = None):
+    """A published autoencoder's directory and config, resolved once: its release's metadata at the commit
+    `revision` resolves to (`dew.interop.sources.snapshot`), its config read there, or `read` where the
+    caller read it there already (`load_autoencoder`'s dispatch), checked first (`check_class`), and its
+    weights fetched only after, at that commit, so a foreign checkpoint is refused by name before any of
+    its weights is read and the weights read are the checked config's."""
+    import json
+    import os
 
-    directory, config = component_source(name_or_dir, revision, subfolder, weights=False)
+    from dew.interop.sources import snapshot
+
+    release = snapshot(str(name_or_dir), revision, weights=False)
+    directory = release / subfolder
+    config: dict = dict(read) if read is not None else json.loads((directory / "config.json").read_text())
     check_class(config, names, directory, nameless=nameless)
-    if weights:
-        directory, config = component_source(name_or_dir, revision, subfolder, weights=True)
+    if weights and not os.path.isdir(name_or_dir):
+        # A Hub release's snapshot is named by the commit it holds.
+        fetched = snapshot(str(name_or_dir), release.name, weights=(subfolder,) if subfolder else True)
+        directory = fetched / subfolder
     return directory, config
-

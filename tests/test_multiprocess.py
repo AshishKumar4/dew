@@ -794,15 +794,28 @@ def pool_checkpoint(tmp_path_factory):
 @pytest.mark.distributed
 def test_every_process_plans_from_the_tightest_room_any_of_their_devices_leaves(tmp_path):
     """The derivation's judgments decide which plan compiles first, so every process reads each alike, the
-    tightest any process's devices leave (`memory.pooled_headroom`, row 3341's review): over two processes
-    whose devices leave four microbatches room to the byte on one and a byte less on the other, each judges
-    four to refuse and compiles eight first, the plan the other compiles, where judged apart one would
-    have compiled four and the other eight."""
+    tightest any process's devices leave (`memory.derived_headroom`, pooled, row 3341's review): over two
+    processes whose devices leave four microbatches room to the byte on one and a byte less than the least
+    it might need on the other (a CPU's footprint an interval, row 5448), each judges four to refuse and
+    compiles eight first, the plan the other compiles, where judged apart one would have compiled four and
+    the other eight."""
     reports = run_pool("agreement", tmp_path, 2, script=Path(__file__).with_name("plan_worker.py"), devices=1)
     first, second = reports
     assert first["need"] == second["need"]
     assert first["derived"] == second["derived"] and first["derived"]["4"] == -1
     assert first["asked"] == second["asked"] and first["asked"][0] == 8 and first["split"] == second["split"]
+
+
+@pytest.mark.distributed
+def test_every_process_leaves_an_undecided_split_to_the_same_compile(tmp_path):
+    """Over two processes whose devices leave four microbatches room to the byte on one and a byte short of
+    the most it might need on the other, alone (its footprint's upper bound), the pooled judgment of four is
+    undecided on both (`memory.derived_headroom`'s interval spanning zero), and both leave it to the same
+    compile: the same splits asked in the same order, the same plan."""
+    reports = run_pool("undecided", tmp_path, 2, script=Path(__file__).with_name("plan_worker.py"), devices=1)
+    first, second = reports
+    assert first["derived"] == second["derived"] and first["derived"]["4"] is None
+    assert first["asked"] == second["asked"] and first["split"] == second["split"]
 
 
 @pytest.mark.distributed

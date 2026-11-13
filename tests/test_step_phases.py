@@ -397,23 +397,10 @@ def test_a_position_saved_before_phases_shared_corpora_resumes_as_it_was_read(sa
     assert after[1] == after[0] and after[0]
 
 
-def test_phases_sharing_a_corpus_saved_under_13_resume_by_13_and_are_refused_by_14():
-    """Phases that share a corpus, read under plan 13, read each phase's corpora from their start (13's
-    `phases` rule), and resume so where the run compiles them at 13, as a run config's resume does; a read
-    compiled at this Dew's, which continues the corpus from the draws the run trained, refuses the position,
-    naming the rule (docs/design/data.md, the rules)."""
-    loader = compile(shared_phases(), read="indexed", loading=READ, plan_version=13)
-    whole, stream = read(loader, 8)
-    stream.close()
-    first, second = shared_ids(first_pass(whole, len(KEPT)))
-    assert set(first) & set(second), "13's second phase reads the shared corpus again from its start"
-    resumes_as_read(loader, whole, (2, 4))
-    _, stopped = read(loader, 4)
-    saved = stopped.get_state()
-    stopped.close()
-    refusing = compile(shared_phases(), read="indexed", loading=READ).train(DataPartition())
-    try:
-        with pytest.raises(ValueError):
-            refusing.set_state(saved)
-    finally:
-        refusing.close()
+def test_phases_sharing_a_corpus_on_their_own_streams_are_refused_at_plan_13():
+    """Phases that share a corpus, each read on its own stream, compiled at plan 13, which no Dew of 13 read
+    by any rule: refused before they read (train 785's F3), where they once read the corpus again from its
+    start and trained it twice; this Dew's plan continues it."""
+    with pytest.raises(ValueError):
+        compile(shared_phases(), read="indexed", loading=READ, plan_version=13)
+    compile(shared_phases(), read="indexed", loading=READ).train(DataPartition()).close()

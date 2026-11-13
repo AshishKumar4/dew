@@ -402,6 +402,41 @@ def test_a_bounded_mixture_counts_each_members_documents_where_the_windows_cutti
         assert statistics[f"data/rows/{name}"] == whole(seen, offset), name
 
 
+def one_member(window) -> bool:
+    """Whether a window's documents are all one member's: the left's tokens under 1000, the right's over."""
+    tokens = np.asarray(window["text"])
+    return len({int(token) >= 1000 for token in tokens[tokens > 0]}) == 1
+
+
+def test_a_rejected_window_of_two_members_documents_is_refused_under_each_member():
+    """A bounded mixture of two named corpora packed into windows that hold both members' documents, and a
+    filter after the pack that rejects each such window: each member counts the refusal of every window that
+    held its documents (row 5716), where the mixture counted them and neither member did."""
+    from dew.data.pipeline import mix
+
+    def chain(*, filtered: bool) -> Pipeline:
+        corpora = [Pipeline(Memory([{"text": np.full(2 + index % 3, offset + index + 1, np.int32)}
+                                    for index in range(12)])).named(name)
+                   for name, offset in (("left", 0), ("right", 1000))]
+        laid = mix(corpora).read("streamed").pack(8, fields=("text",), policy="first-fit")
+        return (laid.filter(one_member, reason="mixed") if filtered else laid).batch(1)
+
+    whole = compile(chain(filtered=False), read="streamed", examples=24).train(DataPartition())
+    try:
+        mixed = sum(not one_member(batch) for batch in whole)
+    finally:
+        whole.close()
+    assert mixed
+    loader = compile(chain(filtered=True), read="streamed", examples=24)
+    stream = loader.train(DataPartition())
+    try:
+        assert all(one_member(batch) for batch in stream)
+    finally:
+        stream.close()
+    statistics = loader.statistics()
+    assert statistics["data/rejected/left/mixed"] == statistics["data/rejected/right/mixed"] == mixed
+
+
 @pytest.mark.parametrize("layout", ["strided", "concat"])
 def test_a_bounded_mixtures_member_counts_resume_while_a_layout_holds_a_document(layout):
     """The mixed read of the test above, its windows 2 tokens apart or packed, its position saved after two
@@ -776,6 +811,52 @@ def test_each_batch_consumes_the_examples_whose_last_rows_it_holds(packed, worke
         if isinstance(stream, Closeable):
             stream.close()
     assert total == 23
+
+
+@dataclasses.dataclass(frozen=True)
+class Pieced:
+    """An objective's expansion of each record `id` into pieces of `lengths` tokens, each token `id`."""
+
+    lengths: tuple[int, ...]
+    identity = "pieced@1"
+
+    def flat_map(self, element):
+        return tuple({"text": np.full(length, int(element["id"]), np.int32)} for length in self.lengths)
+
+
+@pytest.mark.parametrize("lengths", [(2, 5, 3), (2, 0, 5, 3)], ids=["pieces", "an-empty-piece"])
+def test_an_example_first_fit_lays_apart_completes_in_the_window_emitted_after_its_every_piece(lengths):
+    """A run bounded in examples whose objective makes pieces of 2, 5 and 3 tokens of each, packed first-fit
+    into two windows of 5 at a time: the first window holds the first and last pieces, the second the 5, so
+    an example completes in the batch that holds its second window, not its first, which holds its last
+    piece; each batch, one window, consumes the examples whose every piece it and the batches before hold
+    (row 5713). A piece of no tokens, laid nowhere, changes none of it."""
+    from dew.batch import EXAMPLES_CONSUMED
+    from dew.data.pipeline import ObjectiveData, Pack
+
+    chain = Pipeline(Memory({"id": np.arange(1, 7, dtype=np.int32)}))
+    objective = ObjectiveData(train=(Pieced(lengths),), pack=Pack(5, fields=("text",), bins=2))
+    loader = compile(chain.batch(1), read="streamed", objective=objective, examples=6,
+                     loading=Loading(workers=0))
+    seen: collections.Counter[int] = collections.Counter()
+    counted, total = set(), 0
+    stream = loader.train(DataPartition())
+    try:
+        for batch in stream:
+            held = np.asarray(batch["text"])
+            # The documents each window holds, numbered from 1 (a window of one states none: its tokens).
+            laid = batch["text_coordinates"].segments
+            segments = (held > 0).astype(np.int32) if laid is None else np.asarray(laid)
+            for segment in set(segments[segments > 0].tolist()):
+                seen[int(held[segments == segment][0])] += 1
+            done = {example for example, pieces in seen.items() if pieces == 3} - counted
+            assert int(np.sum(batch[EXAMPLES_CONSUMED])) == len(done), (seen, counted)
+            counted |= done
+            total += len(done)
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    assert total == 6
 
 
 class Evens(grain.MapTransform):
@@ -1291,10 +1372,12 @@ def test_a_clocked_runs_cooldown_and_its_step_compiled_ahead_take_its_batches_as
     assert batch_signature(step_batch(trainer, first)) == signed.signed[0]
 
 
-def test_a_batched_step_that_makes_no_rows_of_a_group_carries_its_examples_on():
-    """A batched step after a pack that makes no rows of a group of windows leaves the examples whose last
-    tokens those windows held to the next window kept: the batches of a read bounded in examples consume
-    every one once, where the step's empty group was refused."""
+@pytest.mark.parametrize("bounded", [True, False], ids=["bounded", "unbounded"])
+def test_a_batched_step_that_makes_no_rows_of_a_group_refuses_it_and_carries_its_examples_on(bounded):
+    """A batched step after a pack that makes no rows of a group of windows refuses the group as an empty
+    expansion, counted under its corpus as a record step's is (row 5717), bounded in examples or not, and
+    leaves the examples whose last tokens those windows held to the next window kept: the batches of a
+    read bounded in examples consume every one once."""
     docs = [np.full(index % 4 + 2, index + 1, np.int32) for index in range(12)]
 
     def drop_first(columns):
@@ -1305,14 +1388,23 @@ def test_a_batched_step_that_makes_no_rows_of_a_group_carries_its_examples_on():
 
     chain = (Pipeline(Memory({"text": docs})).read("streamed").pack(6, fields=("text",))
              .flat_map(drop_first, batched=True, batch_size=2).batch(2))
-    stream = compile(chain, read="streamed", examples=len(docs)).train(DataPartition())
+    loader = compile(chain, read="streamed", examples=len(docs) if bounded else None)
+    stream = loader.train(DataPartition())
     try:
-        batches = list(stream)
+        # An unbounded training read repeats its corpus: its first two batches, within its first pass.
+        batches = list(stream if bounded else itertools.islice(stream, 2))
     finally:
         if isinstance(stream, Closeable):
             stream.close()
     assert not any(1 in np.asarray(batch["text"]) for batch in batches)
-    assert sum(int(np.sum(batch[EXAMPLES_CONSUMED])) for batch in batches) == len(docs)
+    refused = {name: value for name, value in loader.statistics().items()
+               if name.endswith("/empty_expansion")}
+    # Once a pass of the corpus: once where the read ends with it, at least once in an endless one's start,
+    # which a reader reads ahead of.
+    (count,) = refused.values()
+    assert count == 1 if bounded else count >= 1, refused
+    if bounded:
+        assert sum(int(np.sum(batch[EXAMPLES_CONSUMED])) for batch in batches) == len(docs)
 
 
 def clocked_records(seed: int) -> tuple[np.ndarray]:

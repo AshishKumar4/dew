@@ -54,7 +54,7 @@
    "lane": "Kernels"
   },
   "tests/test_audio.py": {
-   "comparisons": 8,
+   "comparisons": 7,
    "lane": "Models, Serving & RL"
   },
   "tests/test_audio_condition.py": {
@@ -264,10 +264,6 @@
   "tests/test_guidance_distillation.py": {
    "comparisons": 1,
    "lane": "Training"
-  },
-  "tests/test_guided_decoding.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
   },
   "tests/test_hf_classic_gpt.py": {
    "comparisons": 2,
@@ -498,7 +494,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_quantized.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_image_vae.py": {

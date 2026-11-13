@@ -76,9 +76,13 @@ def laid_out(state: TrainState, window: int) -> TrainState:
     if int(jnp.max(occupancy(state.window))):
         raise ValueError(f"the state pools an open window of {size} microbatches, and the step it is handed "
                          f"to reads {window} an update: a step of another split begins at an update's end")
-    placed = state.window_size.sharding
-    return dataclasses.replace(state, accumulation=None, microstep=state.microstep // size * window,
-                               window_size=jax.device_put(np.int32(window), placed))
+    # Counted on the host and placed as the counts were: an operation on the device arrays would compile a
+    # program of its own in a run handed its step compiled ahead (row 5781).
+    microstep = int(state.microstep) // size * window
+    return dataclasses.replace(
+        state, accumulation=None,
+        microstep=jax.device_put(np.asarray(microstep, state.microstep.dtype), state.microstep.sharding),
+        window_size=jax.device_put(np.int32(window), state.window_size.sharding))
 
 
 class CompiledStep(Protocol):

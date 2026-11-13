@@ -82,7 +82,7 @@ def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_pa
     import torch
     from transformers import AutoModelForCausalLM
 
-    from _dew_torch.precision import float64
+    from _dew_torch.precision import float64, float64_twin
     from dew.interop import PretrainedDecoder
     from dew.nn.rope import YarnScaling
 
@@ -104,23 +104,31 @@ def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_pa
             layout.name: np.asarray(layout.export({'params': gradient})).reshape(layout.shape)
             for layout in loaded.weight_layouts}}
 
-    @as_given
-    def reference(ids, wide=False):
-        with float64() if wide else contextlib.nullcontext():
-            model = AutoModelForCausalLM.from_pretrained(source, dtype=torch.float32)
-            model = (model.to(torch.float64) if wide else model).eval()
-            model.set_attn_implementation('eager')
-            tokens = torch.from_numpy(np.asarray(ids, np.int64))
-            output = model(tokens, labels=tokens)
-            output.loss.backward()
-        return {'logits': output.logits.detach().numpy(),
-                'gradients': {name: parameter.grad.numpy() for name, parameter in model.named_parameters()}}
+    narrow_model = AutoModelForCausalLM.from_pretrained(source, dtype=torch.float32).eval()
+    narrow_model.set_attn_implementation('eager')
+    wide_model = float64_twin(narrow_model, lambda: AutoModelForCausalLM.from_pretrained(
+        source, dtype=torch.float32).eval())
+    wide_model.set_attn_implementation('eager')
+
+    def reference(model, *, wide=False):
+        @as_given
+        def run(ids):
+            model.zero_grad(set_to_none=True)
+            with float64() if wide else contextlib.nullcontext():
+                tokens = torch.from_numpy(np.asarray(ids, np.int64))
+                output = model(tokens, labels=tokens)
+                output.loss.backward()
+            return {'logits': output.logits.detach().numpy(),
+                    'gradients': {name: parameter.grad.detach().numpy().copy()
+                                  for name, parameter in model.named_parameters()}}
+
+        return run
 
     def draw(seed):
         return (np.random.default_rng([0xA2, seed]).integers(0, 64, (4, 32)).astype(np.int32),)
 
-    assert_as_exact(ours, reference, draw, 'phi under a partial YaRN', seeds=YARN_SEEDS,
-                    truth_fn=as_given(lambda ids: reference(ids, wide=True)))
+    assert_as_exact(ours, reference(narrow_model), draw, 'phi under a partial YaRN', seeds=YARN_SEEDS,
+                    truth_fn=reference(wide_model, wide=True))
 
     export = tmp_path / 'export'
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(export)

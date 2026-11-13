@@ -11,12 +11,14 @@ likelihood stays the model's own.
 """
 
 import json
+import re
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import as_given, assert_as_exact, widened
 from token_support import byte_level_tokenizer
 
 from dew.inference import RunProcessor, TextGeneration
@@ -157,33 +159,116 @@ def test_a_json_schema_guided_row_writes_a_document_the_schema_accepts(tokenizer
             assert document["color"] in ("red", "green") and isinstance(document["ok"], bool)
 
 
+BUDGET = 16
+"""The tokens each served guided request asks: past its grammar's longest match and its EOS, so every
+column after the end is held too (zeros, as `Server` lays its buffers out at the asked budget)."""
+GUIDED_RAW_SEEDS = 8
+"""Check 1's declared seeds for guided raw log-probabilities against unmasked full-forward log-softmax."""
+
+
+def _unmasked_raw_scores(model, variables, tokens: jax.Array, prompt_width: int) -> jax.Array:
+    logits = model.apply(variables, tokens)
+    log_probs = jax.nn.log_softmax(logits[:, prompt_width - 1:-1], axis=-1)
+    chosen = tokens[:, prompt_width:]
+    return jnp.take_along_axis(log_probs, chosen[..., None], axis=-1)[..., 0]
+
+
 def test_a_served_guided_request_draws_what_it_draws_alone(tokenizer):
-    """The server carries each row's grammar state beside its cache, so a
-    batch of guided requests draws token for token what each draws alone,
-    and every continuation matches the pattern in full."""
+    """The server carries each row's grammar state beside its cache, so a batch of mixed-length string
+    requests through `Server` draws the exact tokens and termination lengths each request draws on its
+    own, records exact zero raw scores after EOS, and holds check 1 on all BUDGET continuation columns
+    against the standalone walk from the float64 unmasked full forward."""
     pattern = r"[0-9]{3}-[a-c]{2,4}"
     grammar = guided.regex(tokenizer, pattern, EOS, vocab_size=EOS + 1)
     bound = task(tokenizer, grammar, Sampling(temperature=1.0, eos_token_ids=EOS))
-    prompts = ["a", "bcd", "hello there", "x"]
-    alone = [bound(prompt, 16, key=index) for index, prompt in enumerate(prompts)]
-    server = Server.from_task(bound, slots=2, capacity=64)
-    tickets = [server.submit(prompt, 16, key=index) for index, prompt in enumerate(prompts)]
-    server.run()
-    for ticket, lone in zip(tickets, alone, strict=True):
-        served = ticket.result().host()
-        np.testing.assert_array_equal(served.tokens, lone.host().tokens)
-        np.testing.assert_allclose(served.raw_log_probs, lone.host().raw_log_probs, atol=2e-6)
+    wide_model = bound.model.clone(dtype=jnp.float64)
+    wide_vars = widened(bound.variables)
+    alphabet = np.asarray(list("abcdefghijklmnopqrstuvwxyz0123456789 "))
+
+    def mixed_prompts(seed: int) -> list[str]:
+        if seed == 0:
+            return ["a", "bcd", "hello there", "x"]
+        rng = np.random.default_rng([0x6D, seed])
+        return ["".join(rng.choice(alphabet, size=width)) for width in (1, 3, 11, 2)]
+
+    def draw(seed: int):
+        prompts = mixed_prompts(seed)
+        alone = [bound([prompt], BUDGET, key=seed * 8 + i).host() for i, prompt in enumerate(prompts)]
+        server = Server.from_task(bound, slots=2, capacity=64)
+        tickets = [server.submit(prompt, BUDGET, key=seed * 8 + i) for i, prompt in enumerate(prompts)]
+        server.run()
+        served = [ticket.result().host() for ticket in tickets]
+        prompt_widths = np.asarray([len(tokenizer.encode(prompt)) for prompt in prompts], np.int32)
+        emitted = np.zeros(len(prompts), np.int32)
+        max_total = max(int(row.tokens.shape[1]) for row in alone)
+        padded_tokens = np.zeros((len(prompts), max_total), np.int32)
+        for i, (s_row, l_row) in enumerate(zip(served, alone, strict=True)):
+            assert bool(s_row.terminated[0]) and bool(l_row.terminated[0])
+            np.testing.assert_array_equal(s_row.tokens, l_row.tokens)
+            pw = int(prompt_widths[i])
+            after_prompt = [int(tok) for tok in l_row.tokens[0, pw:]]
+            assert EOS in after_prompt
+            eos_at = after_prompt.index(EOS)
+            end = eos_at + 1
+            assert int(s_row.lengths[0]) == end and int(l_row.lengths[0]) == end
+            assert re.fullmatch(pattern, tokenizer.decode(after_prompt[:eos_at])) is not None
+            np.testing.assert_array_equal(s_row.raw_log_probs[0, end:], 0.0)
+            np.testing.assert_array_equal(l_row.raw_log_probs[0, end:], 0.0)
+            emitted[i] = end
+            padded_tokens[i, :l_row.tokens.shape[1]] = l_row.tokens[0]
+        s_raw = np.concatenate([row.raw_log_probs for row in served], axis=0)
+        l_raw = np.concatenate([row.raw_log_probs for row in alone], axis=0)
+        return padded_tokens, prompt_widths, emitted, s_raw, l_raw
+
+    @as_given
+    def truth(padded_tokens, prompt_widths, emitted, _s, _l):
+        out = np.zeros((len(prompt_widths), BUDGET), np.float64)
+        with jax.enable_x64(new_val=True):
+            for i in range(len(prompt_widths)):
+                pw = int(prompt_widths[i])
+                em = int(emitted[i])
+                row_tok = jnp.asarray(padded_tokens[i:i + 1, :pw + em], jnp.int32)
+                scores = _unmasked_raw_scores(wide_model, wide_vars, row_tok, pw)
+                out[i, :em] = np.asarray(scores[0, :em], np.float64)
+        return out
+
+    assert_as_exact(as_given(lambda _t, _pw, _em, s_raw, _l: s_raw),
+                    as_given(lambda _t, _pw, _em, _s, l_raw: l_raw),
+                    draw, "served guided raw log_probs", seeds=GUIDED_RAW_SEEDS, truth_fn=truth)
 
 
 def test_the_raw_likelihood_is_the_models_own_and_the_behaviour_one_the_masked(tokenizer):
-    """The mask shapes the distribution the row draws from, not the one it
-    reports as the model's: forcing a single allowed token makes the
-    behaviour likelihood one while the raw one is the model's log-softmax."""
+    """The mask shapes the distribution the row draws from, not the one it reports as the model's:
+    forcing `"7"` then EOS makes the behaviour log-probability exactly zero while the reported raw
+    log-probability holds check 1 against the model's unmasked full-forward log-softmax."""
     grammar = guided.regex(tokenizer, "7", EOS, vocab_size=EOS + 1)
-    rows = task(tokenizer, grammar, Sampling(temperature=1.0, eos_token_ids=EOS))("q", 4, key=0).host()
-    assert continuation(tokenizer, rows) == "7" and bool(rows.terminated[0])
-    np.testing.assert_array_equal(rows.behavior_log_probs[0, :2], 0.0)
-    assert np.all(rows.raw_log_probs[0, :2] < 0)
+    bound = task(tokenizer, grammar, Sampling(temperature=1.0, eos_token_ids=EOS))
+    narrow_scores = jax.jit(lambda full: _unmasked_raw_scores(bound.model, bound.variables, full, 2)[:, :2])
+    wide_forced = bound.model.clone(dtype=jnp.float64)
+    wide_forced_vars = widened(bound.variables)
+    wide_forced_scores = jax.jit(
+        lambda full: _unmasked_raw_scores(wide_forced, wide_forced_vars, full, 2)[:, :2])
+
+    @as_given
+    def forced_truth(full, _raw):
+        with jax.enable_x64(new_val=True):
+            return np.asarray(wide_forced_scores(jnp.asarray(full, jnp.int32)), np.float64)
+
+    def draw(seed: int):
+        rng = np.random.default_rng([0x7E, seed])
+        prompts = rng.integers(32, 126, size=(4, 2), dtype=np.int32)
+        rows = bound(prompts, 4, key=seed).host()
+        for idx in range(4):
+            single = rows.tokens[idx, 2:2 + int(rows.lengths[idx])]
+            assert tokenizer.decode([int(t) for t in single if t != EOS]) == "7"
+            assert bool(rows.terminated[idx])
+        np.testing.assert_array_equal(rows.behavior_log_probs[:, :2], 0.0)
+        return rows.tokens, rows.raw_log_probs[:, :2]
+
+    assert_as_exact(as_given(lambda _f, raw: raw),
+                    lambda full, _raw: narrow_scores(full),
+                    draw, "guided raw likelihood vs unmasked log-softmax",
+                    seeds=GUIDED_RAW_SEEDS, truth_fn=forced_truth)
 
 
 @pytest.mark.parametrize("name", ["gpt2", "t5", "llama", "wordpiece"])

@@ -1524,10 +1524,11 @@ def _compile_phases(
     # Phases on the step clock whose first reads per share (its order cut where each share reads it: a
     # stream batched by its tokens after steps that drop rows) read each its own stream (`StepPhases`).
     per_share = not tokens and not first.build.global_order
-    # A plan of 13 read each phase's corpora from their start, which its resume reads again
-    # (`StepPhases.CONTINUES`).
-    shared = (_shared(source) if per_share and plan_version >= STRUCTURED
-              else tuple({} for _ in source.pipelines))
+    # A plan of 13 read no phases on their own streams that share a corpus (`_apart`): no Dew of 13 read
+    # them, which this one continues by stamps (`StepPhases.CONTINUES`).
+    if per_share and plan_version < STRUCTURED:
+        _apart(source)
+    shared = _shared(source) if per_share else tuple({} for _ in source.pipelines)
     staged = (_own_streams(source, first, shared, staged_at) if per_share
               else _in_one_order(source, first, staged_at, version=plan_version))
     # Every phase declares the most documents a window of any phase holds, so the run steps one program.
@@ -1641,6 +1642,21 @@ def _ordered(index: int, phase: _Staged) -> _Staged:
 def _corpus_key(corpus: Source) -> str:
     """A corpus as phases share it: its store's content (`Source.fingerprint`), whatever a chain names it."""
     return fingerprint(json.loads(json.dumps(corpus.fingerprint(), sort_keys=True, default=str)))
+
+
+def _apart(phases: Phases) -> None:
+    """Refuse phases read each on its own stream (`StepPhases`) where two read one corpus, under a plan of
+    13, which no Dew read such a chain by: the later would open it at its first record again and train what
+    the earlier read twice; a plan of 14 continues it by stamps (`_shared`)."""
+    seen: dict[str, tuple[int, str]] = {}
+    for index, pipeline in enumerate(phases.pipelines):
+        for chain, corpus in _leaves(pipeline):
+            earlier, named = seen.setdefault(_corpus_key(corpus), (index, _name(chain)))
+            if earlier != index:
+                raise ValueError(f"phases {earlier} and {index} both read one corpus ({named}, "
+                                 f"{_name(chain)}) each on its own stream, which a plan of 13 reads by no "
+                                 "rule; read it under this Dew's plan, which continues it where the run "
+                                 "left it, or in one phase")
 
 
 def _shared(phases: Phases) -> tuple[dict[str, str], ...]:
@@ -2010,12 +2026,12 @@ def iterate(
     plan_version: int = PLAN_VERSIONS[-1],
 ) -> pygrain.IterDataset:
     """A finite record pass through the same lowering, for publication and export, read by data plan
-    `plan_version` (`compile`'s), automatic workers read in the process (`Loading.unsized`)."""
+    `plan_version` (`compile`'s), in the process: automatic workers (`Loading.unsized`) and those the chain
+    names (row 5735), whose turns would interleave the records out of the order the pass publishes."""
     read_by(plan_version)
     loading = loading.unsized()
-    if any(
-        isinstance(stage, (RandomMap, BatchStage, MapBatch, Workers, Repeat)) for stage in _steps(pipeline)
-    ):
+    pipeline = _in_process(pipeline)
+    if any(isinstance(stage, (RandomMap, BatchStage, MapBatch, Repeat)) for stage in _steps(pipeline)):
         raise ValueError("publication needs deterministic, unbatched pipelines without repeat")
     (pipeline,) = _made(_prepared((pipeline,), read, provision=provision, counts=({},)), read, ({},),
                         training=False)
@@ -2023,6 +2039,13 @@ def iterate(
     build = _build(pipeline, read, loading, batch=1, training=False, version=plan_version)
     rows = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
+
+
+def _in_process(pipeline: Pipeline) -> Pipeline:
+    """`pipeline` and each chain it mixes without the loading workers they name (`Workers`)."""
+    held = with_children(pipeline, _in_process)
+    kept = tuple(stage for stage in held.stages if not isinstance(stage, Workers))
+    return dataclasses.replace(held, stages=kept)
 
 
 type Handed = pygrain.MapDataset | pygrain.IterDataset | Mapping[str, np.ndarray]

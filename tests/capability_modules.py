@@ -183,3 +183,16 @@ class NNXDenoiser(nnx.Module):
             level = level + self.text(masked_mean(textcontext.hidden, textcontext.mask))
         x = self.inner(sample) + self.level(level)[:, None, None, :]
         return self.outer(nnx.silu(x)).astype(sample.dtype)
+
+
+class TupleOutputModel(nn.Module):
+    """A user module whose `__call__` takes tokens alone and returns `(hidden, pooled)` rather than logits."""
+
+    vocab_size: int
+    features: int = 16
+
+    @nn.compact
+    def __call__(self, tokens, *, train=False):
+        del train
+        hidden = nn.Embed(self.vocab_size, self.features)(tokens)
+        return hidden, jnp.mean(hidden, axis=1)

@@ -5,6 +5,7 @@ import collections
 import contextlib
 import itertools
 import json
+from pathlib import Path
 
 import flax.linen as nn
 import jax
@@ -378,6 +379,137 @@ def test_every_kinds_run_logs_the_activations_its_command_line_watches(kind, tmp
     cotangents = {name.rsplit("/", 1)[1] for name in logged[2] if name.startswith("inspect/cotangents/")}
     assert {"mean", "std", "rms", "non_finite"} <= cotangents
     assert not any(name.startswith("inspect/") for name in logged[1])
+
+
+def watching_alone(kind: str, root: Path):
+    """`kind`'s run over data under `root` with a trained component its model call's every forward
+    reaches beside the backbone's, and the globs naming that component alone: a decision run's head by its
+    class (`*Head`, `*Readout`: `DecisionModel.head_logits`) or by its path under its part (`head/*`), and
+    an LM run's second prediction depth (`mtp_1/*`), of a model of two (`LMObjective.mtp_weight`)."""
+    import dataclasses
+
+    from dew.config import ObjectiveConfig
+    from dew.registry import ModelConfig
+
+    if kind.startswith("decision"):
+        globs = ["head/*"] if kind.endswith("path") else ["*Head", "*Readout"]
+        return KINDS["decision"](root, drawn=False), globs
+    run = KINDS[kind](root, drawn=False)
+    model = ModelConfig("causal_transformer", {**run.model.fields, "num_nextn_predict_layers": 2})
+    depths = dataclasses.replace(run, model=model, objective=ObjectiveConfig("lm", {"mtp_weight": 0.3}))
+    return depths, ["mtp_1/*"]
+
+
+@pytest.mark.parametrize("kind", ["decision", "decision-path", "lm"])
+def test_a_run_watching_a_trained_component_alone_logs_its_activations_and_cotangents(kind, tmp_path):
+    """A run watching only a component its step trains beside the backbone, a decision run's head or an
+    LM run's prediction depth (`watching_alone`), logs that component's output summary and its loss's
+    cotangent there at its sampled step, named under the component's own path (`head/...`, `mtp_1/...`):
+    each model call the objective trains through opens the step's collections and returns what it sowed
+    (audit3 O2: the head opened its attention maxima alone and a depth's pass returned its routers,
+    maxima and indexer records alone, so a watch of either was refused as watching nothing)."""
+    record, runs = tmp_path / "record", tmp_path / "runs"
+    (tmp_path / "data").mkdir()
+    run, modules = watching_alone(kind, tmp_path / "data")
+    run.save(str(record))
+    inspection = {"class": "dew.training.inspection:Inspection",
+                  "fields": {"modules": modules, "every": 1, "targets": ["params"], "cotangents": True}}
+    settings = {"trainer.name": "watched", "trainer.checkpoint_dir": str(runs), "trainer.steps": "1",
+                "trainer.log_every": "1", "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
+                "trainer.inspection": json.dumps(inspection), "trainer.multi_host": "False",
+                "trainer.compilation_cache_dir": "None"}
+    assert main(["train", str(record / "run.json"),
+                 *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
+    logged = scalars(runs / "watched")[1]
+    component = "head" if kind.startswith("decision") else "mtp_1"
+    for log in ("activations", "cotangents"):
+        found = {name.rsplit("/", 1)[1] for name in logged if name.startswith(f"inspect/{log}/{component}/")}
+        assert {"mean", "std", "non_finite"} <= found, (log, sorted(logged))
+
+
+def test_a_model_applied_in_parts_names_each_module_by_its_path_in_the_variables():
+    """A model applied in parts (a PPO run's policy and critic) whose first part holds a module named as
+    the other part (an actor's `critic`) logs each module by its path in the model's variables, fixed
+    whatever a run watches, the two never alike: the critic's `value` as `critic/value` and the actor's
+    `critic/value` as `policy/critic/value`, by class, by a glob of their path within their part or by
+    one of their path in the variables; and each part's call reads its own probes (`dew.batch.part`),
+    where nesting the critic beside the actor's root paths shared them (rows 5697, audit3 O2)."""
+    from dew.batch import PROBES, part
+    from dew.nn.inspection import (
+        INSPECTED,
+        PROBE,
+        component,
+        discovering,
+        flattened,
+        in_parts,
+        probes_of,
+        watching,
+    )
+
+    class Value(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            return nn.Dense(2, name="value")(x)
+
+    class Actor(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            return Value(name="critic")(x)
+
+    x = jnp.ones((1, 3))
+    actor, critic = Actor(), Value()
+    variables = {"policy": actor.init(jax.random.key(0), x), "critic": critic.init(jax.random.key(1), x)}
+
+    def sown(globs):
+        with watching(globs, cotangents=True), discovering():
+            with component("policy"):
+                _, own = actor.apply(variables["policy"], x, mutable=[INSPECTED])
+            with component("critic"):
+                _, apart = critic.apply(variables["critic"], x, mutable=[INSPECTED])
+        return in_parts({"policy": own.get(INSPECTED, {}), "critic": apart.get(INSPECTED, {})})
+
+    def logged(globs):
+        return sorted({name.rsplit("/", 1)[0] for name in flattened(sown(globs), globs)})
+
+    both = ["activations/critic/value", "activations/policy/critic/value"]
+    assert logged(("Dense",)) == logged(("*value",)) == logged(("critic/value",)) == both
+    assert logged(("policy/*",)) == ["activations/policy/critic", "activations/policy/critic/value"]
+    assert logged(("critic/v*",)) == both
+    probes = {"params": {"policy": {}, "critic": {}}, PROBES: probes_of(sown(("Dense",)))}
+    own, apart = (part(probes, name)[PROBES] for name in ("policy", "critic"))
+    assert jax.tree.structure(own) == jax.tree.structure({"critic": {"value": {PROBE: 0}}})
+    assert jax.tree.structure(apart) == jax.tree.structure({"value": {PROBE: 0}})
+
+
+def test_a_watched_prediction_depth_summarizes_its_rows_real_positions_alone():
+    """An LM run watching its second prediction depth (`mtp_1/*`) summarizes that depth's output over the
+    positions whose every reached token is real and in its document (`CausalTransformer.mtp_hidden_states`,
+    each depth's rows one shorter): two batches of packed rows, two documents one padded token apart and a
+    padded tail, that differ only in the padding's ids log the same summary, bit for bit, where a depth's
+    summary over every position read the padding's states (audit3 O2)."""
+    from dew.batch import TEXT_KEY, coordinates
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=16, qk_norm=False, num_nextn_predict_layers=2)
+    trainer = Trainer(LMObjective(model, 11, mtp_weight=0.3), optax.sgd(0.), key=jax.random.key(0),
+                      inspection=Inspection(modules=("mtp_1/*",), targets=("params",)))
+    rows = jax.device_count()
+
+    # A hole of one padded token: the second depth's span from the first document's last token reaches the
+    # second's first across it, both of its ends real.
+    segments = np.tile(np.r_[[1] * 5, [0], [2] * 4, [0] * 2], (rows, 1)).astype(np.int32)
+
+    def batch(pad):
+        ids = np.where(segments != 0, np.arange(1, 13), pad).astype(np.int32)
+        return {TEXT_KEY: ids, "text_coordinates": coordinates(segments=segments, valid=segments != 0,
+                                                                max_segments=2, xp=np)}
+
+    first, second = (inspected(trainer, batch(pad)) for pad in (3, 7))
+    watched = sorted(name for name in first if name.startswith("inspect/activations/mtp_1/"))
+    assert watched
+    assert [first[name] for name in watched] == [second[name] for name in watched]
 
 
 class Headed(nn.Module):
