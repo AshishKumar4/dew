@@ -15,7 +15,6 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `held_rates`, `scaled_rates`, `settable_rates`, `schedule_states`, `reclocked` and `stepped_rate` are
   imported from there, where `dew.optim` held them; the schedule kinds (`Cosine`, `Linear`, `Power`,
   `OneCycle`, `Exponential`) and `OptimConfig` stay in `dew.optim`.
-
 - Dew requires its JAX build 0.12.0.1.post84 (Python alone; the CUDA and PJRT plugins stay post81's): the
   toolkit's ring waits name their phase, so the interpreter checks two consumers that take alternate tiles
   of one ring; a tcgen05 pair's step block over a partial depth lowers; the lowering cache keys a program
