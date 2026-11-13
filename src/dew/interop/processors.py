@@ -589,9 +589,9 @@ class Processor:
         # An unpadded batch carries no validity field. The host knows the rows
         # are whole here; the model would have to take an all-true mask on
         # trust and build one anyway.
-        token_fields = {POSITIONS_FIELD: jnp.asarray(positions)}
+        token_fields: dict[str, np.ndarray] = {POSITIONS_FIELD: positions}
         if not valid.all():
-            token_fields[VALIDITY_FIELD] = jnp.asarray(valid)
+            token_fields[VALIDITY_FIELD] = valid
         kind = config_wrapper(self.config)
         if kind.gemma4:
             for pixels, coordinates in (("pixel_values", "image_position_ids"),
@@ -612,10 +612,10 @@ class Processor:
                 groups = np.cumsum(vision & ~previous, axis=1, dtype=np.int32) - 1
                 field = ("block_groups" if self.config.get("model_type") == "gemma4_unified"
                          else "image_groups")
-                token_fields[field] = jnp.asarray(np.where(vision, groups, -1))
+                token_fields[field] = np.where(vision, groups, -1)
         elif "video_position_ids" in values:
             raise ValueError("video_position_ids require the Gemma4 visual tower")
-        conditioning: dict[str, jax.Array] = {}
+        conditioning: dict[str, np.ndarray] = {}
         if "pixel_values" in values or "pixel_values_videos" in values:
             if "pixel_values_videos" in values and not kind.video:
                 videos = [name for name, held in WRAPPERS.items() if held.video]
@@ -638,12 +638,16 @@ class Processor:
         if np.any(text < 0) or np.any(text >= self.vocab_size):
             raise ValueError("input_ids must lie in the text vocabulary, including any hard media ranges, "
                              "save the placeholders media fill")
-        prepared = ModelInputs(jnp.asarray(tokens, jnp.int32), token_fields, conditioning)
+        prepared = ModelInputs(
+            jnp.asarray(tokens, jnp.int32),
+            {name: jnp.asarray(field) for name, field in token_fields.items()},
+            {name: jnp.asarray(field) for name, field in conditioning.items()},
+        )
         prepared.validate()
         return prepared
 
     def _images(self, values: Mapping[str, object], tokens: np.ndarray
-                ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+                ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         """Row-align the processor's image and video features to their placeholders.
 
         It runs in two halves. The first reads the processor's output into
@@ -720,15 +724,18 @@ class Processor:
             token_lengths[row, image] = len(slots)
             if groups is not None:
                 groups[row, slots] = image
-        conditioning = {"pixel_values": jnp.asarray(padded), "image_lengths": jnp.asarray(image_counts),
-                        "image_token_lengths": jnp.asarray(token_lengths)}
+        conditioning: dict[str, np.ndarray] = {
+            "pixel_values": padded,
+            "image_lengths": image_counts,
+            "image_token_lengths": token_lengths,
+        }
         if padded_positions is not None:
-            conditioning["image_position_ids"] = jnp.asarray(padded_positions)
+            conditioning["image_position_ids"] = padded_positions
         if padded_grid is not None:
-            conditioning["image_grid_thw"] = jnp.asarray(padded_grid)
-        fields = {"image_indices": jnp.asarray(indices)}
+            conditioning["image_grid_thw"] = padded_grid
+        fields: dict[str, np.ndarray] = {"image_indices": indices}
         if groups is not None:
-            fields["image_groups"] = jnp.asarray(groups)
+            fields["image_groups"] = groups
         return fields, conditioning
 
     def _positioned_chunks(
@@ -759,7 +766,7 @@ class Processor:
         return chunks, patch_positions, selected, kernel
 
     def _audio(self, values: Mapping[str, object], tokens: np.ndarray
-               ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+               ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         """Row-align the processor's clip features and index their placeholders.
 
         Each contiguous run of the audio placeholder is one clip, in the
@@ -808,12 +815,12 @@ class Processor:
         for offset, (row, clip, _) in enumerate(places):
             padded[row, clip] = features[offset]
             padded_mask[row, clip] = mask[offset]
-        conditioning = {
-            "input_features": jnp.asarray(padded),
-            "input_features_mask": jnp.asarray(padded_mask),
-            "audio_lengths": jnp.asarray(counts),
+        conditioning: dict[str, np.ndarray] = {
+            "input_features": padded,
+            "input_features_mask": padded_mask,
+            "audio_lengths": counts,
         }
-        return {"audio_indices": jnp.asarray(indices)}, conditioning
+        return {"audio_indices": indices}, conditioning
 
     @property
     def pools_frames(self) -> bool:
@@ -889,7 +896,7 @@ class Processor:
         return list(chunks), np.asarray(grids, np.int32), merge, spans
 
     def _image_rotary_positions(self, tokens: np.ndarray, valid: np.ndarray,
-                                groups: jax.Array, grids: jax.Array) -> jax.Array:
+                                groups: np.ndarray, grids: np.ndarray) -> np.ndarray:
         """Compute Qwen3.5's get_rope_index on host-normalized image grids.
 
         Text advances one coordinate per token. An image occupies its merged
@@ -919,7 +926,7 @@ class Processor:
                     prepared[row, span] = coordinates + cursor
                     cursor += max(height, width) // merge
                 start = stop
-        return jnp.asarray(prepared)
+        return prepared
 
     def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
         """Decode integer `[B, S]` token rows with the processor's tokenizer, skipping special tokens."""
