@@ -1068,8 +1068,8 @@ class Unbudgeted(template.Mosaic):
     holds at its registers (`Launch.resident` zero) one program a multiprocessor, as it would hold were its
     registers held."""
 
-    def _held(self, ba, config) -> bool:
-        del ba, config
+    def _launches_hold(self, launches, family) -> bool:
+        del launches, family
         return True
 
     def states_held(self, ba, tiles, target, *, training: bool = False) -> int:
@@ -1127,17 +1127,23 @@ def _skipped(name: str, dtype) -> dict:
     return {'skip': jax.ShapeDtypeStruct((RESOURCE_SHAPES[name][1],), jnp.float32)}
 
 
-def _two_roles(name: str, bound, derived, family, facts, *, packed: bool) -> list:
+def _ran(tiles, *, training: bool):
+    """The tiles a product runs at: a training call's the derived ones, a forward without a gradient's its own
+    (`Tiles.forward`, the derived where None)."""
+    return tiles if training else tiles.forward or tiles
+
+
+def _two_roles(name: str, bound, derived, family, facts, *, packed: bool, training: bool) -> list:
     """The walks at two consumer roles a program (`Tiles.walkers`) as a gate case's tiles, which the
     derivation gives a call whose walks fill more than a wave and `RESOURCE_SHAPES` never do: a role's
     registers are its share of the program's; none where the family's walks take one role
     (`template.walk_roles`), packed documents', a value width of an odd number of blocks, or two roles' tiles
-    past the GPU's resources (`Mosaic._staged` None)."""
+    past the GPU's resources for the product, a training call's where `training` (`Mosaic._staged` None)."""
     value_width = RESOURCE_SHAPES[name][3]
     if template.walk_roles(family) < 2 or packed or value_width // derived.block_v % 2:
         return []
     two = template.MOSAIC._staged(bound, derived.block_v, facts, derived.chunk, walkers=2,
-                                  wide=derived.block_o or derived.block_v)
+                                  wide=derived.block_o or derived.block_v, training=training)
     return [] if two is None else [(two, 'two roles ')]
 
 
@@ -1193,8 +1199,8 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
             held = Unbudgeted().derived(bound, facts)
             # The tile the derivation takes where every register held, refused for its registers alone.
             unheld = [] if held is None or held == derived else [(held, 'refused ')]
-            if unheld and any(launch.shared > shared for launch in
-                              template.MOSAIC.launches(bound, held, facts, backward=training)):
+            if unheld and any(launch.shared > shared for launch in template.MOSAIC.launches(
+                    bound, _ran(held, training=training), facts, backward=training)):
                 unheld = []
             if derived is None and variant is not None:
                 return []
@@ -1224,19 +1230,18 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                     return []
                 return [case(name, dtype, args, starts, bound, derived, training=True, packed=packed,
                              kind='refused ')]
-        derived_tiles = [(derived, '')]
-        walked = _two_roles(name, bound, derived, family, facts, packed=packed)
+        walked = _two_roles(name, bound, _ran(derived, training=training), family, facts, packed=packed,
+                            training=training)
         if variant == TWO_ROLES:
             return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
                     for tiles, kind in walked]
         # A training pass's two-role walks a group of their own (`TWO_ROLES`).
         walked = [] if training else walked
-        # A forward without a gradient at its own tiles (`Tiles.forward`), which no fast backward narrows.
-        alone = [] if training or derived.forward is None else [(derived.forward, 'alone ')]
         return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
-                for tiles, kind in derived_tiles + walked + alone + ([] if training else unheld)]
+                for tiles, kind in [(derived, ''), *walked, *([] if training else unheld)]]
 
     def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
+        tiles = _ran(tiles, training=training)
         _, value_heads, key_width, value_width, _ = RESOURCE_SHAPES[name]
 
         def array(*shape, kind=dtype):
@@ -1252,8 +1257,8 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
             held = not training or kind != 'two roles ' or template.backward_holds(
                 *args, tiles=tiles, family=family, target=facts, starts=starts,
                 **unwide, **_skipped(name, dtype))
-        if not held or kind in ('two roles ', 'alone '):
-            # Forced role counts and standalone forward tiles can include a launch the model refuses.
+        if not held or kind == 'two roles ':
+            # Forced role counts can include a launch the model refuses.
             # Its admitted neighbours still have to hold (`apart_failures`).
             unheld = {launch.name for launch in plans[label]
                       if launch.registers > _model(launch, family, facts).budget}
