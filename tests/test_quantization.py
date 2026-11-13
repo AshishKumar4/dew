@@ -1620,8 +1620,8 @@ def test_an_int8_attention_blocks_auto_attention_is_its_rules_where_a_cell_decla
         return {route.kernel for route in routes if route.choice is Choice.ATTENTION}
 
     assert kernels(CausalSelfAttention(ctx=context)) == {DECLARED[cell][0].name}
-    assert not kernels(Quantization(dtype="int8").apply(CausalSelfAttention(ctx=context))) & (
-        _whole_product_kernels())
+    owned = kernels(Quantization(dtype="int8").apply(CausalSelfAttention(ctx=context)))
+    assert owned and not owned & _whole_product_kernels(), owned
 
 
 @pytest.mark.parametrize("target", ["sm100", "sm90"])
@@ -1652,35 +1652,70 @@ def test_an_int8_models_masked_attention_runs_none_of_its_own_orders_whole_produ
 
     # Plain, the order's first kernel, of whole products; under the rule, none such.
     whole = _whole_product_kernels()
-    assert set(_traced(Masked(), chosen, target)) <= whole
-    assert not set(_traced(Quantization(dtype="int8").apply(Masked()), chosen, target)) & whole
+    plain = set(_traced(Masked(), chosen, target))
+    owned = set(_traced(Quantization(dtype="int8").apply(Masked()), chosen, target))
+    assert plain and plain <= whole, plain
+    assert owned and not owned & whole, owned
 
 
-@pytest.mark.parametrize("target", ["sm100", "sm90"])
-def test_an_int8_models_paged_decode_step_reads_its_rows_through_the_layers_attention(target):
-    """A decode step over a paged pool (`KVStore.paged_kernel`, as `CausalSelfAttention._paged_kernel` asks
-    it, 16-key pages of bf16, 4 query heads over 2, 64 wide), traced in a module on a B200 and an H100:
-    plain, a paged kernel; under Qwix's int8 rule, which owns the step's products
-    (`attention.quantized_rule`), none of them, every one forming its products past the rule: the gathered
-    rows through the layer's attention, which routes by the rule (train 801's review F4: the paged path ran
-    A1's whole products)."""
+@pytest.mark.parametrize("step", ["decode", "mixed"])
+def test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention(step):
+    """A paged CausalTransformer (16-slot pages, 4 query heads over 2, 64 wide, bf16) through a decode step
+    and a mixed serving step (`Admitted`: rows decoding beside an admitted prompt), traced for a B200 on its
+    reported routes: plain, the pool read by a paged kernel (`kv_cache.PAGED`) and the mixed step's attention
+    by the template's work list (`CausalSelfAttention._one_work_list`), each forming its products whole;
+    under Qwix's int8 rule, which owns the steps' products, by neither (`PagedCase.owned`,
+    `AttentionCase.quantized`), the gathered rows read through the layer's attention, every attention route
+    the rule's arithmetic, no kernel forming its products past the rule (train 802's review F1 and F2: the
+    mixed step's work list and paged read ran whole products)."""
     pytest.importorskip("qwix")
-    from dew.nn.attention import quantized_rule
-    from dew.nn.kv_cache import KVCache, KVStore
+    from model_support import TINY_DECODER
 
-    chosen = []
+    from dew.batch import coordinates
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.inputs import Admitted
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.generation import Choice
+    from dew.nn.kv_cache import KVCache
 
-    class Decoding(nn.Module):
-        @nn.compact
-        def __call__(self, x):
-            store = KVStore.open(self, KVCache(page_size=16), 2, 64, 2, 64, jnp.bfloat16)
-            query = jnp.zeros((2, 4, 64), jnp.bfloat16)
-            chosen.append(store.paged_kernel(query, softcap=None, arithmetic=False, named="auto",
-                                             owned=quantized_rule(sinks=False) is not None))
-            return nn.Dense(8)(x)
+    rows, width = 4, 6
+    model = CausalTransformer(vocab_size=50, **{**TINY_DECODER, "num_kv_heads": 2, "head_dim": 64,
+                                                "max_seq_len": 128, "dtype": jnp.bfloat16},
+                              kv_cache=KVCache(page_size=16, pages=rows * 8))
 
-    assert None not in _traced(Decoding(), chosen, target)
-    assert set(_traced(Quantization(dtype="int8").apply(Decoding()), chosen, target)) == {None}
+    def routes_of(model: nn.Module) -> dict:
+        params = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+
+        def run(params):
+            cache = model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"]
+            if step == "decode":
+                return model.apply({**params, "cache": cache}, jnp.zeros((rows, 1), jnp.int32),
+                                   attention_mask=jnp.ones((rows, 1), bool), decode=True, mutable=["cache"])
+            valid = jnp.ones((1, rows + 2 * width), bool)
+            tables = next(iter(cache.values()))["self_attn"]["page_table"][jnp.asarray([3, 0])]
+            admitted = Admitted(slots=jnp.asarray([3, rows]), cursors=jnp.asarray([0, 0]), continuing=True,
+                                tables=tables)
+            return model.apply({**params, "cache": cache}, jnp.zeros(valid.shape, jnp.int32),
+                               jnp.asarray([[0, 1]]), decode=True, mutable=["cache"], admitted=admitted,
+                               coordinates=coordinates(valid.shape, valid=valid),
+                               method="states_and_logits_at")
+
+        with generation.assumed("sm100"), generation.routes() as routes:
+            jax.eval_shape(run, params)
+        kernels = {choice: {route.kernel for route in routes if route.choice is choice}
+                   for choice in (Choice.PAGED_DECODE, Choice.ATTENTION, Choice.DECODE)}
+        # The work list's own selection, which it reports where the mixed step weighs it.
+        listed = {route.kernel for route in routes if route.site.endswith("._one_work_list")}
+        return kernels, listed
+
+    plain, listed = routes_of(model)
+    assert plain[Choice.PAGED_DECODE] - {"gathered"}, plain
+    assert listed == ({"template"} if step == "mixed" else set()), listed
+    owned, listed = routes_of(Quantization(dtype="int8").apply(model))
+    attended = owned[Choice.ATTENTION] | owned[Choice.DECODE]
+    assert owned[Choice.PAGED_DECODE] == {"gathered"}, owned
+    assert attended and not attended & _whole_product_kernels(), owned
+    assert not listed, listed
 
 
 def test_an_int8_attention_block_on_xla_is_on_par_with_the_reference_path(monkeypatch):
