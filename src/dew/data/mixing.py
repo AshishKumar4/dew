@@ -442,18 +442,6 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         self._predicate.restored(None if held is None else integer(held, "rejected rows"))
 
 
-    def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._read.get_state(), "owed": self._owed.examples, **self._owed.saved_draws()}
-
-    def set_state(self, state: Mapping[str, object]) -> None:
-        self._read.set_state(record(state["parent"], "carried parent"))
-        self._owed = Owed.restored(integer(state["owed"], "examples owed"),
-                                   json_value(state.get("drawn"), "draws owed"))
-
-    def close(self) -> None:
-        self._read.close()
-
-
 class Accepted(pygrain.IterDataset[Batch]):
     """Grain's filter, with checkpointed counts. A filter of an endless repeat whose passes it
     rejects alike refuses a run of `certain_after` rejections, two whole passes, as reading nothing

@@ -1967,7 +1967,9 @@ class StepPhases(Forwarding):
                        "saved phases' position")
         phase = integer(saved["phase"], "the saved phase")
         ends = list(listed(saved["ends"], "saved phase ends", read=integer, what="a list of steps"))
-        identities = list(strings(saved["identities"], "saved phase identities"))
+        from dew.data.plan import saved_identity
+
+        identities = [saved_identity(held) for held in strings(saved["identities"], "saved phase identities")]
         if phase >= len(self._make) or ends != self._ends[:phase] or identities[:phase] != [
                 self._identity(index) for index in range(phase)]:
             raise _position.PlanChanged(

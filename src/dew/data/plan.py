@@ -715,6 +715,21 @@ version resumes with the Dew that wrote it, or goes on from its weights as a new
 afresh."""
 
 
+def saved_identity(identity: str) -> str:
+    """A plan's identity (`Plan.identity`) a position saved, as this Dew states it: one of 14 held its
+    format's version among its parts, which no version this Dew reads tells rows apart by, so it is read
+    without it; any other as saved (a phases' position's finished phases, `dew.data.dataset.StepPhases`)."""
+    order, separator, parts = identity.rpartition(" under plan ")
+    try:
+        held = json.loads(parts) if separator else None
+    except json.JSONDecodeError:
+        return identity
+    if not isinstance(held, dict) or "version" not in held:
+        return identity
+    del held["version"]
+    return f"{order}{separator}{json.dumps(held, sort_keys=True)}"
+
+
 def read_by(version: int) -> int:
     """The version a read of a run saved under `version` reads by, this Dew's, refused where this Dew reads
     none of it (`PLAN_VERSIONS`): what every read (`dew.data.compile`'s `compile`, `iterate` and `publish`)
@@ -796,12 +811,12 @@ class Plan:
         return described(self.order)
 
     def parts(self) -> dict[str, JSON]:
-        """A digest of each part of the plan but its order, its environment and
-        the share this process reads, which only the position it saves keeps:
-        the manifest's parts each apart, and a list's entries, such as each
-        source's content and each step's identity, one by one."""
+        """A digest of each part of the plan but its order, its environment, its format's version, which
+        reads the same rows at every version this Dew reads (`PLAN_VERSIONS`), and the share this process
+        reads, which only the position it saves keeps: the manifest's parts each apart, and a list's entries,
+        such as each source's content and each step's identity, one by one."""
         recorded = self.record()
-        for name in ("order", "code", "manifest"):
+        for name in ("order", "code", "manifest", "version"):
             del recorded[name]
         recorded["topology"] = json_value(
             {name: value for name, value in self.topology.items() if name != "share"}, "topology"
