@@ -50,7 +50,7 @@ from dew.parity import (
 from dew.parity_stages import staged_units
 
 __all__ = ["merge_shards", "provenance", "record_case", "record_distances", "record_logits",
-           "record_reference", "record_shard", "save", "with_pilots"]
+           "record_reference", "record_shard", "record_truths", "save", "with_pilots"]
 
 
 def record_reference(label: str, draw, evaluate, *, package: str, repo: str, tool: str, out: Path,
@@ -400,6 +400,31 @@ def _weighed(label: str, records, scaled) -> dict[str, np.ndarray]:
     result.update({f"{label}.heavy.{name}": mask for name, mask in zip(names, heavy, strict=True)
                    if mask is not None})
     return result
+
+
+def record_truths(label: str, draw, evaluate, count: int, *, followed: bool = False) -> dict[str, np.ndarray]:
+    """A recording of the reference's float64 truth alone at its first `count` draws (`draw(seed)`, the
+    inputs, `evaluate(inputs)` as `record_case`'s, its float32 outputs unread): each draw's inputs
+    (`<label>.input.<name>`), each leaf's truth's sketch (`truth_sketch`) and shape, and with `followed` the
+    reference's decisions, an evaluation's third value, which its truth followed (`_decided`); the test holds
+    Dew's float64 path to it per leaf at every draw (`reference_error.assert_truths_as_recorded`). No count is
+    sized and no float32 evidence kept: the site holds its function, not its rounding (docs/design/testing.md,
+    a site whose float32 errors no count of draws resolves)."""
+    inputs, sketches, shapes, decisions = [], {}, {}, {}
+    for seed in range(count):
+        drawn = {name: np.asarray(value) for name, value in draw(seed).items()}
+        made = evaluate(drawn)
+        if followed:
+            decisions[seed] = jax.tree.map(np.asarray, made[2])
+        for name, value in made[1].items():
+            sketches.setdefault(name, []).append(truth_sketch(value, seed))
+            shapes.setdefault(name, np.asarray(np.shape(value), np.int64))
+        inputs.append(drawn)
+    return {f"{label}.truths": np.int32(count),
+            **{f"{label}.input.{name}": np.stack([each[name] for each in inputs]) for name in inputs[0]},
+            **{f"{label}.sketch.{name}": np.stack(rows) for name, rows in sketches.items()},
+            **{f"{label}.shape.{name}": shape for name, shape in shapes.items()},
+            **(_decided(label, decisions, count) if followed else {})}
 
 
 def record_logits(directory: Path, model, wide, command: str, *, reference: str, revision: str, license: str,

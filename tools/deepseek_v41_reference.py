@@ -521,13 +521,19 @@ def trained(net, ids):
     _, logits, _ = forward(net, ids)
     loss = cross_entropy(logits, ids)
     loss.backward()
+    return logits.detach(), loss.detach(), taken_gradients(net)
+
+
+def taken_gradients(net) -> dict[str, torch.Tensor]:
+    """Every trainable parameter's gradient after a backward, zeros where none reached it, the parameters'
+    own gradients cleared after."""
     gradients = {}
     for name, parameter in net.named_parameters():
         if parameter.requires_grad:
             gradients[name] = (torch.zeros_like(parameter) if parameter.grad is None
                                else parameter.grad.detach().clone())
             parameter.grad = None
-    return logits.detach(), loss.detach(), gradients
+    return gradients
 
 
 def stepped(net, gradients, ids) -> np.ndarray:
@@ -1040,7 +1046,7 @@ def clearing_quantized_rows(model_module, net, vocabulary: int, seed: int) -> np
     """The `seed`-th drawn rows `[2, LENGTH]` (a stream of their own, redrawn until it does) whose every
     top-k of the release's forward, its quantizers on, clears the gate's `MARGIN`
     (tests/selection_margins.py): rows a float32 port selects over as the release does, its roundings
-    each held to their own (`quantized_forward_evaluated`)."""
+    each held to their own (`followed_evaluated`)."""
     from selection_margins import MARGIN
 
     generator = torch.Generator().manual_seed(0x5154 + seed)
@@ -1093,19 +1099,47 @@ def clearing_cached_rows(net, vocabulary: int, seed: int) -> np.ndarray:
             return ids.numpy().astype(np.int32)
 
 
-def cached_evaluated(model_module, net, wide):
-    """A recorded cached run's evaluation (`record_case`): the release's prefill, teacher-forced steps and
-    DSpark's drafts after each (`cached`), their logits and confidence (`CACHED_LEAVES`), in float32 and in
-    float64."""
+def twin_evaluated(model_module, net, wide, leaves):
+    """A recorded plain site's evaluation (`record_case`): `leaves(net, ids)`, the release's outputs on a
+    draw's rows, in float32 and, from its float64 twin, in float64."""
     def evaluate(inputs):
         ids = torch.from_numpy(inputs["input_ids"].astype(np.int64))
-        with torch.no_grad():
-            narrow = cached(net, ids)
-            with widened(model_module):
-                truth = cached(wide, ids)
-        return ({name: narrow[name].astype(np.float64) for name in CACHED_LEAVES},
-                {name: truth[name] for name in CACHED_LEAVES})
+        narrow = leaves(net, ids)
+        with widened(model_module):
+            truth = leaves(wide, ids)
+        return {name: value.astype(np.float64) for name, value in narrow.items()}, truth
     return evaluate
+
+
+def logits_from(start: int):
+    """A forward's leaves (`twin_evaluated`): each row's logits from position `start` on."""
+    def leaves(net, ids):
+        with torch.no_grad():
+            reset(net)
+            return {"logits": forward(net, ids)[1][:, start:].numpy()}
+    return leaves
+
+
+def cached_leaves(net, ids):
+    """A cached run's leaves (`twin_evaluated`): the release's prefill, teacher-forced steps and DSpark's
+    drafts after each (`cached`), their logits and confidence (`CACHED_LEAVES`)."""
+    with torch.no_grad():
+        run = cached(net, ids)
+    return {name: run[name] for name in CACHED_LEAVES}
+
+
+def step_leaves(net, ids):
+    """A training step's leaves (`twin_evaluated`, `followed_evaluated`): the release's next-token cross
+    entropy over the rows, the model run on each row's inputs (every token but its last) as a trainer's
+    step takes them, each position scored at the next token, and its gradient in every parameter it trains,
+    by the parameter's name, the name model.safetensors stores it by. Run over the whole row, a quantized
+    model rounds the last token's activations too, decisions no step that scores it reads."""
+    reset(net)
+    _, logits, _ = forward(net, ids[:, :-1])
+    loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
+    loss.backward()
+    return {"loss": loss.detach().numpy(),
+            **{f"gradient/{name}": value.numpy() for name, value in taken_gradients(net).items()}}
 
 
 def _inputs(rounded: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -1121,33 +1155,34 @@ def _rounded(record: Record, name: str, dtype=None) -> dict[str, np.ndarray]:
     return joined if dtype is None else {site: value.astype(dtype) for site, value in joined.items()}
 
 
-def quantized_forward_evaluated(model_module, net, wide):
-    """A recorded quantization-aware forward's evaluation (`record_case`): the release's logits, its
-    quantizers on, and every quantizer input (`rounded`), in float32 and in float64, its float64 run
-    following the float32 run's roundings (`followed_quantizers`), whose outputs it returns third."""
+def followed_evaluated(model_module, net, wide, leaves):
+    """A recorded quantization-aware site's evaluation (`record_case(..., followed=True)`): `leaves(net,
+    ids)` with the release's quantizers on, and every quantizer input (`rounded`), in float32 and in
+    float64, its float64 run following the float32 run's roundings (`followed_quantizers`), whose outputs
+    it returns third. Under autograd a following quantizer passes its gradient straight through, as the
+    stand-ins' do (tools/deepseek_v41_kernels.py): the release is inference code, whose quantizers have no
+    backward."""
     def evaluate(inputs):
         ids = torch.from_numpy(inputs["input_ids"].astype(np.int64))
         narrow_record, wide_record = Record(), Record()
         RECORDS[:] = [narrow_record]
         set_quantizers(model_module, enabled=True)
         try:
-            with torch.no_grad():
-                reset(net)
-                logits = forward(net, ids)[1]
+            narrow = leaves(net, ids)
         finally:
             set_quantizers(model_module, enabled=False)
             RECORDS.clear()
         decided = _rounded(narrow_record, "out")
-        with widened(model_module), torch.no_grad():
+        with widened(model_module):
             RECORDS[:] = [wide_record]
             try:
                 with followed_quantizers(model_module, decided):
-                    reset(wide)
-                    truth = forward(wide, ids)[1]
+                    truth = leaves(wide, ids)
             finally:
                 RECORDS.clear()
-        narrow = {"logits": logits.double().numpy(), **_inputs(_rounded(narrow_record, "in", np.float64))}
-        return narrow, {"logits": truth.numpy(), **_inputs(_rounded(wide_record, "in"))}, decided
+        narrow = {**{name: value.astype(np.float64) for name, value in narrow.items()},
+                  **_inputs(_rounded(narrow_record, "in", np.float64))}
+        return narrow, {**truth, **_inputs(_rounded(wide_record, "in"))}, decided
     return evaluate
 
 
@@ -1170,43 +1205,34 @@ def write_recording(seed: int):
     (`recorded_references.record_case`), the reference the suite's variants of a row (an interior gap,
     shifted positions, a shifted cached walk) are held to (tests/test_deepseek_v41.py); over rows drawn
     apart (`clearing_quantized_rows`) the quantization-aware forward's logits and every quantizer input
-    (`quantized_forward_evaluated`), its decisions recorded, which its truth followed; and over rows drawn
-    apart again (`clearing_cached_rows`) the cached run and DSpark's drafts (`cached_evaluated`)."""
+    (`followed_evaluated`), its decisions recorded, which its truth followed; and over rows drawn apart
+    again (`clearing_cached_rows`) the cached run and DSpark's drafts (`cached_leaves`)."""
     from recorded_references import provenance, record_case, save
 
     model_module, args, net, wide = released(seed)
 
     draw, rows = drawn_once(lambda index: clearing_rows(net, args.vocab_size, index))
 
-    def evaluated(start: int):
-        """Each row's logits from position `start` on, in fp32 and in fp64."""
-        def evaluate(inputs):
-            ids = torch.from_numpy(inputs["input_ids"].astype(np.int64))
-            with torch.no_grad():
-                reset(net)
-                narrow = forward(net, ids)[1][:, start:].double().numpy()
-                with widened(model_module):
-                    reset(wide)
-                    truth = forward(wide, ids)[1][:, start:].numpy()
-            return {"logits": narrow}, {"logits": truth}
-        return evaluate
+    def plain(leaves):
+        return twin_evaluated(model_module, net, wide, leaves)
+
+    def followed(leaves):
+        return followed_evaluated(model_module, net, wide, leaves)
 
     # Every position's, and those a cached walk computes after its prompt's prefill.
-    arrays = {**record_case("deepseek v41 plain rows", draw, evaluated(0), summary=True),
-              **record_case("deepseek v41 plain walk", draw, evaluated(PROMPT - 1), summary=True)}
+    arrays = {**record_case("deepseek v41 plain rows", draw, plain(logits_from(0)), summary=True),
+              **record_case("deepseek v41 plain walk", draw, plain(logits_from(PROMPT - 1)), summary=True)}
 
     # The quantization-aware forward's, over rows drawn apart (`clearing_quantized_rows`), held by its
     # float64 run following its own roundings (docs/design/testing.md).
     quantized_draw, quantized = drawn_once(
         lambda index: clearing_quantized_rows(model_module, net, args.vocab_size, index))
-    arrays.update(record_case("deepseek v41 quantized forward", quantized_draw,
-                              quantized_forward_evaluated(model_module, net, wide), summary=True,
-                              followed=True))
+    arrays.update(record_case("deepseek v41 quantized forward", quantized_draw, followed(logits_from(0)),
+                              summary=True, followed=True))
 
     # The cached run and DSpark's drafts, over rows its every selection and fed argmax clears.
     cached_draw, walking = drawn_once(lambda index: clearing_cached_rows(net, args.vocab_size, index))
-    arrays.update(record_case("deepseek v41 plain cached", cached_draw,
-                              cached_evaluated(model_module, net, wide), summary=True))
+    arrays.update(record_case("deepseek v41 plain cached", cached_draw, plain(cached_leaves), summary=True))
     written = save(FIXTURE / "recording.npz", {**arrays, "provenance": provenance(
         "deepseek-ai/DeepSeek-V4.1-Flash", DEEPSEEK_V41_REVISION, "cpu",
         "PYTHONPATH=src:.:tests:tools <release python> tools/deepseek_v41_reference.py --record",
@@ -1218,6 +1244,42 @@ def write_recording(seed: int):
              quantized_rows=np.stack([quantized[index] for index in range(len(quantized))]),
              cached_rows=np.stack([walking[index] for index in range(len(walking))]))
     print(f"{written}: {sorted(arrays)}; {len(rows)} rows")
+
+
+STEP_TRUTHS = 3
+"""The draws a training step's float64 truths are recorded at (`write_step_truths`): a function another
+function computes differs on every draw, so a few hold it, and three keep each site's recording within what
+git holds (`fetched_fixtures.IN_GIT`: four draws of the quantization-aware step, its decisions beside, are
+1.18 MB)."""
+
+
+def write_step_truths(seed: int):
+    """step_truths.npz and quantized_step_truths.npz beside the fixture: the release's training step
+    (`step_leaves`), its loss and every parameter's gradient, plain over drawn rows its selections clear and
+    quantization-aware over rows drawn apart, the latter's every quantizer input beside and its decisions
+    recorded, at STEP_TRUTHS draws, its float64 truth alone (`recorded_references.record_truths`), which
+    Dew's float64 step is held to (tests/test_deepseek_v41_recorded.py). Its float32 errors no count of
+    draws resolves (docs/design/testing.md, the training step's finding), so the step's float32 run is
+    recorded nowhere."""
+    from recorded_references import provenance, record_truths, save
+
+    model_module, args, net, wide = released(seed)
+    draw, _ = drawn_once(lambda index: clearing_rows(net, args.vocab_size, index))
+    quantized_draw, _ = drawn_once(
+        lambda index: clearing_quantized_rows(model_module, net, args.vocab_size, index))
+    plain = twin_evaluated(model_module, net, wide, step_leaves)
+    followed = followed_evaluated(model_module, net, wide, step_leaves)
+    sites = {"step_truths.npz": record_truths("deepseek v41 plain step", draw, plain, STEP_TRUTHS),
+             "quantized_step_truths.npz": record_truths("deepseek v41 quantized step", quantized_draw,
+                                                        followed, STEP_TRUTHS, followed=True)}
+    command = ("PYTHONPATH=src:.:tests:tools <release python> tools/deepseek_v41_reference.py "
+               "--record-step-truths")
+    for name, arrays in sites.items():
+        written = save(FIXTURE / name, {**arrays, "provenance": provenance(
+            "deepseek-ai/DeepSeek-V4.1-Flash", DEEPSEEK_V41_REVISION, "cpu", command,
+            torch=torch.__version__)}, reference=f"deepseek-ai/DeepSeek-V4.1-Flash@{DEEPSEEK_V41_REVISION}",
+            license="mit")
+        print(f"{written}: {written.stat().st_size} bytes", flush=True)
 
 
 def main():
@@ -1233,6 +1295,8 @@ def main():
     parser.add_argument("--padding", action="store_true", help="record the rows the lookup leaves untrained")
     parser.add_argument("--record", action="store_true",
                         help="record the plain logits over drawn rows its selections clear, over seeds")
+    parser.add_argument("--record-step-truths", action="store_true",
+                        help="record the training step's float64 truths alone at a few draws")
     options = parser.parse_args()
     torch.set_default_dtype(torch.float32)
     # One thread keeps every reduction in one order, so a rerun writes the
@@ -1252,6 +1316,8 @@ def main():
         write_padding()
     elif options.record:
         write_recording(options.seed)
+    elif options.record_step_truths:
+        write_step_truths(options.seed)
     elif options.search:
         search(options.seed, options.search)
     else:

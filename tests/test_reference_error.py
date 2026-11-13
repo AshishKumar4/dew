@@ -21,6 +21,7 @@ from reference_error import (
     REDRAW,
     GateFailure,
     Inconclusive,
+    UnrecordedTruth,
     as_given,
     assert_as_exact,
     assert_moves,
@@ -1754,6 +1755,30 @@ def _squared_case(first: int):
         return {"y": x * x - np.float32(1)}, {"y": x.astype(np.float64) ** 2 - 1}
 
     return draw, evaluate
+
+
+def test_a_truths_recording_holds_a_float64_path_to_the_references_function_below_float32_noise():
+    """A truths recording (`record_truths`) keeps the reference's float64 truth alone at a few draws: the
+    reference's function computed in float64 is held to it at every draw (`assert_truths_as_recorded`), and
+    another function is refused, one a part in 2**40 off, far below any float32 run's rounding, among
+    them."""
+    from recorded_truths import assert_truths_as_recorded
+    from tool_support import load
+
+    recorder = load("recorded_references")
+    draw, evaluate = _squared_case(700)
+    recorded = recorder.record_truths("site", draw, evaluate, 4)
+
+    def squared(inputs):
+        return {"y": jnp.asarray(inputs["x"], jnp.float64) ** 2 - 1}
+
+    def off(inputs):
+        return {"y": (jnp.asarray(inputs["x"], jnp.float64) ** 2 - 1) * (1 + 2.0 ** -40)}
+
+    with jax.enable_x64(new_val=True):
+        assert_truths_as_recorded(recorded, "site", squared)
+        with pytest.raises(UnrecordedTruth):
+            assert_truths_as_recorded(recorded, "site", off)
 
 
 def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path):

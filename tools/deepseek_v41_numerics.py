@@ -24,8 +24,8 @@ reference recorded, in the units of its margins (a quantizer's input over
 its block's amax, a top-k row over its largest finite magnitude), which the
 reference tool's NOISE, its seed rank's estimate, takes twice the largest of.
 
-The tests share the runs (`forward`, `updated`, `cached_run`,
-`vision_run`), `decided`, `selections` and the vision bundle from here.
+The tests share `unquantized`, `cached_run`, `vision_run` and the vision
+bundle from here.
 """
 
 from __future__ import annotations
@@ -47,23 +47,16 @@ from flax import linen as nn
 from flax.core import freeze
 from jax.experimental import io_callback
 from model_support import float64_twin
+from quantized_arms import QUANTIZERS
 from reference_error import distance
 
 from dew.interop import Pretrained
-from dew.nn.fake_quant import FakeQuantizing, fake_quant_fp4, fake_quant_fp8, straight_through
+from dew.nn.fake_quant import FakeQuantizing, straight_through
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 
 TINY = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf" / "deepseek-v41-tiny"
-
-
-# The release's three quantizer sites: FP8 over 32 channels under
-# power-of-two scales, FP4 over 16 under E4M3 scales, FP4 over 32 under
-# power-of-two scales.
-QUANTIZERS = {"window": lambda v: fake_quant_fp8(v, 32),
-              "entries": lambda v: fake_quant_fp4(v, 16, e4m3_scale=True),
-              "index": lambda v: fake_quant_fp4(v, 32, e4m3_scale=False)}
 
 
 def unquantized(model):
