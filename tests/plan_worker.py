@@ -1,17 +1,20 @@
 """A small decoder's step planned on each process of a pool whose devices leave each its own room: what
 the plan search compiles and plans on each (`dew.training.memory.pooled_headroom`)."""
 
+import functools
+
 import numpy as np
 from process_support import serve_mode, worker_parser
 
 
-def agreement(args) -> dict:
+def agreement(args, *, undecided: bool = False) -> dict:
     """A small decoder's step planned over every process's device, each device leaving its own room
     (`Device.memory_stats`): the room its derivation says the step needs at four microbatches, read off
     a plan made there at a whole limit's room, and then the splits the search compiles and the plan it
     makes where process 0's device leaves that room to the byte and each other process's a byte less per
     rank than the least its derivation says it might need: a CPU's footprint is an interval (row 5448),
-    which a device short of its upper bound alone leaves undecided."""
+    which a device short of its upper bound alone leaves undecided. `undecided`: each other process's device
+    a byte less per rank than the most it might need alone, which leaves the pooled judgment undecided."""
     import jax
     import optax
 
@@ -41,11 +44,14 @@ def agreement(args) -> dict:
     (judged,) = [entry for entry in planned(4)["derived"] if entry["split"] == 4]
     least, most = judged.get("headroom_bounds", (judged["headroom"],) * 2)
     need = limit - least
-    leaving(need if args.process_id == 0 else limit - most - args.process_id)
+    short = limit - (least if undecided else most) - args.process_id
+    leaving(need if args.process_id == 0 else short)
     plan = planned(None)
     return {"need": need, "asked": [probe["split"] for probe in plan["probes"]], "split": plan["split"],
             "derived": {str(entry["split"]): entry["headroom"] for entry in plan["derived"]}}
 
 
+MODES = {"agreement": agreement, "undecided": functools.partial(agreement, undecided=True)}
+
 if __name__ == "__main__":
-    serve_mode({"agreement": agreement}, worker_parser({"agreement": agreement}, __doc__).parse_args())
+    serve_mode(MODES, worker_parser(MODES, __doc__).parse_args())

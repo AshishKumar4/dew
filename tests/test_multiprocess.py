@@ -807,6 +807,18 @@ def test_every_process_plans_from_the_tightest_room_any_of_their_devices_leaves(
 
 
 @pytest.mark.distributed
+def test_every_process_leaves_an_undecided_split_to_the_same_compile(tmp_path):
+    """Over two processes whose devices leave four microbatches room to the byte on one and a byte short of
+    the most it might need on the other, alone (its footprint's upper bound), the pooled judgment of four is
+    undecided on both (`memory.derived_headroom`'s interval spanning zero), and both leave it to the same
+    compile: the same splits asked in the same order, the same plan."""
+    reports = run_pool("undecided", tmp_path, 2, script=Path(__file__).with_name("plan_worker.py"), devices=1)
+    first, second = reports
+    assert first["derived"] == second["derived"] and first["derived"]["4"] is None
+    assert first["asked"] == second["asked"] and first["split"] == second["split"]
+
+
+@pytest.mark.distributed
 def test_no_process_of_a_cpu_pool_traces_residuals_its_devices_never_judge(pool_checkpoint):
     """A step's derived footprint judges each process's own device, so no process of a CPU pool, whose
     devices state no memory, traces the residuals its loss's pullback keeps (row 3093): process 1 judged
