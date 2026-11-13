@@ -13,7 +13,10 @@ if TYPE_CHECKING:
     from dew.checkpoints import Ranking
     from dew.state import TrainState
 
-from dew.training.evaluation import Summary
+from dew.training.evaluation import Declared, SplitLoss, Summary
+
+type Source = Metric | TrainingScalar | Summary | SplitLoss | Callable[[Mapping], float]
+"""What a selection ranks by: a declared score, a training scalar, or a custom score of the fit's scores."""
 
 
 @dataclasses.dataclass(frozen=True, init=False)
@@ -32,13 +35,13 @@ class Best:
     threshold: float | None = None
     weights_only: bool = False
     split: str | None = None
-    _source: Metric | TrainingScalar | Summary | Callable[[Mapping], float] | None = dataclasses.field(
+    _source: Source | None = dataclasses.field(
         default=None, repr=False, compare=False, metadata={'record': False})
 
     def __init__(self, metric: str | Metric | TrainingScalar | Summary | types.MethodType
                  | Callable[[Mapping], float], top: int = 1, mode: Literal['min', 'max'] | None = None,
                  threshold: float | None = None, weights_only: bool = False, split: str | None = None,
-                 *, _source: Metric | TrainingScalar | Summary | Callable[[Mapping], float] | None = None):
+                 *, _source: Source | None = None):
         if top < 1 or mode not in (None, 'min', 'max'):
             raise ValueError("Best needs integer top >= 1 and mode min or max")
         if threshold is not None and not math.isfinite(threshold):
@@ -55,7 +58,7 @@ class Best:
                              ('weights_only', weights_only), ('split', split), ('_source', source)):
             object.__setattr__(self, field, value)
 
-    def resolved(self, scored: Mapping[str, Sequence[Metric | Summary]]) -> Best:
+    def resolved(self, scored: Mapping[str, Sequence[Declared]]) -> Best:
         """This selection bound to the split it ranks and the metric it names there: `train` for a
         training scalar, else the split of `scored` (each split's metrics) it names, by `split` or as
         its recorded name's prefix, or the only one, and the metric it names among that split's own,
@@ -91,7 +94,7 @@ class Best:
             if metric is None:
                 raise ValueError(f"best metric {selection.metric!r} is not among fit's metrics")
             selection = dataclasses.replace(selection, _source=metric)
-        if isinstance(metric, (Metric, Summary)):
+        if isinstance(metric, (Metric, Summary, SplitLoss)):
             assert selection.split is not None
             if not any(metric is declared for declared in scored[selection.split]):
                 raise ValueError("best must be a metric object passed in metrics")
@@ -106,14 +109,14 @@ class Best:
         return selection
 
 
-def _declared_shown(metric: Metric | Summary) -> Shown | None:
+def _declared_shown(metric: Declared) -> Shown | None:
     """How `metric` itself declares it is shown, which the Metric protocol leaves optional, so it is
     read at this boundary."""
     return getattr(metric, "shown", None)
 
 
 def rankings(best: Sequence[Best], scores: Mapping[str, float], *, validation: str | None,
-             declared: Mapping[str, Sequence[Metric | Summary]], objective) -> tuple[Ranking, ...]:
+             declared: Mapping[str, Sequence[Declared]], objective) -> tuple[Ranking, ...]:
     """How an evaluation's `scores` rank its state: by each `best` policy, a threshold it misses
     ranking nothing (a NaN), or without one by the `validation` split's loss, else the training
     loss. A step no evaluation scored ranks nothing, and asks no aggregate. `declared` (each
@@ -130,7 +133,7 @@ def rankings(best: Sequence[Best], scores: Mapping[str, float], *, validation: s
     for index, selection in enumerate(best):
         metric = selection._source
         assert metric is not None
-        if isinstance(metric, (Metric, TrainingScalar, Summary)):
+        if isinstance(metric, (Metric, TrainingScalar, Summary, SplitLoss)):
             name = f'{selection.split}/{metric.name}'
             value = scores.get(name, float('nan'))
         else:

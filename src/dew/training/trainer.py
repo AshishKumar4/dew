@@ -90,7 +90,7 @@ from dew.optim import (
     with_rates,
 )
 from dew.registry import Unrecordable
-from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
+from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, occupancy, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
@@ -806,12 +806,12 @@ class Trainer(Generic[Loss, Effects]):
                 batch_statistics=None if batch_stats is None else tuple(zeros(x) for x in batch_stats),
                 replayed_statistics=(None if shared or batch_stats is None
                                      else tuple(buffer(zeros(x)) for x in batch_stats)),
-                statistics_stamp=None if batch_stats is None else jnp.full((2,), -1, jnp.int32))
+                statistics_stamp=None if batch_stats is None else jnp.full((2,), -1, jnp.int32),
+                fill=jnp.zeros((), jnp.int32))
 
         pending = jax.eval_shape(allocate)
         # The microbatches the state's window holds are read only where it is replaced (`kept_window`).
-        if kept_window(state.accumulation, pending,
-                       None if shape_only else lambda: int(state.microstep) % window):
+        if kept_window(state.accumulation, pending, read=not shape_only):
             return state
         if not shape_only:
             placement = self.shardings(dataclasses.replace(state, accumulation=pending)).accumulation
@@ -943,7 +943,7 @@ class Trainer(Generic[Loss, Effects]):
         are compiled (`window_dropped`), so a host-master state's resident weights stay where they are."""
         if step not in self._shape.stage_starts or state.window is None:
             return state
-        return dropped(state, int(state.window_size))
+        return dropped(state)
 
     @ruled
     def fit(
@@ -1877,7 +1877,7 @@ class Trainer(Generic[Loss, Effects]):
         state = self._staged(state, run.current)
         signature = self.phase_passes.key(batch_signature(batch))
         if signature not in compiled and self.phase_passes.begins(compiled) and (
-                state.window is None or int(state.microstep) % int(state.window_size) == 0):
+                not int(jnp.max(occupancy(state.window)))):
             # A phase of other passes begins at an update's end: its step is planned afresh, at the split
             # the run was given or the planner's for its own passes, over the state as a fresh state holds
             # it, no window laid out; one that begins inside an update keeps the run's, the one its open

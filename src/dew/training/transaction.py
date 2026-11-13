@@ -61,7 +61,7 @@ from dew.objectives.base import (
 )
 from dew.objectives.routing import refuse_fixed_routers
 from dew.optim import clips_qk, stepped
-from dew.state import Accumulation, TrainState, apart, together
+from dew.state import Accumulation, TrainState, apart, occupancy, together
 from dew.training.compiled_program import gradients_read
 from dew.training.distributed import microbatch
 from dew.training.inspection import Inspection, Summaries, stacked, summaries
@@ -134,8 +134,8 @@ def cleared(acc: Accumulation) -> Accumulation:
         statistics_stamp=None if acc.statistics_stamp is None else jnp.full_like(acc.statistics_stamp, -1))
 
 
-def dropped_window(state, size: int):
-    """`state` with its window of `size` microbatches dropped: its accepted microbatches forgotten and
+def dropped_window(state):
+    """`state` with its window dropped: its accepted microbatches forgotten and
     the next taking its first slot, as a rejected attempt (`Transaction.finish_attempt`) or a batch
     ramp's new stage (`Trainer`'s runner) leaves it, so a committed update pools one window of one
     stage's batches, all drawn under one key (`example_fields`). The window's gradient sum stays in
@@ -143,15 +143,16 @@ def dropped_window(state, size: int):
     wrote keep what they wrote, as torch's AMP keeps a skipped update's running statistics."""
     if state.accumulation is None:
         return state
-    microstep, window = window_dropped(state.microstep, state.accumulation, size)
+    microstep, window = window_dropped(state.microstep, state.accumulation)
     return dataclasses.replace(state, microstep=microstep, accumulation=window)
 
 
-def window_dropped(microstep: jax.Array, acc: Accumulation, size: int) -> tuple[jax.Array, Accumulation]:
-    """`dropped_window`'s two fields: the microstep back at its window's start, and the window cleared but
-    for its gradient sum. A state's other fields go round it, as a compiled program over them alone
-    leaves a host-master state's resident frozen weights where they are."""
-    return microstep - microstep % size, dataclasses.replace(
+def window_dropped(microstep: jax.Array, acc: Accumulation) -> tuple[jax.Array, Accumulation]:
+    """`dropped_window`'s two fields: the microstep back by the microbatches the window held (`occupancy`),
+    and the window cleared, its occupancy 0, but for its gradient sum. A state's other fields go round it,
+    as a compiled program over them alone leaves a host-master state's resident frozen weights where they
+    are."""
+    return microstep - occupancy(acc), dataclasses.replace(
         cleared(dataclasses.replace(acc, gradient=None, batch_statistics=None)),
         gradient=acc.gradient, batch_statistics=acc.batch_statistics)
 
@@ -824,7 +825,7 @@ class Transaction:
                 "its step asks for them (Step.qk_stats), and the run's optimizer clips by them (a QK-Clip, "
                 "muonclip's): its attention would train unclipped")
         previous = state.accumulation
-        fill = state.microstep % self.size
+        fill = occupancy(previous)
         due = (fill + 1) == self.size
         if closing is not None:
             due = due | closing
@@ -1061,6 +1062,7 @@ class Transaction:
         held_stamp = candidate.statistics_stamp
 
         def retain(acc):
+            acc = dataclasses.replace(acc, fill=occupancy(acc) + 1)
             if acc.tokens is not None:
                 acc = dataclasses.replace(acc, tokens=_TokenCount.add(acc.tokens, read))
             if not self.shared:
@@ -1163,7 +1165,7 @@ class Transaction:
                 numerical, accumulation=self._retained_window(state, batch, pending, attempt, read))
         # A rejected attempt drops its window (`dropped_window`): the update it would have closed is
         # skipped whole, its accepted microbatches with it.
-        advanced = _chosen(accepted, numerical, dropped_window(state, self.size))
+        advanced = _chosen(accepted, numerical, dropped_window(state))
         if self.size == 1 and advanced.compute is not None:
             # The copies are the cast of whichever parameters were chosen, so
             # they are cast after the choice. Choosing between the new and the
@@ -1328,7 +1330,7 @@ class Transaction:
                        ) -> Realization:
         """`realized` with the window's records: this microbatch's (`own`, in its slot) and each other one's
         the replay ran (`replays`, those of the `fill` slots the window holds where it `replayed`)."""
-        evaluations = [(own, self._places(state.microstep % self.size, own, part)), *replays]
+        evaluations = [(own, self._places(occupancy(state.accumulation), own, part)), *replays]
         held = jnp.arange(len(replays)) < fill
         ran = jnp.concatenate([jnp.ones((1,), bool), jnp.logical_and(held, replayed)])
         return dataclasses.replace(realized, aux=dataclasses.replace(realized.aux,
@@ -1400,7 +1402,7 @@ class Transaction:
             # columns the objective's batch no longer holds (`model_batch`).
             attempt = state.step * self.split + part
             # Every attempt the run made and did not accept draws afresh (`attempt_step`'s rejections).
-            slot = state.microstep % self.size
+            slot = occupancy(state.accumulation)
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             # A watched cotangent is read unscaled by the factor its backward is seeded with.
             read = self.read(state.variables, state.compute)
@@ -1433,7 +1435,7 @@ class Transaction:
             # The record of each of the window's other microbatches the commit replays, in its slot.
             own = evaluation_of(realized.aux)
             unreplayed = None if own is None else [jax.tree.map(jnp.zeros_like, (own, self._places(
-                state.microstep % self.size, own, part))) for _ in range(self.size - 1)]
+                occupancy(state.accumulation), own, part))) for _ in range(self.size - 1)]
 
             def replay(_):
                 cot = pooled(pending.pooled, realized.stats, factor)

@@ -143,6 +143,22 @@ class EvalSuite:
     every: int | str | Counted | None = None
 
 
+@dataclass(frozen=True, eq=False)
+class SplitLoss:
+    """A validation split's loss, which its evaluation records beside the split's metrics
+    (`<split>/loss`) wherever the objective defines one (`Objective.defines_validation_loss`): a score
+    the fit declares for each split it validates whose suite holds no metric named `loss` of its own, so
+    `Best` and `Plateau` rank it by its name, lower better, as they rank a metric. Each split's is its
+    own object, as each suite's instance of one metric is."""
+
+    name = "loss"
+    shown = Shown(better="lower")
+
+
+type Declared = Metric | Summary | SplitLoss
+"""A score a fit declares (`dew.training._fit.declarations`), which its selections resolve against."""
+
+
 @dataclass(frozen=True)
 class Summary:
     """One scalar a run forms from each evaluation's split scores by a declared weighting, a board's
@@ -1049,7 +1065,7 @@ class MetricScores[Statistics, Additions](Mapping):
 
     def __init__(
         self,
-        declared: Mapping[str, Sequence[Metric | Summary]],
+        declared: Mapping[str, Sequence[Declared]],
         scores: Mapping[str, float],
         objective: Objective[Statistics, Additions],
     ):

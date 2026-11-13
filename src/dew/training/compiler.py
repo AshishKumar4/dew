@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -23,7 +24,7 @@ from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective
-from dew.state import TrainState, apart, together
+from dew.state import TrainState, apart, occupancy, together
 from dew.telemetry.instrumentation import StepFlops
 from dew.training._candidates import Stepping, candidate_for, lowered_for
 from dew.training._lowering import Lowered, routed
@@ -51,7 +52,7 @@ from dew.training.planning import (
     whole_step,
 )
 from dew.training.profiling import pgle_runs
-from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
+from dew.training.rungs import keep_rung, plan_flops, recorded_rung
 from dew.training.transaction import Transaction, outcome
 
 if TYPE_CHECKING:
@@ -67,11 +68,11 @@ def laid_out(state: TrainState, window: int) -> TrainState:
     which the next window's first microbatch replaces unread) for the step to lay out its own
     (`builds_window`), its count of accepted microbatches read in the new window's (`microstep`, whose
     windows and steps the transaction counts by it: the same updates and steps). A state inside an update
-    is refused another window: its open window is laid out for the one it pools."""
+    is refused another window: its open window is laid out for the one it pools (`occupancy`)."""
     size = int(state.window_size)
     if size == window:
         return state
-    if int(state.microstep) % size:
+    if int(jnp.max(occupancy(state.window))):
         raise ValueError(f"the state pools an open window of {size} microbatches, and the step it is handed "
                          f"to reads {window} an update: a step of another split begins at an update's end")
     placed = state.window_size.sharding
@@ -280,7 +281,7 @@ class StepCompiler[L, E]:
         split, unaligned = divmod(int(state.window_size), settings.accumulation)
         # A state pools its window's microbatches where it holds one part filled: the window, laid out for
         # its split, binds it.
-        pools = state.window is not None and int(state.microstep) % int(state.window_size) != 0
+        pools = bool(int(jnp.max(occupancy(state.window))))
         held = state.window is not None or split > 1
         # DiLoCo's replicas, once they have stepped, each count their microbatches in their split's windows,
         # which no other split reads: it binds the split, a stated other refused.
@@ -394,9 +395,8 @@ class StepCompiler[L, E]:
 
         def lower(split: int, narrow: bool, footprint: Footprint | None = None, *, derived: bool = True,
                   lowering: bool = True, floored: bool = False) -> Candidate:
-            rung = {**self.rung(), 'narrow': narrow, 'split': split}
             return candidate_for(stepping, state, batch, schedule, placement, replicated, split,
-                                 narrow, recorded_launches(recorded, rung), lowering=lowering,
+                                 narrow, lowering=lowering,
                                  capacity=capacity, footprint=footprint, derived=derived, floored=floored)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
@@ -440,7 +440,7 @@ class StepCompiler[L, E]:
         chosen = {**self.rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
-            keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
+            keep_rung(record_path, key, {**chosen, 'flops': counted})
         plan = settled(planned, probes, search, above)
         if stepping.staging.read_whole:
             # A transformation given built that kept every layer whole on every stage (`StageLocal.of`).

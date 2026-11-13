@@ -47,6 +47,7 @@ from dew.telemetry.profile import Profiler, active_profile
 from dew.training.ahead import handed
 from dew.training.distributed import batch_divisor
 from dew.training.footprint import Footprint
+from dew.training.interval import latest
 from dew.training.memory import (
     climbed,
     compiled_if_it_fits,
@@ -132,8 +133,8 @@ class Candidate:
     """A step a plan compiles: the shapes of the microbatch it reads, the
     loss's shapes, the narrow copies, the state's placement and shapes as it
     traces them, the bytes held beside it, the program lowered, None once its plan is admitted
-    (`Planned.released`), its kernel launches (`dew.nn.kernels.tuning.tune`) and its kernel report
-    (`dew.training._lowering.KernelReport`: its dispatches' routes and lowered launches)."""
+    (`Planned.released`), and its kernel report (`dew.training._lowering.KernelReport`: its dispatches'
+    routes and lowered launches)."""
     micro: Batch
     shapes: object
     copies: dict
@@ -143,7 +144,6 @@ class Candidate:
     built: int
     """The bytes of `held` the step's arguments hold: the copies and accumulator its first call builds."""
     program: jax.stages.Lowered | None
-    launches: str
     kernels: KernelReport
     footprint: Footprint | None
     """Its derived device footprint; None for a custom step not differentiating the objective."""
@@ -211,13 +211,24 @@ def whole_step(outputs):
     last one's loss, pooled over the window where it commits, and its
     report, as each step of an accumulating run reports its own
     microbatch's; finite and accepted where every microbatch was; and the
-    commits summed."""
+    commits' counts, tokens and norms summed, its inspection the latest
+    part's that committed (`interval.latest`), as a run's interval keeps
+    the latest sampled commit: a step of two commits (a window a rejection
+    left part filled, then the closing part of a run's last batch) reports
+    its second's summaries, never the two added."""
     losses, metrics, finite, accepted, committed = zip(*outputs, strict=True)
     # A recording step's evaluations are every microbatch's, in the order they ran (`RECORD`).
     report = {name: jnp.concatenate([part[name] for part in metrics]) if name.startswith(RECORD) else value
               for name, value in metrics[-1].items()}
+    summed = jax.tree.map(lambda *values: sum(values),
+                          *(dataclasses.replace(part, inspected=None) for part in committed))
+    sample = None
+    for part in committed:
+        if part.inspected is not None:
+            sample = (part.count, part.inspected) if sample is None else latest(
+                (part.count, part.inspected), sample)
     return (losses[-1], report, jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)),
-            jax.tree.map(lambda *values: sum(values), *committed))
+            dataclasses.replace(summed, inspected=None if sample is None else sample[1]))
 
 
 TRACING_COLLECTIONS = 50_000
