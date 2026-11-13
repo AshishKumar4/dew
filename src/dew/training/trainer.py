@@ -1372,7 +1372,7 @@ class Trainer(Generic[Loss, Effects]):
             partition = self._stream_partition()
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
-                         resumed=current if resumed and position is None else None)
+                         resumed=current if resumed and position is None and run.restarted is None else None)
             source = run.source
             stages = source.stages if isinstance(source, RampedStream | PhasedStream | StepPhases) else ()
             ramp = stages if isinstance(source, RampedStream) else ()
