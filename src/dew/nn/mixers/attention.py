@@ -24,7 +24,6 @@ from dew.nn.attention import (
     AttentionImpl,
     attention_case,
     mask_kernel,
-    quantized_rule,
     reference_only,
     scaled_dot_product_attention,
 )
@@ -1635,8 +1634,10 @@ class CausalSelfAttention(nn.Module):
 
     def _one_work_list(self, store: KVStore, query) -> bool:
         """Whether a mixed call's attention runs as one work list through the attention template (`_worked`):
-        where the attention selector takes the template for the call's queries over its cache
-        (`attention_kernels.ATTENTION`) and the template reads the cache's rows (`KVStore.attends_rows`)."""
+        where no quantized model's rule owns the call's products (`AttentionCase.quantized`: the work list's
+        decode forms them whole, past the rule), the attention selector takes the template for the call's
+        queries over its cache (`attention_kernels.ATTENTION`) and the template reads the cache's rows
+        (`KVStore.attends_rows`)."""
         if not store.attends_rows(query, self.ctx.attn_logit_softcap):
             return False
         keys = jax.ShapeDtypeStruct((1, self.ctx.max_seq_len, self.ctx.num_kv_heads, self.ctx.head_dim),
@@ -1644,8 +1645,8 @@ class CausalSelfAttention(nn.Module):
         case = attention_case(query, keys, dtype=self.ctx.dtype, precision=self.ctx.precision,
                               force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
                               softcap=self.ctx.attn_logit_softcap, named=self.ctx.attention_impl)
-        return select(ATTENTION, case, None if self.ctx.attention_impl == 'auto'
-                      else self.ctx.attention_impl).kernel == 'template'
+        return case.quantized is None and select(ATTENTION, case, None if self.ctx.attention_impl == 'auto'
+                                                 else self.ctx.attention_impl).kernel == 'template'
 
     def _worked(self, store: KVStore, query, index, positions, prompt, slots, starts=None,
                 window: int | None = None) -> jax.Array:
@@ -1712,8 +1713,7 @@ class CausalSelfAttention(nn.Module):
         return store.paged_kernel(query, softcap=self.ctx.attn_logit_softcap,
                                   arithmetic=reference_only(query, self.ctx.dtype, self.ctx.precision,
                                                             self.ctx.force_fp32_for_softmax),
-                                  named=self.ctx.attention_impl, windowed=windowed, sinks=sunk,
-                                  owned=quantized_rule(sunk) is not None)
+                                  named=self.ctx.attention_impl, windowed=windowed, sinks=sunk)
 
     def _decode_masks(self, positions, rows: int, key_length: int, valid, history: dict[str, jax.Array]
                       ) -> tuple[jax.Array, jax.Array | None]:
