@@ -102,6 +102,11 @@ __attribute__((constructor)) static void armed(void) {
 """
 """The preloaded library's source: its handler, armed as each process loads it, before Python's faulthandler.
 """
+PYSTACK = ("uv", "tool", "run", "--quiet", "--from", "pystack==1.7.2", "pystack")
+"""Bloomberg's pystack, which unwinds every OS thread of a live process from outside it, native frames and
+Python frames both, a thread with no Python state too (an XLA worker's abort): py-spy's native mode reads only
+the threads Python knows (review, 2026-11-13). Fetched by uv into its cache as a run's collector starts
+(`collect`), so a crash waits on no download."""
 COLLECT_SECONDS = 60
 """How long a dying process waits for its stacks to be read (`SHIM`), and py-spy has to read them (`collect`).
 """
@@ -175,6 +180,23 @@ class Capture:
         return f"no native stacks were captured: {self.why}\n" if self.why else ""
 
 
+def read(pid: str, spy: Path) -> str:
+    """Every thread's stack of the stopped process `pid`, read from outside it: pystack's (`PYSTACK`), each OS
+    thread's native and Python frames; py-spy's (`spy`) where pystack read none."""
+    said = []
+    for command in ([*PYSTACK, "remote", "--native-all", pid], [str(spy), "dump", "--native", "--pid", pid]):
+        try:
+            done = subprocess.run(command, capture_output=True, text=True, timeout=COLLECT_SECONDS // 2 - 2,
+                                  check=False)
+        except (subprocess.TimeoutExpired, OSError) as error:
+            said.append(f"{command[0]} read nothing: {error}")
+            continue
+        if done.returncode == 0 and done.stdout.strip():
+            return done.stdout
+        said.append(f"{command[:7]} read nothing: {done.stderr.strip()[-300:]}")
+    return "\n".join(said)
+
+
 def collect(pipe: Path, done: Path, stacks: Path, spy: Path) -> None:
     """The collector: each process that writes `<pid> <signal>` to `pipe` as a signal ends it (`SHIM`) gets
     py-spy's dump of its every thread, native and Python frames, appended to `stacks`, then `done/done.<pid>`,
@@ -182,17 +204,13 @@ def collect(pipe: Path, done: Path, stacks: Path, spy: Path) -> None:
     """
     with open(os.open(pipe, os.O_RDWR), encoding="ascii", errors="replace") as said:
         (done / "ready").touch()
+        subprocess.Popen([*PYSTACK, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for line in said:
             parts = line.split()
             if len(parts) != 2 or not all(part.isdigit() for part in parts):
                 continue
             pid, signum = parts
-            try:
-                read = subprocess.run([str(spy), "dump", "--native", "--pid", pid], capture_output=True,
-                                      text=True, timeout=COLLECT_SECONDS - 5, check=False)
-                frames = read.stdout or f"py-spy read nothing: {read.stderr.strip()}"
-            except subprocess.TimeoutExpired:
-                frames = f"py-spy read nothing in {COLLECT_SECONDS - 5} s"
+            frames = read(pid, spy)
             with stacks.open("a") as out:
                 at = time.strftime("%H:%M:%SZ", time.gmtime())
                 out.write(f"== process {pid} ended by signal {signum} ({at}): its threads' native stacks\n"

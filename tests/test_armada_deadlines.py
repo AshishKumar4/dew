@@ -282,3 +282,23 @@ def test_a_worker_a_signal_ends_keeps_its_native_stacks_though_pytest_exits_red(
     assert red["exitCode"] == 1 and "signal" not in red
     [kept] = red["artifacts"]
     assert "ended by signal 6" in (tmp_path / "artifacts" / kept).read_text().split("== native stacks", 1)[1]
+
+
+def test_a_thread_with_no_python_state_that_aborts_keeps_its_own_native_stack(ci, tmp_path):
+    """A native thread Python never knew (a C library's worker, as XLA's) that aborts keeps its own stack among
+    the native stacks, read from outside the process by an unwinder of every OS thread (review, 2026-11-13:
+    py-spy's native mode reads only the threads Python knows)."""
+    interpreter(tmp_path, "3.12")
+    (tmp_path / "aborting.c").write_text(
+        "#include <pthread.h>\n#include <stdlib.h>\n#include <unistd.h>\n"
+        "static void *aborting_worker(void *x) { usleep(200000); abort(); return x; }\n"
+        "void start(void) { pthread_t t; pthread_create(&t, 0, aborting_worker, 0); }\n")
+    subprocess.run(["cc", "-shared", "-fPIC", "-g", "-o", str(tmp_path / "aborting.so"),
+                    str(tmp_path / "aborting.c"), "-lpthread"], check=True)
+    written(tmp_path, {"test_any.py": "import ctypes\nimport time\n\n\ndef test_native_abort():\n"
+                                      f"    ctypes.CDLL({str(tmp_path / 'aborting.so')!r}).start()\n"
+                                      "    time.sleep(30)\n"})
+    ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "native.json", 60.0, cache="off")
+    [red] = json.loads((tmp_path / "native.json").read_text())["rows"]
+    [kept] = red["artifacts"]
+    assert "aborting_worker" in (tmp_path / "artifacts" / kept).read_text().split("== native stacks", 1)[1]
