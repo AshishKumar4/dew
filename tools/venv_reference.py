@@ -4,11 +4,14 @@ float64, the recording sized paired against Dew's float32 run (the test's `dew`)
 and its truth's sketch (`record_case(..., summary=True)`), or, for a site whose test has no float64 path of
 Dew's to recompute the truth by, its outputs whole (`outputs`).
 
-    python tools/venv_reference.py SITE PYTHON [SOURCE]
+    python tools/venv_reference.py SITE PYTHON [SOURCE] [--kept DIR] [--resume DIR]
 
 PYTHON is the interpreter of a virtual environment holding the site's package (a distribution's version
 checked against the site's); SOURCE a checkout put on the worker's path where the package is a
-repository rather than a distribution.
+repository rather than a distribution. `--kept DIR` keeps each seed's evaluation there as it is made, and
+`--resume DIR` reads an interrupted run's instead of making it again (`recorded_references._Kept`): a
+recording whose task is recalled goes on from what it had (armada hands a recalled attempt's artifacts to
+the next at $ARMADA_RESUME).
 """
 
 from __future__ import annotations
@@ -150,8 +153,10 @@ where its `dew` runs on the host as given (a pipeline's walk, its own programs i
 the recording keeps the outputs whole, `judged` where the recording is the arm its test's check 1 judges
 and `dew` that arm's reference (another library running what Dew exports for it), so its seeds are sized
 with the two in those places, and `weighed` where its test declares check 1's weighed check: the
-recording keeps the outputs whole and each draw's rounding scale, the reference's own computation's, which
-its worker reads from its float64 twin with every operation tapped (`<draw>.scale_seed`)."""
+recording keeps each draw's rounding scale, the reference's own computation's, which its worker reads from
+its float64 twin with every operation tapped (`<draw>.scale_seed`), and the reference's side of that check
+as the recorder reads it (its heavy elements and its weighed evidence a draw), no outputs unless `outputs`
+says so."""
 
 
 def site_arms(site: str):
@@ -164,7 +169,8 @@ def site_arms(site: str):
             else (getattr(test, "FIXTURE", None), test.draw, test.dew, test.OUTPUTS))
 
 
-def recording(site: str, python: str, source: str | None, given=None) -> dict[str, np.ndarray]:
+def recording(site: str, python: str, source: str | None, given=None, *, kept_in: Path | None = None,
+              resumed_from: Path | None = None) -> dict[str, np.ndarray]:
     """`site`'s recording: each seed's draw run by the site's worker under `python` (`session`), its float32
     run and its float64 truth, sized paired against Dew's float32 run (`record_case`), over the site's arms
     (`site_arms`, or `given`, those already built)."""
@@ -229,18 +235,27 @@ def recording(site: str, python: str, source: str | None, given=None) -> dict[st
         dew = ((lambda inputs: run(narrow, inputs)) if known.get("host")
                else jax.jit(lambda inputs: run(narrow, inputs)))
         return record_case(site, draw, evaluate, store_inputs=False,
-                           summary=not (known.get("outputs") or weighed), dew=dew,
+                           summary=not known.get("outputs"), dew=dew,
                            scale=scale if weighed else None, ahead=len(pool),
-                           judged=known.get("judged", False))
+                           judged=known.get("judged", False), kept_in=kept_in, resumed_from=resumed_from)
 
 
 def main() -> None:
+    import argparse
+
     from recorded_references import provenance, save
 
-    site, python = sys.argv[1], sys.argv[2]
-    source = sys.argv[3] if len(sys.argv) > 3 else None
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("site")
+    parser.add_argument("python")
+    parser.add_argument("source", nargs="?")
+    parser.add_argument("--kept", type=Path, help="keep each seed's evaluation here as it is made")
+    parser.add_argument("--resume", type=Path, help="an interrupted run's --kept, read and not made again")
+    args = parser.parse_args()
+    site, python, source = args.site, args.python, args.source
     known, given = SITES[site], site_arms(site)
-    arrays = recording(site, python, source, given)
+    arrays = recording(site, python, source, given, kept_in=args.kept, resumed_from=args.resume)
     written = save(given[0], {**arrays, "provenance": provenance(
         known["reference"], "", known.get("device", "cpu"),
         f"python tools/venv_reference.py {site} PYTHON{' SOURCE' if source is not None else ''}")},

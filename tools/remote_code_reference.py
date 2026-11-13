@@ -437,7 +437,7 @@ def record(name: str, release_python: str) -> None:
     gradients' leaves are the release's tensors, each read into Dew's parameter it loads as (its
     `WeightLayout.restore`)."""
     # Dew's side, in Dew's environment: the release's runs in `release_python`'s.
-    from model_support import flat_tree, remote_code_site
+    from model_support import flat_tree
     from recorded_references import provenance, record_case, save
 
     from dew.interop import Pretrained
@@ -459,7 +459,6 @@ def record(name: str, release_python: str) -> None:
 
             arrays.update(record_case(
                 f"{name} {site}", lambda seed, site=site: draw(site, seed, config), evaluate,
-                remote_code_site(source, site), truth_proxy=remote_code_site(source, site, wide=True),
                 store_inputs=False, summary=True))
     repo, revision = RELEASES[name][:2]
     versions = subprocess.run([release_python, "-c", "import torch, transformers; "

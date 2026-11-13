@@ -88,7 +88,7 @@ def table_inputs(table: str, seed: int) -> dict[str, np.ndarray]:
 def closed_form(name: str, mean: str, options: dict, inputs: dict, dtype) -> dict:
     """The authors' weight at every step of `inputs`' betas in jnp, their float64 tables cast to
     `dtype` where their `_extract_into_tensor` casts (float32 in their run, kept float64 in the exact
-    one): the proxy a recording plans its count on, and in float64 tests/test_schedulers.py's truth."""
+    one): in float64, tests/test_schedulers.py's truth."""
     import jax.numpy as jnp
 
     cumulative = jnp.cumprod(1 - jnp.asarray(inputs["betas"], jnp.float64))
@@ -137,7 +137,6 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=RECORDED)
     out = parser.parse_args().out
     import jax
-    import jax.numpy as jnp
     import torch
     from recorded_references import provenance, record_case, save
 
@@ -153,10 +152,7 @@ def main() -> None:
                         return tuple({"weight": weights(module, inputs["betas"], mean, options, exact)}
                                      for exact in (False, True))
 
-                    form = partial(closed_form, name, mean, options)
                     recorded.update(record_case(label, partial(table_inputs, table), evaluate,
-                                                partial(form, dtype=jnp.float32),
-                                                truth_proxy=partial(form, dtype=jnp.float64),
                                                 store_inputs=False, summary=True))
                     recorded[f"{label}.provenance"] = provenance(
                         REPOS[name][0], REPOS[name][1], "cpu", "python tools/weighting_reference.py",

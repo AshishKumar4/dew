@@ -1,12 +1,11 @@
 """Recording a reference over seeds, for check 1's `indexed_recording` (tests/reference_error.py).
 
 A reference that cannot run in the test (a CUDA-only library, a fetched source) is recorded once, over
-the seeds check 1 draws: `record_case` plans the count on a proxy that can run (Dew's own XLA path),
-records (1 + REDRAW) times it, confirms the count on the recorded reference itself with `seeds_for`,
+the seeds check 1 draws: `record_case` sizes the count on the recorded reference itself with `seeds_for`,
 records the confirmed count's whole redraw and returns the `<site>.input.*`, `<site>.reference.*`,
 `<site>.truth.*` and `<site>.seeds` arrays to save beside its `provenance` with `save`, which commits a
-recording of at most 1 MiB and sends a larger one to the fetched store (tools/fetched_fixtures.py). The
-proxy only plans: the declared count is the recorded reference's own. (tools/recorded_draws.py is
+recording of at most 1 MiB and sends a larger one to the fetched store (tools/fetched_fixtures.py).
+(tools/recorded_draws.py is
 another thing: it records the random draws a reference generator's library makes, so a second
 precision reads the same samples.)
 
@@ -21,26 +20,29 @@ import concurrent.futures
 import dataclasses
 import json
 import sys
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fetched_fixtures import save
-from reference_error import FEWEST_SEEDS, REDRAW, as_given, input_digest, seeds_for, widened
+from reference_error import FEWEST_SEEDS, REDRAW, as_given, input_digest, seeds_for
 from truth_sketch import truth_sketch
 
 from dew.parity import (
     MOST_SEEDS,
     RECORDED_KINDS,
     SIZING_FROM,
+    Conditioning,
     Inconclusive,
+    RecordedLeaf,
     example_mse,
     example_worst,
+    heavy_masks,
     leaf_summaries,
     recorded_kinds,
     rows_summary,
@@ -64,7 +66,7 @@ def provenance(reference: str, revision: str, device: str, command: str, **detai
                                   "command": command, **details}))
 
 
-def record_reference(label: str, draw, evaluate, proxy, *, package: str, repo: str, tool: str, out: Path,
+def record_reference(label: str, draw, evaluate, *, package: str, repo: str, tool: str, out: Path,
                      description: str | None = None, argv: list[str] | None = None, **constants) -> Path:
     """A parity tool's whole command line: `label`'s recording over its seeds (`record_case`), the release
     of `package` (`repo`'s) pinned (`reference_releases.require`) and run on one CPU thread, saved to
@@ -82,7 +84,7 @@ def record_reference(label: str, draw, evaluate, proxy, *, package: str, repo: s
     require(package)
     torch.set_num_threads(1)
     version = importlib.import_module(package).__version__
-    recorded = record_case(label, draw, evaluate, proxy)
+    recorded = record_case(label, draw, evaluate)
     written = save(out, {**recorded, **{name: np.asarray(value) for name, value in constants.items()},
                          "provenance": provenance(package, version, "cpu", f"python {tool}",
                                                   torch=torch.__version__)},
@@ -92,27 +94,90 @@ def record_reference(label: str, draw, evaluate, proxy, *, package: str, repo: s
     return written
 
 
+class _Kept:
+    """A recording's evaluations kept as they are made and found again, so a long recording survives its
+    task's recall (armada hands a recalled attempt's artifacts to the next): each one's trees (dicts of
+    arrays) saved under `kept` by its recording's `label`, its kind and its seed, with its inputs' digest,
+    and one an interrupted run left under `resumed` or `kept` read in place of making it, and kept on.
+    A record found is this recording's where its reference makes it again: the first found of each kind is
+    made again and held to it bit for bit, so another reference's records (other weights, another site
+    drawing the same inputs) are refused, and so is a record of other inputs. A reference whose evaluation
+    does not repeat to the bit therefore does not resume. With neither directory nothing is kept."""
+
+    def __init__(self, kept: Path | None, resumed: Path | None, label: str):
+        self.kept, self.resumed, self.label = kept, resumed, urllib.parse.quote(label, safe="")
+        self.proven: set[str] = set()
+        if kept is not None:
+            kept.mkdir(parents=True, exist_ok=True)
+
+    def made(self, kind: str, seed: int, inputs, make) -> tuple[dict, ...]:
+        """`make()`'s trees for `kind` at `seed` over `inputs`, found where kept, else made and kept."""
+        digest, name = input_digest(inputs), f"{self.label}.{kind}.{seed}.npz"
+        for directory in filter(None, (self.resumed, self.kept)):
+            if (path := directory / name).exists():
+                with np.load(path, allow_pickle=False) as held:
+                    if int(held["digest"]) != int(digest):
+                        raise ValueError(f"{path} is a record of other inputs than seed {seed}'s here: "
+                                         f"another recording's")
+                    trees = tuple({key.split("/", 1)[1]: held[key] for key in held.files
+                                   if key.startswith(f"{index}/")} for index in range(int(held["trees"])))
+                if kind not in self.proven:
+                    again = tuple(jax.tree.map(np.asarray, tree) for tree in make())
+                    if _bytes(again) != _bytes(trees):
+                        raise ValueError(f"{path} is not what this recording's reference makes at seed "
+                                         f"{seed}: another reference's record, or one that does not repeat")
+                    self.proven.add(kind)
+                if directory != self.kept:
+                    self._write(name, digest, trees)
+                return trees
+        trees = tuple(jax.tree.map(np.asarray, tree) for tree in make())
+        self._write(name, digest, trees)
+        return trees
+
+    def _write(self, name: str, digest: np.uint64, trees: tuple[dict, ...]) -> None:
+        if self.kept is None:
+            return
+        # Whole or absent: a task recalled mid-write leaves no half record for the next to read.
+        partial = self.kept / f"{name}.partial"
+        leaves = {f"{index}/{leaf}": value
+                  for index, tree in enumerate(trees) for leaf, value in tree.items()}
+        with open(partial, "wb") as file:
+            np.savez(file, digest=np.asarray(digest), trees=np.int64(len(trees)), **leaves)
+        partial.replace(self.kept / name)
+
+
+def _bytes(trees: tuple[dict, ...]) -> list:
+    """`trees`' leaves as their names, dtypes, shapes and bytes: equal where the trees are, to the bit."""
+    return [[(name, str(np.asarray(value).dtype), np.shape(value), np.asarray(value).tobytes())
+             for name, value in sorted(tree.items())] for tree in trees]
+
+
 class _Records:
     """A recording's draws (`record_case`), each seed drawn once, as the sizing reads it: a paired sizing
     reads its pilots from SIZING_FROM, which a run of every seed below it would draw too. A pilot is read as
     it is drawn and never again (`_drawn` reads each draw through before the next), so only the one being read
-    is held. With `ahead` above one, `evaluate` is asked that many seeds at a time on threads of its own,
-    which the caller says it may run on: a caller's context (x64, a matmul precision) is its thread's."""
+    is held. With `reduced`, a verdict seed is held the same way, and of each the row `reduced(seed, record)`
+    alone is kept (`rows`): a summarized recording's evidence, where its outputs over (1 + REDRAW) times the
+    seeds are gigabytes. With `ahead` above one, `evaluate` is asked that many seeds at a time on threads of
+    its own, which the caller says it may run on: a caller's context (x64, a matmul precision) is its
+    thread's."""
 
-    def __init__(self, draw, evaluate, ahead: int):
-        self.draw, self.evaluate, self.ahead = draw, evaluate, ahead
-        self.records, self.pilot, self.replayed, self.pending = {}, {}, set(), {}
+    def __init__(self, draw, evaluate, ahead: int, reduced=None, kept: _Kept | None = None):
+        self.draw, self.evaluate, self.ahead, self.reduced = draw, evaluate, ahead, reduced
+        self.kept = _Kept(None, None, "") if kept is None else kept
+        self.records, self.reading, self.rows, self.replayed, self.pending = {}, {}, {}, set(), {}
         self.asking = concurrent.futures.ThreadPoolExecutor(ahead) if ahead > 1 else None
 
     def evaluated(self, seed: int):
         inputs = self.draw(seed)
-        return inputs, self.evaluate(inputs)
+        return inputs, self.kept.made("draw", seed, inputs, lambda: self.evaluate(inputs))
 
     def record(self, seed: int):
         """Seed `seed`'s inputs (with the leaves the reference made, `replayed`), reference and truth."""
-        held = self.pilot if seed >= SIZING_FROM else self.records
+        verdict = seed < SIZING_FROM
+        held = self.records if verdict and self.reduced is None else self.reading
         if seed not in held:
-            self.pilot.clear()
+            self.reading.clear()
             if self.asking is None:
                 inputs, (reference, truth, *made) = self.evaluated(seed)
             else:
@@ -124,11 +189,15 @@ class _Records:
             self.replayed.update(made)
             held[seed] = ({**inputs, **made}, jax.tree.map(np.asarray, reference),
                           jax.tree.map(np.asarray, truth))
+            if verdict and self.reduced is not None:
+                self.rows[seed] = self.reduced(seed, held[seed])
         return held[seed]
 
     def ensure(self, count: int) -> None:
+        """Seeds 0 to `count` drawn, none of them again: a seed whose row is kept was."""
         for seed in range(count):
-            self.record(seed)
+            if seed not in self.rows:
+                self.record(seed)
 
     def __enter__(self) -> "_Records":
         return self
@@ -139,25 +208,26 @@ class _Records:
             self.asking.shutdown(cancel_futures=True)
 
 
-def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, store_inputs: bool = True,
+def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
                 summary: bool = False, dew=None, start: int = FEWEST_SEEDS,
-                examples: bool = False, scale=None, ahead: int = 1,
-                judged: bool = False) -> dict[str, np.ndarray]:
+                examples: bool = False, scale=None, ahead: int = 1, judged: bool = False,
+                kept_in: Path | None = None, resumed_from: Path | None = None) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
-    reference's outputs and their float64 truth (dicts), and `proxy(inputs)` (with `truth_proxy`) a function
-    that can run here, which plans the count. With no proxy, the recorded reference alone sizes the count,
-    recording the draws its doublings take. The recorded reference then confirms it, recording further seeds
-    as `seeds_for` asks, and the recording keeps exactly the confirmed count's draws and their redraw, (1 +
-    REDRAW) times it. Where `draw` is a seeded function the test can call again, `store_inputs=False` records
-    the outputs alone and each draw's `input_digest`, and the test hands `draw` to `indexed_recording` as
-    `inputs_of`. Where `evaluate` gives a third dict, the leaves the reference made that Dew replays (an
+    reference's outputs and their float64 truth (dicts). The recorded reference alone sizes the count
+    (`seeds_for`), recording the draws its doublings take, and the recording keeps exactly the confirmed
+    count's draws and their redraw, (1 + REDRAW) times it. Where `draw` is a seeded function the test can
+    call again, `store_inputs=False` records the outputs alone and each draw's `input_digest`, and the test
+    hands `draw` to `indexed_recording` as `inputs_of`. Where `evaluate` gives a third dict, the leaves the
+    reference made that Dew replays (an
     engine's sampled ids, its kept support, its routes), the recording keeps them whole as
     `<label>.replayed.<leaf>`, and Dew's run and the test's take them beside the draw's inputs: the comparison
     is of the replay. With `summary`, the recording keeps no outputs at all: per seed and leaf, the
     reference's evidence check 1 reads (`leaf_summary`: its mean squared error from its truth, its worst sized
     row, its errors on the truth's rows of zero, finiteness) and its truth's sketch (`truth_sketch`), which
     the test's own float64 path is held to (`indexed_recording`'s `truth_fn`): kilobytes where outputs over (1
-    + REDRAW) times the seeds are gigabytes. With `dew(inputs)`, Dew's own outputs on a seed's inputs, the
+    + REDRAW) times the seeds are gigabytes. Each draw's evidence is read as the draw is made and its
+    outputs dropped (`_Records`), so a summary holds one draw's outputs at a time, unless a weighed check
+    reads them (below). With `dew(inputs)`, Dew's own outputs on a seed's inputs, the
     recorded reference confirms the count paired, as check 1's verdict pairs it (`seeds_for`'s `dew_fn`), for
     a site whose errors are heavy-tailed across draws alike in both arms (a lognormal training sigma), where
     the reference compared with itself on other draws never resolves. With `judged`, the recording is the
@@ -171,34 +241,35 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     recorded as `<label>.scale.<leaf>`, which the test's weighing reads (`conditioning_scale`); the weighed
     check's seeds are sized on the recorded reference as that check judges them (`seeds_for(...,
     conditioning=True)`, paired where the unweighted check's are), recorded as far as its stages draw (from
-    the first seed, as the unweighted check's do), and declared as `<label>.conditioning`; its outputs are
-    kept whole, which the weighing reads. Its unweighted sizing that never resolves declares the cap,
-    MOST_SEEDS (docs/design/testing.md). With `ahead`, an `evaluate` that may run on several threads at once
+    the first seed, as the unweighted check's do), and declared as `<label>.conditioning`. Its outputs are
+    kept whole, which the weighing reads; or, with `summary`, none are: the scales stay, which weigh Dew's
+    own arm in the test, and beside them the reference's side of the weighed check as read here, with its
+    outputs in hand (`_weighed`): each leaf's heavy elements over the weighed check's draws
+    (`<label>.heavy.<leaf>`) and the reference's weighed evidence a draw, a recording of its own under
+    `<label>.weighed` whose leaves are the classes' (`dew.parity.Conditioning.recorded_evidence`). Its
+    unweighted sizing that never resolves declares the cap, MOST_SEEDS (docs/design/testing.md).
+    With `ahead`, an `evaluate` that may run on several threads at once
     is asked that many seeds at a time, the next ones a draw's read reaches beside its own: every reading here
-    walks its seeds in order."""
-    if proxy is None and truth_proxy is not None:
-        raise ValueError("a planning truth requires its proxy")
-    # Without a proxy nothing is drawn ahead: the recorded reference's own doublings draw what they read.
-    planned = (0 if proxy is None else
-               seeds_for(jax.jit(proxy), lambda seed: (draw(seed),), label, start=start,
-                         truth_fn=None if truth_proxy is None else jax.jit(truth_proxy)))
-    print(f"{label}: starting with {planned} seeds", flush=True)
+    walks its seeds in order. With `kept_in`, a directory, each seed's evaluation and scale is saved there as
+    it is made, and with `resumed_from`, an interrupted run's `kept_in`, found there in place of being made
+    again (`_Kept`): the recording a run resumed makes is the one an uninterrupted run makes."""
     # The evaluations asked ahead are cancelled or finished on every exit, before the caller's workers close.
-    with _Records(draw, evaluate, ahead) as held:
+    # A summary that weighs nothing keeps each draw's evidence as it is drawn and drops its outputs; a weighed
+    # one reads each of its check's draws whole, twice (its sizing, then its heavy elements over them all).
+    streamed = summary and scale is None
+
+    def row(seed: int, record) -> _Row:
+        return _row(seed, _summarized(record, examples))
+
+    keeping = _Kept(kept_in, resumed_from, label)
+    with _Records(draw, evaluate, ahead, row if streamed else None, keeping) as held:
         record, ensure = held.record, held.ensure
         records, replayed = held.records, held.replayed
 
         def recorded_draw(seed):
             return np.int32(seed), record(int(seed))[0]
 
-        ensure(staged_units(planned))
-        # The recorded arm is read by index from the host's records, as given; it is the reference, Dew's
-        # run beside it the arm judged, or with `judged` the other way round, as the site's verdict has them.
-        recorded = as_given(lambda index, inputs: record(int(index))[1])
-        live = None if dew is None else as_given(lambda index, inputs: dew(inputs))
-        if judged and (live is None or scale is not None):
-            raise ValueError(f"{label}: a recording judged takes `dew`, the reference it is judged against, "
-                             f"and no `scale`, which is a recorded reference's own")
+        recorded, live = _arms_of(label, record, dew, judged=judged, weighed=scale is not None)
         reference, arm = (live, recorded) if judged else (recorded, live)
         try:
             confirmed = seeds_for(reference, recorded_draw, label, start=start,
@@ -209,14 +280,17 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
             if scale is None:
                 raise
             confirmed = MOST_SEEDS
-        # The recording is the confirmed count's draws and their redraw, no more: a proxy that planned more
-        # than the recorded reference confirms leaves draws the recording does not keep.
+        # The recording is the confirmed count's draws and their redraw, no more.
         kept = staged_units(confirmed)
         weighed, scales = 0, {}
 
         def scaled(seed: int):
             if seed not in scales:
-                scales[seed] = scale(record(seed)[0], seed)
+                inputs = record(seed)[0]
+                (made,) = held.kept.made("scale", seed, inputs, lambda: (scale(inputs, seed),))
+                # As the recording holds it, float32, for the sizing, the reference's weighed evidence and
+                # the test's weighing of Dew's arm alike: one denominator for both arms.
+                scales[seed] = {name: np.asarray(value, np.float32) for name, value in made.items()}
             return scales[seed]
 
         if scale is not None:
@@ -227,37 +301,91 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
             # The weighed check draws its own stages' seeds from the first, as the unweighted check does.
             kept = max(kept, staged_units(weighed))
         ensure(kept)
-        kept_records = [records[seed] for seed in range(kept)]
+        kept_records = [] if streamed else [records[seed] for seed in range(kept)]
+        # The weighed check's own entries, the same whether the outputs are kept or summarized.
+        weighing = {} if scale is None else {
+            f"{label}.conditioning": np.int32(weighed),
+            **{f"{label}.scale.{name}": np.stack([scaled(seed)[name]
+                                                 for seed in range(staged_units(weighed))])
+               for name in scaled(0)}}
     if summary:
-        summarized = (_summarized(record, examples) for record in kept_records)
-        result = _finished(label, _evidence(label, range(kept), summarized), confirmed)
+        # A weighed check that draws past the unweighted one's stages reads the reference and its truth's
+        # sketch at every draw of its own, so the evidence covers the further of the two.
+        rows = (held.rows[seed] if streamed else row(seed, kept_records[seed]) for seed in range(kept))
+        result = _finished(label, _rows_evidence(label, range(kept), rows), confirmed, kept)
+        if scale is not None:
+            result.update(weighing)
+            result.update(_weighed(label, kept_records[:staged_units(weighed)], scaled))
         print(f"{label}: declared {confirmed} seeds; recorded {kept} draws' evidence", flush=True)
         return result
-    result = {}
-    for index, kind in enumerate(("input", "reference", "truth")):
-        if kind == "input" and not store_inputs:
-            continue
-        for name in kept_records[0][index]:
-            stored = "replayed" if kind == "input" and name in replayed else kind
-            result[f"{label}.{stored}.{name}"] = np.stack([entry[index][name] for entry in kept_records])
-    for name in replayed if not store_inputs else ():
-        result[f"{label}.replayed.{name}"] = np.stack([entry[0][name] for entry in kept_records])
-    if not store_inputs:
-        result[f"{label}.input_digest"] = np.asarray([
-            input_digest({name: value for name, value in entry[0].items() if name not in replayed})
-            for entry in kept_records])
+    result = _stacked(label, kept_records, replayed, store_inputs)
     result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
-    if scale is not None:
-        result[f"{label}.conditioning"] = np.int32(weighed)
-        for name in scaled(0):
-            result[f"{label}.scale.{name}"] = np.stack([np.asarray(scaled(seed)[name], np.float32)
-                                                       for seed in range(staged_units(weighed))])
+    result.update(weighing)
     print(f"{label}: declared {confirmed} seeds; recorded {kept} draws", flush=True)
     return result
 
 
+def _arms_of(label: str, record, dew, *, judged: bool, weighed: bool) -> tuple:
+    """A recording's two arms as its sizing reads them (`record_case`): the recorded one, read by index from
+    the host's records, as given, and Dew's run beside it (None where no `dew` is given). The recorded arm is
+    the reference and Dew's the arm judged, or with `judged` the other way round, as the site's verdict has
+    them: a recording judged takes `dew`, the reference it is judged against, and no scale, which is a
+    recorded reference's own."""
+    recorded = as_given(lambda index, inputs: record(int(index))[1])
+    live = None if dew is None else as_given(lambda index, inputs: dew(inputs))
+    if judged and (live is None or weighed):
+        raise ValueError(f"{label}: a recording judged takes `dew`, the reference it is judged against, "
+                         f"and no `scale`, which is a recorded reference's own")
+    return recorded, live
+
+
+def _stacked(label: str, records: Sequence, replayed: set, store_inputs: bool) -> dict[str, np.ndarray]:
+    """`records`' outputs kept whole (`record_case` without a summary): each seed's reference and truth
+    stacked by leaf, its inputs too or, not `store_inputs`, their digest, and the leaves the reference made
+    (`replayed`) as `<label>.replayed.<leaf>` either way."""
+    result = {}
+    for index, kind in enumerate(("input", "reference", "truth")):
+        if kind == "input" and not store_inputs:
+            continue
+        for name in records[0][index]:
+            stored = "replayed" if kind == "input" and name in replayed else kind
+            result[f"{label}.{stored}.{name}"] = np.stack([entry[index][name] for entry in records])
+    for name in replayed if not store_inputs else ():
+        result[f"{label}.replayed.{name}"] = np.stack([entry[0][name] for entry in records])
+    if not store_inputs:
+        result[f"{label}.input_digest"] = np.asarray([
+            input_digest({name: value for name, value in entry[0].items() if name not in replayed})
+            for entry in records])
+    return result
+
+
+def _weighed(label: str, records, scaled) -> dict[str, np.ndarray]:
+    """The reference's side of a summarized recording's weighed check, over `records`, its draws from the
+    first, each (inputs, reference, truth), their rounding scales `scaled(seed)`: each leaf's heavy
+    elements over those draws (`heavy_masks`, as the test's own classing reads them of a reference it
+    can run), `<label>.heavy.<leaf>` where a leaf has any; and the reference's weighed evidence a draw
+    (`Conditioning.recorded_evidence`), kept as a recording's evidence is (`_evidence`) under
+    `<label>.weighed`, its leaves the classes' paths and its truths their zeros."""
+    heavy = heavy_masks((reference, truth) for _, reference, truth in records)
+    conditioning = Conditioning(lambda inputs, seed: scaled(seed), heavy)
+
+    def evidence():
+        for seed, (inputs, reference, truth) in enumerate(records):
+            summaries, zeros = conditioning.recorded_evidence(reference, truth, inputs, seed)
+            yield inputs, summaries, zeros
+
+    nested = f"{label}.weighed"
+    result = _kept(nested, _evidence(nested, range(len(records)), evidence()), len(records))
+    # A truth's leaves in their tree's order, the masks' (`heavy_masks`).
+    names = [jax.tree_util.keystr(path, simple=True, separator="/")
+             for path, _ in jax.tree_util.tree_leaves_with_path(records[0][2])]
+    result.update({f"{label}.heavy.{name}": mask for name, mask in zip(names, heavy, strict=True)
+                   if mask is not None})
+    return result
+
+
 def record_logits(directory: Path, model, wide, command: str, *, reference: str, revision: str, license: str,
-                  draw=None, padded: Mapping[str, np.ndarray] | None = None, planned: bool = True,
+                  draw=None, padded: Mapping[str, np.ndarray] | None = None,
                   extra=None, stepped: int | None = None, **details) -> Path:
     """The tiny decoder at `directory`'s reference recorded over check 1's seeds, which its test reads in
     the reference's place (a release's remote code or a release apart from the suite's, which the test
@@ -270,13 +398,10 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
     (`attention_mask` and its `position_ids`), the leaf `padded_logits` too: its logits over the ids
     padded with 0 where the mask is false, at the mask's valid places; and with `extra`, the leaves
     `extra(network, tokens)` gives over the unpadded ids (a looped model's exit gates), the reference's
-    alone, so its count is not planned on Dew; and with `stepped`, the leaf `stepped_logits`: the logits at
+    alone; and with `stepped`, the leaf `stepped_logits`: the logits at
     the shapes a decode of a `stepped`-token prefill computes them, the prefill's from one forward over
     it and each later id's from one over the ids up to it (ledger 1543), which a test's cached steps
-    are judged against. The count is planned on Dew's own
-    load of the fixture, its padded rows under the mask alone, or, not `planned`, where Dew cannot load
-    beside the reference's release (Ouro's transformers 4.56.2 pins a huggingface_hub older than Dew's
-    interop imports), on the reference alone (`record_case`), and confirmed on the reference; the
+    are judged against. The count is the reference's own (`record_case`); the
     reference's evidence alone is kept with its truth's sketch (`record_case`'s summary), which the
     test's float64 run of Dew's model is held to, saved as recorded_logits.npz beside the fixture with
     its provenance, `reference` at `revision` under `license`, and `details`. Returns the file written."""
@@ -318,30 +443,8 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
             truth = logits(wide, inputs["input_ids"], prefixes=False)
         return logits(model, inputs["input_ids"]), truth
 
-    def ours(network, variables):
-        def run(inputs):
-            ids = inputs["input_ids"]
-            out = {"logits": network.apply(variables, ids)}
-            if mask is not None:
-                rows = network.apply(variables, jnp.where(mask, ids, 0), attention_mask=mask)
-                out["padded_logits"] = rows[mask]
-            if stepped is not None:
-                out["stepped_logits"] = out["logits"]
-            return out
-        return run
-
-    if planned and extra is not None:
-        raise ValueError("a recording with leaves of the reference's alone is not planned on Dew")
-    proxy = truth_proxy = None
-    if planned:
-        from dew.interop import Pretrained
-
-        native = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-        proxy = ours(native.model, native.variables)
-        truth_proxy = ours(native.model.clone(dtype=jnp.float64), widened(native.variables))
     with jax.enable_x64(new_val=True):
-        recording = record_case("logits", draw, evaluate, proxy, truth_proxy=truth_proxy, store_inputs=False,
-                                summary=True)
+        recording = record_case("logits", draw, evaluate, store_inputs=False, summary=True)
     record = provenance(reference, revision, "cpu", command, torch=torch.__version__, dtype="float32",
                         attention="eager", **details)
     return save(directory / "recorded_logits.npz", {**recording, "logits.provenance": record},
@@ -470,22 +573,52 @@ def _summarized(record, examples: bool = False):
     return inputs, dict(zip(names, summaries, strict=True)), truth
 
 
+@dataclasses.dataclass(frozen=True)
+class _Row:
+    """One seed's evidence as a summarized recording keeps it (`_rows_evidence`): its inputs' digest and, by
+    leaf, the reference's summary, its truth's sketch and its truth's shape."""
+
+    digest: str
+    leaves: Mapping[str, RecordedLeaf]
+    sketches: Mapping[str, np.ndarray]
+    shapes: Mapping[str, np.ndarray]
+
+
+def _row(seed: int, record) -> _Row:
+    """`seed`'s row of a record (inputs, each leaf's `RecordedLeaf`, truth), which holds none of its
+    arrays."""
+    inputs, summaries, truth = record
+    return _Row(input_digest(inputs), dict(summaries),
+                {name: truth_sketch(truth[name], seed) for name in summaries},
+                {name: np.asarray(np.shape(truth[name]), np.int64) for name in summaries})
+
+
 def _evidence(label: str, seeds: range, records) -> dict[str, np.ndarray]:
     """`records`' evidence, one row a seed of `seeds`, read one record at a time (an iterable of
-    (inputs, each leaf's `RecordedLeaf`, truth)): each leaf's summary (its rows of float64 zero joined,
-    with their count a seed) and its truth's sketch, and each seed's input digest."""
+    (inputs, each leaf's `RecordedLeaf`, truth), `_row`), joined (`_rows_evidence`)."""
+    return _rows_evidence(label, seeds,
+                          (_row(seed, record) for seed, record in zip(seeds, records, strict=True)))
+
+
+def _rows_evidence(label: str, seeds: range, rows) -> dict[str, np.ndarray]:
+    """`rows`' evidence (`_Row`), one a seed of `seeds`: each leaf's summary (its rows of float64 zero
+    joined, with their count a seed) and its truth's sketch, and each seed's input digest."""
     digests, leaves, sketches, shapes = [], {}, {}, {}
-    for seed, (inputs, summaries, truth) in zip(seeds, records, strict=True):
-        digests.append(input_digest(inputs))
-        for name in summaries:
-            leaves.setdefault(name, []).append(summaries[name])
-            sketches.setdefault(name, []).append(truth_sketch(truth[name], seed))
-            shapes.setdefault(name, np.asarray(np.shape(truth[name]), np.int64))
+    for _, held in zip(seeds, rows, strict=True):
+        digests.append(held.digest)
+        for name, leaf in held.leaves.items():
+            leaves.setdefault(name, []).append(leaf)
+            sketches.setdefault(name, []).append(held.sketches[name])
+            shapes.setdefault(name, held.shapes[name])
     evidence = {f"{label}.drawn": np.asarray(seeds, np.int64), f"{label}.input_digest": np.asarray(digests)}
     for name, summaries in leaves.items():
         evidence.update({
             f"{label}.mse.{name}": np.asarray([leaf.mse for leaf in summaries]),
             f"{label}.worst.{name}": np.asarray([leaf.worst for leaf in summaries]),
+            # Each worst row's largest element's share of it, which the gate's row factor reads; a leaf read
+            # from its rows' distances alone has none (`rows_summary`), and its recording keeps none.
+            **({f"{label}.share.{name}": np.asarray([leaf.share for leaf in summaries], np.float64)}
+               if all(leaf.share is not None for leaf in summaries) else {}),
             f"{label}.finite.{name}": np.asarray([leaf.finite for leaf in summaries]),
             f"{label}.zero_counts.{name}": np.asarray([len(leaf.zero_rows) for leaf in summaries], np.int64),
             f"{label}.zero_rows.{name}": np.concatenate([np.zeros(0, np.int64),
@@ -504,10 +637,12 @@ def _evidence(label: str, seeds: range, records) -> dict[str, np.ndarray]:
     return evidence
 
 
-def _finished(label: str, evidence: Mapping[str, np.ndarray], confirmed: int) -> dict[str, np.ndarray]:
+def _finished(label: str, evidence: Mapping[str, np.ndarray], confirmed: int,
+              kept: int | None = None) -> dict[str, np.ndarray]:
     """The recording `evidence` (`_evidence`) makes at `confirmed` declared seeds: its first (1 + REDRAW)
-    times that many seeds, each leaf's rows of float64 zero by their span a seed (`zero_offsets`)."""
-    result = _kept(label, evidence, staged_units(confirmed))
+    times that many seeds, or `kept` of them where a weighed check draws further, each leaf's rows of
+    float64 zero by their span a seed (`zero_offsets`)."""
+    result = _kept(label, evidence, staged_units(confirmed) if kept is None else kept)
     result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
     return result
 
