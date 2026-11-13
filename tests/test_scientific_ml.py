@@ -359,7 +359,8 @@ def test_a_configured_gauss_newton_states_its_optimizer_as_the_runs_saved_before
     the optimizer a run saved before its clip took effect held (the rate injected around the whole update,
     a clip chained before it), so such a run's checkpoint restores onto it (row 3360's review)."""
     from dew.gauss_newton import solved_directions
-    from dew.optim import OptimConfig, ParamGroup, _rate_only, param_labels, scheduled_solver
+    from dew.optim import OptimConfig, ParamGroup, _rate_only, param_labels
+    from dew.optim_schedules import scheduled_solver
 
     params = LeastSquares(8, bias=True).init(jax.random.key(0))["params"]
     grouped = (ParamGroup("kernels", ("*kernel",)), ParamGroup("rest", ("*",))) if groups else ()

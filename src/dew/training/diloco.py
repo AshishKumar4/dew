@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import functools
 import math
 from collections.abc import Callable, Iterator, Sequence
 
@@ -145,7 +144,7 @@ class DiLoCo:
                                   inner=dataclasses.replace(inner, variables=restarted))
         # A group that rejected an attempt holds a part-filled window of the parameters it leaves: dropped,
         # as a rejection drops one, so its next update pools the met parameters' gradients alone.
-        return _dropped(met, state.window_size)
+        return _dropped(met)
 
 
 def regrouped(inner: ReplicaState, change: Callable[[ReplicaState], ReplicaState]) -> ReplicaState:
@@ -156,42 +155,42 @@ def regrouped(inner: ReplicaState, change: Callable[[ReplicaState], ReplicaState
     return jax.tree.map(lambda *made: jnp.stack(made), *each)
 
 
-def _groups_dropped(first, microstep, window, size):
+def _groups_dropped(first, microstep, window):
     """`window_dropped` of each group's `microstep` and `window`, and the first group's microstep, the
     run's (`first`'s place)."""
     del first
-    microstep, window = jax.vmap(window_dropped, in_axes=(0, 0, None))(microstep, window, size)
+    microstep, window = jax.vmap(window_dropped)(microstep, window)
     return microstep[0], microstep, window
 
 
-def _dropped(state: TrainState, size) -> TrainState:
-    """`state` with each group's window of `size` microbatches dropped, traced in a step."""
+def _dropped(state: TrainState) -> TrainState:
+    """`state` with each group's window dropped, traced in a step."""
     inner = state.inner
     if inner is None or inner.accumulation is None:
         return state
-    first, microstep, window = _groups_dropped(state.microstep, inner.microstep, inner.accumulation, size)
+    first, microstep, window = _groups_dropped(state.microstep, inner.microstep, inner.accumulation)
     return dataclasses.replace(state, microstep=first, inner=dataclasses.replace(
         inner, microstep=microstep, accumulation=window))
 
 
-def dropped(state: TrainState, size: int) -> TrainState:
-    """`state` with its window of `size` microbatches dropped (`window_dropped`), each group's under DiLoCo,
+def dropped(state: TrainState) -> TrainState:
+    """`state` with its window dropped (`window_dropped`), each group's under DiLoCo,
     as a ramp's stage begins (`Trainer._staged`). Only the windows' fields are compiled, so a host-master
     state's resident weights stay where they are."""
     if state.inner is None:
         fields = (state.microstep, state.accumulation)
-        microstep, window = owned_program(functools.partial(window_dropped, size=size),
-                                    out_shardings=jax.tree.map(lambda x: x.sharding, fields))(*fields)
+        microstep, window = owned_program(window_dropped,
+                                          out_shardings=jax.tree.map(lambda x: x.sharding, fields))(*fields)
         return dataclasses.replace(state, microstep=microstep, accumulation=window)
     fields = (state.microstep, state.inner.microstep, state.inner.accumulation)
-    first, microstep, window = owned_program(functools.partial(_groups_dropped, size=size),
-                                       out_shardings=jax.tree.map(lambda x: x.sharding, fields))(*fields)
+    shardings = jax.tree.map(lambda x: x.sharding, fields)
+    first, microstep, window = owned_program(_groups_dropped, out_shardings=shardings)(*fields)
     return dataclasses.replace(state, microstep=first, inner=dataclasses.replace(
         state.inner, microstep=microstep, accumulation=window))
 
 
 def rated(state: TrainState) -> optax.OptState:
-    """The optimizer state whose learning rates a run reads and sets (`dew.optim.learning_rate`,
+    """The optimizer state whose learning rates a run reads and sets (`dew.optim_schedules.learning_rate`,
     `held_rates`, `with_rates`): its own, or under DiLoCo the groups' inner one, its rates stacked, every
     group's alike, which those read at the first group's and set at every group's."""
     return state.opt_state if state.inner is None else state.inner.opt_state

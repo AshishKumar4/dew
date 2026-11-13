@@ -30,6 +30,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from jax._src import core as jcore
 
 from dew._distributions import counted, draw, row_draw, wellformed
 from dew._records import finite
@@ -56,8 +57,8 @@ from dew.nn.inputs import (
     ModelInputs,
     Request,
     continuation_keys,
+    local_ids,
     local_rows,
-    media_slots,
     mesh_of,
     numbered_blocks,
     prompt_major,
@@ -329,10 +330,14 @@ class DiscreteDenoiser:
         if self.block is None:
             return self._denoised(x_t)
         # A walked block revealed whole runs no model for the rest of its steps: nothing is left to
-        # reveal, and its solver steps no further (`Confident`), so no score is read.
-        scores = jax.eval_shape(self._denoised, x_t)[1]
-        return jax.lax.cond(jnp.any(self.masked(x_t)), self._denoised,
-                            lambda x_t: (x_t, jnp.zeros(scores.shape, scores.dtype)), x_t)
+        # reveal, and its solver steps no further (`Confident`), so no score is read. One trace gives
+        # both the scores' shape and the conditional's model branch.
+        closed, (_, scores) = jax.make_jaxpr(self._denoised, return_shape=True)(x_t)
+        filled, log_probs = jax.lax.cond(
+            jnp.any(self.masked(x_t)),
+            lambda tokens: tuple(jcore.eval_jaxpr(closed.jaxpr, closed.consts, tokens)),
+            lambda tokens: (tokens, jnp.zeros(scores.shape, scores.dtype)), x_t)
+        return filled, log_probs
 
     def _denoised(self, x_t):
         fields = {} if self.inputs is None else self.inputs.kwargs()
@@ -543,9 +548,8 @@ def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelI
     if min(inputs.tokens.shape) < 1:
         raise ValueError("masked generation needs nonempty token rows")
     # A prompt's ids within the model's table, as every request's are (`check_inputs`): a slot its media
-    # fill reads its tower where the model says so (`Field.media`).
-    slots = local_rows(media_slots(inputs.token_fields, inputs.tokens.shape))
-    Field.indexing("tokens", (), model).bounded(local_rows(inputs.tokens), slots=slots)
+    # fill reads its tower where the model says so (`TokenTable.media`).
+    Field.indexing("tokens", (), model).bounded(local_ids(inputs))
     capacity = model.max_seq_len if bounded else None
     if capacity is not None and inputs.tokens.shape[1] + budget > capacity:
         raise ValueError("prompt plus max_new_tokens exceeds max_seq_len")

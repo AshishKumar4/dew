@@ -924,6 +924,34 @@ def test_a_tokenizer_whose_model_type_transformers_dispatches_without_remote_cod
     assert load_tokenizer(str(released), local_files_only=True).encode(text) == expected
 
 
+def test_token_exports_under_one_name_are_read_together_only_where_its_files_are_the_same(tmp_path):
+    """A token export commits the identity its tokenizer resolved to, each file's digest among it, so two
+    exports under one tokenizer name are read together only where their ids mean the same: a local
+    tokenizer two of whose tokens exchange ids between exports, its size and EOS as they were, is refused,
+    and a second export by the unchanged files is read with the first."""
+    from dew.data import Memory, concat
+    from dew.data.text import export_tokens
+
+    released = tmp_path / "tokenizer"
+    released.mkdir()
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(Path(__file__).parent / "fixtures" / "hf" / "dory-tiny" / name, released / name)
+
+    def exported(name: str) -> TokenFiles:
+        export_tokens(Memory([{"text": "a b a"}, {"text": "b a"}]), str(tmp_path / name), str(released),
+                      eos=False)
+        return TokenFiles(str(tmp_path / name))
+
+    first, again = exported("first"), exported("again")
+    assert concat([first, again]).facts()["tokenizer"] == str(released)
+    stated = json.loads((released / "tokenizer.json").read_text())
+    vocabulary = stated["model"]["vocab"]
+    vocabulary["a"], vocabulary["b"] = vocabulary["b"], vocabulary["a"]
+    (released / "tokenizer.json").write_text(json.dumps(stated))
+    with pytest.raises(ValueError):
+        concat([first, exported("exchanged")]).facts()
+
+
 def test_hosts_that_mount_one_corpus_at_different_paths_read_one_order(tmp_path):
     """Each host of a pool reads its own copy of a token corpus, mounted where it was put: the
     copies' readers agree on what they read, and a copy that holds other tokens does not."""
@@ -948,3 +976,17 @@ def test_a_one_split_token_export_refuses_a_validation_split_it_does_not_hold(tm
     with pytest.raises(ValueError):
         _, held_out = TokenFiles(str(exported)).holdout(split="val")
         _validated(held_out, 4, 1)
+
+
+@pytest.mark.parametrize("field", ["text", "txt", "caption"])
+def test_tokenize_reads_a_records_text_under_any_conventional_field(field):
+    """A record's text under its conventional field (text, txt or caption) is tokenized by the step's
+    default, its other fields kept and its text field replaced by the ids (row 5757): only `text` was
+    read, and a caption-only record refused."""
+    from dew.data import Memory
+    from dew.data.compile import iterate
+    from dew.data.text import tokenize
+
+    (tokens,) = iterate(Memory([{field: "hi", "tag": 7}]).map(tokenize("byte", eos=False)))
+    assert tokens["text"].tolist() == list(b"hi") and int(tokens["tag"]) == 7
+    assert field == "text" or field not in tokens

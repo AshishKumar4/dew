@@ -12,7 +12,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Cached and block visibility on the template's spans. [1495, 245, 5392, 5437]
 - Performance measurements. [569, 285, 295, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
-- One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427, 1701, 5635, 5739]
+- One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427, 1701, 5739]
 - The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293, 5368]
 - Inference through the templates. [3424, 3602]
 - Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5322, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848]
@@ -42,9 +42,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Stacks, scans and looped models. [1568]
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [3270, 5450, 5625]
-- Checkpoints.variables on a local. [5667]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
-- D2 (audit3 interop-core): pipeline_assembly._bind_language_model binds supplied text-encoder params by reading fabricated zero views of every stored tensor. [5807]
 
 ## Training and parallelism
 

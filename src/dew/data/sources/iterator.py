@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import grain.python as grain
 import numpy as np
 
+from dew._records import integer
 from dew.batch import Batch
 from dew.data.dataset import Closeable, Records, Replayed, Stoppable
 from dew.data.pipeline import Dataset
@@ -126,8 +127,8 @@ class _StreamIterator[Rows: Iterator[Batch]](grain.DatasetIterator):
                 f"{self._label} keeps no position and declares no replay, so it cannot "
                 f"resume; pass replay=True if it reads the same records each time it opens, or "
                 f"state= and load_state=")
-        read, saved = state.get("read"), state.get("state")
-        if isinstance(read, bool) or not isinstance(read, int) or read < 0:
+        read, saved = integer(state.get("read"), "iterator read count"), state.get("state")
+        if read < 0:
             raise ValueError(f"an iterator's position is the count of records it read, not {read!r}")
         if not isinstance(saved, str):
             raise ValueError("this iterator resumes through load_state, and its position holds no state")

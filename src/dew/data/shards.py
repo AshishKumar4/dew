@@ -133,6 +133,8 @@ def cut(manifest: ShardManifest, *, partition: DataPartition, loading: Loading) 
     """`manifest` with the shards a stream deals its shares and their workers (`_shards`): its own, or its
     parts where too few fill them, then no further part (`subdivide`) and their rows their own, so a read
     that places its records (`dew.data.lowering._positioned`) places the shards it reads."""
+    if not manifest.shards:
+        return manifest
     shards = _shards(manifest, partition=partition, loading=loading)
     if shards == manifest.shards:
         return manifest

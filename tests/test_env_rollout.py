@@ -1092,3 +1092,59 @@ def test_a_pools_split_scored_by_its_episodes_agrees_and_fails_together(tmp_path
     assert peer == {"raising": "PeerFailure", "incomplete": "PeerFailure"}
     assert failing == {"raising": "RuntimeError", "incomplete": "ValueError"}
 
+
+def test_control_rollout_fuses_collection_without_warm_recompiles_and_resumes_entropy_cost(tmp_path):
+    """`ActorCritic` rejects nonpositive `spread`, `EnvRunConfig` resumes a control PPO run across a phase
+    that anneals `entropy_cost` while refusing a changed `discount`, and `ControlRollout` fuses its
+    collection summary and epoch permutations with zero warm recompiles on later collections."""
+    import dataclasses
+
+    from dew.config import ObjectiveConfig, TrainerConfig
+    from dew.config.env import EnvConfig, EnvRunConfig, RolloutConfig
+    from dew.optim import OptimConfig
+    from dew.registry import ModelConfig
+    from dew.rl.flight import Racing
+    from dew.telemetry.compiles import Compiles
+    from dew.training import Trainer
+
+    with pytest.raises(ValueError):
+        ActorCritic(2, (8,), (8,), spread=0.0).init(jax.random.key(0), jnp.zeros((1, 2)))
+    env = Batched(TimeLimit(Walk(), episode_length=10), 4)
+    objective = ControlPPOObjective(ActorCritic(1, (8,), (8,)), 1)
+    rollout = ControlRollout(objective, env, unroll_length=4, unrolls=1, epochs=1, minibatches=2)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), rollout=rollout,
+                      checkpoints=None, tracker=None)
+    state = trainer.initial_state()
+    first_mb = rollout(state, {}, jax.random.key(1), objective=objective)
+    assert first_mb["reward"].shape == (2, 4)
+    rollout(state.replace(updates=jnp.int32(1)), {}, jax.random.key(2), objective=objective)
+    with Compiles(None) as warm:
+        rollout(state.replace(updates=jnp.int32(2)), {}, jax.random.key(3), objective=objective)
+    assert warm.count == 0
+
+    racing_fields = dataclasses.asdict(Racing(families=(("loop", 1.0),), obstacles=1, episode_seconds=1.0,
+                                              hz=10.0))
+    actor_critic = "dew.objectives.rl.control:ActorCritic"
+    control_ppo = "dew.objectives.rl.control:ControlPPOObjective"
+    phase1 = EnvRunConfig(
+        env=EnvConfig("flight", {"racing": racing_fields, "views": ["state", "teacher"]}, count=8),
+        model=ModelConfig(actor_critic, {"policy_layers": [8], "value_layers": [8]}),
+        objective=ObjectiveConfig(control_ppo, {"discount": 0.95, "entropy_cost": 0.05,
+                                                "reads": ["teacher"]}),
+        rollout=RolloutConfig("control", {"unroll_length": 2, "epochs": 1, "minibatches": 1}),
+        optim=OptimConfig("adam", learning_rate=1e-3),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1, checkpoint_every=1, log_every=1,
+                              eval_every=None, multi_host=False))
+    phase1.prepare().train("control_phase")
+    phase2 = dataclasses.replace(
+        phase1, objective=ObjectiveConfig(control_ppo, {"discount": 0.95, "entropy_cost": 0.0,
+                                                        "reads": ["teacher"]}),
+        trainer=dataclasses.replace(phase1.trainer, steps=2))
+    resumed = phase2.prepare().train("control_phase")
+    assert int(resumed.updates) == 2
+    bad_phase = dataclasses.replace(
+        phase2, objective=ObjectiveConfig(control_ppo, {"discount": 0.8, "entropy_cost": 0.0,
+                                                        "reads": ["teacher"]}),
+        trainer=dataclasses.replace(phase1.trainer, steps=3))
+    with pytest.raises(ValueError):
+        bad_phase.prepare().train("control_phase")

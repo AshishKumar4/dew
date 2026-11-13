@@ -1187,8 +1187,9 @@ def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
 def test_a_checkpoint_of_the_retired_rate_scale_and_shape_is_refused(tmp_path):
     """Before 1.0 a configured rate was held as a scale times a schedule's shape, under
     `learning_rate_scale` and `learning_rate_shape` in the optimizer's state, where Dew now holds the
-    schedule's own fields (`dew.optim.RateState`). Resuming such a checkpoint is refused (ValueError),
-    even by a run whose state has the same tree, rather than stepping at a rate it no longer forms."""
+    schedule's own fields (`dew.optim_schedules.RateState`). Resuming such a checkpoint is refused
+    (ValueError), even by a run whose state has the same tree, rather than stepping at a rate it no longer
+    forms."""
     def factory(learning_rate_scale, learning_rate_shape):
         return optax.sgd(learning_rate_scale * learning_rate_shape)
 

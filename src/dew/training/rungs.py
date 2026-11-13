@@ -16,15 +16,13 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import logging
 import os
-import re
-import types
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import jax
-import numpy as np
 from jax.sharding import Mesh
 from jaxlib.xla_client import LoadedExecutable
 
@@ -34,7 +32,10 @@ from dew._records import JSON, json_value, record
 from dew.nn.kernels.generation import assumption, gpu_target
 from dew.nn.sharding import trace_context
 from dew.telemetry.instrumentation import StepFlops, step_flops
+from dew.training.identity import Unestablished, stated
 from dew.training.memory import device_memory
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from dew.batch import Batch
@@ -48,29 +49,36 @@ def rung_records() -> Path | None:
     return _cache.beside_compilation_cache('DEW_RUNG_RECORDS', 'dew-rungs')
 
 
-RECORD_VERSION = 2
+RECORD_VERSION = 3
 """The identity a record names (`rung_key`); a record of another version is another run's."""
 
 
 def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
              mesh: Mesh, step: Callable[..., StepFn] | None = None,
-             capacity: int | None = None) -> dict[str, JSON]:
+             capacity: int | None = None) -> dict[str, JSON] | None:
     """What a recorded rung was decided for, read before the step traces: the
     configuration of the `modules` its programs run at the rung it starts from
-    (`Objective.program_key`) and a custom `step`'s name, the code that builds
-    them (`dew._cache.package_digest`), the step's `arguments` (each leaf's path, shape, dtype and
-    placement), the `splits` its plan chooses among (one where the run pins it),
-    the mesh and its devices' kind and allocator limit, the kernels their
+    (`Objective.program_key`) and a custom `step`, as an identity states them
+    (`dew.training.identity.stated`), the code that builds them
+    (`dew._cache.package_digest`), the step's `arguments` (their tree's structure and each leaf's
+    abstract value and placement, stated alike), the `splits` its plan chooses among (one where the run
+    pins it), the mesh and its devices' kind and allocator limit, the kernels their
     generation runs (`gpu_target`), what a model reads from context as it traces
     (`trace_context`), the libraries that compile it and the allocator and
-    XLA_FLAGS settings it compiles under."""
+    XLA_FLAGS settings it compiles under. None where an identity states none of the step (a module
+    holding an array of JAX's): such a run keeps no record and decides its rung as it compiles."""
+    leaves, structure = jax.tree.flatten(arguments)
+    try:
+        traced = stated([list(modules), step, structure,
+                         [[jax.typeof(leaf), leaf.sharding if isinstance(leaf, jax.Array) else None]
+                          for leaf in leaves], trace_context()], "the step a rung record names")
+    except Unestablished as unstated:
+        _log.info("the step keeps no rung record, its rung decided as it compiles: %s", unstated)
+        return None
     devices = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
     limits = {f"{device.device_kind}, limit {device_memory(device).get('bytes_limit', capacity)}"
               for device in devices}
     devices_seen: list[JSON] = [*sorted(limits)]
-    leaves = [f"{jax.tree_util.keystr(path)} {np.shape(leaf)} {leaf.dtype} "
-              f"{leaf.sharding if isinstance(leaf, jax.Array) else None}"
-              for path, leaf in jax.tree_util.tree_flatten_with_path(arguments)[0]]
     settings = sorted(os.environ.get('XLA_FLAGS', '').split())
     allocator = sorted(f"{name}={value}" for name, value in os.environ.items()
                        if name.startswith(('XLA_PYTHON_CLIENT_', 'TF_GPU_ALLOCATOR')))
@@ -78,13 +86,8 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     # builds for two GPUs of a generation (their multiprocessors) never share a record.
     target = (repr(gpu_target()) if jax.default_backend() == 'gpu' or assumption() is not None
               else jax.default_backend())
-    named = step.__qualname__ if isinstance(step, types.FunctionType) else type(step).__qualname__
-    # A module's configuration as its repr reads it, a function field by its name: the address
-    # Python prints beside one is this process's alone.
-    configured = [re.sub(r' at 0x[0-9a-f]+', '', repr(module)) for module in modules]
-    program = repr([RECORD_VERSION, configured, named, _cache.package_digest(), leaves,
-                    list(splits), dict(mesh.shape), target, trace_context(), jax.__version__,
-                    importlib.metadata.version('jaxlib'), allocator])
+    program = json.dumps([RECORD_VERSION, traced, _cache.package_digest(), list(splits), dict(mesh.shape),
+                          target, jax.__version__, importlib.metadata.version('jaxlib'), allocator])
     return {'program': hashlib.sha256(program.encode()).hexdigest(), 'devices': devices_seen,
             'xla_flags': ' '.join(settings)}
 
@@ -95,7 +98,8 @@ def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch]
                   ) -> tuple[Path | None, dict[str, JSON], JSON]:
     """Where the rung of the step over `arguments` on `mesh` is recorded, its key
     (`rung_key`), and the rung the record holds (None if there is none). A
-    process of a pool keeps no record: its processes agree on the rung.
+    process of a pool keeps no record: its processes agree on the rung; nor does a step its key states
+    none of.
 
     A record whose contents name another key is refused by its path, as
     a stale or foreign file; deleting it lets the run decide again."""
@@ -103,6 +107,8 @@ def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch]
     if directory is None or jax.process_count() > 1:
         return None, {}, None
     key = rung_key(modules, arguments, splits, mesh, step, capacity)
+    if key is None:
+        return None, {}, None
     path = directory / f"{hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()}.json"
     if not path.exists():
         return path, key, None
@@ -111,16 +117,6 @@ def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch]
         raise ValueError(f"the rung record {path} was written for another step or device "
                          f"({stored.get('key')!r}, not {key!r}); delete it to decide the rung again")
     return path, key, json_value(stored.get('rung'), f"rung record {path}")
-
-
-def recorded_launches(recorded: JSON, plan: Mapping[str, JSON]) -> str | None:
-    """The kernel launches (`dew.nn.kernels.tuning.tune`) the record holds of
-    the program `plan` compiles, where `plan` is the `recorded` one: the
-    record beside its FLOPs (`plan_flops`)."""
-    kept = dict(record(recorded, 'recorded plan')) if recorded is not None else {}
-    kept.pop('flops', None)
-    launches = kept.pop('launches', None)
-    return launches if kept == plan and isinstance(launches, str) else None
 
 
 def plan_flops(recorded: JSON, executable: jax.stages.Compiled) -> tuple[StepFlops | None, JSON]:

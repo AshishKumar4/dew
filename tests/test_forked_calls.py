@@ -160,6 +160,24 @@ def test_forked_rows_lay_each_prefix_once_and_each_row_back_at_its_tokens():
     assert owned[0] == owned[1] == owned[2] == owned[3] != owned[4]
 
 
+def test_rows_whose_shared_prefix_needs_more_documents_than_a_window_holds_are_laid_apart():
+    """A window's document bound holds for its groups as they lay out (a shared prefix and each row's rest
+    past it, `laid_documents`): two rows over a two-token prefix fit four slots shared but need three
+    documents, so at two a window they lie apart, a window each, every token back at its row's place, as
+    the windows count them (`windows_needed`); at three they share."""
+    from dew.data.forked_rows import token_keys, windows_needed
+
+    rows = [[1, 2, 3], [1, 2, 4]]
+    keys = [token_keys(np.asarray(row), np.arange(len(row)), []) for row in rows]
+    for documents, windows in ((2, 2), (3, 1)):
+        forks = ForkedRows.pack(rows, 4, documents=documents)
+        assert np.asarray(forks.tokens).shape[0] == windows
+        assert windows_needed([3, 3], 4, keys=keys, documents=documents) == windows
+        tokens = np.asarray(forks.tokens).reshape(-1)
+        for number, row in enumerate(rows):
+            assert list(tokens[np.asarray(forks.index[number, :len(row)])]) == row
+
+
 def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():
     """A decoder that reads its tokens in their row's order beyond its mixers (a block router, an expert
     capacity), whose mixer reads no forks (DeepSeek V4's compressed windows, which

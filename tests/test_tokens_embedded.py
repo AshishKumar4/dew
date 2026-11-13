@@ -205,6 +205,69 @@ def test_a_masked_request_whose_image_fills_a_placeholder_past_the_table_is_fill
     assert outside(raised) == (40, 32)
 
 
+def test_a_block_request_whose_image_fills_an_id_past_the_table_is_served():
+    """A block generation over DiffusionGemma, which replaces the id at each slot its image fills before its
+    table reads it (`DiffusionGemma.replaces_media`), is bounded as a text request is: an id past the table
+    at a slot its image fills, the conditioner's and never the table's, is served, and at a slot no image
+    fills, which the table would read, refused, naming it (train 768 F4: DiffusionGemma stated no such
+    replacement, so its block requests refused that id)."""
+    import jax.numpy as jnp
+    from bank_support import fixture
+
+    from dew.diffusion.block import BlockProcess
+    from dew.inference import BlockGeneration
+    from dew.nn.inputs import ModelInputs
+
+    model, variables, tokens, indices, media = fixture("diffusion")
+    past = tokens.at[0, 1].set(32 + 5)
+    task = BlockGeneration(model, variables, BlockProcess(canvas_length=2, vocab_size=32))
+    generated = task(ModelInputs(past, {"image_indices": indices}, media), 2, key=0).host()
+    assert generated.tokens.shape == (1, 6)
+    with pytest.raises(OutsideTable) as raised:
+        task(ModelInputs(past, {"image_indices": jnp.full_like(indices, -1)}, media), 2, key=0)
+    assert outside(raised) == (37, 32)
+
+
+def test_a_media_slot_a_model_reads_from_its_table_bounds_its_id():
+    """A multimodal model whose decoder hashes n-grams of the ids media fill (`Engram.media_stops` False,
+    Qwen4-Exp's) keeps a media slot's id and reads it from a token map of its table's rows, so an id past
+    the table there is refused, naming it, as at any slot its table reads; the same model hashing none
+    replaces that id with its tower's embedding, and the request passes (train 768 F4: every multimodal
+    model was taken to replace it, and the hashed id read past the map with no error)."""
+    from dew.inputs import Field
+    from dew.nn.engram import Engram
+
+    model = placeholder_model()
+    hashing = model.clone(language_model=model.language_model.clone(engram=Engram(
+        layer_ids=(0,), num_embeddings=(), max_ngram_size=3, vocab_size=ROWS, n_heads=2, head_dim=4,
+        compressed_vocab_size=ROWS, media_stops=False)))
+    request = media_rows([[4, PLACEHOLDER + 9, 5, 6]], [[-1, 0, -1, -1]])
+    Field.indexing("tokens", (), model).bounded(request)
+    with pytest.raises(OutsideTable) as raised:
+        Field.indexing("tokens", (), hashing).bounded(request)
+    assert outside(raised) == (PLACEHOLDER + 9, ROWS)
+
+
+def test_a_host_batch_is_bounded_on_the_host():
+    """A run's host batch, numpy rows with media beside them (a `ModelInputs` of host arrays), is bounded
+    where it lies: no array moves to or from a device, the media slots read on the host, an id past the
+    table at a slot its image fills passing and one its table reads refused (train 768 F5: the slots were
+    read on a device for every such batch, on the prefetch worker)."""
+    from dew.nn.inputs import ModelInputs
+
+    inputs = LMObjective(placeholder_model(), 8, head_chunks=1).inputs
+    assert inputs is not None
+    ids = np.tile(np.asarray([[2, 3, PLACEHOLDER + 9, 4, 5, 6, 7, 8, 9]], np.int32), (2, 1))
+    images = np.tile(np.asarray([[-1, -1, 0, -1, -1, -1, -1, -1, -1]], np.int32), (2, 1))
+    pixels = np.zeros((2, 1, 3, 8, 8), np.float32)
+    with jax.transfer_guard("disallow"):
+        inputs.bounded({"text": ModelInputs(ids, {"image_indices": images}, {"pixel_values": pixels})})
+        with pytest.raises(OutsideTable) as raised:
+            inputs.bounded({"text": ModelInputs(ids, {"image_indices": np.full_like(images, -1)},
+                                                {"pixel_values": pixels})})
+    assert outside(raised) == (PLACEHOLDER + 9, ROWS)
+
+
 def test_a_training_batch_whose_media_fill_ids_past_the_table_trains_and_one_its_table_reads_is_refused():
     """A multimodal run's rows whose media slots hold ids past its model's table, which the towers fill and
     the table never reads, pass the bound a run's every batch passes (`InputSpec.bounded`) and train to a
@@ -248,8 +311,9 @@ def test_rows_given_already_placed_are_bounded_where_they_lie():
     import jax.numpy as jnp
 
     from dew.inputs import Field
+    from dew.nn.blocks import TokenTable
 
-    field = Field("tokens", (4,), rows=ROWS, replaced=frozenset({ROWS + 7}))
+    field = Field("tokens", (4,), table=TokenTable(ROWS, frozenset({ROWS + 7}), media=False))
     valid = jnp.asarray([[1, 2, ROWS - 1, ROWS + 7]], jnp.int32)
     # A valid batch, a replaced id past the table among it, reads back its two bounds alone (explicitly),
     # never the batch whole (an implicit read-back, which the guard refuses).
@@ -262,7 +326,10 @@ def test_rows_given_already_placed_are_bounded_where_they_lie():
 
 def _refused_in_a_process(token: int) -> None:
     """A token bound checked in a process of its own, as a data worker's would be."""
-    Field("text", (SEQ_LEN + 1,), rows=ROWS).bounded(np.full(SEQ_LEN + 1, token, np.int32))
+    from dew.nn.blocks import TokenTable
+
+    Field("text", (SEQ_LEN + 1,), table=TokenTable(ROWS, frozenset(), media=False)).bounded(
+        np.full(SEQ_LEN + 1, token, np.int32))
 
 
 def test_a_token_refusal_crosses_a_process_as_itself():

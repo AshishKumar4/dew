@@ -52,6 +52,7 @@ from dew.data.analysis import (
     _member_keys,
     _members,
     _name,
+    _once,
     _preferred_read,
     _promoted,
     _stated,
@@ -82,7 +83,7 @@ from dew.data.dataset import (
     rows_of,
     take_batch,
 )
-from dew.data.facts import merge_facts
+from dew.data.facts import laid_out, merge_facts, row_lengths
 from dew.data.handoff import record_stage_of
 from dew.data.lowering import (
     _as_iter,
@@ -95,17 +96,17 @@ from dew.data.lowering import (
     _repeated,
     _split_spans,
     _tail,
-    _weights,
     _workers,
-    mixed_indexed,
 )
 from dew.data.materialize import _materialize, _Memory
-from dew.data.mixing import CorpusCounts, Proportions
+from dew.data.mixing import CorpusCounts, Proportions, _weights, mixed_indexed
 from dew.data.ordering import place_of
 from dew.data.pipeline import (
     Artifact,
     Batched,
     BatchStage,
+    Combined,
+    Concatenated,
     Configured,
     Costly,
     Dataset,
@@ -135,9 +136,9 @@ from dew.data.pipeline import (
     Slice,
     Stage,
     TokenBudget,
-    TokenGeometry,
     Windows,
     Workers,
+    chains,
     children,
     examples_bound,
     record_stage,
@@ -155,6 +156,7 @@ from dew.data.plan import (
     identified,
     read_by,
     spelled,
+    structured,
 )
 from dew.data.readers import GRAIN, Opener, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
@@ -215,7 +217,7 @@ def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
         # A stream positions its records once, under the steps that read their places, which a cache
         # standing for some of them would split.
         return pipeline
-    if isinstance(pipeline.source, (Mixture, Phases)):
+    if isinstance(pipeline.source, Combined):
         return with_children(pipeline, lambda child: _automatic(child, read, root))
     if any(isinstance(stage, Artifact) for stage in _steps(pipeline)):
         return pipeline
@@ -386,30 +388,14 @@ def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
                        for pipeline in pipelines for leaf, source in _leaves(pipeline))
 
 
-def _laid_out(pipeline: Pipeline) -> TokenGeometry | None:
-    """The rows `pipeline`'s source reads laid out, a token store's windows or a planned pack's
-    (`TokenGeometry`), through the views that keep its rows as they are (a compile's pinned read, a
-    holdout's selection), or None."""
-    if isinstance(pipeline.source, (Mixture, Phases)):
-        return None
-    laid = beneath(pipeline.source, ("read", "selected"))
-    return next((source for source in laid if isinstance(source, TokenGeometry)), None)
-
-
 def _row_tokens(pipeline: Pipeline) -> int | None:
-    """The tokens each row of `pipeline` holds, as its last record step or layout declaring them
-    states (`TokenGeometry`), a source that reads them laid out first (`_laid_out`), or its corpora
-    alike."""
-    steps = (stage.step if isinstance(stage, (Map, RandomMap)) else stage for stage in pipeline.stages)
-    declared = [step for step in (_laid_out(pipeline), *steps) if isinstance(step, TokenGeometry)]
-    if declared:
-        return declared[-1].max_length
-    if nested := children(pipeline):
-        lengths = {_row_tokens(child) for child in nested}
-        if len(lengths) > 1:
-            raise ValueError(f"a token budget needs rows of one length, and the corpora's are {lengths}")
-        return lengths.pop()
-    return None
+    """The tokens each row of `pipeline` holds (`row_lengths`), its corpora alike; corpora whose rows hold
+    several lengths are refused."""
+    lengths = row_lengths(pipeline)
+    if len(lengths) > 1:
+        raise ValueError(f"a token budget needs rows of one length, and the corpora's are {set(lengths)}")
+    (length,) = lengths
+    return length
 
 
 def _budgeted(pipeline: Pipeline, fallback: int | None = None) -> Pipeline:
@@ -422,9 +408,10 @@ def _budgeted(pipeline: Pipeline, fallback: int | None = None) -> Pipeline:
         raise ValueError(
             f"token-budget pipeline {_name(pipeline)} needs a record step declaring TokenGeometry"
         )
-    if budget.tokens % length:
+    count = budget.rows(length)
+    if count is None:
         raise ValueError(f"a token budget of {budget.tokens} is not whole rows of {length} tokens")
-    rows = BatchStage(budget.tokens // length, budget.drop_remainder, budget.batch_fn)
+    rows = BatchStage(count, budget.drop_remainder, budget.batch_fn)
     return dataclasses.replace(
         pipeline, stages=tuple(rows if stage is budget else stage for stage in pipeline.stages)
     )
@@ -764,7 +751,11 @@ def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, traini
     scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise, and
     the data plan `version` it reads by (one each entry, `compile`, `iterate` and `publish`, refused where
     this Dew reads by none of it, before anything is prepared), and the branch's own key where it is named
-    (`_own_key`)."""
+    (`_own_key`). A concatenation of datasets with steps is an order no plan of 13 recorded, refused
+    under one."""
+    if version < STRUCTURED and any(isinstance(chain.source, Concatenated) for chain in chains(branch)):
+        raise ValueError(f"{_name(branch)} joins datasets that have steps of their own (concat), which a "
+                         "plan of 13 reads by no rule; read it under this Dew's plan")
     lowered = _analyzed(branch, read, validation=not training) if lowering is None else lowering
     return _Build(read, loading, seed, batch, lowered, training=training, elastic=branch._elastic,
                   version=version, named=_own_key(branch))
@@ -980,7 +971,8 @@ def _pass_examples(train: Pipeline, read: Read, build: _Build) -> int | None:
     repeat. Its source's records, as a memory read holds them (its leading steps run, the present ones),
     or a streamed source's rows as its shards state or count them at the build's plan version
     (`ShardManifest.sized`), each slice and limit before that place applied;
-    a mixture by weights, those in which every part it mixes comes round once (`Proportions.covering`). None
+    a mixture by weights, those in which every part it mixes comes round once (`Proportions.covering`); a
+    concatenation, its members' added. None
     for a mixture by tokens, a memory read that laid its examples out as it held them, or where a
     step before that place drops or adds one, or keeps them by a rule not yet bound, or nothing states
     the count."""
@@ -995,7 +987,7 @@ def _pass_examples(train: Pipeline, read: Read, build: _Build) -> int | None:
         return None
     # A memory read that laid its examples out as it held them (a pack before its shuffle) holds no source
     # example a bound before that layout could count, as a run bounded in examples refuses it too.
-    held = () if isinstance(source, Mixture) else _written(source, ())
+    held = () if isinstance(source, Combined) else _written(source, ())
     if any(isinstance(stage, (Pack, Windows)) or (isinstance(stage, FlatMap) and stage.examples)
            for stage in held):
         return None
@@ -1010,6 +1002,14 @@ def _pass_examples(train: Pipeline, read: Read, build: _Build) -> int | None:
         if len(known) != len(sizes):
             return None
         count = Proportions.of(_weights(source), source.seed).covering(known)
+    elif isinstance(source, Concatenated):
+        # Its members' passes one after another, each read once; one a member repeats is no pass of its own.
+        sizes = [None if any(isinstance(stage, Repeat) for stage in _steps(child))
+                 else _pass_examples(child, read, build) for child in source.pipelines]
+        known = [size for size in sizes if size is not None]
+        if len(known) != len(sizes):
+            return None
+        count = sum(known)
     elif read == "streamed" and not _in_memory(source):
         stated = [shard.rows for shard in
                   source.manifest().sized(build.stream_loading.threads).shards]
@@ -1038,7 +1038,7 @@ def _held_ahead(train: Pipeline, read: Read) -> str | None:
     objective's rows), the bound held before the layout, its passes counted as the read holds the documents
     (`Limit.passes`).
     None for any other read, whose pass is counted once it is prepared (`_staged`)."""
-    if read != "memory" or isinstance(train.source, (Mixture, Phases)):
+    if read != "memory" or isinstance(train.source, Combined):
         return None
     # The steps the read runs as it holds its rows, as the analysis places them once its configured steps
     # bind (after a cache it fills), and a configured step's after them, which binds to such a step unless
@@ -1074,7 +1074,7 @@ def _rebound(pipeline: Pipeline, examples: int, passes: int | None = None) -> Pi
 def _held_count(train: Pipeline) -> int:
     """The examples a memory read's held bound resolved to (`Limit.passes`), as the stages it ran state."""
     source = train.source
-    ran = () if isinstance(source, (Mixture, Phases)) else _written(source, ())
+    ran = () if isinstance(source, Combined) else _written(source, ())
     at = examples_bound(ran)
     limit = None if at is None else ran[at - 1]
     assert isinstance(limit, Limit), "a held bound is among the stages it ran"
@@ -1276,7 +1276,7 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
                 declare(stage, stage.segments)
                 packed = True
         source = pipeline.source
-        if isinstance(source, (Mixture, Phases)):
+        if isinstance(source, Combined):
             for child in source.pipelines:
                 walk(child, packed=packed)
             return
@@ -1567,7 +1567,7 @@ def _compile_phases(
         consumed = _consumed_by([resolved(before, ends[:before]) for before in range(index)], ends,
                                 plan_version)
         if all(consumed.get(_name(chain), _Trained()) == _Trained()
-               for chain, _ in _leaves(source.pipelines[index])):
+               for chain in _corpora(source.pipelines[index])):
             return staged[index][0]
         return staged_at(index, consumed)
 
@@ -1639,9 +1639,20 @@ def _ordered(index: int, phase: _Staged) -> _Staged:
     return phase
 
 
-def _corpus_key(corpus: Source) -> str:
-    """A corpus as phases share it: its store's content (`Source.fingerprint`), whatever a chain names it."""
-    return fingerprint(json.loads(json.dumps(corpus.fingerprint(), sort_keys=True, default=str)))
+def _corpus_key(chain: Pipeline) -> str:
+    """A corpus (`_corpora`) as phases share it, whatever a chain names it: its store's content
+    (`Source.fingerprint`); a concatenation's, its members' in order, each what it reads and the steps it
+    reads it through (`dew.data.plan.structured`)."""
+    def read_of(pipeline: Pipeline) -> JSON:
+        source = pipeline.source
+        if not isinstance(source, Combined):
+            return json.loads(json.dumps(source.fingerprint(), sort_keys=True, default=str))
+        weights = {"weights": list(source.weights)} if isinstance(source, Mixture) else {}
+        members = [[read_of(child), [structured(stage) for stage in child.stages]]
+                   for child in source.pipelines]
+        return json_value({type(source).__name__: members, **weights}, "a corpus's key")
+
+    return fingerprint(read_of(chain))
 
 
 def _apart(phases: Phases) -> None:
@@ -1650,8 +1661,8 @@ def _apart(phases: Phases) -> None:
     the earlier read twice; a plan of 14 continues it by stamps (`_shared`)."""
     seen: dict[str, tuple[int, str]] = {}
     for index, pipeline in enumerate(phases.pipelines):
-        for chain, corpus in _leaves(pipeline):
-            earlier, named = seen.setdefault(_corpus_key(corpus), (index, _name(chain)))
+        for chain in _corpora(pipeline):
+            earlier, named = seen.setdefault(_corpus_key(chain), (index, _name(chain)))
             if earlier != index:
                 raise ValueError(f"phases {earlier} and {index} both read one corpus ({named}, "
                                  f"{_name(chain)}) each on its own stream, which a plan of 13 reads by no "
@@ -1661,14 +1672,15 @@ def _apart(phases: Phases) -> None:
 
 def _shared(phases: Phases) -> tuple[dict[str, str], ...]:
     """Each phase's mix members a phase on its own stream (`StepPhases`) reads on from another phase, by
-    member key, and the corpus each is (`_corpus_key`): the next phase that reads a corpus continues it from
-    the draws the run trained of it (`dew.data.mixing.Stamping`). Refuses a shared corpus a phase reads other
-    than as a member of its own mix, whose position no key names, and one two phases read through other
-    steps before their mixes, where the earlier's draws are no draws of the later's."""
+    member key, and the corpus each is (`_corpus_key`; a concatenation is one, its join): the next phase
+    that reads a corpus continues it from the draws the run trained of it (`dew.data.mixing.Stamping`).
+    Refuses a shared corpus a phase reads other than as a member of its own mix, whose position no key
+    names, and one two phases read through other steps before their mixes, where the earlier's draws are
+    no draws of the later's."""
     reads: dict[str, list[tuple[int, Pipeline]]] = {}
     for index, pipeline in enumerate(phases.pipelines):
-        for chain, corpus in _leaves(pipeline):
-            reads.setdefault(_corpus_key(corpus), []).append((index, chain))
+        for chain in _corpora(pipeline):
+            reads.setdefault(_corpus_key(chain), []).append((index, chain))
     shared = {key: read for key, read in reads.items() if len({index for index, _ in read}) > 1}
     members: list[dict[str, str]] = [{} for _ in phases.pipelines]
     keyed: dict[str, str] = {}
@@ -1758,11 +1770,22 @@ def _continued(pipeline: Pipeline, consumed: Mapping[str, _Trained]) -> Pipeline
 def _skipping(staged: _Staged, consumed: Mapping[str, _Trained], pipeline: Pipeline) -> _Staged:
     """`staged`, the phase `pipeline` continued past `consumed` (`_continued`), drawing past the places of its
     corpora the run trained already (`_Build.skipped`); a corpus it does not read it records nothing of."""
-    reads = {_name(chain) for chain, _ in _leaves(pipeline)}
+    reads = {_name(chain) for chain in _corpora(pipeline)}
     skipped = {name: held.skipped() for name, held in consumed.items() if held.past and name in reads}
     if not skipped:
         return staged
     return dataclasses.replace(staged, build=dataclasses.replace(staged.build, skipped=skipped))
+
+
+def _corpora(pipeline: Pipeline) -> Iterator[Pipeline]:
+    """Each corpus a phase's order places records of (`_Trained`): a chain under `pipeline`'s mixtures that
+    reads a store, or a concatenation, whose join is one corpus (`_continued` reads the join on)."""
+    source = pipeline.source
+    if isinstance(source, Mixture | Phases):
+        for child in source.pipelines:
+            yield from _corpora(child)
+    else:
+        yield pipeline
 
 
 def _delivered(pipeline: Pipeline, count: int, consumed: dict[str, _Trained]) -> None:
@@ -1897,7 +1920,7 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
     batched = _until(pipeline.stages, (BatchStage, TokenBudget))
     own = any(isinstance(stage, (Map, RandomMap, FlatMap, Filter, Pack, Windows, Native, Batched))
               for stage in pipeline.stages[:batched])
-    if isinstance(pipeline.source, (Mixture, Phases)) and not own:
+    if isinstance(pipeline.source, Combined) and not own:
         return with_children(pipeline, functools.partial(objective_steps, objective=objective, train=train,
                                                          read=read))
     boundary = (
@@ -1912,8 +1935,8 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
     suffix = pipeline.stages[at:]
     # Rows the chain lays out hold the length it gives them, which the objective's geometry gives way to:
     # a pack's or windows', or a source's that reads them laid out (a planned pack, a store's windows).
-    laid_out = layouts or _laid_out(pipeline) is not None
-    geometry = () if laid_out or objective.geometry is None else (objective.geometry,)
+    lays = layouts or laid_out(pipeline) is not None
+    geometry = () if lays or objective.geometry is None else (objective.geometry,)
     pipeline = _objective_records(dataclasses.replace(pipeline, stages=pipeline.stages[:at]),
                                   (*(objective.train if train else objective.evaluate), *geometry))
     return dataclasses.replace(pipeline, stages=(*pipeline.stages, *suffix))
@@ -2002,18 +2025,12 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     if records is not None:
         lowering = _cut(lowering, per_share=True)
     if finite:
-        lowering = _finite(lowering)
+        # A non-repeated diagnostic pass, without training's root repeats.
+        lowering = _once(lowering)
     # A token budget is fixed-length rows by now (`_budgeted`).
     build = _build(pipeline, read, loading, batch=_output_batch(pipeline), training=True,
                    lowering=lowering).tuned(pipeline).pooled(pipeline)
     return _Host(build.batches(pipeline, DataPartition()), packed + _batch_steps(pipeline)[0])
-
-
-def _finite(lowering: _Lowering) -> _Lowering:
-    """A non-repeated diagnostic pass without training's implicit root repeats."""
-    return dataclasses.replace(lowering, parts_unending=False, unending=False, records_unending=False,
-                               onward=False, rooted=False, repeated=True, epochs=1,
-                               children=tuple(_finite(child) for child in lowering.children))
 
 
 @compiling
@@ -2423,7 +2440,7 @@ def publish(
     read_by(plan_version)
     if not isinstance(cache, Cache):
         raise TypeError("publish needs a Cache destination")
-    if isinstance(pipeline.source, (Mixture, Phases)):
+    if isinstance(pipeline.source, Combined):
         raise ValueError("publish each source prefix before mixing")
     planned = _at(pipeline.stages, Pack)
     builder = None
@@ -2435,7 +2452,7 @@ def publish(
         pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:planned])
     (pipeline,) = _prepared((pipeline,), read, provision=provision)
     source = pipeline.source
-    if isinstance(source, (Mixture, Phases)):
+    if isinstance(source, Combined):
         raise ValueError("configured publication needs one physical source")
     manifest = _cache_manifest(source, pipeline.stages, read, plan_version)
 

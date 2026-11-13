@@ -175,6 +175,24 @@ def test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_cou
     assert counted[0] != counted[1]
 
 
+def test_a_phased_runs_later_phases_are_named_from_the_first_batch_its_loop_read(tmp_path):
+    """A run's later phases are named (`later_phases`) from the batch its loop hands its first step, its
+    work counted and its rows marked as the loop reads it (`marked`, `Trainer._counted_batch`), counted no
+    more: the second phase, whose loop runs another pass count, is another program. Counted again, its
+    telemetry columns were refused as reserved before a Qwen3.5-4B run's first step on a GH200."""
+    from dew.data.dataset import DataPartition
+    from dew.training.ahead import first_step_batch, later_phases
+    from dew.training.distributed import marked
+
+    stated = run(tmp_path, STEPS, phased(tmp_path))
+    prepared = dataclasses.replace(stated, trainer=dataclasses.replace(stated.trainer, steps=4)).prepare()
+    readied = prepared.run.readied(prepared.objective, prepared.dataset, None, (), "named")
+    config, loader, steps = readied[0], readied[1], readied[4]
+    trainer = config.built(prepared.objective, config.trainer.mesh, prepared.rollout)
+    first = first_step_batch(trainer, loader, steps, loader.examples if steps is None else None)
+    assert later_phases(trainer, marked(DataPartition(), trainer._counted_batch)(first)) == (1,)
+
+
 def test_a_phased_runs_later_phase_compiles_ahead_as_the_run_lowers_it_at_its_boundary(tmp_path):
     """A run's later phases compile ahead (`LaterPhases`) through its record, trained again by `dew train`
     with its target the phases after the first (`AheadTarget.phases`, `later_phases`, by the trainer's own

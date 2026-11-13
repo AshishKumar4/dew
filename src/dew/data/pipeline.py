@@ -585,10 +585,12 @@ class TokenBudget:
     drop_remainder: bool = DROP_REMAINDER
     batch_fn: Callable[[Sequence[Batch]], Batch] | None = None
 
-    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
-        """Rows of the pipeline's row length, as many a batch as `tokens` holds."""
-        width = facts.get("seq_len")
-        return {**facts, "batch": self.tokens // (width + 1)} if isinstance(width, int) else dict(facts)
+    def rows(self, length: int) -> int | None:
+        """The rows of `length` tokens a batch of `tokens` holds, None where it is not whole rows of them:
+        the one reading of a budget's rows, the batch its chain states (`dew.data.facts.folded`) and the one
+        it compiles to (`dew.data.compile._budgeted`), each of the length the chain's rows hold
+        (`dew.data.facts.row_lengths`)."""
+        return None if self.tokens % length else self.tokens // length
 
     def __post_init__(self) -> None:
         if self.tokens <= 0:
@@ -1051,25 +1053,46 @@ class Phases:
             phase_ends(self.ends if self.ends[-1] is None else (*self.ends, None), "token")
 
 
+@dataclasses.dataclass(frozen=True)
+class Concatenated:
+    """Datasets with steps of their own read one after another, each to its end, as one corpus (`concat`):
+    its rows are its members' joined in their order, each member's as its own steps make them, and the
+    steps written after it read the join. A member ends (one that reads on without end is refused, which
+    the members after it would never follow), a training read repeats the join where a store's rows
+    would repeat, and a place in it is a place in the join: a phase that reads it on continues the join.
+    Stores alone are joined as one store (`dew.data.sources.concatenate.Concatenate`)."""
+
+    pipelines: tuple[Pipeline, ...]
+
+    def __post_init__(self) -> None:
+        if not self.pipelines:
+            raise ValueError("concat needs at least one dataset")
+
+
+Combined = Mixture | Phases | Concatenated
+"""What a chain reads in place of a store: other chains, mixed, read in phases or joined. The one name a
+chain's source is asked by whether it reads a store."""
+
+
 def children(pipeline: Pipeline) -> tuple[Pipeline, ...]:
-    """The chains `pipeline`'s mixture or phases read, none where it reads a store."""
+    """The chains `pipeline`'s mixture, phases or concatenation read, none where it reads a store."""
     source = pipeline.source
-    return source.pipelines if isinstance(source, (Mixture, Phases)) else ()
+    return source.pipelines if isinstance(source, Combined) else ()
 
 
 def chains(pipeline: Pipeline) -> Iterator[Pipeline]:
-    """Every chain of `pipeline`'s tree, children first: each corpus under its mixtures and phases,
-    then the chain that mixes or phases them, and `pipeline` last."""
+    """Every chain of `pipeline`'s tree, children first: each corpus under its mixtures, phases and
+    concatenations, then the chain that combines them, and `pipeline` last."""
     for child in children(pipeline):
         yield from chains(child)
     yield pipeline
 
 
 def with_children(pipeline: Pipeline, rewrite: Callable[[Pipeline], Pipeline]) -> Pipeline:
-    """`pipeline` with each chain its mixture or phases read rewritten by `rewrite`; `pipeline` itself
+    """`pipeline` with each chain it combines (`Combined`) rewritten by `rewrite`; `pipeline` itself
     where it reads a store, or `rewrite` leaves every chain as it was."""
     source = pipeline.source
-    if not isinstance(source, (Mixture, Phases)):
+    if not isinstance(source, Combined):
         return pipeline
     rewritten = tuple(rewrite(child) for child in source.pipelines)
     if all(now is was for now, was in zip(rewritten, source.pipelines, strict=True)):
@@ -1078,9 +1101,9 @@ def with_children(pipeline: Pipeline, rewrite: Callable[[Pipeline], Pipeline]) -
 
 
 def with_stores(pipeline: Pipeline, store: Callable[[Source], Source]) -> Pipeline:
-    """`pipeline` with each store under its mixtures and phases read through `store`, every step as it
+    """`pipeline` with each store under the chains it combines read through `store`, every step as it
     was."""
-    if isinstance(pipeline.source, (Mixture, Phases)):
+    if isinstance(pipeline.source, Combined):
         return with_children(pipeline, functools.partial(with_stores, store=store))
     return dataclasses.replace(pipeline, source=store(pipeline.source))
 
@@ -1560,7 +1583,7 @@ class Piped:
 class Pipeline(Dataset):
     """A dataset's store and the stages its verbs added; what every verb returns."""
 
-    source: Source | Mixture | Phases
+    source: Source | Combined
     stages: tuple[Stage, ...] = ()
     name: str | None = None
     mode: Read | None = None
@@ -1579,14 +1602,16 @@ class Pipeline(Dataset):
 
 
 def concat(datasets: Sequence[Dataset]) -> Pipeline:
-    """The records of `datasets`, stores read one after another, as one dataset."""
+    """The records of `datasets` read one after another, as one dataset: each dataset's rows as its own
+    steps make them, to its end, then the next's (`Concatenated`); stores alone are joined as one store
+    (`Concatenate`), read by index as a store is."""
     from dew.data.sources.base import Source
     from dew.data.sources.concatenate import Concatenate
 
     stores = tuple(dataset for dataset in datasets if isinstance(dataset, Source))
-    if len(stores) < len(datasets):
-        raise ValueError("concat joins stores; add the steps after it, or mix datasets that have steps")
-    return Pipeline(Concatenate(stores))
+    if len(stores) == len(datasets):
+        return Pipeline(Concatenate(stores))
+    return Pipeline(Concatenated(tuple(dataset._chain() for dataset in datasets)))
 
 
 def _token_places(batch: Batch) -> tuple[int, int]:

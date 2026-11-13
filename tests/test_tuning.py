@@ -107,7 +107,11 @@ from test_tuning import launches, operands, step
 from dew.nn.kernels import tuning
 with tuning.reading():
     found = {rows: launches(step(), *operands(rows)) for rows in (13, 15, 40)}
-print(json.dumps([found, tuning.settled(tuning.tune(lambda: step().lower(*operands(15)))[1])]))
+    # Whether every launch of the step has a stored pick, every process taking process 0's (`_settle`).
+    with tuning.seen() as traced:
+        step().lower(*operands(15))
+    settled = tuning._settle(list(traced), measure=False) == 0
+print(json.dumps([found, settled]))
 """
 
 
@@ -244,19 +248,22 @@ def layers(x, branch, scale, gate, up):
     return loss(x, branch, scale, gate, up) + loss(2 * x, branch, scale, gate, up)
 
 
-def described(launches):
+def described(trace):
+    # The distinct launches the traced program makes, as the pool decides them (`tuning._distinct`).
+    with tuning.seen() as found:
+        trace()
     return sorted([type(ba.op).__name__, repr(sorted(ba.autotuning_cache_key.items()))]
-                  for ba in tuning.loads_launches(launches))
+                  for _, ba in tuning._distinct(list(found)))
 
 
 with generation.assumed("sm80"):
-    _, two = tuning.tune(lambda: jax.make_jaxpr(jax.grad(layers, argnums=(0, 1, 2, 3, 4)))(*operands(15)))
-    _, one = tuning.tune(lambda: jax.make_jaxpr(step())(*operands(15)))
+    two = described(lambda: jax.make_jaxpr(jax.grad(layers, argnums=(0, 1, 2, 3, 4)))(*operands(15)))
+    one = described(lambda: jax.make_jaxpr(step())(*operands(15)))
     with tuning.seen() as traced:
         jax.make_jaxpr(step())(*operands(15))
     distinct = sorted({(type(op).__name__, repr(sorted(op.keyed(ba).autotuning_cache_key.items())))
                        for op, ba in traced})
-print(json.dumps([described(two), described(one), [list(launch) for launch in distinct]]))
+print(json.dumps([two, one, [list(launch) for launch in distinct]]))
 """
 
 
@@ -345,10 +352,16 @@ def lower():
     return step().lower(*operands(int(sys.argv[1])))
 
 
-_, launches = tuning.tune(lower, measure=True)
+tuning.tune(lower, measure=True)
+lowered = len(lowerings)
 path = _cache.kernel_picks_path(jax.devices()[0].device_kind)
 stamp = os.stat(path).st_mtime_ns if os.path.exists(path) else None
-print(json.dumps([path, stamp, tuning.settled(launches), len(lowerings)]))
+# Whether every launch of the step now has a stored pick, every process taking process 0's (`_settle`).
+with tuning.reading():
+    with tuning.seen() as traced:
+        step().lower(*operands(int(sys.argv[1])))
+    settled = tuning._settle(list(traced), measure=False) == 0
+print(json.dumps([path, stamp, settled, lowered]))
 """
 
 

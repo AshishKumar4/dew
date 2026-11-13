@@ -51,14 +51,15 @@ from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_p
 from dew.distributed.placement import MeshSpec, Placement
 from dew.held_updates import waiting
 from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
-from dew.optim import OptimConfig, reclocked
-from dew.state import TrainState
+from dew.optim import OptimConfig
+from dew.optim_schedules import reclocked
+from dew.state import TrainState, occupied
 from dew.telemetry.profile import Profiler, region
 from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Branch, Cooldowns
 from dew.training.diloco import regrouped
-from dew.training.evaluation import EvalSuite, Evaluation, Split, Summary, episodic
+from dew.training.evaluation import Declared, EvalSuite, Evaluation, Split, SplitLoss, Summary, episodic
 from dew.training.interval import Interval, LogWriter, Taken, TokenClock
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS
 from dew.training.observe import Observe
@@ -96,26 +97,25 @@ def validation_suites(dataset: Loader, validation: Mapping[str, Split | EvalSuit
     return suites
 
 
-def split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, ...]]:
-    """Each split's own metrics, by its name: two suites may each hold their own instance of one
-    metric."""
-    return {name: tuple(suite.metrics) for name, suite in suites.items()}
-
-
 def declarations(suites: Mapping[str, EvalSuite], metrics: Sequence[Metric],
-                 summaries: Sequence[Summary], *, loss: bool) -> dict[str, tuple[Metric | Summary, ...]]:
+                 summaries: Sequence[Summary], *, loss: bool) -> dict[str, tuple[Declared, ...]]:
     """Every score a fit declares, by split: each suite's metrics (fit's own `metrics` as `val` where it
-    validates no suite) and the summaries in their namespace (`Summary.SPLIT`), which no split can be
-    named. Its selections resolve against this and its rankings read their aggregates' scores off it,
-    one declaration for both. A summary is refused where it repeats another's name or weighs a score
-    no evaluation records (`Summary.check`, the objective's validation loss only where it defines one,
-    `loss`)."""
+    validates no suite), beside them the split's loss where the objective defines one (`loss`), the split
+    is scored by its batches (an episodic one scores its episodes alone, `episodic`) and no metric of the
+    suite is named `loss` (`SplitLoss`), and the summaries in their namespace
+    (`Summary.SPLIT`), which no split can be named. Its selections resolve against this and its rankings
+    read their aggregates' scores off it, one declaration for both. A summary is refused where it repeats
+    another's name or weighs a score no evaluation records (`Summary.check`, the objective's validation
+    loss only where it defines one)."""
     names = [summary.name for summary in summaries]
     if len(names) != len(set(names)):
         raise ValueError(f"summaries are named apart, and {names} repeats one")
     for summary in summaries:
         summary.check(suites, loss)
-    declared: dict[str, tuple[Metric | Summary, ...]] = {**(split_metrics(suites) or {'val': tuple(metrics)})}
+    declared: dict[str, tuple[Declared, ...]] = {
+        split: (*suite.metrics, *((SplitLoss(),) if loss and not episodic(suite.data)
+                                  and all(metric.name != "loss" for metric in suite.metrics) else ()))
+        for split, suite in suites.items()} or {'val': tuple(metrics)}
     if summaries:
         declared[Summary.SPLIT] = tuple(summaries)
     return declared
@@ -152,7 +152,7 @@ class FitPlan:
     """The scalars each step whose evaluations score every split they weigh forms (`Summary`)."""
     branches: tuple[Branch, ...] = ()
     """The run's cooldown branches (`dew.training.cooldown`)."""
-    declared: Mapping[str, tuple[Metric | Summary, ...]] = dataclasses.field(default_factory=dict)
+    declared: Mapping[str, tuple[Declared, ...]] = dataclasses.field(default_factory=dict)
     """Every score the fit declares, by split (`declarations`)."""
     observe: Observe | None = None
 
@@ -305,7 +305,7 @@ class FitPlan:
         stop = self.stop
         if stop is None:
             return False
-        assert isinstance(stop.metric, (Metric, TrainingScalar, Summary)), (
+        assert isinstance(stop.metric, (Metric, TrainingScalar, Summary, SplitLoss)), (
             "fit binds the stopping selector before stepping"
         )
         name = f'{stop.split}/{stop.metric.name}'
@@ -362,6 +362,8 @@ class FitRun:
     last_local_saved: int | None = None
     stopped: bool = False
     training: dict[str, jax.Array] = dataclasses.field(default_factory=dict)
+    update_flops: float | None = None
+    """One update's optimizer work beyond the model's (`OptimConfig.update_flops`), which its logs report."""
     source: Iterator[Batch] | None = None
     train: DevicePrefetchIterator | None = None
     partition: DataPartition | None = None
@@ -468,7 +470,7 @@ class FitRun:
         rejected microbatch's window included; none crossed otherwise."""
         if not any(interval.consumed_committed < point <= interval.consumed for point in points):
             return 0, 0
-        if int(state.microstep) % window:
+        if occupied(state.window):
             return 0, 0
         crossed = interval.consumed, interval.consumed_committed
         interval.consumed_committed = interval.consumed
@@ -650,8 +652,8 @@ def restored(state: TrainState, resume: int, examples: int | None) -> TrainState
 def afresh(initial: TrainState, made: optax.OptState, examples: int | None) -> TrainState:
     """A state supplied to a fit, which reads its data afresh: its clock of examples at none consumed
     where the run is on that clock (`examples`), none on another, and its schedules in the form the run's
-    own optimizer makes (`made`, its init's shapes; `dew.optim.reclocked`), a DiLoCo run's in each group's
-    inner state, its outer optimizer's as it is."""
+    own optimizer makes (`made`, its init's shapes; `dew.optim_schedules.reclocked`), a DiLoCo run's in each
+    group's inner state, its outer optimizer's as it is."""
     consumed = None if examples is None else jnp.zeros((), jnp.int32)
     if initial.inner is not None:
         return dataclasses.replace(initial, consumed=consumed, inner=regrouped(
@@ -899,7 +901,7 @@ def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, s
         for chosen in (owned(Best(choice) if isinstance(choice, str) else choice) for choice in raw)
     )
     labels = [(choice.split, choice.metric) for choice in selection
-              if isinstance(choice._source, (Metric, TrainingScalar))]
+              if isinstance(choice._source, (Metric, TrainingScalar, SplitLoss))]
     if len(labels) != len(set(labels)):
         raise ValueError("select each metric once; one Best.top already keeps all its winners")
     if plateau is not None:
