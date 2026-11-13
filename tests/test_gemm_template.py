@@ -254,19 +254,36 @@ COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family='wgmma')
 FED = dataclasses.replace(COOPERATIVE, family=mosaic_sm90.FED.name)
 """`COOPERATIVE` without a producer: its first consumer issues the rings' loads (`fed.ConsumerFed`)."""
 
+PINGPONG = dataclasses.replace(COOPERATIVE, pingpong=True)
+"""`COOPERATIVE`'s two consumers taking alternate tiles whole, their products in turn (ping-pong)."""
+
+def test_a_family_that_takes_no_pingpong_refuses_it():
+    """Ping-pong is a family's whose own producer loads every tile (`mosaic.Family.takes_pingpong`): a
+    consumer-fed ring's tile refuses it, its first consumer loading every ring's steps, its partner's tiles'
+    past the primed stages none; and tcgen05's persistent walk, whose accumulators turn by tile."""
+    with pytest.raises(ValueError):
+        dataclasses.replace(FED, pingpong=True)
+    tcgen05 = pricing.family_of(mosaic_gpu.Tiles(128, 128, 64, 3, 1, family="tcgen05"), jnp.bfloat16)
+    for family in (mosaic_sm90.FED, tcgen05):
+        with pytest.raises(ValueError):
+            family.persist_scratch(2, pingpong=True)
+
+
 PAIRED = dataclasses.replace(COOPERATIVE, cluster=2)
 """`COOPERATIVE` on a pair of multiprocessors a cluster, the forward's two row tiles of a group sharing its
 matrix's blocks (the interpreter runs the pair's two programs, each loading the shared block whole)."""
 
 
 @runs("sm90")
-@pytest.mark.parametrize("forward", [COOPERATIVE, PAIRED, FED], ids=["one multiprocessor", "a pair", "fed"])
+@pytest.mark.parametrize("forward", [COOPERATIVE, PAIRED, FED, PINGPONG],
+                         ids=["one multiprocessor", "a pair", "fed", "ping-pong"])
 @pytest.mark.parametrize("case", ["scaled", "row scaled"])
 def test_a_cooperative_tile_holds_check_1_with_its_hooks(case, forward):
     """The Hopper launches pinned to a cooperative tile, the forward's alone, a pair's (whose second row
-    tile of a pair past its group's rows stores none of them) or one its first consumer feeds (its rings
-    reused across the program's tiles), interpreted, at an epilogue's column or row scale: each
-    consumer multiplies its half of the stage's rows
+    tile of a pair past its group's rows stores none of them), one its first consumer feeds (its rings
+    reused across the program's tiles) or ping-pong's (each consumer's tiles whole and its own, their
+    products in turn), interpreted, at an epilogue's column or row scale: each
+    consumer multiplies its share of the stage's rows
     and computes their epilogue, as exact as the plain program from float64 truth. An fp32 output's sums are
     the default precision's, which the launches take (exact sums are the kernel gradient's alone). A pair's
     runs on an H100 too (tests/test_gpu_gemm.py)."""
@@ -282,6 +299,22 @@ def a_cooperative_tile_holds_check_1_with_its_hooks(case: str, forward: mosaic_g
         dew = jax.jit(_drop(_dew(spec, interpret_on_cpu=True, precision="default")))
         assert_as_exact(dew, jax.jit(_drop(_plain(spec))), _draw, f"{case} at {forward}",
                         seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
+
+
+@runs("sm90")
+@pytest.mark.parametrize("case", ["plain", "dense plain"])
+def test_a_pingpong_tile_holds_check_1_with_its_gradients(case):
+    """The Hopper forward and input gradient pinned to ping-pong's tile (`PINGPONG`: its two consumers take
+    alternate tiles whole, their products in turn on the tensor cores, each finishing its tile while the
+    other issues the next), interpreted, grouped and dense, a program's tiles more than its consumers: the
+    value and every gradient as exact as the plain program's from float64 truth, the kernel gradient on the
+    cooperative tile (which takes no ping-pong, its consumers each preparing half of a step's rows)."""
+    spec = CASES["plain"] if case == "plain" else dataclasses.replace(CASES["plain"], dense=True)
+    pinned = {grouped_matmul.MosaicGmm: PINGPONG, grouped_matmul.MosaicTgmm: COOPERATIVE}
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.pinned(pinned):
+        assert_as_exact(as_given(_gradients(_dew(spec, interpret_on_cpu=True))), _gradients(_plain(spec)),
+                        _gradient_draw(spec), f"{case} gradients at {PINGPONG}", seeds=SEEDS,
+                        truth_fn=_gradients(_plain(spec, truth=True)))
 
 
 @runs("sm90")

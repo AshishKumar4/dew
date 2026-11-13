@@ -604,6 +604,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
     consumers = 1
     gathers_rows = True  # its load warp's TMA four-row gathers (`gathered.Committed`, row 1376)
+    takes_pingpong = False  # its accumulators in tensor memory turn by tile (`persist`), one product warp
     # The expert down projection's gathered input gradient spilled 56 and 64 bytes at the floor's 24 on a B200
     # (128 x 128 at six stages, 128 x 64 at eight; the hybrid compile-ahead step, row 5358) and nothing at 40.
     gathering_producer = 40
@@ -691,7 +692,9 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
             "accumulators", Accumulators(self.turns, self.rows, width, self.topology, running=summed), "mma",
             ("epilogue",)),), floor=producer)
 
-    def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = ()) -> tuple[tuple, int]:
+    def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = (), *,
+                        pingpong: bool = False) -> tuple[tuple, int]:
+        self.pingponged(pingpong)
         # Its accumulator turns' barriers, filled and drained (`persist`), each rewritten ring's slots'
         # publish barriers (`prepared`), and its tensor memory's address.
         (accumulators,) = self.persist_schedule(consumers, 0).stated()
@@ -701,8 +704,10 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), summed: int = 0,
-                prepared: Callable | None = None, producer: int | None = None) -> None:
-        """`mosaic.Family.persist`. With `prepared`, `prepared(tile, index, slots)` rewrites each step's slots
+                prepared: Callable | None = None, producer: int | None = None,
+                pingpong: bool = False) -> None:
+        """`mosaic.Family.persist`, its tiles' accumulators turning in tensor memory, no ping-pong
+        (`takes_pingpong`). With `prepared`, `prepared(tile, index, slots)` rewrites each step's slots
         before its products read them (a kernel gradient's neighbouring groups' rows zeroed), run by a role
         of its own past the consumers (`warpgroups`: the launch's consumers one more): it waits for each
         step's loads, rewrites them, publishes them to the tensor cores and arrives at the step's `masked`
@@ -715,6 +720,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         sum back) once their commit arrives, freeing the turn for the window after next; the tile's store
         reads the running sums. Each window is a turn (`persistent.tiled`'s `turns`), so the products of a
         window run while the epilogue promotes the one before."""
+        self.pingponged(pingpong)
         if not accumulators:
             raise ValueError(f"{self._HOME}: a persistent launch states their shapes (`accumulators`)")
         if self.topology.paired and (summed or prepared is not None):

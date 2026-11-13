@@ -1323,6 +1323,11 @@ class Transport[Allocated, Opened](abc.ABC):
     where a producer's asynchronous copies run beside the consumers (TMA), more where the consumers issue
     them between their own products (`Mma`'s cp.async)."""
 
+    takes_pingpong: bool = False
+    """Whether its two consumers may take alternate tiles whole, their products in turn (`persist`'s
+    `pingpong`): where a producer of its own loads every tile's steps (`RingFamily`'s), so neither consumer
+    loads a tile its partner walks."""
+
     fixes_up: bool = False
     """Whether a tile's steps may be walked by several programs in turn (`tail.Tail`), each leaving its fp32
     partial in global memory and the last to arrive at the tile's GPU-scope counter merging them
@@ -1574,28 +1579,31 @@ class Transport[Allocated, Opened](abc.ABC):
     @abc.abstractmethod
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
-                unrolled: bool = False, accumulators: tuple = (), producer: int | None = None) -> None:
+                unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
+                pingpong: bool = False) -> None:
         """A persistent kernel's tiles, the grid `tiles` spread over the launch's programs along `axis`, its
         streams (`streams`, as `scoped` hands them) running on across them: `schedule(index)` gives a tile's
         `(active, steps, views, tile)`, whether it streams anything, its step count, each stream's view
-        (`viewed`: a ref and the block indices of the tile's step `j`, counted from 0) and what its
-        consumers are given. Each tile of each consumer role is issued, then finished, once for each value
-        of `active`: `issue(index, tile, walk, active=...)` walks the tile's steps by `walk(step, start,
-        shapes, *, initial=None)`, as `walk` does, a step's index the tile's own (where not active it takes
-        none, its accumulators as they start), and returns the accumulators the walk returns;
-        `finish(index, tile, accs, store, active=...)` stores them by `store(output, value, ref, place)`,
-        a consumer's `value` of output `output` (`outputs`' `(shape, dtype)`) to `ref` at `place`,
-        `store_rows`' `(row_start, first, stored, column, most)` and, where the stored rows come in whole
-        multiples, `least`. A family whose products a role of their own issues runs `issue` in that role
-        and `finish` in its consumers'; a register family runs both in each consumer. The family owns the
-        loads, the step counter across tiles, the streams' drain, the outputs' staging and the stores'
-        completion. A cluster's programs run the same tiles: where a stream is multicast (`streams`),
-        `schedule` gives each of them the same `active`, `steps` and view of it. `walk`'s `in_flight` and
-        `unrolled` are its consumers' walks'. `accumulators` are the shapes of the fp32 accumulators a
-        tile's walk issues into, which a family holding them outside its consumers' registers allocates
-        (tcgen05's tensor memory, read out by `Issuer.chunks`); a register family's walk carries its own. Its
-        producer lowers to `producer` registers a thread (`roles`' floor, `resources.producer_floor` where
-        None), the floor its launch plans with; a family without a producer role takes none."""
+        (`viewed`: a ref and the block indices of the tile's step `j`, counted from 0) and what its consumers
+        are given. Each tile of each consumer role is issued, then finished, once for each value of `active`:
+        `issue(index, tile, walk, active=...)` walks the tile's steps by `walk(step, start, shapes, *,
+        initial=None)`, as `walk` does, a step's index the tile's own (where not active it takes none, its
+        accumulators as they start), and returns the accumulators the walk returns; `finish(index, tile, accs,
+        store, active=...)` stores them by `store(output, value, ref, place)`, a consumer's `value` of output
+        `output` (`outputs`' `(shape, dtype)`) to `ref` at `place`, `store_rows`' `(row_start, first, stored,
+        column, most)` and, where the stored rows come in whole multiples, `least`. A family whose products a
+        role of their own issues runs `issue` in that role and `finish` in its consumers'; a register family
+        runs both in each consumer. The family owns the loads, the step counter across tiles, the streams'
+        drain, the outputs' staging and the stores' completion. A cluster's programs run the same tiles: where
+        a stream is multicast (`streams`), `schedule` gives each of them the same `active`, `steps` and view
+        of it. `walk`'s `in_flight` and `unrolled` are its consumers' walks'. `accumulators` are the shapes of
+        the fp32 accumulators a tile's walk issues into, which a family holding them outside its consumers'
+        registers allocates (tcgen05's tensor memory, read out by `Issuer.chunks`); a register family's walk
+        carries its own. Its producer lowers to `producer` registers a thread (`roles`' floor,
+        `resources.producer_floor` where None), the floor its launch plans with; a family without a producer
+        role takes none. With `pingpong`, on a family that takes it (`takes_pingpong`), its two consumers take
+        alternate tiles whole, their products in turn (`persistent.consumed`'s `turns`), each consumer's tile
+        its own share (`gemm.mosaic_gpu.Tiles.pingpong`)."""
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
@@ -1690,13 +1698,22 @@ class Transport[Allocated, Opened](abc.ABC):
         del consumers
         return [plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
 
-    def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = ()) -> tuple[tuple, int]:
+    def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = (), *,
+                        pingpong: bool = False) -> tuple[tuple, int]:
         """What `persist` scopes in shared memory besides its outputs' staging, which a template's
         allocations count (`resources.Scope`): its barriers (with `rewrites`, each rewritten ring's slots'
-        publish barriers, by its slot count: `persist`'s `prepared`), and its address words
-        (`resources.Scope.addresses`); none where its accumulators live in registers."""
-        del consumers, rewrites
-        return (), 0
+        publish barriers, by its slot count: `persist`'s `prepared`; with `pingpong`, its consumers' turns,
+        `meeting`'s), and its address words (`resources.Scope.addresses`); none else where its accumulators
+        live in registers."""
+        del rewrites
+        self.pingponged(pingpong)
+        return ((self.meeting(consumers),) if pingpong else ()), 0
+
+    def pingponged(self, pingpong: bool) -> None:
+        """Refuse `pingpong` on a family that takes none (`takes_pingpong`): a consumer-fed ring's partner
+        would wait on loads no one issues past the primed stages, and tcgen05's accumulators turn by tile."""
+        if pingpong and not self.takes_pingpong:
+            raise ValueError(f"{self.name} takes no ping-pong: its consumers share each tile")
 
     def published(self) -> None:
         """A consumer's writes to shared memory made visible to the readers that read it asynchronously
@@ -1945,6 +1962,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     bounded_loads = True
     fixes_up = True
     gathers_rows = True
+    takes_pingpong = True
     # Mosaic GPU's default for a warpgroup (its CompilerParams' 128 x 4 x 4 bytes).
     warpgroup_reduction_scratch = 2048
     stores_through_registers = False
@@ -2032,29 +2050,38 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
-                unrolled: bool = False, accumulators: tuple = (), producer: int | None = None) -> None:
+                unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
+                pingpong: bool = False) -> None:
         del accumulators  # its consumers' walks carry their own
+        self.pingponged(pingpong)
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
         # a tile's first loads go out while the consumers store the last one (`_tiled`).
         rings = self.opened(streams)
         staging = self.output_staging(outputs, consumers)
+        # Ping-pong's turns on the tensor cores (`persistent.consumed`'s `turns`).
+        turns = [self.meeting(consumers)] if pingpong else []
 
         def loading():
             loaded, _ = persistent.tiled(tiles, schedule, functools.partial(loads, rings), axis=axis)
             drain(rings.values(), loaded)
 
-        def consuming(smems):
+        def consuming(smems, turns):
             return self._tiled(rings, tiles, schedule, issue, finish, smems, axis=axis, interpret=interpret,
-                               in_flight=in_flight, unrolled=unrolled)
+                               in_flight=in_flight, unrolled=unrolled, turns=turns)
 
-        pl.run_scoped(lambda *smems: self.scheduled(consumers, consuming(smems), loading, floor=producer),
-                      *staging, collective_axes="wg")
+        def scoped(*refs):
+            smems, turn_refs = refs[:len(staging)], refs[len(staging):]
+            consumer = consuming(smems, turn_refs[0] if turn_refs else None)
+            self.scheduled(consumers, consumer, loading, floor=producer)
+
+        pl.run_scoped(scoped, *staging, *turns, collective_axes="wg")
 
     def _tiled(self, rings: dict[str, Ring], tiles: tuple[int, ...], schedule: Callable, issue: Callable,
                finish: Callable, smems, *, axis: str, interpret: bool, in_flight: int,
-               unrolled: bool) -> Callable:
+               unrolled: bool, turns=None) -> Callable:
         """`persist`'s consumers: each walks its tiles' steps at a counter running across the tiles
-        (`_tile_walk`) and stores its outputs (`_stores`); the rings are left as `_ended` leaves them."""
+        (`_tile_walk`) and stores its outputs (`_stores`), each tile its owner's alone at `turns` (ping-pong,
+        `persistent.consumed`'s); the rings are left as `_ended` leaves them."""
         def run(index):
             store = self._stores(smems, index)
 
@@ -2064,7 +2091,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                                        interpret=interpret, in_flight=in_flight, unrolled=unrolled)
 
             ended = persistent.consumed(self, tiles, schedule, issue, finish, store, index, walking,
-                                        axis=axis)
+                                        axis=axis, turns=turns)
             self._ended(rings, ended, index)
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 

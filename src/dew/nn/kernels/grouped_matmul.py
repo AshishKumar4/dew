@@ -578,10 +578,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             return None
         hooks = ba.arguments['hooks']
         stored = hooks.out_dtypes or (ba.arguments['out_dtype'],)
-        plain = resources.tile_registers(family, config.warpgroups, block, dtype, stored=stored,
+        plain = resources.tile_registers(family, config.sharing, block, dtype, stored=stored,
                                         rhs_transposed=self._matrix_transposed(ba),
                                         lhs_retained=ba.arguments.get('paired') is not None)
-        accumulator = -(-config.block_m * columns // config.warpgroups // resources.THREADS)
+        # A consumer's accumulators: its share of the tile's rows (the whole tile's under ping-pong).
+        accumulator = -(-config.share * columns // resources.THREADS)
         # A kernel gradient's consumer prepares its depth half of each step's rows stage in registers (the
         # neighbouring groups' rows zeroed: `mosaic_gpu._staged_halves`), apart from the products, which
         # read shared memory on such a family; mma.sync's products hold that stage in registers already.
@@ -609,8 +610,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # A paired product's second accumulator, carried beside the first (`mosaic_gpu.gmm`'s `paired`): in
         # registers its whole share, in tensor memory the epilogue chunk read beside the first's
         # (`Issuer.chunk_columns`).
-        held_second = -(-config.block_m * family.chunk_columns(config.block_n) // config.warpgroups
-                        // resources.THREADS)
+        held_second = -(-config.share * family.chunk_columns(config.block_n) // resources.THREADS)
         second = held_second if ba.arguments.get('paired') is not None else 0
         plain += second
         if ba.arguments.get('exact_sums') and family.sums_in_persist:
@@ -619,8 +619,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             # beside it a promote at a time (`_promoted`, each product's in turn), not two register
             # accumulators: a 128 x 128 tile 2 x 64 words and the walk's control (B6, where two whole
             # accumulators charged 272 refused it past 248).
-            chunk = -(-config.block_m * family.chunk_columns(columns) // config.warpgroups
-                      // resources.THREADS)
+            chunk = -(-config.share * family.chunk_columns(columns) // resources.THREADS)
             return max(2 * chunk + resources.CONTROL_REGISTERS, plain + max(phases))
         if ba.arguments.get('exact_sums'):
             # Each product's running sum, a second fp32 accumulator (`mosaic_gpu.tgmm`'s exact sums), is
@@ -647,7 +646,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if hooks.prologue is None:
             return 0
         tiles = sum(len(held_axes(axes)) > 1 for axes in hooks.prologue_axes)
-        share = config.block_m * config.block_k // config.warpgroups
+        share = config.share * config.block_k
         stored = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
         in_flight = 0 if self.STAGED_ROWS else family.in_flight
@@ -667,7 +666,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         words)."""
         hooks = ba.arguments['hooks']
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
-        share, columns = config.block_m // config.warpgroups, pricing.tile_columns(config, family)
+        share, columns = config.share, pricing.tile_columns(config, family)
         staging = 0
         if not family.stores_through_registers:
             chunk, _ = mosaic.output_staging(columns, stored)
@@ -686,8 +685,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         vectors += family.column_registers(columns, jnp.float32) if hooks.accumulators > 1 else 0
         # A side tile and an output held beside the next are an epilogue chunk's (`Issuer.chunk_columns`: the
         # whole accumulator's where its registers hold it, tensor memory's chunk on tcgen05).
-        accumulator = -(-config.block_m * family.chunk_columns(columns) // config.warpgroups
-                        // resources.THREADS)
+        accumulator = -(-config.share * family.chunk_columns(columns) // resources.THREADS)
         tiles = sum(len(held_axes(axes)) > 1 for axes in hooks.epilogue_axes) * accumulator
         held = sum(-(-accumulator * jnp.dtype(dtype).itemsize // 4)
                    for dtype in (hooks.out_dtypes or ())[:-1])
@@ -702,16 +700,17 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def _granular(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> bool:
         """Whether `config` is in `family`'s granularity (`candidate`): at most its consumers, at most the
-        programs its registers hold, a ring of two stages at least, whole roles of rows for each consumer,
-        whole column units, one of its depths, and each streamed block's rows in its consumers' equal
+        programs its registers hold, a ring of two stages at least, whole roles of rows for each consumer
+        that shares a tile's rows (`Tiles.sharing`: one under ping-pong, whose consumers take whole tiles),
+        whole column units, one of its depths, and each streamed block's rows in those consumers' equal
         shares (`Family.shares_rows`)."""
         dtype = ba.arguments['tokens'].dtype
         return not (config.warpgroups > min(family.consumers, mosaic_gpu.CONSUMERS)
                     or config.programs > family.programs(config.warpgroups) or config.stages < 2
-                    or config.block_m % (family.role_rows * config.warpgroups)
+                    or config.block_m % (family.role_rows * config.sharing)
                     or config.block_n % family.column_unit(dtype)
                     or config.block_k not in (self.STEPS or family.depths(dtype))
-                    or not all(family.shares_rows(rows, config.warpgroups)
+                    or not all(family.shares_rows(rows, config.sharing)
                                for rows in self._streamed_rows(ba, config)))
 
     def _streamed_rows(self, ba, config: mosaic_gpu.Tiles) -> tuple[int, ...]:
@@ -833,7 +832,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # role of rows).
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
         unit = family.column_unit(ba.arguments['tokens'].dtype)
-        role = family.role_rows * config.warpgroups
+        role = family.role_rows * config.sharing
         band = config.grid_block_n
         moves = [{'stages': config.stages - 1}, {'stages': config.stages + 1},
                  {'grid_block_n': max(1, band // 2)}, {'grid_block_n': band * 2},
@@ -938,7 +937,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         family = next((bundle for bundle in self._families(ba, target) if bundle.name == config.family), None)
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
                 or (family.pairs_product and ba.arguments['interpret'])
-                or self._pair_refuses(ba, config, family)
+                or self._pair_refuses(ba, config, family) or self._pingpong_refuses(config, family)
                 or not self._divides(ba, config) or report.refused(self, ba, config)):
             return False
         # A family fixing its accumulator's rows takes a tile of exactly them a consumer, and one holding its
@@ -952,8 +951,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if tensor:
             blocks = self._allocations(ba, config, family).blocks
             tensor += family.stream_tensor_columns(blocks, config.stages)
-        if (family.accumulator_rows not in (None, config.block_m // config.warpgroups)
-                or tensor > (target.tmem_columns or 0)):
+        if family.accumulator_rows not in (None, config.share) or tensor > (target.tmem_columns or 0):
             return False
         if not self._granular(ba, config, family):
             return False
@@ -974,6 +972,14 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         """Whether the launch's call carries scales beside its matrix (a packed matrix's, step or block
         scales), its layout its own: none of `_Mosaic`'s."""
         return False
+
+    def _pingpong_refuses(self, config: mosaic_gpu.Tiles, family: mosaic.Family) -> bool:
+        """Whether a ping-pong tile (`Tiles.pingpong`) is one the launch does not run: on a family that takes
+        none (`Family.takes_pingpong`: a producer of its own loads every tile), a kernel gradient's (its
+        consumers prepare their halves of each step's rows stage, `STAGED_ROWS`), a scaled or swapped call
+        (a packed decode's buffers and a swapped tile's rows are each consumer's half)."""
+        return config.pingpong and (not family.takes_pingpong or self.STAGED_ROWS or self._scaled
+                                    or config.swapped)
 
     def _pair_refuses(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> bool:
         """Whether a pair's product refuses the call at `config` (`mosaic_gpu.pair_refuses`, the statement

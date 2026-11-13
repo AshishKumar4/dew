@@ -20,7 +20,7 @@ def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
     """The bundle a tile runs on: the one it names (`Tiles.family`, `bundles.named`), for a consumer's share
     of the tile's rows and the columns its accumulators hold (`tile_columns`, `mosaic.Issuer.specialized`)."""
     family = bundles.named(tiles.family, dtype)
-    return family.specialized(tiles.block_m // tiles.warpgroups, tile_columns(tiles, family))
+    return family.specialized(tiles.share, tile_columns(tiles, family))
 
 
 def tile_columns(tiles: "Tiles", family: mosaic.Family) -> int:
@@ -88,9 +88,10 @@ def fixes_up(tiles: "Tiles", dtype) -> bool:
     """Whether a tile's steps may be walked by several programs at `tiles`, each leaving its partial and the
     last to arrive adding them (`mosaic.Family.fixed_up`): its family's, where its consumers hold the tile's
     accumulator in registers, which `fixed_up` leaves and adds whole; not tcgen05's, whose accumulator stays
-    in tensor memory (`Issuer.tensor_columns`), read out a chunk of columns at a time."""
+    in tensor memory (`Issuer.tensor_columns`), read out a chunk of columns at a time; nor a ping-pong tile's,
+    whose consumers each finish their own tiles, which no last wave's partials share."""
     family = family_of(tiles, dtype)
-    return family.fixes_up and not family.tensor_columns(tiles.block_n, 1)
+    return family.fixes_up and not family.tensor_columns(tiles.block_n, 1) and not tiles.pingpong
 
 
 def balanced_tail(tiles: "Tiles", grid: tuple[int, int], steps: int, itemsizes: tuple[int, int], target,

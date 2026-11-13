@@ -25,11 +25,13 @@ The semantics assumed (PTX ISA, `mbarrier`, `cp.async.bulk`, `fence.proxy.async`
   program has not ended is a deadlock.
 
 The properties checked in every reachable state of every interleaving, within the bounds a test gives:
-- no deadlock, and at the end every barrier's phase whole (no arrival left in a phase that never completes)
-  and every completed phase observed by each thread that waits on the barrier (a producer's drain: no slot
-  freed while a release is unseen);
+- no deadlock, and at the end every barrier's phase whole (no arrival left in a phase that never completes),
+  every completed phase observed by some thread that waits on the barrier, and by each that waits on it
+  naming no phase (a producer's drain: no slot freed while a release is unseen); a thread naming each wait's
+  phase may pass over phases its peers observe (ping-pong's consumers, each its own tiles' steps);
 - each wait observes the completion it names, or, naming none, the one it is the thread's next wait for on
-  that barrier: no barrier runs two phases past a thread that still waits on it (a parity wait's aliasing),
+  that barrier: no barrier runs past the completion a thread's next wait on it awaits (a parity wait's
+  aliasing),
   and no thread arrives twice in one phase of a barrier (an early arrival counted toward a phase it does not
   belong to);
 - with that, every execution synchronizes alike, so its happens-before order is one: every read of shared
@@ -338,6 +340,7 @@ def explore(threads: list[list[Event]], arrivals: dict[str, int], *, limit: int 
     every reachable state, and the happens-before order of one execution checked for races. Returns the
     states explored; raises `Violation` with its interleaving where a property fails."""
     counts = [_waits(program) for program in threads]
+    awaited = [_awaited(program) for program in threads]
     seen: set = set()
     stack: list = [(_State(len(threads)), [])]
     completed = None
@@ -349,11 +352,11 @@ def explore(threads: list[list[Event]], arrivals: dict[str, int], *, limit: int 
         seen.add(key)
         if len(seen) > limit:
             raise Violation("bounds", f"more than {limit} states: the bounds are past the checker's", trace)
-        moves = list(state.moves(threads, arrivals, counts, trace))
+        moves = list(state.moves(threads, arrivals, counts, awaited, trace))
         if not moves:
             if not state.ended(threads):
                 raise Violation("deadlock", "no warpgroup can move and some has not ended", trace)
-            state.whole(arrivals, [count[-1] for count in counts], trace)
+            state.whole(arrivals, [_observed(program) for program in threads], trace)
             completed = trace if completed is None else completed
             continue
         stack.extend(moves)
@@ -369,6 +372,39 @@ def _waits(program: list[Event]) -> list[dict]:
         if event.kind == "wait":
             passed[event.at] = passed.get(event.at, 0) + 1
     found.append(dict(passed))
+    return found
+
+
+def _awaited(program: list[Event]) -> list[dict]:
+    """For each position of a program, the completion its next wait on each barrier slot awaits: the one it
+    names (its phase's, counted from one), or, naming none, the one past those its waits before observed."""
+    found, upcoming = [], {}
+    for event in reversed(program):
+        found.append(dict(upcoming))
+        if event.kind == "wait":
+            upcoming[event.at] = event.argument + 1 if event.argument is not None else None
+    found.append(dict(upcoming))
+    found.reverse()
+    # A wait naming no phase awaits the completion past those observed before it.
+    observed: dict = {}
+    for position, event in enumerate(program):
+        found[position] = {at: observed.get(at, 0) + 1 if completion is None else completion
+                           for at, completion in found[position].items()}
+        if event.kind == "wait":
+            observed[event.at] = (observed.get(event.at, 0) + 1 if event.argument is None
+                                  else event.argument + 1)
+    return found
+
+
+def _observed(program: list[Event]) -> dict:
+    """Each barrier slot a program waits on: the completions its waits observe (counted from one) and whether
+    each names its phase."""
+    found: dict = {}
+    for event in program:
+        if event.kind == "wait":
+            seen, named = found.get(event.at, (frozenset(), True))
+            completion = len(seen) + 1 if event.argument is None else event.argument + 1
+            found[event.at] = (seen | {completion}, named and event.argument is not None)
     return found
 
 
@@ -399,18 +435,28 @@ class _State:
         return not self.flight and all(position == len(program)
                                        for position, program in zip(self.positions, threads, strict=True))
 
-    def whole(self, arrivals, waited: list[dict], trace) -> None:
-        """The ended state's barriers: each phase complete, and each seen whole by every thread that waits
-        on it (`waited`, each thread's waits on each barrier slot over its program)."""
+    def whole(self, arrivals, observed: list[dict], trace) -> None:
+        """The ended state's barriers: each phase complete, each completed phase seen by some thread that
+        waits on it, and every one by each that waits on it naming no phase (`observed`, each thread's
+        completions observed on each barrier slot, `_observed`)."""
         for at, state in self.barriers.items():
             if state.pending != arrivals[at[0]] or state.transactions:
                 left = arrivals[at[0]] - state.pending
                 raise Violation("unfinished", f"{at}: {left} arrivals and {state.transactions} transactions "
                                 "left in a phase that never completes", trace)
-            for thread, waits in enumerate(waited):
-                if at in waits and waits[at] != state.phases:
-                    raise Violation("unobserved", f"thread {thread} waited for {waits[at]} of {at}'s "
+            seen = set()
+            for thread, waits in enumerate(observed):
+                if at not in waits:
+                    continue
+                completions, named = waits[at]
+                if not named and len(completions) != state.phases:
+                    raise Violation("unobserved", f"thread {thread} waited for {len(completions)} of {at}'s "
                                     f"{state.phases} completed phases", trace)
+                seen |= completions
+            unseen = sorted(set(range(1, state.phases + 1)) - seen)
+            if any(at in waits for waits in observed) and unseen:
+                raise Violation("unobserved", f"{at}'s completions {unseen} observed by no thread that waits "
+                                "on it", trace)
 
     def arrive(self, at, arrivals, thread, trace, *, transaction: int = 0, count: bool = True) -> None:
         state = self.barrier(at, arrivals)
@@ -426,7 +472,7 @@ class _State:
             self.barriers[at] = _Barrier(state.phases, pending, transactions,
                                          state.arrived | ({thread} if count else frozenset()))
 
-    def moves(self, threads, arrivals, counts, trace) -> Iterator:
+    def moves(self, threads, arrivals, counts, awaited, trace) -> Iterator:
         for flight in sorted(self.flight):
             issuer, position, barrier = flight
             made = self.copy()
@@ -443,7 +489,7 @@ class _State:
             made = self.step(thread, program[position], arrivals, counts, moved)
             if made is not None:
                 made.positions = (*self.positions[:thread], position + 1, *self.positions[thread + 1:])
-                made.check(threads, counts, moved)
+                made.check(awaited, moved)
                 yield made, moved
 
     def step(self, thread, event, arrivals, counts, trace) -> "_State | None":
@@ -471,16 +517,16 @@ class _State:
             made.flight = self.flight | {(thread, self.positions[thread], event.argument)}
         return made
 
-    def check(self, threads, counts, trace) -> None:
-        """No barrier runs two phases past a thread that still waits on it."""
+    def check(self, awaited, trace) -> None:
+        """No barrier runs past the completion a thread's next wait on it awaits (`_awaited`): a wait naming
+        no phase, two phases past the thread's last observed."""
         for thread, position in enumerate(self.positions):
-            done = counts[thread][position]
-            for at, state in self.barriers.items():
-                still = counts[thread][-1].get(at, 0) - done.get(at, 0)
-                if still and state.phases - done.get(at, 0) > 1:
+            for at, completion in awaited[thread][position].items():
+                state = self.barriers.get(at)
+                if state is not None and state.phases > completion:
                     raise Violation(
-                        "aliased", f"{at} runs two phases past thread {thread}, which still waits on it",
-                                    trace)
+                        "aliased", f"{at} runs past completion {completion}, which thread {thread}'s next "
+                                   "wait on it awaits", trace)
 
 
 def _joined(one: dict, other: dict) -> dict:
