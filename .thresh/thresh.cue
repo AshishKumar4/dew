@@ -194,6 +194,7 @@ seams: "norm-cells": {
 		"(sm90, NormRows(jnp.dtype(jnp.bfloat16), narrow=True))": "the fused norm in bf16 on an H100 (FUSED_FASTER, 14a0df682)"
 		"(sm80, NormRows(jnp.dtype(jnp.float16), narrow=True))":  "the fused norm in fp16 on an A100 (FP16_NORM_FASTER, FSNORM16)"
 		"(sm90, NormRows(jnp.dtype(jnp.float16), narrow=True))":  "the fused norm in fp16 on an H100 (FP16_NORM_FASTER, FSNORM16)"
+		"(sm100, NormRows(jnp.dtype(jnp.bfloat16), narrow=True))": "the fused norm in bf16 on a B200 (B200_FUSED, M-EM-40)"
 	}
 }
 
@@ -205,6 +206,7 @@ seams: "swiglu-cells": {
 	declared: {
 		"(sm80, jnp.dtype(jnp.bfloat16))": "the fused SiLU product in bf16 on an A100 (FUSED_FASTER, 14a0df682)"
 		"(sm90, jnp.dtype(jnp.bfloat16))": "the fused SiLU product in bf16 on an H100 (FUSED_FASTER, 14a0df682)"
+		"(sm100, jnp.dtype(jnp.bfloat16))": "the fused SiLU product in bf16 on a B200 (B200_FUSED, M-EM-40)"
 	}
 }
 
