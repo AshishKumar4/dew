@@ -6,6 +6,7 @@ are the verdict, runs none of them: the file carries no `kernel` mark."""
 import dataclasses
 import functools
 import os
+import re
 import tempfile
 import threading
 from collections.abc import Callable
@@ -741,6 +742,35 @@ def test_a_b200s_gathered_input_gradient_fits_its_derived_resources():
                                     {"dew_gmm": _model(launch, arguments, tile)})]
         found = compile_mosaic_kernels(cases, "sm100")
     failed = failures(found) + mosaic_failures(found)
+    assert not failed, "\n".join(failed)
+
+
+def test_a_b200s_split_dense_kernel_gradient_runs_no_rewriting_role():
+    """The 4B's up projection's dense kernel gradient (24,576 rows of 2560 by 9216, fp32) on a compile-only
+    B200 derives a tile whose contraction splits (`Tiles.splits`), and its kernel runs the threads its
+    planning prices for a stage read as loaded (`grouped_matmul._Mosaic.unstaged`): its producer's and its
+    consumers' warpgroups (`.maxntid` 256), no third warpgroup rewriting each step (em35d: 384 threads,
+    6.7x cuBLAS's instructions in that role's predicated LDSM, PRMT and SEL), compiled within its
+    resources."""
+    import kernel_compile as kc
+
+    from dew.nn.kernels import gemm
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    operands = (bf16((24576, 2560)), bf16((24576, 9216)))
+
+    def kernel_gradient(x, dy):
+        # At the default precision, a step's: no promoted sums (`templates.product.promoted`).
+        return gemm.gemm_t(x, dy, None, out_dtype=jnp.float32, precision=jax.lax.Precision.DEFAULT)
+
+    with generation.chosen(grouped_matmul="mosaic"), tuning.seen() as seen:
+        kc.PTX.clear()
+        found = kc.compile_mosaic_kernels([support.KernelCase("up kernel gradient",
+                                                              lambda: (kernel_gradient, operands))], "sm100")
+    assert [config.splits > 1 for config, _ in seen.taken] == [True], seen.taken
+    threads = {int(each) for ptx in kc.PTX.values() for each in re.findall(r"\.maxntid (\d+),", ptx)}
+    assert threads == {256}, threads
+    failed = kc.mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
 

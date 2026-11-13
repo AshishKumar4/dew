@@ -984,10 +984,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def unstaged(self, ba) -> bool:
         """Whether a kernel gradient's rows stage is read as loaded (`mosaic_gpu.rows_unstaged`): a dense call
-        of no prologue or table, laid rows-major, which no consumer or role prepares."""
+        (or its split's runs, `whole_steps`) of no prologue or table, laid rows-major, which no consumer or
+        role prepares."""
         tabled = ba.arguments.get('gather') is not None or ba.arguments.get('scatter') is not None
+        whole = bool(ba.arguments.get('dense')) or bool(ba.arguments.get('whole_steps'))
         return (self.STAGED_ROWS and not self.K_MAJOR
-                and mosaic_gpu.rows_unstaged(dense=bool(ba.arguments.get('dense')),
+                and mosaic_gpu.rows_unstaged(dense=whole,
                                              prologue=ba.arguments['hooks'].prologue, tabled=tabled))
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
@@ -1797,8 +1799,10 @@ class MosaicTgmm(_Mosaic):
 
     def _partials(self, ba):
         """The call `ba` writing fp32 partials, as a split's slices do (`mosaic_gpu.tgmm`): each slice a group
-        of its own, so no dense call's (its stages staged, `unstaged`)."""
-        return self.bind(*ba.args, **{**ba.kwargs, 'out_dtype': 'float32', 'dense': False})
+        of its own, so no dense call's; a dense call's slices whole steps from its first row (`whole_steps`),
+        their stages read as loaded as its own (`unstaged`)."""
+        return self.bind(*ba.args, **{**ba.kwargs, 'out_dtype': 'float32', 'dense': False,
+                                      'whole_steps': bool(ba.arguments.get('dense'))})
 
     def _ran(self, ba, config: mosaic_gpu.Tiles) -> tuple:
         """The call and tile a launch at `config` runs (`_aligned`): a split one's fp32 partials, unsplit."""
@@ -1845,18 +1849,18 @@ class MosaicTgmm(_Mosaic):
              prologue_operands: tuple = (), gather: tuple | None = None, *, out_dtype: str, interpret: bool,
              hooks: Hooks = NO_HOOKS,
              exact_sums: bool = False, dense: bool = False, config: mosaic_gpu.Tiles,
-             return_residuals: bool = False):
+             return_residuals: bool = False, whole_steps: bool = False):
         # The call as the launch runs it, its depth and width padded to whole tiles (`_aligned`), its output
-        # sliced back.
+        # sliced back. `whole_steps`, a dense call's split runs (`_partials`), as `mosaic_gpu.tgmm`'s.
         depth, width = tokens.shape[1], cotangent.shape[1]
         call = self._aligned(self.bind(tokens, cotangent, sizes, prologue_operands, gather,
                                        out_dtype=out_dtype, interpret=interpret, hooks=hooks,
-                                       exact_sums=exact_sums, dense=dense)).arguments
+                                       exact_sums=exact_sums, dense=dense, whole_steps=whole_steps)).arguments
         out = mosaic_gpu.tgmm(call['tokens'], call['cotangent'], sizes, tiles=config, out_dtype=out_dtype,
                               multiprocessors=self._programs(config),
                               interpret=INTERPRETED if interpret else False, prologue=hooks.before(),
                               prologue_operands=call['prologue_operands'], prologue_axes=hooks.prologue_axes,
-                              exact_sums=exact_sums, dense=dense, gather=gather)
+                              exact_sums=exact_sums, dense=dense, gather=gather, whole_steps=whole_steps)
         return out[:, :depth, :width], None
 
 
@@ -1955,12 +1959,12 @@ class MosaicStepScaledTgmm(MosaicTgmm):
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array, prologue_operands: tuple = (),
              gather: tuple | None = None, *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
              exact_sums: bool = False, dense: bool = False, step_scales: tuple = (),
-             config: mosaic_gpu.Tiles, return_residuals: bool = False):
+             config: mosaic_gpu.Tiles, return_residuals: bool = False, whole_steps: bool = False):
         # Bound as a kernel gradient states its operands, rows first: the rows-contiguous operands' transposes
         # (`gemm.blockwise_fp8_kernel_gradient`), which XLA folds into the kernel's own operands, read back as
         # they lie (`mosaic_gpu.tgmm`'s `k_major`); its scales (`step_scales`, the binding's operand) its
-        # mainloop's `step_scales`.
-        del prologue_operands, gather, hooks, dense, return_residuals
+        # mainloop's `step_scales`. Its layout's steps are whole by the caller's (`k_major`), unsplit.
+        del prologue_operands, gather, hooks, dense, return_residuals, whole_steps
         out = mosaic_gpu.tgmm(tokens.T, cotangent.T, sizes, tiles=config, out_dtype=out_dtype,
                               multiprocessors=self._launched(config, interpret),
                               interpret=INTERPRETED if interpret else False, exact_sums=exact_sums,

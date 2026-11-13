@@ -1720,7 +1720,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
          multiprocessors: int, interpret: bool | plgpu.InterpretGPUParams = False, prologue=None,
          prologue_operands: tuple = (), prologue_axes: tuple = (), exact_sums: bool = False,
          dense: bool = False, k_major: bool = False, step_scales: tuple | None = None,
-         gather: tuple | None = None) -> jax.Array:
+         gather: tuple | None = None, whole_steps: bool = False) -> jax.Array:
     """Each group's rows of `lhs` `[rows, depth]` transposed times its rows of `rhs` `[rows, width]`:
     `[groups, depth, width]` in `out_dtype`, an empty group's zero. The depth must divide by
     `tiles.block_m` and the width by `tiles.block_n`, and the tile takes one multiprocessor;
@@ -1732,7 +1732,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     `exact_sums` adds each step's product into the fp32 sum by an IEEE add, which holds two
     accumulators in registers. A `dense` call (one group, every row) on a family that fixes up a tile
     across programs (`balanced`) runs its output tiles' last wave balanced over the programs; with no
-    prologue, its stages are read as loaded (`rows_unstaged`).
+    prologue, its stages are read as loaded (`rows_unstaged`), and so are the runs of its split (each a group
+    of whole steps from the call's first row, `_sliced`: `whole_steps`, which no other call states).
     With `k_major`, `lhs` is `[depth, rows]` and `rhs` `[width, rows]`, the rows contiguous (an FP8
     product's operands, as Hopper's FP8 tensor cores read both), each group's rows whole steps of
     `tiles.block_k` (the caller's layout: no step straddles groups, so no stage is rewritten), with no
@@ -1778,17 +1779,21 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
             side if axes.GROUPS not in side_axes
             else jnp.repeat(side, tiles.splits, axis=list(side_axes).index(axes.GROUPS))
             for side, side_axes in zip(prologue_operands, prologue_axes, strict=True))
+        # A dense call's runs are whole steps from its first row, so no step holds two runs' rows: read as
+        # loaded, as the call's own planning prices them (`grouped_matmul._Mosaic.unstaged`), not rewritten by
+        # a role zeroing neighbours no step has (em35d: the 4B's up kernel gradient issued 6.7x cuBLAS's
+        # instructions at 384 threads, its rewriting role's predicated LDSM, PRMT and SEL each step).
         partials = tgmm(lhs, rhs, sliced, tiles=dataclasses.replace(tiles, splits=1), out_dtype=jnp.float32,
                         multiprocessors=multiprocessors, interpret=interpret, prologue=prologue,
                         prologue_operands=prologue_operands, prologue_axes=prologue_axes,
-                        exact_sums=exact_sums, gather=gather)
+                        exact_sums=exact_sums, gather=gather, whole_steps=dense)
         return partials.reshape(g, tiles.splits, m, n).sum(axis=1).astype(out_dtype)
     # Dew: the rows padded to a multiple of 8, as `gmm`'s, past every group; to whole row blocks where the
     # family's loads read past an operand unpredicated (its last group's last block). A table is padded to
     # whole row blocks always, a pad reading row 0 of its operand, which stays as it is: its producer reads
     # a step's entries by plain loads, which no TMA bounds (`_walked_rows`).
     # A rows-contiguous call's stages are read whole as ever (`_whole_stages`).
-    unstaged = not k_major and rows_unstaged(dense=dense, prologue=prologue,
+    unstaged = not k_major and rows_unstaged(dense=dense or whole_steps, prologue=prologue,
                                              tabled=any(table is not None for table in tables))
     # A stage read as loaded (`rows_unstaged`) zeroes no rows past the call's, so its rows are padded to whole
     # steps wherever its loads past them do not read zeros (an interpreted slice clamps).
@@ -1830,8 +1835,9 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
 def rows_unstaged(*, dense: bool, prologue, tabled: bool) -> bool:
     """Dew: whether a `tgmm` stage is read as loaded, no consumer or role rewriting it: a dense call's (one
     group, every row: no step holds a neighbouring group's rows, and its rows past the call's are zeros,
-    `tgmm`'s padding), with no prologue transforming it and no table gathering its rows (`tabled`). Its step
-    is then its products alone (`_gradient_unrolled`)."""
+    `tgmm`'s padding; its split's runs alike, whole steps from its first row), with no prologue transforming
+    it and no table gathering its rows (`tabled`). Its step is then its products alone
+    (`_gradient_unrolled`)."""
     return dense and prologue is None and not tabled
 
 

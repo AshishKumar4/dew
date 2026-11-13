@@ -1927,6 +1927,32 @@ def test_a_split_kernel_gradient_holds_check_1(splits):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("generation_name", generations("sm90", "sm100"))
+@pytest.mark.parametrize("splits", [2, 3])
+def test_a_dense_split_kernel_gradient_reads_its_runs_as_loaded_and_holds_check_1(generation_name, splits):
+    """Interpreted as `generation_name`, a dense kernel gradient (one group, every row: `ROWS` rows, no whole
+    number of steps) whose contraction splits into runs of whole steps from its first row (`Tiles.splits`,
+    `_sliced`), each run's stage read as loaded as the dense call's own (`rows_unstaged`: no step holds two
+    runs' rows, and its rows past the call's read zeros), on par with XLA's over the draws (check 1), truth
+    float64's."""
+    with generation.assumed(generation_name):
+        family = "tcgen05" if generation_name == "sm100" else "wgmma"
+        tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, splits=splits, family=family)
+
+        def split(x, dy):
+            return mosaic_gpu.tgmm(x, dy, jnp.asarray([ROWS], jnp.int32), tiles=tiles, out_dtype=jnp.float32,
+                                   multiprocessors=1, interpret=grouped_matmul.INTERPRETED, dense=True)
+
+        def plain(x, dy, truth=False):
+            wide = jnp.float64 if truth else jnp.float32
+            return (x.astype(wide).T @ dy.astype(wide))[None]
+
+        assert_as_exact(split, jax.jit(plain), _gradient_rows_draw,
+                        f"{splits}-way dense split kernel gradient", seeds=SEEDS,
+                        truth_fn=functools.partial(plain, truth=True))
+
+
+@INTERPRETS
 @pytest.mark.parametrize("exact_sums", [False, True], ids=["summed in turn", "exact sums"])
 def test_a_kernel_gradient_its_consumers_feed_holds_check_1(exact_sums):
     """Interpreted, a kernel gradient at a tile its first consumer feeds (`FED`, two stages), each group a
