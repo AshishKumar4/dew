@@ -343,9 +343,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     """
     if sinks is not None and sinks.shape != (query.shape[2],):
         raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
-    rule = attention_quantized.owner()
-    quantized = rule is not None and not attention_quantized.whole(rule)
-    if quantized and (not attention_quantized.takes(rule) or sinks is not None or dropout_rate):
+    quantized = _quantized(sinks is not None, bool(dropout_rate))
+    if quantized == 'reference':
         raise ValueError("the template computes a quantized model's attention under an int8 rule of Qwix's "
                          "dynamic absmax, no sinks and no dropout; the reference path computes the rest")
 
@@ -1174,6 +1173,16 @@ def _xla_kernel_narrows(query) -> bool:
         query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not bf16_dot_runs())
 
 
+def _quantized(sinks: bool, dropout: bool) -> str | None:
+    """`AttentionCase.quantized`'s kernel for a call with `sinks` or `dropout`: the template's quantized
+    attention where a quantized model's rule owning its products takes it, the reference path where it does
+    not; None where no rule owns them or it quantizes no activation."""
+    rule = attention_quantized.owner()
+    if rule is None or attention_quantized.whole(rule):
+        return None
+    return 'template' if attention_quantized.takes(rule) and not (sinks or dropout) else 'reference'
+
+
 def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_softmax=True, softcap=None,
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,
                    max_segments=None, key_value_seq_lengths=None, key_value_seq_starts=None,
@@ -1207,7 +1216,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),
-        splash_mask=False, shards=sequence_shards(), dropout=dropout, form=generation.numerics().forms)
+        splash_mask=False, shards=sequence_shards(), dropout=dropout, form=generation.numerics().forms,
+        quantized=_quantized(sinks is not None, dropout))
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
     # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement
     # read the case (`TPU_SUPPORTS`).
