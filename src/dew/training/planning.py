@@ -39,7 +39,7 @@ from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import OuterProgram, compiler_options, owned_program, program_digest
 from dew.nn.kernels.templates import report
-from dew.objectives.base import RECORD, Objective
+from dew.objectives.base import RECORD, Objective, Ratio
 from dew.state import TrainState, apart, together
 from dew.telemetry.compiles import EVENTS, Compiles
 from dew.telemetry.instrumentation import compiled_memory
@@ -226,7 +226,11 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]]):
               for name, value in metrics[-1].items()}
     loss = losses[-1]
     if committed[-1] is not None and committed[-1].own is not None:
-        own = jax.tree.map(lambda *values: sum(values), *(part.own for part in committed))
+        owns = [part.own for part in committed]
+        # Pooled as a window pools them (`Transaction.prepare_attempt`): a loss stated as one scalar as the
+        # mean of its equal microbatches', statistics by their sums.
+        scalar = all(not isinstance(part, Ratio) and jnp.ndim(part) == 0 for part in owns)
+        own = sum(owns) / len(owns) if scalar else jax.tree.map(lambda *values: sum(values), *owns)
         loss = jnp.where(committed[-1].count > 0, loss, reduce(own)[0].astype(loss.dtype))
     summed = jax.tree.map(lambda *values: sum(values), *(
         part if part is None else dataclasses.replace(part, own=None) for part in committed))
