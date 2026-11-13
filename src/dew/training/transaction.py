@@ -180,7 +180,8 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
     examples its microbatch `consumed` (`TrainState.consumed`, where the run keeps one), the loss, the
     metrics with the batch's counts, and whether the loss is finite, the microbatch accepted and the
     window committed."""
-    metrics = {**aux.metrics, **step_counts(batch)}
+    # A metric stated as a statistic is pooled by it across the step's microbatches (`Aux.pooled`).
+    metrics = {**aux.metrics, **aux.pooled, **step_counts(batch)}
     if aux.record is not None:
         assert "evaluated" in aux.record, "a recording transaction stacks its evaluations (`recorded`)"
         metrics |= recorded_metrics(aux.record)

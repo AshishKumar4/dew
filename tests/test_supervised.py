@@ -180,9 +180,9 @@ def test_the_loss_is_the_mean_over_the_real_rows_and_metrics_report_by_name():
     alone, aux = objective.scalar_loss(variables, real, STEP)
     np.testing.assert_allclose(objective.scalar_loss(variables, padded, STEP)[0], alone, rtol=1e-6)
     outputs = Affine().apply(variables, real["x"])
-    np.testing.assert_allclose(aux.metrics["accuracy"].mean()[0],
+    np.testing.assert_allclose(aux.metrics["accuracy"],
                                np.mean(np.argmax(outputs, -1) == real["label"]), rtol=1e-6)
-    np.testing.assert_allclose(aux.metrics["squared"].mean()[0], np.mean(squared(outputs, real)), rtol=1e-6)
+    np.testing.assert_allclose(aux.metrics["squared"], np.mean(squared(outputs, real)), rtol=1e-6)
 
 
 def supervised_run(loss) -> RunConfig:

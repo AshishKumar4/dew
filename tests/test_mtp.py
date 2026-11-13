@@ -185,7 +185,7 @@ def test_the_term_is_off_by_default():
     (loss, aux), grads = jax.value_and_grad(
         lambda p: objective.scalar_loss(p, batch, step_at()), has_aux=True)(params)
 
-    assert float(loss) == float(aux.metrics["ce"].mean()[0])
+    assert float(loss) == float(aux.metrics["ce"])
     assert "mtp_ce" not in aux.metrics
     plain = {"params": {key: value for key, value in params["params"].items()
                         if key != "mtp_0"}}
@@ -212,7 +212,7 @@ def test_the_term_adds_the_weighted_mean_depth_cross_entropy(hyper_connections):
     (loss, aux), grads = jax.value_and_grad(
         lambda p: objective.scalar_loss(p, batch, step_at()), has_aux=True)(params)
 
-    ce = float(aux.metrics["ce"].mean()[0])
+    ce = float(aux.metrics["ce"])
     assert abs(float(loss) - ce) > 1e-2
 
     # Over drawn models and tokens, the term and the loss it joins on par with the written ones (check 1).
@@ -223,7 +223,7 @@ def test_the_term_adds_the_weighted_mean_depth_cross_entropy(hyper_connections):
 
     def dew(params, tokens):
         loss, aux = objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())
-        return aux.metrics["mtp_ce"].mean()[0], loss
+        return aux.metrics["mtp_ce"], loss
 
     def written(model):
         main, depths = written_cross_entropy(model), written_depth_cross_entropy(model)
@@ -287,8 +287,8 @@ def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same(depths):
     _, by_columns = objective.scalar_loss(params, columns, step_at())
     _, by_inputs = objective.scalar_loss(params, carried, step_at())
 
-    assert float(by_inputs.metrics["ce"].mean()[0]) == float(by_columns.metrics["ce"].mean()[0])
-    assert float(by_inputs.metrics["mtp_ce"].mean()[0]) == float(by_columns.metrics["mtp_ce"].mean()[0])
+    assert float(by_inputs.metrics["ce"]) == float(by_columns.metrics["ce"])
+    assert float(by_inputs.metrics["mtp_ce"]) == float(by_columns.metrics["mtp_ce"])
     options = {"train": True, "depths": True, "rngs": {"dropout": step_at().key}}
     supplied = objective.token_scores(params, carried[TEXT_KEY], **options)
     laid = coordinates(segments=segments, positions=positions)

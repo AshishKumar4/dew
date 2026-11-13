@@ -365,7 +365,7 @@ def test_ppos_critic_reads_the_progress_its_step_passes():
              OLD_VALUES_KEY: jnp.zeros_like(mask), RETURNS_KEY: mask}
 
     def critic_loss(objective: PPOObjective, step: Step) -> np.ndarray:
-        return np.asarray(objective.loss(variables, batch, step)[1].metrics["critic/loss"].mean()[0])
+        return np.asarray(objective.loss(variables, batch, step)[1].metrics["critic/loss"])
 
     trained = Step(jnp.asarray(0), jax.random.key(1), None, committed=jnp.asarray(3, jnp.int32))
     validated = replace(trained, training=False)

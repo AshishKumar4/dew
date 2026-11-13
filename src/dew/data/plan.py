@@ -930,15 +930,17 @@ class Plan:
                 f"saved data plan {', '.join(changed)} changed, so the records the saved position counts "
                 "are not this run's; resume with the sources, steps and tokenizers that wrote it"
             )
-        if resume != "relaxed" and edited is None:
+        rewritten: list[str] = []
+        if edited is None:
             # A function outside Dew that declares no identity, a step's or the factory's that configured
             # it, is what its code computes: its module's bytes changed, it may make other rows from the
-            # same records (row 3938).
+            # same records (row 3938), which an exact resume refuses and a relaxed one reads on over, naming
+            # each such step (`code.<step>`).
             saved_code = _saved_code(saved, (*self.manifest.ran, *self.manifest.steps))
             rewritten = [step.name for step, before, now in zip(
                 (*self.manifest.ran, *self.manifest.steps), saved_code, self.manifest.code(), strict=False)
                 if before is not None and before != now]
-            if rewritten:
+            if rewritten and resume != "relaxed":
                 raise PlanChanged(
                     tuple(f"code.{name}" for name in rewritten),
                     f"the code of data step {', '.join(rewritten)} changed since the position was saved, "
@@ -956,7 +958,7 @@ class Plan:
             _log.warning("resuming volatile data; fetched outcomes may differ")
         if edited:
             _log.warning("resuming a mixture whose members changed: %s", ", ".join(edited))
-        return changes + (edited or ())
+        return changes + tuple(f"code.{name}" for name in rewritten) + (edited or ())
 
     def _rules_alike(self, saved: Mapping[str, object]) -> None:
         """Refuse a saved plan that read by a rule (`rules`) whose value is not this Dew's, naming the rule:

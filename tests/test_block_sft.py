@@ -249,7 +249,7 @@ def test_official_sft_loss_and_every_parameter_gradient(source):
         lambda values: obj.scalar_loss(values, batch, step), has_aux=True)(variables)
     np.testing.assert_allclose(loss, reference["loss"], atol=1e-5, rtol=0)
     for name, loss in (("canvas_ce", "canvas_loss"), ("encoder_ce", "encoder_loss")):
-        np.testing.assert_allclose(aux.metrics[name].mean()[0], reference[loss].mean(), atol=1e-5, rtol=0)
+        np.testing.assert_allclose(aux.metrics[name], reference[loss].mean(), atol=1e-5, rtol=0)
     expected = reference_variables(loaded, "gradient.safetensors")
     assert_tree_close(gradient, expected, 1e-4)
     updated = jax.tree.map(lambda value, grad: value - 0.001 * grad, variables, gradient)

@@ -240,8 +240,8 @@ def test_a_validation_token_accuracy_is_the_unpadded_one_and_at_most_one():
               VALID_ROWS: np.arange(len(tokens) + 3) < len(tokens)}
     _, aux = objective.loss(variables, padded, step)
     expected = int(reference["1/correct"]) / int(reference["1/total"])
-    assert float(aux.metrics["token_accuracy"].mean()[0]) == pytest.approx(expected, rel=1e-6)
-    assert float(aux.metrics["token_accuracy"].mean()[0]) <= 1.0
+    assert float(aux.metrics["token_accuracy"]) == pytest.approx(expected, rel=1e-6)
+    assert float(aux.metrics["token_accuracy"]) <= 1.0
 
 
 def test_a_masked_diffusion_accuracy_leaves_its_repeat_rows_out(windows):

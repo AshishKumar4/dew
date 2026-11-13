@@ -69,7 +69,7 @@ def run(config: dict[str, object], batch: int, seq: int, steps: int,
         if not bool(finite):
             raise RuntimeError(f"the loss went non-finite at step {index}")
         record.losses.append(float(loss))
-        record.token_accuracy.append(float(metrics["token_accuracy"].mean()[0]))
+        record.token_accuracy.append(float(metrics["token_accuracy"]))
     return record
 
 

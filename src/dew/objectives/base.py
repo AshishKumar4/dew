@@ -19,6 +19,7 @@ import copy
 import enum
 import functools
 import math
+import sys
 import weakref
 import zlib
 from abc import ABC, abstractmethod
@@ -187,7 +188,11 @@ class Exponentiated(Ratio):
         return jnp.where(active, jnp.exp(value), 0), active
 
     def held(self) -> float:
-        return math.exp(super().held()) if float(np.asarray(self.mass)) > 0 else 0.0
+        if float(np.asarray(self.mass)) <= 0:
+            return 0.0
+        # A cross entropy past a float's range is an infinite perplexity, as `mean`'s exp reads it.
+        mean = super().held()
+        return math.exp(mean) if mean < math.log(sys.float_info.max) else math.inf
 
 
 @struct.dataclass
@@ -604,13 +609,14 @@ class Aux(Generic[Effects]):
     collections. `effects` are additive observations that the optimizer
     applies once per committed update, not once per microbatch.
     """
-    metrics: Mapping[str, jax.Array | Pooled]
-    """The step's metrics, each the loss's own report. A `Pooled` one (a `Ratio`, its numerator and its
-    mass; an `Exponentiated` one, its exponential; a batch's `Moments`) pools over the microbatches a step
-    is read in, so the step logs it as the step read whole would (docs/design/training.md, the logged
-    metrics); an array is one microbatch's, which a step read in several logs as its last's, under
-    `<name>/last_microbatch`, and a metric the objective shows (`Objective.shown`), which a run selects
-    by, is refused as an array where a step is read in several."""
+    metrics: Mapping[str, jax.Array]
+    """The step's metrics, each the loss's own report, a number however it was stated: a metric stated as a
+    `Pooled` statistic (a `Ratio`, its numerator and its mass; an `Exponentiated` one, its exponential; a
+    batch's `Moments`) reads here as its value, and its statistic is kept in `pooled`, which the trainer
+    pools over the microbatches a step is read in, so the step logs it as the step read whole would
+    (docs/design/training.md, the logged metrics); an array is one microbatch's, which a step read in
+    several logs as its last's, under `<name>/last_microbatch`, and a metric the objective shows
+    (`Objective.shown`), which a run selects by, is refused as an array where a step is read in several."""
     variables: Variables | None = None
     """Whole nonparameter collections from one accepted microbatch, such as BatchNorm statistics.
 
@@ -636,6 +642,17 @@ class Aux(Generic[Effects]):
     """What a recording evaluation's `Step.sample` and `Step.boundary` calls produced (`Step.record`),
     which `Objective._loss` fills (`Evaluated`) and a transaction stacks with its replays' (`Recorded`);
     None otherwise."""
+    pooled: Mapping[str, Pooled] = struct.field(default_factory=dict)
+    """The statistics behind the metrics stated as `Pooled`, by name, which the trainer pools across a
+    step's microbatches (`dew.training.planning.whole_step`); set from `metrics` as an Aux is made."""
+
+    def __post_init__(self):
+        # A metric stated as a statistic reads as its value; the statistic is kept for the trainer's pooling.
+        stated = {name: value for name, value in self.metrics.items() if isinstance(value, Pooled)}
+        if stated:
+            object.__setattr__(self, "metrics", {name: value.mean()[0] if isinstance(value, Pooled) else value
+                                                 for name, value in self.metrics.items()})
+            object.__setattr__(self, "pooled", {**self.pooled, **stated})
 
 
 def _has_aux(loss: Loss | tuple[Loss, Aux[Effects]]) -> TypeIs[tuple[Loss, Aux[Effects]]]:
