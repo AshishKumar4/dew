@@ -212,6 +212,47 @@ def _key(path: Path, configs: JSON) -> str:
     return hashlib.sha256(identity.encode()).hexdigest()[:24]
 
 
+def _converts() -> None:
+    """Refuse a conversion where diffusers' key maps, which run in torch, cannot run, naming the install."""
+    missing = [name for name in ("diffusers", "huggingface_hub", "torch")
+               if importlib.util.find_spec(name) is None]
+    if missing:
+        raise ImportError(f"a single-file checkpoint converts through diffusers' key maps, which run in "
+                          f"torch, and {missing} are not installed; {INSTALL}")
+
+
+def _origin(configs: Path, hub: sources.SourceReference | None, metadata: list[Path]) -> JSON:
+    """Where a conversion's configs came from, as its cache entry is named by it: the Hub repo and commit
+    `hub` names, or a local directory's contents, which can change in place, and the size and mtime of the
+    weights it can lend a component the file lacks."""
+    if hub is not None:
+        return to_record(hub, sources.SourceReference)
+    digest = hashlib.sha256()
+    for file in metadata:
+        digest.update(f"{file.relative_to(configs).as_posix()}\0".encode() + file.read_bytes())
+    for file in sorted(configs.glob("*/*.safetensors*")):
+        _, size, modified = stat_identity(file)
+        digest.update(f"{file.relative_to(configs).as_posix()}\0{size}\0{modified}\0".encode())
+    return f"{configs.resolve()}#{digest.hexdigest()}"
+
+
+def _publish_metadata(staging: Path, configs: Path, metadata: list[Path],
+                      index: Mapping[str, object]) -> None:
+    """The configs' metadata files and the pipeline's index (`pipeline_index`) written into `staging`."""
+    for file in metadata:
+        copied = staging / file.relative_to(configs)
+        copied.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(file, copied)
+    (staging / "model_index.json").write_text(json.dumps(index, indent=2))
+
+
+def _weights_file(library: str) -> str:
+    """The safetensors file a component of `library` holds its weights in (`Declared.stem`)."""
+    from dew.interop.diffusion import Declared
+
+    return f"{Declared(library, '').stem}.safetensors"
+
+
 @contextmanager
 def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
              hub: sources.SourceReference | None = None) -> Iterator[tuple[Path, Path]]:
@@ -235,15 +276,7 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
     when the caller's block exits without an error, so an interrupted or
     failed load leaves nothing cached.
     """
-    missing = [
-        name for name in ("diffusers", "huggingface_hub", "torch") if importlib.util.find_spec(name) is None
-    ]
-    if missing:
-        raise ImportError(
-            f"a single-file checkpoint converts through diffusers' key maps, which run in torch, "
-            f"and {missing} are not installed; {INSTALL}"
-        )
-
+    _converts()
     source = Path(path)
     checkpoint: dict[str, torch.Tensor] = {}
     if configs is None:
@@ -254,19 +287,7 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
         configs = _configs(repo)
         hub = sources.SourceReference(repo, configs.name)
     metadata = _metadata(configs)
-    if hub is not None:
-        origin = to_record(hub, sources.SourceReference)
-    else:
-        # A local directory's configs can change in place, so their contents
-        # name them, not their path, and so do the size and mtime of the
-        # weights it can lend a component the file lacks.
-        digest = hashlib.sha256()
-        for file in metadata:
-            digest.update(f"{file.relative_to(configs).as_posix()}\0".encode() + file.read_bytes())
-        for file in sorted(configs.glob("*/*.safetensors*")):
-            _, size, modified = stat_identity(file)
-            digest.update(f"{file.relative_to(configs).as_posix()}\0{size}\0{modified}\0".encode())
-        origin = f"{configs.resolve()}#{digest.hexdigest()}"
+    origin = _origin(configs, hub, metadata)
     target = Path(dew_cache_dir()) / "single_file" / _key(source, origin)
     if (target / "model_index.json").is_file():
         yield target, target
@@ -276,17 +297,13 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
         checkpoint = {name: _torch_view(np.asarray(tensor)) for name, tensor in stored.items()}
     index = pipeline_index(configs)
     with staged(target) as staging:
-        for file in metadata:
-            copied = staging / file.relative_to(configs)
-            copied.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(file, copied)
-        (staging / "model_index.json").write_text(json.dumps(index, indent=2))
+        _publish_metadata(staging, configs, metadata, index)
         missing = []
         for name, library, tensors in converted(checkpoint, configs, index):
             if tensors is None:
                 missing.append(name)
                 continue
-            weights = "diffusion_pytorch_model.safetensors" if library == "diffusers" else "model.safetensors"
+            weights = _weights_file(library)
             write_file(
                 {key: host_view(value.contiguous(), f"{name}'s {key}") for key, value in tensors.items()},
                 staging / name / weights,
@@ -342,10 +359,7 @@ def _borrowed_specs(
             if isinstance(declared_entry, list) and declared_entry
             else "diffusers"
         )
-        weights_name = (
-            "diffusion_pytorch_model.safetensors" if library == "diffusers" else "model.safetensors"
-        )
-        virtual_file = f"{name}/{weights_name}"
+        virtual_file = f"{name}/{_weights_file(library)}"
         entries[virtual_file] = {tname: spec for tname, (_, spec) in component_specs.items()}
         for tname, (real_file, _) in component_specs.items():
             backing_files[f"{virtual_file}\0{tname}"] = real_file
@@ -367,14 +381,7 @@ def metadata(
 ) -> tuple[Path, sources.StoredWeights]:
     """Build the metadata directory and translated component specs of a single-file checkpoint from
     its safetensors header alone, without downloading or reading weight payloads."""
-    missing_pkgs = [
-        name for name in ("diffusers", "huggingface_hub", "torch") if importlib.util.find_spec(name) is None
-    ]
-    if missing_pkgs:
-        raise ImportError(
-            f"a single-file checkpoint converts through diffusers' key maps, which run in torch, "
-            f"and {missing_pkgs} are not installed; {INSTALL}"
-        )
+    _converts()
     import diffusers
     import torch
 
@@ -389,16 +396,7 @@ def metadata(
         configs = _configs(repo)
         hub = sources.SourceReference(repo, configs.name)
     meta_files = _metadata(configs)
-    if hub is not None:
-        origin: JSON = to_record(hub, sources.SourceReference)
-    else:
-        digest = hashlib.sha256()
-        for file in meta_files:
-            digest.update(f"{file.relative_to(configs).as_posix()}\0".encode() + file.read_bytes())
-        for file in sorted(configs.glob("*/*.safetensors*")):
-            _, size, modified = stat_identity(file)
-            digest.update(f"{file.relative_to(configs).as_posix()}\0{size}\0{modified}\0".encode())
-        origin = f"{configs.resolve()}#{digest.hexdigest()}"
+    origin = _origin(configs, hub, meta_files)
     selected = (Path(source.subfolder or "") / filename).as_posix()
     source_id: JSON = (
         [*stat_identity(source.file(root, filename))]
@@ -411,23 +409,16 @@ def metadata(
     index = pipeline_index(configs)
     if not (target / "model_index.json").is_file():
         with staged(target) as staging:
-            for file in meta_files:
-                copied = staging / file.relative_to(configs)
-                copied.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(file, copied)
-            (staging / "model_index.json").write_text(json.dumps(index, indent=2))
+            _publish_metadata(staging, configs, meta_files, index)
     entries: dict[str, Mapping[str, jax.ShapeDtypeStruct]] = {}
     absent: list[str] = []
     for name, library, tensors in converted(checkpoint, configs, index):
         if tensors is None:
             absent.append(name)
             continue
-        weights_name = (
-            "diffusion_pytorch_model.safetensors" if library == "diffusers" else "model.safetensors"
-        )
         # Each tensor's shape and dtype as the read with weights holds it (`host_view`), its dtype the
         # one owner's of a torch dtype's NumPy one (`host_dtype`).
-        entries[f"{name}/{weights_name}"] = {
+        entries[f"{name}/{_weights_file(library)}"] = {
             key_name: jax.ShapeDtypeStruct(tuple(int(dim) for dim in tensor.shape),
                                            host_dtype(tensor, f"{name}'s {key_name}"))
             for key_name, tensor in tensors.items()
@@ -446,10 +437,8 @@ def metadata(
         for comp_name, comp_lib, comp_tensors in converted(loaded_ckpt, configs, index):
             if comp_tensors is None:
                 continue
-            wname = (
-                "diffusion_pytorch_model.safetensors" if comp_lib == "diffusers" else "model.safetensors"
-            )
-            out[f"{comp_name}/{wname}"] = {k: host_view(t, k) for k, t in comp_tensors.items()}
+            out[f"{comp_name}/{_weights_file(comp_lib)}"] = {
+                k: host_view(t, k) for k, t in comp_tensors.items()}
         return out
 
     def read_tensor(file: str, tensor_name: str) -> np.ndarray:

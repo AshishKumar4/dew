@@ -22,6 +22,8 @@ cannot make: a Hub archive's entries through a seekable stream (`HfFileSystem.op
 fetched (`dew.interop.dduf.metadata`). Every check and its order as upstream's; an entry is its data's
 offset and length, which upstream's `DDUFEntry` holds beside its path. A local archive is read by the
 public `read_dduf_file`. Delete this module when `read_dduf_file` takes a binary stream (ledger 5762).
+An archive with a ZIP comment, which huggingface_hub's exporter never writes, reads up to 64 KiB of its
+tail in zipfile's search for its end record (ledger 5779).
 """
 
 from __future__ import annotations

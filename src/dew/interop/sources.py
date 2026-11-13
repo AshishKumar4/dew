@@ -366,19 +366,22 @@ def snapshot(name_or_dir: str, revision: str | None, *,
     if os.path.isdir(name_or_dir):
         return Path(name_or_dir)
     from huggingface_hub import constants, snapshot_download
-    from huggingface_hub.errors import LocalEntryNotFoundError
+    from huggingface_hub.errors import IncompleteSnapshotError, LocalEntryNotFoundError
 
     try:
         directory = Path(snapshot_download(name_or_dir, revision=revision,
                                            allow_patterns=METADATA_PATTERNS))
-    except LocalEntryNotFoundError:
-        if not constants.HF_HUB_OFFLINE:
-            raise
+    except LocalEntryNotFoundError as missing:
         # Offline, a commit none of whose files is metadata (a repo of one DDUF archive) has no snapshot
         # folder in the Hub cache, which huggingface_hub makes only around a file it fetches: its folder
         # is the one of the commit the revision named online (`hub_commit`), as the online call returned
-        # it, and holds what the cache holds of it.
+        # it. A folder the cache holds, or one it knows lacks a file (`IncompleteSnapshotError`), is
+        # huggingface_hub's to answer for.
+        if not constants.HF_HUB_OFFLINE or isinstance(missing, IncompleteSnapshotError):
+            raise
         directory = hub_storage(name_or_dir) / "snapshots" / hub_commit(name_or_dir, revision).value
+        if directory.exists():
+            raise
     if weights is False:
         return directory
     files = repo_files(name_or_dir, directory)
@@ -425,11 +428,16 @@ def _hub_files(name: str, revision: str) -> list[str]:
 
 
 def _hub_header(name: str, revision: str, file: str) -> dict[str, tuple[list[int], str]]:
-    """Each tensor of a Hub file's safetensors header, its shape and dtype tag, read over HTTP."""
-    from huggingface_hub import HfApi
+    """Each tensor of a Hub file's safetensors header, its shape and dtype tag, read over HTTP by the
+    header's exact range (`safetensors_header`) through a stream with no read-ahead: no byte of a tensor
+    fetched, where `HfApi.parse_safetensors_file_metadata` asks the file's first 100,001 bytes."""
+    from huggingface_hub import HfFileSystem
 
-    header = HfApi().parse_safetensors_file_metadata(name, file, revision=revision)
-    return {tensor_name: (list(tensor.shape), tensor.dtype) for tensor_name, tensor in header.tensors.items()}
+    with HfFileSystem().open(f"{name}@{revision}/{file}", "rb", cache_type="none") as stream:
+        header, _ = safetensors_header(stream)
+    return {tensor_name: (list(_records.integers(_records.record(entry, tensor_name)["shape"], "shape")),
+                          _records.text(_records.record(entry, tensor_name)["dtype"], "dtype"))
+            for tensor_name, entry in header.items() if tensor_name != "__metadata__"}
 
 def _hub_sidecar(name: str, revision: str, file: str, tensor_name: str) -> tuple[list[int], str, str]:
     """One tiny metadata sidecar tensor's shape, dtype tag and hex bytes, read by its range over HTTP

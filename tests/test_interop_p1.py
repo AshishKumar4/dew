@@ -67,12 +67,9 @@ def _payloads(path: Path) -> list[tuple[str, int, int]]:
 
 
 def _weightless(hub, repo: str, files: dict[str, Path], declared: tuple[str, ...] = ()) -> None:
-    """No weight file left the Hub for `repo` whole, and none of a tensor's payload but the `declared`
-    metadata tensors' (a sidecar, a latent's statistics) beyond a safetensors file's header read: each
-    range it served (`Served.asked`) clear of every other tensor's payload, save one from a safetensors
-    file's first byte, which huggingface_hub's public header read (`HfApi.parse_safetensors_file_metadata`)
-    asks in one range of its own size. A DDUF archive's every range is clear: its headers and metadata
-    entries are read by their exact ranges."""
+    """No byte of a stored tensor's payload left the Hub for `repo` but the `declared` metadata tensors'
+    (a sidecar, a latent's statistics): every weight file it served, it served by ranges (`Served.asked`),
+    each clear of every other tensor's payload."""
     for served in hub.served:
         if served.repo != repo or served.file is None or served.sent == 0:
             continue
@@ -81,8 +78,6 @@ def _weightless(hub, repo: str, files: dict[str, Path], declared: tuple[str, ...
         if payloads:
             assert served.asked is not None, served
             begin, end = served.asked
-            if begin == 0 and served.file.endswith(".safetensors"):
-                continue
             assert not any(begin < stop and start < end for start, stop in payloads), served
 
 
@@ -166,6 +161,12 @@ def test_pipeline_dduf_single_file_and_composite_loads_without_weights_download_
     unrecorded = _hub_loaded(root, None, "acme/flux-dduf", "unrecorded", offline=True,
                              options={**options, "dduf_file": "unrecorded.dduf"})
     assert unrecorded["refused"] == "FileNotFoundError"
+    # A snapshot the cache holds part of (a metadata file of it gone) is refused offline, as
+    # huggingface_hub answers for it, not read as one without that file.
+    for held in (root / "hub").glob("models--acme--sd3/snapshots/*/scheduler/scheduler_config.json"):
+        held.unlink()
+    partial = _hub_loaded(root, None, "acme/sd3", "sd3-partial", offline=True, options=options)
+    assert "refused" in partial, partial
 
 
 def test_single_file_loads_without_weights_across_storage_dtypes_and_borrowed_shards(
@@ -519,3 +520,41 @@ def test_medias_processor_keeps_image_paths_and_bytes_atomic(tmp_path: Path) -> 
             np.asarray(batch_candidate.conditioning["pixel_values"]),
             np.asarray(ref_batch.conditioning["pixel_values"]),
         )
+
+
+def test_a_host_processors_images_by_url_path_and_bytes_read_as_the_arrays(tmp_path: Path) -> None:
+    """A source processor of the usual kind (Gemma 3's, a `HostProcessor`) given its images by URL, by path
+    (text or `Path`) or as an encoded byte buffer computes the fields it computes from the decoded arrays:
+    a URL or a path reaches the processor as text, which it loads itself, and a byte buffer is opened as
+    the image it holds (B5's review: every text was opened as a local file, so a URL failed)."""
+    import threading
+    from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+    loaded = Pretrained.load(FIXTURES / "hf" / "gemma3-native-tiny", dtype="float32", attention_impl="xla",
+                             max_seq_len=64)
+    assert loaded.processor is not None
+    pixels = (np.random.default_rng(5).random((16, 12, 3)) * 255).astype(np.uint8)
+    path = tmp_path / "image.png"
+    Image.fromarray(pixels).save(path)
+    prompt = json.loads((FIXTURES / "hf" / "gemma3-native-tiny" / "prompts.json").read_text())[0]
+
+    class Quiet(SimpleHTTPRequestHandler):
+        def __init__(self, *args, **options):
+            super().__init__(*args, directory=str(tmp_path), **options)
+
+        def log_message(self, format: str, *args: str) -> None:
+            """Quiet."""
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Quiet)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/image.png"
+        expected = loaded.processor([prompt], images=[[pixels]])
+        for given in (url, str(path), path, path.read_bytes(), bytearray(path.read_bytes())):
+            read = loaded.processor([prompt], images=[[given]])
+            np.testing.assert_array_equal(np.asarray(read.tokens), np.asarray(expected.tokens))
+            for field, value in expected.conditioning.items():
+                np.testing.assert_array_equal(np.asarray(read.conditioning[field]), np.asarray(value))
+    finally:
+        server.shutdown()
+

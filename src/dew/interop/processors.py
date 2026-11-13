@@ -45,10 +45,14 @@ class ProcessorCall(TypedDict, total=False):
     video_metadata: Sequence[Mapping[str, object]]
 
 
+type HostMedia = Media | str | Sequence[HostMedia]
+"""What a `HostProcessor` takes as images: `Media`, and a path or URL it loads itself."""
+
+
 class HostProcessor(Protocol):
     """Declares the HF processor operations kept outside compiled model computation."""
 
-    def __call__(self, *, images: Media | None = None,
+    def __call__(self, *, images: HostMedia | None = None,
                  **kwargs: Unpack[ProcessorCall]) -> Mapping[str, object]: ...
     # The files it wrote are its own bookkeeping; dew calls this for the effect.
     def save_pretrained(self, save_directory: str) -> None: ...
@@ -122,16 +126,18 @@ def _is_image_collection(value: MediaInput) -> TypeGuard[Sequence[MediaInput]]:
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
 
 
-def _as_host_media(value: MediaInput) -> Media:
-    """Narrow `MediaInput` to `Media` when handing images to a `HostProcessor`."""
+def _as_host_media(value: MediaInput) -> HostMedia:
+    """`value` as a `HostProcessor` takes its images: a path or URL as its text, which the processor
+    loads itself (`transformers.image_utils.load_image`), a `Path` as its text, a byte buffer opened as
+    the image it holds, an array or an image as it is."""
     import io
 
     from PIL import Image
 
-    if isinstance(value, np.ndarray | Image.Image):
+    if isinstance(value, np.ndarray | Image.Image | str):
         return value
-    if isinstance(value, str | Path):
-        return Image.open(value)
+    if isinstance(value, Path):
+        return str(value)
     if isinstance(value, bytes | bytearray):
         return Image.open(io.BytesIO(value))
     return [_as_host_media(entry) for entry in value]
