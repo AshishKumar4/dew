@@ -203,12 +203,37 @@ def test_a_gpu_step_runs_the_collectives_its_layout_plans(case):
             report.collectives[axis]), axis
 
 
+def test_a_layers_gathered_bytes_are_its_split_parameters_whole_a_runs_by_its_row():
+    """The bytes a device gathers for its largest layer (`gathered_layer_bytes`): a layer's split
+    parameters whole, its frozen split's beside them, a parameter no axis splits and one of no layer left
+    out, and a scanned run stacked by stage counted a layer's row of it."""
+    from dew.training.memory import gathered_layer_bytes
+
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("fsdp",))
+    split, whole = NamedSharding(mesh, P("fsdp")), NamedSharding(mesh, P())
+
+    def leaf(shape, dtype=jnp.float32, sharding=split):
+        return jax.ShapeDtypeStruct(shape, dtype, sharding=sharding)
+
+    variables = {
+        "params": {"backbone": {
+            "embed": leaf((1000, 64)),
+            "layers_0": {"w": leaf((64, 64))},
+            "layers_1": {"w": leaf((64, 128)), "norm": leaf((64,), sharding=whole)},
+            "stages": {"layers_2_5": {"w": leaf((1, 4, 64, 256), jnp.bfloat16,
+                                                NamedSharding(mesh, P(None, None, "fsdp")))}}}},
+        "frozen": {"backbone": {"layers_1": {"v": leaf((64, 64), jnp.bfloat16)}}},
+    }
+    # layers_1: 64 x 128 fp32 and its frozen 64 x 64 bf16; layers_0 16,384 and a row of the run 32,768.
+    assert gathered_layer_bytes(variables) == 64 * 128 * 4 + 64 * 64 * 2
+
+
 def test_a_gpu_step_over_fsdp_combines_its_parameter_gathers_a_layer_at_a_time():
     """A step over fsdp 2 on compile-only H100s, three decoder layers of 3.5M parameters computed in bf16
     over fp32 ones, under the step's options (`step_compiler_options`, its gathers combined up to its
-    largest layer's, `gathered_layer_bytes`): no all-gather of the compiled step moves more than one layer's
-    bf16 parameters (one whole MiB over them), where the 1 GiB of the collective options alone combines
-    them past one layer (IG-SCALING-2XH100: 4.7 of Qwen3.5-4B's layers a gather, 5 GiB more held)."""
+    largest layer's parameters as stored, `gathered_layer_bytes`): no all-gather of the compiled step moves
+    more than that layer's bytes (a whole MiB over them), where the 1 GiB of the collective options alone
+    combines them past it (IG-SCALING-2XH100: 4.7 of Qwen3.5-4B's layers a gather, 5 GiB more held)."""
     from dew.telemetry.instrumentation import hlo_instructions
     from dew.telemetry.trace import collective
     from dew.training.memory import gathered_layer_bytes
@@ -227,7 +252,7 @@ def test_a_gpu_step_over_fsdp_combines_its_parameter_gathers_a_layer_at_a_time()
 
     step = adam_step(objective, optimizer)
 
-    layer = gathered_layer_bytes(objective, placed)
+    layer = gathered_layer_bytes(placed)
     assert layer is not None
 
     def largest_gather(gathered):
