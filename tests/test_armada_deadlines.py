@@ -247,3 +247,20 @@ def test_a_task_says_each_red_row_last_where_armada_keeps_its_tail(ci, tmp_path,
     said = capsys.readouterr().out.rstrip().splitlines()
     red = said.index("RED 3.12:tests/test_any.py")
     assert "the sum is wrong" in said[red + 1] and "  | ..." in said[red:]
+
+
+def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci, tmp_path):
+    """A pytest an abort ends (a native library's, here os.abort) keeps its whole output and its processes' native
+    stacks among the task's artifacts, named on its red row, so the cause is read from what it left (row 5801:
+    train 788's abort left faulthandler's Python stacks and no native frame; owner, 2026-11-13)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_any.py": "import os\n\n\ndef test_aborts():\n    print('before the abort')\n"
+                                      "    os.abort()\n"})
+    ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "aborted.json", 30.0, cache="off")
+    [aborted] = json.loads((tmp_path / "aborted.json").read_text())["rows"]
+    assert (aborted["exitCode"], aborted.get("signal")) == (1, 6)
+    [kept] = aborted["artifacts"]
+    where = tmp_path / "artifacts" / kept
+    assert "before the abort" in (where / "output.txt").read_text()
+    stacks = (where / "native-stacks.txt").read_text()
+    assert "ended by signal 6" in stacks and "abort" in stacks
