@@ -13,6 +13,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   imported from there, where `dew.optim` held them; the schedule kinds (`Cosine`, `Linear`, `Power`,
   `OneCycle`, `Exponential`) and `OptimConfig` stay in `dew.optim`.
 
+- Dew requires its JAX build 0.12.0.1.post84 (Python alone; the CUDA and PJRT plugins stay post81's): the
+  toolkit's ring waits name their phase, so the interpreter checks two consumers that take alternate tiles
+  of one ring; a tcgen05 pair's step block over a partial depth lowers; the lowering cache keys a program
+  4 to 5 seconds sooner on a 32-layer step.
 - Dew requires its JAX build 0.12.0.1.post83 (Python alone; the CUDA and PJRT plugins stay post81's): a
   Pallas interpreter's thread map runs its threads on a CPU client of its own, so an interpreted kernel
   inside a host callback no longer deadlocks when the calling computation's client has a full device queue.
