@@ -57,8 +57,8 @@ from dew.nn.inputs import (
     ModelInputs,
     Request,
     continuation_keys,
+    local_ids,
     local_rows,
-    media_slots,
     mesh_of,
     numbered_blocks,
     prompt_major,
@@ -548,9 +548,8 @@ def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelI
     if min(inputs.tokens.shape) < 1:
         raise ValueError("masked generation needs nonempty token rows")
     # A prompt's ids within the model's table, as every request's are (`check_inputs`): a slot its media
-    # fill reads its tower where the model says so (`Field.media`).
-    slots = local_rows(media_slots(inputs.token_fields, inputs.tokens.shape))
-    Field.indexing("tokens", (), model).bounded(local_rows(inputs.tokens), slots=slots)
+    # fill reads its tower where the model says so (`TokenTable.media`).
+    Field.indexing("tokens", (), model).bounded(local_ids(inputs))
     capacity = model.max_seq_len if bounded else None
     if capacity is not None and inputs.tokens.shape[1] + budget > capacity:
         raise ValueError("prompt plus max_new_tokens exceeds max_seq_len")
