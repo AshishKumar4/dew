@@ -24,6 +24,7 @@ from dew.nn.attention import (
     AttentionImpl,
     attention_case,
     mask_kernel,
+    quantized_rule,
     reference_only,
     scaled_dot_product_attention,
 )
@@ -1711,7 +1712,8 @@ class CausalSelfAttention(nn.Module):
         return store.paged_kernel(query, softcap=self.ctx.attn_logit_softcap,
                                   arithmetic=reference_only(query, self.ctx.dtype, self.ctx.precision,
                                                             self.ctx.force_fp32_for_softmax),
-                                  named=self.ctx.attention_impl, windowed=windowed, sinks=sunk)
+                                  named=self.ctx.attention_impl, windowed=windowed, sinks=sunk,
+                                  owned=quantized_rule(sunk) is not None)
 
     def _decode_masks(self, positions, rows: int, key_length: int, valid, history: dict[str, jax.Array]
                       ) -> tuple[jax.Array, jax.Array | None]:
