@@ -39,6 +39,7 @@ from dew.batch import FROZEN, Batch, at_path, owned_dicts, placed_at, select, un
 from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume
 from dew.data.compile import Handed
 from dew.data.dataset import (
+    Checkpointable,
     Closeable,
     DataPartition,
     Loader,
@@ -48,7 +49,7 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.data.pipeline import Dataset
-from dew.data.plan import DataResume
+from dew.data.plan import DataResume, PlanChanged
 from dew.distributed.batches import (
     PREFETCH_DEPTH,
     DevicePrefetchIterator,
@@ -120,14 +121,16 @@ from dew.training._fit import (
     clocked,
     consumption_counted,
     counted_step,
-    data_resumed,
     declarations,
     first_batch,
     fit_policies,
     handed_splits,
     pooled_first,
     read_batch,
+    restarted,
     restored,
+    restored_or_restarted,
+    resumed_on,
     stage_reached,
     unrecorded_parts,
     validation_read,
@@ -1309,15 +1312,15 @@ class Trainer(Generic[Loss, Effects]):
             run.stop_control = checkpoints.control(checkpoints.latest)
         if checkpoints is None or start.resume is None:
             return 0, None, lambda: self._placed(start, positioned=False)[:2], start.abstract
-        position, differs = data_resumed(
-            dataset, self._stream_partition(),
-            functools.partial(checkpoints.position, start.resume, DataPartition.of(self.device_mesh)),
-            resume=self.data_resume, step=start.resume)
-        if differs:
-            run.restarted = differs
-            _log.warning("the saved data position's plan differs from this run's in %s, so its data starts "
-                         "again from the beginning of its order while its state resumes "
-                         "(data_resume='relaxed'; 'exact' refuses it)", ", ".join(differs))
+        # Its saved position, which the stream the run opens restores, or starts again where its plan
+        # changed (`_prefetched`); a position saved for other shares is none of this run's to read.
+        try:
+            position = checkpoints.position(start.resume, DataPartition.of(self.device_mesh))
+        except PlanChanged as changed:
+            if self.data_resume == "exact":
+                raise
+            position = None
+            self._restarting(run, tuple(changed.differs))
         return start.resume, position, lambda: self._placed(start, positioned=False)[:2], start.abstract
 
     def _stream_partition(self) -> DataPartition:
@@ -1376,7 +1379,7 @@ class Trainer(Generic[Loss, Effects]):
             partition = self._stream_partition()
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
-                         resumed=current if resumed and position is None else None)
+                         resumed=current if resumed and position is None and run.restarted is None else None)
             source = run.source
             stages = source.stages if isinstance(source, RampedStream | PhasedStream | StepPhases) else ()
             ramp = stages if isinstance(source, RampedStream) else ()
@@ -1402,6 +1405,10 @@ class Trainer(Generic[Loss, Effects]):
                     # a compile refuses it, before the state it would check is traced from that batch.
                     agreed_same("training batch layout", lambda: batch_layout(split_fields(placed_first)[0]))
                     self._fitting(abstract, placed_first)
+            elif position is not None:
+                # Its first batch read, so its worker has restored the stream or started it again
+                # (`_prefetched`), which the run reports as it starts (`DataRestarted`).
+                waited_read(run, interval, agree=True, peek=True)
         state, shardings = placed()
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
@@ -1467,9 +1474,21 @@ class Trainer(Generic[Loss, Effects]):
         """`source`'s batches placed ahead of the step by the prefetch worker, which restores it to
         `position` first, once a pool's processes agree their streams read the same records."""
         assert run.partition is not None
-        if position is not None and isinstance(source, PhasedStream):
-            # A schedule's stage opens where the position stands: the pool agrees on the one it reads.
-            source.set_state(position)
+        if position is None and run.restarted is not None and isinstance(
+                source, StepPhases | RampedStream | PhasedStream):
+            # Started again where its saved position was none of this run's: at the stage its step is in.
+            position = restarted(source, None, None, run.current, run.restarted)
+        elif position is not None and isinstance(source, PhasedStream):
+            # A schedule's stage opens where the position stands, or where it starts again: the pool
+            # agrees on the one it reads.
+            position, differs = resumed_on(source, lambda: position, resume=self.data_resume,
+                                           step=run.current)
+            self._restarting(run, differs)
+
+        def restore(stream: Checkpointable, saved: bytes) -> None:
+            # On the worker that reads the stream, which it opens once (row 5577).
+            self._restarting(run, restored_or_restarted(stream, saved, resume=self.data_resume,
+                                                        step=run.current))
         if jax.process_count() > 1:
             # Each process opened its own stream over its own copy of the
             # corpus, and none reads a record before all agree it is one.
@@ -1496,7 +1515,17 @@ class Trainer(Generic[Loss, Effects]):
             run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), run.marked,
                                   functools.partial(shard_batch, self.device_mesh, reads=run.reads))
         return DevicePrefetchIterator(source, self.device_mesh, self._shape.prefetch, source_state=position,
-                                      reads=run.reads, prepare=prepare)
+                                      reads=run.reads, prepare=prepare, restore=restore)
+
+    @staticmethod
+    def _restarting(run: FitRun, differs: tuple[str, ...]) -> None:
+        """Note a resume whose data starts again, its saved plan differing in `differs` (`DataRestarted`)."""
+        if not differs:
+            return
+        run.restarted = differs
+        _log.warning("the saved data position's plan differs from this run's in %s, so its data starts "
+                     "again from the beginning of its order while its state resumes (data_resume='relaxed'; "
+                     "'exact' refuses it)", ", ".join(differs))
 
     def _scheduled(self, plan: FitPlan, run: FitRun) -> None:
         """Open the next stage of a schedule where the run's commits reached the one it stands in

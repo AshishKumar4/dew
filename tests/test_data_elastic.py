@@ -523,6 +523,37 @@ def test_an_elastic_expansion_reads_one_readers_pieces_in_or_out_of_workers(work
             share.close()
 
 
+@dataclasses.dataclass(frozen=True)
+class Drawn:
+    """A row with a draw of its generator beside it."""
+
+    def __call__(self, row, rng):
+        return {**row, "draw": np.int64(rng.integers(1 << 30))}
+
+
+def test_a_draw_after_an_expansion_is_one_readers_however_its_workers_spread_the_inputs():
+    """A random step after an expansion draws by the row's place among the rows the expansion made (Grain's
+    `random_map`), so one reader of the chain draws alike in no loading workers, in workers that run the
+    expansion over each input (spread), and read elastically, where workers spread the inputs and keyed
+    each draw by its input and its row in it (spec alignment S3, row 5715)."""
+    chain = Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(24)))).shuffle(5).repeat()
+    drawn = chain.flat_map(Pieces(3)).random_map(Drawn()).batch(BATCH)
+
+    def rows(batch):
+        return list(zip(*(np.asarray(batch[name]).tolist() for name in ("id", "piece", "draw")), strict=True))
+
+    def read(stream) -> list:
+        try:
+            return [rows(batch) for batch in itertools.islice(stream, 3)]
+        finally:
+            stream.close()
+
+    whole = read(worker_reader(drawn, 0, 1, 0))
+    assert len({draw for step in whole for _, _, draw in step}) > 1
+    assert read(worker_reader(drawn, 0, 1, 2)) == whole
+    assert read(worker_reader(drawn.elastic(), 0, 1, 2)) == whole
+
+
 class Inline(futures.Executor):
     """Grain's prefetch thread pool, which runs each read as the prefetch submits it, so the reads
     it asks for ahead are made before the read that asked returns. The pool is where reads leave the
