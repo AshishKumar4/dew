@@ -338,12 +338,29 @@ def stored_bounds(name: str, count: int, stored: Mapping[str, list[str]] | None 
     return bounds if bounds is not None and len(bounds) + 1 == count else None
 
 
+KEPT = 1.5
+"""How far past the plan's target a group's tests may weigh before its file is cut afresh: a stored cut is
+kept while each group's recorded tests stay within it (`planned`, cuts.py's `weighed`), and a cut the file
+ran as while its heaviest group, setup included, does (cuts.py's `split`, `refolded`)."""
+
+
+@functools.cache
+def held_seconds() -> float:
+    """The most a stored cut's group may weigh by its recorded tests (`KEPT` of .armada.json's target)."""
+    return KEPT * json.loads(Path(".armada.json").read_text())["target"]
+
+
 def planned(name: str, nodes: list[str], seconds: list[float], count: int,
             stored: Mapping[str, list[str]] | None = None) -> list[list[str]]:
     """Test file `name`'s recorded `nodes` as the plan's `count` groups: its stored cut where it holds them
-    (`stored_bounds`), else cut by their `seconds` (`cut`)."""
+    (`stored_bounds`) and each group's recorded `seconds` stay within `held_seconds`, else cut by their
+    `seconds` (`cut`), as cuts.py's `weighed` weighs it."""
     bounds = stored_bounds(name, count, stored)
-    return cut_by(nodes, bounds) if bounds is not None else cut(nodes, seconds, count)
+    if bounds is not None:
+        groups, weight = cut_by(nodes, bounds), dict(zip(nodes, seconds, strict=True))
+        if max(sum(weight[node] for node in group) for group in groups) <= held_seconds():
+            return groups
+    return cut(nodes, seconds, count)
 
 
 @functools.cache
@@ -398,8 +415,7 @@ def cut_record() -> Path:
     return Path(weights) if weights else DURATIONS
 
 
-def kept(nodes: list[str], planned: list[list[str]], mean: float,
-         bounds: list[str] | None = None) -> list[list[str]]:
+def kept(nodes: list[str], planned: list[list[str]], mean: float) -> list[list[str]]:
     """`nodes`, a task's collected tests of one split file in node-id order, as the plan's groups `planned`
     (the file's recorded tests cut, `cut`): each test the record names in its planned group, so no group runs
     a recorded test its plan did not weigh (2026-11-11: two new parameters moved test_recurrence's 963 s test
@@ -408,17 +424,14 @@ def kept(nodes: list[str], planned: list[list[str]], mean: float,
     there are groups (`groups`), the kth run joining the kth group, so a new parametrization spreads across
     the groups from its first run, never into one group past its deadline (2026-11-03: test_attention_mosaic's
     ~190 new ids, weighed nothing, packed into one). A group of a file whose record misses a test it collects
-    is run, never reused (ci.py's `record`). Under a stored cut (`bounds`, `stored_bounds`) a new test joins
-    the group whose interval it sorts into, where it stays once recorded, so the file's other groups keep
-    their records (Main, 2026-11-13)."""
+    is run, never reused (ci.py's `record`): under a stored cut too, which places it by its interval once
+    recorded (`cut_by`), so a new parametrization is never packed into one group (train 793's review)."""
     group_of = {node: index for index, members in enumerate(planned) for node in members}
     held: list[list[str]] = [[] for _ in planned]
     new: list[list[str]] = []
     for unit in units(nodes):
         placed = next((group_of[nodes[index]] for index in unit if nodes[index] in group_of), None)
-        if placed is None and bounds is not None:
-            held[bisect.bisect_right(bounds, nodes[unit[0]])].extend(nodes[index] for index in unit)
-        elif placed is None:
+        if placed is None:
             new.append([nodes[index] for index in unit])
         else:
             held[placed].extend(nodes[index] for index in unit)

@@ -1037,6 +1037,25 @@ def test_a_split_file_keeps_its_stored_cut_and_its_groups_records_whatever_armad
     assert json.loads((tmp_path / "tests/test_cuts.json").read_text()) == {}
 
 
+def test_a_stored_cut_a_group_of_which_has_outgrown_its_bound_is_cut_afresh(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A stored cut one of whose groups the record now times past `session.KEPT` of the target is not run as
+    it is: the plan and its tasks cut the file afresh alike, so a group past its deadline, which no green run
+    would fold away, never runs again as stored (train 793's review)."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
+    nodes = [f"tests/test_steady.py::test_{index}" for index in range(3)]
+    (tmp_path / "tests/test_steady.py").write_text("".join(f"def test_{index}():\n    pass\n"
+                                                           for index in range(3)))
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict(zip(nodes, [300.0, 200.0, 100.0],
+                                                                           strict=True))))
+    # Stored as [test_0, test_1] and [test_2]: its first group's 500 s is past 1.5 x 300.
+    (tmp_path / "tests/test_cuts.json").write_text(json.dumps({"tests/test_steady.py": [nodes[2]]}))
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(commit(tmp_path, "base")))
+    assert {row["name"]: sorted(row["tests"]) for row in rows} == {
+        "3.12:tests/test_steady.py#1/2": nodes[:1], "3.12:tests/test_steady.py#2/2": nodes[1:]}
+
+
 def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cuts_them(
         ci, tmp_path, monkeypatch, cache_worker):
     """Tests marked shared_setup with one name, on their own decorators, run in one group of their

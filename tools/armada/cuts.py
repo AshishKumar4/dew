@@ -34,7 +34,7 @@ def split(session, tests: list[float], seconds: float, target: float, cut: int =
         return [seconds / count] * count
     setup = max(seconds - sum(tests), 0.0) / cut
     heaviest = max(sum(tests[run.start:run.stop]) for run in session.groups(tests, cut)) if cut > 1 else None
-    if heaviest is not None and heaviest + setup <= KEPT * target:
+    if heaviest is not None and heaviest + setup <= session.KEPT * target:
         count = cut
     else:
         room = max(target - setup, target / 2)
@@ -42,7 +42,6 @@ def split(session, tests: list[float], seconds: float, target: float, cut: int =
     return [sum(tests[run.start:run.stop]) + setup for run in session.groups(tests, count) if run]
 
 
-KEPT = 1.5
 """How far past the target a split file's heaviest group may run before the file is cut again."""
 
 
@@ -75,10 +74,13 @@ def weighed(session, tests: list[float], seconds: float, target: float,
     tests/test_model_protocols.py's 10,537 s of tests were planned as 195 groups of 6,500 s, 354 task-hours;
     armada sized the run by its longest tasks, gave the sites' 874 map tasks 20 of its 688 containers, and
     train 772's CI ran out its deadline). A file with a stored cut (`stored`: each of its groups' recorded
-    seconds, session.CUTS) runs as that cut, each group its tests plus the setup each paid: the durations fold
-    alone keeps or replaces a cut (`refolded`), so a group's name means the same tests from run to run and its
-    record is found again (Main, 2026-11-13)."""
-    if stored:
+    seconds, session.CUTS) runs as that cut, each group its tests plus the setup each paid, while every
+    group's tests stay within `session.KEPT` of `target` (`session.planned`'s test, so its tasks cut it
+    alike): the durations fold alone keeps or replaces a cut (`refolded`), so a group's name means the same
+    tests from run to run and its record is found again (Main, 2026-11-13); one outgrown is cut afresh, so a
+    group past its deadline, which no green run would fold away, is not run as it is again (train 793's
+    review)."""
+    if stored and max(stored) <= session.KEPT * target:
         setup = max((measured[0] if measured is not None else seconds) - sum(stored), 0.0) / len(stored)
         return [weight + setup for weight in stored]
     if measured is not None:
@@ -120,14 +122,14 @@ def refolded(session, stored: Mapping[str, list[str]], runs: Mapping[str, list[f
     kept = dict(stored)
     for name, seconds in runs.items():
         bounds = stored.get(name)
-        if max(seconds) <= KEPT * target:
+        if max(seconds) <= session.KEPT * target:
             if bounds is not None and len(bounds) + 1 == len(seconds):
                 continue
             own, count = before.get(name, {}), len(seconds)
         else:
             own = after.get(name, {})
             units = session.unit_seconds(list(own), list(own.values()))
-            count = len(split(session, units, sum(seconds), target)) if own else 1
+            count = len(split(session, units, sum(seconds), target, len(seconds))) if own else 1
         kept.pop(name, None)
         if count > 1 and own:
             groups = session.cut(list(own), list(own.values()), count)

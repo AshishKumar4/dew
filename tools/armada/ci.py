@@ -2267,7 +2267,7 @@ def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut
     """Whether a file's record `own` no longer cuts it as it runs: its tests differ from those its rows
     `observed` (one added, removed or renamed); a file within `target` (it took `seconds`), or one with no
     tests to cut, is recorded past it, so the plan would split what runs whole; or, for a file past it (as
-    `cut` groups), the groups the plan cuts from the record (`cuts.split`) run a group past `cuts.KEPT` of
+    `cut` groups), the groups the plan cuts from the record (`cuts.split`) run a group past `session.KEPT` of
     the target as its tests ran, setup included, and those it would cut from what they took run their
     heaviest shorter. A cut that fits is kept whatever its tests' times drift, as the plan keeps it, and so
     is one whose heaviest group no cut shortens (a test heavier than the budget, which runs alone either
@@ -2285,7 +2285,7 @@ def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut
         count = len(cuts.split(session, weights, seconds, target, cut))
         return max(sum(ran[run.start:run.stop]) + setup for run in session.groups(weights, count) if run)
 
-    return heaviest(recorded) > cuts.KEPT * target and heaviest(ran) < heaviest(recorded)
+    return heaviest(recorded) > session.KEPT * target and heaviest(ran) < heaviest(recorded)
 
 
 ARTIFACTS = "/armada/task/artifacts"
