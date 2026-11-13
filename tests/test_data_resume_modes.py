@@ -51,6 +51,26 @@ def test_an_exact_resume_whose_data_changed_is_refused(tmp_path):
         _fit(tmp_path, seed=2, steps=4, data_resume="exact")
 
 
+def test_a_step_compiled_ahead_over_a_resume_whose_data_changed_starts_as_its_run_does(tmp_path):
+    """The batch a step compiled ahead, or an offline view, starts a resumed run on (`first_step_batch`) is
+    the one its run starts on: over data shuffled by another seed, resumed relaxed, the new order's first
+    batch, as the run starts its data again; resumed exactly, refused, as the run is."""
+    from dew.data.compile import compile
+    from dew.training.ahead import first_step_batch
+
+    _fit(tmp_path, seed=1, steps=2)
+    (x,) = records(0)
+
+    def first(directory, data_resume: str):
+        trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0, data_resume=data_resume,
+                          checkpoints=None if directory is None else Checkpoints(str(directory)))
+        loader = compile(Pipeline(Memory({"x": x})).shuffle(seed=2).repeat().batch(BATCH))
+        return first_step_batch(trainer, loader, steps=4)
+
+    np.testing.assert_array_equal(first(tmp_path, "relaxed")["x"], first(None, "relaxed")["x"])
+    with pytest.raises(ValueError):
+        first(tmp_path, "exact")
+
 def test_a_resume_whose_data_is_unchanged_reads_on_and_records_no_restart(tmp_path):
     """A relaxed resume of unchanged data reads on from its saved position, as an exact one does: the same
     weight as a run trained to the end without stopping, and no restart reported."""

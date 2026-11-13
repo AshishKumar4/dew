@@ -1007,13 +1007,14 @@ def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader:
     run checked (`Trainer.validate`), and the first batch of the stream of this process's share fit opens
     (`Trainer._stream_partition`, its ramp's stages beginning where updates do) from the position its
     checkpoint left a run resumed under `resume` at (`Checkpoints.position`), under the layout's rules,
-    as the run's resume reads it (`dew.training.startup.resume_admitted`, row 3917). A run its checkpoint
+    or started again where its plan changed and the run resumes its data relaxed, as the run's resume
+    reads it (`dew.training.startup.resume_admitted`, row 3917). A run its checkpoint
     completes has no step to take, and is refused. What a step compiled ahead (`AheadTarget.compiled`)
     and an offline view of a run (`dew.config.RunConfig.viewed`) start from."""
     from flax import linen as nn
 
     from dew.data.dataset import DataPartition
-    from dew.training._fit import first_batch
+    from dew.training._fit import data_resumed, first_batch
 
     trainer._declare_input(lambda: first_batch(loader, trainer._stream_partition()))
     trainer.reading(loader, examples=examples, steps=steps)
@@ -1023,11 +1024,16 @@ def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader:
     if resumed is not None and steps is not None and resumed >= steps:
         raise ValueError(f"the run is complete at step {resumed}, its last checkpoint written, so it has no "
                          "step to take")
-    # The shares fit reads by, its layout placing the rows, the saved one's among them.
+    # The shares fit reads by, its layout placing the rows, the saved one's among them, read on from or
+    # started again as the run's data resume decides (`Trainer.data_resume`, `data_resumed`).
     with nn.logical_axis_rules(trainer.layout.axis_rules):
-        position = None if checkpoints is None or resumed is None else checkpoints.position(
-            resumed, DataPartition.of(trainer.device_mesh))
-        return first_batch(loader, trainer._stream_partition(), position)
+        partition = trainer._stream_partition()
+        if checkpoints is None or resumed is None:
+            return first_batch(loader, partition)
+        saved = DataPartition.of(trainer.device_mesh)
+        position, _ = data_resumed(loader, partition, lambda: checkpoints.position(resumed, saved),
+                                   resume=trainer.data_resume, step=resumed)
+        return first_batch(loader, partition, position)
 
 
 class CompiledAhead(SystemExit):

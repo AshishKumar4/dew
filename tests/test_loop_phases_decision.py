@@ -128,12 +128,13 @@ def test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_cou
     """From the same state over the same batch, each phase's step of the phased decision run computes what
     a run whose loop runs that phase's count computes: its loss and its stepped parameters the same bits (the
     ask's invariant 1); and the FLOPs it counts are that run's, so its FLOP count follows the phase's count,
-    two passes counting more than one (invariant 5)."""
+    two passes counting more than one (invariant 5); and its offline view of an update is that run's."""
     from dew.batch import PHASE as READ_IN
     from dew.config import TrainerConfig
     from dew.data.dataset import DataPartition
     from dew.distributed.batches import split_fields
     from dew.training import Layout, MeshSpec
+    from dew.training.inspection import Inspection, inspected
 
     settings = TrainerConfig(checkpoint_dir=str(tmp_path / "runs"), steps=4, log_every=1, eval_every=None,
                              checkpoint_every=None, checkpoint_final=False, multi_host=False,
@@ -172,6 +173,11 @@ def test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_cou
                                          jax.device_get(stepped.variables), jax.device_get(own.variables)))
         assert stepping.step_flops == alone.step_flops is not None
         counted.append(stepping.step_flops)
+        # Its offline view of one update over the phase's batch is that run's view (`inspected`, at the
+        # count of the phase the batch was read in, not the run's last).
+        for trainer in (stepping, alone):
+            trainer.inspection = Inspection(paths=("*",), targets=("updates",))
+        assert inspected(stepping, batches[phase]) == inspected(alone, batch), phase
     assert counted[0] != counted[1]
 
 

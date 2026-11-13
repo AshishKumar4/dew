@@ -21,6 +21,7 @@ import numpy as np
 import optax
 from flax import struct
 
+from dew.distributed.batches import split_fields
 from dew.nn.inspection import Watched, statistics
 from dew.nn.sharding import layers_of
 from dew.optim import parameter_name
@@ -170,17 +171,22 @@ def inspected[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     `steps`, the run's length, as `fit(steps=...)` builds it. The stepped state is discarded."""
     if trainer.inspection is None:
         raise ValueError("the trainer names no inspection (Trainer(inspection=...)) to report")
+    # The phase the batch was read in (`PhasePasses.at`), read off its host fields, which no step takes.
+    trainer.phase_passes.at(batch)
+    batch, _ = split_fields(batch)
     # An objective that names its input field alone reads its shape off the batch, as `fit` does.
     trainer._declare_input(lambda: batch)
     trainer.scheduled(None if steps is None else steps // trainer.accumulation)
     state, _, _ = trainer.place()
-    step, window = trainer.compile(state, batch), int(state.window_size)
-    # A window is split x accumulation microbatches (`TrainState.window_size`), and each call steps a
-    # split's parts of it, a rejected part's place too: the window's rest, rounded up, in calls.
-    split = window // trainer.accumulation
-    committed = None
-    for _ in range(-(-(window - int(jnp.max(occupancy(state.window)))) // split)):
-        state, *_, committed = step(state, batch, sampled=True)
+    # The step at that phase's pass count, as `fit` and a step compiled ahead build it, not the run's base.
+    with trainer.phase_passes.scoped(trainer, trainer._compiler):
+        step, window = trainer.compile(state, batch), int(state.window_size)
+        # A window is split x accumulation microbatches (`TrainState.window_size`), and each call steps a
+        # split's parts of it, a rejected part's place too: the window's rest, rounded up, in calls.
+        split = window // trainer.accumulation
+        committed = None
+        for _ in range(-(-(window - int(jnp.max(occupancy(state.window)))) // split)):
+            state, *_, committed = step(state, batch, sampled=True)
     if committed is None or committed.inspected is None or not int(committed.count):
         raise ValueError("the sampled window did not commit over this batch (a part of it rejected, its "
                          "loss not finite); inspect a batch whose window commits")
