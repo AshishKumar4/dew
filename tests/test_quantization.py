@@ -1562,6 +1562,18 @@ def test_an_int8_attention_block_under_each_qwix_rule_runs_where_its_attention_i
                                     jnp.zeros((2, 32, 64)))
 
 
+def _traced(block: nn.Module, chosen: list, target: str) -> list:
+    """What a module records into `chosen` as it traces (its init, then its apply) for the GPU generation
+    `target`: the kernels its calls chose."""
+    from dew.nn.kernels import generation
+
+    chosen.clear()
+    x = jnp.zeros((1, 8), jnp.bfloat16)
+    with generation.assumed(target):
+        jax.eval_shape(block.apply, jax.eval_shape(block.init, jax.random.key(0), x), x)
+    return list(chosen)
+
+
 def _whole_product_kernels() -> set[str]:
     """The attention kernels that form their products inside a launch a quantized model's rule never sees
     (`attention_kernels._WHOLE_PRODUCTS` among their supports)."""
@@ -1621,7 +1633,6 @@ def test_an_int8_models_masked_attention_runs_none_of_its_own_orders_whole_produ
     order ran cuDNN's whole products under the rule)."""
     pytest.importorskip("qwix")
     from dew.nn.attention import mask_kernel
-    from dew.nn.kernels import generation
     from dew.nn.kernels.selection import Unlowerable
 
     query = jnp.zeros((1, 64, 4, 64), jnp.bfloat16)
@@ -1639,29 +1650,22 @@ def test_an_int8_models_masked_attention_runs_none_of_its_own_orders_whole_produ
                 chosen.append(refused.kernel)
             return nn.Dense(8)(x)
 
-    x = jnp.zeros((1, 8), jnp.bfloat16)
-
-    def chose(block: nn.Module) -> set[str]:
-        chosen.clear()
-        with generation.assumed(target):
-            jax.eval_shape(block.apply, jax.eval_shape(block.init, jax.random.key(0), x), x)
-        return set(chosen)
-
     # Plain, the order's first kernel, of whole products; under the rule, none such.
-    assert chose(Masked()) <= _whole_product_kernels()
-    assert not chose(Quantization(dtype="int8").apply(Masked())) & _whole_product_kernels()
+    whole = _whole_product_kernels()
+    assert set(_traced(Masked(), chosen, target)) <= whole
+    assert not set(_traced(Quantization(dtype="int8").apply(Masked()), chosen, target)) & whole
 
 
 @pytest.mark.parametrize("target", ["sm100", "sm90"])
 def test_an_int8_models_paged_decode_step_reads_its_rows_through_the_layers_attention(target):
-    """A decode step over a paged pool (`KVStore.paged_kernel`, as `CausalSelfAttention._paged_kernel` asks it,
-    16-key pages of bf16, 4 query heads over 2, 64 wide), traced in a module on a B200 and an H100: plain, a
-    paged kernel; under Qwix's int8 rule, which owns the step's products (`attention.quantized_rule`), none
-    of them, every one forming its products past the rule: the gathered rows through the layer's attention,
-    which routes by the rule (train 801's review F4: the paged path ran A1's whole products)."""
+    """A decode step over a paged pool (`KVStore.paged_kernel`, as `CausalSelfAttention._paged_kernel` asks
+    it, 16-key pages of bf16, 4 query heads over 2, 64 wide), traced in a module on a B200 and an H100:
+    plain, a paged kernel; under Qwix's int8 rule, which owns the step's products
+    (`attention.quantized_rule`), none of them, every one forming its products past the rule: the gathered
+    rows through the layer's attention, which routes by the rule (train 801's review F4: the paged path ran
+    A1's whole products)."""
     pytest.importorskip("qwix")
     from dew.nn.attention import quantized_rule
-    from dew.nn.kernels import generation
     from dew.nn.kv_cache import KVCache, KVStore
 
     chosen = []
@@ -1672,19 +1676,11 @@ def test_an_int8_models_paged_decode_step_reads_its_rows_through_the_layers_atte
             store = KVStore.open(self, KVCache(page_size=16), 2, 64, 2, 64, jnp.bfloat16)
             query = jnp.zeros((2, 4, 64), jnp.bfloat16)
             chosen.append(store.paged_kernel(query, softcap=None, arithmetic=False, named="auto",
-                                             owned=quantized_rule(False) is not None))
+                                             owned=quantized_rule(sinks=False) is not None))
             return nn.Dense(8)(x)
 
-    x = jnp.zeros((1, 8), jnp.bfloat16)
-
-    def chose(block: nn.Module) -> list:
-        chosen.clear()
-        with generation.assumed(target):
-            jax.eval_shape(block.apply, jax.eval_shape(block.init, jax.random.key(0), x), x)
-        return list(chosen)
-
-    assert None not in chose(Decoding())
-    assert set(chose(Quantization(dtype="int8").apply(Decoding()))) == {None}
+    assert None not in _traced(Decoding(), chosen, target)
+    assert set(_traced(Quantization(dtype="int8").apply(Decoding()), chosen, target)) == {None}
 
 
 def test_an_int8_attention_block_on_xla_is_on_par_with_the_reference_path(monkeypatch):

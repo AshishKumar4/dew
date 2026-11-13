@@ -1013,10 +1013,11 @@ class PagedCase:
     owned: bool = False
 
 
-_OWNED = Requirement('owned', lambda case: not case.owned,
-                     "a quantized model's rule owns the step's products, which this kernel forms inside its "
-                     "launch, past the rule; the gathered rows through the layer's attention take them",
-                     row=INHERENT)
+_OWNED: Requirement[PagedCase] = Requirement('owned', lambda case: not case.owned,
+                                             "a quantized model's rule owns the step's products, which "
+                                             "this kernel forms inside its launch, past the rule; the "
+                                             "gathered rows through the layer's attention take them",
+                                             row=INHERENT)
 """The requirement every paged kernel holds (`PagedCase.owned`): the complexity audit's A1 at a paged step."""
 
 
