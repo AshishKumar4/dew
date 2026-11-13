@@ -41,6 +41,7 @@ from jax._src import core as jax_core
 from jax._src.literals import TypedNdArray
 from jax.core import ShapedArray
 from jax.extend import core as jcore
+from jax.typing import DTypeLike
 
 from dew.nn import programs
 
@@ -840,7 +841,7 @@ def _apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitu
 
 
 def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitude | None],
-                 dtype) -> Apart:
+                 dtype: DTypeLike) -> Apart:
     """`_apart` of a float output of `dtype` before its dtype holds it (`_held_apart`), `finite` before its
     own bound is read: whether its operands make it finite."""
     name = symbol(equation.primitive)
@@ -920,7 +921,8 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
     return NOWHERE
 
 
-def _power_apart(equation: jcore.JaxprEqn, operand: Apart, bound: Magnitude | None, dtype) -> Apart:
+def _power_apart(equation: jcore.JaxprEqn, operand: Apart, bound: Magnitude | None,
+                 dtype: DTypeLike) -> Apart:
     """A square's or an integer power's `Apart`, of `dtype`, before its dtype holds it (`_float_apart`)."""
     power = 2 if symbol(equation.primitive) == "square" else equation.params["y"]
     if power == 0:
@@ -940,14 +942,14 @@ def _power_apart(equation: jcore.JaxprEqn, operand: Apart, bound: Magnitude | No
     return Apart(floor, sign, operand.number, operand.number and operand.floor is not None)
 
 
-def _apart_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
-                 apart: list[Apart]) -> Magnitude | None:
-    """`_real_bound`'s bound of a float equation whose result shrinks with an operand or needs one away from
-    zero, each operand's magnitude read only where it is proven finite (`Apart.finite`: an infinite
-    dividend's quotient is infinite whatever bounds it, and a value that overflowed in a narrower dtype
-    reads small in a wider one) and each held where the equation needs it, None otherwise; a divisor, a
-    reciprocal root's operand and a negative power's base are read by their floor alone, which an infinite
-    one holds too, its result a zero:
+def _apart_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apart: list[Apart],
+                 dtype: DTypeLike) -> Magnitude | None:
+    """`_real_bound`'s bound of an equation of a float `dtype` whose result shrinks with an operand or needs
+    one away from zero, each operand's magnitude read only where it is proven finite (`Apart.finite`: an
+    infinite dividend's quotient is infinite whatever bounds it, and a value that overflowed in a narrower
+    dtype reads small in a wider one) and each held where the equation needs it, None otherwise; a divisor, a
+    reciprocal root's operand and a negative power's base are read by their floor alone, which an infinite one
+    holds too, its result a zero:
     - a quotient `x / y` of a finite `|x| <= 2**a` and `|y| >= 2**l`: at most `2**(a - l)`, a power the
       rounded quotient is at most (a division by a reciprocal's product rounds under it as well);
     - `sqrt` of a finite `0 <= x <= 2**a`: at most `2**ceil(a / 2)`; `rsqrt` of `x >= 2**l`: at most
@@ -958,10 +960,9 @@ def _apart_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
       most `2**(2**b max(|l|, |a|))`, and a power more;
     - an integer power of `y <= -1` of `|x| >= 2**l`: at most `2**(y l)`, where `2**(-y l)` is a float (the
       reciprocal of a power that underflows to zero is infinite)."""
-    name, aval = symbol(equation.primitive), equation.outvars[0].aval
-    if not isinstance(aval, ShapedArray) or not jnp.issubdtype(aval.dtype, jnp.floating):
+    if not jnp.issubdtype(dtype, jnp.floating):
         return None
-    upper, held = operands[0], apart[0]
+    name, upper, held = symbol(equation.primitive), operands[0], apart[0]
     above = held.above
     if name == "div":
         floor = apart[1].floor
@@ -989,7 +990,7 @@ def _apart_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
     power = equation.params["y"]
     if power == 0:
         return UNIT
-    if held.floor is None or -power * held.floor < int(jnp.finfo(aval.dtype).minexp):
+    if held.floor is None or -power * held.floor < int(jnp.finfo(dtype).minexp):
         return None
     return power * held.floor
 
@@ -1014,7 +1015,7 @@ def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
     dtype = np.dtype(aval.dtype)
     if dtype == np.bool_:
         return UNIT
-    real = _real_bound(equation, operands, apart)
+    real = _real_bound(equation, operands, apart, dtype)
     if not jnp.issubdtype(dtype, jnp.integer):
         return real
     full = _integer_range(dtype)
@@ -1028,13 +1029,13 @@ def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
     return None if real is None else min(real, full)
 
 
-def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
-                apart: list[Apart]) -> Magnitude | None:
-    """`_bounded`'s bound as the real arithmetic on the operands' bounds proves it (a float's, or an
-    integer's before its dtype wraps it), each operand `|x| <= 2**a` (`y`'s `2**b`). Each rule's reason
-    over the box of its operands, and its float rounding's slack (a float rounds to nearest, monotone, so a
-    result whose exact value is under a representable power of two `2**c` rounds to at most it: the
-    rules whose bound is such a power spend no slack):
+def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apart: list[Apart],
+                dtype: DTypeLike) -> Magnitude | None:
+    """`_bounded`'s bound of an output of `dtype` as the real arithmetic on the operands' bounds proves it (a
+    float's, or an integer's before its dtype wraps it), each operand `|x| <= 2**a` (`y`'s `2**b`). Each
+    rule's reason over the box of its operands, and its float rounding's slack (a float rounds to nearest,
+    monotone, so a result whose exact value is under a representable power of two `2**c` rounds to at most it:
+    the rules whose bound is such a power spend no slack):
     - a comparison, `is_finite`, `sign`: at most 1 by its definition;
     - `tanh`, `logistic`, `sin`, `cos`, `erf` of a real operand: at most 1 everywhere in the reals, and at
       most 2 as computed: a native implementation's polynomial is not certified within the real range (an
@@ -1070,7 +1071,7 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
         # One power past the real range for a native implementation's rounding.
         return UNIT + 1
     if name in APART_BOUNDED or (name == "integer_pow" and equation.params["y"] < 1):
-        return _apart_bound(equation, operands, apart) if real else None
+        return _apart_bound(equation, operands, apart, dtype) if real else None
     if any(bound is None for bound in operands):
         return None
     given: list[int] = [bound for bound in operands if bound is not None]
