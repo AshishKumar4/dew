@@ -1105,14 +1105,18 @@ def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_l
 
 @pytest.mark.parametrize(("generation_name", "tokens", "width", "declared"), [
     ("sm80", 4096, 128, True), ("sm90", 32768, 64, True), ("sm80", 256, 128, True), ("sm80", 4096, 256, True),
-    ("sm90", 65536, 128, False), ("sm80", 65536, 64, False)],
-    ids=["a100-measured", "h100-longest", "shorter", "wider", "longer", "longer-narrower"])
+    ("sm90", 65536, 128, False), ("sm80", 65536, 64, False), ("sm100", 4096, 256, True),
+    ("sm100", 16384, 128, True), ("sm100", 1024, 128, False), ("sm100", 4096, 64, False),
+    ("sm100", 32768, 256, False)],
+    ids=["a100-measured", "h100-longest", "shorter", "wider", "longer", "longer-narrower", "b200-measured",
+         "b200-longest", "b200-shorter", "b200-narrower", "b200-longer"])
 def test_a_16_bit_calls_declared_cell_holds_only_within_its_receipts_shapes(generation_name, tokens, width,
                                                                              declared):
     """A bf16 causal call over 8 key heads on an A100 or an H100, whose declared cell names FlashAttention
     (`attention_kernels.DECLARED`), its receipts holding up to 32768 tokens (`MEASURED`: their lead growing
     as the calls shorten): a call within them, a shorter or a wider one among them, is in that cell; a
-    longer one is a cell none declares, which takes the template (row 5285)."""
+    longer one is a cell none declares, which takes the template (row 5285). On a B200, whose cell names
+    cuDNN, its receipts' shapes alone: 4096 to 16384 tokens at widths 128 and 256."""
     from dew.nn import attention_kernels
     from dew.nn.attention import attention_case
 
