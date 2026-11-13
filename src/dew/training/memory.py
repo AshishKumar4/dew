@@ -30,7 +30,7 @@ from dew.mesh import batch_axes, mesh_axes
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.kernels.templates import report
-from dew.nn.protocols import OffloadsResiduals, Recomputing, TritonGemm
+from dew.nn.protocols import ComputesIn, OffloadsResiduals, Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
 from dew.telemetry.instrumentation import compiled_memory
@@ -51,17 +51,56 @@ COLLECTIVES = {
 }
 """NVIDIA JAX-Toolbox's collective options for a GPU step over several devices: the scheduler overlaps
 each collective with compute, and the collectives combine into few large ones. Measured in
-docs/performance.md, "Collectives over several GPUs"."""
+docs/performance.md, "Collectives over several GPUs". A step that gathers its layers' parameters combines
+its all-gathers up to one layer's instead (`gathered_layer_bytes`)."""
+
+GATHER_THRESHOLD = 'xla_gpu_all_gather_combine_threshold_bytes'
+"""The bytes XLA combines a step's all-gathers up to (`COLLECTIVES`, `step_compiler_options`)."""
+
+LAYER = re.compile(r"layers_\d+")
+"""A decoder layer's module name in a variables tree (`dew.inference.banks.one_layer`)."""
 
 
-def step_compiler_options(objective, tokens: float, frozen: bool,
-                          devices: int) -> jax.stages.CompilerOptions | None:
+def gathered_layer_bytes(objective, variables: Variables) -> int | None:
+    """The bytes a device gathers for the largest layer's split parameters: each leaf a parameter axis
+    splits (`parameter_axes`) under a `layers_{i}` module (`LAYER`), of every collection (a frozen split's
+    too), gathered whole, a floating leaf in the dtype its step computes in where that is narrower (a
+    module's `ComputesIn.dtype`: XLA converts the shard, then gathers it); None where no layer's leaf is
+    split. A step whose all-gathers combine up to one layer's gathers each layer at once and holds no more
+    than a layer's ahead of its use (`step_compiler_options`): on 2 x H100 at fsdp 2, Qwen3.5-4B's 1 GiB
+    combined about 4.7 layers' 215 MiB each in its forward and held 5 GiB more at its peak than 128 MiB
+    did, in the same time (IG-SCALING-2XH100), and a Llama-3.1-8B's 128 MiB split its 0.44 GB layers' and
+    lost 2.6% (docs/performance.md)."""
+    stated = [jnp.dtype(module.dtype).itemsize for module in objective.towers()
+              if isinstance(module, ComputesIn) and module.dtype is not None]
+    computed = min(stated, default=None)
+    layers: dict[tuple[str, ...], int] = {}
+    for path, leaf in jax.tree_util.tree_flatten_with_path(variables)[0]:
+        names = [str(getattr(key, "key", key)) for key in path[1:]]
+        at = max((index for index, name in enumerate(names) if LAYER.fullmatch(name)), default=None)
+        sharding = getattr(leaf, "sharding", None)
+        if at is None or not (isinstance(sharding, NamedSharding) and any(
+                sharding.mesh.shape[axis] > 1 for assignment in sharding.spec
+                for axis in parameter_axes(mesh_axes(assignment)))):
+            continue
+        itemsize = jnp.dtype(leaf.dtype).itemsize
+        if computed is not None and jnp.issubdtype(leaf.dtype, jnp.floating):
+            itemsize = min(itemsize, computed)
+        layer = tuple(names[:at + 1])
+        layers[layer] = layers.get(layer, 0) + leaf.size * itemsize
+    return max(layers.values(), default=None)
+
+
+def step_compiler_options(objective, tokens: float, frozen: bool, devices: int, *,
+                          gathered: int | None = None) -> jax.stages.CompilerOptions | None:
     """Return the XLA options for this objective's training step on this device.
 
     Each option applies unless the run set that flag itself. `tokens` is the
     number of tokens one device steps (`device_tokens`), `frozen` says
     whether the step trains next to frozen weights, and `devices` is how
-    many the step spans: over several GPUs it takes `COLLECTIVES`.
+    many the step spans: over several GPUs it takes `COLLECTIVES`, its
+    all-gathers combined up to the `gathered` bytes of its largest layer
+    (`gathered_layer_bytes`) in whole MiB where it gathers its layers.
 
     On a GPU, dots that share an input (q, k and v; gate and up) run separately.
     XLA's dot merger would run them as one GEMM over their weights, concatenated
@@ -95,6 +134,8 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
     options: dict[str, Option] = {}
     if backend() == 'gpu' and devices > 1:
         options.update({name: value for name, value in COLLECTIVES.items() if xla_flag(name) is None})
+        if gathered and xla_flag(GATHER_THRESHOLD) is None:
+            options[GATHER_THRESHOLD] = -(-gathered // 2 ** 20) * 2 ** 20
     small = tokens <= 128
     if (backend() == 'gpu' and xla_flag('xla_gpu_dot_merger_threshold_mb') is None
             and not (frozen and small)):
@@ -183,7 +224,7 @@ def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: 
     mesh's batch axes, and whether `variables` hold frozen weights it trains beside."""
     shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
     return step_compiler_options(objective, device_tokens(objective, micro, shards), FROZEN in variables,
-                                 mesh.devices.size)
+                                 mesh.devices.size, gathered=gathered_layer_bytes(objective, variables))
 
 
 def device_tokens[LossT, EffectsT](objective: Objective[LossT, EffectsT], batch: Batch, shards: int) -> float:
