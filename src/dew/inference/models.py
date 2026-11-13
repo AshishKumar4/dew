@@ -191,6 +191,7 @@ class ReleasedRun(SavedRun):
             raise ValueError("a release holds the weights its export chose (`dew export --ema`); load the "
                              "run itself to choose its average")
         from dew.checkpoints import host_or_placed
+        from dew.interop.pretrained import on_default_device
 
         host_or_placed(on_host, mesh, layout)
         variables = (unflatten(read_specs(self.directory)) if self.shapes
@@ -214,7 +215,10 @@ class ReleasedRun(SavedRun):
 
         if on_host:
             return jax.tree_util.tree_map_with_path(cast, variables)
-        # The memory-mapped release read and cast a leaf at a time as it is placed, never whole.
+        # The memory-mapped release read and cast a leaf at a time as it is placed, never whole: on the
+        # mesh asked, else on JAX's default device, uncommitted, as a family's load places it (ledger 4798).
+        if mesh is None and layout is None:
+            return on_default_device(variables, cast=cast)
         return place(variables, mesh, layout, cast=cast)
 
 

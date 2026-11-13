@@ -112,7 +112,9 @@ from dew.sampling.text import Sampling, with_ids_of
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
+    from jax.tree_util import KeyPath
 
+    from dew.distributed.host import Leaf
     from dew.inference.tasks import SavedRun, TaskSettings
     from dew.interop.releases import ReleasePlan
     from dew.lora import Adapter, LoRA
@@ -194,17 +196,23 @@ def _share_quantized_aliases(tensors: dict[str, unread.Stored], aliases: tuple[t
                 tensors[name] = value
 
 
-def on_default_device(variables: Variables) -> Variables:
+def on_default_device(variables: Variables, *, cast: Callable[[KeyPath, Leaf], Leaf] | None = None
+                      ) -> Variables:
     """`variables` with each host leaf on JAX's default device as a `jnp` array is, uncommitted, so a
     jitted call reads it where it is and a placement moves it, one leaf at a time: a leaf's transfer
     completes before the next starts, and its host copy is released (a memory-mapped one's pages
-    evicted, `dew.distributed.host.evict`) once its device copy is written back in its place."""
+    evicted, `dew.distributed.host.evict`) once its device copy is written back in its place. A leaf is
+    as `cast(path, leaf)` makes it where given, cast as it is placed."""
     from dew.distributed.host import placed_leaves
+
+    def placed(path: KeyPath, leaf: Leaf) -> Leaf:
+        if not isinstance(leaf, (np.ndarray, np.generic)):
+            return leaf
+        return jax.device_put(leaf if cast is None else cast(path, leaf))
 
     # A freshly loaded tree's nodes are its own plain dicts, written in place so that no host leaf
     # outlives its device copy.
-    return placed_leaves(variables, lambda _, leaf: jax.device_put(leaf)
-                         if isinstance(leaf, (np.ndarray, np.generic)) else leaf, in_place=True)
+    return placed_leaves(variables, placed, in_place=True)
 
 
 @dataclass(frozen=True)
