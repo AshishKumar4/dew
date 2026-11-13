@@ -1268,7 +1268,10 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
     # The first step's pass count, the phase its batch was read in (`Trainer`'s `phase_passes`).
     trainer.phase_passes.at(batch)
     try:
-        with assumed(on, portable=portable), trainer.phase_passes.scoped(trainer, trainer._compiler):
+        # Traced with the target's first device as the default, so a library that reads the GPU it is traced
+        # for (JAX's cuDNN attention gates, row 5894) reads the target's, not this process's backend.
+        with (assumed(on, portable=portable), trainer.phase_passes.scoped(trainer, trainer._compiler),
+              jax.default_device(trainer.device_mesh.devices.flat[0])):
             target = gpu_target()
             planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity,
                                              frontier)
