@@ -17,7 +17,7 @@ from dew.data.text import HFTokenizer
 from dew.decision import DecisionObjective
 from dew.diffusion.discrete import MDLM
 from dew.inference.tasks import RunProcessor, TextGeneration
-from dew.inputs import OutsideTable
+from dew.inputs import Field, OutsideTable
 from dew.objectives.diffusion import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.registry import models
@@ -322,3 +322,24 @@ def test_rows_given_already_placed_are_bounded_where_they_lie():
     with pytest.raises(OutsideTable) as refused:
         field.bounded(jnp.asarray([[1, ROWS + 3, 2, 3]], jnp.int32))
     assert (refused.value.token, refused.value.rows) == (ROWS + 3, ROWS)
+
+
+def _refused_in_a_process(token: int) -> None:
+    """A token bound checked in a process of its own, as a data worker's would be."""
+    Field("text", (SEQ_LEN + 1,), rows=ROWS).bounded(np.full(SEQ_LEN + 1, token, np.int32))
+
+
+def test_a_token_refusal_crosses_a_process_as_itself():
+    """A token refusal raised in another process reaches the one that waits on it as the refusal it was
+    (`OutsideTable`), with the id, the table's rows and the message it named, not as an error that hides it:
+    an exception crosses a process as its arguments, which the refusal keeps."""
+    import concurrent.futures
+    import multiprocessing
+
+    pool = concurrent.futures.ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"))
+    with pool, pytest.raises(OutsideTable) as raised:
+        pool.submit(_refused_in_a_process, ROWS + 5).result()
+    assert outside(raised) == (ROWS + 5, ROWS)
+    with pytest.raises(OutsideTable) as here:
+        _refused_in_a_process(ROWS + 5)
+    assert str(raised.value) == str(here.value)

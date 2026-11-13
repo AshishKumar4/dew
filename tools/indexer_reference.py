@@ -217,15 +217,11 @@ def published_keep(mask: str, segments: np.ndarray = PUBLISHED_SEGMENTS) -> np.n
 def write_published_recording(command: str) -> None:
     """recorded_<case>.npz, one a case, each under the size a fixture keeps in git: the case's published
     loss and its gradient in the indexer's scores recorded over check 1's seeds (`record_case`), the
-    float32 run against the float64 run, the count planned on Dew's `indexer_kl` and confirmed on the
-    reference."""
+    float32 run against the float64 run."""
     import jax
     import jax.numpy as jnp
     from fetched_fixtures import save
     from recorded_references import provenance, record_case
-
-    from dew.nn.mla import indexer_kl
-    from dew.nn.sparse_selection import top_k_keys
 
     scale = PUBLISHED["head_dim"] ** -0.5
     published = {dtype: published_methods(dtype) for dtype in (jnp.float32, jnp.float64)}
@@ -246,20 +242,8 @@ def write_published_recording(command: str) -> None:
                               "per query": np.asarray(per_query)})
             return found[0], found[1]
 
-        def proxy(inputs, mask=mask, sparse=sparse):
-            keep = jnp.asarray(published_keep(mask))
-            region = top_k_keys(inputs["scores"], keep, PUBLISHED["top_k"]) if sparse else keep
-
-            def loss(scores):
-                per_query = indexer_kl(scores, inputs["query"], inputs["key"], region, scale)
-                return jnp.mean(per_query), per_query
-
-            (value, per_query), gradient = jax.value_and_grad(loss, has_aux=True)(inputs["scores"])
-            return {"loss": value, "gradient": gradient, "per query": per_query}
-
         with jax.enable_x64(new_val=True):
-            recording = record_case(name, published_inputs, evaluate, proxy, truth_proxy=proxy,
-                                    store_inputs=False, summary=True)
+            recording = record_case(name, published_inputs, evaluate, store_inputs=False, summary=True)
         recording[f"{name}.provenance"] = provenance("MaxText MLA.calculate_indexer_loss", COMMIT, "cpu",
                                                      command, dtype="float32", top_k=PUBLISHED["top_k"])
         written = save(FIXTURES / f"recorded_{name}.npz", recording, reference="MaxText 0.2.4",

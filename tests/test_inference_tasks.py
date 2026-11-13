@@ -11,6 +11,7 @@ import optax
 import pytest
 from flax import linen as nn
 from model_support import decoder
+from serving_support import assert_same_generation
 
 from dew.data.dataset import Loader
 from dew.diffusion.block import BlockProcess
@@ -23,14 +24,6 @@ from dew.sampling import Sampling, generate
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 SAMPLING = Sampling(temperature=0.8, top_k=5, eos_token_ids=(3, 9))
-
-
-def assert_same_generation(actual, expected):
-    np.testing.assert_array_equal(actual.tokens, expected.tokens)
-    np.testing.assert_array_equal(actual.lengths, expected.lengths)
-    np.testing.assert_array_equal(actual.terminated, expected.terminated)
-    np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=2e-6, rtol=2e-6)
-    np.testing.assert_allclose(actual.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
 
 
 @pytest.mark.parametrize("family", ["llama-tiny", "diffusion-gemma-workflow"])
@@ -358,15 +351,17 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
     expected = draw(state.variables)
     actual = objective.pipeline(state)([[1, 2]], 1, key=3, sampling=sampling).host()
     reference = draw(state.averaged)
+    # The pipeline is the policy's own task over the live weights, so the same program: to the bit; the
+    # averaged weights draw other likelihoods, which tell the two apart.
     np.testing.assert_array_equal(actual.tokens, expected.tokens)
-    np.testing.assert_allclose(actual.raw_log_probs, expected.raw_log_probs, atol=1e-7, rtol=1e-7)
-    assert not np.allclose(actual.raw_log_probs, reference.raw_log_probs, atol=1e-5, rtol=1e-5)
+    np.testing.assert_array_equal(actual.raw_log_probs, expected.raw_log_probs)
+    assert not np.array_equal(expected.raw_log_probs, reference.raw_log_probs)
     checkpoints = Checkpoints(str(tmp_path))
     checkpoints.save(int(state.step), state, None, artifact=objective.inference_record())
     checkpoints.wait()
     restored = dew.pipeline(str(tmp_path))([[1, 2]], key=3).host()
     np.testing.assert_array_equal(restored.tokens, expected.tokens)
-    np.testing.assert_allclose(restored.raw_log_probs, expected.raw_log_probs, atol=1e-7, rtol=1e-7)
+    np.testing.assert_array_equal(restored.raw_log_probs, expected.raw_log_probs)
 
 
     import jax.numpy as jnp

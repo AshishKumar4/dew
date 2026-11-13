@@ -63,15 +63,13 @@ class Startup:
 
 class DataObjective(Protocol):
     """What a fit's data reads of its objective: its steps over the data (`Objective.data`) and whether
-    it counts real tokens (`Objective.counts_tokens`), and what it hands it: the plan version its data
-    reads by (`Objective.bind_plan`) and the widths its data bound (`Objective.bind_widths`)."""
+    it counts real tokens (`Objective.counts_tokens`), and what it hands it: the widths its data bound
+    (`Objective.bind_widths`)."""
 
     @property
     def counts_tokens(self) -> bool: ...
 
     def data(self) -> ObjectiveData: ...
-
-    def bind_plan(self, version: int) -> None: ...
 
     def bind_widths(self, widths: Mapping[str, object]) -> None: ...
 
@@ -91,10 +89,7 @@ def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
     with startup.phase("data", "preparing the data"):
         loader, validation = fitted(dataset, validation, objective=objective.data(), examples=examples,
                                     epochs=epochs, steps=steps, tokens=tokens)
-    # The plan version the data reads its rows by, a loader's own where it was compiled already (handed
-    # data reads by none), then the widths it bound: what a saved run of the objective records.
-    if loader.plan is not None:
-        objective.bind_plan(loader.plan.version)
+    # The widths the data bound: what a saved run of the objective records.
     objective.bind_widths(loader.widths)
     # A schedule whose last stage ends its data bounds the run as tokens= does (`run_tokens`).
     tokens = run_tokens(loader, tokens, counts_tokens=objective.counts_tokens)

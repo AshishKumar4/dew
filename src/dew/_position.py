@@ -65,19 +65,19 @@ class Global:
     `records` counts every record of the run, the completed phases' too."""
 
     plan: Mapping[str, object] | None = None
-    tokens: tuple[int, ...] | None = ()
+    tokens: tuple[int, ...] = ()
     """The committed tokens each phase of `completed` ended at, for a run on the committed-token clock
-    (`dew.data.pipeline.schedule`), which no record count of a phase states; empty on the record clock,
-    None in a position written before positions held them."""
+    (`dew.data.pipeline.schedule`), which no record count of a phase states; empty on the record clock."""
+    origin: int = 0
+    """How many of `records` the current order's own reader had not read when it was opened: the run's
+    count less its phase's start, less the order's own records, so a stream opened at its own start
+    partway through a phase (a resume that starts its data again) keeps the run's count; 0 for one opened
+    where its phase starts, as every stream opens but a restart's."""
 
 
 def encode(place: Global) -> bytes:
     """`place` as the bytes a checkpoint stores for it."""
-    held = dataclasses.asdict(place)
-    if place.tokens is None:
-        # A position read from before positions held stage tokens records none, as it was written.
-        del held["tokens"]
-    return json.dumps({ENVELOPE: held}).encode()
+    return json.dumps({ENVELOPE: dataclasses.asdict(place)}).encode()
 
 
 def decode(position: bytes) -> Global | None:
@@ -90,16 +90,19 @@ def decode(position: bytes) -> Global | None:
     envelope = _enveloped(position, ENVELOPE)
     if envelope is None:
         return None
-    fields = {"records", "order", "completed"}
+    fields = {"records", "order", "completed", "tokens"}
     if fields - set(envelope):
         raise ValueError(
             f"a saved global data position is missing {sorted(fields - set(envelope))}; "
             f"the checkpoint's position was written by dew and is damaged")
     completed = tuple((str(order), int(end)) for order, end in envelope["completed"])
     plan = envelope.get("plan")
+    # A position of plan 13, which knew no restart, holds no origin: its streams opened where their phases
+    # start.
     return Global(records=int(envelope["records"]), order=str(envelope["order"]),
                   completed=completed, plan=None if plan is None else record(plan, "data plan"),
-                  tokens=None if "tokens" not in envelope else tuple(int(end) for end in envelope["tokens"]))
+                  tokens=tuple(int(end) for end in envelope["tokens"]),
+                  origin=int(envelope.get("origin", 0)))
 
 
 def read(position: bytes) -> Global:

@@ -34,7 +34,7 @@ from multimodal_families import (
     text_rows,
 )
 from one_draw import assert_as_exact_as_the_reference
-from reference_error import GateFailure, widened
+from reference_error import GateFailure, Inconclusive, widened
 from reference_runs import assert_arms_as_recorded
 from safetensors.numpy import load_file
 
@@ -730,18 +730,20 @@ def test_a_drawn_site_is_on_par_with_its_reference(arms):
 @pytest.mark.parametrize("arms", DRAWN_SITES)
 def test_a_drawn_sites_slip_fails_its_check(arms, slipped):
     """`test_a_drawn_site_is_on_par_with_its_reference`'s site with its characteristic slip, or one layer's
-    gradient with its sign flipped, in its narrow arm alone fails the same check: a test of its own, as
+    gradient with its sign flipped, in its narrow arm alone fails the same check, decided: a slip the
+    site leaves undecided (`Inconclusive`, a `GateFailure` too) is no slip caught. A test of its own, as
     each is a check-1 run of the site's whole draws (qwen35/text's three in one task ran past its 1,680 s
     deadline, the CPU suite at 87e689ba5)."""
     family, _, kind = arms.partition("/")
     site = f"multimodal-{family}" + (f"-{kind}" if kind else "")
     recording, draw, dew, leaves = pipeline_arms(arms)
     slip = computing(family, slipped=slipped, text=kind == "text")
-    with pytest.raises(GateFailure):
+    with pytest.raises(GateFailure) as failed:
         # The slip is the narrow arm's alone: the truth stays the recorded one's (`dew`'s float64 run).
         assert_arms_as_recorded(
             (recording, draw, lambda dtype, inputs: (dew if dtype == jnp.float64 else slip)(dtype, inputs),
              leaves), site, SEEDS[arms], f"{arms} slipped {slipped}", weighed=arms in WEIGHED)
+    assert not isinstance(failed.value, Inconclusive)
 
 
 def _float32_values_in_float64(loaded, inputs) -> int:

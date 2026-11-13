@@ -1,5 +1,6 @@
 import dataclasses
 import gc
+import hashlib
 import http.server
 import json
 import logging
@@ -351,6 +352,16 @@ def released_past_budget():
 
 
 @pytest.fixture
+def unqualified(monkeypatch):
+    """A test of the gate itself, whose sites are its subjects and declare the counts it tests them at: no
+    qualification run sizes them (`check1_wire.QUALIFY`). Its file asks for it
+    (`pytestmark = pytest.mark.usefixtures("unqualified")`)."""
+    from check1_wire import QUALIFY
+
+    monkeypatch.delenv(QUALIFY, raising=False)
+
+
+@pytest.fixture
 def without_deterministic_ops(monkeypatch):
     """The cuda lane runs the whole suite under --xla_gpu_deterministic_ops,
     under which Dew's fused kernels take their ordered schedules (a
@@ -431,9 +442,12 @@ def cache_worker():
         def log_message(self, *args):
             pass
 
-        def _answer(self, status: int, body: bytes = b"", close: bool = False) -> None:
+        def _answer(self, status: int, body: bytes = b"", close: bool = False,
+                    etag: str | None = None) -> None:
             self.send_response(status)
             self.send_header("Content-Length", str(len(body)))
+            if etag is not None:
+                self.send_header("ETag", f'"{etag}"')
             if close:
                 self.send_header("Connection", "close")
             self.end_headers()
@@ -468,7 +482,7 @@ def cache_worker():
             if value is None:
                 self._answer(404)
             else:
-                self._answer(200, value)
+                self._answer(200, value, etag=hashlib.md5(value).hexdigest())
 
         def do_PUT(self):
             if not self._authorized():
@@ -476,8 +490,17 @@ def cache_worker():
             if not bounds["min_bytes"] <= int(self.headers["Content-Length"]) <= bounds["max_bytes"]:
                 self._answer(413, close=True)
                 return
-            stored[self.path] = self.rfile.read(int(self.headers["Content-Length"]))
-            self._answer(204)
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            # The Worker's preconditions, R2's ETag the MD5 of the object: If-Match an object of that ETag,
+            # If-None-Match `*` no object; a failed one is a 412 and writes nothing.
+            held = stored.get(self.path)
+            etag = None if held is None else hashlib.md5(held).hexdigest()
+            match, none = self.headers.get("If-Match"), self.headers.get("If-None-Match")
+            if (match is not None and match.strip('"') != etag) or (none == "*" and held is not None):
+                self._answer(412)
+                return
+            stored[self.path] = body
+            self._answer(204, etag=hashlib.md5(body).hexdigest())
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()

@@ -141,8 +141,23 @@ def main() -> None:
             save(written / f"{kind}.npz", {"run": np.frombuffer(packed, np.uint8)},
                  reference=f"Dew {commit[:12]}, tools/saved_runs_reference.py", license="MIT", root=args.root)
             (args.root / written / f"{kind}.evidence.json").write_text(json.dumps(seen, indent=1) + "\n")
-    source = {"commit": commit, "kinds": sorted(kinds), "evidence": EVIDENCE}
-    (args.root / written / "source.json").write_text(json.dumps(source, indent=1) + "\n")
+    publish(args.root / written / "source.json", commit, kinds)
+
+
+def publish(manifest: Path, commit: str, kinds: list[str]) -> None:
+    """The generation's manifest (`source.json`) naming `kinds` beside every kind an earlier recording of
+    the same commit named, written whole in one rename: a recording of some kinds extends its generation,
+    never drops the kinds already recorded there, whose archives and evidence stay on disk and whose
+    checks test_saved_runs.py runs for each kind the manifest names. A manifest of another commit or
+    evidence is refused, a generation being one commit's recordings under one tool."""
+    held = json.loads(manifest.read_text()) if manifest.is_file() else {
+        "commit": commit, "kinds": [], "evidence": EVIDENCE}
+    if (held["commit"], held["evidence"]) != (commit, EVIDENCE):
+        raise ValueError(f"{manifest} records {held['commit'][:12]} under {held['evidence']}, not this "
+                         f"recording's {commit[:12]} under {EVIDENCE}")
+    staged = manifest.with_suffix(".json.partial")
+    staged.write_text(json.dumps({**held, "kinds": sorted({*held["kinds"], *kinds})}, indent=1) + "\n")
+    staged.replace(manifest)
 
 
 if __name__ == "__main__":

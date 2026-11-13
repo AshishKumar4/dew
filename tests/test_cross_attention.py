@@ -24,7 +24,7 @@ import torch
 from flax import linen as nn
 from model_support import TINY_DECODER, Digits, decoder, flat_tree, stepped_outputs
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
-from test_serving import assert_same_generation
+from serving_support import Served, assert_same_draws, assert_served_as_exact
 
 from dew.batch import FROZEN, coordinates, thaw
 from dew.checkpoints import Checkpoints
@@ -40,13 +40,14 @@ from dew.nn.cross_attention import (
     CROSS_LENGTHS,
     CrossAttention,
     GatedCrossAttention,
+    SharedCrossAttention,
     crossing,
     encode_context,
     gated_join,
 )
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
-from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext, ModelInputs
+from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, CrossContext, ModelInputs
 from dew.nn.kv_cache import KVCache
 from dew.nn.mlp import GatedMLP
 from dew.nn.ngpt import NGPT
@@ -348,6 +349,51 @@ def test_a_cached_context_decodes_as_the_full_forward():
     assert_a_cached_context_decodes_as_the_full_forward(MODEL, "cached context")
 
 
+@pytest.mark.parametrize("cross", [CROSS, SharedCrossAttention(layer_ids=(0, 2), context_length=6)],
+                         ids=["own attention", "the layer's attention"])
+def test_a_cached_document_reads_its_own_context_without_it(cross):
+    """A packed row's prefill, documents 1 and 2 two tokens each over a context of two tokens, one each
+    (`CONTEXT_SEGMENTS` [1, 2]), into a cache, then calls without the context: a step continuing document
+    2, a call continuing it and starting document 3, and a step continuing document 3. Document 2's later
+    tokens read its own context alone and document 3's none, in every call: their logits are the same, bit
+    for bit, whatever document 1's tokens and its context token (and, for document 3, document 2's), as
+    the cache keeps each context token's document and the row's last document beside the keys and values
+    and moves the last on with each call, for both blocks. The kept keys alone, every later call read both
+    documents' context. A row whose context names no documents is read whole by every later token."""
+    model = MODEL.clone(cross_attention=cross)
+    variables, ids, context, _ = model_draw(model)(1)
+    packed = coordinates(segments=jnp.asarray([[1, 1, 2, 2]] * B, jnp.int32),
+                         positions=jnp.asarray([[0, 1, 0, 1]] * B, jnp.int32), max_segments=2)
+    later = [(slice(4, 5), [1], [2]), (slice(5, 7), [1, 2], [3, 0]), (slice(7, 8), [1], [1])]
+    _, made = model.apply(variables, B, method=CausalTransformer.init_cache, mutable=["cache"])
+
+    def decoded(ids, context, *, named: bool) -> np.ndarray:
+        given = {CONTEXT: context[:, :2], CONTEXT_LENGTHS: jnp.full((B,), 2, jnp.int32)}
+        given |= {CONTEXT_SEGMENTS: jnp.asarray([[1, 2]] * B, jnp.int32)} if named else {}
+        _, held = model.apply({**variables, **made}, ids[:, :4], decode=True, mutable=["cache"],
+                              coordinates=packed, conditioning=given)
+        found = []
+        for tokens, documents, positions in later:
+            on = coordinates(segments=jnp.asarray([documents] * B, jnp.int32),
+                             positions=jnp.asarray([positions] * B, jnp.int32), max_segments=2)
+            out, held = model.apply({**variables, **held}, ids[:, tokens], decode=True, mutable=["cache"],
+                                    coordinates=on)
+            found.append(np.asarray(out))
+        return np.concatenate(found, axis=1)
+
+    first = ids.copy()
+    first[:, :2] = (ids[:, :2] + 1) % VOCAB
+    second = context.copy()
+    second[:, 0] = -context[:, 0]
+    both = second.copy()
+    both[:, 1] = -context[:, 1]
+    found = decoded(ids, context, named=True)
+    np.testing.assert_array_equal(found, decoded(first, second, named=True))
+    # Document 3's tokens, the call's second and the last step, read no context.
+    np.testing.assert_array_equal(found[:, 2:], decoded(ids, both, named=True)[:, 2:])
+    assert not np.array_equal(decoded(ids, context, named=False), decoded(ids, second, named=False))
+
+
 def test_a_scanned_stack_runs_its_blocks_as_the_plain_one():
     """With a block on every layer the layers scan as one run, its blocks' leaves stacked, on par with
     the plain loop from its float64 (check 1)."""
@@ -489,15 +535,25 @@ CONTEXT_TOKENS = [2, 4, 3, 0, 1]
 
 
 @functools.cache
-def served_task() -> TextGeneration:
+def served_task(eos_token_ids: int | None = 12) -> TextGeneration:
     """model_support's one-layer decoder with a block before its layer, its gates drawn away from
-    zero, as a greedy task."""
+    zero, as a greedy task stopping at `eos_token_ids`, at its budget alone where None."""
     model = decoder().clone(max_seq_len=128, cross_attention=SERVED)
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     params = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jnp.full_like(leaf, 0.8) if path[-1].key.startswith("alpha_") else leaf, params)
-    return TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0,
-                                                                                    eos_token_ids=12))
+    return TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=eos_token_ids))
+
+
+
+
+def drawn_context(index: int, row: np.ndarray) -> dict[str, np.ndarray]:
+    """Request `index`'s context in the draw of `row`: as many tokens as its own (`CONTEXT_TOKENS`), drawn
+    from the row."""
+    context = np.random.default_rng([*row.tolist(), index]).standard_normal((1, SERVED.context_length, 6))
+    return {CONTEXT: context.astype(np.float32),
+            CONTEXT_LENGTHS: np.asarray([CONTEXT_TOKENS[index]], np.int32)}
 
 
 def request(index: int, length: int | None = None) -> ModelInputs:
@@ -535,11 +591,33 @@ def test_a_served_request_reads_its_own_context(options):
     elsewhere = server.submit(request(2, 1), BUDGETS[2], key=2)
     server.run()
     for ticket, lone in zip([*tickets, again, elsewhere], [*alone, alone[2], other], strict=True):
-        assert_same_generation(ticket.result(), lone)
+        assert_same_draws(ticket.result(), lone)
+        # A greedy draw's behavior likelihood is zero, served or alone.
+        np.testing.assert_array_equal(ticket.result().host().behavior_log_probs,
+                                      lone.host().behavior_log_probs)
     # "1234567" keeps its last token to prefill: one full page of four is shared, under its context alone.
     # A paged server shares prefixes unless told not to (`prefix_cache` None).
     shares = "kv_cache" in options and options.get("prefix_cache", True)
     assert (hits, server.prefix_hits) == ((4, 4) if shares else (0, 0))
+
+
+@pytest.mark.parametrize("options", [
+    {},
+    {"kv_cache": KVCache(page_size=4, pages=40)},
+    {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3},
+    {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True},
+], ids=["dense", "paged", "chunked", "prefix"])
+def test_served_requests_score_their_draws_from_their_own_contexts(options):
+    """Requests of their own contexts, one with none, served together as
+    `test_a_served_request_reads_its_own_context` serves them, over a dense cache, a pool of pages, pieces
+    of three tokens and a prefix cache, greedily to their budgets: each draws what it draws alone, and
+    scores each drawn token on par with a full forward over its prompt, its context and the tokens drawn
+    before it (check 1), truth float64's."""
+    requests = [Served(len(prompt), conditioning=functools.partial(drawn_context, index))
+                for index, prompt in enumerate(PROMPTS)]
+    label = f"served contexts {', '.join(options) or 'dense'}"
+    assert_served_as_exact(served_task(eos_token_ids=None), requests, label,
+                           serving={"slots": 4, "capacity": 128, "admission": 2, **options})
 
 
 def test_a_server_refuses_a_context_its_layers_cannot_read():
@@ -793,7 +871,12 @@ def test_a_served_requests_host_context_is_checked_on_the_host():
     with jax.transfer_guard_host_to_device("disallow_explicit"):
         ticket = server.submit(host, BUDGETS[0], key=0)
     server.run()
-    assert_same_generation(ticket.result(), bound(given, BUDGETS[0], key=0))
+    device = server.submit(given, BUDGETS[0], key=0)
+    server.run()
+    # One server's program over the same values: every field to the bit.
+    served, held = ticket.result().host(), device.result().host()
+    for field in ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs"):
+        np.testing.assert_array_equal(getattr(served, field), getattr(held, field), err_msg=field)
 
 
 def test_a_tokens_context_is_present_where_its_document_holds_keys_whatever_their_order():

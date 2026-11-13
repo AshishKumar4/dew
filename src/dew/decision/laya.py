@@ -13,6 +13,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -186,6 +187,17 @@ class LayaConfig:
         return Temperatures({}, dict(self.temperature_by_options), default=self.temperature)
 
 
+def published_encoder(bundle: "PretrainedDecision") -> str | None:
+    """The encoder Laya's agent names in a release of `bundle`: the one the release it was read from named
+    (`PretrainedDecision.named_encoder`), else its tokenizer's name where that names a model on the Hub;
+    none where its tokenizer was read from a directory on this machine, whose path a release would publish
+    (row 4788), which leaves the key out: Laya's agent refuses such a config (`LAYA_REQUIRED`)."""
+    if bundle.named_encoder is not None:
+        return bundle.named_encoder
+    name = bundle.decision_tokenizer.name
+    return None if Path(name).expanduser().is_absolute() or Path(name).exists() else name
+
+
 def head_files(bundle: "PretrainedDecision") -> HeadFiles:
     """Laya's head in its release (`dew.decision.formats`): its tensors under Laya's names beside the
     encoder's in `model.safetensors`, and `rl_agent_config.json` with the head's depth, the layout's window,
@@ -200,8 +212,7 @@ def head_files(bundle: "PretrainedDecision") -> HeadFiles:
     layout = bundle.layout
     if not isinstance(layout, QuestionLayout):
         raise ValueError(f"Laya's head reads rows a QuestionLayout lays out, not a {type(layout).__name__}")
-    # The encoder Laya's agent names: its tokenizer's, which the release holds under tokenizer/.
-    config = LayaConfig.of(head.layers, layout, bundle.calibration, bundle.decision_tokenizer.name)
+    config = LayaConfig.of(head.layers, layout, bundle.calibration, published_encoder(bundle))
     # What Laya's file states of a layout, read as its readers read it; a layout that names Laya's own
     # order, question first, lays rows out as one that names none.
     held = replace(layout, order=None) if layout.order == "question_first" else layout

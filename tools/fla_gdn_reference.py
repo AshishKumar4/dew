@@ -152,8 +152,8 @@ def serve() -> None:
 
 def write_seeded(worker, names: list[str], out: Path) -> None:
     """Each named site's seeded draws with fla's outputs and gradients and their float64 truth (`worker`,
-    `serve`'s `Session`), recorded as a summary (`record_case`) into `out`, Dew's portable rule in the site's
-    dtype the sizing proxy and its float64 token recurrence held to fla's reference at every seed: a unit
+    `serve`'s `Session`), recorded as a summary (`record_case`) into `out`, Dew's float64 token
+    recurrence held to fla's reference at every seed: a unit
     of the recording, whose units `merged` joins into the fixture."""
     import functools
 
@@ -192,10 +192,8 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
             held_to_the_oracle(exact_run, arrays, truth, roundings, f"fla {name}")
             return reference, truth
 
-        portable = functools.partial(lambda hooks, arrays, leaves: ruled(
-            functools.partial(chunk_on, 'xla', hooks), arrays, leaves), site.hooks, leaves=site.leaves)
         if site.paired:
-            # Sized paired with the template's own arm, no proxy planning it: the site's errors are
+            # Sized paired with the template's own arm: the site's errors are
             # heavy-tailed across draws alike in both arms, which no count of either alone resolves. Where
             # the template refuses the call its test skips the site, which no recording then serves.
             dew = jax.jit(functools.partial(lambda hooks, arrays, leaves: ruled(
@@ -208,8 +206,7 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
                 continue
             stored.update(record_case(name, site.arrays, evaluate, store_inputs=False, summary=True, dew=dew))
         else:
-            stored.update(record_case(name, site.arrays, evaluate, portable, truth_proxy=exact_run,
-                                      store_inputs=False, summary=True))
+            stored.update(record_case(name, site.arrays, evaluate, store_inputs=False, summary=True))
         print(f"{name}: recorded in {time.perf_counter() - began:.0f} s", flush=True)
     stored["provenance"] = provenance(
         version, version, device.strip(),

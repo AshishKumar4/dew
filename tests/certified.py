@@ -1083,16 +1083,22 @@ def _gathered(params, operand, indices):
 
 
 def _ordered(value) -> np.ndarray:
-    """Each value's place in the lane's total order of its type, as int64: a float's sign and magnitude
-    bits, so -NaN < -inf < ... < -0 < +0 < ... < +inf < NaN as XLA's sort and top_k order them; an
-    integer or a boolean its own value."""
+    """Each value's place in the lane's total order of its type, as uint64, over the type's whole range: a
+    float's sign and magnitude bits, so -NaN < -inf < ... < -0 < +0 < ... < +inf < NaN as XLA's sort and
+    top_k order them; a signed integer's value past its type's least (its sign bit flipped), an unsigned
+    one's and a boolean's as it is. A signed key overflowed at the ends: an unsigned 2^63 read negative,
+    and the least int64 was its own negation."""
     value = np.asarray(value)
-    if value.dtype == np.bool_ or np.issubdtype(value.dtype, np.integer):
-        return value.astype(np.int64)
-    bits = _bits(value).astype(np.int64)
-    width = 8 * value.dtype.itemsize
-    magnitude = bits & ((1 << (width - 1)) - 1)
-    return np.where(bits >> (width - 1) & 1, -magnitude - 1, magnitude)
+    if value.dtype == np.bool_ or np.issubdtype(value.dtype, np.unsignedinteger):
+        return value.astype(np.uint64)
+    half = np.uint64(1) << np.uint64(63)
+    if np.issubdtype(value.dtype, np.integer):
+        return value.astype(np.int64).view(np.uint64) ^ half
+    bits = _bits(value).astype(np.uint64)
+    sign = np.uint64(1) << np.uint64(8 * value.dtype.itemsize - 1)
+    magnitude = bits & (sign - np.uint64(1))
+    # A negative float below every positive one, the larger its magnitude the lower.
+    return np.where(bits & sign, half - np.uint64(1) - magnitude, half + magnitude)
 
 
 def _sort_key(value) -> np.ndarray:
@@ -1121,7 +1127,8 @@ def _top(params, operand) -> list[np.ndarray]:
     greatest first and of equal ones the earlier first, and their indices, int32."""
     axis = params.get("axis", -1)
     moved = np.moveaxis(np.asarray(operand), axis, -1)
-    order = np.argsort(-_ordered(moved), axis=-1, kind="stable")[..., :params["k"]]
+    # The order reversed by each key's complement, which no key overflows as its negation did.
+    order = np.argsort(~_ordered(moved), axis=-1, kind="stable")[..., :params["k"]]
     return [np.moveaxis(np.take_along_axis(moved, order, -1), -1, axis),
             np.moveaxis(order.astype(np.int32), -1, axis)]
 

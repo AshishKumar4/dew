@@ -286,9 +286,11 @@ jobs:
         # armada does (owner, 2026-11-06).
         BACKGROUND_POOL: ${{ (github.event_name == 'schedule' || inputs.whole) && '48' || '' }}
       # tools/ci/suite.sh, which this step reads from the ref, holds what the run takes. A push to base/kernels
-      # runs no gangs: main's trains run them. It runs at a lane's whole-suite priority (-10), so it never takes
-      # containers from a train, a precheck or a lane's targeted run (the maintainer, 2026-10-28), on the pool
-      # armada gives it. A push to main the queue did not grade (a direct push) is its tip's only test, at 5, in
+      # runs no gangs: main's trains run them. It runs at a targeted run's priority (0), below every train and
+      # urgent run, on the pool armada gives it, one run at a time and the newest tip pending behind it (the
+      # concurrency groups above): at a lane's whole-suite priority (-10) it waited behind every other run and
+      # ran out its deadline ungraded, each of the eleven runs that started from 2026-11-09 to 11-12, though
+      # reuse left each about 115 tasks (the owner, 2026-11-01: every push to base is graded). A push to main the queue did not grade (a direct push) is its tip's only test, at 5, in
       # a concurrency group of its own (the maintainer, 2026-10-29, 2026-10-31), its gangs and its suite at one
       # priority, so the suite never recalls its own gangs' containers. Main's whole run (the schedule's, the
       # queue's whole dispatch) is background work: it runs at -15, below every lane's run at a head (verdict.sh's
@@ -296,7 +298,7 @@ jobs:
       # gates' shadow held the fleet while lanes waited at 0).
       run: |
         case "$GITHUB_REF_NAME" in base/kernels) gangless=1 ;; *) gangless= ;; esac
-        case "$GITHUB_REF_NAME" in main) priority=5 ;; base/kernels) priority=-10 ;; *) priority= ;; esac
+        case "$GITHUB_REF_NAME" in main) priority=5 ;; base/kernels) priority=0 ;; *) priority= ;; esac
         if [ -n "$DEW_WHOLE_SUITE" ]; then priority=-15; fi
         # A run below every lane's waits for capacity within its deadlines: background ones (train 665's review).
         case "$priority" in -*) background=1 ;; *) background= ;; esac
