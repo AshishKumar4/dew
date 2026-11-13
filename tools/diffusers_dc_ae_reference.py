@@ -1,6 +1,7 @@
 """The actual DC-AE, saved and walked, for tests/fixtures.
 
-Two tiny `AutoencoderDC`s from diffusers 0.34.0 are constructed with the
+Three tiny `AutoencoderDC`s are constructed, each by the diffusers release its record names (`conv`
+and `shuffle` 0.34.0's, `plain` 0.39.0's), with the
 controls the published checkpoints use, at narrow widths:
 
 - `conv`, as `dc-ae-f32c32-sana-1.1`: strided-convolution downsampling,
@@ -10,7 +11,10 @@ controls the published checkpoints use, at narrow widths:
 - `shuffle`, as `dc-ae-f32c32-in-1.0`: pixel-unshuffle and pixel-shuffle
   resampling, no first level (its input and output convolutions are
   resampling blocks), batch norms and ReLU in the decoder's residual levels,
-  and no multiscale branch.
+  and no multiscale branch;
+- `plain`, `conv` without either end's channel shortcut and with a SiLU before
+  the decoder's last convolution (`encoder_out_shortcut`, `decoder_in_shortcut`,
+  `decoder_conv_act_fn`).
 
 Each is saved with `save_pretrained` - its real config and its real
 safetensors - and recorded in float32, channel-first, as `vae.encode(x).latent`
@@ -28,8 +32,12 @@ bias, and every batch norm's running statistics, moved off their init,
 rounded to bfloat16-representable values so the fixture compresses; they are
 still float32 tensors.
 
-    python tools/diffusers_dc_ae_reference.py OUTPUT_DIR
+    python tools/diffusers_dc_ae_reference.py OUTPUT_DIR conv shuffle    # with diffusers 0.34.0
+    python tools/diffusers_dc_ae_reference.py OUTPUT_DIR plain           # with the test extra's diffusers
     python tools/diffusers_dc_ae_reference.py bundle OUTPUT_DIR tests/fixtures/dc_ae.tar.xz
+
+Named variants are recorded into OUTPUT_DIR beside what it holds, each by its cohort's release (`COHORTS`),
+the record keeping the others'; a run records one cohort's variants.
 """
 
 from __future__ import annotations
@@ -41,10 +49,12 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers_reference_helpers import on_bfloat16_grid
-from reference_releases import RELEASES, require
+from reference_releases import require
 from reference_vjp import recorded_vjp
 
-DIFFUSERS = RELEASES["diffusers"]["diffusers"]
+COHORTS = {"conv": "diffusers-0.34", "shuffle": "diffusers-0.34", "plain": "diffusers"}
+"""The reference release each variant is recorded by (`reference_releases.RELEASES`): a run records the
+variants of the release installed, one cohort at a time."""
 COMMON = {"in_channels": 3, "latent_channels": 8, "attention_head_dim": 8,
           "encoder_block_types": ["ResBlock", "ResBlock", "EfficientViTBlock"],
           "decoder_block_types": ["ResBlock", "ResBlock", "EfficientViTBlock"],
@@ -59,6 +69,13 @@ CONFIGS = {
                 "downsample_block_type": "pixel_unshuffle", "upsample_block_type": "pixel_shuffle",
                 "decoder_norm_types": ["batch_norm", "batch_norm", "rms_norm"],
                 "decoder_act_fns": ["relu", "relu", "silu"], "scaling_factor": 0.3189},
+    # `conv` with neither end's channel shortcut and a SiLU before the decoder's last convolution: the
+    # controls AutoencoderDC takes beside the published checkpoints' defaults.
+    "plain": {**COMMON, "encoder_layers_per_block": [1, 1, 2], "decoder_layers_per_block": [1, 1, 2],
+              "encoder_qkv_multiscales": [[], [], [5]], "decoder_qkv_multiscales": [[], [], [5]],
+              "downsample_block_type": "Conv", "upsample_block_type": "interpolate",
+              "decoder_norm_types": "rms_norm", "decoder_act_fns": "silu", "scaling_factor": 0.41407,
+              "encoder_out_shortcut": False, "decoder_in_shortcut": False, "decoder_conv_act_fn": "silu"},
 }
 BATCH = 2
 HEIGHT, WIDTH = 32, 48
@@ -125,19 +142,32 @@ def bundle(directory: str, destination: str) -> None:
     print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
 
 
-def main(destination: str) -> None:
-    import diffusers
-
-    require("diffusers")
+def main(destination: str, variants: list[str]) -> None:
+    """Record `variants`, one cohort's (`COHORTS`), into `destination`, beside the variants it holds,
+    whose releases its record keeps."""
+    unknown = sorted(set(variants) - set(CONFIGS))
+    if unknown:
+        raise ValueError(f"{unknown} are no variants of {sorted(CONFIGS)}")
+    if not variants:
+        raise ValueError(f"name the variants to record, one cohort's at a time: {COHORTS}")
+    cohorts = {COHORTS[name] for name in variants}
+    if len(cohorts) != 1:
+        raise ValueError(f"the variants asked are recorded by {sorted(cohorts)}: record each cohort's apart, "
+                         "in its own environment")
+    (cohort,) = cohorts
+    release = require(cohort)["diffusers"]
     torch.set_num_threads(2)
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)
-    for name, config in CONFIGS.items():
-        arrays = build(config, root / name)
+    held = root / "dc_ae.json"
+    releases = json.loads(held.read_text()).get("releases", {}) if held.exists() else {}
+    for name in variants:
+        arrays = build(CONFIGS[name], root / name)
         np.savez_compressed(root / name / "reference.npz", **arrays)
-    record = {"diffusers": DIFFUSERS, "configs": CONFIGS, "batch": BATCH, "height": HEIGHT,
-              "width": WIDTH, "small": SMALL, "seed": SEED}
-    (root / "dc_ae.json").write_text(json.dumps(record, indent=1) + "\n")
+        releases[name] = release
+    record = {"releases": releases, "configs": CONFIGS, "batch": BATCH, "height": HEIGHT, "width": WIDTH,
+              "small": SMALL, "seed": SEED}
+    held.write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     print(f"{root}: {size / 1e6:.2f} MB")
 
@@ -146,4 +176,4 @@ if __name__ == "__main__":
     if len(sys.argv) > 3 and sys.argv[1] == "bundle":
         bundle(sys.argv[2], sys.argv[3])
     else:
-        main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/dew-dc-ae-reference")
+        main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/dew-dc-ae-reference", sys.argv[2:])

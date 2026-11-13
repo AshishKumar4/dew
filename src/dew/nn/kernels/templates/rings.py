@@ -140,9 +140,9 @@ def passed(rings: tuple, lo, hi, *, first: jax.Array | int = 0, between=None) ->
 @dataclasses.dataclass(frozen=True)
 class Turn:
     """Step `counter`'s turn of a ring of `stages` slots (`Ring`), the counter running from the ring's first
-    load: its slot, `counter % stages`, and its rotation, `counter // stages`, whose parity is the phase of
-    the slot's barriers its waits take. Every slot's barriers complete one phase a rotation, so the one parity
-    serves them all (`plgpu.barrier_wait`'s `parity`), with no phase tracked a barrier. A slot a Python int
+    load: its slot, `counter % stages`, and its rotation, `counter // stages`, the phase of the slot's
+    barriers its waits take. Every slot's barriers complete one phase a rotation, so the one rotation serves
+    them all (`plgpu.barrier_wait`'s `phase`), with no phase tracked a barrier. A slot a Python int
     where a walk knows it (a rotation unrolled: `rotated`), traced otherwise; the parities integer arithmetic
     (a warp's Mosaic lowering takes no boolean not)."""
     counter: jax.Array | int
@@ -158,12 +158,6 @@ class Turn:
     def parity(self):
         """The parity of the phase its fill completes, which a wait for it takes."""
         return self.rotation % 2 == 1
-
-    @property
-    def freed(self):
-        """The parity of the phase the rotation before completes at its slot's release, which its fill waits
-        for (a second rotation's on)."""
-        return (self.rotation + 1) % 2 == 1
 
     def back(self, steps: int, stages: int) -> "Turn":
         """The turn `steps` before it (fewer than `stages`), its slot constant where this one's is."""
@@ -249,7 +243,7 @@ class Ring:
         arrival each at the slot's load barrier, which takes as many (`ring`'s `copies`)."""
         slot = opaque(turn.slot)
         pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
-            self.consumed.at[slot], parity=turn.freed))
+            self.consumed.at[slot], phase=turn.rotation - 1))
         if not isinstance(view, Pieces):
             plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot],
                                     collective_axes=self.multicast)
@@ -284,7 +278,7 @@ class Ring:
         phase of a barrier is by each thread that waits on it; a wait again for the same turn returns at
         once, its slot not refilled until released."""
         slot = opaque(turn.slot)
-        plgpu.barrier_wait(self.full.at[slot], parity=turn.parity)
+        plgpu.barrier_wait(self.full.at[slot], phase=turn.rotation)
         return self.smem.at[slot]
 
     def release(self, turn: Turn) -> None:
@@ -342,7 +336,7 @@ def drained(barriers: Sequence, end, stages: int) -> None:
         @pl.when(turn.counter >= 0)
         def _(turn=turn):
             for barrier in barriers:
-                plgpu.barrier_wait(barrier.at[opaque(turn.slot)], parity=turn.parity)
+                plgpu.barrier_wait(barrier.at[opaque(turn.slot)], phase=turn.rotation)
 
 
 def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, multicast: bool = False,

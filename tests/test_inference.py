@@ -675,6 +675,10 @@ LAYOUT_SEEDS = 128
 """The layout sites' declared seeds, sized by `seeds_for` paired with each layout's draw on armada's CPUs:
 128 for every layout (fsdp-stage's on two machines, the others' on one), a sizing that took 17 to 55 s of
 each case's run when the case sized itself (row 4341)."""
+PLACED_IMAGES_SEEDS = 8
+"""The declared seeds of a run's images on each trainer layout, paired with the one-device run's: sized
+by `seeds_for` on armada's CPUs (2026-11-12, eg-sized2 at 0aed05577f7), 8 for every layout, where each run
+sized them again."""
 
 
 @pytest.mark.mesh(devices=4)
@@ -760,6 +764,28 @@ def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     np.testing.assert_array_equal(
         np.asarray(restored.variables["encoders"]["textcontext"]["table"]),
         np.asarray(objective.inputs.conditions["textcontext"].encoder.params["table"]))
+
+
+def test_a_pipeline_continues_a_conversation_its_processors_chat_template_renders(tmp_path):
+    """`dew.pipeline`'s text task given a conversation (`[{"role": "user", "content": "Hi"}]`, training.md's
+    example) renders it through its processor's chat template with the assistant's turn opened
+    (`Processor.chat`) and continues it from there, where the conversation was read as token rows and
+    refused (spec T1)."""
+    import shutil
+
+    source = tmp_path / "source"
+    shutil.copytree(Path(__file__).parent / "fixtures/hf/deepseek-v41-tiny", source)
+    config = json.loads((source / "tokenizer_config.json").read_text())
+    config["chat_template"] = ("{% for message in messages %}{{ message['role'] }}: "
+                               "{{ message['content'] }}\n{% endfor %}"
+                               "{% if add_generation_prompt %}assistant:{% endif %}")
+    (source / "tokenizer_config.json").write_text(json.dumps(config))
+    pipe = dew.pipeline(str(source))
+    messages = [{"role": "user", "content": "Hi"}]
+    prompt = np.asarray(pipe.processor.chat(messages).tokens)
+    drawn = pipe(messages, 3, key=1).host().tokens
+    assert drawn.shape == (1, prompt.shape[1] + 3)
+    np.testing.assert_array_equal(drawn[:, :prompt.shape[1]], prompt)
 
 
 def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
@@ -861,6 +887,17 @@ def test_a_run_record_holding_a_field_its_objective_does_not_write_is_refused(tm
     with pytest.raises(ValueError):
         dew.pipeline(str(tmp_path))
 
+
+
+@pytest.mark.parametrize("selection", [{"ema": True}, {"ema": False}, {"step": 2}], ids=str)
+def test_a_step_or_an_ema_choice_beside_a_source_is_refused(selection):
+    """`dew.pipeline` of a source checkpoint, which holds one set of weights and no average, refuses a step
+    or an EMA choice, either of which selects nothing of it, and loads it given neither (audit3 inference
+    F4: an ordinary source's load took `ema=True` and `ema=False` as no choice at all)."""
+    source = str(Path(__file__).parent / "fixtures/hf/phi-tiny")
+    with pytest.raises(ValueError):
+        dew.pipeline(source, **selection)
+    assert isinstance(dew.pipeline(source), TextGeneration)
 
 
 def test_pipeline_loads_a_run_published_to_the_hub_at_the_commit_it_resolved(tmp_path, monkeypatch):
@@ -1074,7 +1111,7 @@ def test_a_run_draws_images_on_every_trainer_layout_as_one_device_does(tmp_path,
     (`TextToImage.scoring`), on par with one device against its float64 twin over the same prepared noise
     and conditions (check 1) (ledger 1817)."""
     from arm_arithmetic import widened
-    from reference_error import as_given, assert_as_exact, seeds_for
+    from reference_error import as_given, assert_as_exact
 
     from dew.inference import ImageRequest, ScoringServer
     from dew.training import Layout, MeshSpec
@@ -1112,9 +1149,8 @@ def test_a_run_draws_images_on_every_trainer_layout_as_one_device_does(tmp_path,
             return wide(held, steps=3, key=int(keys[0])).host().images
 
     label = f"images on {spec}"
-    count = seeds_for(drawn(alone), draw, label, truth_fn=truth, dew_fn=drawn(placed))
-    assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=count, truth_fn=truth)
-    assert_as_exact(served, drawn(alone), draw, label, seeds=count, truth_fn=truth)
+    assert_as_exact(drawn(placed), drawn(alone), draw, label, seeds=PLACED_IMAGES_SEEDS, truth_fn=truth)
+    assert_as_exact(served, drawn(alone), draw, label, seeds=PLACED_IMAGES_SEEDS, truth_fn=truth)
 
 
 def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajectory(tmp_path):

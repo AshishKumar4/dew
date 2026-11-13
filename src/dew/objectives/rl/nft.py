@@ -165,7 +165,7 @@ class DiffusionNFTObjective(DiffusionObjective):
         if step.ema is None:
             raise ValueError("DiffusionNFT's old policy is its EMA slot, which this step does not carry")
         rows, trained = times.shape
-        real = self.row_weights(batch, rows) > 0
+        real = self.real_rows(batch, rows)
         samples = jnp.where(real.reshape(rows, *(1,) * (samples.ndim - 1)), samples, 0)
         r = jnp.where(real, self.optimality(jnp.where(real, advantages, 0)), 0)
         # An inpainting model's masked-image inputs, as the rollout encoded them (`NFTRollout`).

@@ -11,6 +11,62 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   as they are stored (no transposes), held to optax's iteration as its oracle; its layout, shape scalings,
   coefficient presets and preconditionings (AOL, Schatten), which 0.2.8 first ships, are optax's.
 
+- Dew requires its JAX build 0.12.0.1.post84 (Python alone; the CUDA and PJRT plugins stay post81's): the
+  toolkit's ring waits name their phase, so the interpreter checks two consumers that take alternate tiles
+  of one ring; a tcgen05 pair's step block over a partial depth lowers; the lowering cache keys a program
+  4 to 5 seconds sooner on a 32-layer step.
+- Dew requires its JAX build 0.12.0.1.post83 (Python alone; the CUDA and PJRT plugins stay post81's): a
+  Pallas interpreter's thread map runs its threads on a CPU client of its own, so an interpreted kernel
+  inside a host callback no longer deadlocks when the calling computation's client has a full device queue.
+- Dew requires its JAX build 0.12.0.1.post82 (Python alone; the CUDA and PJRT plugins stay post81's): a
+  Mosaic GPU kernel over operands on a concrete mesh lowers a reshard of a literal, so a bf16 template
+  decode on an Ampere or Ada GPU whose operands sit on a `NamedSharding` lowers, where it failed with
+  "Shaped arrays must be represented by ir.Values, got: 0".
+- A resume treats its data relaxed by default (`TrainerConfig.data_resume`, `--set trainer.data_resume=exact`):
+  the run's parameters, optimizer state, step, schedule and random state resume as saved, and its data reads
+  on at its saved position where the saved plan makes the same rows; where the plan differs (a rule, a
+  fact, the order, the sources or steps, the topology, or a plan version this Dew does not read), the data
+  starts again from the beginning of its order, the log naming each part that differs and the run's
+  records holding it (`DataRestarted`); data read in stages (phases, schedules, a batch ramp) starts again
+  at the stage the run's progress stands in, that stage's own start, its boundaries where the run's progress
+  places them, and a run bounded in examples ends at its own count. `exact` refuses any difference, as every
+  resume did before.
+  `compile(..., resume=)` takes `"relaxed"` where it took `"non-exact"`, and a plan's refusal is a
+  `dew.data.plan.PlanChanged` naming what differs (`differs`).
+
+- Data plan version 14, the last global one: a plan describes each step by its structure (its class and
+  fields, a callable by its own identity, an array by its fingerprint, a mapping in its order) and records,
+  by name, the rules its read takes its next rows by (`identity`, `shuffle`, `mix`, `dealing`, `grain`,
+  `phases`) and the shards a stream reads, each one value beside the code that implements it
+  (docs/design/data.md, the rules). A resume compares them and refuses a differing one by its name; a Grain
+  upgrade refuses only a position whose iterator state its iterators cannot restore. Phases that share a
+  corpus continue it from the draws the run trained. This Dew reads plans of 13 exactly (a run's resume
+  compiles its data at 13, and a per-share position of 13 resumes in a read compiled at 14 as 13 read it)
+  and refuses 8 to 12, naming both ways on: resume with the Dew that wrote it, or go on from its weights as
+  a new run that reads its data afresh. `Objective.bind_plan`, `dew.data.pipeline.earlier`, `Pipeline.at`
+  and `ObjectiveData.earlier` are gone, and `Source.manifest` takes no version.
+
+- A run resumes from what the current Dew and the one before it wrote, and refuses an earlier format by
+  name with the ways on: a step that holds a decision run's projections packed (`q`, `k` and `v` in one
+  array, as an earlier Dew stored them) where the run holds them apart, and a step that holds its whole
+  train state as one item. `Checkpoints.restore(served=)` and `Objective.served_groups` are gone with the
+  packed form's resume, and `Checkpoints.restore_profiles` refuses a step that holds its post-hoc EMA
+  profiles in its optimizer's one-item state (read them with the Dew that wrote it). Such a step's weights
+  still load (`Checkpoints.variables`, `Pretrained.from_saved`): start a fresh run from them, or resume it
+  with the Dew that wrote it.
+
+- A schedule's step horizons (its warmup's and decay's lengths in steps) are operands of its solver's state
+  (`RateState.horizons`) where a run builds it stated (`OptimConfig.build(stated=True)`), so a rehearsed run
+  and the run itself step one program over the persistent compile cache whatever their lengths. A schedule
+  states them through the new `ScheduleBase.horizons(steps)` hook, and `ScheduleBase.values` takes them
+  as `values(horizons, rates)` where it took `values(steps, rates)`: a subclass that read the run's length
+  in `values` overrides `horizons` to state the lengths it reads, or reads `{}`.
+
+- On a GPU holding tensor memory (a B200, B300 or other SM 10.x/11.x part), a run refuses to start under a
+  cuBLAS below 13.2 (`UnsafeCublas`), whose kernels free their tensor memory twice beside another kernel's
+  (JAX's CUDA plugin warns of it at start), and the installer takes the cuda13 build there or none,
+  refusing `--cuda 12`.
+
 - A run's fit plan judges a head that keeps its whole logits by their fp32 bytes before it traces the step's
   gradient (`Objective.whole_head_table` names the head's table), and bounds the rung after a traced one
   from that trace, so a step whose whole logits leave no room is planned from one gradient trace and
@@ -32,6 +88,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   posterior and imagination noise from `Step`'s per-example update streams, and compute minibatch-wide
   advantage moments and return percentiles once across a split step's microbatches
   (`Objective.batch_statistics`, `Step.batch_statistics`, `Objective.real_rows`).
+
+- `DreamerRollout` compiles its JAX environment reset once (`saved_shapes` reading shapes via
+  `jax.eval_shape`), and `dew.rl.evaluation` fuses `episodes` into a single compiled program.
 
 - A paged `Server` keeps a prefix cache by default (`prefix_cache=None` derives it on wherever the layout pages,
   the rows sample a token a step on the server's own mesh and the model computes a split prompt as a whole

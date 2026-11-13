@@ -416,6 +416,17 @@ MIRRORS = "dew_mirrors"
 elastic read's order, `dew.data.elastic_order`) carries their mirror counters, by process."""
 
 
+def without_mirrors[V](held: Mapping[str, V]) -> Mapping[str, V | Mapping[str, JSON]]:
+    """`held`, one level of a position, its loading workers' mirror counters emptied (`MIRRORED`,
+    `MIRRORS`): what a position states of where its corpus stands, whichever processes mirrored it."""
+    emptied: dict[str, V | Mapping[str, JSON]] = dict(held)
+    if isinstance(emptied.get(MIRRORED), Mapping):
+        emptied[MIRRORED] = {"process": "saved", "counts": {}}
+    if isinstance(emptied.get(MIRRORS), Mapping):
+        emptied[MIRRORS] = {}
+    return emptied
+
+
 def carried_mirrors(state: Mapping[str, object] | Sequence[object] | None) -> dict[str, dict[str, float]]:
     """Each loading worker's mirror counters a reader's position carries (`MIRRORED`, `MIRRORS`), by the
     worker's process, each its latest: cumulative, so a worker's counters count once."""
@@ -477,11 +488,7 @@ class PositionText:
             return "{" + ", ".join(f"{json.dumps(text(name, 'data position record key'))}: "
                                    f"{self._shared(entry, kept)}" for name, entry in value.items()) + "}"
         if isinstance(value, Mapping):
-            emptied = dict(value)
-            if isinstance(emptied.get(MIRRORED), Mapping):
-                emptied[MIRRORED] = {"process": "saved", "counts": {}}
-            if isinstance(emptied.get(MIRRORS), Mapping):
-                emptied[MIRRORS] = {}
+            emptied = without_mirrors(value)
             return "{" + ", ".join(f"{json.dumps(text(name, 'data position record key'))}: "
                                    f"{self._text(entry, kept)}" for name, entry in emptied.items()) + "}"
         raise ValueError(f"data position={value!r}: this field is not a value a JSON config carries")

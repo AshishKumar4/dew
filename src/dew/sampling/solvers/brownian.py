@@ -85,10 +85,12 @@ def _brownian_noise(state: _Brownian, first, second, shape, depth: int) -> jax.A
     """The bridge's increment over `[first, second]`, normalized the way
     k-diffusion's `BrownianTreeNoiseSampler` normalizes it: signed with the
     interval's direction and divided by the square root of its width, so the
-    result is a standard normal draw carrying the path's correlations."""
+    result is a standard normal draw carrying the path's correlations. An
+    interval of no width has none: zero, where the division has no value."""
     increment = (_brownian_walk(state, second, shape, depth)
                  - _brownian_walk(state, first, shape, depth))
-    return increment / jnp.sqrt(jnp.abs(second - first))
+    width = jnp.abs(second - first)
+    return jnp.where(width > 0, increment / jnp.sqrt(jnp.where(width > 0, width, 1)), 0)
 
 
 def _sde_step(x, denoised, sigma, target):
@@ -180,4 +182,6 @@ class DPMSolverSDE:
             return _sde_step(x, denoised_mid, sigma_t, down) + noise * up
 
         stepped = lax.cond(jnp.all(sigma_s == 0), lambda _: denoised, midpoint, None)
-        return jnp.where(sigma_s > 0, stepped, denoised), state
+        # A step between equal levels has no length and leaves x as it is, as Euler's does
+        # (`_euler_step`): a grid repeating a sigma, its final sigma_min among them.
+        return jnp.where(sigma_s == sigma_t, x, jnp.where(sigma_s > 0, stepped, denoised)), state

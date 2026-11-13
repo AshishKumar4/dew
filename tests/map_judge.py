@@ -69,7 +69,9 @@ def record_units(label: str, payload: Callable[[int, int], object], upto: int | 
     process's start to its units (`before`: its imports, collection, the site's setup and compiles) and those
     its units took (`draws`), so a run's map tasks say what each paid
     before any draw (Main, 2026-11-02: the map task's fixed cost measured before it is cut), and the
-    seconds of each named phase within its units' (`phases`, read once they are done)."""
+    seconds of each named phase within its units' (`phases`, read once they are done): what a task pays
+    once inside its draws, whatever it draws, which the plan counts with its setup (a check-1 site's
+    `first` draw with the compiles within it, and its `weighing`; tools/armada/costs.py's `timed`)."""
     span = os.environ.get(DRAWS)
     if not span:
         return False

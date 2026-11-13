@@ -1,9 +1,10 @@
 """Native DC-AE against the actual `AutoencoderDC`.
 
-`tools/diffusers_dc_ae_reference.py` builds two tiny instances with the
-published checkpoints' controls - `conv` as SANA 1.1's (strided convolutions,
-interpolation, multiscale attention) and `shuffle` as the `in-1.0` family's
-(pixel shuffles, resampling input and output blocks, batch norms, ReLU) -
+`tools/diffusers_dc_ae_reference.py` builds three tiny instances - `conv` with
+SANA 1.1's controls (strided convolutions, interpolation, multiscale attention),
+`shuffle` with the `in-1.0` family's (pixel shuffles, resampling input and
+output blocks, batch norms, ReLU), and `plain`, `conv` without its channel
+shortcuts and with a SiLU before the decoder's last convolution -
 saves them with `save_pretrained`, and records in float32 the latent of a
 rectangular batch, the decode of a fixed latent, their vector-Jacobian
 products against fixed probes for the input and every parameter, and the
@@ -37,7 +38,7 @@ from dew.nn.autoencoders.dc_ae import DCAE
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5
 GRADIENT = 1e-4
-VARIANTS = ("conv", "shuffle")
+VARIANTS = ("conv", "shuffle", "plain")
 
 
 @pytest.fixture(scope="module")
@@ -113,6 +114,27 @@ def test_the_autoencoder_scales_as_the_pipeline_does(variant):
     np.testing.assert_allclose(
         decoded, np.asarray(autoencoder.decode_batch(params, raw)), rtol=1e-5, atol=1e-5
     )
+
+
+def test_a_standalone_load_reads_its_config_once(source, monkeypatch):
+    """A published DC-AE loaded on its own (`load_autoencoder`) reads its config once: its dispatch's read,
+    which picks the loader, is the one the loader checks its class by and builds from, where the loader
+    resolved the release and parsed its config twice again (audit3 families F4). The reads are counted at
+    the file."""
+    from pathlib import Path as PathType
+
+    from dew.interop.autoencoders.pretrained import load_autoencoder
+
+    read_text, reads = PathType.read_text, []
+
+    def counted(path, *args, **kwargs):
+        if path.name == "config.json":
+            reads.append(path)
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(PathType, "read_text", counted)
+    loaded = load_autoencoder(str(source / "plain"), dtype=jnp.float32)
+    assert isinstance(loaded.model, DCAE) and len(reads) == 1
 
 
 def test_a_missing_tensor_is_refused(source, tmp_path):

@@ -380,16 +380,17 @@ def raised(done: subprocess.CompletedProcess) -> dict[str, list[str]]:
     closing line (Python's `Type: message` after its frames, a chained error's cause among them), read from
     stdout and stderr with a rank's `[N] ` prefix (`dew launch`'s) taken off; none where no traceback was
     printed. A refusal's test reads its error here, where its exit status alone a crash would pass."""
-    lines = [re.sub(r"^\[\d+\] ", "", line) for line in (done.stdout + "\n" + done.stderr).splitlines()]
     found: dict[str, list[str]] = {}
-    within = False
-    for line in lines:
+    within: set[str] = set()
+    for raw in (done.stdout + "\n" + done.stderr).splitlines():
+        ranked = re.match(r"^\[(\d+)\] (.*)$", raw)
+        rank, line = ranked.groups() if ranked else ("", raw)
         if line == "Traceback (most recent call last):":
-            within = True
-        elif within and line and not line.startswith(" "):
+            within.add(rank)
+        elif rank in within and line and not line.startswith(" "):
             # The traceback's closing line, past its frames: its error's type, any class's dotted name
             # (`ValueError`, `socket.gaierror`, `grpc._channel._InactiveRpcError`), and its message.
-            within = False
+            within.remove(rank)
             named, _, message = line.partition(": ")
             if re.fullmatch(r"(\w+\.)*\w+", named):
                 found.setdefault(named, []).append(message)
@@ -406,3 +407,11 @@ def running(pid: int) -> bool:
     except (FileNotFoundError, ProcessLookupError):
         return False
     return status.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+def refusal(error: BaseException) -> dict:
+    """A pool's refusal as its type states it (`dew._coordination`): its type, the agreement it was made
+    at, and the process it names (the rank that failed, the one that found otherwise, how many ran out)."""
+    kind = type(error).__name__
+    named = {"PeerFailure": "rank", "PoolDiffers": "process", "StreamsEnded": "ended"}.get(kind)
+    return {"type": kind, "phase": getattr(error, "phase", None), "named": named and getattr(error, named)}

@@ -43,6 +43,7 @@ from dew.interop.decoder_bindings import decoder_layouts
 from dew.interop.safetensors_io import LazyTensors
 from dew.interop.sources import StoredWeights
 from dew.interop.streaming import LazyTree, WeightLayout
+from dew.interop.unread import Stored
 from dew.interop.weights import AUTO, ParamTree, source_alias
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -180,7 +181,7 @@ class _TextTowers:
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
               policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
               attention_impl: AttentionImpl = "auto", params: Variables | None = None, lazy: bool = False,
-              stored: StoredWeights | None = None
+              stored: StoredWeights | None = None, weights: bool = True
               ) -> tuple[DiffusionConditioner, tuple[WeightLayout, ...], Mapping[str, np.ndarray],
                          dict[str, Mapping[str, object]]]:
         """Construct the published text composition from metadata and either weight source."""
@@ -188,14 +189,16 @@ class _TextTowers:
         if not names:
             raise ValueError("A latent diffusion source needs at least one text encoder")
         towers, tokenizers, text_params, layouts, pins = _clip_towers(
-            directory, names, compute, param_dtype=param_dtype, params=params, lazy=lazy, stored=stored)
+            directory, names, compute, param_dtype=param_dtype, params=params, lazy=lazy, stored=stored,
+            weights=weights)
         components: dict[str, Mapping[str, object]] = {
             name: _component_config(directory, name) for name in names}
         t5 = None
         if self.t5_tower is not None and component_present(index, self.t5_tower):
             t5, t5_params, t5_layouts, components[self.t5_tower] = _t5_tower(
                 directory, compute, self.t5_tower, policy.sequence, param_dtype=param_dtype,
-                params=None if params is None else params[self.t5_tower], lazy=lazy, stored=stored)
+                params=None if params is None else params[self.t5_tower], lazy=lazy, stored=stored,
+                weights=weights)
             if params is None:
                 text_params = {**text_params, self.t5_tower: t5_params}
             layouts += t5_layouts
@@ -228,14 +231,13 @@ class _QwenImageText:
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
               policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
               attention_impl: AttentionImpl = "auto", params: Variables | None = None, lazy: bool = False,
-              stored: StoredWeights | None = None
+              stored: StoredWeights | None = None, weights: bool = True
               ) -> tuple[QwenImageConditioner, tuple[WeightLayout, ...], Mapping[str, np.ndarray],
                          dict[str, Mapping[str, object]]]:
         """Construct `QwenImageConditioner` at the pipeline's prompt budget."""
         return _qwen_image_conditioning(directory, index, compute, tokens=policy.sequence,
                                         param_dtype=param_dtype, attention_impl=attention_impl,
-                                        params=params, lazy=lazy, stored=stored)
-
+                                        params=params, lazy=lazy, stored=stored, weights=weights)
     def unconditional(self, index: Mapping[str, object]) -> dict:
         """The empty prompt, encoded through the same template."""
         return {"text": ""}
@@ -256,14 +258,14 @@ class _HiddenStatesText:
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
               policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
               attention_impl: AttentionImpl = "auto", params: Variables | None = None, lazy: bool = False,
-              stored: StoredWeights | None = None
+              stored: StoredWeights | None = None, weights: bool = True
               ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...], Mapping[str, np.ndarray],
                          dict[str, Mapping[str, object]]]:
         """Construct `HiddenStatesConditioner` at the pipeline's prompt budget."""
         return _hidden_states_conditioning(
             directory, index, compute, pipeline=self.pipeline, tokens=policy.sequence,
             guidance=policy.guidance if self.embeds_guidance else None, param_dtype=param_dtype,
-            attention_impl=attention_impl, params=params, lazy=lazy, stored=stored)
+            attention_impl=attention_impl, params=params, lazy=lazy, stored=stored, weights=weights)
 
     def unconditional(self, index: Mapping[str, object]) -> dict:
         """The empty prompt a guided call encodes as its negative."""
@@ -280,13 +282,13 @@ class _WanText:
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
               policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
               attention_impl: AttentionImpl = "auto", params: Variables | None = None, lazy: bool = False,
-              stored: StoredWeights | None = None
+              stored: StoredWeights | None = None, weights: bool = True
               ) -> tuple[WanConditioner, tuple[WeightLayout, ...], Mapping[str, np.ndarray],
                          dict[str, Mapping[str, object]]]:
         """Construct `WanConditioner` at the pipeline's prompt budget."""
         encoder, layouts, components = _wan_conditioning(
             directory, compute, tokens=policy.sequence, param_dtype=param_dtype, params=params, lazy=lazy,
-            stored=stored)
+            stored=stored, weights=weights)
         return encoder, layouts, {}, components
 
     def unconditional(self, index: Mapping[str, object]) -> dict:
@@ -306,7 +308,7 @@ class _Denoiser:
 
     component: str
     model: nn.Module
-    weights: Callable[[str, bool], tuple[Variables, tuple[WeightLayout, ...]]]
+    weights: Callable[[str, bool, StoredWeights | None, bool], tuple[Variables, tuple[WeightLayout, ...]]]
     plan: Callable[[Mapping[str, tuple[int, ...]]], tuple[WeightLayout, ...]]
     """The layouts `weights` returns, from the stored tensors' shapes alone: what a
     pipeline bound from saved variables exports through (`assemble_pipeline`)."""
@@ -325,7 +327,8 @@ class _Denoiser:
 def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: str,
                            attention_impl: AttentionImpl, param_dtype: str = "float32",
                            variables: Variables | None = None, lazy: bool = False,
-                           text: bool = True, stored: StoredWeights | None = None) -> PipelineParts:
+                           text: bool = True, stored: StoredWeights | None = None,
+                           weights: bool = True) -> PipelineParts:
     """Read a published latent diffusion directory into native modules and variables.
 
     The directory's own denoiser component selects the family (`pipeline_denoiser`),
@@ -350,7 +353,7 @@ def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: st
     compute = resolve_dtype(dtype)
     denoiser = pipeline_denoiser(directory, dtype=dtype, attention_impl=attention_impl)
     if variables is None:
-        denoiser_variables, denoiser_layouts = denoiser.weights(param_dtype, lazy)
+        denoiser_variables, denoiser_layouts = denoiser.weights(param_dtype, lazy, stored, weights)
     else:
         denoiser_variables = {name: value for name, value in variables.items()
                               if name not in ("encoders", "autoencoder")}
@@ -362,12 +365,14 @@ def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: st
     policy = _call_policy(index, denoiser)
     autoencoder, vae_params, vae_layouts, vae_config = _diffusion_vae(
         directory, compute, param_dtype=param_dtype,
-        params=None if variables is None else variables["autoencoder"], lazy=lazy, stored=stored)
+        params=None if variables is None else variables["autoencoder"], lazy=lazy, stored=stored,
+        weights=weights)
     rows, columns = denoiser.sample_size
     size = (rows * autoencoder.downscale_factor, columns * autoencoder.downscale_factor)
     encoder, text_layouts, text_retained, components = denoiser.text.build(
         directory, index, denoiser, policy, compute, size, param_dtype=param_dtype,
-        attention_impl=attention_impl, params=held.get("conditioning"), lazy=lazy, stored=stored)
+        attention_impl=attention_impl, params=held.get("conditioning"), lazy=lazy, stored=stored,
+        weights=weights)
     components.update({denoiser.component: denoiser.config, "vae": vae_config})
     height, width = _geometry(index, size)
     # AutoencoderKLWan declares no channel count; it reads RGB.
@@ -391,7 +396,7 @@ def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: st
     if component_present(index, "safety_checker"):
         finish, encoders["safety"], safety_layouts, safety_configs = _image_safety(
             directory, compute, param_dtype=param_dtype, params=held.get("safety"), lazy=lazy,
-            stored=stored)
+            stored=stored, weights=weights)
         components.update(safety_configs)
     schedule = SourceSchedule.from_config(_component_config(directory, "scheduler"))
     components["scheduler"] = dict(schedule.config)
@@ -507,9 +512,12 @@ def pipeline_denoiser(directory: Path, *, dtype: str | None, attention_impl: Att
     return builder(config, directory, dtype=dtype, attention_impl=attention_impl)
 
 
-def _transformer_source(directory: Path, path_of: Callable[[str, int], tuple[str, ...] | None]
-                        ) -> tuple[Callable[[str, bool], tuple[Variables, tuple[WeightLayout, ...]]],
-                                   Callable[[Mapping[str, tuple[int, ...]]], tuple[WeightLayout, ...]]]:
+def _transformer_source(
+    directory: Path, path_of: Callable[[str, int], tuple[str, ...] | None]
+) -> tuple[
+    Callable[[str, bool, StoredWeights | None, bool], tuple[Variables, tuple[WeightLayout, ...]]],
+    Callable[[Mapping[str, tuple[int, ...]]], tuple[WeightLayout, ...]],
+]:
     """Read a transformer denoiser's parameters, and their layouts, from its
     component, each where its family's `path_of(name, rank)` places it;
     `lazy` leaves them `SourceLeaf`s for a placement to read. Beside it, the
@@ -521,24 +529,29 @@ def _transformer_source(directory: Path, path_of: Callable[[str, int], tuple[str
     return weights, functools.partial(diffusion.transformer_layouts, path_of=path_of)
 
 
-def _component_weights(directory: Path, component: str,
-                       read: Callable[..., tuple[LazyTree, tuple[WeightLayout, ...]]]
-                       ) -> Callable[[str, bool], tuple[Variables, tuple[WeightLayout, ...]]]:
-    """A denoiser's `weights(param_dtype, lazy)`: its `component`'s tensors read by `read`, the
-    parameters under `params`, beside their layouts."""
+def _component_weights(
+    directory: Path, component: str, read: Callable[..., tuple[LazyTree, tuple[WeightLayout, ...]]]
+) -> Callable[[str, bool, StoredWeights | None, bool], tuple[Variables, tuple[WeightLayout, ...]]]:
+    """A denoiser's `weights(param_dtype, lazy, stored, weights_loaded)`: its `component`'s tensors read by
+    `read`, the parameters under `params`, beside their layouts."""
     from dew.interop import diffusion
 
-    def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
-        params, layouts = read(diffusion.component_tensors(directory, component), param_dtype=param_dtype,
-                               lazy=lazy)
+    def weights(
+        param_dtype: str, lazy: bool, stored: StoredWeights | None, weights_loaded: bool
+    ) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        tensors = diffusion.component_tensors(
+            directory, component, stored=stored, weights_loaded=weights_loaded
+        )
+        params, layouts = read(tensors, param_dtype=param_dtype, lazy=lazy)
         return {"params": params}, layouts
+
     return weights
 
 
-def _transformer_denoiser(name: str, model: nn.Module, fields: Mapping[str, object], config: dict,
-                         dtype: str | None,
-                         weights: Callable[[str, bool], tuple[Variables, tuple[WeightLayout, ...]]],
-                         plan: Callable[[Mapping[str, tuple[int, ...]]], tuple[WeightLayout, ...]],
+def _transformer_denoiser(
+    name: str, model: nn.Module, fields: Mapping[str, object], config: dict, dtype: str | None,
+    weights: Callable[[str, bool, StoredWeights | None, bool], tuple[Variables, tuple[WeightLayout, ...]]],
+    plan: Callable[[Mapping[str, tuple[int, ...]]], tuple[WeightLayout, ...]],
                          text: _TextTowers | _QwenImageText | _HiddenStatesText | _WanText, *,
                          patch: int, latent_input: int, sample_size: tuple[int, int], context_width: int,
                          pipeline: str, origin: Origin = "scheduler", frames: int | None = None) -> _Denoiser:
@@ -560,9 +573,15 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None,
     fields = diffusion.sd3_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = fields.value
 
-    def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
+    def weights(
+        param_dtype: str, lazy: bool, stored: StoredWeights | None, weights_loaded: bool
+    ) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        tensors = diffusion.component_tensors(
+            directory, "transformer", stored=stored, weights_loaded=weights_loaded
+        )
         params, buffers, layouts = diffusion.translate_sd3_weights(
-            diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype, lazy=lazy)
+            tensors, param_dtype=param_dtype, lazy=lazy
+        )
         return {"params": params, "buffers": buffers}, layouts
 
     return _transformer_denoiser(
@@ -721,22 +740,53 @@ def _shapes(stored: StoredWeights | None, folder: str) -> dict[str, tuple[int, .
     return None if held is None else {name: spec.shape for name, (_, spec) in held.items()}
 
 
+def _unread_component(
+    directory: Path,
+    component: str,
+    stored: StoredWeights | None,
+    *,
+    weights: bool,
+    metadata: tuple[str, ...] = (),
+) -> Mapping[str, Stored] | None:
+    if weights:
+        return None
+    from dew.interop import diffusion
+
+    return diffusion.component_tensors(
+        directory, component, stored=stored, weights_loaded=False, metadata=metadata
+    )
+
+
 def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32",
-                   params: Variables | None = None, lazy: bool = False, stored: StoredWeights | None = None
+                   params: Variables | None = None, lazy: bool = False, stored: StoredWeights | None = None,
+                   weights: bool = True
                    ) -> tuple[AutoEncoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build the published autoencoder `vae/` holds, as `LOADERS` names its
     class and an AutoencoderKL otherwise, with its parameters and their source
     layouts; supplied `params` are bound without a weight read, and `lazy`
     leaves read ones `SourceLeaf`s."""
-    from dew.interop.autoencoders.pretrained import LOADERS, load_kl_vae
+    from dew.interop.autoencoders.pretrained import LOADERS, load_kl_vae, registration
 
-    load = LOADERS.get(_component_config(directory, "vae").get("_class_name", ""), load_kl_vae)
+    class_name = _component_config(directory, "vae").get("_class_name")
+    entry = registration(class_name if isinstance(class_name, str) else None)
+    load = LOADERS.get(class_name or "", load_kl_vae)
+    tensors = (
+        None
+        if params is not None
+        else _unread_component(
+            directory,
+            "vae",
+            stored,
+            weights=weights,
+            metadata=() if entry is None else entry.metadata_tensors,
+        )
+    )
     return load(directory, compute, subfolder="vae", param_dtype=param_dtype, params=params, lazy=lazy,
-                shapes=_shapes(stored, "vae"))
-
+                shapes=_shapes(stored, "vae"), tensors=tensors)
 
 def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtype: str = "float32",
-                 params: Variables | None = None, lazy: bool = False, stored: StoredWeights | None = None):
+                 params: Variables | None = None, lazy: bool = False, stored: StoredWeights | None = None,
+                 weights: bool = True):
     """Build the published CLIP text towers, their tokenizers, their parameters, the layouts those
     parameters came from and the tokenizers' files, each pinned as it is loaded."""
     from dew.data.text import pin_tokenizer
@@ -747,10 +797,12 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtyp
     for name in names:
         config = _component_config(directory, name)
         model = translate_config(config).value.clone(dtype=compute)
+        tensors = None if params is not None else _unread_component(directory, name, stored, weights=weights)
         tower, tree, recorded, _ = bind_component(
             directory / name, name, config, model, lambda name, rank: _text_head_path(name),
             lambda bound, model=model: model, prefix=("encoders", "conditioning", name),
-            params=params, param_dtype=param_dtype, lazy=lazy, shapes=_shapes(stored, name))
+            params=params, param_dtype=param_dtype, lazy=lazy, shapes=_shapes(stored, name),
+            tensors=tensors)
         towers.append(tower)
         if params is None:
             bound = {**bound, name: tree}
@@ -762,7 +814,8 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtyp
 
 
 def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dtype: str = "float32",
-              params: Variables | None = None, lazy: bool = False, stored: StoredWeights | None = None):
+              params: Variables | None = None, lazy: bool = False, stored: StoredWeights | None = None,
+              weights: bool = True):
     """Build the published T5 encoder as the conditioner's segment, with its
     parameters, their layouts and its config.
 
@@ -776,15 +829,18 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dt
     config = _component_config(directory, component)
     tower = translate_t5_config(config).value.clone(dtype=compute)
     pinned = pin_tokenizer(str(directory / ("tokenizer" + component.removeprefix("text_encoder"))))
+    tensors = None if params is not None else _unread_component(directory, component, stored, weights=weights)
     return bind_component(
         directory / component, component, config, tower, lambda name, rank: _t5_path(name),
         lambda bound: T5Segment(tower, pinned.transformers(), component, tokens, files=pinned),
         prefix=("encoders", "conditioning", component), params=params,
-        param_dtype=param_dtype, lazy=lazy, validate=t5_embedding, shapes=_shapes(stored, component))
+        param_dtype=param_dtype, lazy=lazy, validate=t5_embedding, shapes=_shapes(stored, component),
+        tensors=tensors)
 
 
 def _wan_conditioning(directory: Path, compute, *, tokens: int, param_dtype: str,
-                      params: Variables | None = None, lazy: bool = False, stored: StoredWeights | None = None
+                      params: Variables | None = None, lazy: bool = False,
+                      stored: StoredWeights | None = None, weights: bool = True
                       ) -> tuple[WanConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
     """Build Wan's conditioner: the UMT5 encoder, its tokenizer, the
     parameters and their layouts."""
@@ -796,6 +852,9 @@ def _wan_conditioning(directory: Path, compute, *, tokens: int, param_dtype: str
         raise ValueError(f"Wan's text encoder is a umt5 model, not {config.get('model_type')!r}")
     tower = translate_t5_config(config).value.clone(dtype=compute)
     pinned = pin_tokenizer(str(directory / "tokenizer"))
+    tensors = (
+        None if params is not None else _unread_component(directory, "text_encoder", stored, weights=weights)
+    )
     encoder, _, layouts, _ = bind_component(
         directory / "text_encoder", "text_encoder", config, tower, lambda name, rank: _t5_path(name),
         lambda bound: WanConditioner(tower, pinned.transformers(),
@@ -803,9 +862,9 @@ def _wan_conditioning(directory: Path, compute, *, tokens: int, param_dtype: str
                                      str(directory), tokens=tokens, param_dtype=param_dtype,
                                      tokenizer_files=pinned),
         prefix=("encoders", "conditioning", "text_encoder"), params=params,
-        param_dtype=param_dtype, lazy=lazy, validate=t5_embedding, shapes=_shapes(stored, "text_encoder"))
+        param_dtype=param_dtype, lazy=lazy, validate=t5_embedding, shapes=_shapes(stored, "text_encoder"),
+        tensors=tensors)
     return encoder, layouts, {"text_encoder": config}
-
 
 def _qwen_vl_text_config(config: Mapping[str, object]) -> dict:
     """The Qwen3-VL encoder's text_config as the Qwen3 decoder it computes for a prompt.
@@ -832,32 +891,15 @@ _TEXT_ENCODER = ("encoders", "conditioning", "text_encoder")
 def _bind_language_model[C: ConditionEncoder](
         directory: Path, record: decoder_parts.DecoderFields, family: str, rename: Callable[[str], str],
         conditioner: Callable[[Variables], C], *, vision: tuple[str, ...], param_dtype: str,
-        params: Variables | None, lazy: bool, stored: StoredWeights | None = None
+        params: Variables | None, lazy: bool, stored: StoredWeights | None = None, weights: bool = True
         ) -> tuple[C, tuple[WeightLayout, ...], Mapping[str, np.ndarray]]:
-    """Bind a language-model text encoder into the conditioner its pipeline runs:
-    supplied `params` as they are, or the `text_encoder` component's tensors
-    read as their decoder `family` reads a decoder's checkpoint
-    (`hf_decoders.read_decoder`), `rename` giving each tensor its name there,
-    with their layouts in the pipeline under every name they are stored by
-    (`decoder_bindings.decoder_layouts`), an equal alias's too. Supplied
-    `params` take their layouts from the same reading of the stored tensors'
-    headers (`StoredWeights`), over arrays that hold no bytes, where the
-    pipeline has its source; none without it.
-
-    The tensors under a `vision` prefix are a vision tower no text prompt
-    reads, so they stay out of the variables and come back as stored, under
-    their export names, for a source export to write back
-    (`Pretrained.retained_tensors`); with supplied `params`, read from the
-    source when the export reads them.
-    """
+    """Bind a language-model text encoder into the conditioner its pipeline runs."""
     from dew.interop import diffusion
 
-    def read(tensors: Mapping[str, np.ndarray], *, lazy: bool
+    def read(tensors: Mapping[str, Stored], *, lazy: bool
              ) -> tuple[Variables, tuple[WeightLayout, ...], list[str]]:
         """The decoder's variables, the bindings of `tensors` under every name they
         are stored by, and the names no leaf takes, the vision tower's among them."""
-        # A checkpoint may store one tensor under two names (a Mistral-3 under both
-        # its spellings): equal copies read once, and each name keeps its binding.
         aliases: dict[str, list[str]] = {}
         owners: dict[tuple[str, ...], str] = {}
         for name in tensors:
@@ -876,10 +918,23 @@ def _bind_language_model[C: ConditionEncoder](
             name for name in tensors if name.startswith(vision)]
 
     if params is None:
-        tensors = diffusion.component_tensors(directory, "text_encoder")
+        tensors = diffusion.component_tensors(
+            directory, "text_encoder", stored=stored, weights_loaded=weights
+        )
         variables, bound, unread = read(tensors, lazy=lazy)
-        return (conditioner({"text_encoder": variables}), bound,
-                {f"text_encoder/{name}": tensors[name] for name in unread})
+        if weights:
+            retained: Mapping[str, np.ndarray] = {
+                f"text_encoder/{name}": np.asarray(tensors[name]) for name in unread
+            }
+        elif stored is not None and (held := stored.specs("text_encoder")) is not None:
+            source = stored.tensors({name: held[name] for name in unread})
+            retained = LazyTensors(
+                {f"text_encoder/{name}": source.specs[name] for name in unread},
+                lambda name: source[name.removeprefix("text_encoder/")],
+            )
+        else:
+            retained = {}
+        return conditioner({"text_encoder": variables}), bound, retained
     if stored is None or (held := stored.specs("text_encoder")) is None:
         return conditioner(params), (), {}
     _, bound, unread = read({name: np.broadcast_to(np.zeros((), spec.dtype), spec.shape)
@@ -888,7 +943,6 @@ def _bind_language_model[C: ConditionEncoder](
     return conditioner(params), bound, LazyTensors(
         {f"text_encoder/{name}": source.specs[name] for name in unread},
         lambda name: source[name.removeprefix("text_encoder/")])
-
 
 def _text_name(name: str) -> str:
     """A multimodal text encoder's language-model tensor under its decoder's own name, its head too, as a
@@ -902,7 +956,7 @@ def _text_name(name: str) -> str:
 def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compute, *,
                              tokens: int, param_dtype: str, attention_impl: AttentionImpl,
                              params: Variables | None = None, lazy: bool = False,
-                             stored: StoredWeights | None = None
+                             stored: StoredWeights | None = None, weights: bool = True
                              ) -> tuple[QwenImageConditioner, tuple[WeightLayout, ...],
                                         Mapping[str, np.ndarray], dict[str, Mapping[str, object]]]:
     """Build Qwen-Image's conditioner: the Qwen3-VL language model, its
@@ -922,9 +976,9 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
         directory, record, "qwen3", _text_name,
         lambda bound: QwenImageConditioner(decoder, pinned.transformers(), bound, str(directory),
                                            tokens=tokens, param_dtype=param_dtype, tokenizer_files=pinned),
-        vision=("model.visual.",), param_dtype=param_dtype, params=params, lazy=lazy, stored=stored)
+        vision=("model.visual.",), param_dtype=param_dtype, params=params, lazy=lazy, stored=stored,
+        weights=weights)
     return encoder, layouts, retained, {"text_encoder": config}
-
 
 _FLUX2_TEXT: Mapping[str, tuple[Literal["qwen3", "mistral3"], tuple[int, ...]]] = MappingProxyType({
     "qwen3": ("qwen3", (9, 18, 27)), "mistral3": ("mistral3", (10, 20, 30))})
@@ -951,8 +1005,8 @@ def _hidden_states_name(multimodal: bool) -> Callable[[str], str]:
 def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], compute, *,
                                 pipeline: Literal["flux2", "z_image"], tokens: int, guidance: float | None,
                                 param_dtype: str, attention_impl: AttentionImpl,
-                                params: Variables | None = None,
-                                lazy: bool = False, stored: StoredWeights | None = None
+                                params: Variables | None = None, lazy: bool = False,
+                                stored: StoredWeights | None = None, weights: bool = True
                                 ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...],
                                            Mapping[str, np.ndarray], dict[str, Mapping[str, object]]]:
     """Build FLUX.2's or Z-Image's conditioner: the text encoder's language
@@ -992,12 +1046,12 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
             template=template, layers=layers, thinking=pipeline == "z_image", tokens=tokens,
             guidance=guidance, param_dtype=param_dtype, tokenizer_files=pinned),
         vision=_MISTRAL3_VISION if multimodal else (), param_dtype=param_dtype, params=params, lazy=lazy,
-        stored=stored)
+        stored=stored, weights=weights)
     return encoder, layouts, retained, {"text_encoder": config}
 
-
 def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
-                  params: Variables | None = None, lazy: bool = False, stored: StoredWeights | None = None):
+                  params: Variables | None = None, lazy: bool = False, stored: StoredWeights | None = None,
+                  weights: bool = True):
     """Build the safety head a file declares: the finish, its parameters, their
     layouts and the two configs it ships; supplied `params` are bound without
     a weight read."""
@@ -1009,13 +1063,18 @@ def _image_safety(directory: Path, compute, *, param_dtype: str = "float32",
         transform = json.load(handle)
     head = CLIPSafetyHead(translate_vision_config(config).value.clone(dtype=compute),
                           int(config["projection_dim"]), dtype=compute)
+    tensors = (
+        None
+        if params is not None
+        else _unread_component(directory, "safety_checker", stored, weights=weights)
+    )
     finish, params, layouts, _ = bind_component(
         directory / "safety_checker", "safety_checker", config, head, lambda name, rank: _safety_path(name),
         lambda bound: ImageSafety(head, CLIPImageTransform.from_config(transform)),
         prefix=("encoders", "safety"), params=params, param_dtype=param_dtype, lazy=lazy,
         # The root scoring vectors and thresholds, the head's only one-name paths.
         state=lambda name: (path := _safety_path(name)) is not None and len(path) == 1,
-        shapes=_shapes(stored, "safety_checker"))
+        shapes=_shapes(stored, "safety_checker"), tensors=tensors)
     return finish, params, layouts, {"safety_checker": config, "feature_extractor": transform}
 
 

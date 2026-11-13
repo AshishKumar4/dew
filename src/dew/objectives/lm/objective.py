@@ -66,7 +66,6 @@ from dew.batch import (
     token_positions,
 )
 from dew.data.chat import ROLES_KEY, Role
-from dew.data.plan import PLAN_VERSIONS, SHARED_STATE
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
@@ -894,21 +893,13 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                              "blocks beyond its own source, so depths are refused with blocks")
         refuse_block_reading(self.model, "a batch's blocks")
 
-    plan: int = PLAN_VERSIONS[-1]
-    """The data plan version the run's rows are read by (`bind_plan`), a new run's where it binds none."""
-
-    def bind_plan(self, version: int) -> None:
-        """Take the run's data plan version (`Objective.bind_plan`): a run of a plan before `SHARED_STATE`
-        laid every row whole, and resumes so (`shares_prefixes`)."""
-        self.plan = version
-
     def shares_prefixes(self, train: bool = False) -> bool:
         """Whether rows that begin alike are scored over one copy of their prefix (`token_scores` of rows
         whose coordinates carry forks, `dew.data.forked_rows.ForkedRows`): where the model computes each
         document over its ancestors as its own row does
         (`ForkedCalls`; in a training step with `train`, no dropout drawing), no in-context step reads
-        a row's tokens in its order, and the run's plan is one that shares (`SHARED_STATE`, `bind_plan`)."""
-        return (self.plan >= SHARED_STATE and self.adaptation is None
+        a row's tokens in its order."""
+        return (self.adaptation is None
                 and isinstance(self.model, ForkedCalls) and self.model.fork_refusal(train) is None)
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
@@ -1019,10 +1010,12 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
         if depths:
-            depth_scores, (sown, qk, kls) = self._depth_pass(
-                params, gathered['prediction_inputs']['states'] if stream_depth else hidden, inputs, targets,
-                prepared, roles, losses.dtype, table, rows, (sown, qk, kls), (routing, qk_stats, indexer),
-                train=train, rngs=rngs, collections=collections, packing=packing)
+            with self._watched(prepared, watched):
+                depth_scores, (sown, qk, kls, inspected) = self._depth_pass(
+                    params, gathered['prediction_inputs']['states'] if stream_depth else hidden, inputs,
+                    targets, prepared, roles, losses.dtype, table, rows, (sown, qk, kls, inspected),
+                    (routing, qk_stats, indexer, watched), train=train, rngs=rngs, collections=collections,
+                    packing=packing)
         passes = self._exit_scores(params, gathered, targets, (losses, correct), before) if exits else None
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
                       whole, inspected, moved, passes)
@@ -1030,14 +1023,15 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     def _depth_pass(self, params, source, inputs, targets, prepared, roles, dtype, table, rows, records,
                     asked, *, train, rngs, collections: list[str], packing: dict):
         """The prediction depths' scores (`_depth_scores`) from the trunk's `source` states, and the
-        trunk's `records` (`(sown, qk, kls)`) with the depths' added to each the call `asked` for: a routed
-        depth balances, counts and indexes like a trunk layer. Depth d's state at p scores the target d
-        further out, so its targets are the shifted row's from d on."""
+        trunk's `records` (`(sown, qk, kls, inspected)`) with the depths' added to each the call `asked`
+        for: a routed depth balances, counts and indexes like a trunk layer, and a watched one sows its
+        summary under its own path (`mtp_<d>`), over the positions its caller names. Depth d's state at p
+        scores the target d further out, so its targets are the shifted row's from d on."""
         states = self.model.apply(params, source, inputs, train=train, rngs=rngs, method="mtp_hidden_states",
                                   mutable=collections or False, **packing)
         if collections:
             states, depth_sown = states
-            names = (ROUTER_COLLECTION, QK, INDEXER_COLLECTION)
+            names = (ROUTER_COLLECTION, QK, INDEXER_COLLECTION, INSPECTED)
             records = tuple({**(held or {}), **depth_sown.get(name, {})} if wanted else held
                             for held, name, wanted in zip(records, names, asked, strict=True))
         return self._depth_scores(params, states, targets, prepared, roles, dtype, table, rows), records

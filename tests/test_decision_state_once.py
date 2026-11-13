@@ -240,45 +240,6 @@ def test_a_row_over_one_state_decides_each_question_as_its_own_row_does():
                     seeds=STATE_ONCE_SEEDS, truth_fn=truth)
 
 
-def test_a_stated_shared_layout_read_by_an_earlier_plan_lays_its_rows_in_streams_and_decides_alike():
-    """A layout that states its `shared_state`, read by a data plan from before rows forked a state
-    (`dew.data.plan.SHARED_STATE`), lays its rows as that plan's runs wrote them: each window's rows in
-    streams at their own rows' positions and no documents, the same rows and tokens this Dew's plan packs,
-    so a run saved under such a plan rebuilds the data plan it saved (`DecisionObjective.data`,
-    `QuestionLayout.streamed`); and the objective bound to that plan (`bind_plan`) decides each question
-    through those rows as its own row does (check 1, float64 truth). The earlier plan's rows were laid as
-    documents continuing a shared part, another plan's steps, and its checkpoint was refused (the
-    promotion's final review, finding 2)."""
-    from dew.data.plan import IN_ORDER
-
-    shared = in_streams(SHARED, segments=2)
-    shared.bind_plan(IN_ORDER)
-    alone = in_streams(OWN, segments=1)
-    rows = examples()
-    earlier = windows_of(shared, rows, count=8, plan_version=IN_ORDER)
-    latest = windows_of(in_streams(SHARED, segments=2), rows, count=8)
-    assert len(earlier) == len(latest) > 1
-    for written, forked in zip(earlier, latest, strict=True):
-        assert {"streams", "positions"} <= written.keys() and not {"documents", "parents"} & written.keys()
-        for field in ("tokens", "segments", "positions"):
-            np.testing.assert_array_equal(written[field], forked[field])
-    windows = {"shared": earlier, "alone": windows_of(alone, rows, count=24)}
-    initialized = jax.jit(lambda key: unboxed(shared.init(key, variables={})))
-    wide = copy.copy(alone)
-    wide.model = DecisionModel(alone.model.backbone.clone(dtype=jnp.float64),
-                               alone.model.head.clone(dtype=jnp.float64), alone.model.context_encoder)
-
-    @as_given
-    def truth(variables):
-        with jax.enable_x64(new_val=True):
-            return scored(wide, windows["alone"], widened(variables))
-
-    assert_as_exact(as_given(lambda variables: scored(shared, windows["shared"], variables)),
-                    as_given(lambda variables: scored(alone, windows["alone"], variables)),
-                    lambda seed: (initialized(jax.random.key(seed)),), "rows in streams over one state",
-                    seeds=STATE_ONCE_SEEDS, truth_fn=truth)
-
-
 def shared_parts(batch) -> list[str]:
     """What each row of a window writes before its question, as text: its shared document where its rows
     ask over one state, the row whole otherwise (its own row, which opens with it)."""
@@ -376,26 +337,20 @@ def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_o
     assert all(answers[name].choice in question.options for name, question in QUESTIONS.items())
 
 
-def test_a_run_read_by_a_plan_from_before_rows_shared_a_state_declares_a_question_a_row(tmp_path):
-    """A lettered decision run whose layout states no sharing, read by a data plan from before a request's
-    questions shared a state (`dew.data.plan.SHARED_STATE`), trains a question a row, and the task loaded
-    from the step it saves lays a request's three questions in three rows, as it trained; the same run
-    under this Dew's plan lays them in one row over one state (`DecisionObjective.bind_plan`: a saved run
-    resumed under its earlier plan declared, at the step the resume saved, the sharing the code derived,
-    so its task forked the requests of a run that read none)."""
+def test_a_decision_run_whose_layout_states_no_sharing_declares_a_request_one_row(tmp_path):
+    """A lettered decision run whose layout states no sharing trains a request's questions over one copy of
+    its state, and the task loaded from the step it saves lays a request's three questions in one row
+    over one state, as it trained."""
     from run_kinds import lettered, trained
 
     from dew.data import Memory
-    from dew.data.plan import IN_ORDER
     from dew.decision import Decide, decisions
 
     rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(8)
     run = dataclasses.replace(lettered(tmp_path, drawn=False), data=rows, validation=None)
-    for name, version, laid in (("earlier", IN_ORDER, len(QUESTIONS)), ("shared", None, 1)):
-        trained(dataclasses.replace(run, data_plan_version=version), tmp_path, name,
-                trainer={"checkpoint_final": True})
-        decide = Decide.from_run(str(tmp_path / "runs" / name))
-        assert len(decide.layout.rows(decide.tokenizer, decide.specials, STATES[0], QUESTIONS)) == laid, name
+    trained(run, tmp_path, "shared", trainer={"checkpoint_final": True})
+    decide = Decide.from_run(str(tmp_path / "runs" / "shared"))
+    assert len(decide.layout.rows(decide.tokenizer, decide.specials, STATES[0], QUESTIONS)) == 1
 
 
 class Merging(ByteTokenizer):

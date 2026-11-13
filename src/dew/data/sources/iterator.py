@@ -27,7 +27,7 @@ class Iterated(Dataset):
     opens, and a resume reads them again to its position (`Replayed`); a
     stream with neither trains, and its resume is refused. `identity` declares
     its content version in a run's plan and its logs; with none, a resume
-    needs `resume="non-exact"` (`Manifest.exact`)."""
+    needs `resume="relaxed"` (`Manifest.exact`)."""
 
     factory: Callable[[], Iterator[Batch]]
     identity: str | None = None
@@ -59,7 +59,7 @@ class Iterated(Dataset):
     def records(self, read: Read) -> Records:
         raise ValueError(f"{self.describe()} is an iterator, read only as a stream")
 
-    def manifest(self, version: int) -> ShardManifest:
+    def manifest(self) -> ShardManifest:
         return ShardManifest((Shard(self.describe(), self.describe()),), self._read_shard)
 
     def _read_shard(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:

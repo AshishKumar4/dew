@@ -45,10 +45,14 @@ class ProcessorCall(TypedDict, total=False):
     video_metadata: Sequence[Mapping[str, object]]
 
 
+type HostMedia = Media | str | Sequence[HostMedia]
+"""What a `HostProcessor` takes as images: `Media`, and a path or URL it loads itself."""
+
+
 class HostProcessor(Protocol):
     """Declares the HF processor operations kept outside compiled model computation."""
 
-    def __call__(self, *, images: Media | None = None,
+    def __call__(self, *, images: HostMedia | None = None,
                  **kwargs: Unpack[ProcessorCall]) -> Mapping[str, object]: ...
     # The files it wrote are its own bookkeeping; dew calls this for the effect.
     def save_pretrained(self, save_directory: str) -> None: ...
@@ -112,6 +116,31 @@ def _chat_image(image: object) -> Media | str | bytes:
         return image
     raise ValueError(f"an image part holds an array, a PIL image, a path or url, or bytes, not "
                      f"{type(image).__name__}")
+
+
+type MediaInput = Media | str | bytes | bytearray | Path | Sequence[MediaInput]
+
+
+def _is_image_collection(value: MediaInput) -> TypeGuard[Sequence[MediaInput]]:
+    """Whether `value` is a sequence of media items rather than one atomic path, byte buffer or array."""
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
+
+
+def _as_host_media(value: MediaInput) -> HostMedia:
+    """`value` as a `HostProcessor` takes its images: a path or URL as its text, which the processor
+    loads itself (`transformers.image_utils.load_image`), a `Path` as its text, a byte buffer opened as
+    the image it holds, an array or an image as it is."""
+    import io
+
+    from PIL import Image
+
+    if isinstance(value, np.ndarray | Image.Image | str):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes | bytearray):
+        return Image.open(io.BytesIO(value))
+    return [_as_host_media(entry) for entry in value]
 
 
 def takes_medias(reference: HostProcessor | MediasProcessor) -> TypeGuard[MediasProcessor]:
@@ -334,7 +363,7 @@ class Processor:
         return AutoProcessor.from_pretrained(str(self.directory), local_files_only=True,
                                              trust_remote_code=trusted, **options)
 
-    def host_media(self, text: str | Sequence[str], *, images: Media) -> dict[str, np.ndarray]:
+    def host_media(self, text: str | Sequence[str], *, images: MediaInput) -> dict[str, np.ndarray]:
         """The source's fields for `text` and `images` as host arrays in their own dtypes, before Dew
         aligns them to model rows: asked of the processor in the tensor type it computes in
         (`_media_tensors`), and read as `_from_arrays` reads them, a bfloat16 field widened to
@@ -342,7 +371,7 @@ class Processor:
         return self._host_arrays(self.media(text=text if isinstance(text, str) else list(text), images=images,
                                             return_tensors=self._media_tensors))
 
-    def media(self, *, images: Media | None = None,
+    def media(self, *, images: MediaInput | None = None,
               **kwargs: Unpack[ProcessorCall]) -> Mapping[str, object]:
         """Return the source's media fields before Dew aligns them to model rows: its processor's own,
         or, for a processor whose public call takes its media as `medias` (Kimi K2.5's release's), the
@@ -352,9 +381,9 @@ class Processor:
         # An audio-only processor takes no images keyword at all.
         if images is None:
             return self._media_reference(**kwargs)
-        return self._media_reference(images=images, **kwargs)
+        return self._media_reference(images=_as_host_media(images), **kwargs)
 
-    def _medias_fields(self, images: Media | Sequence[object] | None,
+    def _medias_fields(self, images: MediaInput | None,
                        **kwargs: Unpack[ProcessorCall]) -> dict[str, np.ndarray]:
         """The fields of a processor whose public call takes `medias` and `text` (Kimi K2.5's release's
         KimiK25Processor at 4d01dfe, kimi_k25_processor.py:72-119), as Dew reads every other's: each row
@@ -377,23 +406,38 @@ class Processor:
         if text is None:
             raise ValueError(f"{type(self._media_reference).__name__} takes its media with their text")
         rows = [text] if isinstance(text, str) else list(text)
-        # One image (an array, a PIL image) or a sequence of them.
-        given: list[object] = ([] if images is None else list(images) if isinstance(images, Sequence)
-                               else [images])
+        # One image (an array, a PIL image, a path or bytes) or a sequence of them.
+        given: list[MediaInput] = (
+            [] if images is None else list(images) if _is_image_collection(images) else [images]
+        )
         per_row = len(rows) > 1 and len(given) == len(rows) and all(
-            isinstance(entry, Sequence) for entry in given)
+            _is_image_collection(entry) for entry in given
+        )
         image_id, _ = _media_token_ids(self.record)
         blocks = self._merge_size() ** 2
         tokens, pixels, grids = [], [], []
         for index, row in enumerate(rows):
             if per_row:
                 entry = given[index]
-                taken = list(entry) if isinstance(entry, Sequence) else [entry]
+                taken = list(entry) if _is_image_collection(entry) else [entry]
             else:
                 count = int(np.count_nonzero(np.asarray(self.reference(text=row)["input_ids"]) == image_id))
                 taken, given = given[:count], given[count:]
-            medias = [{"type": "image", "image": PILImage.fromarray(np.asarray(image))
-                       if isinstance(image, np.ndarray) else image} for image in taken]
+            medias = [
+                {
+                    "type": "image",
+                    "image": (
+                        PILImage.fromarray(np.asarray(image))
+                        if isinstance(image, np.ndarray)
+                        else str(image)
+                        if isinstance(image, Path)
+                        else bytes(image)
+                        if isinstance(image, bytearray)
+                        else image
+                    ),
+                }
+                for image in taken
+            ]
             values = reference(medias=medias, text=row, return_tensors="np")
             ids = np.asarray(values["input_ids"]).reshape(-1)
             grid = np.asarray(values["grid_thws"]).reshape(-1, 3) if taken else np.zeros((0, 3), np.int64)
@@ -423,7 +467,7 @@ class Processor:
 
         return image_text(self._media_reference, where=str(self.directory))
 
-    def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
+    def __call__(self, text: str | Sequence[str], *, images: MediaInput | None = None,
                  audio: Media | None = None, videos: Media | None = None,
                  video_metadata: Sequence[Mapping[str, object]] | None = None) -> ModelInputs:
         if video_metadata is not None and videos is None:
@@ -545,9 +589,9 @@ class Processor:
         # An unpadded batch carries no validity field. The host knows the rows
         # are whole here; the model would have to take an all-true mask on
         # trust and build one anyway.
-        token_fields = {POSITIONS_FIELD: jnp.asarray(positions)}
+        token_fields: dict[str, np.ndarray] = {POSITIONS_FIELD: positions}
         if not valid.all():
-            token_fields[VALIDITY_FIELD] = jnp.asarray(valid)
+            token_fields[VALIDITY_FIELD] = valid
         kind = config_wrapper(self.config)
         if kind.gemma4:
             for pixels, coordinates in (("pixel_values", "image_position_ids"),
@@ -568,10 +612,10 @@ class Processor:
                 groups = np.cumsum(vision & ~previous, axis=1, dtype=np.int32) - 1
                 field = ("block_groups" if self.config.get("model_type") == "gemma4_unified"
                          else "image_groups")
-                token_fields[field] = jnp.asarray(np.where(vision, groups, -1))
+                token_fields[field] = np.where(vision, groups, -1)
         elif "video_position_ids" in values:
             raise ValueError("video_position_ids require the Gemma4 visual tower")
-        conditioning: dict[str, jax.Array] = {}
+        conditioning: dict[str, np.ndarray] = {}
         if "pixel_values" in values or "pixel_values_videos" in values:
             if "pixel_values_videos" in values and not kind.video:
                 videos = [name for name, held in WRAPPERS.items() if held.video]
@@ -594,12 +638,16 @@ class Processor:
         if np.any(text < 0) or np.any(text >= self.vocab_size):
             raise ValueError("input_ids must lie in the text vocabulary, including any hard media ranges, "
                              "save the placeholders media fill")
-        prepared = ModelInputs(jnp.asarray(tokens, jnp.int32), token_fields, conditioning)
+        prepared = ModelInputs(
+            jnp.asarray(tokens, jnp.int32),
+            {name: jnp.asarray(field) for name, field in token_fields.items()},
+            {name: jnp.asarray(field) for name, field in conditioning.items()},
+        )
         prepared.validate()
         return prepared
 
     def _images(self, values: Mapping[str, object], tokens: np.ndarray
-                ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+                ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         """Row-align the processor's image and video features to their placeholders.
 
         It runs in two halves. The first reads the processor's output into
@@ -676,15 +724,18 @@ class Processor:
             token_lengths[row, image] = len(slots)
             if groups is not None:
                 groups[row, slots] = image
-        conditioning = {"pixel_values": jnp.asarray(padded), "image_lengths": jnp.asarray(image_counts),
-                        "image_token_lengths": jnp.asarray(token_lengths)}
+        conditioning: dict[str, np.ndarray] = {
+            "pixel_values": padded,
+            "image_lengths": image_counts,
+            "image_token_lengths": token_lengths,
+        }
         if padded_positions is not None:
-            conditioning["image_position_ids"] = jnp.asarray(padded_positions)
+            conditioning["image_position_ids"] = padded_positions
         if padded_grid is not None:
-            conditioning["image_grid_thw"] = jnp.asarray(padded_grid)
-        fields = {"image_indices": jnp.asarray(indices)}
+            conditioning["image_grid_thw"] = padded_grid
+        fields: dict[str, np.ndarray] = {"image_indices": indices}
         if groups is not None:
-            fields["image_groups"] = jnp.asarray(groups)
+            fields["image_groups"] = groups
         return fields, conditioning
 
     def _positioned_chunks(
@@ -715,7 +766,7 @@ class Processor:
         return chunks, patch_positions, selected, kernel
 
     def _audio(self, values: Mapping[str, object], tokens: np.ndarray
-               ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+               ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         """Row-align the processor's clip features and index their placeholders.
 
         Each contiguous run of the audio placeholder is one clip, in the
@@ -764,12 +815,12 @@ class Processor:
         for offset, (row, clip, _) in enumerate(places):
             padded[row, clip] = features[offset]
             padded_mask[row, clip] = mask[offset]
-        conditioning = {
-            "input_features": jnp.asarray(padded),
-            "input_features_mask": jnp.asarray(padded_mask),
-            "audio_lengths": jnp.asarray(counts),
+        conditioning: dict[str, np.ndarray] = {
+            "input_features": padded,
+            "input_features_mask": padded_mask,
+            "audio_lengths": counts,
         }
-        return {"audio_indices": jnp.asarray(indices)}, conditioning
+        return {"audio_indices": indices}, conditioning
 
     @property
     def pools_frames(self) -> bool:
@@ -845,7 +896,7 @@ class Processor:
         return list(chunks), np.asarray(grids, np.int32), merge, spans
 
     def _image_rotary_positions(self, tokens: np.ndarray, valid: np.ndarray,
-                                groups: jax.Array, grids: jax.Array) -> jax.Array:
+                                groups: np.ndarray, grids: np.ndarray) -> np.ndarray:
         """Compute Qwen3.5's get_rope_index on host-normalized image grids.
 
         Text advances one coordinate per token. An image occupies its merged
@@ -875,7 +926,7 @@ class Processor:
                     prepared[row, span] = coordinates + cursor
                     cursor += max(height, width) // merge
                 start = stop
-        return jnp.asarray(prepared)
+        return prepared
 
     def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
         """Decode integer `[B, S]` token rows with the processor's tokenizer, skipping special tokens."""

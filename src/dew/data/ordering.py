@@ -1,10 +1,12 @@
 """A locality order over physical shards, without materializing record permutations; a streamed read's
-windowed shuffle, its windows read as the one before is given (`WindowShuffle`)."""
+windowed shuffle, its windows read as the one before is given (`WindowShuffle`); and an indexed order past
+the places a phase's run trained already (`Skipping`)."""
 
 from __future__ import annotations
 
+import bisect
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import overload
 
 import grain.experimental as gx
@@ -14,6 +16,7 @@ from grain._src.python.dataset.transformations.shuffle import _reshuffle_window,
 
 from dew.batch import Batch
 from dew.data.dataset import Ranges
+from dew.data.pipeline import Pipeline, Repeat
 
 
 class BlockShuffle(grain.MapDataset[Batch]):
@@ -138,3 +141,38 @@ class _WindowShuffled(_WindowShuffleDatasetIterator[Batch]):
         self._ended, self._ahead, self._next = False, [], None
         super().set_state(state)
 
+
+class Skipping(grain.MapDataset):
+    """`rows` with the places `skipped` (sorted) left out, its `index`th row the `index`th of `rows` that
+    is not among them: a corpus a phase of a global order continues past the places the run trained already
+    (`dew.data.lowering._Build.skipped`)."""
+
+    def __init__(self, rows: grain.MapDataset, skipped: Sequence[int]):
+        super().__init__(rows)
+        self._rows, self._skipped = rows, skipped
+
+    def __len__(self) -> int:
+        return len(self._rows) - bisect.bisect_left(self._skipped, len(self._rows))
+
+    @overload
+    def __getitem__(self, index: slice) -> grain.MapDataset: ...
+
+    @overload
+    def __getitem__(self, index: int) -> Batch: ...
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return self.slice(index)
+        # The least place with `index` places before it not skipped: the fixed point of counting the skipped
+        # places up to it, which no skipped place is.
+        place = index
+        while (moved := index + bisect.bisect_right(self._skipped, place)) != place:
+            place = moved
+        return self._rows[place]
+
+
+def place_of(pipeline: Pipeline) -> int | None:
+    """Where a corpus's chain places its records for the phases that continue it
+    (`dew.data.lowering._Build.skipped`): at its first repeat, whose `index`th row is its place `index`; None
+    where it repeats nothing, its places its own rows."""
+    return next((index for index, stage in enumerate(pipeline.stages) if isinstance(stage, Repeat)), None)

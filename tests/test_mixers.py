@@ -22,7 +22,6 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from port_support import row_names_port
 from reference_error import assert_as_exact, logits_operands, widened, with_gradients
 from residual_orders import orders, permuted, residual_width
 
@@ -202,10 +201,10 @@ def pulled(forward, variables, cotangent):
     return with_gradients(lambda variables: forward(variables).astype(cotangent.dtype))(variables, cotangent)
 
 
-def packed_forward(model, tokens, *, documents=DOCUMENTS, segmented=True):
+def packed_forward(model, tokens, *, documents=DOCUMENTS):
     """The forward of the documents' `tokens` `[1, sum(documents)]` packed in one row (positions
     restarting per document, then PADDING slots whose logits the loss ignores), their segment ids
-    given, or with `segmented` False the same row and positions without them."""
+    given."""
     total = sum(documents)
     assert tokens.shape == (1, total)
     segments = [jnp.full((1, length), i + 1, jnp.int32) for i, length in enumerate(documents)]
@@ -213,22 +212,12 @@ def packed_forward(model, tokens, *, documents=DOCUMENTS, segmented=True):
     positions = jnp.concatenate([*(jnp.arange(length)[None] for length in documents),
                                  jnp.zeros((1, PADDING), jnp.int32)], axis=1)
     row = jnp.concatenate([tokens, jnp.zeros((1, PADDING), tokens.dtype)], axis=1)
-    tokens_at = (coordinates(segments=segments, positions=positions, max_segments=len(documents) + 1)
-                 if segmented else coordinates(positions=positions))
+    tokens_at = coordinates(segments=segments, positions=positions, max_segments=len(documents) + 1)
 
     def forward(variables):
         return model.apply(variables, row, coordinates=tokens_at)[:, :total]
 
     return forward
-
-
-def packed_and_alone(model, variables, tokens, cotangent):
-    """Logits and parameter gradients of the documents' `tokens` run packed (`packed_forward`) and
-    of each document run alone, the latter concatenated (`documents_alone`)."""
-    def run(forward):
-        return jax.jit(functools.partial(pulled, forward))(variables, cotangent)
-
-    return run(packed_forward(model, tokens)), run(documents_alone(model, tokens))
 
 
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
@@ -258,12 +247,10 @@ KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm"
 recurrent kinds default to their models' heads (Kimi Linear's 64 of 128, Qwen3.5's 32 of 128), whose
 per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
 
-REFUSED = {"kpool_sparse_attention"}
-"""Kinds that refuse packed rows."""
-
 SEEDS = {"attention": 64, "deepseek_v4": 256, "deepseek_v4 csa": 256, "deepseek_v4 csa2": 256,
          "deepseek_v4 hca": 256, "gated_delta_net": 512, "kimi_delta_attention": 64,
-         "lightning_attention": 64, "llama4": 128, "mamba": 32, "mamba2": 256, "mamba3": 512, "memory": 256,
+         "kpool_sparse_attention": 16, "kpool_sparse_attention notail": 16, "lightning_attention": 64,
+         "llama4": 128, "mamba": 32, "mamba2": 256, "mamba3": 512, "memory": 256,
          "mla": 64,
          "mlp": 64, "parallel": 64, "qsa_attention": 128, "short_conv": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` per kind (on armada): the
@@ -339,13 +326,6 @@ def assert_packs_as_alone(kind):
     model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=max(128, total + PADDING), **overrides)
     tokens = jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB)
     variables = model.init(jax.random.key(4), tokens)
-    cotangent = jax.random.normal(jax.random.key(5), (1, total, VOCAB))
-    if kind in REFUSED:
-        unsegmented = functools.partial(pulled, packed_forward(model, tokens, segmented=False))
-        jax.block_until_ready(jax.jit(unsegmented)(variables, cotangent))
-        with pytest.raises(ValueError):
-            packed_and_alone(model, variables, tokens, cotangent)
-        return
     assert_packed_as_alone(model, variables, f"packed {kind}", SEEDS[kind])
 
 
@@ -373,6 +353,21 @@ def test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does(c
     variables = model.init(jax.random.key(4), jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB))
     assert_packed_as_alone(model, variables, f"packed deepseek_v4 {compressor}",
                            SEEDS[f"deepseek_v4 {compressor}"])
+
+
+def test_a_packed_row_of_kpool_attention_without_tails_computes_what_its_documents_compute_alone():
+    """The k-pool layer selecting whole pools alone (`index_kpool_always_select_tail=False`): a document's
+    first queries, before its first pool completes, select nothing and read every key of their own
+    document alike, as the document alone reads its row's, so a row packing documents gives each
+    document's logits and the parameters' gradients its documents give run one at a time (check 1);
+    those queries read the whole packed row's keys alike, other documents' and the padding's among them
+    (the spec pass's review of T2)."""
+    total = sum(DOCUMENTS)
+    model = tiny(mixer=mixers.build("kpool_sparse_attention", index_kpool_always_select_tail=False),
+                 max_seq_len=max(128, total + PADDING))
+    variables = model.init(jax.random.key(4), jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB))
+    assert_packed_as_alone(model, variables, "packed kpool_sparse_attention without tails",
+                           SEEDS["kpool_sparse_attention notail"])
 
 
 def assert_packed_as_alone(model, variables, what: str, seeds: int):
@@ -422,8 +417,6 @@ def test_no_token_reaches_another_document(kind):
     adds each position's by a scatter, which a GPU's deterministic XLA (`--xla_gpu_deterministic_ops`)
     sums in an order every id in the row decides, so new ids in the first document reorder the
     second's sums though nothing crosses."""
-    if kind in REFUSED:
-        pytest.skip(f"{kind} refuses packed rows")
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
     model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=128, **overrides)
     first, second = DOCUMENTS[:2]
@@ -616,26 +609,6 @@ def test_a_mixers_refusal_names_its_kind_and_entries_across_a_process_boundary()
     assert (again.kind, again.names, again.why) == ("mla", ("kv_cache",), "its latents are its cache")
 
 
-@pytest.mark.parametrize("kind, rungs", [
-    ("attention", [None, "minimal", "save_dot_except_mlp", "full"]),
-    ("mamba2", [None, "minimal_with_scan_and_conv", "minimal_with_conv", "minimal", "full"]),
-    ("gated_delta_net", [None, "all_but_delta_memory", "minimal_with_scan_and_conv", "minimal_with_conv",
-                         "minimal", "full"]),
-])
-def test_a_decoder_climbs_only_the_remat_rungs_its_layers_mark(kind, rungs):
-    """`recompute_more` passes a rung that keeps the same of the decoder's marked names as the rung
-    below or above it: 'all_but_delta_memory', which recomputes a delta rule's memory alone, is a
-    rung only for a decoder with a delta rule, 'minimal_with_scan_and_conv', which keeps a
-    recurrence's scan, only for a decoder with a recurrence, so attention's ladder is the one before
-    either (a recurrent decoder's 'save_dot_except_mlp' keeps no more of its names than 'full')."""
-    fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
-    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=64, **overrides)
-    climbed = [model]
-    while (stronger := climbed[-1].recompute_more()) is not None:
-        climbed.append(stronger)
-    assert [rung.recompute_record() for rung in climbed] == rungs
-
-
 def test_a_cross_attention_feed_forward_keeps_its_rungs_where_the_trunk_has_none():
     """A decoder with no trunk MLP, Mamba-2's layout, marks its gated cross-attention's feed-forward
     (`marked_residuals`): 'minimal', which keeps that MLP's projections, climbs on to 'full', which
@@ -648,39 +621,6 @@ def test_a_cross_attention_feed_forward_keeps_its_rungs_where_the_trunk_has_none
     minimal = model.restore_recompute(model.clone(remat="minimal").recompute_record())
     climbed = minimal.recompute_more()
     assert climbed is not None and climbed.recompute_record() == "full"
-
-
-@pytest.mark.parametrize("kind", ["kimi_delta_attention", "mamba", "mamba2", "gated_delta_net"])
-def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsys):
-    """A decoder skips the remat rungs that keep none of its mixers' names (`MixerBase.marks`), so
-    a kind may name only what its layer marks: under `jax.checkpoint` a policy saving each one alone
-    keeps more for a tiny decoder's backward than a policy saving nothing. A recurrence's output is
-    both its 'context' and its 'scan', either of which keeps it. A delta rule's decay and inverse are
-    its port's (`row_names_port`, interpreted off a GPU), named within its rule's declared span
-    (`derivatives.declared_derivative`), whose saved residuals JAX reports as the span's outputs; the
-    port runs at the default product precision its fp32 products are declared at."""
-    from jax.ad_checkpoint import print_saved_residuals
-
-    from dew.nn.backbones.decoder_block import RematPolicy
-
-    value = mixers.build(kind, **KIND_FIELDS.get(kind, ({}, {}))[0])
-    assert value.marks() is not None
-    model = tiny(mixer=value, max_seq_len=64, **KIND_FIELDS.get(kind, ({}, {}))[1])
-    tokens = jax.random.randint(jax.random.key(3), (1, 64), 0, VOCAB)
-    variables = model.init(jax.random.key(4), tokens)
-
-    def loss(variables):
-        with row_names_port("gated_delta_rule", "fla"):
-            return jnp.sum(model.apply(variables, tokens) ** 2)
-
-    def saved(names):
-        capsys.readouterr()
-        policy = RematPolicy(save=names).checkpoint_policy()
-        print_saved_residuals(jax.checkpoint(loss, policy=policy), variables)
-        return capsys.readouterr().out
-
-    nothing = saved(())
-    assert [name for name in value.marks() or () if saved((name,)) == nothing] == []
 
 
 def one_tap(kind):

@@ -205,6 +205,23 @@ def test_raised_names_each_error_a_process_ended_with_whatever_its_names_capital
     assert set(raised(done)) == {"json.decoder.JSONDecodeError", "socket.gaierror", "_Private"}, done.stderr
 
 
+@pytest.mark.parametrize("order", [(0, 1), (1, 0)])
+def test_raised_keeps_each_ranks_error_when_their_traceback_lines_interleave(order):
+    """Ranks can begin their tracebacks before either finishes; each closing line belongs to its rank."""
+    from process_support import raised
+
+    errors = ["ValueError", "RuntimeError"]
+    reports = [
+        subprocess.run([sys.executable, "-c", f"raise {error}('rank {rank}')"],
+                       capture_output=True, text=True, timeout=60, check=False).stderr.splitlines()
+        for rank, error in enumerate(errors)
+    ]
+    lines = [f"[{rank}] {reports[rank][0]}" for rank in order]
+    lines.extend(f"[{rank}] {line}" for rank in order for line in reports[rank][1:])
+    done = subprocess.CompletedProcess([], 1, "\n".join(lines), "")
+    assert raised(done) == {error: [f"rank {rank}"] for rank, error in enumerate(errors)}, done.stdout
+
+
 def test_a_relayed_child_says_its_output_as_it_comes_and_its_stacks_when_it_runs_past_its_time():
     """`relayed` runs a child as its own group, every line it writes passed on as it comes, so a rank's log
     holds how far a gang's child got even when the gang's deadline kills the rank (row 4686: trains 670 and

@@ -105,9 +105,9 @@ def evaluated(arrays: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], dic
             {name: np.asarray(value, np.float64) for name, value in exact.items()})
 
 
-def proxy(arrays):
-    """Dew's own composition (`dew.rl.preference_logsigmoid_terms`) on a batch, which plans the seeds
-    the recorder confirms on TRL."""
+def composed(arrays):
+    """Dew's own composition (`dew.rl.preference_logsigmoid_terms`) on a batch in TRL's layout, which
+    tests/test_dpo.py holds to the recording."""
     import jax
     import jax.numpy as jnp
 
@@ -133,6 +133,6 @@ def proxy(arrays):
 if __name__ == "__main__":
     from recorded_references import record_reference
 
-    record_reference("dpo", batch, evaluated, proxy, package="trl", repo="huggingface/trl",
+    record_reference("dpo", batch, evaluated, package="trl", repo="huggingface/trl",
                      tool="tools/parity_dpo.py", out=FIXTURES / "rl" / "dpo.npz", description=__doc__,
                      beta=BETA)

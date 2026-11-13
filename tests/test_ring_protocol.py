@@ -176,13 +176,13 @@ def _first(program, kind: str, *, after: int = 0) -> int:
 
 
 def test_a_flipped_parity_is_caught():
-    """A consumer's first wait on a load at the other parity: it passes before the load lands, or waits a
-    phase that never comes, and the checker gives the interleaving."""
+    """A consumer's first wait on a load at the phase after, of the other parity: it passes before the load
+    lands, or waits a phase that never comes, and the checker gives the interleaving."""
     threads, arrivals = walked(2, 1, (3,), 0, unrolled=False)
     consumer = threads[0]
     index = _first(consumer, "wait")
     event = consumer[index]
-    flipped = dataclasses.replace(event, argument=not event.argument)
+    flipped = dataclasses.replace(event, argument=event.argument + 1)
     with pytest.raises(Violation) as found:
         explore(_mutated(threads, 0, index, [flipped]), arrivals)
     assert found.value.kind in ("aliased", "unordered", "deadlock")

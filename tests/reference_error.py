@@ -89,7 +89,7 @@ from arm_forms import (
     stacked_on_host as stacked_on_host,
     windows as windows,
 )
-from check1_wire import CENSUS, DRAWS, STAGES
+from check1_wire import CENSUS, DRAWS, QUALIFY, STAGES
 from float64_terms import evaluated_on, float64_terms, lowered, scan_groups
 from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, record_units
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
@@ -135,10 +135,12 @@ from dew.parity import (
     recorded_kinds,
 )
 from dew.parity_stages import REDRAW, staged_units
+from dew.telemetry.compiles import Compiles
 from dew.training.compiled_program import lowering_platform
 
 PRECISION = "precision"
 """The entry of a reference's array file that records the precision its generator's matmuls took."""
+
 
 
 def ieee_fixture(path) -> dict[str, np.ndarray]:
@@ -149,14 +151,33 @@ def ieee_fixture(path) -> dict[str, np.ndarray]:
     regenerated with TF32 matmuls, ten mantissa bits, sits farther from
     float64 and so widens the budget to fit a coarser Dew, and the float32
     arrays it stores look the same; only the generator's record tells."""
-    with np.load(path) as stored:
-        arrays = {name: stored[name] for name in stored.files}
-    recorded = str(arrays.pop(PRECISION)) if PRECISION in arrays else "no precision"
+    arrays, recorded = _stored_precision(path)
     if recorded != "ieee":
         raise ValueError(f"{path} records {recorded!r} for its matmuls, not 'ieee'; regenerate it "
                          f"with IEEE matmuls")
     return arrays
 
+
+def upstream_fixture(path) -> dict[str, np.ndarray]:
+    """The arrays of a port's upstream recording, refused unless its generator recorded the upstream at its
+    own default precision (`_dew_torch.precision.UPSTREAM_DEFAULT`): a port multiplies as its upstream does
+    at the default precision (fla's Triton dots an fp32 product as one TF32), so its reference is the
+    upstream's own arithmetic, like with like, never one a switch made IEEE (`ieee_fixture`'s, every other
+    reference's)."""
+    from _dew_torch.precision import UPSTREAM_DEFAULT
+
+    arrays, recorded = _stored_precision(path)
+    if not recorded.startswith(UPSTREAM_DEFAULT):
+        raise ValueError(f"{path} records {recorded!r} for its matmuls, not its upstream at its own default "
+                         "precision; regenerate it with no precision switch set")
+    return arrays
+
+
+def _stored_precision(path) -> tuple[dict[str, np.ndarray], str]:
+    """A reference's array file's arrays and what its generator recorded of its matmuls (`PRECISION`)."""
+    with np.load(path) as stored:
+        arrays = {name: stored[name] for name in stored.files}
+    return arrays, str(arrays.pop(PRECISION)) if PRECISION in arrays else "no precision"
 
 
 WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
@@ -169,6 +190,7 @@ of different instruction sets, though the bits still part with the host (docs/pe
 SSD kernel's host check 1 without YNNPACK"); and XLA:CPU's fusion choices are not Dew's (rows 4520, 4522).
 The empty list, not the documented `-individual_dot`, because compiler options take no such spelling and
 that one leaves a scan's reductions fused. The census (`CENSUS`) compiles without it (`switched_off`)."""
+
 
 
 def switched_off() -> dict:
@@ -651,6 +673,13 @@ def _repeat_promised() -> bool:
     return jax.default_backend() == "cpu" or deterministic_ops_requested()
 
 
+def _arm_name(arm, reference_fn, library_fn, at_arm: int) -> str:
+    """How a refusal names one of a site's arms beside Dew's: the reference, the library arm, or a further
+    reference by its place among the arms."""
+    return ("the reference" if arm is reference_fn else "the library arm" if arm is library_fn
+            else f"reference {at_arm}")
+
+
 def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
     """Raise unless `fn`, `name` of a check's arms, gives `first` again on the same `inputs`: an arm that
     draws a noise of its own, or reads state its last call left, compares Dew with a reference on draws no
@@ -968,8 +997,12 @@ def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None, scale=None) -> 
     """Check 1's conditioning of `reference_fn` (dew.parity's `Conditioning`): its rounding scale at a draw as
     its arm runs (`summed_as_run`, a window loop's by window), or `scale(inputs, seed)` where its program is
     not one here (`assert_as_exact`'s `conditioning_scale`), its heavy elements over `seeds` as `ran`, its
-    compiled arm where given, runs it; the reference and its truth unrewritten, as their arms run."""
+    compiled arm where given, runs it; the reference and its truth unrewritten, as their arms run. A
+    recording that keeps no outputs gives its conditioning whole (`recorded_weighing`: the scale, the heavy
+    elements and the reference's weighed evidence, each read when it was made), and nothing here is run."""
     from rounding_bound import rounding_scale
+    if isinstance(scale, Conditioning):
+        return scale
     scaled = reference_fn.fn if isinstance(reference_fn, _Windowed) else reference_fn
 
     def scale_of(inputs, seed):
@@ -1012,9 +1045,20 @@ def _truth_and_terms(truth_fn, terms_fn, inputs):
         return terms_fn(*widened(inputs))
 
 
+def _first_timed(timed: dict, rows_at: Callable, seed):
+    """The first draw's rows (`rows_at(0, seed)`), its seconds and the backend compiles JAX reports within
+    it written to `timed` (a jit compiles at its first call): what the process pays once, whatever it goes
+    on to draw."""
+    began = time.perf_counter()
+    with Compiles(None) as compiles:
+        rows = rows_at(0, seed)
+    timed.update(first=time.perf_counter() - began, compiled=sum(compiles.seconds))
+    return rows
+
+
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
            library_fn=None, library_leaves: Sequence[str] = (), also: Sequence = (), terms_fn=None,
-           label: str = "", examples: bool = False, conditioning=None):
+           label: str = "", examples: bool = False, conditioning=None, timed: dict | None = None):
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
     the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
@@ -1096,8 +1140,11 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                                                else (mine_at, truth, terms))
                 with summed_as_run():
                     other = dew if dew_fn is arm and here is mine_at else arm(*here)
-                    if not at and arm is reference_fn and arm is not dew_fn and here is ordered[0][1]:
-                        _of_its_inputs(label, "the reference", arm, here, other)
+                    # Every arm whose result enters the verdict is a function of its inputs: the
+                    # reference, the library arm and each further reference, each run again.
+                    if not at and arm is not dew_fn and mine_at is ordered[0][0]:
+                        _of_its_inputs(label, _arm_name(arm, reference_fn, library_fn, at_arm), arm, here,
+                                       other)
                 shared = true_here is truth
                 if weighed is not None:
                     terms_here = weighed[id(true_here)].ones
@@ -1114,7 +1161,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         return rows
 
     for at, seed in enumerate(seeds):
-        rows = rows_at(at, seed)
+        rows = rows_at(at, seed) if timed is None or at else _first_timed(timed, rows_at, seed)
         for at_arm, row in enumerate(rows):
             evidence[at_arm].append(row)
             per_example[at_arm].append(stacked[at_arm])
@@ -1218,17 +1265,20 @@ def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn,
 
 
 def _recorded(label: str, drawn_for, references: int, arms, upto: int | None = None,
-              weighed: dict | None = None, offset: int = 0) -> bool:
+              weighed: dict | None = None, offset: int = 0, first: dict | None = None) -> bool:
     """A map task's draws (`record_units`): each of a site's `references` draws over its range, up to
     `upto` where given, with its arms' YNNPACK mode (`_mode_of`) and, weighed, its classes' digest
-    (`Conditioning.digest`), the seconds its weighing took beside its draws'. False where the process is
-    no map task."""
+    (`Conditioning.digest`), the seconds its weighing took beside its draws', and those of its first draw
+    with the backend compiles JAX reported within it (`first`, `compiled`, `_drawn`'s): a site's arms
+    compile at their first call, so a task's first draw holds its compiles, a cost it pays once whatever
+    it draws, which the plan must not read as each draw's (tools/armada/costs.py's `timed`; a site cut to
+    two draws a task paid its compiles 128 times, row 5492). False where the process is no map task."""
     def payload(start, stop):
         draws = [drawn_for(index)(start, stop) for index in range(references)]
         held = (weighed or {}).get("of")
         return {"draws": draws, "refused": _mode_of(arms), "heavy": None if held is None else held.digest()}
     return record_units(label, payload, upto=upto, offset=offset,
-                        phases=lambda: {"weighing": (weighed or {}).get("seconds", 0.0)})
+                        phases=lambda: {"weighing": (weighed or {}).get("seconds", 0.0), **(first or {})})
 
 
 def _pooled_draws(label: str, references: int, arms):
@@ -1371,6 +1421,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                           terms=terms)
             return
         truth_fn, terms = store.site(label)
+    elif os.environ.get(QUALIFY) and not (drawing() or judging()):
+        _qualified(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
+                   examples=examples, plain=not (library_fn or also or terms or conditioning))
     if conditioning is not None:
         _deferred(dew_fn, reference_fn, draw, label, seeds=seeds, conditioning=conditioning,
                   truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
@@ -1412,6 +1465,41 @@ def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditionin
             weighed()
 
 
+class StaleSeeds(AssertionError):
+    """A site whose declared seeds are fewer than its own sizing takes where it runs (`_qualified`): the count
+    was sized on other arithmetic, an arm's rounding having changed since (8eff72712a6 moved one site's from 8
+    to 256 and two others' down), or on another host level."""
+
+
+def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, examples: bool,
+               plain: bool) -> None:
+    """A qualification run's sizing of one site (`QUALIFY`) before its verdict: the count `seeds_for` sizes
+    here, Dew paired with its reference as the verdict pairs them, on sizing seeds no verdict draws, as every
+    site's count is sized (without its terms: `seeds_for` reads none); above the site's declared `seeds` it
+    raises StaleSeeds. Each site appends a line to the run's file (`QUALIFY`'s value): its test, its label,
+    its declared count and the count sized, or why it is not sized: its reference is a recording without
+    pilots, whose count is its recording's, or its verdict is not the `plain` pair's (a library arm, further
+    references, terms of its own, a weighed check), which this sizing does not judge. A site whose draw
+    cannot draw a sizing seed (one that indexes a fixed set of draws) fails with its draw's own error: it has
+    no pilot stream, so its count cannot be sized again (`seeds_for`'s contract). No sizing runs under a
+    prepared store or in a map task or its judge."""
+    import json
+
+    record = {"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0], "label": label,
+              "declared": seeds}
+    recorded = getattr(reference_fn, "recorded", False) and getattr(reference_fn, "pilots", None) is None
+    if not plain or recorded:
+        record["unsized"] = "its verdict is not the plain pair's" if not plain else "a recording's count"
+    else:
+        record["sized"] = seeds_for(reference_fn, draw, label, truth_fn=truth_fn, dew_fn=dew_fn,
+                                    orders=orders, examples=examples)
+    with open(os.environ[QUALIFY], "a", encoding="utf-8") as log:
+        log.write(json.dumps(record) + "\n")
+    if (sized := record.get("sized", 0)) > seeds:
+        raise StaleSeeds(f"{label}: this site sizes {sized} seeds here and declares {seeds}: its count was "
+                         f"sized on other arithmetic or another host level; declare what it sizes now")
+
+
 def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, library_fn,
                  library_row, library_leaves, also, terms, examples: bool, weighing, upto: int | None = None,
                  offset: int = 0) -> None:
@@ -1435,6 +1523,8 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     ranges: dict[tuple[int, int], list[_Draws]] = {}
     # The site's weighing where it draws (`weighing`), built once, and the seconds that took.
     weighed: dict[str, object] = {}
+    # The seconds of the first draw this process takes of the site and of its compiles (`_drawn`'s `timed`).
+    first: dict[str, float] = {}
 
     def conditioning_now():
         if weighing is not None and "of" not in weighed:
@@ -1450,7 +1540,7 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
                 draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
                                library_fn=library_fn, library_leaves=library_leaves, also=further,
                                terms_fn=terms_fn, label=label, examples=examples,
-                               conditioning=conditioning_now())
+                               conditioning=conditioning_now(), timed=first)
                 ranges[start, stop] = draws if further else [draws]
                 narrow_leaves[:] = _narrow(ranges[start, stop][0])
             return ranges[start, stop][index]
@@ -1458,7 +1548,7 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
 
     arms = [dew_fn, reference_fn, *([] if library_fn is None else [library_fn]), *further]
     # A map task of the site's draws, or their judge (DRAWS, POOL).
-    if _recorded(label, drawn_for, 1 + len(further), arms, upto, weighed, offset):
+    if _recorded(label, drawn_for, 1 + len(further), arms, upto, weighed, offset, first):
         return
     pooled = _pooled_draws(label, 1 + len(further), arms)
     if pooled is not None:
@@ -1840,14 +1930,30 @@ def recorded_weighing(stored, site: str) -> dict:
     """The weighed check a recorded `site` declares (`assert_as_exact`'s `conditioning` and
     `conditioning_scale`): its declared seeds, and each draw's rounding scale as recorded beside the
     reference's outputs (`<site>.scale.<leaf>`, tools/recorded_references.py's `record_case(scale=...)`),
-    read at the draw's index, the first of the indexed inputs (`indexed_recording`)."""
+    read at the draw's index, the first of the indexed inputs (`indexed_recording`). A recording that keeps
+    no outputs (`record_case(scale=..., summary=True)`) holds the reference's side of the weighed check as
+    its recorder read it, and gives the conditioning whole: the scale, each leaf's heavy elements
+    (`<site>.heavy.<leaf>`) and the reference's weighed evidence a draw (`<site>.weighed`, a recording of
+    evidence whose leaves are the classes', `dew.parity.Conditioning.recorded_evidence`)."""
     scales = {name.removeprefix(f"{site}.scale."): value for name, value in stored.items()
               if name.startswith(f"{site}.scale.")}
 
     def scale(inputs, seed):
         return {name: value[int(inputs[0])] for name, value in scales.items()}
 
-    return {"conditioning": int(stored[f"{site}.conditioning"]), "conditioning_scale": scale}
+    declared = int(stored[f"{site}.conditioning"])
+    if f"{site}.weighed.input_digest" not in stored:
+        return {"conditioning": declared, "conditioning_scale": scale}
+    # The masks in the leaves' order, a truth's tree's (`heavy_masks`), None for a leaf of no heavy element.
+    heavy = [stored.get(f"{site}.heavy.{name}") for name in sorted(scales)]
+    evidence = _recorded_evidence(stored, f"{site}.weighed")
+    dtypes = _recorded_tree(stored, f"{site}.weighed", "dtype")
+
+    def recorded_of(inputs, seed):
+        return {path: _recorded_leaf(evidence, str(dtypes[path]), path, int(inputs[0]))
+                for path in evidence["mse"]}
+
+    return {"conditioning": declared, "conditioning_scale": Conditioning(scale, heavy, recorded_of)}
 
 
 def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn=None, leaves=None):
@@ -1949,16 +2055,41 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     return draw, lookup(reference), lookup(truth)
 
 
+def _recorded_tree(stored, site: str, kind: str) -> dict[str, np.ndarray]:
+    """A recording's entries of `kind` (`<site>.<kind>.<leaf>`), by leaf."""
+    prefix = f"{site}.{kind}."
+    return {name.removeprefix(prefix): np.asarray(value) for name, value in stored.items()
+            if name.startswith(prefix)}
+
+
+def _recorded_evidence(stored, site: str) -> dict[str, dict[str, np.ndarray]]:
+    """A summary's evidence under `site`, each kind as the recording's layout holds it
+    (`dew.parity.RECORDED_KINDS`), by leaf: a site's own, its pilots' (`<site>.pilot`), or its weighed
+    check's (`<site>.weighed`, the classes' leaves)."""
+    return {kind: _recorded_tree(stored, site, kind) for kind in recorded_kinds("seed", "span", "offsets")}
+
+
+def _recorded_leaf(evidence, dtype: str, name: str, row: int) -> RecordedLeaf:
+    """The leaf `name`'s recorded evidence at a seed's `row` of `evidence` (`_recorded_evidence`)."""
+    start, stop = evidence["zero_offsets"][name][row], evidence["zero_offsets"][name][row + 1]
+    examples = {field: evidence[field][name][row] for field in ("example_mse", "example_worst")
+                if name in evidence[field]}
+    # A recording made before its worst rows' shares were kept holds none: the gate then reads the row by
+    # its width's factor (`_Draws.factor`).
+    share = float(evidence["share"][name][row]) if name in evidence["share"] else None
+    return RecordedLeaf(float(evidence["mse"][name][row]), float(evidence["worst"][name][row]),
+                        evidence["zero_rows"][name][start:stop], evidence["zero_errors"][name][start:stop],
+                        finite=bool(evidence["finite"][name][row]), dtype=dtype, share=share,
+                        **{field: None if np.isnan(value).all() else value
+                           for field, value in examples.items()})
+
+
 def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     """`indexed_recording` of a recording of the reference's evidence alone."""
     def tree(kind):
-        prefix = f"{site}.{kind}."
-        return {name.removeprefix(prefix): np.asarray(value) for name, value in stored.items()
-                if name.startswith(prefix)}
+        return _recorded_tree(stored, site, kind)
 
-    # A summary's evidence, each kind as the recording's layout holds it (`dew.parity.RECORDED_KINDS`).
-    kinds = recorded_kinds("seed", "span", "offsets")
-    verdict, pilot = ({kind: tree(prefix + kind) for kind in kinds} for prefix in ("", "pilot."))
+    verdict, pilot = (_recorded_evidence(stored, under) for under in (site, f"{site}.pilot"))
     mse, worst, finite, sketch, zero_offsets = (verdict[kind] for kind in
                                                 ("mse", "worst", "finite", "sketch", "zero_offsets"))
     shapes, dtypes = tree("shape"), tree("dtype")
@@ -1995,19 +2126,7 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
 
     def reference(index, inputs):
         evidence, _, row = held(int(index))
-
-        def leaf(name):
-            start, stop = evidence["zero_offsets"][name][row], evidence["zero_offsets"][name][row + 1]
-            examples = {field: evidence[field][name][row] for field in ("example_mse", "example_worst")
-                        if name in evidence[field]}
-            return RecordedLeaf(float(evidence["mse"][name][row]), float(evidence["worst"][name][row]),
-                                evidence["zero_rows"][name][start:stop],
-                                evidence["zero_errors"][name][start:stop],
-                                finite=bool(evidence["finite"][name][row]), dtype=str(dtypes[name]),
-                                **{field: None if np.isnan(value).all() else value
-                                   for field, value in examples.items()})
-
-        return {name: leaf(name) for name in mse}
+        return {name: _recorded_leaf(evidence, str(dtypes[name]), name, row) for name in mse}
 
     reference.recorded = True
     if pilots:

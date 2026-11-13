@@ -169,12 +169,8 @@ def enable_compilation_cache(path: str):
     A directory named after the process first compiled holds the programs
     compiled after: JAX's cache is settled again at the next compile.
 
-    Each Pallas Mosaic GPU kernel a process lowers is kept beside them, in
-    `<path>/pallas`, keyed by the installed code and all the lowering reads
-    (Dew's JAX build's `jax_pallas_lowering_cache_dir`), so a later process
-    reads it back rather than lowering it again; a directory the user named
-    (`JAX_PALLAS_LOWERING_CACHE_DIR`) is theirs. Dew is declared sealed by its source
-    (`JAX_PALLAS_LOWERING_CACHE_SOURCES`), so its kernels holding its own code are kept too.
+    Each Pallas Mosaic GPU kernel a process lowers is kept beside them
+    (`keep_lowerings`).
 
     A run under `--xla_gpu_deterministic_ops` keeps no picks (`keeps_picks`):
     jax 0.11.2's XLA measures nothing there and gives each instruction the
@@ -197,14 +193,7 @@ def enable_compilation_cache(path: str):
     # in the cache directory would name one directory for every jaxlib and write picks from a
     # process this policy keeps to reading (`jax._src.compiler.get_compile_options`).
     jax.config.update('jax_persistent_cache_enable_xla_caches', 'none')
-    if 'JAX_PALLAS_LOWERING_CACHE_DIR' not in os.environ:
-        jax.config.update('jax_pallas_lowering_cache_dir', os.path.join(path, 'pallas'))
-    # Dew's code a kernel holds as it lowers (an inline_mgpu body, a marked call) is named in that cache by
-    # Dew's source, its whole tree's digest (Dew's JAX build's declared source packages): Dew's code a
-    # lowering runs reads nothing but its arguments, its closure and Dew's code. Without it, a third of
-    # Dew's kernels are lowered afresh in every process (FS-LCACHE-2).
-    declared = {name for name in os.environ.get('JAX_PALLAS_LOWERING_CACHE_SOURCES', '').split(',') if name}
-    os.environ['JAX_PALLAS_LOWERING_CACHE_SOURCES'] = ','.join(sorted(declared | {'dew'}))
+    keep_lowerings(path)
     # JAX's defaults skip small and fast compilations; a run's many small programs (its schedule, its
     # metrics, its data's transforms) each compile again on every restart without them, so every
     # program is cached, unless the user named a threshold (JAX_PERSISTENT_CACHE_MIN_*), which is theirs.
@@ -218,6 +207,21 @@ def enable_compilation_cache(path: str):
         if picks:
             os.makedirs(picks, exist_ok=True)
         os.environ['XLA_FLAGS'] = f"{flags} --xla_gpu_per_fusion_autotune_cache_dir={picks}".strip()
+
+
+def keep_lowerings(path: str) -> None:
+    """Keep each Pallas Mosaic GPU lowering beside the compiled programs in `path`, in `<path>/pallas`, keyed
+    by the installed code and all the lowering reads (Dew's JAX build's `jax_pallas_lowering_cache_dir`), so
+    another program or process reads it back rather than lowering it again; a directory the user named for
+    them (`JAX_PALLAS_LOWERING_CACHE_DIR`) is theirs. Dew's code a kernel holds as it lowers (an inline_mgpu
+    body, a marked call) is named in that cache by Dew's source, its whole tree's digest (Dew's JAX build's
+    declared source packages, `JAX_PALLAS_LOWERING_CACHE_SOURCES`): Dew's code a lowering runs reads nothing
+    but its arguments, its closure and Dew's code. Without it, a third of Dew's kernels are lowered afresh
+    in every process (FS-LCACHE-2)."""
+    if 'JAX_PALLAS_LOWERING_CACHE_DIR' not in os.environ:
+        jax.config.update('jax_pallas_lowering_cache_dir', os.path.join(path, 'pallas'))
+    declared = {name for name in os.environ.get('JAX_PALLAS_LOWERING_CACHE_SOURCES', '').split(',') if name}
+    os.environ['JAX_PALLAS_LOWERING_CACHE_SOURCES'] = ','.join(sorted(declared | {'dew'}))
 
 
 UNCACHED = ("jax_enable_compilation_cache",)
@@ -432,7 +436,8 @@ def measures_picks() -> bool:
 
 def persist_compilations() -> None:
     """Point XLA at the on-disk executable cache, unless a directory is set or JAX's cache is
-    turned off.
+    turned off; a directory set keeps the kernels' lowerings beside its programs too
+    (`keep_lowerings`).
 
     A run compiles its step for seconds to minutes, a loaded task the first time its shapes are
     seen (a minute for a text-to-image sample on an A100), and every restart compiles them again
@@ -452,7 +457,13 @@ def persist_compilations() -> None:
     one. XLA reads the autotuner's flags (`enable_compilation_cache`) as the backend opens, so a
     process whose backend is open keeps its executables here and measures its picks again.
     """
-    if jax.config.jax_compilation_cache_dir or not jax.config.jax_enable_compilation_cache:
+    if not jax.config.jax_enable_compilation_cache:
+        return
+    if jax.config.jax_compilation_cache_dir:
+        # A directory the user or a launcher named (JAX_COMPILATION_CACHE_DIR) is theirs, and the
+        # kernels' lowerings follow it: left off, every program and process lowered every Mosaic kernel
+        # again, 35 to 50 s a program on a 4B decoder's step (FS-TRACE-REAL).
+        keep_lowerings(jax.config.jax_compilation_cache_dir)
         return
     from dew._coordination import pool_size
 

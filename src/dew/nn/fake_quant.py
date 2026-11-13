@@ -14,6 +14,7 @@ import ml_dtypes
 import numpy as np
 from flax import linen as nn
 
+from dew.nn.derivatives import contracted, surrogate
 from dew.nn.precision import at_least_fp32, divided
 
 E2M1 = np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32)
@@ -88,15 +89,17 @@ def _e2m1_quotient(values, scale):
     return jnp.copysign(jnp.asarray(E2M1[:8])[index], values)
 
 
-def straight_through(x, rounded):
-    """`rounded` forward, bit for bit in any dtype, and the identity's
-    gradient backward. `stop_gradient(x) - x` is +0, and subtracting +0
-    leaves every value as it is, a negative zero included, which the
-    kernels keep; adding it would turn -0 into +0, and `x + (rounded - x)`
-    re-rounds in bf16 wherever the quantizer clamped far from `x`. The
-    estimator is Dew's choice; the release is inference code and the paper
-    names none."""
-    return jax.lax.stop_gradient(rounded.astype(x.dtype)) - (jax.lax.stop_gradient(x) - x)
+def _rounded_value(x, rounded):
+    """`rounded` in `x`'s dtype, bit for bit, a negative zero included, which the kernels keep."""
+    return rounded.astype(x.dtype)
+
+
+straight_through = contracted("test_a_straight_through_rounding_holds_every_order")(
+    surrogate(_rounded_value, lambda primals, tangents, value: tangents[0]))
+"""`rounded` forward, bit for bit in `x`'s dtype (`_rounded_value`), and the identity's derivative, `x`'s
+tangent, at every order, declared (`dew.nn.derivatives.surrogate`): `x + (rounded - x)` would re-round in
+bf16 wherever the quantizer clamped far from `x`, and turn a -0 into +0. The estimator is Dew's choice; the
+release is inference code and the paper names none."""
 
 
 def fp8_scaled_blocks(x, block: int):

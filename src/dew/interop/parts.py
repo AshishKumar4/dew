@@ -206,7 +206,8 @@ def _read_layer_typed_model(view: PartView) -> Mapping[str, object]:
     """Qwen2's model: each layer attends under its config layer type's mask, a window where it is
     `sliding_attention` (`create_sliding_window_causal_mask` at the config's sliding_window)."""
     fields = dict(_read_llama_model(view))
-    types = tuple(_records.strings(view.config.layer_types, 'layer_types'))[:fields['num_layers']]
+    layers = _records.integer(fields['num_layers'], 'num_layers')
+    types = tuple(_records.strings(view.config.layer_types, 'layer_types'))[:layers]
     if set(types) - {'full_attention', 'sliding_attention'}:
         raise Ambiguous(f"the layer types {sorted(set(types))} are not attention's full or sliding masks")
     fields['layer_types'] = types
@@ -831,8 +832,13 @@ class KnownPart:
     the gate's rows first): each reads as its parts (`_fused_linear`)."""
 
     def known(self) -> type:
-        module, _, qualname = self.location.partition(':')
-        return getattr(__import__(module, fromlist=[qualname]), qualname)
+        return _known_class(self.location)
+
+
+@cache
+def _known_class(location: str) -> type:
+    module, _, qualname = location.partition(':')
+    return getattr(__import__(module, fromlist=[qualname]), qualname)
 
 
 _LLAMA = 'transformers.models.llama.modeling_llama'
@@ -1088,10 +1094,10 @@ MLP is Llama's, Qwen3-MoE's experts Mixtral's, GLM-4.7-Flash's attention DeepSee
 
 
 @cache
-def _known_by_role() -> dict[str, tuple[tuple[KnownPart, type], ...]]:
-    table: dict[str, list[tuple[KnownPart, type]]] = {}
+def _known_by_role() -> dict[str, tuple[KnownPart, ...]]:
+    table: dict[str, list[KnownPart]] = {}
     for part in KNOWN:
-        table.setdefault(part.role, []).append((part, part.known()))
+        table.setdefault(part.role, []).append(part)
     return {role: tuple(entries) for role, entries in table.items()}
 
 
@@ -1104,7 +1110,8 @@ def identify(module: torch.nn.Module, roles: tuple[str, ...]) -> tuple[KnownPart
     if 'forward' in vars(module):
         raise Ambiguous(f"{cls.__qualname__} is called through its instance's own forward")
     for role in roles:
-        for part, known in _known_by_role().get(role, ()):
+        for part in _known_by_role().get(role, ()):
+            known = part.known()
             renaming = matched_class(cls, known, whole=part.whole)
             if renaming is not None and _same_invocation(cls, known, renaming):
                 return part, renaming

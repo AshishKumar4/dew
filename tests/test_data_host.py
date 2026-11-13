@@ -161,3 +161,21 @@ def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_
     # A host whose workers start at no cost takes as many as its CPUs hold over any stated run.
     free = Loading(workers="auto", worker_buffer=2, host=Host(3, 2**40, worker_start=0.0))
     assert free.resolved(rows, reads=1, batches=1).workers == 3
+
+
+def nonzero(row) -> bool:
+    """Whether a record's id is past the first."""
+    return int(row["id"]) != 0
+
+
+def test_an_offline_pass_reads_a_chain_that_names_workers_in_its_own_order():
+    """A finite record pass for publication and export (`iterate`) of a chain that names its workers reads
+    it, in the order it reads in the process (row 5735): such a chain was refused, and two workers taking
+    turns over its inputs, one of whose first it filters, would publish 2, 1, 4, 3, 5."""
+    from dew.data.compile import iterate
+
+    def ids(chain) -> list[int]:
+        return [int(row["id"]) for row in iterate(chain)]
+
+    chain = Pipeline(Memory([{"id": np.int64(index)} for index in range(6)])).filter(nonzero)
+    assert ids(chain.workers(2)) == ids(chain) == [1, 2, 3, 4, 5]

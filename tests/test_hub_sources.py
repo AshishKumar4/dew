@@ -10,7 +10,6 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pytest
-from data_support import LATEST
 from hub_support import native_builder, stated_shards
 
 from dew.data.dataset import DataPartition, Loading
@@ -596,7 +595,7 @@ def test_a_downloaded_hub_split_streams_offline_as_it_streamed_online(tmp_path, 
     def streamed(source):
         read = sorted((int(row["id"]), str(row["text"]), tuple(sorted(row)))
                       for row in iterate(Pipeline(source), read="streamed"))
-        return source.fingerprint(), [shard.id for shard in source.manifest(LATEST).shards], read
+        return source.fingerprint(), [shard.id for shard in source.manifest().shards], read
 
     online = streamed(split())
     assert online[2] == [(row["id"], row["text"], ("id", "text")) for row in rows[:6]]

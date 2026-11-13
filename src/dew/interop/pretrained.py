@@ -373,7 +373,7 @@ class Pretrained:
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
                    layout: Layout | None = None, dtype: DTypeLike | None = None,
-                   param_dtype: DTypeLike | None = None) -> Self:
+                   param_dtype: DTypeLike | None = None, on_host: bool = False) -> Self:
         """Return the pinned checkpoint `run` (`SavedRun.pinned`), rebuilt from the run's own inference
         record, in the layout of the architecture the record names, computing in `dtype` and stored in
         `param_dtype` where given. A decoder no family's layout writes (`dew.interop.layouts.source_layout`)
@@ -391,8 +391,8 @@ class Pretrained:
 
         model_config = saved_model(run.record, dtype)
         model = model_config.build()
-        # Restored where `mesh` and `layout` place them, sharded as a run's own load is.
-        variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
+        # Restored where `mesh` and `layout` place them, sharded as a run's own load is, or into host arrays.
+        variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype, on_host=on_host)
         # The run's task as its loader reads it (`saved_settings`): its policy, budget, pad and
         # end-of-sequence ids and process, which the export writes in the format its readers read.
         held = None if run.objective.settings is None else saved_settings(run.record, run.objective.settings)
@@ -1202,9 +1202,9 @@ def _placement(mesh: MeshSpec | Mesh | None, layout: Layout | None, *, on_host: 
     of a tree, a leaf at a time (`place`), by the layout as a model that places its own tree refines it
     (`_refined`), or none: refused beside `on_host`, which keeps the variables as host arrays, or a load
     without its weights, whose restore places them."""
-    if on_host and (mesh is not None or layout is not None):
-        raise ValueError("on_host keeps the variables as host arrays, and mesh and layout place them; "
-                         "pass one")
+    from dew.checkpoints import host_or_placed
+
+    host_or_placed(on_host, mesh, layout)
     streaming = mesh is not None or layout is not None
     if streaming and not weights:
         raise ValueError("a source loaded without its weights has nothing to place; the restore that "
@@ -1308,7 +1308,8 @@ def _pipeline_weights(source: sources.SourceReference, root: Path, index: Mappin
 def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: str | None,
                         placed: Callable[[Variables], Variables], *, streaming: bool, dtype: str,
                         attention_impl: AttentionImpl, param_dtype: str, variables: Variables | None = None,
-                        text: bool = True, stored: sources.StoredWeights | None = None) -> PretrainedPipeline:
+                        text: bool = True, stored: sources.StoredWeights | None = None,
+                        weights: bool = True) -> PretrainedPipeline:
     """The pipeline `index` describes, assembled from the directory its
     source resolved to (a snapshot, a single file's conversion or a DDUF
     file's unpacking), its variables `placed` and `commit` its revision.
@@ -1317,12 +1318,11 @@ def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: st
     them."""
     loaded = PretrainedPipeline(processor=None, **assemble_pipeline(
         directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
-        variables=variables, lazy=streaming, text=text, stored=stored))
+        variables=variables, lazy=streaming, text=text, stored=stored, weights=weights))
     # A pipeline placed on a mesh is placed by its denoiser's draw and its encoders' own tables, one loaded
     # without its text encoder as one loaded with it (`pipeline_axes`).
-    with boxed({**current_boxes(), **(pipeline_axes(loaded) if streaming else {})}):
+    with boxed({**current_boxes(), **(pipeline_axes(loaded) if streaming and weights else {})}):
         return replace(loaded, variables=placed(loaded.variables), revision=commit)
-
 
 def pipeline_axes(loaded: PretrainedPipeline) -> dict[tuple[str, ...], tuple[str | None, ...]]:
     """The axes a loaded pipeline's parameters are drawn in: its denoiser's draw over its encoders'
@@ -1465,9 +1465,8 @@ def _pipeline_source(source: sources.SourceReference, root: Path, single_file: s
                      dduf_file: str | None, placed: Callable[[Variables], Variables], *, dtype: str,
                      attention_impl: AttentionImpl, param_dtype: str, streaming: bool,
                      size: tuple[int, ...] | None = None, variables: Variables | None = None,
-                     text: bool = True) -> PretrainedPipeline | None:
+                     text: bool = True, weights: bool = True) -> PretrainedPipeline | None:
     """The source as a latent diffusion pipeline, or None when it is a decoder.
-
     A single file converts into the pipeline it describes, and a DDUF file
     unpacks into the one it packs; a directory with a model_index.json is
     one unless its own config.json names a model (`_names_a_model`): a
@@ -1483,17 +1482,20 @@ def _pipeline_source(source: sources.SourceReference, root: Path, single_file: s
 
     directory, commit = source.directory(root), source.revision
 
-    def pipeline(directory: Path, stored: sources.StoredWeights | None = None) -> PretrainedPipeline:
+    def pipeline(directory: Path, stored: sources.StoredWeights | None = None,
+                 *, load_weights: bool = True) -> PretrainedPipeline:
         index = json.loads((directory / "model_index.json").read_text())
         if size is not None:
             index = {**index, "dew_height": size[-2], "dew_width": size[-1],
                      **({"dew_frames": size[0]} if len(size) == 3 else {})}
         return _assembled_pipeline(directory, index, commit, placed, streaming=streaming, dtype=dtype,
                                    attention_impl=attention_impl, param_dtype=param_dtype,
-                                   variables=variables, text=text, stored=stored)
-
+                                   variables=variables, text=text, stored=stored, weights=load_weights)
     if dduf_file is not None:
         from dew.interop import dduf
+        if not weights:
+            unpacked_meta, stored_dduf = dduf.metadata(source, root, dduf_file)
+            return pipeline(unpacked_meta, stored_dduf, load_weights=False)
         return pipeline(dduf.unpacked(source.file(root, dduf_file)))
     if single_file is not None:
         from dew.interop import single_file as original
@@ -1503,12 +1505,19 @@ def _pipeline_source(source: sources.SourceReference, root: Path, single_file: s
         # component the file lacks come from the repo at that commit.
         configs = directory if (directory / "model_index.json").is_file() else None
         hub = None if configs is None or commit is None else source
+        if not weights:
+            converted_meta, stored_sf = original.metadata(source, root, single_file, configs, hub)
+            return pipeline(converted_meta, stored_sf, load_weights=False)
         with original.unpacked(source.file(root, single_file), configs, hub) as (
                 converted, published):
             return replace(pipeline(converted), source=published)
     if (directory / "model_index.json").is_file() and not _names_a_model(directory):
-        if variables is not None:
-            return pipeline(directory, sources.StoredWeights(source.name, root, source.subfolder or ""))
+        if variables is not None or not weights:
+            return pipeline(
+                directory,
+                sources.StoredWeights(source.name, root, source.subfolder or ""),
+                load_weights=weights,
+            )
         index = json.loads((directory / "model_index.json").read_text())
         skipped = () if text else text_components(
             pipeline_denoiser(directory, dtype=dtype, attention_impl=attention_impl).text, index)
@@ -1567,7 +1576,7 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
         # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
         loaded = _pipeline_source(reference, directory, single_file, dduf_file, placed,
                                   dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
-                                  streaming=streaming)
+                                  streaming=streaming, weights=weights)
         if loaded is not None:
             _unread_overrides(overrides, "a diffusion pipeline")
             _unpacked(packed_experts, "a diffusion pipeline")
@@ -2002,13 +2011,8 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
     head_source = description.head
     directory = source.directory(root)
     backbone = None
-    shared: Mapping[str, np.ndarray] = {}
+    shared: Mapping[str, unread.Stored] = {}
     if component is not None:
-        # The route of the config the backbone translates (`_native_config`), decided once, before its
-        # weights are read, and carried to its load, so an unregistered backbone is verified once. The
-        # transformers forward reads its backbone's weights itself, and none without them; the shared
-        # file is read for it only where the head is stored in it, but its weights' snapshot is resolved
-        # and pinned here whenever it reads weights.
         pinned = source.component(component.config_folder)
         remote = None if code is None else pinned.directory(code)
         routed = _routed(_native_config(component.config, overrides), remote=remote, pinned=pinned,
@@ -2016,8 +2020,13 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
         forwarded = isinstance(routed.route, TorchRoute)
         reads_shared = not forwarded or bool(head_source.weight_file is None and component.tensor_prefix)
         config_root = root
+        weight_source = source.component(component.weights_folder)
+        if not weights and reads_shared:
+            header_shared = sources.stored_tensors(weight_source, root)
+            if header_shared is not None:
+                shared = header_shared
+                reads_shared = False
         if weights or reads_shared:
-            weight_source = source.component(component.weights_folder)
             root = weight_source.weights(root)
             directory = source.directory(root)
             if source.revision is not None:
@@ -2038,13 +2047,19 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
     missing = False
     if head_source.weight_file is None:
         head_tensors = {} if component is None else component.other_tensors(shared)
+    elif not weights:
+        stored_head = source.stored_file(
+            root, head_source.weight_file, optional=head_source.initialize is not None
+        )
+        missing = stored_head is None
+        head_tensors = {} if stored_head is None else stored_head
     else:
         path = (source.file(root, head_source.weight_file) if head_source.initialize is None
                 else source.optional_file(root, head_source.weight_file))
         missing = path is None
         head_tensors = {} if path is None else sources.tensor_file(path)
     head = head_source.build(backbone, dtype, attention_impl,
-                             shapes=None if missing else {name: tensor.shape
+                             shapes=None if missing else {name: unread.held(tensor).shape
                                                           for name, tensor in head_tensors.items()})
     if missing:
         if backbone is None or head_source.initialize is None:
@@ -2069,7 +2084,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
                                    head_source.path, (), param_dtype=param_dtype, lazy=True)
         if head_source.reshape is not None:
             params = head_source.reshape(head, params)
-        if not streaming:
+        if weights and not streaming:
             params = materialize(params)
         variables = {"params": params}
     if backbone is None:
