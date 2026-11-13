@@ -289,6 +289,12 @@ class Forwarding:
             source.request_stop()
 
     @property
+    def in_process(self) -> bool:
+        """Whether the stream it reads now reads in the training process (`ReadsInProcess`)."""
+        source = self._forwarded()
+        return isinstance(source, ReadsInProcess) and source.in_process
+
+    @property
     def stop_seconds(self) -> float | None:
         source = self._forwarded()
         seconds = source.stop_seconds if isinstance(source, Budgeted) else None

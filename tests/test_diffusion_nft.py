@@ -93,12 +93,13 @@ def nudged(variables, key):
         for leaf, key in zip(leaves, keys, strict=True)])}
 
 
-def fitted(nft, reward, prompts, **rollout):
-    """A rollout over `nft` and the state before and after one update a fit takes from its batch."""
+def fitted(nft, reward, prompts, trained=None, **rollout):
+    """A rollout over `nft` and the state before and after one update a fit takes from its batch, the
+    trainer built with `trained`'s arguments too."""
     from dew.data.dataset import Loader
 
     sampled = NFTRollout(nft, reward, **rollout)
-    trainer = Trainer(nft, optax.sgd(1e-2), key=jax.random.key(21), rollout=sampled)
+    trainer = Trainer(nft, optax.sgd(1e-2), key=jax.random.key(21), rollout=sampled, **(trained or {}))
     initial = trainer.place()[0]
     count = len(next(iter(prompts.values())))
     data = Loader(train=lambda partition: itertools.repeat(prompts), val=None, records=count, batch=count)
@@ -165,6 +166,20 @@ def test_a_rollout_samples_the_old_policy_and_normalizes_by_the_batchs_spread():
     corrupted["advantages"][3] = 1e6
     corrupted["rewards"][3] = 1e9
     assert_filled_batch_invariants(nft, filled_nft, corrupted, FilledBatch(4, real=False).map(three))
+
+
+def test_a_step_read_in_two_microbatches_trains_and_logs_its_reward():
+    """A step the trainer reads in two microbatches trains, and logs the reward it shows, pooled over its
+    rows, which a split step once refused as one microbatch's (train 800's F2)."""
+    from recording import RecordingTracker
+
+    tracker = RecordingTracker()
+    nft = objective(variables=nudged(objective().init(jax.random.key(20)), jax.random.key(22)))
+    _, _, final = fitted(nft, reward, nft.inputs.tokenize(PROMPTS), {"split": 2, "tracker": tracker},
+                         groups=2, steps=3, train_steps=2)
+    assert int(final.updates) == 1
+    logged = [scalars["train/reward"] for _, scalars in tracker.scalars if "train/reward" in scalars]
+    assert len(logged) == 1 and np.isfinite(logged[0])
 
 
 def test_the_released_decay_is_its_trainers_schedule():

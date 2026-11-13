@@ -382,8 +382,7 @@ class GRPOObjective(TokenScorer):
             importance = None
         effective = mask * keep
         pg, weights, mass, aux = self.policy_ratio(terms, effective, keep, importance)
-        pg_loss, _ = pg.mean()
-        metrics = {"pg": pg_loss, **{f"actor/{k}": v for k, v in aux.items()}, **metrics}
+        metrics = {"pg": pg, **{f"actor/{k}": v for k, v in aux.items()}, **metrics}
         if self.beta > 0:
             if step.ema is None:
                 raise ValueError(
@@ -391,7 +390,7 @@ class GRPOObjective(TokenScorer):
                     "a GRPO run with beta above zero always freezes one")
             reference = self.packed_log_probs(step.ema, batch, progress=self.progress(step))
             kl = self.reference_penalty(terms.policy, reference, weights, mass)
-            metrics["kl"], _ = kl.mean()
+            metrics["kl"] = kl
             objective = Ratio(pg.total + self.beta * kl.total, mass)
         else:
             objective = pg

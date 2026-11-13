@@ -197,7 +197,7 @@ class TunedLatents(NamedTuple):
     statistics: Variables
     regularizer: jax.Array
     hinge: jax.Array
-    terms: dict[str, jax.Array]
+    terms: dict[str, Pooled]
 
 
 _DEFAULT_SOLVER = DDIM()

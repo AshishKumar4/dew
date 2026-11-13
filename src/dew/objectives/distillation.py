@@ -53,6 +53,7 @@ from dew.objectives.base import (
     Aux,
     Objective,
     Omitted,
+    Pooled,
     Prediction,
     ProgramModule,
     Ratio,
@@ -393,11 +394,13 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
                                  weights=scored).total
             estimate = self.row_mean(jax.lax.stop_gradient(ratio), batch, weights=scored).total
         total = (1 - alpha) * statistics.total + alpha * temperature ** 2 * soft
-        reported = {**aux.metrics, "distill/alpha": alpha, "distill/temperature": temperature,
-                    "distill/kl": estimate / counted, "distill/soft_loss": temperature ** 2 * soft / counted,
-                    "distill/teacher_loss": (self.row_mean(teacher_losses, batch, weights=scored).total
-                                             / counted),
-                    "distill/teacher_nonfinite": jnp.sum(weights * ~finite)}
+        # The student's own metrics with their statistics, and each term the ratio its mean is over the
+        # student's mass, which a split step pools.
+        reported: dict[str, jax.Array | Pooled] = {
+            **aux.metrics, **aux.pooled, "distill/alpha": alpha, "distill/temperature": temperature,
+            "distill/kl": Ratio(estimate, mass), "distill/soft_loss": Ratio(temperature ** 2 * soft, mass),
+            "distill/teacher_loss": Ratio(self.row_mean(teacher_losses, batch, weights=scored).total, mass),
+            "distill/teacher_nonfinite": jnp.sum(weights * ~finite)}
         if self.features:
             projections = variables["params"].get(PROJECTIONS, {})
             distances = []
@@ -410,7 +413,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
             feature = (self.row_mean(jnp.stack(distances), batch, rows=1, weights=scored).total
                        / len(self.features))
             total = total + beta * feature
-            reported.update({"distill/beta": beta, "distill/feature": feature / counted})
+            reported.update({"distill/beta": beta, "distill/feature": Ratio(feature, mass)})
         return Ratio(total, mass), replace(aux, metrics=reported)
 
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:

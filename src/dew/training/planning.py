@@ -67,7 +67,7 @@ from dew.training.memory import (
     step_fits,
     temporaries_factor,
 )
-from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
+from dew.training.model_flops import TOKENS, TRAINING_FLOPS
 from dew.training.profiling import PGLE_CAPTURE
 
 if TYPE_CHECKING:
@@ -264,16 +264,13 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
 
 def _pooled(name: str, values: list):
     """A step's metric `name` from its microbatches' `values`: a recording step's evaluations every
-    microbatch's in the order they ran (`RECORD`); the model FLOPs and tokens counted, summed; a `Pooled`
-    statistic by its own pooling (`Pooled.pooled`); any other its last microbatch's (`Aux.metrics`)."""
+    microbatch's in the order they ran (`RECORD`); a `Pooled` statistic by its own pooling
+    (`Pooled.pooled`); any other its last microbatch's (`Aux.metrics`), the model FLOPs and tokens among
+    them, which every microbatch counts of the whole batch it is read from (`step_counts`)."""
     if name.startswith(RECORD):
         return jnp.concatenate(values)
-    if name == TOKENS:
-        return functools.reduce(_TokenCount.add, values)
     if isinstance(values[-1], Pooled):
         return Pooled.pooled(values)
-    if name == TRAINING_FLOPS:
-        return jax.tree.map(lambda *parts: sum(parts), *values)
     return values[-1]
 
 

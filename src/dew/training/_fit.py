@@ -349,9 +349,9 @@ class FitRun:
     restarted: tuple[str, ...] | None = None
     """What differed between a relaxed resume's saved data plan and the run's, which started its data
     again (`dew.data.plan.PlanChanged.differs`); None where the data read on or the run did not resume."""
-    unworked: bool = False
-    """Whether a per-share stream reads its data in the training process, no loading workers sized for it
-    (row 5852), which its log says once where it starves the step (`Trainer._written`)."""
+    starved: bool = False
+    """Whether its log said that a per-share stream read in the training process, no loading workers sized
+    for it (row 5852), starves the step, which it says once (`Trainer._written`)."""
     current: int = 0
     loss: jax.Array | None = None
     evaluation: Evaluation | None = None
