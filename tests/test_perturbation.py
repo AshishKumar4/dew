@@ -25,7 +25,7 @@ import optax
 import pytest
 from flax import linen as nn
 from model_support import parameter_loss
-from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, seeds_for
+from reference_error import as_given, assert_as_exact, assert_computes_the_oracle
 from scipy import stats
 
 from dew.batch import FROZEN
@@ -47,6 +47,9 @@ from dew.training import Layout, Trainer
 LAYOUT = Layout(min_shard=1, tolerance=1.0)
 ESTIMATES = 256
 """Independent steps' estimates a test of the estimator's expectation averages."""
+MICROBATCH_SEEDS = 512
+"""The declared seeds of an update read in two microbatches against its batch whole, paired: sized by
+`seeds_for` on armada's CPUs (2026-11-12, eg-sized2 at 0aed05577f7), where each run sized it again."""
 
 
 def squared(outputs, batch):
@@ -420,8 +423,7 @@ def test_an_update_read_in_two_microbatches_estimates_what_its_batch_whole_does(
 
     whole, split = estimate(1), estimate(2)
     label = "node perturbation in two microbatches"
-    assert_as_exact(split, whole, draw, label, truth_fn=truth,
-                    seeds=seeds_for(whole, draw, label, truth_fn=truth, dew_fn=split))
+    assert_as_exact(split, whole, draw, label, truth_fn=truth, seeds=MICROBATCH_SEEDS)
 
 
 def test_a_run_trains_without_differentiating_its_model():

@@ -15,6 +15,7 @@ import dataclasses
 import datetime
 import functools
 import logging
+import math
 import os
 import sys
 import time
@@ -80,15 +81,13 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import (
-    STACKED_OPTIMIZERS,
+from dew.optim import STACKED_OPTIMIZERS, declaring, with_bounds
+from dew.optim_schedules import (
     ScheduleBase,
-    declaring,
     held_rates,
     scaled_rates,
     schedule_states,
     settable_rates,
-    with_bounds,
     with_horizons,
     with_rates,
 )
@@ -668,7 +667,7 @@ class Trainer(Generic[Loss, Effects]):
     def _stated(self, state: TrainState) -> TrainState:
         """`state` with its scheduled solvers' step horizons this run's (`OptimConfig.horizons`), which a
         configured run's optimizer holds as operands it sets on every state it steps (`stated`,
-        `dew.optim.with_horizons`): its step and its start are one program at any length of run, a
+        `dew.optim_schedules.with_horizons`): its step and its start are one program at any length of run, a
         rehearsal's or a restart's served from the persistent cache. A restore's template (`_placing`)
         holds them made, so a checkpoint saved without them restores. A trainer given an Optax
         transformation keeps its own."""
@@ -677,7 +676,7 @@ class Trainer(Generic[Loss, Effects]):
             return state
         steps = self._shape.updates
         horizons = config.horizons(steps, clocked=self._shape.examples is not None)
-        schedules = {group: rate for group, rate in config.grouped_rates().items()
+        schedules = {group: rate for group, (rate, _) in config.grouped_rates().items()
                      if isinstance(rate, ScheduleBase)}
         return rates_set(state, lambda held: with_horizons(held, horizons, schedules, steps))
 
@@ -1156,6 +1155,13 @@ class Trainer(Generic[Loss, Effects]):
                                                   resumed=initial is None and interval.last_saved is not None)
         if complete:
             return state
+        # The update's work beyond the model's, of an optimizer the objective steps its params with whole: one
+        # that phases it apart (`Objective.optimizer`, a consistency distillation's two networks) states none.
+        if self._config is not None and type(self.objective).optimizer is Objective.optimizer:
+            spread = math.prod(size for axis, size in self.device_mesh.shape.items() if axis != STAGE_AXIS)
+            # Read under the axes the modules boxed, a stage-local run's stacked by stage, as `_groups` reads.
+            with self._staging.held(boxed(self._boxed_axes())):
+                run.update_flops = self._config.update_flops(state.variables["params"], devices=spread)
         compiled: dict[Hashable, tuple[CompiledStep, StepFlops | None]] = run.compiled
         seen = 0
         run.notice = PreemptionNotice()
@@ -2080,7 +2086,8 @@ class Trainer(Generic[Loss, Effects]):
             return
         read, elapsed = reading
         scalars = {**logged_scalars(read, taken.counts, elapsed, self.device_mesh.devices.size,
-                                    rollout=self.rollout is not None), **run.startup.scalars()}
+                                    rollout=self.rollout is not None, update_flops=run.update_flops),
+                   **run.startup.scalars()}
         if run.unworked and elapsed > 0 and taken.counts.waited > elapsed / 2:
             # Said once: a per-share stream read in the process starves the step.
             run.unworked = False

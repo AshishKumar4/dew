@@ -1,6 +1,6 @@
 """A rehearsal of a recipe and its real run share their step: the run's length reaches its programs as
-operands alone (`dew.optim.RateState.horizons`), so the real run, in a fresh process, reads every program
-the rehearsal compiled from the persistent cache and compiles none."""
+operands alone (`dew.optim_schedules.RateState.horizons`), so the real run, in a fresh process, reads every
+program the rehearsal compiled from the persistent cache and compiles none."""
 
 import json
 import os

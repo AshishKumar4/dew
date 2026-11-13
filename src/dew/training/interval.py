@@ -29,7 +29,7 @@ from dew.data.dataset import rows_of
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Ratio, held_metric
-from dew.optim import learning_rate
+from dew.optim_schedules import learning_rate
 from dew.state import TrainState
 from dew.telemetry.instrumentation import (
     NO_FLOPS,
@@ -426,9 +426,9 @@ def held(rate: jax.typing.ArrayLike | None, scale: jax.Array | None,
 
 
 def copied(state: TrainState) -> tuple[jax.Array | None, jax.Array | None]:
-    """`held`'s copies of the learning rate `state`'s optimizer state holds (`dew.optim.learning_rate`,
-    under DiLoCo its groups') and its loss scale, which a log reads: the run's call and a run compiled
-    ahead's alike (`dew.training.ahead.started`)."""
+    """`held`'s copies of the learning rate `state`'s optimizer state holds
+    (`dew.optim_schedules.learning_rate`, under DiLoCo its groups') and its loss scale, which a log reads:
+    the run's call and a run compiled ahead's alike (`dew.training.ahead.started`)."""
     rate, scale = learning_rate(rated(state)), None if state.scale is None else state.scale.scale
     if rate is None and scale is None:
         return None, None
@@ -522,7 +522,7 @@ class Taken(NamedTuple):
 
 
 def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int, *,
-                   rollout: bool) -> dict[str, float]:
+                   rollout: bool, update_flops: float | None = None) -> dict[str, float]:
     """One logging interval's scalars, as a run logs them, from its reading on the host.
 
     Loss and objective aux metrics are the logged step's values. train/grad_norm is instead the mean
@@ -532,7 +532,9 @@ def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int
     span all jitted programs in this process, as compilation_cache_counts describes. The optimizer
     state supplies the last applied update's rate (`learning_rate`): a rejected attempt leaves it, and
     an accumulation window moves it only when its update commits. The latest sampled commit's
-    summaries go under `inspect/` (`dew.training.inspection`), where one committed."""
+    summaries go under `inspect/` (`dew.training.inspection`), where one committed. `update_flops` is one
+    update's optimizer work beyond the model's (`OptimConfig.update_flops`), counted once for each update
+    the interval committed."""
     from dew.training.memory import peak_memory_gib
 
     # A work count a process refused (`_counted_batch`) is NaN here, and train/mfu absent.
@@ -541,6 +543,8 @@ def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int
                **{f"train/{k}": held_metric(v) for k, v in read.aux.items()},
                **throughput(elapsed, counts.since_log, counts.samples, counts.flops, devices,
                             waited=counts.waited, compiling=counts.compiling, training_flops=work,
+                            update_flops=None if update_flops is None or read.committed is None
+                            else update_flops * float(read.committed[1]),
                             tokens=None if read.scored is None else _TokenCount.host(read.scored)),
                **real_token_share(None if read.scored is None else _TokenCount.host(read.scored),
                                   counts.computed)}
@@ -685,7 +689,8 @@ def real_token_share(scored: int | None, computed: int | None) -> dict[str, floa
 
 def throughput(elapsed: float, steps: int, samples: int, flops: StepFlops | None, devices: int, *,
                waited: float = 0.0, compiling: float = 0.0, training_flops: float | None = None,
-               tokens: float | None = None, peak: float | None = None) -> dict[str, float]:
+               tokens: float | None = None, peak: float | None = None,
+               update_flops: float | None = None) -> dict[str, float]:
     """Compute the interval's rates from the records it read and its FLOPs, on a mesh of `devices`, each
     device's dense `peak` its kind's bf16 peak by default (`model_flops_utilization`).
 
@@ -694,7 +699,11 @@ def throughput(elapsed: float, steps: int, samples: int, flops: StepFlops | None
     train/flops is the objective's analytical training work on real rows a
     step, over the whole mesh, on any device: 3*forward for full FT,
     explicit frozen/trainable matrix work for PEFT. train/mfu is that work
-    over the whole mesh's peak, where the device's peak is known. train/hfu keeps hardware HLO
+    over the whole mesh's peak, where the device's peak is known. `update_flops` is the interval's
+    optimizer work beyond the model's (`OptimConfig.update_flops`: Muon's Newton-Schulz products, once an
+    update), reported as its pair, train/update_flops a step and train/update_mfu over the same peak: the
+    two shares, train/mfu and train/update_mfu, add to the step's counted work over peak, and train/mfu
+    stays the model's, as a run of any optimizer reports it. train/hfu keeps hardware HLO
     work including remat; train/hlo_flops_util is the former HLO model
     count with recomputation removed (`StepFlops.utilizations`). No HLO
     count substitutes for MFU.
@@ -726,6 +735,8 @@ def throughput(elapsed: float, steps: int, samples: int, flops: StepFlops | None
     work = training_flops if training_flops is not None and math.isfinite(training_flops) else None
     if work is not None:
         scalars["train/flops"] = float(work) / steps
+    if update_flops is not None:
+        scalars["train/update_flops"] = float(update_flops) / steps
     stepping = elapsed - compiling
     if stepping <= 0:
         return scalars
@@ -738,4 +749,8 @@ def throughput(elapsed: float, steps: int, samples: int, flops: StepFlops | None
         utilization = model_flops_utilization(per_device / steps, step_time, peak)
         if utilization is not None:
             scalars["train/mfu"] = utilization
+    if update_flops is not None:
+        utilization = model_flops_utilization(float(update_flops) / devices / steps, step_time, peak)
+        if utilization is not None:
+            scalars["train/update_mfu"] = utilization
     return scalars if flops is None else {**scalars, **flops.utilizations(steps, step_time, peak)}

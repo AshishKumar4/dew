@@ -18,7 +18,11 @@ draws, the uniforms `MaskedDiffusionObjective` draws from `jax.random.key(0)`
 (the split's first key for the times and its second for the masking), with
 the corrupted rows they give; and the reverse step's categorical over each
 position of a partly masked row, normalized, which is the distribution
-`_ddpm_update` draws from. seeds.npz holds the loss over the seeds check 1
+`_ddpm_update` draws from, under a head of its own, a quarter of the loss's
+(`reverse_head`): under the loss's, whose logits spread 2.8 deep, 53 of the
+384 outcomes expected fewer than five of the test's 20,000 draws (the rarest
+at 2.8e-8), which the sampling gate refuses; under a quarter of it the rarest
+expects 46. seeds.npz holds the loss over the seeds check 1
 draws (`record_case`, tools/recorded_references.py), each seed's rows,
 weights and uniforms a seeded NumPy draw (`draw`) the test makes again: the
 per-token loss, the batch's mean loss and its gradient in both weights, in
@@ -157,8 +161,10 @@ def main() -> None:
     arrays["mask_uniform"] = np.asarray(jax.random.uniform(mask_key, (ROWS, LENGTH)))
     arrays["corrupted"], _ = nelbo(reference, arrays, torch.float32)
     # The reverse step's categorical from t to s over a row with every other
-    # position masked: `_ddpm_update`'s q_xs, normalized per position.
-    backbone = Backbone(arrays["hidden"], arrays["head"], torch.float64)
+    # position masked: `_ddpm_update`'s q_xs, normalized per position, under
+    # a head a quarter of the loss's (the module's account).
+    arrays["reverse_head"] = arrays["head"] / np.float32(4)
+    backbone = Backbone(arrays["hidden"], arrays["reverse_head"], torch.float64)
     model = stand_in(reference, backbone)
     row = torch.tensor(arrays["tokens"])
     row[:, ::2] = MASK

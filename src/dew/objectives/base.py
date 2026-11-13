@@ -740,11 +740,12 @@ class ReleasedTask(SavedTask, Protocol):
 
     @classmethod
     def source_of(cls, run: SavedRun, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
-                  dtype: DTypeLike | None, param_dtype: DTypeLike | None) -> Pretrained:
+                  dtype: DTypeLike | None, param_dtype: DTypeLike | None, on_host: bool) -> Pretrained:
         """`run`, a step its native release holds (`dew.inference.models.ReleasedRun`), as the source a
         run that names it starts from (`dew.interop.pretrained.Pretrained.load`): its task's bundle,
-        its weights placed on `mesh` under `layout`, computing in `dtype` and stored in `param_dtype`
-        where given; refused where its task has no bundle a run starts from."""
+        its weights placed on `mesh` under `layout`, or read into host arrays with `on_host`, computing in
+        `dtype` and stored in `param_dtype` where given; refused where its task has no bundle a run
+        starts from."""
         ...
 
 

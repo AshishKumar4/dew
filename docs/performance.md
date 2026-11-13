@@ -23,7 +23,12 @@ steps, the whole mesh's analytical training work a step, logged on every device:
 sum(model_forward_flops)` where every counted network trains, the frozen and trainable work
 apart where some do not (an adapter, a frozen encoder). `train/mfu` is the interval's summed
 work over `non_compile_seconds * aggregate_peak`, `train/flops` over the time of a step at the
-mesh's peak, logged where the device's bf16 peak is known.
+mesh's peak, logged where the device's bf16 peak is known. An optimizer whose update multiplies
+matrices reports that work beside it as the pair `train/update_flops` and `train/update_mfu`, the same
+counts of the update's own work (`OptimConfig.update_flops`: Muon's Newton-Schulz products, once an
+update, `steps * (4 m² n + 2 m³)` a matrix of short side m and long side n). `train/mfu` stays the
+model's, so runs of one model under any optimizer compare, and the two shares add to the step's counted
+work over peak.
 The forward work is analytical, not inferred from HLO: `Counted.model_flops(lengths)`
 receives the real lengths of independent rows or packed segments. One multiply-add
 counts as two operations. A dense projection contributes `2 * in * out` per real
@@ -1964,6 +1969,12 @@ bundle. Toolbox's while-loop double buffering stays out too: the 8B, whose
 layers Dew unrolls, stepped in 479.4 and 479.1 ms with it and 479.5 and
 479.2 without (2a6e1d3d9's parent), and it failed XLA's schedule check
 (`hlo_schedule.cc:463`) in a two-process GPU pool's step.
+
+On the same pair, 2026-11-12, a Qwen3.5-4B decision step (random weights, 12,288-token joint rows, full
+remat, one or two rows a device a microbatch, Muon and AdamW; IG-SCALING-2XH100, row 5568) took the
+scheduler and three all-gather thresholds: the scheduler hid half the exposed communication (77 to 40 ms of
+a 1,078 ms step), and 1 GiB, 128 MiB and 30 MiB stepped within 1% of each other in all 15 timed cells, 128
+MiB holding 39.4 GiB of peak at two rows against 1 GiB's 44.6.
 
 ```
 cd <dew checkout> && JAX_PLATFORMS=cuda XLA_FLAGS= XLA_PYTHON_CLIENT_MEM_FRACTION=0.90 PYTHONPATH=src \

@@ -134,6 +134,15 @@ def test_one_frame_of_images_is_a_still_grid_and_several_take_turns():
     assert {"early", "late"} <= {text.text for text in moving.iter(f"{SVG}text")}
 
 
+def test_one_frame_of_images_takes_its_caption_still():
+    """One frame of images with its caption is a still grid, its caption drawn without animation, where
+    animating the caption on the still figure's zero-second loop raised."""
+    batch = np.full((2, 4, 4, 3), 128, np.uint8)
+    still = read(figures.images([batch], captions=["sample"], columns=2, size=16))
+    assert "@keyframes" not in still.find(f"{SVG}style").text
+    assert "sample" in {text.text for text in still.iter(f"{SVG}text")}
+
+
 def test_an_image_drawn_sharp_keeps_its_pixels():
     """`Figure.image` without `photo` embeds a PNG whose pixels are the array's, gray or color, drawn
     pixelated."""

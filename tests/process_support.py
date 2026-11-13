@@ -380,16 +380,17 @@ def raised(done: subprocess.CompletedProcess) -> dict[str, list[str]]:
     closing line (Python's `Type: message` after its frames, a chained error's cause among them), read from
     stdout and stderr with a rank's `[N] ` prefix (`dew launch`'s) taken off; none where no traceback was
     printed. A refusal's test reads its error here, where its exit status alone a crash would pass."""
-    lines = [re.sub(r"^\[\d+\] ", "", line) for line in (done.stdout + "\n" + done.stderr).splitlines()]
     found: dict[str, list[str]] = {}
-    within = False
-    for line in lines:
+    within: set[str] = set()
+    for raw in (done.stdout + "\n" + done.stderr).splitlines():
+        ranked = re.match(r"^\[(\d+)\] (.*)$", raw)
+        rank, line = ranked.groups() if ranked else ("", raw)
         if line == "Traceback (most recent call last):":
-            within = True
-        elif within and line and not line.startswith(" "):
+            within.add(rank)
+        elif rank in within and line and not line.startswith(" "):
             # The traceback's closing line, past its frames: its error's type, any class's dotted name
             # (`ValueError`, `socket.gaierror`, `grpc._channel._InactiveRpcError`), and its message.
-            within = False
+            within.remove(rank)
             named, _, message = line.partition(": ")
             if re.fullmatch(r"(\w+\.)*\w+", named):
                 found.setdefault(named, []).append(message)

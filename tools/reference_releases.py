@@ -45,6 +45,8 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     "diffusers-pipelines": {"diffusers": tested("diffusers"), "transformers": "4.49.0"},
     "diffusers-limits": {"diffusers": tested("diffusers"), "mpmath": "1.3.0"},
     "diffusers-0.40": {"diffusers": "0.40.0"},
+    # The DC-AE fixture's first two variants (tools/diffusers_dc_ae_reference.py), as 0.34.0 recorded them.
+    "diffusers-0.34": {"diffusers": "0.34.0"},
     # Wan 2.1's transformer and pipeline fixtures: the transformer, the pipeline's walk and its UMT5 text
     # tower, the test extra's releases (diffusers_wan_reference).
     "diffusers-wan": {"diffusers": tested("diffusers"), "transformers": tested("transformers")},

@@ -513,12 +513,18 @@ def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematP
     weights = held["params"]
     count = jax.tree.leaves(weights)[0].shape[0]
     keys = jax.random.split(run.make_rng("dropout"), count) if run.has_rng("dropout") else None
+    # What each layer reads of its own beside its weights: its read-only collections (a frozen layer
+    # scalar's, a differential extension's head selection), stacked on the run's layer axis as its weights
+    # are, which the layer's call takes as the ordinary scan's does.
+    updated = {"params", in_backward.MASTERS, in_backward.NORMS, *current.moments}
+    constants = {name: tree for name, tree in held.items() if name not in updated}
     alone = run.clone(parent=None)
 
-    def applied(weights_i, carry, key, metadata):
+    def applied(weights_i, carry, own, metadata):
+        key, constants_i = own
         rngs = None if key is None else {"dropout": key}
-        return alone.apply({"params": weights_i}, carry, train=True, decode=False, kv_store=None,
-                           per_layer_input=None, attention_metadata=metadata, rngs=rngs)
+        return alone.apply({"params": weights_i, **constants_i}, carry, train=True, decode=False,
+                           kv_store=None, per_layer_input=None, attention_metadata=metadata, rngs=rngs)
 
     layer = applied if remat is not None else jax.checkpoint(
         applied, policy=_KEPT_WITHOUT_A_RUNG.checkpoint_policy(), prevent_cse=False)
@@ -526,7 +532,7 @@ def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematP
     return in_backward.scanned_run(
         run.path, layer, weights, held.get(in_backward.MASTERS),
         {name: held[name] for name in current.moments}, in_backward.norms_of(held[in_backward.NORMS]), x,
-        keys, (attention_metadata,))
+        (keys, constants), (attention_metadata,))
 
 
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],

@@ -36,7 +36,7 @@ What lands in tests/fixtures/t5:
 which it leaves as it is:
 the reference's fp32 last hidden state and its float64 truth on each seed's
 drawn ids (tests/test_t5_encoders.py's `t5_draw`), kept as the evidence check
-1 reads (`summary`), the count planned on Dew's own encoder:
+1 reads (`summary`):
 
     PYTHONPATH=src /tmp/t5ref/bin/python tools/t5_reference.py seeds
 """
@@ -134,17 +134,14 @@ def write_seeds(directory: Path, name: str, reader) -> None:
     """`directory`'s checkpoint recorded over check 1's seeds as `<directory>-seeds.npz` beside it
     (`record_case`): the
     reference's fp32 encoder and its float64 truth, built and run inside `_dew_torch.precision.float64`, on
-    each seed's drawn ids, the count planned on Dew's own encoder against its float64 run."""
+    each seed's drawn ids."""
     import sys
-
-    import jax
 
     sys.path[:0] = [str(FIXTURES.parents[1]), str(Path(__file__).resolve().parent)]
     from recorded_references import provenance, record_case, save
     from test_t5_encoders import t5_draw
 
     from _dew_torch.precision import float64, float64_twin
-    from dew.inputs import T5Text
 
     torch.set_num_threads(1)
     model = reader.from_pretrained(directory, dtype=torch.float32).eval()
@@ -159,18 +156,8 @@ def write_seeds(directory: Path, name: str, reader) -> None:
                 truth = wide(input_ids=ids, attention_mask=mask).last_hidden_state.numpy()
         return {"last_hidden_state": reference}, {"last_hidden_state": truth}
 
-    encoder = T5Text.from_pretrained(str(directory))
-    with jax.enable_x64(new_val=True):
-        wide_encoder = T5Text.from_pretrained(str(directory), dtype="float64", param_dtype="float64")
-
-    def proxy(inputs):
-        return {"last_hidden_state": encoder.encode(encoder.params, inputs).hidden}
-
-    def truth_proxy(inputs):
-        return {"last_hidden_state": wide_encoder.encode(wide_encoder.params, inputs).hidden}
-
-    arrays = record_case(name, lambda seed: t5_draw(seed, model.config.vocab_size), evaluate, proxy,
-                         truth_proxy=truth_proxy, store_inputs=False, summary=True)
+    arrays = record_case(name, lambda seed: t5_draw(seed, model.config.vocab_size), evaluate,
+                         store_inputs=False, summary=True)
     import transformers
 
     arrays[f"{name}.provenance"] = provenance("transformers", transformers.__version__, "cpu",

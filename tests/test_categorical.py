@@ -17,6 +17,9 @@ from dew.nn.categorical import token_log_probs
 
 MASKED_SEEDS = 8
 """Check 1's declared seeds for a masked row against the row of its held classes alone."""
+MASKED_FORM_SEEDS = {"divergence": 32, "ranked probability": 16}
+"""The masked forms whose paired sizing takes more than `MASKED_SEEDS` on the suite's host level (the
+gate's qualification run at main 0aed05577f7, ledger 5698): their declared seeds."""
 SMOOTHED_SEEDS = 8
 """Check 1's declared seeds for a smoothed target's cross entropy against Optax's."""
 COLLAPSE_SEEDS = {20: 8, 40: 8, 80: 8}
@@ -166,7 +169,8 @@ def test_a_masked_class_adds_no_term_in_value_or_gradient(form):
     def alone(rows):
         return of(rows[:, :4], None)
 
-    assert_as_exact(masked, alone, lambda seed: (logits(jnp.float32, seed=seed),), form, seeds=MASKED_SEEDS)
+    assert_as_exact(masked, alone, lambda seed: (logits(jnp.float32, seed=seed),), form,
+                    seeds=MASKED_FORM_SEEDS.get(form, MASKED_SEEDS))
     rows = logits(jnp.float32)
     gradient = np.asarray(jax.grad(lambda rows: of(rows, held).sum())(rows))
     assert np.all(np.isfinite(gradient)) and np.all(gradient[:, 4:] == 0)
@@ -349,8 +353,11 @@ def test_the_divergences_derivative_stays_finite_wherever_its_rows_are():
     assert np.all(np.isfinite(jacobian)) and np.all(jacobian[1] == 0)
 
 
-GROUP_SEEDS = 16
-"""Check 1's declared seeds for a group's divergence and its gradient."""
+GROUP_SEEDS = 64
+"""Check 1's declared seeds for a group's divergence and its gradient, sized on the suite's host level
+(the gate's qualification run at main 0aed05577f7, ledger 5698)."""
+AGREEING_SEEDS = 32
+"""Check 1's declared seeds for agreeing members' divergence, sized alike."""
 
 
 def drawn(seed: int):
@@ -437,7 +444,7 @@ def test_members_that_agree_have_no_divergence_and_extreme_logits_stay_finite():
     whose float64 truth is zero, met on par (check 1); logits of a thousand keep the divergence and its
     gradient finite."""
     assert_as_exact(divergence_of, written_out, agreeing,
-                    "agreeing members", seeds=GROUP_SEEDS)
+                    "agreeing members", seeds=AGREEING_SEEDS)
     logits, options, groups, canonical = agreeing(0)
     apart = canonical.at[0, 1].set(jnp.arange(4))
     divergence, _ = categorical.group_divergence(logits * 1000, groups, apart, options)

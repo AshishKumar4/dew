@@ -317,7 +317,7 @@ class GRPOObjective(TokenScorer):
             policy = self.packed_log_probs(params, batch, progress=progress)
             qk, sown, inspected = None, None, None
         dtype = at_least_fp32(policy.dtype)
-        real = (self.row_weights(batch, shape[0]) > 0)[:, None]
+        real = self.real_rows(batch, shape[0])[:, None]
         mask = jnp.where(real, jnp.asarray(batch[RESPONSE_MASK_KEY], dtype), 0)
         behavior = jnp.where(real, jnp.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], dtype), 0)
         proximal = OLD_LOG_PROBS_KEY in batch

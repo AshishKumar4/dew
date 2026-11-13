@@ -125,6 +125,45 @@ def test_pallas_lowerings_are_kept_beside_the_compiled_programs_unless_the_user_
     assert fresh(script, str(cache), platforms="cpu") == str(named)
 
 
+LOWERED = """
+import collections, json
+import jax, jax.numpy as jnp
+from jax._src import monitoring
+from jax.sharding import NamedSharding, PartitionSpec
+from dew.nn.kernels import gemm, generation
+from dew.training.ahead import compile_only_gpus
+from dew.training.runtime import ready_process
+
+served = []
+monitoring.register_event_listener(
+    lambda event, **_: served[-1].update([event.rsplit("/", 1)[-1]]) if "lowering_cache" in event else None)
+ready_process()
+devices = jax.sharding.Mesh(compile_only_gpus("sm90")[:1], ("data",))
+x = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16, sharding=NamedSharding(devices, PartitionSpec()))
+with generation.chosen(grouped_matmul="mosaic"), generation.assumed("sm90"), \\
+        jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90")):
+    for program in (lambda a, b: gemm.gemm(a, b, None, out_dtype=jnp.bfloat16),
+                    lambda a, b: gemm.gemm(a, b, None, out_dtype=jnp.bfloat16) + 0):
+        served.append(collections.Counter())
+        jax.jit(program).trace(x, x).lower()
+print(json.dumps([dict(counts) for counts in served]))
+"""
+
+
+def test_a_directory_the_user_names_keeps_the_kernels_lowerings_for_another_program_and_process(tmp_path):
+    """A run whose compilation cache directory the user or a launcher names (JAX_COMPILATION_CACHE_DIR)
+    keeps each Pallas Mosaic GPU lowering beside its programs, as Dew's own directory does: a second program
+    of the process and a second process read the kernel's lowering back rather than lowering it again,
+    where it lowered every kernel again in every program and process (FS-TRACE-REAL)."""
+    from process_support import fresh
+
+    first = fresh(LOWERED, cache_dir=tmp_path / "theirs", platforms="cpu")
+    second = fresh(LOWERED, cache_dir=tmp_path / "theirs", platforms="cpu")
+    assert first[0].get("miss") and not first[0].get("hit")
+    assert first[1].get("hit") and not first[1].get("miss")
+    assert all(program.get("hit") and not program.get("miss") for program in second)
+
+
 def test_a_rebuilt_cuda_plugin_reads_no_picks_its_earlier_build_measured(tmp_path):
     """Dew builds its CUDA PJRT plugins again under one jaxlib, and a plugin is the GPU compiler
     the autotuner's picks were measured with, so each build keeps its picks apart: a process

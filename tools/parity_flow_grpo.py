@@ -91,8 +91,8 @@ def author_transition(reference, inputs: dict, dtype) -> dict[str, np.ndarray]:
 
 
 def dew_transition(inputs: dict) -> dict:
-    """Dew's transition on a draw (`transition_inputs`), by `author_transition`'s names: the count the
-    recording plans on, and tests/test_flow_grpo.py's arm and, in float64, its truth."""
+    """Dew's transition on a draw (`transition_inputs`), by `author_transition`'s names:
+    tests/test_flow_grpo.py's arm and, in float64, its truth."""
     import jax.numpy as jnp
     from reference_error import with_gradients
 
@@ -119,7 +119,7 @@ def dew_transition(inputs: dict) -> dict:
 
 def write_recording(command: str) -> None:
     """RECORDED: the author code's transition recorded over check 1's seeds (`record_case`'s summary),
-    its float32 run's evidence from its float64 run, the count planned on Dew's (`dew_transition`)."""
+    its float32 run's evidence from its float64 run."""
     import jax
     import torch
     from fetched_fixtures import save
@@ -136,8 +136,7 @@ def write_recording(command: str) -> None:
         return found, truth
 
     with jax.enable_x64(new_val=True):
-        recorded = record_case("transition", transition_inputs, evaluate, dew_transition,
-                               truth_proxy=dew_transition, store_inputs=False, summary=True)
+        recorded = record_case("transition", transition_inputs, evaluate, store_inputs=False, summary=True)
     recorded["transition.provenance"] = provenance("Flow-GRPO sde_step_with_logprob", COMMIT, "cpu", command,
                                                    torch=torch.__version__)
     written = save(RECORDED, recorded, reference=f"flow_grpo {COMMIT}", license="MIT")

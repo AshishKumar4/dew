@@ -86,7 +86,7 @@ if TYPE_CHECKING:
     from dew.objectives.base import Metric, Objective
     from dew.objectives.rl.control import ControlRollout
     from dew.objectives.rl.dreamer import DreamerRollout
-    from dew.optim import ScheduleBase
+    from dew.optim_schedules import ScheduleBase
     from dew.sampling.solvers import Solver
 
 # A type annotation as a value: a class, a union of them, a subscripted
@@ -1582,7 +1582,7 @@ schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
     "linear": "dew.optim:Linear",
     "one_cycle": "dew.optim:OneCycle",
     "power": "dew.optim:Power",
-}, base="dew.optim:ScheduleBase")
+}, base="dew.optim_schedules:ScheduleBase")
 
 
 # A run config's own class sits above the registry, which names it for the type checker alone. A run

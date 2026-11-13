@@ -539,6 +539,16 @@ class CrossContext:
     queries: jax.Array | None = None
 
     @staticmethod
+    def queries_of(coordinates: Coordinates | None) -> jax.Array | None:
+        """The documents a call's tokens read a context by, `[B, S]` (`queries`): its coordinates' segments,
+        over forks each token's tree, a row's documents continuing one another; None where its coordinates
+        name none."""
+        if coordinates is None or coordinates.segments is None:
+            return None
+        segments = coordinates.segments
+        return segments if coordinates.forks is None else coordinates.forks.trees(segments)
+
+    @staticmethod
     def parted(conditioning: Mapping[str, jax.Array] | None
                ) -> tuple[dict[str, jax.Array] | None, dict[str, jax.Array] | None]:
         """`conditioning`'s context entries (`CONTEXT`, `CONTEXT_LENGTHS`), which a decoder reads, and

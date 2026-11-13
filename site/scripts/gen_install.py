@@ -33,8 +33,11 @@ EXTRAS = ("<!-- BEGIN extras (site/scripts/gen_install.py checks them against py
           "<!-- END extras -->")
 
 
-def facts() -> tuple[list[tuple[str, int, tuple[int, int]]], str, str]:
-    """The CUDA builds, the package index and the least Python, read as literals so the installer
+def facts() -> tuple[list[tuple[str, int, tuple[int, int]]], str, str,
+                     tuple[tuple[int, ...], int]]:
+    """The CUDA builds, the package index, the least Python, and the SM majors whose GPUs hold tensor memory
+    with the least CUDA major a build's cuBLAS must be of beside it (dew._builds.TENSOR_MEMORY_SMS,
+    LEAST_CUBLAS_BESIDE_TENSOR_MEMORY: cuBLAS's major is its CUDA build's), read as literals so the installer
     stays independent of Dew's runtime imports."""
     source = ast.parse((REPO / "src/dew/_builds.py").read_text())
 
@@ -48,7 +51,8 @@ def facts() -> tuple[list[tuple[str, int, tuple[int, int]]], str, str]:
     least = re.fullmatch(r">=\s*(\d+\.\d+)", required)
     if least is None:
         raise SystemExit(f"gen_install reads a requires-python of the form >=X.Y, not {required!r}")
-    return builds, index, least[1]
+    tensor_memory = (literal("TENSOR_MEMORY_SMS"), literal("LEAST_CUBLAS_BESIDE_TENSOR_MEMORY")[0])
+    return builds, index, least[1], tensor_memory
 
 
 def documented_extras(text: str) -> set[str]:
@@ -107,7 +111,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--check", action="store_true", help="Check the generated blocks without writing them.")
     args = parser.parse_args()
-    builds, index, python = facts()
+    builds, index, python, (tensor_sms, tensor_cuda) = facts()
     pyproject = tomllib.loads((REPO / "pyproject.toml").read_text())
     project = pyproject["project"]
     pip = next(line for line in (REPO / "tools/pip.txt").read_text().splitlines()
@@ -125,11 +129,17 @@ def main() -> None:
                          f"{sorted(documented_extras(page) - extras)}, which pyproject.toml does not declare")
     shell = [f"python_min={python}", f"package_index={index}", f"pip_least='{pip}'",
              "cuda_builds='" + " ".join(f"{build}:{driver}:{major}.{minor}"
-                                        for build, driver, (major, minor), _ in builds) + "'"]
+                                        for build, driver, (major, minor), _ in builds) + "'",
+             f"tensor_memory_sms='{' '.join(map(str, tensor_sms))}'",
+             f"tensor_memory_cuda={tensor_cuda}"]
     table = ["| Build | CUDA | NVIDIA driver | GPU (SM) |", "|---|---|---|---|"]
     for build, driver, (major, minor), cuda in builds:
         table.append(f"| `{build}` | {cuda // 1000}.{cuda % 1000 // 10} or later | {driver} or later, or an older "
                      f"one under NVIDIA's cuda-compat | {major}.{minor} or later |")
+    held = next(build for build, _, _, cuda in reversed(builds) if cuda // 1000 >= tensor_cuda)
+    table += ["", f"A GPU that holds tensor memory (SM {' and '.join(f'{major}.x' for major in tensor_sms)}: a "
+              f"B200, a B300) runs `{held}` or newer alone: an older build's cuBLAS frees a kernel's tensor "
+              "memory twice beside Dew's own kernels there, so Dew and the installer take no older one."]
     least = [f"Dew needs Python {python} or newer, and CI tests {' and '.join(PYTHONS)}."]
     advice = [f"Use pip {pip_version} or newer and uv {uv} or newer: older ones trust the roots of "
               "eMudhra's compromised certificate authorities (October 2026). Update pip from its wheel by "
