@@ -495,6 +495,15 @@ class MosaicForward(_Mainloop[Tiles]):
                 and family.shares_rows(config.relaunch_k or config.block_k,
                                        config.relaunch_consumers or config.consumers)):
             return False
+        # Its products' right operands, the keys' tile in S = Q·Kᵀ (the heads' width deep, a key tile's
+        # columns) and the values' in P·V (a key tile's rows of the launch's value columns, `Tiles.columns`),
+        # ones its family's products take (`Issuer.takes_right`: tcgen05's 64-row products pad a narrow one
+        # only at their own depth). Its natural rewalk's are judged as its launch's (`legal`).
+        width = _width(query.shape[-1], family, query.dtype)
+        value_columns = config.columns or _width(ba.arguments["value"].shape[-1], family, query.dtype)
+        if not (family.takes_right(width, config.block_k)
+                and family.takes_right(config.block_k, value_columns)):
+            return False
         # A paged call's key tiles (the launch's, its natural rewalk's) whole in its pages or its pages whole
         # in them (`_pages_hold`).
         tiles = (config.block_k, config.relaunch_k or config.block_k)

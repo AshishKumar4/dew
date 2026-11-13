@@ -16,7 +16,7 @@ from kernel_compile import gate_generations
 from test_attention_mosaic import BACKWARD_HOOKS, SHAPES, _check_backward, _residuals
 from test_attention_triton import SCORE_HOOKS, score_hooks
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
@@ -570,3 +570,36 @@ def test_an_fp16_backward_compiles_spill_free_as_its_model_decides(width):
         found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config))], "sm90")
     failed = mosaic_failures(found) + undercounts(found)
     assert not failed, "\n".join(failed)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("kept", [template.Kept.SPLIT, template.Kept.NONE], ids=["training", "inference"])
+@pytest.mark.parametrize("rows", [2, 1], ids=["step", "decision"])
+def test_each_tcgen05_forward_the_4b_steps_refusals_derive_lowers_for_a_b200(rows, kept):
+    """Qwen3.5-4B's attention (16 query heads over 4, 256 wide, 12,288 causal tokens: its step's two rows and
+    the planner's one-row decision) on a compile-only B200: each config its derivation offers on tcgen05's
+    chunks as a compile refuses the one before (`report.refuse_launch`, a spill's refusal) lowers, so a
+    refusal never steps the step onto a forward it cannot build (the B200 4B step, its spill refused onto 64 x
+    128 keys at 16 value columns, raised at its values' padded operand)."""
+    from dew.nn.kernels.templates import report
+
+    tokens, heads, kv_heads, width = 12288, 16, 4, 256
+    spans = template.spans(tokens, tokens, rows, causal=True)
+    query = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
+
+    def forward(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None, residuals=kept)
+
+    with generation.assumed("sm100"), report.refusals():
+        target = generation.gpu_target()
+        op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        ba = op.bind(*args, residuals=kept, interpret=False)
+        offered = 0
+        while (config := op.derived(ba, target)) is not None and config.family == "tcgen05.chunks":
+            with tuning.pinned({attention_mosaic.MosaicForward: config}):
+                jax.jit(forward).trace(query, key, key).lower(lowering_platforms=("cuda",))
+            report.refuse_launch(op, ba, config, {"attention_forward"})
+            offered += 1
+        assert offered

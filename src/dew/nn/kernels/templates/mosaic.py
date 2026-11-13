@@ -719,6 +719,12 @@ class Issuer[Accumulator](abc.ABC):
         del rows, columns
         return self
 
+    def takes_right(self, rows: int, columns: int) -> bool:
+        """Whether its products take a right operand of `rows` (their depth) x `columns` from shared memory:
+        any, unless they pad a narrow one in a tile of their own (`Tcgen05ChunksIssuer`)."""
+        del rows, columns
+        return True
+
     def relay_bytes(self, rows: int, depth: int) -> int:
         """The shared memory a consumer's register left operand of `rows` x `depth` (an accumulator's value a
         product reads) takes on its way to the product's layout (`relaying`): none where the cast stays in

@@ -984,6 +984,12 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         # jsf-gate100b): a staged block's columns step in 32.
         return max(2 * 16, super().narrowest_columns(dtype))
 
+    def takes_right(self, rows: int, columns: int) -> bool:
+        # A right operand of fewer than `PADDED` columns is padded in the building role's tile of a 64-row
+        # product's depth (`_padded`): a deeper one's is not (a 128-key tile's values at a 16-column block:
+        # the B200 4B step's forward, a spill refused onto it, raised as it lowered).
+        return columns >= PADDED or rows == self.rows
+
     def right_swizzle(self, dtype, columns: int) -> int:
         # A 64-row product splits its N columns between two lane groups, each reading whole tiles of its
         # right operand's swizzle (Mosaic GPU: "the M or N MMA instruction size was chosen to be 96, which is
@@ -1074,10 +1080,10 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         whole tiles of no shared-memory tiling a transposed operand takes (Mosaic GPU's layout inference
         refused Kimi delta attention's 16-wide sub-chunk pairs on a B200; row 4747's debugging at
         0e5d3aa9df8: padded, they lower)."""
-        padded = self._scoped()["padded"][mosaic.ROLE.get()]
         rows, columns = rhs.shape
-        if rows != self.rows:
+        if not self.takes_right(rows, columns):
             raise ValueError(f"{self.name} pads a {self.rows}-row right operand, not {rows} rows")
+        padded = self._scoped()["padded"][mosaic.ROLE.get()]
         padded[...] = jnp.zeros((rows, PADDED), padded.dtype)
         plgpu.store(padded.at[:, :columns], plgpu.load(rhs, layout=plgpu.Layout.WGMMA, optimized=False),
                     optimized=False)
