@@ -269,7 +269,7 @@ class HostExecution:
         shards = math.prod(self.accelerator.shape[axis] for axis in batch_axes(self.accelerator))
         options = step_compiler_options(self.objective, device_tokens(self.objective, batch, shards),
                                         FROZEN in variables, self.accelerator.devices.size,
-                                        gathered=gathered_layer_bytes(variables))
+                                        gathered=gathered_layer_bytes(self.objective, variables))
         return dict(options or {})
 
     def snapshot(self, variables):

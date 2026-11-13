@@ -583,6 +583,21 @@ def test_a_diloco_run_over_stages_keeps_each_layer_whole_on_every_stage():
 
 
 @pytest.mark.mesh(devices=8)
+def test_a_stage_local_runs_largest_layer_gathers_what_the_replicated_pipelines_does():
+    """The bytes a device gathers for a stage-local run's largest layer (`gathered_layer_bytes`), its
+    layers stacked by stage, are the replicated pipeline's, every layer whole on every stage: a stacked run
+    is read back onto its layers before it is sized, so a step's gathers combine up to one layer, not up to
+    the run."""
+    from dew.training.memory import gathered_layer_bytes
+
+    found = []
+    for stage_local in (True, False):
+        run = trainer(decoder(), optax.adam(1e-3), STAGED, 8, stage_local=stage_local)
+        found.append(gathered_layer_bytes(run.objective, run.initial_state().variables))
+    assert found[0] is not None and found[0] == found[1], found
+
+
+@pytest.mark.mesh(devices=8)
 def test_a_stage_local_runs_inspection_reports_each_stored_layer_by_its_name():
     """An inspection of a stage-local run selects and summarizes each stored layer its stacked leaves hold,
     by the layer's own name: a path naming one layer reports that layer, and a glob reports each layer it

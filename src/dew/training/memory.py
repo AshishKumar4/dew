@@ -27,7 +27,7 @@ from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
 from dew.distributed.placement import parameter_axes
 from dew.mesh import batch_axes, mesh_axes
-from dew.nn.backbones.layer_names import group_layers
+from dew.nn.backbones.layer_names import StoredRow, group_layers, stored_layers
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.kernels.templates import report
@@ -58,29 +58,37 @@ its all-gathers up to one layer's instead (`gathered_layer_bytes`)."""
 GATHER_THRESHOLD = 'xla_gpu_all_gather_combine_threshold_bytes'
 """The bytes XLA combines a step's all-gathers up to (`COLLECTIVES`, `step_compiler_options`)."""
 
-def gathered_layer_bytes(variables: Variables) -> int | None:
-    """The bytes a device gathers for the largest layer's split parameters (`splits_parameter`), of every
-    collection (a frozen split's too), each gathered whole in the dtype it is stored in: what a layer's
+def gathered_layer_bytes(objective, variables: Variables) -> int | None:
+    """The bytes a device gathers for the largest layer's split parameters (`splits_parameter`), every
+    collection's (a frozen split's too), each gathered whole in the dtype it is stored in: what a layer's
     gathers move at most, whatever narrower dtype its step converts a shard to first (a bf16 step over fp32
     parameters gathers half), so no layer's gathers are split, and at most two of a bf16 step's are held
-    ahead. A layer is a stack module's (`group_layers`): a `layers_N`'s whole, or a row of a scanned run
-    `layers_3_7`, stacked by its layers and, a stage-local store's under `stages`, by stage first. None where
-    no layer's leaf is split. A step whose all-gathers combine up to one layer's gathers each layer at once
-    (`step_compiler_options`): on 2 x H100 at fsdp 2, Qwen3.5-4B's 1 GiB combined about 4.7 layers' 215 MiB
-    each in its forward and held 5 GiB more at its peak than 128 MiB did, in the same time
-    (IG-SCALING-2XH100), and a Llama-3.1-8B's 128 MiB split its 0.44 GB layers and lost 2.6%
-    (docs/performance.md)."""
-    layers: dict[tuple[str, ...], float] = {}
-    for path, leaf in jax.tree_util.tree_flatten_with_path(variables)[0]:
-        names = [key.key for key in path[1:] if isinstance(key, jax.tree_util.DictKey)]
-        found = [(index, run) for index, name in enumerate(names) if (run := group_layers(str(name)))]
-        if not found or not splits_parameter(leaf):
-            continue
-        index, run = found[-1]
-        rows = len(run) * (leaf.shape[0] if "stages" in names[:index] else 1)
-        layer = tuple(map(str, names[:index + 1]))
-        layers[layer] = layers.get(layer, 0) + leaf.size * jnp.dtype(leaf.dtype).itemsize / rows
-    return math.ceil(max(layers.values())) if layers else None
+    ahead. A layer is a stack module's `layers_N`, every run the objective's networks store stacked (a
+    stage-local or periodic run, a bank) read back onto its layers first (`stored_layers`, the networks' own
+    views, as their exports read them); None where no layer's leaf is split. A step whose all-gathers
+    combine up to one layer's gathers each layer at once (`step_compiler_options`): on 2 x H100 at fsdp 2,
+    Qwen3.5-4B's 1 GiB combined about 4.7 layers' 215 MiB each in its forward and held 5 GiB more at its
+    peak than 128 MiB did, in the same time (IG-SCALING-2XH100), and a Llama-3.1-8B's 128 MiB split its 0.44
+    GB layers and lost 2.6% (docs/performance.md)."""
+    def layered(tree):
+        # A bank's rows are read where they lie (`StoredRow`): their shapes and dtypes are what is sized.
+        return jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype) if isinstance(leaf, StoredRow)
+                            else leaf, stored_layers(objective, tree, banks=True))
+
+    # Two trees cut alike: the leaves' own dtypes, and a mark of which a parameter axis splits.
+    sized = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), variables)
+    marks = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(
+        leaf.shape, jnp.int8 if splits_parameter(leaf) else jnp.uint8), variables)
+    sized, marks = jax.eval_shape(lambda sized, marks: (layered(sized), layered(marks)), sized, marks)
+    layers: dict[tuple[str, ...], int] = {}
+    for (path, leaf), mark in zip(jax.tree_util.tree_flatten_with_path(sized)[0], jax.tree.leaves(marks),
+                                  strict=True):
+        names = [str(key.key) for key in path[1:] if isinstance(key, jax.tree_util.DictKey)]
+        found = [index for index, name in enumerate(names) if group_layers(name) is not None]
+        if found and mark.dtype == jnp.int8:
+            layer = tuple(names[:found[-1] + 1])
+            layers[layer] = layers.get(layer, 0) + leaf.size * jnp.dtype(leaf.dtype).itemsize
+    return max(layers.values(), default=None)
 
 
 def splits_parameter(leaf) -> bool:
@@ -222,7 +230,7 @@ def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: 
     mesh's batch axes, and whether `variables` hold frozen weights it trains beside."""
     shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
     return step_compiler_options(objective, device_tokens(objective, micro, shards), FROZEN in variables,
-                                 mesh.devices.size, gathered=gathered_layer_bytes(variables))
+                                 mesh.devices.size, gathered=gathered_layer_bytes(objective, variables))
 
 
 def device_tokens[LossT, EffectsT](objective: Objective[LossT, EffectsT], batch: Batch, shards: int) -> float:
