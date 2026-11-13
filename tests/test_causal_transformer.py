@@ -1561,8 +1561,10 @@ def test_rows_of_one_document_each_attend_as_unpacked_rows():
 
     assert_as_exact(states(model, 1), states(model, 2), drawn(model), "one document a row",
                     seeds=SEEDS['one document a row'], truth_fn=states(model.clone(dtype=jnp.float64), 2))
-    narrow = model.clone(dtype=jnp.bfloat16)
-    ids = jnp.zeros(segments.shape, jnp.int32)
+    # A B200 call of a shape its cuDNN cell timed: 16-bit, 8 query heads over 2 of 64, 128 tokens.
+    narrow = tiny(num_heads=8, num_kv_heads=2, head_dim=64, max_seq_len=128, dtype=jnp.bfloat16)
+    rows = (jnp.arange(128)[None, :] < jnp.asarray([[70], [128]])).astype(jnp.int32)
+    ids = jnp.zeros(rows.shape, jnp.int32)
     params = jax.eval_shape(narrow.init, jax.random.key(0), ids)
 
     def routes(given):
@@ -1571,7 +1573,7 @@ def test_rows_of_one_document_each_attend_as_unpacked_rows():
         return [(route.kernel, route.refusal) for route in found
                 if route.choice == generation.Choice.ATTENTION]
 
-    assert routes(laid(1)) == routes(None)
+    assert routes(coordinates(rows.shape, segments=rows, max_segments=1, right_padded=True)) == routes(None)
 
 
 def _rotate_half_reference(x, freqs_cos, freqs_sin, scale=None):
