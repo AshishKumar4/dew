@@ -92,7 +92,7 @@ from dew.optim_schedules import (
     with_rates,
 )
 from dew.registry import Unrecordable
-from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, occupancy, together
+from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, occupied, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
@@ -1982,7 +1982,7 @@ class Trainer(Generic[Loss, Effects]):
         state = self._staged(state, run.current)
         signature = self.phase_passes.key(batch_signature(batch))
         if signature not in compiled and self.phase_passes.begins(compiled) and (
-                not int(jnp.max(occupancy(state.window)))):
+                not occupied(state.window)):
             # A phase of other passes begins at an update's end: its step is planned afresh, at the split
             # the run was given or the planner's for its own passes, over the state as a fresh state holds
             # it, no window laid out; one that begins inside an update keeps the run's, the one its open

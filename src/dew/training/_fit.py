@@ -53,7 +53,7 @@ from dew.held_updates import waiting
 from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
 from dew.optim import OptimConfig
 from dew.optim_schedules import reclocked
-from dew.state import TrainState, occupancy
+from dew.state import TrainState, occupied
 from dew.telemetry.profile import Profiler, region
 from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Counted
@@ -473,7 +473,7 @@ class FitRun:
         rejected microbatch's window included; none crossed otherwise."""
         if not any(interval.consumed_committed < point <= interval.consumed for point in points):
             return 0, 0
-        if int(jnp.max(occupancy(state.window))):
+        if occupied(state.window):
             return 0, 0
         crossed = interval.consumed, interval.consumed_committed
         interval.consumed_committed = interval.consumed

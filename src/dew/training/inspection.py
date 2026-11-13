@@ -25,7 +25,7 @@ from dew.distributed.batches import split_fields
 from dew.nn.inspection import Watched, statistics
 from dew.nn.sharding import layers_of
 from dew.optim import parameter_name
-from dew.state import occupancy
+from dew.state import occupied
 
 if TYPE_CHECKING:
     from dew.batch import Batch
@@ -185,7 +185,7 @@ def inspected[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
         # split's parts of it, a rejected part's place too: the window's rest, rounded up, in calls.
         split = window // trainer.accumulation
         committed = None
-        for _ in range(-(-(window - int(jnp.max(occupancy(state.window)))) // split)):
+        for _ in range(-(-(window - occupied(state.window)) // split)):
             state, *_, committed = step(state, batch, sampled=True)
     if committed is None or committed.inspected is None or not int(committed.count):
         raise ValueError("the sampled window did not commit over this batch (a part of it rejected, its "
