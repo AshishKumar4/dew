@@ -500,7 +500,9 @@ def test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100
     def decode(query, key_pool, value_pool, table):
         return attention_decode.attend(query, key_pool, value_pool, spans, table=table)
 
-    assert "mosaic_gpu" in lowered_for(decode, (query, pool, pool, table), "sm90").compile().as_text()
+    # The Mosaic kernels the executable itself carries (`report.binaries`): a launch compiled, none spilling.
+    found = report.binaries(lowered_for(decode, (query, pool, pool, table), "sm90").compile())
+    assert found and all(binary.frame == 0 for binary in found), found
 
 
 @pytest.mark.parametrize("slices", [1, 3, 7])
