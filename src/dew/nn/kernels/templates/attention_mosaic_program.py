@@ -874,8 +874,25 @@ def placed_draws(drop: Dropout | None, queries: int, keys: int) -> Dropout | Non
     return dataclasses.replace(drop, queries=padded(drop.queries, queries), keys=padded(drop.keys, keys))
 
 
+def held_params(family: mosaic.Family, refs: tuple, params: tuple, row, head, first, queries: int) -> tuple:
+    """A query tile's score-hook parameters its walk holds across its steps, read once before it (the spec's
+    hook operands, a query tile's once: kernel-templates.md's hooks' section), each step taking them
+    (`_param`'s `held`): a HEAD's scalar and a QUERY's vector of the tile's `queries` from `first` in the
+    accumulator's row layout; None for a KEY's and a TILE's, which each step reads at its keys."""
+    def held(ref, kind):
+        if kind is Kind.HEAD:
+            return ref[head]
+        if kind is not Kind.QUERY:
+            return None
+        shared_row, shared_head = shared_place(ref.shape, row, head)
+        places = {"batch": shared_row, "heads": shared_head, "queries": pl.ds(first, queries)}
+        return family.rows_of(ref.at[axes.placed(kind.axes, places)])
+
+    return tuple(held(ref, param.kind) for ref, param in zip(refs, params, strict=True))
+
+
 def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_first=None, *,
-           keys_first: bool = False):
+           keys_first: bool = False, held=None):
     """A hook parameter's values for a tile `like` of queries from `first` (and keys from `k_first`, a score
     tile's), as `kind` lays them out: the head's scalar, else the tile's entries (a score tile's `[bq, bk]`,
     an output tile's `[bq, Dv]`) in the accumulator's layout, its queries' and keys' broadcast. A score hook
@@ -884,8 +901,11 @@ def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_fir
     operation takes (jax 0.11.2's layout inference finds none for a `[64, 1]` or `[1, 64]` array's convert or
     compare, a lowering probe for an H100), so a hook that reshapes or indexes an axis fails to lower here,
     never silently; a pointwise hook is the same function of either. A score tile whose rows are its keys
-    (`keys_first`, `[bk, bq]`) reads a tile parameter's entries from its keys-first copy `[B, H, Kp, Qp]`."""
+    (`keys_first`, `[bk, bq]`) reads a tile parameter's entries from its keys-first copy `[B, H, Kp, Qp]`. A
+    walk's `held` value of it (`held_params`), where it holds one, is the tile's, a QUERY's broadcast."""
     queries, keys = like.shape[::-1] if keys_first else like.shape
+    if held is not None:
+        return held if kind is Kind.HEAD else algebra.expand(held, like)
     if kind is Kind.HEAD:
         return ref[head]
     if kind is not Kind.OUTPUT:
@@ -1408,7 +1428,7 @@ def _fused_held(logits: tuple, dtype, *, dropped: bool) -> list:
 
 
 def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple, *, grads: str | None = None,
-               keys_first: bool = False) -> tuple[list, int]:
+               keys_first: bool = False, held: bool = False) -> tuple[list, int]:
     """A step's score-hook parameters (`params`, each its `Kind` and dtype), live beside its logits: a
     TILE's `[bq, bk]` tile, a KEY's vector in the accumulator's column layout and a QUERY's in its row
     layout (`Family.column_registers`, `row_registers`); a HEAD's scalar no tile; each in the dtype its kernel
@@ -1418,8 +1438,9 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
     slope, formed in their place and stored, no tile beside them (an A100's dK/dV under a tile bias at
     64 x 64, width 64: 255 registers unspilled and none spilled at a cap of 247, where its tile beside them
     priced 280). A `keys_first` step's
-    tile lays its keys along its rows, so a KEY's vector is in the row layout and a QUERY's in the column.
-    Returns the step's tiles and the vectors' registers."""
+    tile lays its keys along its rows, so a KEY's vector is in the row layout and a QUERY's in the column. A
+    walk that holds a QUERY's vector across its steps (`held`, `held_params`) prices it apart
+    (`_held_registers`). Returns the step's tiles and the vectors' registers."""
     keys, queries = ((family.row_registers, family.column_registers) if keys_first
                      else (family.column_registers, family.row_registers))
     step, vectors = [], 0
@@ -1428,9 +1449,17 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
             step.append((block_q, block_k, dtype))
         elif kind is Kind.KEY:
             vectors += keys(block_k, dtype) + (keys(block_k, jnp.float32) if grads == "keys" else 0)
-        elif kind is Kind.QUERY:
+        elif kind is Kind.QUERY and not held:
             vectors += queries(block_q, dtype) + (queries(block_q, jnp.float32) if grads == "queries" else 0)
     return step, vectors
+
+
+def _held_registers(family: mosaic.Family, block_q: int, params: tuple, *, residuals: bool = False) -> int:
+    """The registers a forward walk holds across its steps in the accumulator's row layout: its query tile's
+    score-hook parameters (`held_params`, a QUERY's vector in the dtype its kernel loads it) and, a training
+    walk's (`residuals`), its per-query rows (`TRAINING_ROWS`)."""
+    rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0
+    return rows + sum(family.row_registers(block_q, dtype) for kind, dtype in params if kind is Kind.QUERY)
 
 
 PREDICATE_REGISTERS = 7
@@ -1488,17 +1517,19 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     under a softcap at 64 x 64, ptxas 255 unspilled where three fp32 tiles priced 260; the IR's breadth-first
     live set holds the third, ET-HOOKBREAK); a training walk's then its power's integral part built in bits,
     two int32 tiles beside its weights (ET-HOOKBREAK: a natural training walk 174 at width 64, its fold's
-    110 and 64 int32). A score hook's parameters are live beside the logits it reads (`_hook_live`), a phase
-    of their own: the hook adds them into its logits, dead past it (ET-PINFWD: key-bias and tile-bias at
-    64 x 64 on two consumers, width 64, ptxas 168 unspilled where they priced beside the weights 180 and
-    196). Where its family reads operands from registers, its products' fragments beside their tiles
-    (`_products`): the logits' product of `width`-deep queries and keys, and the values' product of the
-    weights. A key tile whose indices do not fold holds its masks' places (`_mask_places`). An fp32 call's
-    `parts` (`MosaicForward.parts`) issue its logits' products' terms into one accumulator and form its
-    weights' parts one at a time from its fp32 weights, held whole across them, its remainder fp32 and the
-    part in the operands' dtype beside them (`attention_mosaic_forward._parted_products`: priced as 16-bit
-    weights, the fp32 forward at 64 x 64 on three consumers, width 64, counted 100 where ptxas needed 152,
-    and spilled 16 bytes at the 128 three consumers leave, et-fp32model). A `scaled` walk's
+    110 and 64 int32). A score hook's key and tile parameters are live beside the logits it reads
+    (`_hook_live`), a phase of their own: the hook adds them into its logits, dead past it (ET-PINFWD:
+    key-bias and tile-bias at 64 x 64 on two consumers, width 64, ptxas 168 unspilled where they priced
+    beside the weights 180 and 196); a query's vector the walk reads once before its steps, held beside every
+    phase (`held_params`, `_held_registers`). Where its family reads operands from registers, its products'
+    fragments beside their tiles (`_products`): the logits' product of `width`-deep queries and keys, and the
+    values' product of the weights. A key tile whose indices do not fold holds its masks' places
+    (`_mask_places`). An fp32 call's `parts` (`MosaicForward.parts`) issue its logits' products' terms into
+    one accumulator and form its weights' parts one at a time from its fp32 weights, held whole across
+    them, its remainder fp32 and the part in the operands' dtype beside them
+    (`attention_mosaic_forward._parted_products`: priced as 16-bit weights, the fp32 forward at 64 x 64 on
+    three consumers, width 64, counted 100 where ptxas needed 152, and spilled 16 bytes at the 128 three
+    consumers leave, et-fp32model). A `scaled` walk's
     (`MosaicForward.scales_in_kernel`) holds beside its step its weights at the scale and its small weights
     raised, fp32, the small ones' parts, and a part's product's own accumulator `[bq, Dv]` fp32
     (`algebra.at_scale`, `attention_mosaic_forward._accumulated`): priced as one fp32 tile and the
@@ -1513,13 +1544,11 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     A100's at width 128 spilled 128 bytes at 255).
     """
     block_q, block_k = tiles.block_q, tiles.block_k
-    hooked, vectors = _hook_live(family, block_q, block_k, params)
+    hooked, vectors = _hook_live(family, block_q, block_k, params, held=True)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)
-    step = [logits, weights, *([weights] if residuals else [])]
-    if parts > 1:
-        # Its weights fp32, their remainder fp32 and the part taken from it (`_parted_products`).
-        step = [logits, logits, logits, weights, *([weights] if residuals else [])]
+    # An fp32 call's weights fp32, their remainder fp32 and the part taken (`_parted_products`).
+    step = [logits] * (3 if parts > 1 else 1) + [weights] * (2 if residuals else 1)
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
         if family.operands_in_registers:
@@ -1576,8 +1605,8 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
         if residuals:
             phases.append([logits, weights, weights, bits, bits])
     if scopes_products(family):
-        sums = (block_q, value_width, jnp.float32)
-        phases = _read_back(phases, logits, sums, parted=parts > 1 and not scaled)
+        phases = _read_back(phases, logits, (block_q, value_width, jnp.float32),
+                            parted=parts > 1 and not scaled)
     depth = value_width if width is None else width
     products = _products(
         family, dtype,
@@ -1588,9 +1617,8 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
     if codes:
         phases += _converted(block_k, value_width if width is None else width, value_width)
-    # A training walk's per-query rows (`TRAINING_ROWS`), in the accumulator's row layout.
-    rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0
-    walked = max(resources.live_registers(family, carried, *phases, *products), scored) + rows
+    walked = (max(resources.live_registers(family, carried, *phases, *products), scored)
+              + _held_registers(family, block_q, params, residuals=residuals))
     return max(walked, _reach_registers(family, block_q, positions, per_span)) if positions else walked
 
 
@@ -1627,7 +1655,7 @@ def peaks_registers(family: mosaic.Family, tiles: Tiles, dtype, *, params: tuple
     tcgen05's read back beside their conversion (one priced, an H100's and a B200's at 64 x 64 width 64 37
     registers where ptxas needed 64 to 72, et-parity-u)."""
     block_q, block_k = tiles.block_q, tiles.block_k
-    hooked, vectors = _hook_live(family, block_q, block_k, params)
+    hooked, vectors = _hook_live(family, block_q, block_k, params, held=True)
     logits = (block_q, block_k, jnp.float32)
     # A product read back from tensor memory, converted to the walk's layout and reduced, each live at once
     # (tcgen05's chunks: two priced, a B200's peak walk at 64 x 64, width 128, priced 69 where ptxas needed
@@ -1640,7 +1668,8 @@ def peaks_registers(family: mosaic.Family, tiles: Tiles, dtype, *, params: tuple
         narrow=tiles.narrow, lhs_swizzle=query_swizzle(family))
     carried = [(block_q, 1, jnp.float32)]
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
-    return max(resources.live_registers(family, carried, step, *products), scored)
+    return (max(resources.live_registers(family, carried, step, *products), scored)
+            + _held_registers(family, block_q, params))
 
 
 @dataclasses.dataclass(frozen=True)

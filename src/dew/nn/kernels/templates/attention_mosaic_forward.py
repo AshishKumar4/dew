@@ -63,6 +63,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _views_of,
     approximate,
     bundle_of,
+    held_params,
     hook_reduces,
     issued_into,
     issued_pairs,
@@ -831,7 +832,7 @@ class _Codes(NamedTuple):
 
 
 def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, spans: _Spans | None,
-            hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool,
+            hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool, params_held: tuple,
             held: tuple | None = None, product: Callable[[], jax.Array] | None = None,
             interpret: bool = False, codes: _Codes | None = None, training: bool = False,
             first_at: Callable | None = None) -> tuple:
@@ -845,7 +846,7 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     walks' query places (`training`: its peak walk's and its anchored one's), where its hook reads them, are
     in the accumulator's layout (`Family.as_tile`): a hook's term of a slice of them (a row-indexed one's
     `q_pos[:, :1]`) found no layout on mma.sync, whose reductions' inference offers no accumulator layout (row
-    5279)."""
+    5279). The hook's parameters the walk holds (`params_held`, `held_params`) are the tile's as they are."""
     row, head = place
     family, tiles = program.family, program.tiles
     shape = (tiles.block_q, tiles.block_k)
@@ -881,8 +882,8 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
                      draw=None if hooked.drop is None else hooked.drop.draw(row, head), held=held)
     if training and score_places(hooks)[0]:
         coords = coords._replace(q_pos=family.as_tile(coords.q_pos))
-    params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first)
-                   for ref, param in zip(hooked.score, hooks.score_params, strict=True))
+    params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first, held=kept)
+                   for ref, param, kept in zip(hooked.score, hooks.score_params, params_held, strict=True))
     logits, products = algebra.logits_of(spec, s, coords, params, masked=jnp.logical_not(whole(index)))
     return k_first, coords, logits, products
 
@@ -1004,12 +1005,15 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # as many arrivals as the others at any count of consumers (three take one fewer than the first and
     # second, and its partners' last turn waited forever: the interpreted hang of row 4840).
     pl.when(consumer > 0)(turn)
-    # The queries' intervals and ids read once, before the walk (`_query_bounds`).
+    # The queries' intervals and ids, and the score hook's parameters of the query tile, read once, before
+    # the walk (`_query_bounds`, `held_params`).
     held = None if spans is None else program.bounds(first, spans, row)
+    params_held = held_params(family, hooked.score, hooks.score_params, row, head, first, tiles.block_q)
 
     def scored(index, slots, product=None):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
-                       hooks=hooks, drawn=hooked.drop is not None, held=held, product=product,
+                       hooks=hooks, drawn=hooked.drop is not None, held=held, params_held=params_held,
+                       product=product,
                        interpret=interpret, codes=codes, training=training,
                        first_at=(first_at if family.in_flight and family.retires_register_products
                                  else None))
@@ -1365,12 +1369,14 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, s
     # Every consumer but the first a turn ahead, as `_consumer`'s.
     pl.when(consumer > 0)(turn)
     held = None if spans is None else program.bounds(first, spans, place[0])
+    row, head = place[:2]
+    params_held = held_params(family, hooked.score, hooks.score_params, row, head, first, tiles.block_q)
 
     def step(index, slots, arg, accumulators):
         # The peak walk's logits draw no dropout.
         _, coords, logits, _ = _scored(program, spec, q, index, slots, first, spans, hooked, place[:2], whole,
-                                       turn, hooks=hooks, drawn=False, held=held, interpret=interpret,
-                                       training=True)
+                                       turn, hooks=hooks, drawn=False, held=held, params_held=params_held,
+                                       interpret=interpret, training=True)
         # The partner's turn, as a training step's value product would take it.
         turn(wait=False)
         turn(arrive=False)
