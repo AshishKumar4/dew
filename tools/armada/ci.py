@@ -2281,35 +2281,11 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
         aside = {node for row_ in held for node in row_.get("whole_suite", [])} - observed.keys()
         own = {node: seconds for node, seconds in kept.items() if node.split("::")[0] == name
                and session.site_name(node, marked) not in marked and node not in aside}
-        if stale(own, observed, sum(row_["seconds"] for row_ in held), max(counts, default=1), target):
+        took = sum(row_["seconds"] for row_ in held)
+        if cuts.stale(session, own, observed, took, max(counts, default=1), target):
             kept = {node: seconds for node, seconds in kept.items() if node not in own}
             kept.update({node: round(seconds, 3) for node, seconds in observed.items()})
     return dict(sorted(kept.items()))
-
-
-def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut: int, target: float) -> bool:
-    """Whether a file's record `own` no longer cuts it as it runs: its tests differ from those its rows
-    `observed` (one added, removed or renamed); a file within `target` (it took `seconds`), or one with no
-    tests to cut, is recorded past it, so the plan would split what runs whole; or, for a file past it (as
-    `cut` groups), the groups the plan cuts from the record (`cuts.split`) run a group past `session.KEPT` of
-    the target as its tests ran, setup included, and those it would cut from what they took run their
-    heaviest shorter. A cut that fits is kept whatever its tests' times drift, as the plan keeps it, and so
-    is one whose heaviest group no cut shortens (a test heavier than the budget, which runs alone either
-    way): a fold rewrites a file only where its plan changes for the better."""
-    if own.keys() != observed.keys():
-        return True
-    if seconds <= target or not own:
-        return sum(own.values()) > target
-    nodes = sorted(own)
-    recorded = session.unit_seconds(nodes, [own[node] for node in nodes])
-    ran = session.unit_seconds(nodes, [observed[node] for node in nodes])
-    setup = max(seconds - sum(ran), 0.0) / cut
-
-    def heaviest(weights: list[float]) -> float:
-        count = len(cuts.split(session, weights, seconds, target, cut))
-        return max(sum(ran[run.start:run.stop]) + setup for run in session.groups(weights, count) if run)
-
-    return heaviest(recorded) > session.KEPT * target and heaviest(ran) < heaviest(recorded)
 
 
 ARTIFACTS = "/armada/task/artifacts"

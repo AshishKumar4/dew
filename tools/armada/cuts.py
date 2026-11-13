@@ -136,3 +136,29 @@ def refolded(session, stored: Mapping[str, list[str]], runs: Mapping[str, list[f
             if all(groups):
                 kept[name] = [group[0] for group in groups[1:]]
     return kept
+
+
+def stale(session, own: dict[str, float], observed: dict[str, float], seconds: float, cut: int,
+          target: float) -> bool:
+    """Whether a file's record `own` no longer cuts it as it runs: its tests differ from those its rows
+    `observed` (one added, removed or renamed); a file within `target` (it took `seconds`), or one with no
+    tests to cut, is recorded past it, so the plan would split what runs whole; or, for a file past it (as
+    `cut` groups), the groups the plan cuts from the record (`split`) run a group past `session.KEPT` of
+    the target as its tests ran, setup included, and those it would cut from what they took run their
+    heaviest shorter. A cut that fits is kept whatever its tests' times drift, as the plan keeps it, and so
+    is one whose heaviest group no cut shortens (a test heavier than the budget, which runs alone either
+    way): a fold rewrites a file only where its plan changes for the better."""
+    if own.keys() != observed.keys():
+        return True
+    if seconds <= target or not own:
+        return sum(own.values()) > target
+    nodes = sorted(own)
+    recorded = session.unit_seconds(nodes, [own[node] for node in nodes])
+    ran = session.unit_seconds(nodes, [observed[node] for node in nodes])
+    setup = max(seconds - sum(ran), 0.0) / cut
+
+    def heaviest(weights: list[float]) -> float:
+        count = len(split(session, weights, seconds, target, cut))
+        return max(sum(ran[run.start:run.stop]) + setup for run in session.groups(weights, count) if run)
+
+    return heaviest(recorded) > session.KEPT * target and heaviest(ran) < heaviest(recorded)
