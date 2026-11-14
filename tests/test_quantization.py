@@ -988,7 +988,7 @@ armada."""
 
 def test_an_objective_over_a_quantized_packed_task_holds_the_canonical_tree():
     """A task's tree quantized for serving holds its projections packed; an objective built over it, a
-    distillation teacher's, holds the model's canonical tree (`dew.inference.projections.unpacked`), each
+    distillation teacher's, holds the model's canonical tree (`dew.nn.projections.unpacked`), each
     member the packed kernel's columns quantized as they were (`split_columns`), and computes logits on
     par (check 1) with the served task's over drawn prompts, from the quantized model's own float64
     value: the unquantized model in float64 over the served packed weights dequantized exactly. A

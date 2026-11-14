@@ -1652,7 +1652,7 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
 
 def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -> Variables:
     """A task's weights with its backbone's projections packed as a served decoder's are, each
-    group's input quantization moved with it (`dew.inference.projections`): the one layout a task holds
+    group's input quantization moved with it (`dew.nn.projections`): the one layout a task holds
     whatever its source stored, a run's packed or an export's apart, so its loads compute one program
     (ledger 2299). Weights it owns (`owned`, a load's) pack in place, their members freed
     (`packed_owned`); a bundle's borrowed ones (`Decide.of`) into a new tree that leaves the bundle's
@@ -1660,7 +1660,7 @@ def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -
     its whole tree's groups, each frozen where all its members were (ledger 2439). An adapter binds
     and an export writes the model's own tree (`unpacked`)."""
     from dew.batch import part
-    from dew.inference.projections import inference_projections, packed_owned
+    from dew.nn.projections import inference_projections, packed_owned
 
     pack = packed_owned if owned else inference_projections
     return joined({"backbone": pack(model.backbone, part(variables, "backbone")),
@@ -1673,7 +1673,7 @@ def trained_tree(model: DecisionModel, variables: Variables) -> Variables:
     one tree wherever it runs: a trunk held frozen splits back frozen (ledger 2439). A task that holds
     no weights (a scoring task's, `Decide.scoring`) has none to split."""
     from dew.batch import FROZEN, part
-    from dew.inference.projections import unpacked
+    from dew.nn.projections import unpacked
 
     backbone = part(variables, "backbone")
     if "params" not in backbone and FROZEN not in backbone:

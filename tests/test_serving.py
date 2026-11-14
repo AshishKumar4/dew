@@ -292,7 +292,7 @@ def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
     """Serving holds the same weight bytes; reloading casts and repacks the trained tree."""
     from flax.core import freeze
 
-    from dew.inference.projections import inference_projections
+    from dew.nn.projections import inference_projections
 
     bound = task(Sampling(temperature=0, eos_token_ids=None))
     source = jax.tree.map(np.asarray, bound.variables)
@@ -336,7 +336,7 @@ def test_inference_projection_layout_preserves_special_attention_logits(case):
     weights and tokens."""
     from model_support import float64_twin
 
-    from dew.inference.projections import inference_projections
+    from dew.nn.projections import inference_projections
 
     model = CausalTransformer(
         vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=1, head_dim=8,
@@ -428,7 +428,7 @@ def test_host_task_and_server_preserve_nonzero_lora_branches():
 
 def test_reload_normalizes_source_precision_before_concatenating_projections():
     """A float64 value just above an FP16 midpoint must not double-round through FP32."""
-    from dew.inference.projections import inference_projections
+    from dew.nn.projections import inference_projections
 
     bound = task(Sampling(temperature=0, eos_token_ids=None))
     source = jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float16), bound.variables)
@@ -2031,7 +2031,7 @@ def test_a_user_decoder_module_is_packed_where_it_names_its_groups():
     at their paths in its variables: a user's module around a decoder that
     names the decoder's is packed, draws what the unpacked weights draw, and
     is served and reloaded from them; one that names none keeps its layout."""
-    from dew.inference.projections import inference_projections
+    from dew.nn.projections import inference_projections
 
     bound = task(Sampling(temperature=0, eos_token_ids=None))
     answering = wrapped(AnsweringDecoder, bound.model, bound.variables, bound.sampling, bound.processor)
@@ -2061,7 +2061,7 @@ def test_a_tree_split_for_training_packs_as_its_whole_tree_and_splits_back_as_it
     split, so a model reads the same tree whatever its layers' membership; split, it is the tree it was,
     each member in its own collection; and a server of it reloads its unsplit source weights."""
     from dew.batch import PACKED_FROZEN, freeze, thaw
-    from dew.inference.projections import inference_projections, packed_owned, unpacked
+    from dew.nn.projections import inference_projections, packed_owned, unpacked
 
     model = decoder().clone(num_layers=2, max_seq_len=128)
     whole = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
@@ -2091,7 +2091,7 @@ def test_a_projection_quantized_apart_from_its_group_is_served_unpacked():
     and packs its gate and up projections, which no pattern selects: a server draws what the task
     draws on its own. Packed, the query was served as `qkv_proj`, which the pattern does not
     select, so unquantized."""
-    from dew.inference.projections import projection_groups
+    from dew.nn.projections import projection_groups
     from dew.quantization import Quantization
 
     bound = task(Sampling(temperature=0, eos_token_ids=None))

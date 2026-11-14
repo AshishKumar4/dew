@@ -1008,10 +1008,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         The constructor keeps the model as `model`, the module the objective
         trains, which `program_key` names by default. A loaded task's tree, its
         projections packed for serving, is held as the model's own tree
-        (`dew.inference.projections.unpacked`), and a tree of Flax `FrozenDict`s
+        (`dew.nn.projections.unpacked`), and a tree of Flax `FrozenDict`s
         (a loaded task's) as dicts (`dew.batch.dicts`).
         """
-        from dew.inference.projections import unpacked
+        from dew.nn.projections import unpacked
 
         # What the source drew fresh beside the weights it loaded, none where other variables replace them.
         self._fresh = ()

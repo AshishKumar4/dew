@@ -61,11 +61,11 @@ from dew.objectives.base import (
 )
 from dew.objectives.routing import refuse_fixed_routers
 from dew.optim import clips_qk, stepped
-from dew.state import Accumulation, TrainState, apart, occupancy, together
+from dew.state import Accumulation, TokenCount, TrainState, apart, occupancy, together
 from dew.training.compiled_program import gradients_read
 from dew.training.distributed import microbatch
 from dew.training.inspection import Inspection, Summaries, stacked, summaries
-from dew.training.model_flops import _TokenCount, step_counts
+from dew.training.model_flops import step_counts
 from dew.training.narrow import forward_variables, narrowed
 from dew.training.staging import fetched, in_device, staged
 
@@ -1073,7 +1073,7 @@ class Transaction:
         def retain(acc):
             acc = dataclasses.replace(acc, fill=occupancy(acc) + 1)
             if acc.tokens is not None:
-                acc = dataclasses.replace(acc, tokens=_TokenCount.add(acc.tokens, read))
+                acc = dataclasses.replace(acc, tokens=TokenCount.add(acc.tokens, read))
             if not self.shared:
                 acc = dataclasses.replace(
                     acc,
@@ -1150,7 +1150,7 @@ class Transaction:
         # The microbatch's real tokens (`tokens`, two uint32 words), which its window's commit trains on,
         # the window's accepted ones before it too.
         read = tokens
-        held = read if previous is None or previous.tokens is None else _TokenCount.add(previous.tokens, read)
+        held = read if previous is None or previous.tokens is None else TokenCount.add(previous.tokens, read)
         if self.size == 1:
             committed, inspected, native_finite, norm = commit(numerical)
             numerical = _chosen(due, committed, numerical)
@@ -1190,7 +1190,7 @@ class Transaction:
         counted = due & accepted & done
         if state.deferred is not None:
             taken = input_taken(state.opt_state, advanced.opt_state)
-            held = _TokenCount.add(state.deferred, jnp.where(taken, held, 0).astype(jnp.uint32))
+            held = TokenCount.add(state.deferred, jnp.where(taken, held, 0).astype(jnp.uint32))
             waiting = jnp.where(due & accepted & ~done, held, jnp.where(counted, 0, state.deferred))
             advanced = dataclasses.replace(advanced, deferred=waiting.astype(jnp.uint32))
         return advanced, loss, aux, Committed(

@@ -89,18 +89,19 @@ def test_a_commit_counts_the_tokens_of_its_windows_microbatches_alone():
     with it (`dropped_window`): the next window, the third and fourth microbatches, commits, and its
     update trained on their tokens alone, which its commit reports (`Committed.tokens`), the dropped
     window's never, and nothing before the commit."""
-    from dew.training.model_flops import TOKENS, _TokenCount
+    from dew.state import TokenCount
+    from dew.training.model_flops import TOKENS
 
     train = trainer()
     rows = 2 * jax.device_count()
-    data = [{**batch, TOKENS: _TokenCount.words(np.full(rows, tokens))}
+    data = [{**batch, TOKENS: TokenCount.words(np.full(rows, tokens))}
             for batch, tokens in zip(batches(), (3, 5, 7, 11), strict=True)]
     state = train.initial_state()
     run = train.compile(state, data[0])
     reported = []
     for batch in data:
         state, _, _, _, accepted, committed = run(state, batch)
-        reported.append((bool(accepted), _TokenCount.host(jax.device_get(committed.tokens))))
+        reported.append((bool(accepted), TokenCount.host(jax.device_get(committed.tokens))))
     assert reported == [(True, 0), (False, 0), (True, 0), (True, (7 + 11) * rows)]
 
 

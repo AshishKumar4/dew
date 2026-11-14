@@ -18,8 +18,8 @@ from dew.data.dataset import Loader
 from dew.data.pipeline import Pipeline
 from dew.diffusion import schedules, transforms
 from dew.diffusion.process import Process
-from dew.inference.projections import unpacked
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.projections import unpacked
 from dew.objectives.lm import LMObjective
 from dew.registry import ModelConfig, from_record, to_record
 from dew.training import Trainer

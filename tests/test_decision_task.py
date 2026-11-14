@@ -716,8 +716,8 @@ def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(deci
     adapter."""
     from dew.batch import part
     from dew.decision.model import DecisionModel
-    from dew.inference.projections import unpacked
     from dew.lora import LoRA
+    from dew.nn.projections import unpacked
     from dew.objectives.base import joined
 
     # An adapter binds the model's own tree, the projections a served task packs split back.
