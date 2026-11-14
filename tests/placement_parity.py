@@ -16,15 +16,17 @@ def x64() -> bool:
 
 
 def widened_start(trainer) -> object:
-    """`trainer`'s start placed, and in float64 (`x64`) the float32 run's own start, every floating leaf
-    widened: a float64 truth steps the arms' start, where the objective's float literals would be drawn
-    anew in float64."""
+    """`trainer`'s start placed, and in float64 (`x64`) the float32 run's own start, drawn by `trainer`
+    narrow, every floating leaf widened as a float64 truth holds it (`arm_arithmetic.float64_held`): a
+    float64 truth steps the arms' start, where the objective's float literals would be drawn anew in
+    float64."""
+    from arm_arithmetic import float64_held
+
     if not x64():
         return trainer.place()[0]
     with jax.enable_x64(new_val=False):
         start = trainer.place()[0]
-    return jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
-                        else leaf, start)
+    return float64_held(start)
 
 
 def floats(state) -> dict[str, np.ndarray]:
