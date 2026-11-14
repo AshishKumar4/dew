@@ -61,7 +61,10 @@ import importlib
 import io
 import json
 import os
+import signal
+import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -79,6 +82,7 @@ from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.selection import Unlowerable
 from dew.registry import models
 from dew.telemetry.benchmark import carried
+from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
 from dew.telemetry.profile import Profiler
 from dew.telemetry.trace import communication_totals, device_events, window_split
 from dew.training import Trainer
@@ -399,6 +403,113 @@ def ahead_name(case: Case) -> str:
     return f"{hashlib.sha256(cases_to_json([case]).encode()).hexdigest()[:16]}.dew-aot"
 
 
+WINDOW_PARTS = 6
+"""How many parts a timed window is cut into, each closed by one wait (`window_parts`)."""
+
+
+def window_parts(steps: int) -> list[int]:
+    """`steps` cut into at most `WINDOW_PARTS` parts of as near equal sizes, the larger first, none empty."""
+    count = min(WINDOW_PARTS, steps)
+    return [steps // count + (index < steps % count) for index in range(count)]
+
+
+GPU_IDLE = 0x1
+"""nvidia-smi's clocks_event_reasons bit for a GPU with nothing to run (`DeviceSampler.summary` masks it)."""
+
+
+class DeviceSampler:
+    """Each GPU sampled by nvidia-smi every `PERIOD_MS` while the context is open (its SM clock, power
+    draw, temperature and active clock event reasons), so a window's GPU is read under its load and not at
+    the idle moments before or after it; nothing sampled on a host without nvidia-smi. Its process runs on
+    the host's CPU and touches no timed work."""
+
+    PERIOD_MS = 250
+    FIELDS = ("sm_mhz", "power_w", "temperature_c", "event_reasons")
+
+    def __enter__(self) -> "DeviceSampler":
+        try:
+            self.process = subprocess.Popen(
+                ["nvidia-smi",
+                 "--query-gpu=index,clocks.sm,power.draw,temperature.gpu,clocks_event_reasons.active",
+                 "--format=csv,noheader,nounits", f"-lms={self.PERIOD_MS}"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            self.process = None
+        self.lines = ""
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self.process is not None:
+            # SIGINT, as a user's Ctrl-C ends nvidia-smi's loop: it flushes what it sampled before it exits.
+            self.process.send_signal(signal.SIGINT)
+            self.lines, _ = self.process.communicate(timeout=30)
+
+    def summary(self) -> dict[str, dict[str, object]] | None:
+        """Each GPU's samples: their count, the least and greatest of each reading, and every clock
+        event reason any sample held (nvidia-smi's bitmask, or'd); None where nothing was sampled."""
+        gpus: dict[str, list[list[str]]] = {}
+        for line in self.lines.splitlines():
+            index, *values = (value.strip() for value in line.split(","))
+            if len(values) == len(self.FIELDS):
+                gpus.setdefault(index, []).append(values)
+        if not gpus:
+            return None
+
+        def span(rows: list[list[str]], column: int) -> list[float] | None:
+            numbers = [float(row[column]) for row in rows if row[column].replace(".", "", 1).isdigit()]
+            return [min(numbers), max(numbers)] if numbers else None
+
+        # GpuIdle (0x1) said by a sample taken between steps is no reason the clock was held down.
+        def reasons(rows: list[list[str]]) -> str:
+            held = 0
+            for row in rows:
+                held |= int(row[3], 16) & ~GPU_IDLE if row[3].startswith("0x") else 0
+            return hex(held)
+
+        return {index: {"samples": len(rows),
+                        **{name: span(rows, column) for column, name in enumerate(self.FIELDS[:3])},
+                        "event_reasons": reasons(rows)}
+                for index, rows in gpus.items()}
+
+
+def timed_parts(step, state, parts: list[int]):
+    """`sum(parts)` steps dispatched back to back from `state`, then each part's last loss awaited in
+    turn, the seconds from the first dispatch to each read: no wait inside the window. Returns the last
+    state, loss and finiteness, and each part's (steps, seconds)."""
+    started = time.perf_counter()
+    carry, marks = (state, None, None), []
+    for size in parts:
+        for _ in range(size):
+            carry = step(carry[0])
+        marks.append(carry[1])
+    ends = []
+    for loss in marks:
+        jax.block_until_ready(loss)
+        ends.append(time.perf_counter() - started)
+    jax.block_until_ready(carry)
+    begins = [0.0, *ends[:-1]]
+    return (*carry, [(size, end - begun) for size, end, begun in zip(parts, ends, begins, strict=True)])
+
+
+def tuning_digest() -> dict[str, object] | None:
+    """The XLA per-fusion autotuning results' directory XLA_FLAGS names
+    (--xla_gpu_per_fusion_autotune_cache_dir) as it stands at the row: its result files' count and the
+    sha256 of their names and contents. The directory is a node's, shared by its jobs, so the digest names
+    what it held then, not the picks this step alone used; None where no such directory is named."""
+    flags = os.environ.get("XLA_FLAGS", "").split()
+    option = "--xla_gpu_per_fusion_autotune_cache_dir="
+    named = [flag.removeprefix(option) for flag in flags if flag.startswith(option)]
+    if not named or not named[-1]:
+        return None
+    directory = Path(named[-1])
+    files = sorted(path for path in directory.rglob("*.textproto")
+                   if path.is_file()) if directory.is_dir() else []
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(directory)).encode() + b"\0" + path.read_bytes() + b"\0")
+    return {"directory": str(directory), "results": len(files), "sha256": digest.hexdigest()}
+
+
 def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None) -> Row:
     """Warm up, then time the compiled step over a fixed number of steps. `peaks` is each device's
     measured high-water (`measured_peak`), None in a pool."""
@@ -410,12 +521,27 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
     handed = ahead if ahead is not None and ahead.devices == jax.device_count() else None
     trainer = build_trainer(case, config.attention_impl, ahead=handed)
 
+    count_compilation_cache()
+    hits = compilation_cache_counts().get("train/cache_hits", 0.0)
     with compiled_step(case, trainer, fixed_batch=config.fixed_batch) as compiled:
         state, step, compile_seconds = compiled.state, compiled.step, compiled.compile_seconds
+        hits = compilation_cache_counts().get("train/cache_hits", 0.0) - hits
+        # The GPUs sampled from before the warm step, so nvidia-smi's start (NVML's, up to half a second) is
+        # behind it when the window begins.
+        device_window = DeviceSampler().__enter__()
         # At least one warm step, so the first dispatch of the executable is
         # outside the timed window.
         state, loss, is_finite, _ = timed_steps(step, state, max(config.warmup, 1))
-        state, loss, is_finite, elapsed = timed_steps(step, state, config.steps)
+        # The timed window dispatched whole, as a run dispatches it, and read in parts (`WINDOW_PARTS`):
+        # each part's last loss awaited in turn once every step is dispatched, so no wait drains the device
+        # inside the window, and a window that runs slow where it starts (the device or its allocator
+        # warming) shows as a series that falls, where one running another program stays slow throughout.
+        # The GPUs sampled under the window's load (`DeviceSampler`).
+        try:
+            state, loss, is_finite, parts = timed_parts(step, state, window_parts(config.steps))
+        finally:
+            device_window.__exit__()
+        elapsed = sum(seconds for _, seconds in parts)
 
         # A second window of the same length, waiting on every step, for the
         # spread. The loop above dispatches asynchronously on purpose, as a run
@@ -477,6 +603,20 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
             # or a stronger one where the step did not fit.
             "remat": recompute_record(trainer.objective),
             "ms_per_step": round(step_time * 1e3, 3),
+            # The timed window's parts, each's ms a step in order, and every synced step's ms in order:
+            # how the step's time moves from the window's start (2026-11-14: a perf gate round's first arm
+            # read 40% slow on the very tree its others read).
+            "window_ms_series": [round(seconds / size * 1e3, 3) for size, seconds in parts],
+            "synced_ms_series": [round(seconds * 1e3, 3) for seconds in synced],
+            # The GPUs under the warm step's and the timed window's load: each one's samples' count, its
+            # SM clock, power and temperature as sampled through them, and the clock event reasons any
+            # sample held (`DeviceSampler`).
+            "device_window": device_window.summary(),
+            # JAX's persistent-cache hits while the step was compiled, its state's and other programs'
+            # among them; and the XLA autotuning results' directory as it stood at the row
+            # (`tuning_digest`).
+            "compile_cache_hits": hits,
+            "tuning": tuning_digest(),
             "p10_ms": round(float(p10), 3),
             "p50_ms": round(float(p50), 3),
             "p90_ms": round(float(p90), 3),

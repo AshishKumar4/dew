@@ -150,6 +150,13 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     assert row["finite"] and np.isfinite(row["loss"])
     assert row["measured_steps"] == 2 and row["fixed_batch"] is fixed_batch
     assert row["ms_per_step"] > 0 and row["p50_ms"] > 0
+    # The timed window's time as its parts' series, each part's steps' mean, of which ms_per_step is the mean
+    # weighted by each part's steps; every synced step's own time, which the spread reads.
+    assert len(row["window_ms_series"]) == 2 and len(row["synced_ms_series"]) == 2
+    sizes = tool.window_parts(2)
+    weighted = sum(ms * size for ms, size in zip(row["window_ms_series"], sizes, strict=True)) / sum(sizes)
+    assert row["ms_per_step"] == pytest.approx(weighted, abs=1e-3)
+    assert row["p50_ms"] == pytest.approx(float(np.median(row["synced_ms_series"])), abs=1e-3)
     try:
         counted = models.build_objective(case).training_flops(None, models.global_batch(case))
     except MissingFlopsCount:
@@ -261,3 +268,38 @@ def a_cases_measured_peak_holds_at_least_the_bytes_xla_planned(tmp_path):
     row = peak_row(tmp_path, "cuda", "--profile-dir", str(tmp_path / "traces"), "--profile-steps", "1")
     assert row["peak_device_bytes"] == row["peak_bytes_by_device"][0] >= row["planned_device_bytes"] > 0
     assert any((tmp_path / "traces/peak-run").rglob("*.xplane.pb"))
+
+
+@pytest.mark.parametrize(("steps", "parts"), [(30, [5] * 6), (2, [1, 1]), (7, [2, 1, 1, 1, 1, 1]), (1, [1])])
+def test_a_timed_window_is_cut_into_parts_that_hold_every_step(steps, parts):
+    """A timed window of `steps` is cut into at most six parts, none empty, holding every step once."""
+    assert load("benchmark_step").window_parts(steps) == parts
+
+
+def test_the_tuning_a_process_compiles_with_is_named_by_its_results_digest(tmp_path, monkeypatch):
+    """The per-fusion autotuning results XLA_FLAGS names are counted and digested by their names and contents:
+    a result added or changed changes the digest; no directory named, no digest."""
+    tool = load("benchmark_step")
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_enable_command_buffer=")
+    assert tool.tuning_digest() is None
+    monkeypatch.setenv("XLA_FLAGS", f"--xla_gpu_per_fusion_autotune_cache_dir={tmp_path}")
+    (tmp_path / "a.textproto").write_text("pick a")
+    first = tool.tuning_digest()
+    assert first["results"] == 1 and first["directory"] == str(tmp_path)
+    (tmp_path / "a.textproto").write_text("pick b")
+    changed = tool.tuning_digest()
+    (tmp_path / "b.textproto").write_text("pick c")
+    assert len({first["sha256"], changed["sha256"], tool.tuning_digest()["sha256"]}) == 3
+
+
+def test_a_device_samplers_summary_holds_each_gpus_span_and_every_clock_event_reason_any_sample_held():
+    """The GPUs sampled under a window's load summarized per GPU: the samples' count, each reading's least
+    and greatest, and the clock event reasons any sample held, or'd, GpuIdle (between steps) not among
+    them."""
+    sampler = load("benchmark_step").DeviceSampler()
+    sampler.lines = ("0, 1980, 410.5, 51, 0x0000000000000001\n0, 1755, 690.25, 58, 0x0000000000000004\n"
+                     "0, 1830, 650.0, 57, 0x0000000000000000\n")
+    assert sampler.summary() == {"0": {"samples": 3, "sm_mhz": [1755.0, 1980.0], "power_w": [410.5, 690.25],
+                                       "temperature_c": [51.0, 58.0], "event_reasons": "0x4"}}
+    sampler.lines = ""
+    assert sampler.summary() is None
