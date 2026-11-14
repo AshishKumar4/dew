@@ -17,7 +17,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, resources, swizzling
-from dew.nn.kernels.templates.recurrence.intra import intra_rows, systems
+from dew.nn.kernels.templates.recurrence.intra import _named, intra_rows, systems
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Held,
@@ -138,7 +138,8 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
                          grid_names=("chunks", "heads"), blocks=blocks, stages=(1, 2),
                          live=chunk_liveness(5), steps=steps, model=model,
                          held=_own_held(call, keys, len(products)),
-                         staging=staging, landing=landing, name="recurrence_intra_own", issues=False,
+                         staging=staging, landing=landing, name=_named("recurrence_intra_own", products),
+                         issues=False,
                          swizzles={name: resources.widest_swizzle(dtype, keys)
                                    for name, (_, dtype) in blocks.items()})(q, k, hi, lo, beta, taken)
 
