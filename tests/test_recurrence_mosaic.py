@@ -1120,13 +1120,18 @@ def _two_roles(name: str, bound, derived, family, facts, *, packed: bool, traini
     derivation gives a call whose walks fill more than a wave and `RESOURCE_SHAPES` never do: a role's
     registers are its share of the program's; none where the family's walks take one role
     (`template.walk_roles`), packed documents', a value width of an odd number of blocks, or two roles' tiles
-    past the GPU's resources for the product, a training call's where `training` (`Mosaic._staged` None)."""
+    past the GPU's resources for the product, a training call's where `training` (`Mosaic._staged` None).
+    Their launches' producers are raised past a compile's spills as the derivation's are
+    (`Mosaic._settled`), under the target whose capacities a refusal's identity reads."""
     value_width = RESOURCE_SHAPES[name][3]
     if template.walk_roles(family) < 2 or packed or value_width // derived.block_v % 2:
         return []
     two = template.MOSAIC._staged(bound, derived.block_v, facts, derived.chunk, walkers=2,
                                   wide=derived.block_o or derived.block_v, training=training)
-    return [] if two is None else [(two, 'two roles ')]
+    if two is None:
+        return []
+    with generation.assumed(facts):
+        return [(template.MOSAIC._settled(bound, two, facts), 'two roles ')]
 
 
 def _gate_call(name: str, dtype, given: list, starts, tiles, family, *, training: bool):
@@ -1225,10 +1230,12 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                 *args, tiles=tiles, family=family, target=facts, starts=starts,
                 **unwide, **_skipped(name, dtype))
         if not held or kind == 'two roles ':
-            # Forced role counts can include a launch the model refuses.
+            # Forced role counts can include a launch the model refuses: at setmaxnreg's least producer, as
+            # the template's legality judges it, a raised producer's consumers the assembler's to certify.
             # Its admitted neighbours still have to hold (`apart_failures`).
             unheld = {launch.name for launch in plans[label]
-                      if launch.registers > _model(launch, family, facts).budget}
+                      if launch.registers > _model(dataclasses.replace(launch, producer=None), family,
+                                                   facts).budget}
             if unheld:
                 apart[label] = unheld
 
@@ -1350,10 +1357,10 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
 def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blackwell(name):
     """A geometry's 16-bit training at its derived tiles, compiled for a compile-only B200 over one row of
     2048 tokens, so each persistent launch's programs walk several tiles (the gate's 256 tokens walk one): no
-    launch spills. Its producer at
-    24 registers, the walk's indices and addresses spilled once a program walked three tiles or more and
-    ptxas allocated the consumers past their live set around them (`mainloop.PERSISTENT_PRODUCER`, row 5693:
-    the 4B SSD's scores' gradient spilled 16 bytes at its 248 registers, its model 223)."""
+    launch spills, certification raising a launch's producer where it spills at setmaxnreg's least
+    (`resources.Producers`): at 24 registers, the walk's indices and addresses spilled once a program walked
+    three tiles or more and ptxas allocated the consumers past their live set around them (row 5693: the 4B
+    SSD's scores' gradient spilled 16 bytes at its 248 registers, its model 223)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -1363,15 +1370,24 @@ def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blac
     args = resource_operands(name, dtype, rows, length)
     bound = template.MOSAIC.bind(*args, None, max_segments=None, bound=None if name in RATED else 1.0,
                                  **_form(name, dtype), **_skipped(name, dtype))
-    with generation.assumed(facts):
-        tiles = template.MOSAIC.derived(bound, facts)
-        models = _models(template.MOSAIC.launches(bound, tiles, facts, backward=True), family, facts)
     # The output's and the final memory's cotangents.
     cotangents = [jax.ShapeDtypeStruct(args[2].shape, dtype),
                   jax.ShapeDtypeStruct(args[5].shape, jnp.float32)]
-    call = functools.partial(_gate_call, name, dtype, [*args, *cotangents], None, tiles, family,
-                             training=True)
-    (record,) = compile_mosaic_kernels([KernelCase(name, call, models)], 'sm100')
+    stepped = set()
+    while True:
+        # Derived as a run derives them, a launch spilling at the tiles before refused (`stepped_down`).
+        with generation.assumed(facts):
+            tiles = template.MOSAIC.derived(bound, facts)
+            models = _models(template.MOSAIC.launches(bound, tiles, facts, backward=True), family, facts)
+        call = functools.partial(_gate_call, name, dtype, [*args, *cotangents], None, tiles, family,
+                                 training=True)
+        (record,) = compile_mosaic_kernels([KernelCase(name, call, models)], 'sm100')
+        spilling = {kernel["kernel"] for kernel in record.get("kernels", ()) if kernel.get("spilled")}
+        if not spilling or tiles in stepped:
+            break
+        stepped.add(tiles)
+        with generation.assumed(facts):
+            report.refuse_launch(template.MOSAIC, bound, tiles, spilling)
     assert not mosaic_failures([record]), mosaic_failures([record])
 
 
@@ -1394,10 +1410,13 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
                                 if kernel.get("spilled") and kernel["kernel"] not in
                                 refused_kernels(record, apart.get(case.name, set()))}
                     for case, record in zip(cases, found, strict=True) if case.required}
-        spilling = {name: kernels for name, kernels in spilling.items() if kernels and name not in stepped}
+        # A case refused once at a config, and again at the config its derivation then gives (a launch's
+        # producer raised a step, `Mosaic._settled`), never twice at one.
+        spilling = {name: kernels for name, kernels in spilling.items()
+                    if kernels and (name, launched[name][1]) not in stepped}
         if not spilling:
             break
-        stepped |= set(spilling)
+        stepped |= {(name, launched[name][1]) for name in spilling}
         # Refused as the run's compile refuses them: under the target, whose capacities the launch's identity
         # reads.
         with generation.assumed(generation.gpu_target(target)):

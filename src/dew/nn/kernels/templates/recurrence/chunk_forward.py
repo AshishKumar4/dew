@@ -310,7 +310,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     # float64).
     held = given if delta or rounded else Operand(rows, product.EXACT_PARTS, jnp.dtype(jnp.float32))
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
-                interpret, generation.gpu_target(), tiles.chunk, ranged=ranged)
+                interpret, generation.gpu_target(), tiles.chunk, ranged=ranged, producers=tiles.producers)
     table = None if forked is None else tabled(forked, width, columns)
     scans = scans and (table is None or scan_holds(call, tiles, out_dtype or dtype, table))
     beta = laid(beta).reshape(rows, heads).T

@@ -774,13 +774,6 @@ class Issuer[Accumulator](abc.ABC):
         return plgpu.inline_mgpu(arg_types=(self.layout, plgpu.Layout.WG_SPLAT(())), return_type=returned)(
             shifted)(tile, jnp.asarray(shift, jnp.int32))
 
-    loads_past_floor: bool = False
-    """Whether this is an issuer on which some launches' producers hold more than `resources.producer_floor`'s
-    registers in their issue loop: each such launch states its floor where a receipt shows the need
-    (`Launch.producer`), and the compile gate holds the rest to the default (`producer_failures`, spills).
-    tcgen05's: the recurrence's states, solve and reverse walk spilled 52, 164 and 40 bytes at 24 on sm100
-    (row 5357), its other launches spill-free at 24; none of warpgroup MMA's or mma.sync's."""
-
     def entry_floor(self, tiles) -> int:
         """The least registers a thread a program issuing products into a consumer's fp32 `tiles` (each
         `(rows, columns, dtype)`, its accumulators among them) launches with (`resources.Launch.entry`). It

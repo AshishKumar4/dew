@@ -400,7 +400,6 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     chunks (`chunks`, in an epilogue's register layout, `STORED`)."""
 
     name = "tcgen05"
-    loads_past_floor = True
 
     rows = 128  # a product's rows on one CTA (tcgen05's M without a CTA pair)
 
@@ -977,7 +976,6 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
     and tcgen05's products, so interpreted it runs the same."""
 
     name = "tcgen05.chunks"
-    loads_past_floor = True
     # Mosaic GPU's tcgen05 lowering takes no TF32 operand ("Unsupported input element type: tf32",
     # jsf-gate100b): an fp32 product takes bf16 parts.
     fp8_formats = (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.float8_e5m2))

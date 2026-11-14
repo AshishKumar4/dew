@@ -46,7 +46,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     sequence_walk,
     shared_allocation,
     staging_tiles,
-    stated_producer,
     stream_blocks,
     stream_tile,
     stream_views,
@@ -469,7 +468,7 @@ def _reverse_keyed(call: Call, h) -> tuple[Operand, object]:
 
 
 def _reverse_launched(program, call: Call, tiles: Tiles, batch: int, sequences: int, *, gates: bool,
-                      skips: bool, table: Table | None, producer: int | None):
+                      skips: bool, table: Table | None):
     """`_reverse`'s `program` launched (`launch_kernel`): its outputs, its walked streams and its final
     memories' streams, a program walking `tiles.walkers` value blocks; where the walk `gates` the values,
     their stream and beta's sums, where it `skips`, the skip's sums, under a decay a key dimension the
@@ -507,7 +506,7 @@ def _reverse_launched(program, call: Call, tiles: Tiles, batch: int, sequences: 
                          grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=(1, 2),
                          steps=steps, model=2 * (2 + call.delta) * chunk * width * walked_width * steps,
                          held=table_held(_reverse_held(call, bv, gates=gates, skips=skips), call, table, bv),
-                         consumers=tiles.walkers, producer=producer,
+                         consumers=tiles.walkers,
                          live=sequence_live(8),
                          staging=(*staging_tiles(held, *dict.fromkeys(((call.block, bv), (chunk, bv)))),
                                   (plgpu.SMEM((chunk, bv), held.stored),)),
@@ -515,15 +514,6 @@ def _reverse_launched(program, call: Call, tiles: Tiles, batch: int, sequences: 
                          landing={**memory_landing(call, bv), "corrected": values.landing(chunk, bv),
                                   **final_landing, **table_landing(call, table is not None, bv)},
                          after=after)
-
-
-def _reverse_producer(call: Call) -> int | None:
-    """`_reverse`'s producer floor, the one value its plan and its walk's schedule read (`stated_producer`):
-    80, GDN's bf16 reverse walk's producer spilling 12 to 40 bytes at 24 to 64, none from 72 (row 5357,
-    jsf-pfloor-ab3 on the promotion's candidate; at 64 on its base before, jsf-pfloor-ab2), and a forked
-    call's 12 bytes at 72, none at 80 (on a B200, its PTX's decrement alone changed, armada
-    20261110174422-11220d9e)."""
-    return stated_producer(call, 80)
 
 
 @lowered_once
@@ -557,7 +547,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
     batch, chunks = dht.shape[0] // (call.heads * width), call.chunks
     final = Operand(dht.shape[0], 1, jnp.dtype(jnp.float32))
     assert gates or not skips, "the walk adds a skip where it gates the values"
-    producer = _reverse_producer(call)
+    producer = call.producer(_reverse)
     assert call.per_key == (memory is not None), "the walk takes the memories under a decay a key dimension"
     returns = 0 if table is None else 1 + (table.held > 0)
 
@@ -638,7 +628,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
     # The keys take the place of weights without the delta rule, and the keys and the prefix that of values
     # a walk gates none of: operands no step reads.
     launched = _reverse_launched(program, call, tiles, batch, sequences.shape[0], gates=gates, skips=skips,
-                                 table=table, producer=producer)(
+                                 table=table)(
         q, k, k if w is None else w, do, local, hi, lo, dht, sequences, k if v is None else v,
         hi if beta is None else beta, *(() if skip is None else (skip.astype(jnp.float32),)),
         *(() if memory is None else (memory,)), *(() if table is None else (table.loads, table.stores)))
