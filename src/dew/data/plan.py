@@ -902,7 +902,8 @@ class Plan:
                 "(from_grain(..., identity=), from_iter(..., identity=)), which an exact resume cannot "
                 "check; name it, or resume relaxed (`data_resume='relaxed'`)")
         # Its steps' identities name an encoder by the import path it has now (row 5996).
-        manifest = record(moved_paths(saved.get("manifest")), "saved data manifest")
+        manifest = record(moved_paths(json_value(saved.get("manifest"), "saved data manifest")),
+                          "saved data manifest")
         semantic = self.manifest.semantic()
         saved_steps = _identities(manifest.get("steps", []))
         # The saved order described, as this plan's is (`spelled_order`), whichever version recorded it.
