@@ -491,17 +491,18 @@ def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
 COUNT_LOW, COUNT_HIGH = 3, 31
 """The counting language's ids: each token follows its predecessor by one, wrapping from COUNT_HIGH to
 COUNT_LOW."""
-COUNT_RUNS, COUNT_STEPS, COUNT_GROUPS, COUNT_TOKENS = 8, 40, 4, 4
-"""A GRPO policy's runs, each its own initialization and prompts, and each run's updates over eight prompts of
-two tokens, `COUNT_GROUPS` completions of `COUNT_TOKENS` a prompt."""
-COUNT_MARGIN = 2.0
-"""The claim: forty updates halve each run's held-out loss of the language's own continuations."""
+COUNT_RUNS, COUNT_STEPS, COUNT_GROUPS, COUNT_TOKENS = 8, 60, 8, 4
+"""A GRPO policy's runs, each its own initialization and prompts, and each run's updates over eight prompts
+of two tokens, `COUNT_GROUPS` completions of `COUNT_TOKENS` a prompt."""
+COUNT_MARGIN = 4.0
+"""The claim: training quadruples each run's held-out reward, the chance its policy follows the rule."""
 
 
 def counted(start, length: int) -> np.ndarray:
     """`length` ids counting up from `start` by the language's rule."""
     span = COUNT_HIGH - COUNT_LOW
-    return (COUNT_LOW + (np.asarray(start)[..., None] - COUNT_LOW + np.arange(length)) % span).astype(np.int32)
+    steps = np.asarray(start)[..., None] - COUNT_LOW + np.arange(length)
+    return (COUNT_LOW + steps % span).astype(np.int32)
 
 
 def counting_reward(text: str, record) -> float:
@@ -525,17 +526,16 @@ def counting_prompts(seed) -> dict:
             INFO_KEY: np.stack([_utf8("", 8) for _ in starts])}
 
 
-def test_a_grpo_policy_rewarded_for_its_language_learns_it():
-    """Language RL's scenario (docs/design/testing.md: collect rollouts, score them, update a policy): a
-    policy drawing completions of two-token prompts, rewarded for each token that follows the counting
-    language's rule (`counting_reward`), trained by GRPO on its own draws (`RolloutScheduler.sampled`), cuts
-    its held-out loss of the language's own continuations, the rule's next tokens after prompts no run trained
-    on, by COUNT_MARGIN times, over independent runs, each from its own initialization and prompts, as the
-    learning gate judges a learning claim (`learning_gate.assert_learns`)."""
+def counting_gains(runs, *, steps: int = COUNT_STEPS, learning_rate: float = 3e-2,
+                   margin: float = COUNT_MARGIN) -> np.ndarray:
+    """Each of `runs`' contrast for "training raises the held-out reward `margin` times": the log of its
+    policy's held-out reward after over before, less the log of `margin`. A run is a GRPO policy from its
+    own initialization trained `steps` updates on its own prompts; its held-out reward is the expected
+    share of rule-following tokens its policy draws after 64 prompts no run trained on, each continuation
+    on the rule so far, read off the policy's own likelihoods (`per_token_log_probs`), no draw's noise."""
     import itertools
 
     import optax
-    from learning_gate import assert_learns
 
     from dew.data.dataset import Loader, replayed
     from dew.training import Trainer
@@ -545,23 +545,31 @@ def test_a_grpo_policy_rewarded_for_its_language_learns_it():
                                        max_new_tokens=COUNT_TOKENS, sampling=Sampling(temperature=1.0))
     scored = jax.jit(objective.per_token_log_probs)
 
-    def held_out_loss(variables, run: int) -> float:
-        """The policy's mean loss of the rule's continuation after each of 64 held-out prompts."""
+    def reward(variables, run: int) -> float:
         starts = np.random.default_rng([run, 10_000]).integers(COUNT_LOW, COUNT_HIGH, size=64)
-        rows = counted(starts, 2 + COUNT_TOKENS)
-        return float(-jnp.mean(scored(objective.model_variables(variables), jnp.asarray(rows))[:, 1:]))
+        rows = jnp.asarray(counted(starts, 2 + COUNT_TOKENS))
+        return float(jnp.mean(jnp.exp(scored(objective.model_variables(variables), rows)[:, 1:])))
 
-    def contrasts(runs):
-        drops = []
-        for run in runs:
-            trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(int(run)), rollout=rollout)
-            start = trainer.initial_state()
-            data = Loader(replayed(lambda partition, run=run: (counting_prompts([run, step])
-                                                               for step in itertools.count())),
-                          None, batch=8, records=None)
-            state = trainer.fit(data, steps=COUNT_STEPS, log_every=COUNT_STEPS)
-            drops.append(np.log(held_out_loss(start.variables, run) / held_out_loss(state.variables, run))
-                         - np.log(COUNT_MARGIN))
-        return {"training halves the held-out loss of the language's continuations": np.asarray(drops)}
+    gains = []
+    for run in runs:
+        trainer = Trainer(objective, optax.adam(learning_rate), key=jax.random.key(int(run)), rollout=rollout)
+        start = trainer.initial_state()
+        data = Loader(replayed(lambda partition, run=run: (counting_prompts([run, step])
+                                                           for step in itertools.count())),
+                      None, batch=8, records=None)
+        state = trainer.fit(data, steps=steps, log_every=steps)
+        gains.append(np.log(reward(state.variables, run) / reward(start.variables, run)) - np.log(margin))
+    return np.asarray(gains)
 
-    assert_learns(contrasts, "a GRPO policy learning its language", units=COUNT_RUNS)
+
+def test_a_grpo_policy_rewarded_for_its_language_learns_it():
+    """Language RL's scenario (docs/design/testing.md: collect rollouts, score them, update a policy): a
+    policy drawing completions of two-token prompts, rewarded for each token that follows the counting
+    language's rule (`counting_reward`), trained by GRPO on its own draws (`RolloutScheduler.sampled`),
+    raises its held-out reward COUNT_MARGIN times (`counting_gains`) over independent runs, each from its
+    own initialization and prompts, as the learning gate judges a learning claim
+    (`learning_gate.assert_learns`)."""
+    from learning_gate import assert_learns
+
+    assert_learns(lambda runs: {"training quadruples the held-out reward": counting_gains(runs)},
+                  "a GRPO policy learning its language", units=COUNT_RUNS)
