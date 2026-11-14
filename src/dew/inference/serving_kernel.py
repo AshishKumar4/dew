@@ -31,6 +31,7 @@ from dew.nn.attention_blocks import CROSS_KEY, CROSS_VALUE
 from dew.nn.cross_attention import CROSS_CACHE
 from dew.nn.inputs import Admitted, ModelInputs, default_placement
 from dew.nn.kernels.options import (
+    UNGRAPHED_OPTIONS,
     Option,
     OuterProgram,
     Placements,
@@ -69,7 +70,6 @@ from dew.sampling.text import (
     prefill_state,
     rounding_keys,
 )
-from dew.telemetry.benchmark import UNGRAPHED_OPTIONS
 
 
 @struct.dataclass
@@ -988,7 +988,7 @@ def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[
     """`_compiled` over `formats` and model `options`
     (`dew.nn.kernels.options.compiler_options`), for the decoding step and
     the admitting one, compiled without CUDA command buffers on a GPU
-    (`dew.telemetry.benchmark.UNGRAPHED_OPTIONS`): its inputs are fresh
+    (`dew.nn.kernels.options.UNGRAPHED_OPTIONS`): its inputs are fresh
     buffers every call, so a command buffer was updated before it could
     replay, and the device waited out the update (on an RTX 4080 serving
     Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting

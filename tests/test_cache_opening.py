@@ -131,8 +131,8 @@ def test_a_servers_free_slots_open_with_no_forward_traced():
     a blank prompt's prefill for them, in that program."""
     from jax.experimental import checkify
 
-    from dew.nn.inputs import ModelInputs
     from dew.inference.serving_kernel import StateTypes, opened
+    from dew.nn.inputs import ModelInputs
     from dew.sampling.text import decode_ops, prefill_state
 
     model, slots = decoder().clone(max_seq_len=32), 4

@@ -402,8 +402,13 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             launches.pallas_call, grid=(queries // block_q, batch, heads), interpret=interpret,
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages))
         rowed = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
-        # A scaled walk's launch named apart: a call compiles it beside its unscaled form (`scaled`).
-        name = report.named("attention_forward_scaled" if spec.headroom else "attention_forward")
+        def named(form: algebra.Forward) -> str:
+            # Each form's launch named apart, as the Mosaic mainloop's are: the fold's natural rewalk
+            # (`algebra.unfolded`) beside the call's own form, and a scaled walk beside its unscaled form
+            # (`scaled`), so no two bodies share a name (`report.kernel_bodies`).
+            rewalk = form.natural and not spec.natural
+            return report.named(f"attention_forward{'_natural' if rewalk else ''}"
+                                f"{'_scaled' if form.headroom else ''}")
 
         def launched(form: algebra.Forward, live: jax.Array | None, into=None):
             # The call in `form` (`algebra.walked_launches`' launch): its outputs and its rows' running
@@ -411,14 +416,14 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             del live, into
             *out, maxima = launch(functools.partial(kernel, spec=form, maxima=True), in_specs=in_specs,
                                   out_specs=[*out_specs, per_row], out_shape=[*out_shape, rowed],
-                                  name=name)(*arrays)
+                                  name=named(form))(*arrays)
             return tuple(out), maxima, None
 
         if spec.reaches:
             out = algebra.walked_launches(spec, launched)
         else:
             out = launch(functools.partial(kernel, spec=spec, maxima=False), in_specs=in_specs,
-                         out_specs=out_specs, out_shape=out_shape, name=name)(*arrays)
+                         out_specs=out_specs, out_shape=out_shape, name=named(spec))(*arrays)
         return tuple(out) if residuals is not Kept.NONE else out[0]
 
     GENERATES = True

@@ -256,35 +256,23 @@ class Ungraphed(ValueError):
     RTX PRO 6000 read 1.47 ms with command buffers, its reduces alone, and 4.27 ms without, G4-LF-2), and on
     an A100 a measured call after a run of recurrence calls failed outright with them ("Failed to check
     stream capturing status", none without, the same calls memcheck-clean: row 4880). A timed call runs as a
-    program compiled without them (`UNGRAPHED_OPTIONS`), or in a process that runs none (`UNGRAPHED`): a
-    call compiled already (a `jax.stages.Compiled`) is refused in one that runs them."""
+    program compiled without them (`dew.nn.kernels.options.UNGRAPHED_OPTIONS`), or in a process that runs
+    none (`UNGRAPHED_FLAG`): a call compiled already (a `jax.stages.Compiled`) is refused in one that runs
+    them."""
 
 
-UNGRAPHED = ""
-"""The command buffer kinds a timing process's XLA_FLAGS name (`--xla_gpu_enable_command_buffer`): none
-(`Ungraphed`)."""
-
-UNGRAPHED_OPTIONS = {"xla_gpu_enable_command_buffer": UNGRAPHED}
-"""The compile options of a program run without command buffers (`owned_program`'s `step`): a timed one's
-(`Ungraphed`), and a server's admitting step's, whose fresh inputs update a command buffer before it can
-replay (`dew.inference.serving_kernel.decode_programs`)."""
+UNGRAPHED_FLAG = "--xla_gpu_enable_command_buffer="
+"""The XLA_FLAGS entry of a process that runs no command buffers (`Ungraphed`): the process form of
+`dew.nn.kernels.options.UNGRAPHED_OPTIONS`, stated here as this module loads without Dew
+(tools/timing.py's `instrument`)."""
 
 
 def graphs() -> bool:
-    """Whether this process's XLA:GPU may run programs as command buffers: unless its XLA_FLAGS leave it
-    none, each occurrence of the flag taken in turn as XLA's parser takes it (a list of kinds replacing the
-    one before it, a list of `+KIND`s and `-KIND`s amending it), XLA's defaults where no list is given."""
-    kinds: set[str] | None = None
-    for token in os.environ.get("XLA_FLAGS", "").split():
-        name, _, value = token.partition("=")
-        if name != "--xla_gpu_enable_command_buffer":
-            continue
-        listed = [kind.strip().upper() for kind in value.split(",") if kind.strip()]
-        if not (listed and all(kind[0] in "+-" for kind in listed)):
-            kinds = set(listed)
-        elif kinds is not None:  # amending XLA's defaults leaves some kind running
-            for kind in listed:
-                (kinds.add if kind[0] == "+" else kinds.discard)(kind[1:])
+    """Whether this process's XLA:GPU may run programs as command buffers: unless its XLA_FLAGS list none
+    (`dew._devices.xla_flag_kinds`, XLA's defaults where they list none)."""
+    from dew._devices import xla_flag_kinds
+
+    kinds = xla_flag_kinds("xla_gpu_enable_command_buffer")
     return kinds is None or bool(kinds)
 
 
@@ -318,15 +306,15 @@ class DeviceTime:
             return self._read(fn, *args)
         if isinstance(fn, jax.stages.Compiled):
             raise Ungraphed(f"{fn} was compiled to run as this process's command buffers, which CUPTI does "
-                            f"not read whole: set XLA_FLAGS=--xla_gpu_enable_command_buffer={UNGRAPHED} "
+                            f"not read whole: set XLA_FLAGS={UNGRAPHED_FLAG} "
                             "before JAX starts, or time the function it compiles")
         return self._read(self.program(fn, evicted=False), *args)
 
     def program(self, fn: Callable, evicted: bool) -> Callable:
         """`fn`'s timed program (`kernels`): its call, behind an eviction where `evicted` (`behind`), compiled
-        without command buffers (`UNGRAPHED_OPTIONS`), once a session."""
+        without command buffers (`dew.nn.kernels.options.UNGRAPHED_OPTIONS`), once a session."""
         if (fn, evicted) not in self._joined:
-            from dew.nn.kernels.options import owned_program
+            from dew.nn.kernels.options import UNGRAPHED_OPTIONS, owned_program
 
             self._joined[fn, evicted] = owned_program(behind(fn) if evicted else fn, step=UNGRAPHED_OPTIONS)
         return self._joined[fn, evicted]

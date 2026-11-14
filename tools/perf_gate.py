@@ -538,8 +538,9 @@ def compiled_sample(printed: str) -> tuple[float, dict]:
 
 
 def ahead_battery(args: argparse.Namespace) -> int:
-    """Each step of `--kind`'s compiled ahead of its run (benchmark_step --compile-ahead, for one
-    compile-only GPU of the kind, `COMPILE_TARGETS`), in each tree's environment of `--lock`, into
+    """Each step of `--kind`'s compiled ahead of its run (benchmark_step --compile-ahead, over the run's
+    own GPUs where `--topology` names them, else one compile-only GPU of the kind, `COMPILE_TARGETS`),
+    in each tree's environment of `--lock`, into
     `--out`/<the tree's directory name>: what `run --ahead` hands each arm's step rows, so the GPU compiles
     none of a step that is the program compiled ahead (dew-ops' perf jobs, in their GPU-free prepare). A
     tree whose own benchmark_step has no `--compile-ahead` (one older than the handoff), asked of the tool
@@ -554,19 +555,30 @@ def ahead_battery(args: argparse.Namespace) -> int:
     cases = [case for name, case in STEP_CASES.items()
              if (not args.only or any(word in name for word in args.only))
              and device in STEP_HARDWARE.get(name, (device,))]
-    failed = []
-    for name, path in trees.items():
-        if name in unbuilt or not cases:
-            continue
-        taken = _run(Path(path), pythons[name], "benchmark_step.py", ["--help"], head_path / "tools", 600)
-        if taken.returncode == 0 and "--compile-ahead" not in taken.stdout:
-            print(f"{name}: its benchmark_step has no --compile-ahead (a tree before the handoff): none of "
-                  "its steps is compiled ahead", flush=True)
-            continue
-        done = taken if taken.returncode else _run(
-            Path(path), pythons[name], "benchmark_step.py",
-            ["--cases", json.dumps(cases), "--compile-ahead", str(Path(args.out) / Path(path).name),
-             "--generation", generation, "--capacity-gib", str(gib)], head_path / "tools", 3600)
+    # What each tree's benchmark_step takes, asked first: every tree's steps are compiled ahead, or none is,
+    # so no arm's GPU compiles (and autotunes) what another arm's prepare compiled offline (review: a base
+    # that could not compile over the node's GPUs ran tuned on the GPU beside a head compiled at autotune 0).
+    built = {name: path for name, path in trees.items() if name not in unbuilt and cases}
+    taken = {name: _run(Path(path), pythons[name], "benchmark_step.py", ["--help"], head_path / "tools", 600)
+             for name, path in built.items()}
+    if failed := [name for name, done in taken.items() if done.returncode]:
+        for name in failed:
+            print(f"{name}: its benchmark_step could not say what it takes: {taken[name].stderr[-400:]}",
+                  flush=True)
+        return 1
+    needs = ["--compile-ahead", *(["--topology"] if args.topology else [])]
+    if lacking := [name for name, done in taken.items()
+                   if any(word not in done.stdout for word in needs)]:
+        # A tree before the handoff, or one that cannot compile over the node's own GPUs (a step compiled
+        # for a canonical GPU is refused by a run whose pool is smaller, `BuildTarget.held`).
+        print(f"{', '.join(lacking)}: its benchmark_step takes no {' or '.join(needs)}: no tree's steps are "
+              "compiled ahead, every arm compiling its own on the GPU", flush=True)
+        return 0
+    target = ["--topology", args.topology] if args.topology else ["--capacity-gib", str(gib)]
+    for name, path in built.items():
+        done = _run(Path(path), pythons[name], "benchmark_step.py",
+                    ["--cases", json.dumps(cases), "--compile-ahead", str(Path(args.out) / Path(path).name),
+                     "--generation", generation, *target], head_path / "tools", 3600)
         said = f"into {args.out}" if done.returncode == 0 else f"not: {done.stderr[-400:]}"
         print(f"{name}: steps compiled ahead {said}", flush=True)
         failed += [name] if done.returncode else []
@@ -832,6 +844,9 @@ def main() -> int:
                                                        else {}))
     aheading.add_argument("--environments", default="")
     aheading.add_argument("--only", nargs="*", default=[])
+    aheading.add_argument("--topology", default="",
+                          help="the run's GPUs' serialized topology (a GPU node's $DEW_NODE_TOPOLOGY), "
+                               "each step compiled over them; else over a canonical GPU of --kind")
     args = parser.parse_args()
     with contextlib.suppress(BrokenPipeError):
         return {"run": run, "compile": compile_battery, "ahead": ahead_battery,

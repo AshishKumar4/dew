@@ -28,6 +28,7 @@ from typing import Literal, Protocol, Self, runtime_checkable
 import jax
 
 from dew._records import JSON
+from dew.telemetry.benchmark import UNGRAPHED_FLAG
 
 
 @runtime_checkable
@@ -159,8 +160,8 @@ def _drain() -> None:
 
 COMMAND_BUFFERS = (
     "no device time is attributed to HLO ops (reports/hlo_stats.json): the kernels XLA ran as CUDA "
-    "command buffers stay under their module. Profile with "
-    "XLA_FLAGS=--xla_gpu_enable_command_buffer= for op-level reports, and time runs without it")
+    f"command buffers stay under their module. Profile with XLA_FLAGS={UNGRAPHED_FLAG} for op-level "
+    "reports, and time runs without it")
 
 
 def process_directory(directory: Path) -> Path:

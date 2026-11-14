@@ -170,7 +170,7 @@ def worker_env(env: dict, clock: str) -> dict:
     if clock != "device" or "--xla_gpu_enable_command_buffer" in env.get("XLA_FLAGS", ""):
         return env
     flags = env.get("XLA_FLAGS", os.environ.get("XLA_FLAGS", ""))
-    return {**env, "XLA_FLAGS": f"{flags} --xla_gpu_enable_command_buffer={instrument().UNGRAPHED}".strip()}
+    return {**env, "XLA_FLAGS": f"{flags} {instrument().UNGRAPHED_FLAG}".strip()}
 
 
 class Process:
