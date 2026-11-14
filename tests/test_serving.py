@@ -127,8 +127,8 @@ def test_a_server_over_split_rows_takes_its_projections_on_each_devices_rows(sca
     scanned as one stack, the GEMM template named and interpreted as an H100's: its projections take the
     template's launch on each device's own rows, each weight entering whole (`dew.nn.sharding.FORWARD`,
     traced under `placing`), as a trainer's step takes them per shard, and every request draws what it
-    draws alone on one device (train 818 F1: a served step traced under no placement left every product to
-    the partitioner, which no launch takes; train 821 F2)."""
+    draws alone on one device: a served step traced under no placement left every product to the
+    partitioner, which no launch takes."""
     from dew.nn.kernels import generation
 
     model = decoder().clone(dtype="bfloat16", emb_features=64, max_seq_len=128, num_layers=2,
@@ -155,8 +155,8 @@ def test_a_server_decoding_on_one_device_prefills_its_split_rows_through_each_de
     whose rows split, the GEMM template named and interpreted as an H100's: the prefill's projections take
     the template's launch on each prefilling device's rows, each weight whole (`dew.nn.sharding.FORWARD`,
     which the prefill takes on its mesh whether or not the decode has one), and every request draws what
-    it draws alone (train 821 F1: the unmeshed server traced its prefill under no placement, whose chosen
-    launch the partitioned rows refused)."""
+    it draws alone: an unmeshed server traced its prefill under no placement, whose chosen launch the
+    partitioned rows refused."""
     from dew.nn.kernels import generation
 
     model = decoder().clone(dtype="bfloat16", emb_features=64, max_seq_len=128)

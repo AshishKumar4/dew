@@ -80,6 +80,7 @@ from ..gemma3n import AltUp, clamped_predictions, rescale_to
 from ..host_memory import on_host
 from ..hyper_connections import Carried, HyperConnections, enter_streams, leave_streams, stream_head
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates_of
+from ..kernels import generation
 from ..kv_cache import DecodeCursor, KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
@@ -1521,20 +1522,24 @@ class CausalTransformer(LinearProducts):
                                 for layer in self.dspark.target_layers], axis=-1)
 
     def init_draft_cache(self, batch_size: int):
-        """Allocate the drafter's window caches, separately from the trunk's cache."""
+        """Allocate the drafter's window caches, separately from the trunk's cache, by a forward traced for
+        its shapes alone (`generation.unforced`)."""
         assert self.dspark is not None
         width = len(self.dspark.target_layers) * self.emb_features
-        self.draft(jnp.zeros((batch_size, 1, width), self.dtype or jnp.float32),
-                   jnp.zeros((batch_size,), jnp.int32), decode=True)
+        with generation.unforced():
+            self.draft(jnp.zeros((batch_size, 1, width), self.dtype or jnp.float32),
+                       jnp.zeros((batch_size,), jnp.int32), decode=True)
 
     def init_mtp_cache(self, batch_size: int):
-        """Allocate the prediction depths' caches, separately from the trunk's cache."""
+        """Allocate the prediction depths' caches, separately from the trunk's cache, by a forward traced
+        for its shapes alone (`generation.unforced`)."""
         shape = ((batch_size, 1, self.emb_features) if self.mtp_hyper_connections is None else
                  (batch_size, 1, self.mtp_hyper_connections.hc_mult, self.emb_features))
-        for block in self.mtp:
-            block(jnp.zeros(shape, self.dtype),
-                  jnp.zeros((batch_size, 1, self.emb_features), self.dtype), decode=True,
-                  prediction_phase="extend" if self.index_share_for_mtp_iteration else "ordinary")
+        with generation.unforced():
+            for block in self.mtp:
+                block(jnp.zeros(shape, self.dtype),
+                      jnp.zeros((batch_size, 1, self.emb_features), self.dtype), decode=True,
+                      prediction_phase="extend" if self.index_share_for_mtp_iteration else "ordinary")
 
     def hidden_states(self, tokens, **kwargs):
         """Return the final normalized states, without the vocabulary projection."""
@@ -2170,9 +2175,11 @@ class CausalTransformer(LinearProducts):
 
         It runs the forward pass in decode mode on a single dummy token, and
         that token's keys are never written: the first decode-mode call
-        allocates the cache, and the calls after it write to it.
+        allocates the cache, and the calls after it write to it. The forward
+        is traced for its shapes alone (`generation.unforced`).
         """
-        self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
+        with generation.unforced():
+            self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
 
     # The serving and training hooks (`dew.nn.protocols`).
 

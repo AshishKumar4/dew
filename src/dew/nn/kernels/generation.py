@@ -181,11 +181,12 @@ def chosen(**kernels: str) -> Iterator[None]:
 @contextlib.contextmanager
 def unforced() -> Iterator[None]:
     """Within the block, no kernel choice and no kernel config is forced (`chosen`'s choices and
-    `dew.nn.kernels.tuning.pinned`'s pins cleared): a trace that exists only for its shapes, whose
-    selections never run, takes each selector's own pick and each launch its own config, since nothing it
-    selects ever runs, so a choice or pin a caller forces for the programs that run is not met by a product
-    no launch takes or a launch its pin does not fit (Main, 11-14). Its one user is such a trace, a decode
-    cache's allocating forward (`dew.sampling.text._empty_cache`), which row 6082 deletes."""
+    `dew.nn.kernels.tuning.pinned`'s pins cleared): a trace that exists only for its shapes takes each
+    selector's own pick and each launch its own config, since nothing it selects ever runs, so a choice or
+    pin a caller forces for the programs that run is not met by a product no launch takes or a launch its
+    pin does not fit. Its users are such traces alone: a decoder's cache allocation, whose forward over a
+    dummy token writes nothing (`CausalTransformer.init_cache`, `init_mtp_cache`, `init_draft_cache`), which
+    row 6082 replaces with each mixer's own cache spec."""
     from dew import _cache
 
     with _cache.KERNEL_CHOICES(()), _cache.KERNEL_PINS(()):
