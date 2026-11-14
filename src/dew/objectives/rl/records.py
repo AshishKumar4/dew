@@ -5,10 +5,8 @@ import json
 from collections.abc import Mapping
 from dataclasses import asdict
 
-import numpy as np
-
 from dew._records import finite, listed, record as section
-from dew.inference.rollouts import Draw
+from dew.inference.rollouts import Draw, routing_json
 from dew.registry import from_record
 from dew.sampling.text import Sampling
 
@@ -23,15 +21,10 @@ messages = functools.partial(listed, read=json_object, what="a list of chat mess
 
 
 def record_json(value: Episode | Draw) -> str:
-    """`value` as JSON, its fields as `asdict` writes them and a draw's routing as nested lists of
-    expert ids: the text `episode_from_record` and `draw_record` read back."""
-    return json.dumps(asdict(value), allow_nan=False, default=_json_leaf)
-
-
-def _json_leaf(value: np.ndarray | Mapping[str, np.ndarray]) -> list | dict[str, np.ndarray]:
-    """A record's leaf JSON writes no other way: an array as nested lists, a routing record keyed by site
-    (`dew.inference.rollouts.Routing`) as an object of them."""
-    return dict(value) if isinstance(value, Mapping) else value.tolist()
+    """`value` as JSON, its fields as `asdict` writes them and its arrays, a draw's routing among them, as
+    `routing_json` writes a routing record (nested lists, an object of them by site): the text
+    `episode_from_record` and `draw_record` read back."""
+    return json.dumps(asdict(value), allow_nan=False, default=routing_json)
 
 
 def draw_record(value: Mapping[str, object], sampling: Sampling) -> Draw:
