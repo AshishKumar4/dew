@@ -883,27 +883,26 @@ class KVStore:
         return _gather_pages(pool, self._get(TABLE), self.layout.groups)
 
     def case(self, query: jax.Array, *, softcap: float | None, arithmetic: bool, named: str,
-             windowed: bool = False, sinks: bool = False, owned: bool = False) -> PagedCase:
+             windowed: bool = False, sinks: bool = False) -> PagedCase:
         """The `PagedCase` of a decode step's query `[rows, heads, head_dim]` over this pool, its values as
         wide as the pool stores them (`_value_width`), under the layer's `softcap`, its reference-only
         `arithmetic` (`dew.nn.attention.reference_only`) and its `AttentionImpl`, `named`; a `windowed`
-        step reads each row from its window's first key; a layer with `sinks` has attention sinks; an
-        `owned` step's products a quantized model's rule owns (`PagedCase.owned`)."""
+        step reads each row from its window's first key; a layer with `sinks` has attention sinks."""
         return PagedCase(heads=query.shape[-2], kv_heads=self.kv_heads, head_dim=self.head_dim,
                          value_dim=self._value_width(), dtype=jnp.dtype(query.dtype),
                          pool=jnp.dtype(self.dtype),
                          page_size=self.layout.page_size, quantized=self.layout.quantized,
                          groups=self.layout.groups, head_shards=_head_shards(query), softcap=softcap,
                          arithmetic=arithmetic, named=named, rows=query.shape[0], queries=1,
-                         keys=self._slots(), windowed=windowed, sinks=sinks, owned=owned)
+                         keys=self._slots(), windowed=windowed, sinks=sinks)
 
     def paged_kernel(self, query: jax.Array, *, softcap: float | None, arithmetic: bool, named: str,
-                     windowed: bool = False, sinks: bool = False, owned: bool = False) -> str | None:
+                     windowed: bool = False, sinks: bool = False) -> str | None:
         """The paged kernel the selector gives a decode step's query over this pool (`PAGED`, over its one
         `case`), reported as the step's route, which `decode` runs; None where no paged kernel takes it and
         the layer reads the gathered rows itself."""
         kernel = select(PAGED, self.case(query, softcap=softcap, arithmetic=arithmetic, named=named,
-                                         windowed=windowed, sinks=sinks, owned=owned)).kernel
+                                         windowed=windowed, sinks=sinks)).kernel
         return None if kernel == 'gathered' else kernel
 
     def _value_width(self) -> int:
@@ -978,6 +977,14 @@ DECODE_QUERY = ("activation_batch", "activation_heads", None)
 """The logical axes of a decode query `[rows, heads, head_dim]`."""
 
 
+def _rule_owned() -> bool:
+    """Whether a quantized model's rule owns the products of the call being traced and quantizes them
+    (`attention_quantized.quantizing`), every `PagedCase` built reading it where it is built."""
+    from dew.nn.kernels.templates import attention_quantized
+
+    return attention_quantized.quantizing() is not None
+
+
 @dataclasses.dataclass(frozen=True)
 class PagedCase:
     """A decode step over a paged pool as the paged selector reads it (`PAGED`, `KVStore.case`): the
@@ -989,8 +996,9 @@ class PagedCase:
     reads (its table's slots of pages, or a compact cache's capacity), which a kernel that plans the step
     plans it over (`_template_tiles`); whether it reads each row from its window's first key (`windowed`);
     whether the layer has attention sinks (`sinks`); and whether a quantized model's rule owns the step's
-    products (`owned`, `dew.nn.attention`'s `AttentionCase.quantized`), which every paged kernel forms
-    inside its launch, past the rule: the gathered rows through the layer's attention take it there."""
+    products and quantizes them (`owned`, read where the case is built, `_rule_owned`), which every paged
+    kernel forms inside its launch, past the rule: the gathered rows through the layer's attention, which
+    routes by the rule (`dew.nn.attention`'s `AttentionCase.quantized`), take it there."""
 
     heads: int
     kv_heads: int
@@ -1010,7 +1018,7 @@ class PagedCase:
     keys: int
     windowed: bool = False
     sinks: bool = False
-    owned: bool = False
+    owned: bool = dataclasses.field(init=False, default_factory=_rule_owned)
 
 
 _OWNED: Requirement[PagedCase] = Requirement('owned', lambda case: not case.owned,
