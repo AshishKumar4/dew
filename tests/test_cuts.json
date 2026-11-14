@@ -627,12 +627,6 @@
 "tests/test_compile_ahead.py::test_compiling_ahead_on_gpus_of_no_stated_memory_is_refused_before_anything_traces[False]",
 "tests/test_compile_ahead.py::test_programs_kept_under_other_code_settings_or_target_are_refused_by_name[setting-process3-target3]"
 ],
-"tests/test_config_cli.py": [
-"tests/test_config_cli.py::test_a_spec_field_the_dataset_lacks_is_a_command_line_error"
-],
-"tests/test_config_paths.py": [
-"tests/test_config_paths.py::test_a_run_trained_from_python_trains_as_dew_train_trains_it[jepa]"
-],
 "tests/test_contracts_gemm.py": [
 "tests/test_contracts_gemm.py::test_a_gemm_prologue_holds_every_order[normal]",
 "tests/test_contracts_gemm.py::test_a_quantized_convolution_holds_every_order_it_takes[1-normal]",
@@ -2130,9 +2124,6 @@
 "tests/test_perturbation.py::test_an_update_read_in_two_microbatches_estimates_what_its_batch_whole_does",
 "tests/test_perturbation.py::test_the_estimate_is_the_gradient_in_expectation[trailing-general]"
 ],
-"tests/test_pipeline_core.py": [
-"tests/test_pipeline_core.py::test_a_memory_mix_with_a_member_that_accepts_no_row_compiles_and_reads_the_others"
-],
 "tests/test_pipeline_golden.py": [
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[images_arrayrecord-workers=2,shares=2]",
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[images_tfds-workers=0,shares=1]",
@@ -2397,9 +2388,6 @@
 "tests/test_recurrence_witness.py": [
 "tests/test_recurrence_witness.py::test_a_grouped_backwards_records_lie_in_their_key_heads_enclosures[keys gated-sm80]",
 "tests/test_recurrence_witness.py::test_an_amperes_inference_forward_is_witnessed_as_its_states_and_output_launches"
-],
-"tests/test_recurrent_sequence_split.py": [
-"tests/test_recurrent_sequence_split.py::test_a_delta_rule_split_over_the_sequence_runs_its_rows_as_whole_ones[kimi delta attention-all_valid]"
 ],
 "tests/test_reference_runs.py": [
 "tests/test_reference_runs.py::test_lm_fine_tune_steps_are_as_exact_as_torch",
@@ -2703,9 +2691,6 @@
 "tests/test_slot_sources.py::test_a_slot_release_loads_its_readout_and_exports_the_same_task[512-slot_lm]",
 "tests/test_slot_sources.py::test_a_slot_release_reads_the_labels_its_layout_states_in_their_order",
 "tests/test_slot_sources.py::test_a_slot_release_states_the_window_and_the_prompt_its_layout_accepted[slot_lm]"
-],
-"tests/test_source_schedulers.py": [
-"tests/test_source_schedulers.py::test_source_config_rebuilds_its_scheduler_trajectory_and_gradient[euler_ancestral.leading_zero_snr_v]"
 ],
 "tests/test_speculative.py": [
 "tests/test_speculative.py::test_a_longrope_crossing_reseeds_the_drafter_as_a_prefill_of_its_history_does[depth]",

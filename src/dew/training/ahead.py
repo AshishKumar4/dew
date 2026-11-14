@@ -35,7 +35,9 @@ and `LMObjective.head_tile`. No run times plans itself.
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
+import contextvars
 import copyreg
 import dataclasses
 import functools
@@ -48,11 +50,10 @@ import logging
 import os
 import pickle
 import platform
-import subprocess
-import sys
 import tempfile
 import time
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from concurrent.futures import Future
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -100,10 +101,10 @@ if TYPE_CHECKING:
     from jaxlib._jax import Traceback
 
     from dew.checkpoints import Resume
-    from dew.config import RunConfig
     from dew.data.compile import Handed
     from dew.data.dataset import DataPartition, Loader
     from dew.data.pipeline import Dataset
+    from dew.state import TrainState
     from dew.training._fit import FitArguments, FitPlan, Start
     from dew.training.planning import Planned
     from dew.training.trainer import Trainer
@@ -1100,84 +1101,103 @@ def later_phases[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batc
     return tuple(sorted(set(firsts.values()) - {first}))
 
 
-@dataclasses.dataclass
-class LaterPhases:
-    """A configured run, its record (`run`, `dew.config.RunConfig`) trained again by `dew train` once its
-    first step is dispatched, with its target its later data phases' steps (`AheadTarget.phases`) and its
-    links the run's own: a process of its own compiles them into the persistent compilation cache the run
-    reads, on this host's CPU over its own GPUs' topology (`host_gpus`), none of them drawn, so each
-    phase's first compile in the run reads its backend's program from the cache instead of compiling it
-    while the GPUs idle at the phase's boundary (row 5556: 241, 309 and 386 s at a 4B decision run's). Its
-    plan is admitted to the pool XLA's allocator holds on each GPU (`device_memory`), the state a fresh
-    run's, as the run's at an update's end, which is where a phase begins; a phase whose run plans another
-    program at its boundary compiles that as it did. The process is a group of its own whose lifeline
-    ends it however the run ends (`dew._cleanup.start`); one still running as the run ends is stopped, and
-    one whose compile failed has its log said: the run's boundary compiles its phase as it would have,
-    nothing retried. A run the record cannot rebuild (`RunConfig.unrecorded`), a pool of several
-    processes, a run with no persistent cache or one on another platform starts none. `trust` names the
-    packages the run's record may import (`dew train --trust`)."""
+class LaterPlans:
+    """The later data phases' steps of a run (`later_phases`), each planned and compiled on a thread of this
+    process once the run's first step is dispatched, over its state's shapes as they stand at an update's
+    end and the batch each phase delivers (`phase_batch`), at the split the run was given or the planner's
+    own, its objective a copy at its pass count (`PhasePasses.apart`), so the loop's objectives and plan are
+    never touched. What each compiled is handed to that phase's boundary (`taken`), whose plan, made there
+    against the devices' allocators as they stand, finds each candidate's trace (`candidate_for`) and
+    executable (`FitSearch.compiled`) made: the GPUs no longer idle while it compiles (336 s at a 4B
+    decision run's second phase on a GH200, M-MC-3q). One thread, joined: each phase's at its boundary,
+    every phase's as the run ends, however it ends. A phase whose plan failed off the loop says so at its
+    boundary, which plans it as it would have. A pooled run, a host-master or rollout run, one that tunes
+    its kernels or runs PGLE plans its phases at their boundaries."""
 
-    run: RunConfig
-    trust: tuple[str, ...] = ()
-    process: subprocess.Popen | None = None
-    # The directory of the process's record, topology and log, made as it starts, removed once it ends.
-    held: tempfile.TemporaryDirectory | None = None
+    def __init__(self, futures: Mapping[int, Future]) -> None:
+        self.futures = dict(futures)
 
-    def started[LossT, EffectsT](self, trainer: Trainer[LossT, EffectsT], batch: Batch) -> None:
-        """The process compiling the later phases of `trainer`'s run, started where they hold steps of other
-        programs than the step of `batch`, its first (`later_phases`)."""
-        from dew._cleanup import start
+    @classmethod
+    def started[LossT, EffectsT](cls, trainer: Trainer[LossT, EffectsT], batch: Batch,
+                                 state: TrainState) -> LaterPlans | None:
+        """The thread planning the later phases of `trainer`'s run, begun where they hold steps of other
+        programs than the step of `batch`, its first (`later_phases`), over the shapes of `state`, the
+        state its first step returned; None where it plans none."""
+        from dew.distributed.batches import split_fields
 
-        devices = jax.local_devices()
-        directory = jax.config.jax_compilation_cache_dir
-        if jax.process_count() > 1 or directory is None or {device.platform for device in devices} != {"gpu"}:
-            return
-        if trainer.host_master or trainer.rollout is not None or trainer.tune_kernels or pgle_runs():
-            # What a step compiled ahead refuses (`compile_ahead`): its phases compile in the run.
-            return
+        if (jax.process_count() > 1 or trainer.host_master or trainer.rollout is not None
+                or trainer.tune_kernels or pgle_runs() or state.inner is not None):
+            return None
         phases = later_phases(trainer, batch)
         if not phases:
-            return
-        self.held = tempfile.TemporaryDirectory(prefix="dew-later-phases-", dir=directory)
-        held = Path(self.held.name)
-        (held / "topology").write_bytes(topologies.get_attached_topology("cuda").serialize())
-        # The host's topology states its GPUs' memory, which the phases' plans are made against.
-        target = AheadTarget(gpu_target(devices[0].device_kind).generation, len(devices),
-                             topology=str(held / "topology"), phases=phases)
-        command = self.command(self.recorded(target, trainer._compiler.links(trainer.device_mesh), held))
-        with (held / "log").open("w") as written:
-            self.process = start(command, stdout=written, stderr=subprocess.STDOUT,
-                                 env={**os.environ, "JAX_PLATFORMS": "cpu"})
-        _log.info("compiling the steps of data phases %s ahead in process %d", list(phases), self.process.pid)
+            return None
+        shapes = fresh_shapes(state, trainer.accumulation)
+        pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dew-later-phases")
+        try:
+            # Each phase's plan reads the loop's context as the run's first compile did (its mesh, its
+            # options), copied as it is submitted.
+            # The fields the devices read, as the phase's boundary compiles over them (`split_fields`).
+            futures = {trainer.phase_passes.counts[phase]: pool.submit(
+                contextvars.copy_context().run, _phase_plan, trainer, shapes,
+                split_fields(phase_batch(trainer, batch, phase))[0], trainer.phase_passes.counts[phase])
+                for phase in phases}
+        finally:
+            pool.shutdown(wait=False)
+        _log.info("planning the steps of data phases %s off the loop", list(phases))
+        return cls(futures)
 
-    def recorded(self, target: AheadTarget, links: Mapping[str, Link], directory: Path) -> str:
-        """The run's record (`RunConfig.save`) in `directory`, its target `target` and its links `links`, the
-        ones the run traced with, measured or stated, so its run lowers the run's program: where the record
-        is written."""
-        stated = dataclasses.replace(self.run.trainer, compile_ahead=target, links=dict(links))
-        return dataclasses.replace(self.run, trainer=stated).save(str(directory))
-
-    def command(self, record: str) -> tuple[str, ...]:
-        """`dew train` of `record` (the CLI's own module, `dew._cli.main`), trusting the packages the
-        run's record may import."""
-        return (sys.executable, "-m", "dew._cli.main", "train", record,
-                *(word for name in self.trust for word in ("--trust", name)))
+    def taken(self, passes: int | None) -> dict | None:
+        """The executables the phase whose step runs `passes` compiled (`FitSearch.compiled`), its plan
+        waited for; None where none was planned or its plan failed, said."""
+        future = self.futures.pop(passes, None) if passes is not None else None
+        if future is None:
+            return None
+        try:
+            return future.result()
+        except Exception as error:  # the boundary plans the phase as it would have
+            _log.warning("planning the step of %d passes off the loop failed; its boundary plans it: %r",
+                         passes, error)
+            return None
 
     def stopped(self) -> None:
-        """The process stopped where it still runs as the run ends, its log said where it failed, and its
-        directory removed."""
-        from dew._cleanup import stop
+        """Every phase's plan waited for as the run ends, a pending one not begun, one that failed said."""
+        for passes, future in self.futures.items():
+            if future.cancel():
+                continue
+            if (error := future.exception()) is not None:
+                _log.warning("planning the step of %d passes off the loop failed: %r", passes, error)
+        self.futures.clear()
 
-        if self.process is not None:
-            failed = self.process.poll()
-            if failed and self.held is not None:
-                _log.warning("compiling the later phases ahead failed (exit %d): %s", failed,
-                             (Path(self.held.name) / "log").read_text()[-4000:])
-            stop(self.process)
-        if self.held is not None:
-            self.held.cleanup()
-        self.process = self.held = None
 
+def fresh_shapes(state: TrainState, accumulation: int) -> TrainState:
+    """`state`'s shapes, each on its sharding, as a fresh state holds it at an update's end: no window, no
+    narrow copies, its window size a step of one microbatch's (`dew.training.compiler.freshly_held`)."""
+    laid = dataclasses.replace(state, accumulation=None, compute=None,
+                               window_size=np.int32(accumulation))
+    return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
+                                                          sharding=getattr(leaf, "sharding", None)), laid)
+
+
+def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
+                                 passes: int) -> dict:
+    """The executables a plan of `trainer`'s step at `passes` compiled over `state`'s shapes and `batch`
+    (`LaterPlans`), on a compiler and objective of its own; what it compiled before a refusal where no
+    candidate fit the devices as they stand off the loop, which the boundary judges again."""
+    from dew.training.compiler import StepCompiler
+    from dew.training.planning import PlanRefused
+
+    phases = trainer.phase_passes.apart(passes)
+    compiler = StepCompiler(phases.base, trainer._compiler.links(trainer.device_mesh), None, phases)
+    stepping = trainer._stepping(phases.base, compiler)
+    stepping = dataclasses.replace(stepping, shape=dataclasses.replace(stepping.shape,
+                                                                       split=trainer._given_split))
+    executables: dict = {}
+    try:
+        compiler._plan(stepping, state, batch, None, executables=executables)
+    except PlanRefused as refused:
+        _log.info("the step of %d passes fits no plan off the loop; its boundary plans it: %s", passes,
+                  refused)
+    return executables
 
 def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
                                  partition: DataPartition | None = None) -> Batch:

@@ -50,7 +50,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Time to first step: the compile path's re-derivations. [5556, 5558, 5669]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
-- CI time: every test within 120 seconds. [6050, 6051, 6052]
+- CI time: every test within 120 seconds. [6050]
 - Training & Data's tests on check 1. [708]
 - XLA:CPU edges. [1591]
 
