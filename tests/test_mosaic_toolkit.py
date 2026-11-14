@@ -727,27 +727,29 @@ def _padded(rows: int, family) -> int:
 
 
 def _persisted_products(x, w, *, family, interpret, rows: int | None = None, resident: int = 1,
-                        once: bool = False):
+                        once: tuple[str, ...] = ()):
     """`x @ w` a tile at a time through `family`'s persistent walk (`Family.persist`): each tile the
     family's least rows covering `rows` (its own least where None; `_padded`), of which it stores `rows`,
     tile `t` the tiles' rows `t` on, each step `PERSISTED_DEPTH` of the contraction, the middle tile
     multiplying nothing (zeros); each tile issued (`issue`'s walk) and finished (`Issuer.chunks`, each
     chunk stored at its columns), on the family's roles, launched for `resident` programs a multiprocessor.
-    With `once`, each tile's `x` block is its first step's, loaded once at the tile's start (`persist`'s
-    `once`) and read by every step: `x[:, :PERSISTED_DEPTH] @` the sum of `w`'s step blocks."""
+    Each of `once`'s operands is its first step's block a tile, loaded once at the tile's start (`persist`'s
+    `once`) and read by every step: with `x` once, `x[:, :PERSISTED_DEPTH] @` the sum of `w`'s step blocks;
+    with both, every step that one product."""
     stored = family.rows if rows is None else rows
     rows, columns = _padded(stored, family), w.shape[1]
     family = family.specialized(rows, columns)
     shape = (rows, columns)
-    left = {'x': ((rows, PERSISTED_DEPTH), x.dtype)}
-    blocks = {**({} if once else left), 'w': ((PERSISTED_DEPTH, columns), w.dtype)}
+    every = {'x': ((rows, PERSISTED_DEPTH), x.dtype), 'w': ((PERSISTED_DEPTH, columns), w.dtype)}
+    blocks = {name: block for name, block in every.items() if name not in once}
+    held = {name: block for name, block in every.items() if name in once}
 
     def body(x_gmem, w_gmem, o_gmem):
         def scope(*, streams):
             def schedule(index):
                 tile = index[0]
-                views = {'x': (x_gmem, (lambda j: (tile, 0)) if once else (lambda j: (tile, j))),
-                         'w': (w_gmem, lambda j: (j, 0))}
+                views = {'x': (x_gmem, (lambda j: (tile, 0)) if 'x' in once else (lambda j: (tile, j))),
+                         'w': (w_gmem, (lambda j: (0, 0)) if 'w' in once else (lambda j: (j, 0)))}
                 return tile != 1, PERSISTED_STEPS, views, tile
 
             def issue(wg, tile, walk, *, active):
@@ -765,7 +767,7 @@ def _persisted_products(x, w, *, family, interpret, rows: int | None = None, res
                            accumulators=(shape,), once=streams["once"] if once else None)
 
         family.scoped(scope, streams={"walked": family.streams(blocks, 2, 1),
-                                      **({"once": family.streams(left, 1, 1)} if once else {})})
+                                      **({"once": family.streams(held, 1, 1)} if once else {})})
 
     out = jax.ShapeDtypeStruct((PERSISTED_TILES * rows, columns), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
@@ -807,10 +809,26 @@ def test_a_persistent_tiles_once_stream_loads_once_and_every_step_reads_it():
     family = mosaic_sm100.RINGS
     x, w = _persisted_operands(family.rows)
     with generation.assumed("sm100"):
-        got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED, once=True))
+        got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED, once=('x',)))
     left = np.asarray(x, np.float32)[:, :PERSISTED_DEPTH]
     steps = np.asarray(w, np.float32).reshape(PERSISTED_STEPS, PERSISTED_DEPTH, -1).sum(axis=0)
     expected = left @ steps
+    expected[family.rows:2 * family.rows] = 0
+    np.testing.assert_array_equal(got, expected)
+
+
+@INTERPRETS
+def test_a_persistent_tile_whose_every_operand_is_a_once_stream_walks_its_steps():
+    """Interpreted: a persistent walk on tcgen05's bundle whose every operand is a once stream (no ring a
+    step): each step reads the tile's two blocks, so each active tile's rows are their product times the
+    walk's steps, the inactive middle tile's zeros."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.RINGS
+    x, w = _persisted_operands(family.rows)
+    with generation.assumed("sm100"):
+        got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED, once=('x', 'w')))
+    left = np.asarray(x, np.float32)[:, :PERSISTED_DEPTH]
+    expected = PERSISTED_STEPS * (left @ np.asarray(w, np.float32)[:PERSISTED_DEPTH])
     expected[family.rows:2 * family.rows] = 0
     np.testing.assert_array_equal(got, expected)
 
