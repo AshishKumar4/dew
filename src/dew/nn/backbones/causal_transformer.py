@@ -128,7 +128,7 @@ from .decoder_block import (
     remat_record,
     residual_normed,
 )
-from .decoder_cache import depths_cache, drafter_cache, trunk_cache
+from .decoder_cache import named_caches, trunk_cache
 from .decoder_fields import refuse_unbuildable, settle_fields, softmax_attention_layers
 from .decoder_stack import (
     DecoderBank,
@@ -1523,14 +1523,14 @@ class CausalTransformer(LinearProducts):
 
     def init_draft_cache(self, batch_size: int):
         """Open the drafter's window caches for `batch_size` rows, apart from the trunk's, as its stages
-        state them (`decoder_cache.drafter_cache`), tracing no forward."""
+        state them (`decoder_cache.named_caches`), tracing no forward."""
         assert self.dspark is not None
-        put_opened(self, drafter_cache(self, batch_size))
+        put_opened(self, named_caches(self.dspark_stages, batch_size))
 
     def init_mtp_cache(self, batch_size: int):
         """Open the prediction depths' caches for `batch_size` rows, apart from the trunk's, as the depths
-        state them (`decoder_cache.depths_cache`), tracing no forward."""
-        put_opened(self, depths_cache(self, batch_size))
+        state them (`decoder_cache.named_caches`), tracing no forward."""
+        put_opened(self, named_caches(self.mtp, batch_size))
 
     def hidden_states(self, tokens, **kwargs):
         """Return the final normalized states, without the vocabulary projection."""

@@ -5,12 +5,16 @@ Each layer's cache sits under the layer's name; a store banked by run keeps each
 under the run's name, as a decode over the bank reads them (`StackView`); a loop's passes keep theirs
 under the names their views store them by (`looping.pass_entries`); and the decoder's own holders sit
 beside them: its cursor of learned positions and its engram's history. The prediction depths' caches and
-the block drafter's are apart, each opened by its own method, as a decode opens them where it runs them.
+the block drafter's are apart (`named_caches`), each opened by its own method, as a decode opens them where
+it runs them.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
+
+from flax import linen as nn
 
 from ..kv_cache import CacheSpec, stacked_spec
 from ..sharding import pipeline_stages
@@ -46,15 +50,10 @@ def trunk_cache(model: CausalTransformer, rows: int) -> CacheSpec:
     return spec
 
 
-def depths_cache(model: CausalTransformer, rows: int) -> CacheSpec:
-    """`model`'s prediction depths' decode caches for `rows` rows, each under its depth's name."""
-    return {name: held for depth in model.mtp if (name := depth.name) and (held := depth.cache_spec(rows))}
-
-
-def drafter_cache(model: CausalTransformer, rows: int) -> CacheSpec:
-    """`model`'s block drafter's window caches for `rows` rows, each under its stage's name."""
-    return {name: held for stage in model.dspark_stages
-            if (name := stage.name) and (held := stage.cache_spec(rows))}
+def named_caches(holders: Sequence[nn.Module], rows: int) -> CacheSpec:
+    """The decode caches of a decoder's `holders` kept apart from its trunk's, its prediction depths' or its
+    block drafter's stages', for `rows` rows, each under its holder's name."""
+    return {name: held for holder in holders if (name := holder.name) and (held := holder.cache_spec(rows))}
 
 
 def _banked_layer(model: CausalTransformer, run: int):

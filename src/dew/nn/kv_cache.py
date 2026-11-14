@@ -111,9 +111,9 @@ class Opened:
     """One decode-cache leaf as its holder opens it: its shape, its dtype, and what it holds before any
     write, `fill` (the value every element takes, or a function of no argument that builds the leaf: a
     paged cache's page table). Each holder states its leaves so, its `cache_spec`, and both its decode's
-    first write and `init_cache` open them from that statement (`cache_variables`, `opened`), so neither can
-    open a leaf the other does not. The dtype is the one the holder's writes carry, which `kept` holds
-    them to."""
+    first write and `init_cache` open them from that statement (`cache_variables`, `materialized`), so
+    neither can open a leaf the other does not. The dtype is the one the holder's writes carry, which
+    `kept` holds them to."""
 
     shape: tuple[int, ...]
     dtype: jax.typing.DTypeLike
@@ -193,14 +193,14 @@ def stacked_spec(specs: Sequence[CacheSpec]) -> CacheSpec:
 
 
 def put_opened(module: nn.Module, spec: CacheSpec) -> None:
-    """Put the cache `spec` states into `module`'s cache collection, each leaf opened (`opened`), under
+    """Put the cache `spec` states into `module`'s cache collection, each leaf opened (`materialized`), under
     the names the holders keep them by, its children's in theirs: a model's `init_cache`, which traces no
     forward."""
-    for name, value in opened(spec).items():
+    for name, value in materialized(spec).items():
         module.put_variable("cache", name, value)
 
 
-def opened(spec: CacheSpec) -> dict:
+def materialized(spec: CacheSpec) -> dict:
     """The cache `spec` states, each leaf opened (`Opened`): what `init_cache` returns, with no forward
     traced."""
     return jax.tree.map(_open, dict(spec))
