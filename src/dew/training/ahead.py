@@ -111,6 +111,10 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
+_UNTUNED = ("this step was compiled ahead into a file for %s GPUs without their tuned choices, XLA's "
+            "untuned program; a run's compile on such a GPU tunes it, and a job's prepare into the "
+            "persistent cache takes the choices such runs wrote")
+
 @functools.cache
 def compile_only_tpus(topology: str) -> tuple:
     """The devices of the TPU `topology` ('v5e:4x4', as `jax.experimental.topologies` names one), none
@@ -337,6 +341,10 @@ class AheadOfTime:
     built: BuildTarget | None = None
     """The target its executable was built for (`BuildTarget`), which a process loading it must be
     (`loaded`); None for a step compiled ahead before steps recorded it, which no process loads."""
+    tuned: bool = True
+    """Whether its compile took the GPU kind's tuned choices, as the device's own compile makes them: a step
+    compiled ahead into a file is XLA's untuned program there (`AheadTarget`), which its save and its load
+    say."""
     refusals: tuple = ()
     """The kernel launch configs its compiles found spilling and refused
     (`dew.nn.kernels.templates.report.refused_launches`), which a run handed the step refuses before it
@@ -385,6 +393,8 @@ class AheadOfTime:
 
     def save(self, path: str | Path) -> None:
         """Write the step to `path`, for `load` on a host of its topology."""
+        if not self.tuned:
+            _log.warning(_UNTUNED, self.generation)
         Path(path).write_bytes(filed(self))
 
     @staticmethod
@@ -397,6 +407,8 @@ class AheadOfTime:
                              "ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
         _current(path, "step", [step.executable, *sampled])
+        if not vars(step).get("tuned", True):
+            _log.warning(_UNTUNED, step.generation)
         return step
 
     def loaded(self) -> jax.stages.Compiled:
@@ -907,8 +919,10 @@ class AheadTarget:
     generation: str
     devices: int
     path: str | None = None
-    """Where the step is saved (`AheadOfTime.save`); none where `phases` names the steps, which the
-    run's persistent compilation cache keeps."""
+    """Where the step is saved (`AheadOfTime.save`). None keeps it in the run's persistent compilation
+    cache alone, with every later data phase's step (`later_phases`), where the run's compiles find them:
+    a job's prepare for its node's run (`--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY`, row 5460);
+    or where `phases` names the steps."""
     capacity_gib: float | None = None
     frontier: bool = False
     """Whether the report lists each rung above the plan that fits at fewer microbatches than every plan
@@ -968,22 +982,37 @@ class AheadTarget:
         stated_limit(list(trainer.device_mesh.devices.flat))
         batch = first_step_batch(trainer, loader, steps, examples, resume)
         topology = None if self.topology is None else Path(self.topology).read_bytes()
-        if self.phases:
-            # Each later phase's step, into the persistent cache its run reads, its evaluations the first's,
-            # each planned afresh at the split the run was given, as its run plans it at its boundary.
-            last: AheadOfTime | None = None
-            for phase in self.phases:
+        if self.path is not None and not self.phases:
+            # As XLA compiles it without a GPU's tuned choices, which the step's record, its save and its
+            # load say: a host's autotune cache holds some of a kind's choices or none, and a step a device
+            # runs takes all of them or none (`report.for_devices`, which the persistent cache's steps take).
+            ahead = dataclasses.replace(
+                _compiled_ahead(trainer, batch, frontier=self.frontier, plan=plan, topology=topology),
+                tuned=False)
+            ahead.save(self.path)
+            return CompiledAhead(self.path, ahead)
+        # Into the persistent cache the run reads alone: the steps of the phases named, or the first step
+        # and each later phase's, as a job's prepare compiles its node's run (`topology`, row 5460). A
+        # phase's step is planned afresh at the split the run was given, as its run plans it at its
+        # boundary; the evaluations' programs compile with the first step's.
+        batches = ([phase_batch(trainer, batch, phase) for phase in self.phases] if self.phases else
+                   [batch, *(phase_batch(trainer, batch, phase) for phase in later_phases(trainer, batch))])
+        ahead = None
+        for index, stepped in enumerate(batches):
+            first = not index and not self.phases
+            if not first:
                 trainer._planned_afresh()
-                last = _compiled_ahead(trainer, phase_batch(trainer, batch, phase), frontier=False, plan=None,
-                                       topology=topology)
-                _log.info("the step of data phase %d compiled ahead in %.1f s", phase, last.planned_seconds)
-            assert last is not None, "a target of phases names one"
-            return CompiledAhead(None, last)
-        if self.path is None:
-            raise ValueError("a step compiled ahead is saved where its target's path says; name one")
-        ahead = _compiled_ahead(trainer, batch, frontier=self.frontier, plan=plan, topology=topology)
-        ahead.save(self.path)
-        return CompiledAhead(self.path, ahead)
+            try:
+                # Into a cache a device run reads as tuned: every choice the GPU kind's runs tuned, or none.
+                with report.for_devices():
+                    ahead = _compiled_ahead(trainer, stepped, frontier=False, plan=plan if first else None,
+                                            topology=topology)
+            except report.Untuned as untuned:
+                # Its run compiles it on the device, which tunes it, and the next prepare finds it.
+                _log.warning("a step is not preparable until a device run has tuned it: %s", untuned)
+                continue
+            _log.info("a step compiled ahead into the cache in %.1f s", ahead.planned_seconds)
+        return CompiledAhead(None, ahead)
 
 
 def stated_limit(devices: Sequence) -> int | None:
@@ -1045,9 +1074,12 @@ class CompiledAhead(SystemExit):
     Compiling was the whole run, so uncaught it ends the program with status 0 and no traceback, the
     step's cost logged; `ahead` is the step (the last phase's) and `path` where it was saved, if it was."""
 
-    def __init__(self, path: str | None, ahead: AheadOfTime):
+    def __init__(self, path: str | None, ahead: AheadOfTime | None):
         super().__init__(0)
         self.path, self.ahead = path, ahead
+        if ahead is None:
+            _log.info("no step compiled ahead: none was preparable until a device run has tuned it")
+            return
         _log.info("the step compiled ahead for %s %s GPUs holds %s bytes a device at its peak; saved to "
                   "%s", ahead.devices, ahead.generation, ahead.peak_bytes, path or "the compilation cache")
         if ahead.plan is not None:
@@ -1132,16 +1164,12 @@ class LaterPlans:
         phases = later_phases(trainer, batch)
         if not phases:
             return None
+        from dew.training._candidates import _shapes
         from dew.training.compiler import fresh
 
-        shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
-                                                                sharding=getattr(leaf, "sharding", None)),
-                              fresh(state))
-        # A phase's step is planned at its boundary where its pass count changes (`PhasePasses.begins`):
-        # the first later phase of each count none before it ran.
+        shapes = _shapes(fresh(state))
         counts = trainer.phase_passes.counts
-        seen = {counts[int(batch[PHASE].index)]}
-        begun = [phase for phase in phases if counts[phase] not in seen and not seen.add(counts[phase])]
+        begun = trainer.phase_passes.begun(int(batch[PHASE].index), phases)
         # Each plan traces under the loop's contexts as it stands, its JAX states carried (`carried`: they
         # hold per thread), its context variables copied.
         entered = carried()
@@ -1193,8 +1221,6 @@ def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Train
 
     phases = trainer.phase_passes.apart(passes)
     compiler = StepCompiler(phases.base, trainer._compiler.links(trainer.device_mesh), None, phases)
-    # Its empty window binds no split, as at the boundary (`StepCompiler.afresh`).
-    compiler.afresh = True
     stepping = trainer._stepping(phases.base, compiler)
     stepping = dataclasses.replace(stepping, shape=dataclasses.replace(stepping.shape,
                                                                        split=trainer._given_split))

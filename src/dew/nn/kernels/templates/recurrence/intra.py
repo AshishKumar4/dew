@@ -48,13 +48,14 @@ def _intra_held(call: Call, block: int, outputs: int = 1) -> Held:
     """`_intra_walk`'s consumer thread at key block `block` forming `outputs` pairs' sums, which its walk
     holds across the key blocks (`mosaic.Walk.sums`: in registers, but where its family keeps them in memory
     of its own, `Issuer.keeps_sums`): the block's prefix scan (its running pair, a shifted pair and the
-    decay); then the factors every output shares beside the block's tiles, staged before any product is issued
-    (`algebra.key_block_pairs`): its prefix halves and their separated pair, the rows' grid and their gate
-    down, the keys, a sub-chunk's keys gated up and an output's rows gated down as each is formed and staged
-    in its parts, their masks, and a product's operands (a row block against a chunk of keys, read
-    transposed). The pairs read their rows' grid alone (`algebra.key_block_pairs`), one int32 tile: its
-    columns' too stated 256 and 254 registers for an sm100's two intra launches, where ptxas held each at 248
-    spilling none, least 232 (armada recurrence-unused-grid-proof)."""
+    decay); then the factors every output shares beside the block's tiles across its sub-chunks, each
+    sub-chunk's operands staged and its products issued in turn (`algebra.key_block_pairs`): its prefix halves
+    and their separated pair, the rows' grid, each output's rows gated down, the keys, a sub-chunk's keys
+    gated up and an output's rows masked to it as each is formed and staged in its parts, their masks, and a
+    product's operands (a row block against a chunk of keys, read transposed). The pairs read their rows' grid
+    alone (`algebra.key_block_pairs`), one int32 tile: its columns' too stated 256 and 254 registers for an
+    sm100's two intra launches, where ptxas held each at 248 spilling none, least 232 (armada
+    recurrence-unused-grid-proof)."""
     chunk = call.chunk
     pairing = _pairing_operand(call)
     paired = product_fragments(call, (pairing, chunk, block), (pairing, block, chunk), rhs_transposed=True)
@@ -273,15 +274,18 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                 set `r`'s rows gated down."""
                 return operands.staged(family, value, raised[s - 1] if r is None else lefts[r][s - 1])
 
-            # Every operand staged before any product, published once (`Family.staged_together`).
-            with family.staged_together():
-                pairs = algebra.key_block_pairs([functools.partial(rows, name) for name in products],
-                                                operand("keys"), whole, at_token, staged, chunk=chunk,
-                                                scales=[shrinking if name == "scores" else 1.0
-                                                        for name in products])
             issuer = Issuer(call)
-            return carry, tuple(issuer.summed(found, into=acc)
-                                for found, acc in zip(pairs, accumulators, strict=True))
+            for formed in algebra.key_block_pairs([functools.partial(rows, name) for name in products],
+                                                  operand("keys"), whole, at_token, staged, chunk=chunk,
+                                                  scales=[shrinking if name == "scores" else 1.0
+                                                          for name in products]):
+                # A sub-chunk's operands staged and published once (`Family.staged_together`), its products
+                # issued then, running under the next sub-chunk's forming.
+                with family.staged_together():
+                    found = formed()
+                accumulators = tuple(issuer.summed([product], into=acc)
+                                     for product, acc in zip(found, accumulators, strict=True))
+            return carry, accumulators
 
         def read(carry, totals):
             """The sums once the walk is done, the system masked once (a row whose write gate overflows
