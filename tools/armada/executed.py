@@ -10,7 +10,7 @@ and every file's before collection.
 What the recorder logs is everything the process executed, read, imported and started, as it happened
 (lifetime.py), which the supervisor reads once the process has exited: this plugin decides no record. It
 writes how collection found each file (`DEW_COLLECTED`), which accounts for a file whose every test the
-selection set aside, and which tests carry the marks a row names (`whole_suite`, `release_env`)."""
+selection set aside."""
 
 import ctypes
 import json
@@ -28,7 +28,7 @@ if lifetime.log is None:
 # reads from outside it once its deadline passes, and puts in its row before its interrupt (ci.py's
 # `dumped`): a stall names its call site, one in collection or a fixture's setup too, which pytest's report
 # of the interrupt cannot (2026-11-03: a group stalled 28 minutes in a read with no deadline, its row saying
-# only that no tests ran). pytest's own id, past a launcher before it (a release check's `uv run`). Taken
+# only that no tests ran). pytest's own id. Taken
 # out of the environment, so no pytest a test starts writes over it.
 if written := os.environ.pop("DEW_PYTEST_PID", None):
     reader = int(os.environ.pop("DEW_STACKS_READER"))
@@ -47,14 +47,6 @@ collected: dict[str, int] = {}
 is 0."""
 deselected: dict[str, int] = {}
 """Each test file's tests the selection set aside, as pytest reports it (`pytest_deselected`)."""
-released: dict[str, dict[str, list[str]]] = {}
-"""Each test file's release checks, by the requirement each runs under, as pytest resolves a node's
-release_env mark, recorded before any selection: its row names them, and a whole suite's run plans their
-tasks from it (`ci.py release-plan`)."""
-whole_suite: dict[str, list[str]] = {}
-"""Each test file's tests marked whole_suite, by their node ids, as pytest resolves a node's marks (its own,
-its class's, its module's, a parameter set's, a conftest's), every one collected, those the selection sets
-aside among them: the file's row names its cells (`ci.py slow`, verdict.sh's record of what main holds)."""
 SHARED_SCOPES = ("session", "package")
 """The fixture scopes whose making and ending serve every file after them: they run for every file."""
 
@@ -108,27 +100,6 @@ def tally(counts: dict[str, int], items) -> None:
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items):
     tally(collected, items)
-    # Every cell collected, those a train's run sets aside among them: main holds its cells though its train
-    # CI never times one, so a whole-suite run of one main has is no new slow test (verdict.sh).
-    for item in items:
-        if item.get_closest_marker("whole_suite"):
-            whole_suite.setdefault(item.nodeid.split("::")[0], []).append(item.nodeid)
-    # Before any selection sets them aside, as every run but a release check's does (`ci.py selected`).
-    # A mark that names no one requirement string fails the collection: set aside from every run, no
-    # release task would plan its test, which would run nowhere.
-    for item in items:
-        marks = list(item.iter_markers("release_env"))
-        if not marks:
-            continue
-        named = {mark.args[0] for mark in marks
-                 if len(mark.args) == 1 and isinstance(mark.args[0], str) and not mark.kwargs}
-        if len(named) != 1 or any(len(mark.args) != 1 or mark.kwargs for mark in marks):
-            raise pytest.UsageError(
-                f"{item.nodeid}: release_env takes one requirement string, as "
-                f"release_env(\"transformers==5.18.0\"); it has "
-                f"{', '.join(f'args {mark.args} kwargs {mark.kwargs}' for mark in marks)}")
-        checks = released.setdefault(item.nodeid.split("::")[0], {})
-        checks.setdefault(named.pop(), []).append(item.nodeid)
 
 
 def pytest_deselected(items):
@@ -185,7 +156,5 @@ def pytest_sessionfinish(session):
     lifetime.switch(lifetime.SHARED)
     if counted := os.environ.get("DEW_COLLECTED"):
         with open(counted, "w") as out:
-            json.dump({name: {"collected": count, "deselected": deselected.get(name, 0),
-                              **({"whole_suite": whole_suite[name]} if name in whole_suite else {}),
-                              **({"release_env": released[name]} if name in released else {})}
+            json.dump({name: {"collected": count, "deselected": deselected.get(name, 0)}
                        for name, count in collected.items()}, out)
