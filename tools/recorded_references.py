@@ -380,6 +380,30 @@ def _weighed(label: str, records, scaled) -> dict[str, np.ndarray]:
     return result
 
 
+def record_torch_summary(path: Path, label: str, draw, run, *, name: str, revision: str, command: str,
+                         reference: str, license: str) -> Path:
+    """`label`'s recording at `path` of a torch reference over check 1's seeds (`record_case`'s summary):
+    `run(inputs, dtype)` its outputs in a torch dtype on a seed's inputs (`draw(seed)`, which the test draws
+    again), its float32 run's evidence from its float64 run, with its provenance (`name` at `revision`, run
+    by `command` on the CPU). Returns the file written (`save`)."""
+    import torch
+
+    from _dew_torch.precision import float64
+
+    def evaluate(inputs):
+        found = run(inputs, torch.float32)
+        with float64():
+            truth = run(inputs, torch.float64)
+        return found, truth
+
+    with jax.enable_x64(new_val=True):
+        recorded = record_case(label, draw, evaluate, store_inputs=False, summary=True)
+    recorded[f"{label}.provenance"] = provenance(name, revision, "cpu", command, torch=torch.__version__)
+    written = save(path, recorded, reference=reference, license=license)
+    print(f"{written}: {written.stat().st_size} bytes", flush=True)
+    return written
+
+
 def record_truths(label: str, draw, evaluate, count: int, *, followed: bool = False) -> dict[str, np.ndarray]:
     """A recording of the reference's float64 truth alone at its first `count` draws (`draw(seed)`, the
     inputs, `evaluate(inputs)` as `record_case`'s, its float32 outputs unread): each draw's inputs

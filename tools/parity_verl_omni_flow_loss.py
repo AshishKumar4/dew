@@ -104,29 +104,14 @@ def dew_loss(inputs: dict) -> dict:
 
 
 def write_recording(command: str) -> None:
-    """RECORDED: verl-omni's loss recorded over check 1's seeds (`record_case`'s summary), its float32
-    run's evidence from its float64 run."""
-    import jax
-    import torch
-    from fetched_fixtures import save
-    from recorded_references import provenance, record_case
+    """RECORDED: verl-omni's loss recorded over check 1's seeds (`record_torch_summary`)."""
+    from recorded_references import record_torch_summary
 
-    from _dew_torch.precision import float64
-
-    reference = fetched_reference()
-
-    def evaluate(inputs):
-        found = verl_omni_loss(reference, inputs, torch.float32)
-        with float64():
-            truth = verl_omni_loss(reference, inputs, torch.float64)
-        return found, truth
-
-    with jax.enable_x64(new_val=True):
-        recorded = record_case("loss", loss_inputs, evaluate, store_inputs=False, summary=True)
-    recorded["loss.provenance"] = provenance("verl-omni FlowGRPOLoss.compute_loss", COMMIT, "cpu", command,
-                                             torch=torch.__version__)
-    written = save(RECORDED, recorded, reference=f"verl-omni {COMMIT}", license="Apache-2.0")
-    print(f"{written}: {written.stat().st_size} bytes", flush=True)
+    compute_loss = fetched_reference()
+    record_torch_summary(RECORDED, "loss", loss_inputs,
+                         lambda inputs, dtype: verl_omni_loss(compute_loss, inputs, dtype),
+                         name="verl-omni FlowGRPOLoss.compute_loss", revision=COMMIT, command=command,
+                         reference=f"verl-omni {COMMIT}", license="Apache-2.0")
 
 
 def main() -> None:
