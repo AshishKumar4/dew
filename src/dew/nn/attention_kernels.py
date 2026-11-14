@@ -7,7 +7,6 @@ import dataclasses
 import functools
 import importlib
 import importlib.util
-import logging
 import math
 from typing import NamedTuple
 
@@ -23,8 +22,6 @@ from .kernels.selection import Kernel, Op, Requirement
 from .kernels.templates import attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
 from .precision import wide_cpu_arithmetic
-
-_log = logging.getLogger(__name__)
 
 SIXTEEN_BIT = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
 """The operands FlashAttention's kernels and tokamax's Triton attention are built for, which neither states
@@ -628,10 +625,10 @@ def _dense_peak_of(rows: int, queries: int, heads: int, keys: int, kv_heads: int
                    causal: bool, placed, mesh, assumed) -> int | None:
     """`_dense_peak` of a call of these shapes, each operand `placed` whole (on the context's `mesh` where
     None), compiled once a shape, mesh and device `assumed` through Dew's compile point (`options.jit`) by
-    Dew's one call of XLA's compile for its target (`report.xla_compiled`: a compile-only device's flags,
-    its autotuning off and its sorts' scratch XLA's table's): a device's arguments, its outputs past those
-    they alias, and its temporaries (`compiled_memory`); none where the step compiles only once a device
-    run has tuned it (`report.Untuned`), its memory analysed by no compile here."""
+    Dew's one call of XLA's compile for its target (`report.xla_compiled`), offline whatever compiles around
+    it (`report.read_offline`: a program read for its memory alone, which no device runs, so a prepare's
+    compile ahead judges a call as its device run does): a device's arguments, its outputs past those they
+    alias, and its temporaries (`compiled_memory`)."""
     del mesh, assumed
     import jax
 
@@ -641,12 +638,8 @@ def _dense_peak_of(rows: int, queries: int, heads: int, keys: int, kv_heads: int
 
     query = jax.ShapeDtypeStruct((rows, queries, heads, width), dtype, sharding=placed)
     key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), dtype, sharding=placed)
-    try:
+    with report.read_offline():
         compiled = report.xla_compiled(options.jit(_dense_step(causal)).lower(query, key, key, query), None)
-    except report.Untuned as untuned:
-        _log.warning("jax.nn's xla attention's training step at %s is not analysed until a device run has "
-                     "tuned it: %s", (rows, queries, heads, keys, kv_heads, width, dtype), untuned)
-        return None
     memory = compiled_memory(compiled)
     return None if memory is None else memory.argument + memory.output - memory.alias + memory.temp
 

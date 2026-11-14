@@ -781,6 +781,19 @@ def for_devices() -> Iterator[None]:
         _FOR_DEVICES.reset(held)
 
 
+@contextlib.contextmanager
+def read_offline() -> Iterator[None]:
+    """Within the block, a deviceless GPU compile is one only read for its memory or text, whatever
+    `for_devices` holds around it (a call's plan judging a program no device runs, inside a prepare that
+    compiles a step ahead): it skips the autotuner and keeps XLA's sorts as they fall back (`targeted`'s
+    offline compile), so it needs no device run's tuning."""
+    held = _FOR_DEVICES.set(False)
+    try:
+        yield
+    finally:
+        _FOR_DEVICES.reset(held)
+
+
 def autotuned(devices: Sequence) -> bool:
     """Whether a program compiled for `devices` takes XLA's tuned choices (`targeted`): any device that
     runs, or compile-only GPUs within `for_devices`; a deviceless GPU compile outside it is read at
