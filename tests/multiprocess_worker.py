@@ -865,7 +865,7 @@ def text_to_image(args):
     fixture, and this process's share of a batch of its images and prompts."""
     from dew.diffusion import presets
     from dew.inputs import Condition, Field, InputSpec
-    from dew.inputs.encoders import CLIPText
+    from dew.interop.encoders import CLIPText
     from dew.nn.backbones.dit import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
 
