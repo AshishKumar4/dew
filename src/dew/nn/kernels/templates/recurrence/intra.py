@@ -7,6 +7,7 @@ nothing of the mainloop reads them."""
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable
 
 import jax
@@ -214,12 +215,12 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                      functools.partial(_intra_staged, call, products=products),
                      functools.partial(_intra_streamed, call, queries=scored), contracted=True)
     steps = width // keys
-    # The scores' scale where each part stays in range: up to one on the gated rows, which shrinks every
-    # product and so every sum held across the key blocks (the pairs of two unscaled blocks near fp32's
-    # largest pass it); past one on the read sums, whose products a gated-up key may attenuate after a row's
-    # scale would have overflowed it (a query of 1e30 at a scale of 1e10).
-    shrinking = min(scale, 1.0)
-    growing = scale / shrinking
+    # The scores' scale where each part stays in range: its magnitude up to one on the gated rows, which
+    # shrinks every product and so every sum held across the key blocks (the pairs of two unscaled blocks
+    # near fp32's largest pass it); past one, and its sign, on the read sums, whose products a gated-up key
+    # may attenuate after a row's scale would have overflowed it (a query of 1e30 at a scale of 1e10).
+    shrinking = min(abs(scale), 1.0)
+    growing = math.copysign(max(abs(scale), 1.0), scale)
 
     def program(at, q_ref, k_ref, g_ref, beta_ref, taken_ref, *outs, streams, staging, landing):
         n, h = at["chunks"], at["heads"]
