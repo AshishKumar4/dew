@@ -169,7 +169,8 @@ def test_a_lanes_files_ask_beside_their_reports_and_a_follow_up_hands_each_the_a
         ci, tmp_path, monkeypatch, cache_worker):
     """Each file a GPU lane runs writes its sites' asks for their later units (check 1's LATER) beside its
     report, where its receipt carries them; a follow-up lane given those asks (`asked`, check 1's ASKED) hands
-    them to each file's process, and its run reuses no row the test cache holds: a follow-up judges what the run it follows left undecided, never a green earned before (Main,
+    them to each file's process, and its run reuses no row the test cache holds: a follow-up judges what the
+    run it follows left undecided, never a green earned before (Main,
     2026-11-14; train 859's review: one channel, the LATER asks)."""
     url, stored, _ = cache_worker
     gpu_lane_at(tmp_path, monkeypatch, url, 0)
