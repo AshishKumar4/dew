@@ -12,10 +12,11 @@ from test_recurrence_chunk import assert_packed_on_par, hosted, sigmoid
 
 from dew.nn.kernels.log_linear import levels, log_linear_attention
 
-ROWS, LENGTH, GROUPS, HEADS, WIDTH, VALUES = 2, 40, 1, 2, 16, 8
-"""Two rows of 40 tokens (six levels), one key group serving two value heads."""
-DOCUMENTS = ((0, 13, 22), (0, 9, 33))
-"""Each row's packed documents' first tokens."""
+ROWS, LENGTH, GROUPS, HEADS, WIDTH, VALUES = 2, 136, 1, 2, 16, 8
+"""Two rows of 136 tokens (nine levels: zero to six within a 64-token block, `log_linear.WITHIN`, seven and
+eight a recurrence each), one key group serving two value heads."""
+DOCUMENTS = ((0, 13, 50), (0, 70, 99))
+"""Each row's packed documents' first tokens: a document of 86 and one of 70 tokens reach level seven."""
 SEEDS = {False: 32, True: 32}
 """Each site's declared seeds (one sequence, packed), sized by `seeds_for` on armada."""
 
