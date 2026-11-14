@@ -623,57 +623,6 @@ def _replaced(config, **changes):
         return refusal
 
 
-@dataclasses.dataclass(frozen=True)
-class _Staging:
-    """An `Oversized` launch's config: the float32 words its program stages in shared memory."""
-    words: int
-
-
-@dataclasses.dataclass(frozen=True)
-class _Oversized(tuning.KernelOp):
-    """A launch staging its config's words in shared memory and copying its operand through them."""
-    config_cls: Any = _Staging
-
-    def _fwd(self, x, *, config, return_residuals=False):
-        from jax.experimental.pallas import mosaic_gpu as plgpu
-
-        def body(x_ref, out_ref, staged):
-            out_ref[...] = x_ref[...] + staged[:x_ref.shape[0]]
-
-        kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(x.shape, x.dtype),
-                              scratch_types=[plgpu.SMEM((config.words,), jnp.float32)])
-        return kernel(x), None
-
-    def _get_heuristics_config(self, ba):
-        return _Staging(128)
-
-
-@lowers("sm90")
-def test_a_launch_no_block_holds_is_named_uncertified_and_fails_the_gate():
-    """A launch whose program stages more shared memory than an H100's block holds, certified on a
-    compile-only H100 (`report.certified`): XLA refuses to compile it alone, so certification names it
-    (`report.uncertified`), which the compile gate fails (`mosaic_failures`); one within the block is
-    certified, nothing named."""
-    from kernel_compile import mosaic_failures
-
-    from dew.training.ahead import compile_only_gpus
-
-    op = _Oversized()
-    ba = op.bind(jax.ShapeDtypeStruct((128,), jnp.float32))
-    named = report.uncertified()
-    with generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]):
-        assert report.certified(op, ba, _Staging(128)) == ()
-        assert set(report.uncertified()) == set(named)
-        assert report.certified(op, ba, _Staging(256 * 1024)) == ()
-    refused = {key: why for key, why in report.uncertified().items() if key not in named}
-    assert len(refused) == 1, refused
-    record = {"name": "oversized", "limit": 232448, "tmem_limit": 0,
-              "kernels": [{"kernel": "k", "unread": [], "shared": 512, "tmem": 0, "registers": 32,
-                           "spilled": 0}],
-              "uncertified": list(refused.values())}
-    assert mosaic_failures([record])
-
-
 def _model(launch, ba, config) -> resources.RegisterModel:
     """What a launch's model decides at `config` for the call `ba` at its residency (`Tiles.programs`, where
     the launch's own model, `mosaic_gpu.gmm`'s `registers`, decides its register moves, which the gate holds

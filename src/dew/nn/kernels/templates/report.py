@@ -401,9 +401,10 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     program retraced, where a compile's refusal retraces the whole program (`settled`): a B200's 4B step
     stepped its attention forward 19 times that way, 42 minutes, every rewalk a step's trace. None on a
     process compiling for no GPU or an interpreted launch; none for a launch XLA does not compile alone (a
-    collective's, a block past its shared memory), which its program's compile reads as before (`settled`)
-    and `uncertified` names. Once a process, by launch (`certifications`), and once a GPU model a machine:
-    each verdict, an accepted config's and a refused one's, is stored with the kernel picks
+    collective's, its devices the program's), which its program's compile reads as before (`settled`) and
+    `uncertified` names; a launch Mosaic refuses as it lowers (a block past its shared memory) raises here
+    as its program's lowering would. Once a process, by launch (`certifications`), and once a GPU model a
+    machine: each verdict, an accepted config's and a refused one's, is stored with the kernel picks
     (`_verdict_key`), so a warm start traces and compiles nothing to certify."""
     device = _certifying_device()
     if device is None or arguments.arguments.get("interpret"):
@@ -423,9 +424,8 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
         try:
             kernels = _compiled_launch(op, arguments, config, device, reverse)
         except jax.errors.JaxRuntimeError as error:
-            # XLA refuses the launch alone (its block's shared memory, a collective's devices): its program's
-            # compile refuses it as it did before certification (`settled`), and the gate names it
-            # (`uncertified`).
+            # XLA refuses the launch alone (a collective's devices): its program's compile reads it as it did
+            # before certification (`settled`), and the gate names it (`uncertified`).
             _log.warning("launch %s at %s is not certified: XLA does not compile it alone (%s)",
                          type(op).__name__, config, str(error)[:200])
             with _GUARD:
