@@ -15,10 +15,10 @@ from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 
-from dew.config.release import Release
 from dew.decision.calibration import Calibration
 from dew.decision.layout import Layout
 from dew.interop.release import ReleaseDtypes, ReleaseTask
+from dew.interop.release_record import Release
 from dew.nn.precision import Numerics
 from dew.registry import dtype_name, from_record, to_record
 
@@ -64,7 +64,7 @@ def released_length(directory: Path, default: int) -> int:
 
 
 def _loaded(directory: Path) -> Release | None:
-    from dew.config.release import Release
+    from dew.interop.release_record import Release
 
     return Release.load(directory)
 
