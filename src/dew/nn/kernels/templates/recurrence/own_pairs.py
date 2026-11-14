@@ -212,7 +212,7 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
     gradients `d_scores` and `d_system` `[R, HV * C]`: a launch of their own, no products on the tensor
     cores, as the forward's (`intra_own`), each key block's offsets reading the pairs' gradients' own bands
     (`algebra.own_bands`, taken once from the squares, a column an offset, `algebra.band_strip`) and the keys
-    and separated prefix shifted (`shifted_keys`). In `_key_pairs_back`'s walk, they held an H100's Kimi
+    and the tokens' own decays shifted (`shifted_keys`). In `_key_pairs_back`'s walk, they held an H100's Kimi
     Linear launch at 248 registers, 2268 us against 672 (M-JS-50d)."""
     chunk, width, family = call.chunk, call.width, call.family
     given, gates, square = call.given, call.gates, fp32_operand(call)

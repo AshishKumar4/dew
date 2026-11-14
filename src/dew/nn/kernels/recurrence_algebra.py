@@ -687,11 +687,6 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
     return products
 
 
-Shifted = Callable[[int], Callable[[jax.Array], tuple]]
-"""A key block's shifted reads (`key_diagonal_bands`): `shifted(c)` readies block `c`'s, `shifted(c)(e)` its
-keys and separated prefix (`separated`'s whole and fraction) each row holding the token `e` before its own's:
-separated once as they are staged, not again at each of a sub-chunk's offsets."""
-
 
 def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub: int = SUB) -> list:
     """Each sub-chunk's own pairs of one key block under a decay a key dimension, each its own decay, as a
