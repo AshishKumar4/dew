@@ -196,9 +196,9 @@ def _rows_of(ref, keys: int) -> jax.Array:
 
 
 def intra_masked(found: jax.Array, *, strict: bool, scale: float) -> jax.Array:
-    """An output's pairs `found` (a key block's factored pairs, or the sub-chunks' own placed,
-    `algebra.banded`) as its sum takes them: below the diagonal where `strict` (the system), else on and
-    below it and scaled (the scores)."""
+    """An output's pairs `found` (a key block's factored pairs) as its sum takes them: below the diagonal
+    where `strict` (the system), else on and below it and scaled (the scores); the sub-chunks' own pairs'
+    bands alike, in their form (`algebra.band_masked`)."""
     lag = algebra._lags(found.shape)
     return jnp.where(lag > 0, found, 0.0) if strict else jnp.where(lag >= 0, found, 0.0) * scale
 

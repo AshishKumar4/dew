@@ -239,12 +239,13 @@ class _Run:
 
 def _paired(q, k, decays, beta, taken, call, *, scale: float, solves: bool) -> tuple:
     """`intra._intra`'s scores, system where it `solves`, and prefix halves, each sub-chunk's own pairs
-    added from a launch of their own (`own_pairs.intra_own`), on the entries the walk leaves zero, each
-    rounded once: their sums exact in the outputs' forms."""
+    added from a launch of their own (`own_pairs.intra_own`'s bands, placed, `algebra.placed_bands`), on the
+    entries the walk leaves zero, each rounded once: their sums exact in the outputs' forms."""
     *walked, hi, lo = _intra(q, k, decays, beta, taken, call, scale=scale, solves=solves)
     own = own_pairs.intra_own(q, k, hi, lo, beta, taken, call, scale=scale,
                               products=("scores", "system") if solves else ("scores",))
-    return (*(found + mine for found, mine in zip(walked, own, strict=True)), hi, lo)
+    return (*(found + algebra.placed_bands(mine, chunk=call.chunk)
+              for found, mine in zip(walked, own, strict=True)), hi, lo)
 
 
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
