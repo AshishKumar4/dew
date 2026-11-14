@@ -136,6 +136,19 @@ def test_moe_mesh_example_routes_and_serves_on_eight_cpu_devices(tmp_path):
     assert "<svg" in (out / "moe-mesh.svg").read_text()
 
 
+def test_moe_mesh_example_records_the_global_dispatch_its_layers_run(tmp_path):
+    """Asked the global dispatch on the same eight-device mesh, the example records the dispatch its layers
+    ran by their own rule (`Mixture.dispatch_over`), global, whatever all-to-all XLA's partitioner adds to
+    the compiled step, which it prints as a diagnostic alone (ledger 4775: the example read its dispatch off
+    that count, a second way to decide what the rule decides)."""
+    out = tmp_path / "mesh"
+    smoke("moe_mesh", out, "--out", str(out), "--steps", "1", "--snapshot-every", "1",
+          "--batch-size", "8", "--sequence-length", "12", "--experts", "2", "--top-k", "1",
+          "--dispatch", "global", smoke_args=False, devices=8)
+    record = json.loads((out / "moe-mesh.json").read_text())
+    assert record["dispatch"] == "global", record["all_to_all_ops"]
+
+
 @pytest.mark.parametrize("section", ["reliability"])
 def test_landing_snippet_runs(section, tmp_path):
     """Each landing cell runs, offline from small fixtures, and does what it shows."""
