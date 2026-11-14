@@ -921,7 +921,7 @@ def test_a_trace_whose_transcript_is_not_the_gateways_json_leaves_the_trial_infr
 
 def test_an_agent_command_that_cannot_start_is_infra(tmp_path):
     """A command whose executable is missing raises OSError at its launch, the trial's own external
-    boundary: the session is INFRA_ERROR naming it, which the scheduler retries, not a failed future
+    boundary: the session is INFRA_ERROR, which the scheduler retries, not a failed future
     that aborts the rollout (ledger 1875)."""
     command = Command(lambda task, directory: [str(tmp_path / "missing-agent")],
                       lambda task, directory, code: 1.0, tmp_path / "work")
@@ -936,7 +936,7 @@ def test_an_agent_command_that_cannot_start_is_infra(tmp_path):
 
 def test_harbor_judges_an_unreadable_result_as_infra(tmp_path):
     """A trial whose result.json is not JSON is an infrastructure failure of the trial, an
-    INFRA_ERROR naming it, not a decode error that aborts the rollout (ledger 1875)."""
+    INFRA_ERROR, not a decode error that aborts the rollout (ledger 1875)."""
     from dew.interop.harness import Trial
 
     artifacts = tmp_path / "trial"
