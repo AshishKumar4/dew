@@ -14,7 +14,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import as_given, assert_as_exact, widened
+from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
 
 
 def allocated_bytes(monkeypatch, operation):
@@ -175,47 +175,50 @@ def dtype_arms(run):
 
 def torch_coder_walk(model, call, dtype, inputs) -> dict:
     """A source autoencoder's vector-Jacobian product, as check 1 compares it (`coder_walk`): `call(model,
-    operand)`'s outputs, a tuple, over a draw's channel-first `operand` at `dtype`, each dotted with its
-    probe among the draw's `probes`, differentiated for the operand and every parameter the source trains:
-    the outputs and the operand's gradient channels last, each parameter's gradient by its name, zero
-    where the outputs do not reach it."""
+    operand)`'s outputs, a tuple, over a draw's channel-first `operand` at `dtype`, under the draw's
+    `probes`, differentiated for the operand and every parameter the source trains
+    (`reference_error.torch_with_gradients`, the parameters swapped in by `torch.func.functional_call`):
+    the outputs and the operand's gradient channels last, each parameter's gradient by its name."""
     import torch
 
-    def tensor(value):
-        return torch.from_numpy(np.asarray(value)).to(dtype)
+    class Walked(torch.nn.Module):
+        """`call(model, operand)` as a module's forward, whose parameters `functional_call` swaps."""
 
-    named = [(name, value) for name, value in model.named_parameters() if value.requires_grad]
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = model
+
+        def forward(self, operand):
+            return call(self.model, operand)
+
+    walked = Walked()
+    weights = {f"model.{name}": value.detach().numpy() for name, value in model.named_parameters()
+               if value.requires_grad}
+
+    def forward(operand, weights):
+        return torch.func.functional_call(walked, weights, (operand,))
+
+    width = np.float64 if dtype == torch.float64 else np.float32
+    # Its own graph: a torch arm runs under `torch.no_grad` (`torch_arms`).
     with torch.enable_grad():
-        operand = tensor(inputs["operand"]).requires_grad_()
-        outputs = call(model, operand)
-        loss = torch.zeros((), dtype=dtype)
-        for output, probe in zip(outputs, inputs["probes"], strict=True):
-            loss = loss + (output * tensor(probe)).sum()
-        every = [operand, *(value for _, value in named)]
-        found = torch.autograd.grad(loss, every, allow_unused=True)
-    gradients = [torch.zeros_like(value) if gradient is None else gradient
-                 for gradient, value in zip(found, every, strict=True)]
-    return {"outputs": tuple(channels_last(output.detach().numpy()) for output in outputs),
-            "operand": channels_last(gradients[0].numpy()),
-            "parameters": {name: gradient.numpy()
-                           for (name, _), gradient in zip(named, gradients[1:], strict=True)}}
+        outputs, grad_operand, grad_weights = torch_with_gradients(forward)(
+            np.asarray(inputs["operand"], width), weights, tuple(inputs["probes"]))
+    return {"outputs": tuple(channels_last(output) for output in outputs),
+            "operand": channels_last(grad_operand),
+            "parameters": {name.removeprefix("model."): gradient for name, gradient in grad_weights.items()}}
 
 
 def coder_walk(call, params, layouts):
     """Dew's arm of a source autoencoder's vector-Jacobian product (`torch_coder_walk`), run as given:
     `call(params, operand)`'s outputs, a tuple, over a draw's channel-first `operand` moved channels last,
-    each dotted with its probe, differentiated for the operand and the parameters, each of `layouts`'
-    parameters' gradient written into its source tensor's layout as an export writes it, by the source
-    tensor's name."""
-    @jax.jit
-    def pulled(params, operand, probes):
-        outputs, pull = jax.vjp(call, params, operand)
-        return outputs, pull(probes)
+    under its probes (`reference_error.with_gradients`), each of `layouts`' parameters' gradient written
+    into its source tensor's layout as an export writes it, by the source tensor's name."""
+    pulled = jax.jit(with_gradients(call))
 
     @as_given
     def walked(inputs):
         probes = tuple(channels_last(probe) for probe in inputs["probes"])
-        outputs, (grad_params, grad_operand) = pulled(params, channels_last(inputs["operand"]), probes)
+        outputs, grad_params, grad_operand = pulled(params, channels_last(inputs["operand"]), probes)
         exported = {"autoencoder": grad_params}
         return {"outputs": tuple(np.asarray(output) for output in outputs),
                 "operand": np.asarray(grad_operand),

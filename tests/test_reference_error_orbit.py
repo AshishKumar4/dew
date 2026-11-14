@@ -265,7 +265,7 @@ def test_the_stages_log_names_a_judgements_narrow_leaves(tmp_path, monkeypatch):
     errors rest on check 2, and no other."""
     import json
 
-    from reference_error import STAGES_LOG
+    from check1_judge import STAGES_LOG
 
     log = tmp_path / "stages.jsonl"
     monkeypatch.setenv(STAGES_LOG, str(log))

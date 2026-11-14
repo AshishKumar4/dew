@@ -90,9 +90,10 @@ from arm_forms import (
     stacked_on_host as stacked_on_host,
     windows as windows,
 )
-from check1_wire import CENSUS, DRAWS, QUALIFY, STAGES
+from check1_judge import SWITCHED, Verdict, _judged_pooled, _logged, _narrow, _verdicts
+from check1_wire import CENSUS, QUALIFY
 from float64_terms import evaluated_on, float64_terms, lowered, scan_groups
-from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, record_units
+from map_judge import drawing, judging, record_units
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
 
 from dew._accuracy import distance, reduction_bound, within
@@ -103,7 +104,7 @@ from dew.parity import (
     FEWEST_SEEDS,
     LOWER_TAIL,
     MOST_SEEDS,
-    NARROW_FACTORS,
+    NARROW_FACTORS as NARROW_FACTORS,
     PARITY,
     RECORDED_KINDS,
     ROW_FACTOR,
@@ -111,7 +112,7 @@ from dew.parity import (
     UPPER_TAIL,
     Conditioning,
     Finding,
-    GateFailure,
+    GateFailure as GateFailure,
     Inconclusive,
     RecordedLeaf,
     _drawn_from,
@@ -422,11 +423,6 @@ def _paired_arms(arms) -> list[_Paired]:
     return [layer for arm in arms for layer in _layers(arm) if isinstance(layer, _Paired)]
 
 
-SWITCHED: list[dict] = []
-"""The sites decided onto YNNPACK's fusions (`_ynn_decided`) since the last test's report took them: each its
-label and XLA:CPU's refusal, which tests/conftest.py reports as the test's JUnit property `ynn_switched`."""
-
-
 @functools.cache
 def _ynn_option_held() -> None:
     """Raise unless XLA:CPU compiles a trivial program with WITHOUT_YNN's options, once a process: where an
@@ -474,17 +470,6 @@ def _ynn_decided(label: str, arms, inputs) -> None:
 def _mode_of(arms) -> str | None:
     """XLA:CPU's refusal that moved a site's arms onto YNNPACK's fusions (`_ynn_decided`), or None."""
     return next((arm.pairing.refused for arm in _paired_arms(arms) if arm.pairing.refused), None)
-
-
-def _with_mode(findings: list, arms) -> list:
-    """`findings`, each naming its site's arms' YNNPACK mode where they were decided onto the fusions
-    (`_ynn_decided`), so a failure says which code its arms ran."""
-    refused = _mode_of(arms)
-    if refused is None:
-        return findings
-    return [dataclasses.replace(finding, message=f"{finding.message} (both arms with YNNPACK's fusions: "
-                                                 f"XLA:CPU refused one without, {refused!r})")
-            for finding in findings]
 
 
 def _truth_program(fn):
@@ -1266,26 +1251,6 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     return [first, *drawn[len(arms) - len(also):]] if also else first
 
 
-STAGES_LOG = STAGES
-"""The environment variable (`check1_wire.STAGES`) naming a file each check-1 judgement appends its stage, its
-verdict, its leaves of narrow rows (NARROW_FACTORS) and whether its reference equalled the truth on every
-first-stage seed (`exact`: a site that measures no rounding, or a truth that is its reference run again) to,
-one JSON line (`_logged`): what a train reads every site's stage-two rate from, every attempt counted, and
-which sites' local errors rest on check 2."""
-
-
-def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn: str | None = None,
-            exact: bool | None = None) -> None:
-    import json
-
-    path = os.environ.get(STAGES_LOG)
-    if path:
-        with open(path, "a", encoding="utf-8") as log:
-            log.write(json.dumps({"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0],
-                                  "label": label, "stage": stage, "verdict": verdict,
-                                  "narrow_leaves": narrow_leaves, "ynn": ynn, "exact": exact}) + "\n")
-
-
 @dataclasses.dataclass(frozen=True)
 class _SiteTerms:
     """A site's own program of its truth's terms (`assert_as_exact`'s `terms`): `fn` on a draw's inputs
@@ -1367,7 +1332,7 @@ def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn,
     return terms_fn, dict(also or {})
 
 
-def _recorded(label: str, drawn_for, references: int, arms, upto: int | None = None,
+def _recorded(label: str, drawn_for, verdict: "Verdict", arms, upto: int | None = None,
               weighed: dict | None = None, offset: int = 0, first: dict | None = None) -> bool:
     """A map task's draws (`record_units`): each of a site's `references` draws over its range, up to
     `upto` where given, with its arms' YNNPACK mode (`_mode_of`) and, weighed, its classes' digest
@@ -1375,52 +1340,14 @@ def _recorded(label: str, drawn_for, references: int, arms, upto: int | None = N
     with the backend compiles JAX reported within it (`first`, `compiled`, `_drawn`'s): a site's arms
     compile at their first call, so a task's first draw holds its compiles, a cost it pays once whatever
     it draws, which the plan must not read as each draw's (tools/armada/costs.py's `timed`; a site cut to
-    two draws a task paid its compiles 128 times, row 5492). False where the process is no map task."""
+    two draws a task paid its compiles 128 times, row 5492). The test's manifest notes the site with its
+    `verdict`, which its judge reads (`judged_from_records`). False where the process is no map task."""
     def payload(start, stop):
-        draws = [drawn_for(index)(start, stop) for index in range(references)]
+        draws = [drawn_for(index)(start, stop) for index in range(len(verdict.labels))]
         held = (weighed or {}).get("of")
         return {"draws": draws, "refused": _mode_of(arms), "heavy": None if held is None else held.digest()}
-    return record_units(label, payload, upto=upto, offset=offset,
+    return record_units(label, payload, upto=upto, offset=offset, verdict=verdict,
                         phases=lambda: {"weighing": (weighed or {}).get("seconds", 0.0), **(first or {})})
-
-
-def _pooled_draws(label: str, references: int, arms):
-    """A judge's draws (`pooled_units`): `drawn_for(index)` over its map tasks' records of this site,
-    `drawn(start, stop)` the pooled draws of those seeds, refused past the seeds the records hold from seed
-    0 on; the site's arms take the mode the map tasks ran them in, which must be one. None where the
-    process is no judge."""
-    pieces = pooled_units(label)
-    if pieces is None:
-        return None
-    held = pieces[-1][1]
-    modes = {payload["refused"] for _, _, payload in pieces}
-    if len(modes) > 1:
-        raise PoolRefused(f"{label}: the map tasks ran the arms in different modes: "
-                          f"{sorted(map(str, modes))}", held)
-    refused = modes.pop()
-    if len({payload.get("heavy") for _, _, payload in pieces}) > 1:
-        raise PoolRefused(f"{label}: the map tasks weighed by different classes (`Conditioning.digest`)",
-                          held)
-    pairings = {arm.pairing for arm in _paired_arms(arms)}
-    for pairing in pairings:
-        pairing.decided, pairing.refused = True, refused
-    if pairings and refused is not None:
-        SWITCHED.append({"label": label, "refused": refused})
-    pooled = [functools.reduce(_Draws.joined, (payload["draws"][index] for _, _, payload in pieces))
-              for index in range(references)]
-
-    def drawn_for(index: int):
-        def drawn(start, stop):
-            if stop > held and start == held:
-                # The second stage's seeds, drawn by later map tasks a judge asks for (`ask_later`).
-                ask_later(label, held, stop)
-            if stop > held:
-                raise PoolRefused(f"{label}: its stage draws seeds {start} to {stop}; the map tasks drew 0 "
-                                  f"to {held} ({DRAWS} covers 0 to (1 + REDRAW) times the declared seeds)",
-                                  held)
-            return pooled[index].between(start, stop)
-        return drawn
-    return drawn_for
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
@@ -1583,7 +1510,8 @@ def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditionin
     try:
         _site_judged(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
                      library_fn=library_fn, library_row=library_row, library_leaves=library_leaves,
-                     also=also, terms=terms, examples=examples, weighing=None, upto=plain)
+                     also=also, terms=terms, examples=examples, weighing=None, upto=plain,
+                     defers_to=f"{label}, conditioned")
     except Inconclusive:
         weighed()
     else:
@@ -1628,13 +1556,20 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
 
 def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, library_fn,
                  library_row, library_leaves, also, terms, examples: bool, weighing, upto: int | None = None,
-                 offset: int = 0, followed=None) -> None:
+                 offset: int = 0, followed=None, defers_to: str | None = None) -> None:
     """`assert_as_exact`'s judgment of one site under `label`, weighed where `weighing` is given (dew.parity's
     `Conditioning`: built of the site's compiled reference and truth where it draws, never in its judge), a
-    map task recording its range's draws up to `upto` where given, its classes' digest beside them."""
+    map task recording its range's draws up to `upto` where given, its classes' digest beside them, its
+    judge judging its map tasks' pooled draws (`_judged_pooled`), no arm or truth built. Its verdict
+    (`Verdict`) names the weighed check it `defers_to` where it stays undecided (`_deferred`)."""
     given = reference_fn
     terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=library_fn,
                            library_row=library_row, library_leaves=library_leaves, also=also, terms=terms)
+    verdict = Verdict(seeds, (label, *(f"{label}, against {name}" for name in also)), library_fn is not None,
+                      defers_to)
+    if judging():
+        _judged_pooled(label, verdict)
+        return
     truth_program = _truth_program(truth_fn)
     terms_fn = _site_terms(terms_fn, terms, draw, truth_fn if truth_fn is not None else reference_fn,
                            truth_program)
@@ -1674,14 +1609,9 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
 
     arms = [dew_fn, reference_fn, *([] if library_fn is None else [library_fn]), *further]
     # A map task of the site's draws, or their judge (DRAWS, POOL).
-    if _recorded(label, drawn_for, 1 + len(further), arms, upto, weighed, offset, first):
+    if _recorded(label, drawn_for, verdict, arms, upto, weighed, offset, first):
         return
-    pooled = _pooled_draws(label, 1 + len(further), arms)
-    if pooled is not None:
-        drawn_for = pooled
-        narrow_leaves[:] = _narrow(drawn_for(0)(0, 1))
-    _verdicts(drawn_for, seeds, [label, *(f"{label}, against {name}" for name in also)], narrow_leaves, arms,
-              library=library_fn is not None)
+    _verdicts(drawn_for, verdict, narrow_leaves, lambda: _mode_of(arms))
 
 
 def _site_terms(terms_fn, terms, draw, truth, truth_program):
@@ -1695,31 +1625,6 @@ def _site_terms(terms_fn, terms, draw, truth, truth_program):
         terms_fn = _cancelling_terms(draw, truth, program)
     return terms_fn if terms_fn is None or isinstance(terms_fn, _SiteTerms) else functools.partial(
         float64_terms, terms_fn)
-
-
-def _narrow(draws: _Draws) -> list[str]:
-    """The leaves of rows of one or two values (NARROW_FACTORS)."""
-    return [name for name, width in zip(draws.names, draws.widths, strict=True) if width in NARROW_FACTORS]
-
-
-def _verdicts(drawn_for, seeds: int, labels: list[str], narrow_leaves: list[str], arms, *,
-              library: bool = False) -> None:
-    """Each reference's check 1 over its draws (`_staged`, `drawn_for(index)` the draws against reference
-    `index`, judged under `labels[index]`), each logged (STAGES_LOG) with whether its reference equalled
-    the truth on every first-stage seed, unknown (None) for the first where a `library` arm's error stands
-    in for its reference's on some leaves; a GateFailure where any leaf is over, else an Inconclusive where
-    any is left unresolved."""
-    overs, unresolveds = [], []
-    for index, named in enumerate(labels):
-        over, unresolved, stage = _staged(drawn_for(index), seeds, named)
-        exact = None if library and not index else not np.any(drawn_for(index)(0, seeds).theirs)
-        _logged(named, stage, _verdict(over, unresolved), narrow_leaves, _mode_of(arms), exact)
-        overs += over
-        unresolveds += unresolved
-    if overs:
-        raise GateFailure(_with_mode(overs + unresolveds, arms))
-    if unresolveds:
-        raise Inconclusive(_with_mode(unresolveds, arms))
 
 
 def _moved(draws: _Draws, stage: int) -> tuple[list[str], list[str], bool]:
@@ -1860,7 +1765,15 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
 def recording(path) -> dict[str, np.ndarray]:
     """A recording of a reference over seeds (`indexed_recording`'s `stored`), read whole: where a pin
     holds it, from the fetched store's local copy, checked against the pin; else from the file at
-    `path`, as git holds one of at most 1 MiB (tools/fetched_fixtures.py)."""
+    `path`, as git holds one of at most 1 MiB (tools/fetched_fixtures.py). Read, decompressed and
+    checked once a process (`_read_recording`), each call its own copy of the arrays: a site reads its
+    recording at each of its calls (`declared_seeds`, `indexed_recording`), the fla template's 41 MB 24
+    times in one map task (16.4 s)."""
+    return {name: value.copy() for name, value in _read_recording(str(path)).items()}
+
+
+@functools.cache
+def _read_recording(path: str) -> dict[str, np.ndarray]:
     from tool_support import load
 
     with np.load(load("fetched_fixtures").local(path), allow_pickle=False) as stored:
