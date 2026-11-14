@@ -44,6 +44,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [5450, 5625]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
+- Prepared_embeddings sits in call_metadata.py, the per-call data beside the residual, to keep causal_transformer.py under 2500 lines. [6189]
 
 ## Training and parallelism
 
