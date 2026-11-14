@@ -448,3 +448,49 @@ def test_a_stored_nvfp4_matrix_no_tile_holds_takes_the_decoded_product():
                                         formats.NvFp4Block.of(matrix), jnp.asarray([1], jnp.int32),
                                         out_dtype=jnp.float32)[:5]
     np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
+
+
+@pytest.mark.parametrize("generation_name", ["sm90", "sm100"])
+def test_a_gathered_product_with_a_prologue_holds_check_1_with_its_gradients(generation_name):
+    """A grouped product of gathered rows through a prologue (row 5391: an expert projection over a scaled
+    token stream, the scale a row of the product's, in the table's order), on a CPU as an H100 and a B200,
+    interpreted: its output and its tokens', scales' and matrices' gradients on par with the plain formula's
+    in float32 from float64 truth (check 1), where `gemm` refused the combination."""
+    sizes = jnp.asarray([70, 0, 129, 57], jnp.int32)
+    rows = int(sizes.sum())
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        table = jnp.asarray(rng.integers(0, 200, rows), jnp.int32)
+        return (jnp.asarray(rng.normal(size=(200, 128)), jnp.bfloat16), table,
+                jnp.asarray(rng.uniform(0.5, 2.0, size=(rows,)), jnp.float32),
+                jnp.asarray(rng.normal(size=(4, 128, 256)) / 16, jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(rows, 256)), jnp.float32))
+
+    def scaled(x, scale):
+        return x * scale[:, None]
+
+    def templated(tokens, table, scale, matrices):
+        return gemm.gemm(tokens, matrices, sizes, prologue=scaled, prologue_operands=((scale, ("rows",)),),
+                         gather=table, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    def plain(tokens, table, scale, matrices, wide=jnp.float32):
+        x = scaled(tokens[table].astype(wide), scale.astype(wide)).astype(
+            wide if wide == jnp.float64 else tokens.dtype).astype(wide)
+        group = jnp.repeat(jnp.arange(4), sizes, total_repeat_length=rows)
+        return jnp.einsum("rk,rkn->rn", x, matrices.astype(wide)[group])
+
+    def run(fn):
+        def call(tokens, table, scale, matrices, cotangent):
+            out, pull = jax.vjp(lambda t, s, m: fn(t, table, s, m), tokens, scale, matrices)
+            return out, *pull(cotangent.astype(out.dtype))
+        return call
+
+    def emulated(*arguments):
+        # The forward and its reverse traced as the generation (`interpret_on_cpu`'s emulated device).
+        with generation.assumed(generation_name):
+            return run(templated)(*arguments)
+
+    assert_as_exact(jax.jit(emulated), jax.jit(run(plain)), draw,
+                    "a gathered product with a prologue and its gradients", seeds=SEEDS,
+                    truth_fn=run(functools.partial(plain, wide=jnp.float64)))

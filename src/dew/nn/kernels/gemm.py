@@ -81,10 +81,13 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
     other layer's zero. `paired`, a second matrix of `rhs`'s shape (a stack of them at the same `layer`), the
     rows multiply into a second accumulator the epilogue takes before its side operands (`epilogue(acc,
     paired_acc, *sides)`: a gate's and an up projection's SwiGLU), else an output. `gather`, int32 `[rows]` of
-    a grouped call with no prologue (a stack's layer's too), makes the product's rows `lhs[gather]`, read
-    where they lie: a mixture of experts' tokens in their own order, the router's sort fused into the rows'
-    loads where Mosaic GPU's launch takes the call (its producer's gather, row 1376), gathered by XLA
-    elsewhere; the rows' cotangent is summed back into each token's (`lhs`'s, a token every slot reads).
+    a grouped call (a stack's layer's too), makes the product's rows `lhs[gather]`, read where they lie: a
+    mixture of experts' tokens in their own order, the router's sort fused into the rows' loads where Mosaic
+    GPU's launch takes the call (its producer's gather, row 1376), gathered by XLA elsewhere; the rows'
+    cotangent is summed back into each token's (`lhs`'s, a token every slot reads). With a prologue, its
+    side operands along the rows are the product's rows' (`gather`'s order, a normalized stream's scale
+    gathered with it), and the rows are gathered first, the prologue's product taking them as an ungathered
+    call's (row 5391: an expert projection over a normalized or scaled token stream).
     `scatter`, int32 `[rows]` of a grouped call, a permutation, writes the product's row `i` at each output's
     row `scatter[i]`: the slots in token order, the un-permute fused into Mosaic GPU's stores
     (`mosaic.Scattered`), written by XLA elsewhere; the outputs' cotangents are read back through it, a
@@ -100,8 +103,12 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
                            interpret_on_cpu=interpret_on_cpu,
                            refused=(transpose_rhs, prologue, prologue_operands, paired, prologue_jvp,
                                     out_dtypes, applied))
-    _gemm_refused(group_sizes, prologue=prologue, gather=gather, scatter=scatter,
-                  compute=compute, applied=applied, lhs=lhs)
+    _gemm_refused(group_sizes, gather=gather, scatter=scatter, compute=compute, applied=applied,
+                  prologue=prologue, lhs=lhs)
+    if gather is not None and prologue is not None:
+        # The prologue's rows are the product's (its sides `gather`'s order): gathered first, its
+        # derivative summing each row's cotangent back into its token's.
+        lhs, gather = lhs[gather], None
     straight = compute is not None
     compute = jnp.dtype(lhs.dtype if compute is None else compute)
     dense = group_sizes is None and layer is None
@@ -237,12 +244,12 @@ def _scattered_cotangent(cotangent, scatter, *, epilogue, first) -> tuple:
 
 
 def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, lhs) -> None:
-    """`gemm`'s refusal of a call it does not take: gathered rows but a grouped call's with no prologue (a
-    prologue's side operands are each row's, which a gather would read at its tokens' rows, undefined),
-    scattered rows but a grouped call's, a prologue beside a named `compute`, and a formed operand
-    (`applied`) but a prologue's, of `lhs`'s shape and dtype."""
-    if gather is not None and (group_sizes is None or prologue is not None):
-        raise ValueError("gathered rows are a grouped call's, with no prologue")
+    """`gemm`'s refusal of a call it does not take: gathered rows but a grouped call's, or beside a formed
+    operand (`applied`, a producer's rows already in the product's order), scattered rows but a grouped
+    call's, a prologue beside a named `compute`, and a formed operand but a prologue's, of `lhs`'s shape and
+    dtype."""
+    if gather is not None and (group_sizes is None or applied is not None):
+        raise ValueError("gathered rows are a grouped call's, beside no formed operand")
     if scatter is not None and group_sizes is None:
         raise ValueError("scattered rows are a grouped call's")
     if compute is not None and prologue is not None:
