@@ -16,6 +16,7 @@ from attention_oracle import attention_on_par, exact_attention, float64_weights
 from contract_support import normal_drawn
 from model_support import as_stepped
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_fp32_reduction_bound
+from sharded import assert_runs_per_shard, split_executable
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_masks import with_key_lengths
@@ -610,7 +611,7 @@ def test_a_grouped_query_keeps_the_tensor_axis_split(kv_heads):
     repeats to the axis's 2 as each shard would hold it, is grouped per shard: each device's program
     does half the work of the call off the mesh, by XLA's own count on the reference path (no Pallas
     call, whose work XLA does not count), and attends on par with that call (check 1)."""
-    from jax.sharding import NamedSharding, PartitionSpec
+    from jax.sharding import PartitionSpec
 
     from dew.training import MeshSpec
 
@@ -630,24 +631,14 @@ def test_a_grouped_query_keeps_the_tensor_axis_split(kv_heads):
         return (analysis[0] if isinstance(analysis, list) else analysis)["flops"]
 
     mesh = MeshSpec(tensor=2).build(jax.devices()[:2])
-    heads = NamedSharding(mesh, PartitionSpec(None, None, "tensor"))
-    whole = NamedSharding(mesh, PartitionSpec())
-
-    def placed(operands):
-        return [jax.device_put(x, heads if x.shape[2] % 2 == 0 else whole) for x in operands]
-
-    with jax.set_mesh(mesh):
-        compiled = jax.jit(attend).lower(*placed(draw(0))).compile()
-
-    @as_given
-    def split(*operands):
-        with jax.set_mesh(mesh):
-            return compiled(*placed(operands))
-
-    alone = jax.jit(attend)
-    assert flops(compiled) <= 0.6 * flops(alone.lower(*draw(0)).compile())
-    assert_as_exact(split, alone, draw, f"a lone query of 8 heads over {kv_heads} split over tensor",
-                    seeds=TENSOR_SPLIT_SEEDS[kv_heads])
+    specs = [PartitionSpec(None, None, "tensor") if shape[2] % 2 == 0 else PartitionSpec()
+             for shape in ((2, 1, 8, 32), (2, 32, kv_heads, 32), (2, 32, kv_heads, 32))]
+    split = split_executable(jax.jit(attend), draw(0), specs, mesh)
+    alone = jax.jit(attend).lower(*draw(0)).compile()
+    assert flops(split) <= 0.6 * flops(alone)
+    assert_runs_per_shard(attend, draw, specs, mesh,
+                          f"a lone query of 8 heads over {kv_heads} split over tensor",
+                          seeds=TENSOR_SPLIT_SEEDS[kv_heads], truth_fn=attend)
 
 
 @pytest.mark.mesh(devices=2)
