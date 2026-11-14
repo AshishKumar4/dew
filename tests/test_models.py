@@ -434,9 +434,13 @@ def test_dropout_is_active_in_train_mode(rng, stack):
                   mlp_ratio=2, dropout_rate=0.5)
     x, temb, textcontext = small_inputs(rng)
     params = model.init(rng, x, temb, textcontext)
-    # nudge every param off init: the zero-initialized adaLN gates and final
-    # projection make a fresh DiT output exactly zero, hiding dropout
-    params = jax.tree.map(lambda p: p + 0.02, params)
+    # nudge every param off init by a drawn amount: the zero-initialized adaLN gates and final projection
+    # make a fresh DiT output exactly zero, hiding dropout, and one nudge for every weight leaves each
+    # row's features alike, which a layer norm maps to zero whatever was dropped
+    leaves, tree = jax.tree.flatten(params)
+    keys = jax.random.split(rng, len(leaves))
+    params = jax.tree.unflatten(tree, [leaf + 0.02 * jax.random.normal(key, leaf.shape, leaf.dtype)
+                                       for leaf, key in zip(leaves, keys, strict=True)])
 
     d0 = model.apply(params, x, temb, textcontext, train=True, rngs={"dropout": jax.random.PRNGKey(1)})
     d1 = model.apply(params, x, temb, textcontext, train=True, rngs={"dropout": jax.random.PRNGKey(2)})
@@ -729,6 +733,76 @@ def test_a_layer_norms_variance_is_its_centered_mean_square():
                     truth_fn=normalized(nn.LayerNorm(epsilon=1e-5, dtype=jnp.float64)))
 
 
+TOWER_NORM_SEEDS = 8
+"""The tower norms' declared seeds for check 1 (`assert_as_exact`)."""
+
+WIDTH = 64
+"""The towers' width: RAE's encoders take a head of 64 (`HEAD_WIDTH`)."""
+
+
+def _tower_layout(tower):
+    """`tower`'s tiny layout (`ViTLayout`) of one layer `WIDTH` wide, as its module builds it; None for
+    CLIP's text tower, whose block is `clip_layer`'s own."""
+    from dew.nn.autoencoders.rae import RepresentationEncoder
+    from dew.nn.vision.llama4 import Llama4Vision
+    from dew.nn.vision.qwen35 import Qwen35Vision
+    from dew.nn.vision.siglip import SiglipVision
+
+    sizes = {"hidden_size": WIDTH, "intermediate_size": 2 * WIDTH, "num_heads": 2, "patch_size": 8}
+    return {"clip text": lambda: None,
+            "siglip": lambda: SiglipVision(num_layers=1, image_size=16, **sizes).layout(),
+            "llama4": lambda: Llama4Vision(num_layers=1, image_size=16, **sizes).layout(),
+            "qwen35": lambda: Qwen35Vision(depth=1, num_position_embeddings=4, **sizes).layout(),
+            "rae": lambda: RepresentationEncoder("siglip2", width=WIDTH, layers=1, patch=8,
+                                                 input_size=16).layout()}[tower]()
+
+
+@pytest.mark.parametrize("tower", ["clip text", "siglip", "llama4", "qwen35", "rae"])
+def test_a_towers_layer_norms_read_rows_as_torch_s_do(tower):
+    """Each tower's block normalizes its input as torch's LayerNorm does, every tower's reference being
+    torch's: over rows a hundred from zero at a spread of one, where flax's one-pass E[x^2] - E[x]^2
+    cancels in fp32, the block's first norm's output (`input_layernorm`) is on par (check 1) with torch's
+    float32 LayerNorm of the same rows at that norm's parameters, from their float64."""
+    import torch
+
+    from dew.nn.inputs import AttentionMetadata
+    from dew.nn.text_encoders import clip_layer
+    from dew.nn.vision.vit import vit_block
+
+    layout = _tower_layout(tower)
+    block = (clip_layer(WIDTH, 2, 2 * WIDTH, 8) if layout is None
+             else vit_block(layout, 0, dtype=jnp.float32, precision=None))
+    eps = 1e-5 if layout is None else layout.norm_eps
+    rotary = layout is not None and layout.rotary is not None
+    metadata = AttentionMetadata(rotary_positions=jnp.zeros((2, 8, 2), jnp.int32)) if rotary else None
+    rows = jnp.zeros((2, 8, WIDTH), jnp.float32)
+    params = block.init(jax.random.key(0), rows, attention_metadata=metadata)["params"]
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 3)
+        return (np.asarray(jax.random.normal(keys[0], rows.shape, jnp.float32) + 100.0),
+                np.asarray(1.0 + 0.1 * jax.random.normal(keys[1], (WIDTH,), jnp.float32)),
+                np.asarray(0.1 * jax.random.normal(keys[2], (WIDTH,), jnp.float32)))
+
+    def normalized(x, scale, bias):
+        held = {**params, "input_layernorm": {"scale": scale, "bias": bias}}
+        _, state = block.apply({"params": held}, x, attention_metadata=metadata, capture_intermediates=True,
+                               mutable=["intermediates"])
+        return state["intermediates"]["input_layernorm"]["__call__"][0]
+
+    def torch_s(x, scale, bias):
+        x, scale, bias = (torch.from_numpy(np.asarray(each)) for each in (x, scale, bias))
+        return torch.nn.functional.layer_norm(x, (WIDTH,), scale, bias, eps=eps).numpy()
+
+    def truth(x, scale, bias):
+        x = np.asarray(x, np.float64)
+        centered = x - x.mean(-1, keepdims=True)
+        return centered / np.sqrt((centered ** 2).mean(-1, keepdims=True) + eps) * scale + bias
+
+    assert_as_exact(normalized, as_given(torch_s), draw, f"{tower} tower norm", seeds=TOWER_NORM_SEEDS,
+                    truth_fn=as_given(truth))
+
+
 def test_a_group_norm_narrower_than_its_input_normalizes_at_its_own_width(rng):
     """A float64 input under a float32 group norm is normalized at the module's width, statistics and
     affine result alike, as flax's GroupNorm of that dtype normalizes it (its centered variance), the
@@ -837,3 +911,65 @@ def test_layer_norm_is_flax_s_keeping_only_its_input_for_the_backward(rng, use_s
     _, pullback = jax.vjp(lambda value: ours.apply(params, value), x)
     held = [leaf for leaf in jax.tree.leaves(pullback) if np.size(leaf) == x.size]
     assert held and {leaf.dtype for leaf in held} == {x.dtype}
+
+
+MIXED_ROW_SEEDS = 64
+"""The layer norm's declared seeds for check 1 over bf16 rows of mixed magnitudes, sized by `seeds_for` on
+armada."""
+
+
+def test_a_layer_norm_centers_a_bf16_row_in_float32():
+    """A bf16 row of mixed magnitudes (outliers of 256 either side among values about one, as an
+    activation's channels hold them) is centered in float32, as flax's `nn.LayerNorm` centers it: run as
+    given, op by op, where no compiler keeps a bf16 difference wide, Dew's output and the gradients of its
+    input, scale and bias are on par with flax's (check 1) from float64, where a difference taken in bf16
+    rounds the values about one to its 8 bits."""
+    shape = (2, 6, 16)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 6)
+        outliers = 256.0 * jnp.sign(jax.random.normal(keys[1], shape)) * (
+            jax.random.uniform(keys[2], shape) < 0.125)
+        return (np.asarray((jax.random.normal(keys[0], shape) + outliers).astype(jnp.bfloat16)),
+                np.asarray(1.0 + 0.1 * jax.random.normal(keys[3], shape[-1:], jnp.float32)),
+                np.asarray(0.1 * jax.random.normal(keys[4], shape[-1:], jnp.float32)),
+                np.asarray(jax.random.normal(keys[5], shape, jnp.float32)))
+
+    assert_as_exact(as_given(normalized(LayerNorm(epsilon=1e-5))),
+                    as_given(normalized(nn.LayerNorm(epsilon=1e-5))), draw, "bf16 mixed-row layer norm",
+                    seeds=MIXED_ROW_SEEDS,
+                    truth_fn=normalized(nn.LayerNorm(epsilon=1e-5, dtype=jnp.float64)))
+
+
+SHARDED_LAYER_NORM_SEEDS = 32
+"""The sharded layer norm's declared seeds for check 1, sized by `seeds_for` on armada."""
+
+
+def test_a_layer_norm_over_sharded_features_centers_each_row_by_one_mean():
+    """A layer norm whose features lie in shards (flax's `axis_name`, its statistics over every shard) reads
+    each row less one mean, the same on every shard: over rows whose two shards' means differ (one about
+    zero, one about ten), mapped over the shards under that name, its output and the gradients of its
+    input, scale and bias are on par with flax's (check 1) from float64, where each shard less its own
+    mean would center it alone."""
+    # Two shards of four rows, eight features a shard.
+    shape = (2, 4, 8)
+
+    def sharded(module):
+        def apply(x, scale, bias):
+            def shard(x, scale, bias):
+                return module.apply({"params": {"scale": scale, "bias": bias}}, x)
+            return jax.vmap(shard, axis_name="shards")(x, scale, bias)
+        return with_gradients(apply)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 4)
+        offsets = np.array([0.0, 10.0], np.float32)[:, None, None]
+        return (np.asarray(jax.random.normal(keys[0], shape, jnp.float32)) + offsets,
+                np.asarray(1.0 + 0.1 * jax.random.normal(keys[1], (shape[0], shape[-1]), jnp.float32)),
+                np.asarray(0.1 * jax.random.normal(keys[2], (shape[0], shape[-1]), jnp.float32)),
+                np.asarray(jax.random.normal(keys[3], shape, jnp.float32)))
+
+    fields = {"epsilon": 1e-5, "axis_name": "shards"}
+    assert_as_exact(sharded(LayerNorm(**fields)), sharded(nn.LayerNorm(**fields)), draw,
+                    "sharded layer norm", seeds=SHARDED_LAYER_NORM_SEEDS,
+                    truth_fn=sharded(nn.LayerNorm(**fields, dtype=jnp.float64)))
