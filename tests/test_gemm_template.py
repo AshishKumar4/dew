@@ -254,19 +254,36 @@ COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family='wgmma')
 FED = dataclasses.replace(COOPERATIVE, family=mosaic_sm90.FED.name)
 """`COOPERATIVE` without a producer: its first consumer issues the rings' loads (`fed.ConsumerFed`)."""
 
+PINGPONG = dataclasses.replace(COOPERATIVE, pingpong=True)
+"""`COOPERATIVE`'s two consumers taking alternate tiles whole, their products in turn (ping-pong)."""
+
+def test_a_family_that_takes_no_pingpong_refuses_it():
+    """Ping-pong is a family's whose own producer loads every tile (`mosaic.Family.takes_pingpong`): a
+    consumer-fed ring's tile refuses it, its first consumer loading every ring's steps, its partner's tiles'
+    past the primed stages none; and tcgen05's persistent walk, whose accumulators turn by tile."""
+    with pytest.raises(ValueError):
+        dataclasses.replace(FED, pingpong=True)
+    tcgen05 = pricing.family_of(mosaic_gpu.Tiles(128, 128, 64, 3, 1, family="tcgen05"), jnp.bfloat16)
+    for family in (mosaic_sm90.FED, tcgen05):
+        with pytest.raises(ValueError):
+            family.persist_scratch(2, pingpong=True)
+
+
 PAIRED = dataclasses.replace(COOPERATIVE, cluster=2)
 """`COOPERATIVE` on a pair of multiprocessors a cluster, the forward's two row tiles of a group sharing its
 matrix's blocks (the interpreter runs the pair's two programs, each loading the shared block whole)."""
 
 
 @runs("sm90")
-@pytest.mark.parametrize("forward", [COOPERATIVE, PAIRED, FED], ids=["one multiprocessor", "a pair", "fed"])
+@pytest.mark.parametrize("forward", [COOPERATIVE, PAIRED, FED, PINGPONG],
+                         ids=["one multiprocessor", "a pair", "fed", "ping-pong"])
 @pytest.mark.parametrize("case", ["scaled", "row scaled"])
 def test_a_cooperative_tile_holds_check_1_with_its_hooks(case, forward):
     """The Hopper launches pinned to a cooperative tile, the forward's alone, a pair's (whose second row
-    tile of a pair past its group's rows stores none of them) or one its first consumer feeds (its rings
-    reused across the program's tiles), interpreted, at an epilogue's column or row scale: each
-    consumer multiplies its half of the stage's rows
+    tile of a pair past its group's rows stores none of them), one its first consumer feeds (its rings
+    reused across the program's tiles) or ping-pong's (each consumer's tiles whole and its own, their
+    products in turn), interpreted, at an epilogue's column or row scale: each
+    consumer multiplies its share of the stage's rows
     and computes their epilogue, as exact as the plain program from float64 truth. An fp32 output's sums are
     the default precision's, which the launches take (exact sums are the kernel gradient's alone). A pair's
     runs on an H100 too (tests/test_gpu_gemm.py)."""
@@ -282,6 +299,22 @@ def a_cooperative_tile_holds_check_1_with_its_hooks(case: str, forward: mosaic_g
         dew = jax.jit(_drop(_dew(spec, interpret_on_cpu=True, precision="default")))
         assert_as_exact(dew, jax.jit(_drop(_plain(spec))), _draw, f"{case} at {forward}",
                         seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
+
+
+@runs("sm90")
+@pytest.mark.parametrize("case", ["plain", "dense plain"])
+def test_a_pingpong_tile_holds_check_1_with_its_gradients(case):
+    """The Hopper forward and input gradient pinned to ping-pong's tile (`PINGPONG`: its two consumers take
+    alternate tiles whole, their products in turn on the tensor cores, each finishing its tile while the
+    other issues the next), interpreted, grouped and dense, a program's tiles more than its consumers: the
+    value and every gradient as exact as the plain program's from float64 truth, the kernel gradient on the
+    cooperative tile (which takes no ping-pong, its consumers each preparing half of a step's rows)."""
+    spec = CASES["plain"] if case == "plain" else dataclasses.replace(CASES["plain"], dense=True)
+    pinned = {grouped_matmul.MosaicGmm: PINGPONG, grouped_matmul.MosaicTgmm: COOPERATIVE}
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.pinned(pinned):
+        assert_as_exact(as_given(_gradients(_dew(spec, interpret_on_cpu=True))), _gradients(_plain(spec)),
+                        _gradient_draw(spec), f"{case} gradients at {PINGPONG}", seeds=SEEDS,
+                        truth_fn=_gradients(_plain(spec, truth=True)))
 
 
 @runs("sm90")
@@ -709,7 +742,7 @@ def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs)
 @pytest.mark.parametrize("rows", [1, 8, 32])
 def test_an_amperes_decode_product_splits_its_depth_over_the_wave(rows, transpose_rhs):
     """An A100 decode step's dense product over a 2048 x 2048 matrix (row 483's input gradient), the matrix
-    lying either way, derives a swapped tile of at most `SWAPPED_ROWS` rows whose depth splits until its
+    lying either way, derives a legal tile, swapped or not as its walk prices, whose depth splits until its
     programs fill most of the wave (`pricing.split_count` pricing the matrix's stream): its steps priced
     at their MMA alone, it walked 12 programs on 108 multiprocessors at 2.8-3.0x XLA's time (M-NS-12)."""
     launch = grouped_matmul.MosaicGmm()
@@ -720,9 +753,10 @@ def test_an_amperes_decode_product_splits_its_depth_over_the_wave(rows, transpos
     with generation.assumed("sm80"):
         target = generation.gpu_target()
         tile = launch.derived(bound, target)
-        assert tile is not None and tile.swapped and launch.legal(bound, tile, target), tile
-    assert tile.block_m <= grouped_matmul.SWAPPED_ROWS, tile
-    programs = 2048 // tile.block_m * -(-rows // tile.block_n) * tile.splits
+        assert tile is not None and launch.legal(bound, tile, target), tile
+    # Its output tiles: swapped, the matrix's rows by the call's; else the call's rows by the matrix's.
+    rows_of, columns_of = (2048, rows) if tile.swapped else (rows, 2048)
+    programs = -(-rows_of // tile.block_m) * -(-columns_of // tile.block_n) * tile.splits
     assert programs >= target.multiprocessors // 2, (tile, programs)
 
 
@@ -1062,6 +1096,25 @@ def test_a_parts_units_are_priced_at_the_clock_it_holds_under_load():
                if rate is not None)
     assert unmeasured.loaded_clock_hz == unmeasured.clock_hz
     assert cost.rates(b200, device=True)[-1] == cost.rates(unmeasured, device=True)[-1]
+
+
+def test_a_decoded_operand_moves_its_stage_its_decoders_reads_and_each_decoded_copy():
+    """A step's shared traffic (`pricing.step_shared_bytes`) counts each part of a decoded operand's passage
+    (row 5874: the NVFP4 decode's two forms priced against each other): a decode into registers moves its
+    packed bytes twice, staged and read by its decoders, and the products read none of it; a decode into a
+    stage each consumer keeps its own moves one more read of the packed stage and one more decoded stage than
+    one its consumers share."""
+    tiles = mosaic_gpu.Tiles(128, 128, 256, 3, 1, warpgroups=2, family="wgmma")
+    family = pricing.family_of(tiles, jnp.bfloat16)
+    packed, stage = 0.5 + 1 / 16, 2
+    left, right = tiles.block_m * tiles.block_k, tiles.block_n * tiles.block_k
+
+    def moved(itemsizes, decoded):
+        return pricing.step_shared_bytes(tiles, family, itemsizes, decoded)
+
+    assert moved((packed, 2), ((0, 1), None)) - moved((0, 2), ((0, 1), None)) == left * 2 * packed
+    assert (moved((2, packed), (None, (stage, 2))) - moved((2, packed), (None, (stage, 1)))
+            == right * (packed + stage))
 
 
 def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiprocessors_a_target_states():

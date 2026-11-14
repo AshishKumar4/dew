@@ -199,6 +199,43 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
 
 
 @lowers("sm90")
+@pytest.mark.parametrize(("block_m", "block_n"), [(128, 128), (64, 128)])
+def test_a_pingpong_tile_compiles_within_its_resources_as_its_register_model_prices_it(block_m, block_n):
+    """A Hopper GEMM pinned to a ping-pong tile (`Tiles.pingpong`: two consumers each holding a whole
+    tile's accumulators, their products in turn), legal at a consumer's 64 rows (its granularity whole roles
+    of the rows one consumer holds, `Tiles.sharing`), its forward and its input gradient, grouped and dense,
+    compiled by Mosaic and ptxas for a compile-only H100: spilling nothing, its registers
+    as its model prices each consumer's whole tile (`model_failures`), its turns' barriers within its planned
+    shared memory (`mosaic_failures`)."""
+    from kernel_compile import compile_mosaic_kernels, model_failures, mosaic_failures
+
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    tile = mosaic_gpu.Tiles(block_m, block_n, 64, 3, 1, warpgroups=2, family='wgmma', pingpong=True)
+    launch = grouped_matmul.MosaicGmm()
+    sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
+    one = jax.ShapeDtypeStruct((1,), jnp.int32)
+    calls = {"grouped forward": ((bf16((1024, 512)), bf16((4, 512, 1024)), sizes), {"trans_rhs": False}),
+             "grouped input gradient": ((bf16((1024, 1024)), bf16((4, 512, 1024)), sizes),
+                                        {"trans_rhs": True}),
+             "dense forward": ((bf16((1024, 512)), bf16((1, 512, 1024)), one),
+                               {"trans_rhs": False, "dense": True})}
+    cases = []
+    for name, (args, options) in calls.items():
+        with generation.assumed("sm90"):
+            ba = launch.bind(*args, out_dtype="bfloat16", interpret=False, **options)
+            model = _model(launch, ba, tile)
+            assert launch.legal(ba, tile, generation.gpu_target()), name
+        cases.append(support.KernelCase(f"{name} {tile}", lambda ba=ba: launch.lowering(ba, tile),
+                                        {"dew_gmm": model}))
+    found = compile_mosaic_kernels(cases, "sm90")
+    assert len(found) == len(cases) and all(record.get("kernels") for record in found), found
+    failed = mosaic_failures(found) + model_failures(found)
+    assert not failed, "\n".join(failed)
+
+
+@lowers("sm90")
 def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
     """The dense GEMM's mainloop at a cluster pair's 128 x 256 tile, compiled for a compile-only H100 as the
     GPU compiles it, has its HGMMAs left running while the next step's operands are awaited: ptxas
@@ -947,6 +984,25 @@ def _gpt_oss_projected():
 
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     return step, (shaped((512, 2880)), shaped((4, 2880, 2880)), jax.ShapeDtypeStruct((4,), jnp.int32))
+
+
+@lowers("sm80")
+def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds():
+    """An A100's GEMM, its forward and its gradients at the gate's tiles, issues each cp.async copy without a
+    source size (`cp.async`'s `src-size`, a bounds check a transfer): its launch extends every operand its
+    blocks read past, so its specs promise their copies in bounds (`mosaic_sm80`'s `oob_fill_mode`), where a
+    pipeline that checks a block sliced from a dynamically started view (the fork's zero-fill) would bound
+    every transfer of the sm80 cells, unchanged at their pin otherwise."""
+    from kernel_compile import PTX, compile_mosaic_kernels
+
+    cases = [each.case for form in ("forward", "input gradient", "kernel gradient")
+             for each in _gate_cases("sm80", form)]
+    found = compile_mosaic_kernels(cases, "sm80")
+    modules = [kernel["module"] for record in found for kernel in record.get("kernels", ())]
+    copies = [line for module in modules for line in PTX.get(module, "").splitlines() if "cp.async.c" in line]
+    assert copies, modules
+    bounded = [line.strip() for line in copies if re.search(r"\],\s*\d+,\s*%r", line)]
+    assert not bounded, bounded[:4]
 
 
 def test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it():

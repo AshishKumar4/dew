@@ -2240,6 +2240,59 @@ def _recorded_following(decisions_at, certified, live):
     return followed
 
 
+def certifier(site: str, truth_fn, shapes: Mapping[str, np.ndarray], recorded_sketch):
+    """`truth_fn`, Dew's float64 path, as a recorded truth holds it: its program as the gate compiles a
+    truth (`live`), and `certified(index, *arguments)`, its leaves on `arguments` (a draw's inputs, a
+    followed site's recorded decisions before them), each held to the recorded truth's sketch at draw
+    `index` (`recorded_sketch(index, name)`, of the leaves `shapes` names) within float64's rounding of the
+    computation, its roundings counted once on its trace; past it, `UnrecordedTruth`: a summarized
+    recording's (`indexed_recording`), and a truths recording's (tests/recorded_truths.py)."""
+    live, roundings = _truth_program(truth_fn), {}
+
+    def certified(index: int, *arguments):
+        computed = live(*arguments)
+        if not roundings:
+            # One draw's roundings, a window loop's its window's: each window is a draw of its own.
+            program, traced = _one_draws_program(truth_fn, arguments)
+            roundings["count"] = chain_roundings(jax.make_jaxpr(program)(*traced))
+        eps = float(np.finfo(np.float64).eps)
+        if set(computed) != set(shapes):
+            raise AssertionError(f"{site}: `truth_fn` gives the leaves {sorted(computed)}, the recording "
+                                 f"{sorted(shapes)}")
+        for name, value in computed.items():
+            value = np.asarray(value, np.float64)
+            if value.shape != tuple(shapes[name].tolist()):
+                raise AssertionError(f"{site}: the truth of {name!r} recomputed is {value.shape}, the "
+                                     f"recorded reference's {tuple(shapes[name].tolist())}")
+            recorded = recorded_sketch(index, name)
+            if not np.isfinite(value).all():
+                raise AssertionError(f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not "
+                                     f"finite")
+            # The leaf's norm, scaled by its largest magnitude first so no square overflows.
+            largest = float(np.max(np.abs(value))) if value.size else 0.0
+            norm = largest * float(np.linalg.norm(value / largest)) if largest > 0 else 0.0
+            # The oracle rule's bound on the difference's norm, and the rounding of both sketches, the
+            # recorded truth's magnitudes no more than this one's and the difference's (`sketch_rounding`).
+            oracle = 2 * roundings["count"] * eps * norm
+            magnitude = float(np.sum(np.abs(value))) * (1 + value.size * eps) + np.sqrt(value.size) * oracle
+            bound = (SKETCH_DEVIATIONS * oracle + 2 * sketch_rounding(magnitude)) * (1 + 1e-6)
+            apart = truth_sketch(value, index) - recorded
+            # Its root mean square, scaled by its largest first so no square overflows.
+            widest = float(np.max(np.abs(apart))) if apart.shape == recorded.shape else np.inf
+            away = (widest * float(np.sqrt(np.mean(np.square(apart / widest)))) if 0 < widest < np.inf
+                    else widest)
+            if not (np.isfinite(bound) and away <= bound):
+                raise UnrecordedTruth(
+                    f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not the recorded "
+                    f"reference's: its sketch is {away:.3e} away (root mean square), past float64's "
+                    f"rounding of the computation "
+                    f"({roundings['count']} roundings); `truth_fn` does not compute what the reference's "
+                    f"truth did")
+        return computed
+
+    return live, certified
+
+
 def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     """`indexed_recording` of a recording of the reference's evidence alone."""
     def tree(kind):
@@ -2261,7 +2314,6 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     if min(count, len(digests)) < staged_units(seeds):
         raise AssertionError(f"{site}: {min(count, len(digests))} recorded seeds, and check 1 over {seeds} "
                              f"may draw {staged_units(seeds)}")
-    roundings = {}
 
     def held(seed):
         """`seed`'s evidence, its input digests and its row in them: a verdict seed's, or a pilot's."""
@@ -2296,52 +2348,12 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     if pilots:
         reference.pilots = range(SIZING_FROM, SIZING_FROM + pilots)
 
-    # The truth recomputed, compiled as the gate compiles a truth; its roundings are counted on its trace.
-    live = _truth_program(truth_fn)
+    def recorded_sketch(index: int, name: str):
+        evidence, _, row = held(index)
+        return evidence["sketch"][name][row]
 
-    def certified(index: int, *arguments):
-        """`truth_fn` on `arguments` (a seed's inputs, a followed site's recorded decisions before them),
-        held to the recorded truth's sketch at seed `index`."""
-        computed = live(*arguments)
-        if not roundings:
-            # One draw's roundings, a window loop's its window's: each window is a draw of its own.
-            program, traced = _one_draws_program(truth_fn, arguments)
-            roundings["count"] = chain_roundings(jax.make_jaxpr(program)(*traced))
-        eps = float(np.finfo(np.float64).eps)
-        if set(computed) != set(sketch):
-            raise AssertionError(f"{site}: `truth_fn` gives the leaves {sorted(computed)}, the recording "
-                                 f"{sorted(sketch)}")
-        for name, value in computed.items():
-            value = np.asarray(value, np.float64)
-            if value.shape != tuple(shapes[name].tolist()):
-                raise AssertionError(f"{site}: the truth of {name!r} recomputed is {value.shape}, the "
-                                     f"recorded reference's {tuple(shapes[name].tolist())}")
-            evidence, _, row = held(index)
-            recorded = evidence["sketch"][name][row]
-            if not np.isfinite(value).all():
-                raise AssertionError(f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not "
-                                     f"finite")
-            # The leaf's norm, scaled by its largest magnitude first so no square overflows.
-            largest = float(np.max(np.abs(value))) if value.size else 0.0
-            norm = largest * float(np.linalg.norm(value / largest)) if largest > 0 else 0.0
-            # The oracle rule's bound on the difference's norm, and the rounding of both sketches, the
-            # recorded truth's magnitudes no more than this one's and the difference's (`sketch_rounding`).
-            oracle = 2 * roundings["count"] * eps * norm
-            magnitude = float(np.sum(np.abs(value))) * (1 + value.size * eps) + np.sqrt(value.size) * oracle
-            bound = (SKETCH_DEVIATIONS * oracle + 2 * sketch_rounding(magnitude)) * (1 + 1e-6)
-            apart = truth_sketch(value, index) - recorded
-            # Its root mean square, scaled by its largest first so no square overflows.
-            widest = float(np.max(np.abs(apart))) if apart.shape == recorded.shape else np.inf
-            away = (widest * float(np.sqrt(np.mean(np.square(apart / widest)))) if 0 < widest < np.inf
-                    else widest)
-            if not (np.isfinite(bound) and away <= bound):
-                raise UnrecordedTruth(
-                    f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not the recorded "
-                    f"reference's: its sketch is {away:.3e} away (root mean square), past float64's "
-                    f"rounding of the computation "
-                    f"({roundings['count']} roundings); `truth_fn` does not compute what the reference's "
-                    f"truth did")
-        return computed
+    # The truth recomputed, compiled as the gate compiles a truth, held to the recorded sketch.
+    live, certified = certifier(site, truth_fn, shapes, recorded_sketch)
 
     if decided:
         return draw, reference, _recorded_following(decisions_at, certified, live)

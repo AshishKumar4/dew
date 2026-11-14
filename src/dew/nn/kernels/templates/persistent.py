@@ -46,20 +46,50 @@ def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: 
 
 
 def consumed(family: Family, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
-             store: Callable, index, walking: Callable, *, axis: str) -> jax.Array:
+             store: Callable, index, walking: Callable, *, axis: str, turns=None) -> jax.Array:
     """Consumer role `index`'s tiles of a persistent kernel (`tiled`'s), issued and finished in turn
     (`Family.persist`'s `issue` and `finish`): each tile's accumulators `issue(index, tile, walk,
     active=...)`, `walk` its steps' (`walking(counter, active, steps, views)`, built where the tile is
     visited) where it streams any, a walk of none (`unwalked`) where not, then `finish(index, tile, accs,
-    store, active=...)`. Returns the counter past the last tile."""
+    store, active=...)`. Returns the counter past the last tile.
+
+    With `turns` (`Family.meeting`'s two barriers of two consumers' arrivals: ping-pong, `persist`'s
+    `pingpong`), each tile is its owner's alone, the active tiles' turn counted (`done`) alternating between
+    the two consumers, so each walks its own tiles at the shared counter and passes over its partner's. Its
+    products take the tensor cores in turn: an owner arrives at its own barrier and waits for its partner's
+    arrival there, issues the tile, then arrives at its partner's barrier, and finishes the tile while its
+    partner issues the next (FlashAttention-3's alternation; consumer 1 arrives once at consumer 0's
+    barrier before its first tile, so consumer 0 goes first). No arrival overruns a phase: a consumer's next
+    arrival at a barrier comes after its own wait at its other barrier, which needs its partner's arrival
+    there, which comes only after the partner's wait at this barrier completed the phase before. Past the
+    last tile, the consumer the next tile would be its arrives at its own barrier once more and waits there,
+    completing and observing the phase its partner's last arrival opened (consumer 1's first, where no tile
+    ran), so no barrier ends with an arrival pending or a phase its waiter has not seen."""
+    if turns is not None:
+        pl.when(index == 1)(lambda: family.turn(turns.at[0], 2, wait=False))
+
     def visit(counter, active, steps, views, tile, done):
-        del done
         walk = walking(counter, active, steps, views)
 
         def run(walk, *, active: bool):
             finish(index, tile, issue(index, tile, walk, active=active), store, active=active)
 
-        pl.when(active)(lambda: run(walk, active=True))
-        pl.when(~active)(lambda: run(unwalked(family), active=False))
+        if turns is None:
+            pl.when(active)(lambda: run(walk, active=True))
+            pl.when(~active)(lambda: run(unwalked(family), active=False))
+            return
+        mine, alternating = done % 2 == index, turns
 
-    return tiled(tiles, schedule, visit, axis=axis)[0]
+        def owned():
+            family.turn(alternating.at[index], 2)
+            accumulators = issue(index, tile, walk, active=True)
+            family.turn(alternating.at[1 - index], 2, wait=False)
+            finish(index, tile, accumulators, store, active=True)
+
+        pl.when(active & mine)(owned)
+        pl.when(~active & mine)(lambda: run(unwalked(family), active=False))
+
+    counter, done = tiled(tiles, schedule, visit, axis=axis)
+    if turns is not None:
+        pl.when(done % 2 == index)(lambda: family.turn(turns.at[index], 2))
+    return counter

@@ -73,6 +73,8 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     spilling. Its streams run through `persist`, or a plain walk over a `Feed` (`fed`) every consumer walks
     whole (no `passed`: a consumer's steps are every consumer's); it takes no cluster (a multicast ring's
     loads are each program's producer's)."""
+
+    takes_pingpong = False  # its first consumer issues every ring's loads, its partner's tiles' too
     cluster = 1
     feeds_itself = True
     gathers_rows = True  # the loading consumer, a whole warpgroup, gathers a step's rows (`gathered.Ring`)
