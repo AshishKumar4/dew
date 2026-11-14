@@ -1335,11 +1335,12 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
         # (`report.certified`), as a run on that GPU certifies it: the cache it prepares holds that run's.
         certifying = (contextlib.nullcontext() if on_tpus
                       else report.certifying(trainer.device_mesh.devices.flat[0]))
-        # Traced with the target's first device as the default too, so a library that reads the GPU it is
-        # traced for (JAX's cuDNN attention gates, row 5894) reads the target's, not this process's backend.
+        # A library that reads the GPU it is traced for (JAX's cuDNN attention gates, row 5894) reads the
+        # target's from the concrete mesh the step traces on (`Trainer._traced_on`); made the process's
+        # default device besides, the compile-only GPU changed the program a run on that GPU compiles first,
+        # which then refused the step (row 6163).
         with (assumed(on, portable=portable), certifying,
-              trainer.phase_passes.scoped(trainer, trainer._compiler),
-              jax.default_device(trainer.device_mesh.devices.flat[0])):
+              trainer.phase_passes.scoped(trainer, trainer._compiler)):
             target = gpu_target()
             # A fresh run's start compiles beside its step's planning, which reads none of it.
             from dew.training.distributed import start_compiling
