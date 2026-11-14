@@ -250,37 +250,61 @@ another's (a question's option lines' stream, its instructions', rows 2008 to 24
 means what today's, which has none, does. A saved run's records read without them (`earlier_fields`)."""
 
 
-MOVED_PATHS: Mapping[str, str] = {
-    f"dew.inputs.encoders:{name}": f"dew.interop.encoders:{name}"
-    for name in ("CLIPText", "T5Text", "HFAudio")
-} | {
-    f"dew.inputs.diffusion:{name}": f"dew.interop.conditioners:{name}"
-    for name in ("DiffusionConditioner", "QwenImageConditioner", "HiddenStatesConditioner", "WanConditioner")
+MOVED_CLASSES: Mapping[tuple[str, str], tuple[str, ...]] = {
+    ("dew.inputs.encoders", "dew.interop.encoders"): ("CLIPText", "T5Text", "HFAudio"),
+    ("dew.inputs.diffusion", "dew.interop.conditioners"): (
+        "DiffusionConditioner", "QwenImageConditioner", "HiddenStatesConditioner", "WanConditioner"),
 }
-"""Import paths an earlier Dew recorded, by the path each names now: the encoders that bind a released
-checkpoint, dew.interop's since row 5996, which a run's record, its steps' artifacts or its data plan named
-under dew.inputs. The one table their readers of saved records translate by (`moved_paths`): a run's record
-(`dew.config.earlier.earlier_run`), a step's artifact (`dew.inference.tasks.earlier_shapes`) and a saved
-data plan's manifest (`dew.data.plan.Plan.check`); a path given today is read as given
-(`dew.registry.imported`)."""
+"""The classes an earlier Dew kept in another module, by that module and the one each is in now: the
+encoders that bind a released checkpoint, dew.interop's since row 5996, which a run's record, its steps'
+artifacts and its data plans named under dew.inputs. Carried to 1.0 with the other `earlier_*` readers."""
+
+MOVED_PATHS: Mapping[str, str] = {
+    f"{earlier}{separator}{name}": f"{now}{separator}{name}"
+    for (earlier, now), names in MOVED_CLASSES.items() for name in names for separator in ":."
+}
+"""Each moved class's path as an earlier Dew wrote it, by the path it has now: an import path a record names
+(`module:Class`, `dew.registry.import_path`) and the class a data plan describes a step's part by
+(`module.Class`, `dew.data.plan.structured`)."""
+
+_MOVED = re.compile("|".join(rf"\b{re.escape(path)}\b" for path in MOVED_PATHS))
+_EARLIER = {now: earlier for earlier, now in MOVED_PATHS.items()}
+_SPELLED_EARLIER = re.compile("|".join(rf"\b{re.escape(path)}\b" for path in _EARLIER))
 
 
 def moved_record(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved record's fields, the JSON its file holds, with the import paths they name translated
+    """A saved record's fields, the JSON its file holds, with the paths they name translated
     (`moved_paths`)."""
     return {name: moved_paths(json_value(value, name)) for name, value in record.items()}
 
 
 def moved_paths(value: JSON) -> JSON:
-    """`value`, a saved record's JSON, with every string an earlier Dew recorded as an import path
-    `MOVED_PATHS` holds read as the path it names now; the rest as it is."""
+    """`value`, JSON an earlier Dew saved (a run's record, a step's artifact, a data plan or a position's
+    order), with each moved class's path in its text read as the path it has now (`MOVED_PATHS`),
+    wherever a string holds it: a record's class names one whole, and a data plan's step configuration,
+    itself JSON in a string, among its other parts. Readers of saved records translate by it (`earlier_run`,
+    `dew.inference.tasks.earlier_shapes`, `dew.data.plan.Plan.check`); a path given today is read as given
+    (`dew.registry.imported`)."""
     if isinstance(value, str):
-        return MOVED_PATHS.get(value, value)
+        return moved_spelling(value)
     if isinstance(value, dict):
         return {key: moved_paths(held) for key, held in value.items()}
     if isinstance(value, list):
         return [moved_paths(held) for held in value]
     return value
+
+
+def moved_spelling(text: str) -> str:
+    """`text` with each moved class's path an earlier Dew wrote read as the path it has now
+    (`MOVED_PATHS`)."""
+    return _MOVED.sub(lambda path: MOVED_PATHS[path.group(0)], text)
+
+
+def earlier_spelling(text: str) -> str:
+    """`text` with each moved class's path spelled as an earlier Dew wrote it (`MOVED_PATHS`): what a data
+    plan's digests hash (`dew.data.plan.fingerprint`), so a position saved before a class moved, which
+    holds its members' and its parts' digests alone, compares equal to the same plan's now."""
+    return _SPELLED_EARLIER.sub(lambda path: _EARLIER[path.group(0)], text)
 
 
 def earlier_fields(value: JSON) -> JSON:
