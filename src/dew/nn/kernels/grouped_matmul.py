@@ -703,22 +703,13 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def _granular(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> bool:
         """Whether `config` is in `family`'s granularity (`candidate`): at most its consumers, at most the
         programs its registers hold, a ring of two stages at least, whole roles of rows for each consumer,
-        whole column units, one of its depths, and each streamed block's rows in its consumers' equal
-        shares (`Family.shares_rows`)."""
+        whole column units, and one of its depths."""
         dtype = ba.arguments['tokens'].dtype
         return not (config.warpgroups > min(family.consumers, mosaic_gpu.CONSUMERS)
                     or config.programs > family.programs(config.warpgroups) or config.stages < 2
                     or config.block_m % (family.role_rows * config.warpgroups)
                     or config.block_n % family.column_unit(dtype)
-                    or config.block_k not in (self.STEPS or family.depths(dtype))
-                    or not all(family.shares_rows(rows, config.warpgroups)
-                               for rows in self._streamed_rows(ba, config)))
-
-    def _streamed_rows(self, ba, config: mosaic_gpu.Tiles) -> tuple[int, ...]:
-        """The rows of each block a step streams, each its leading axis as it lies (its consumers' shares
-        of them, `Family.shares_rows`): the rows' tile's (`block_m`, or `block_k` read transposed) and the
-        matrix's (`block_k`, or `block_n` read transposed)."""
-        return config.block_m, config.block_k, *((config.block_n,) if self._matrix_transposed(ba) else ())
+                    or config.block_k not in (self.STEPS or family.depths(dtype)))
 
     def _matrix_transposed(self, ba) -> bool:
         """Whether the matrix's blocks lie transposed, `[width, depth]` (`trans_rhs`), as its stream reads
@@ -1758,11 +1749,6 @@ class MosaicTgmm(_Mosaic):
         prologue = ba.arguments['hooks'].prologue
         return (family.bounded_loads and rows % cooperative != 0
                 and mosaic_gpu.ragged_rows(rows, prologue=prologue, k_major=self.K_MAJOR))
-
-    def _streamed_rows(self, ba, config: mosaic_gpu.Tiles) -> tuple[int, ...]:
-        # Both operands stream a step's rows (the tokens): `block_k` of them each.
-        del ba
-        return (config.block_k,)
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """`_Mosaic.candidate` on one multiprocessor a tile or a pair (`tgmm` multicasts nothing), a family

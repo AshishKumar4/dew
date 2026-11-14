@@ -109,16 +109,14 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            interpret, family: str, name: str | None = None, scratch: tuple = (),
            approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | None = None,
            model_flops: int | None = None, reduction_scratch: int = 0, resident: int = 1,
-           ahead: Callable | None = None, settled: tuple[int, ...] = (),
            prefetched: Callable | None = None, model: resources.RegisterModel | None = None) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
     checked against the mesh it runs in (`launches.kernel`), named as the launch tracing it reports `name`
     with its register `model` where given (`report.named`), a launch lowered once for every call of its
     facts (`tuning.lowered_once`), its `cost` the hardware's work and `model_flops` the model's share of it,
-    and its `settled` operands those its programs read `ahead` of their wait (`dependent`, `checked`)."""
+    its L2 `prefetched` views issued before its wait (`dependent`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
-    launched = bodies.dependent(entry, interpret, ahead=ahead, settled=settled, scratch=len(scratch),
-                         prefetched=prefetched)
+    launched = bodies.dependent(entry, interpret, prefetched=prefetched)
     built = launches.kernel(launched, name=name or family, out_type=out_type, grid=grid,
                             grid_names=grid_names, num_threads=warpgroups, thread_name="wg",
                             scratch_types=scratch,
@@ -126,10 +124,7 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
                                                             reduction_scratch=reduction_scratch),
                             interpret=bodies.interpreted(interpret),
                             kernel_name=report.named(name, model=model), cost_estimate=cost, **clustered)
-    # Its settled operands are checked where its programs read them before their wait (`waits`): a launch
-    # that does not wait is ordered after the one before it, whatever it reads first.
-    return checked(built, name or family, resident, model_flops, settled if bodies.waits(interpret) else (),
-                   moves=model is None or model.moves)
+    return checked(built, name or family, resident, model_flops, moves=model is None or model.moves)
 
 
 def _is_ref(operand) -> bool:
@@ -137,18 +132,16 @@ def _is_ref(operand) -> bool:
     return isinstance(jax.typeof(operand), state_types.AbstractRef)
 
 
-def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | None = None,
-            settled: tuple[int, ...] = (), *, moves: bool = True) -> Callable:
+def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | None = None, *,
+            moves: bool = True) -> Callable:
     """The launch `built` (`launches.kernel`, which holds each call per shard), each call traced at its
     residency (`bodies.RESIDENT`) and moving its roles' registers where it `moves` them (`bodies.MOVES`,
     `resources.RegisterModel.moves`) under the name `kernel`: a launch built once for every call of its facts
     checks each call's own; and refused at its trace where two of the refs it adds into in place share a shape
     and a dtype, which `stacked_zeros` makes one ref (row 3180). Its call declares `model_flops`, the model's
     share of the work its cost states (the rest its own recomputation), where given, as its custom call's
-    frontend attribute (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads, and the operands it
-    reads ahead of its wait, `settled` (`bodies.SETTLED`), which the compile point checks."""
-    stated = {**({} if model_flops is None else {MODEL_FLOPS: str(model_flops)}),
-              **({bodies.SETTLED: ",".join(map(str, settled))} if settled else {})}
+    frontend attribute (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads."""
+    stated = {} if model_flops is None else {MODEL_FLOPS: str(model_flops)}
 
     def launch(*operands):
         if stated:
@@ -1442,7 +1435,6 @@ class Transport[Allocated, Opened](abc.ABC):
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               ahead: Callable | None = None, settled: tuple[int, ...] = (),
                prefetched: Callable | None = None, registers: int | None = None,
                producer: int | None = None, shared: int | None = None,
                moves: bool | None = None) -> Callable:
@@ -1457,10 +1449,10 @@ class Transport[Allocated, Opened](abc.ABC):
         `reducing_warpgroups` (the block's, where its arithmetic may reduce across warps implicitly) each
         reserving its share of reduction scratch (`warpgroup_reduction_scratch`); its first `scalars` operands
         tables of integers its programs read an element at a time (a grouped schedule's), which a GPU reads
-        from global memory and a TPU from its scalar memory; its `settled` operands (indices) read `ahead`
-        of the program's wait for the launch before it, and its `prefetched` views prefetched into L2
-        before it, where given (`dependent`); its consumer thread's `registers`, where the launch states
-        them, its register decision recorded on the launch tracing it (`resources.register_model`, its
+        from global memory and a TPU from its scalar memory; its `prefetched` views prefetched into L2
+        before the program's wait for the launch before it, where given (`dependent`); its consumer
+        thread's `registers`, where the launch states them, its register decision recorded on the launch
+        tracing it (`resources.register_model`, its
         producer lowered to `producer` where the family has one, `roles`, and its residency bounded by the
         `shared` bytes it stages where stated; `report.Launch.kernels`), which the compile point checks its
         kernel against; and whether its program moves registers between its roles where the launch states
@@ -1624,12 +1616,6 @@ class Transport[Allocated, Opened](abc.ABC):
         each copy's launch axes as its tile holds them (`templates.axes.held`), say which of the
         accumulator's axes a vector follows, where a family stages its loads through registers in the
         accumulator's layouts (`mosaic_sm80.Mma`); a vector whose axes go unstated follows its columns."""
-
-    def shares_rows(self, rows: int, consumers: int) -> bool:
-        """Whether a step's block of `rows` rows splits into the copies `consumers` consumers each make of it:
-        always where a producer loads it whole (TMA's rings)."""
-        del rows, consumers
-        return True
 
     def load_barriers(self, count: int) -> pallas_core.ScratchShape:
         """The scoped allocation of `count` whole loads' completions (`loaded`'s barriers), which a program's
@@ -1963,7 +1949,6 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               ahead: Callable | None = None, settled: tuple[int, ...] = (),
                prefetched: Callable | None = None, registers: int | None = None,
                producer: int | None = None, shared: int | None = None,
                moves: bool | None = None) -> Callable:
@@ -1974,8 +1959,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                       warpgroups=self.warpgroups(consumers), family=self.name, interpret=interpret,
                       name=name, approx_math=approx_math, cluster=cluster, cost=cost,
-                      model_flops=model_flops, resident=resident, ahead=ahead, settled=settled,
-                      prefetched=prefetched,
+                      model_flops=model_flops, resident=resident, prefetched=prefetched,
                       model=(None if registers is None
                              else resources.register_model(self, consumers, registers, producer=producer,
                                                            programs=resident, shared=shared, moves=moves)),

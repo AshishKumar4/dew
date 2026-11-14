@@ -546,7 +546,6 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               ahead: Callable | None = None, settled: tuple[int, ...] = (),
                prefetched: Callable | None = None, registers: int | None = None,
                producer: int | None = None, shared: int | None = None,
                moves: bool | None = None) -> Callable:
@@ -555,8 +554,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         # Its programs read a table from global memory as any operand, and no producer runs beside them.
         del reducing_warpgroups, scalars, producer, moves  # one warpgroup: no roles to move registers between
         _one(consumers, clustered=cluster > 1)
-        built = launches.kernel(bodies.dependent(entry, interpret, ahead=ahead, settled=settled,
-                                                 prefetched=prefetched),
+        built = launches.kernel(bodies.dependent(entry, interpret, prefetched=prefetched),
                                 name=name or self.name,
                                 out_type=out_type, grid=grid, grid_names=grid_names,
                                 compiler_params=plgpu.CompilerParams(approx_math=approx_math,
@@ -567,8 +565,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                                                  else resources.register_model(self, consumers, registers,
                                                                                shared=shared))),
                                 cost_estimate=cost)
-        return mosaic.checked(built, name or self.name, resident, model_flops,
-                              settled if bodies.waits(interpret) else ())
+        return mosaic.checked(built, name or self.name, resident, model_flops)
 
     def program_scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)

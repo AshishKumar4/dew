@@ -489,13 +489,6 @@ class MosaicForward(_Mainloop[Tiles]):
         # tiles lower at widths 64 to 256 on sm80 and sm90, dd-k16b).
         if config.block_q < family.role_rows and config.block_k % (WARPGROUP_WARPS * 16):
             return False
-        # Its key tiles (the launch's, its natural rewalk's) split among the consumers that copy them
-        # (`Transport.shares_rows`: two mma.sync consumers' cp.async in whole 64-row parts, so no 32-key tile
-        # of two consumers, fs-qualified6).
-        if not (family.shares_rows(config.block_k, config.consumers)
-                and family.shares_rows(config.relaunch_k or config.block_k,
-                                       config.relaunch_consumers or config.consumers)):
-            return False
         # Its products' right operands, the keys' tile in S = Q·Kᵀ (the heads' width deep, a key tile's
         # columns) and the values' in P·V (a key tile's rows of the launch's value columns, `Tiles.columns`),
         # ones its family's products take (`Issuer.takes_right`: tcgen05's 64-row products pad a narrow one

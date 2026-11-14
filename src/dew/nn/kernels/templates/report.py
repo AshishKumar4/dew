@@ -684,13 +684,7 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
              ) -> jax.stages.Compiled:
     """`lowered` compiled (`kept`), its communicators admitted against the room the process's pool left
     them before it runs (`dew.communicators.admit`): every program Dew compiles passes here. `first` is
-    its first compile where another thread made it (`attempts`). A program whose launch reads ahead of its
-    wait an operand it produces is refused (`lowered.unsettled`)."""
-    from dew.nn.kernels.lowered import Unsettled, unsettled
-
-    if found := unsettled(lowered):
-        raise Unsettled("a launch reads ahead of its wait an operand its program produces, which the launch "
-                        f"before it may still be writing: {', '.join(found)}")
+    its first compile where another thread made it (`attempts`)."""
     executable = kept(lowered, options, relower=relower, first=first)
     communicators.admit(executable)
     return executable
