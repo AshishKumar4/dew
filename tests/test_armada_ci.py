@@ -1850,8 +1850,7 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
     taken away runs no other file again (train 668: a module added to nn/backbones re-keyed 589 rows).
     A module of a name an import the file's run tried and failed looks for runs it again, as the import
     now finds it, and only it; so does a package of the name of a module it executed, which shadows it, and an
-    __init__.py added to a namespace package on the way to one; each taken away again returns the file to
-    inputs it ran green on, whose run is reused (the row keeps each green run's executed set); a top-level
+    __init__.py added to a namespace package on the way to one, and each taken away again; a top-level
     package added under src/, which may shadow any import, runs every file."""
     # src/pkg/space is a namespace package on the way to pkg.space.sub.used: its import executes no file.
     for name, source in {"src/pkg/__init__.py": "", "src/pkg/space/sub/__init__.py": "",
@@ -1886,15 +1885,15 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
                ("src/idle/new.py", "def value(): return 3\n", [1, 1]),
                ("src/other/extra.py", "def value(): return 4\n", [1, 1]),
                ("src/other/extra.py", None, [1, 1]),
-               # Taken away again, the tree is one the file ran green on: that run is reused.
-               ("src/other/optional.py", "VALUE = 1\n", [1, 2]), ("src/other/optional.py", None, [1, 2]),
-               ("src/other/lone/__init__.py", "def value(): return 5\n", [1, 3]),
-               ("src/other/lone/__init__.py", None, [1, 3]), ("tests/test_added.py", None, [1, 3]),
-               # test_lone's green run kept since its first, which ran in one process with test_uses,
-               # holds the package lookups that process made: they changed, it runs too, as a key reads
-               # what its run read.
-               ("src/pkg/space/__init__.py", "", [2, 4]), ("src/pkg/space/__init__.py", None, [2, 4]),
-               ("src/top/__init__.py", "", [3, 5])]
+               # Taken away again, the file runs again: a lookup keys these inputs with its last run's set
+               # alone, and no main of this checkout names an earlier run (`green_record`).
+               ("src/other/optional.py", "VALUE = 1\n", [1, 2]), ("src/other/optional.py", None, [1, 3]),
+               ("src/other/lone/__init__.py", "def value(): return 5\n", [1, 4]),
+               ("src/other/lone/__init__.py", None, [1, 5]), ("tests/test_added.py", None, [1, 5]),
+               # test_lone's last run was alone in its process, so its record holds none of test_uses'
+               # package lookups: only test_uses runs.
+               ("src/pkg/space/__init__.py", "", [2, 5]), ("src/pkg/space/__init__.py", None, [3, 5]),
+               ("src/top/__init__.py", "", [4, 6])]
     for path, source, runs in changes:
         if path and source is None:
             (tmp_path / path).unlink()
@@ -1912,10 +1911,10 @@ def test_a_tools_init_added_or_a_helper_of_a_shadowing_name_reruns_the_rows_whos
         ci, tmp_path, monkeypatch, cache_worker):
     """tools/ is a namespace package, which a test imports from (`from tools import x`): an __init__.py added
     to it, which runs on every such import and makes it a regular package, reruns each row that imported
-    from it (train 672's review: no row's key held tools' own lookup), and its removal returns the row to
-    inputs it ran green on, whose run is reused (the row keeps each green run's executed set); a helper
-    under tests/ of a module's name, which shadows it as tests/ leads sys.path, reruns each row that imported
-    that name, and one of another name reruns none."""
+    from it (train 672's review: no row's key held tools' own lookup), and so does its removal, as the row's
+    last run executed it and no main of this checkout names the run before (`green_record`); a helper under
+    tests/ of a module's name, which shadows it as tests/ leads sys.path, reruns each row that imported that
+    name, and one of another name reruns none."""
     (tmp_path / "tools").mkdir(exist_ok=True)
     (tmp_path / "tools/helper.py").write_text("def value(): return 1\n")
     written(tmp_path, {
@@ -1936,9 +1935,9 @@ def test_a_tools_init_added_or_a_helper_of_a_shadowing_name_reruns_the_rows_whos
         return len((tmp_path / "runs").read_text())
 
     assert run() == 1
-    for path, source, runs in (("tools/__init__.py", "", 2), ("tools/__init__.py", None, 2),
-                               ("tests/unrelated_helper.py", "VALUE = 1\n", 2),
-                               ("tests/json.py", "def dumps(value): return str(value)\n", 3)):
+    for path, source, runs in (("tools/__init__.py", "", 2), ("tools/__init__.py", None, 3),
+                               ("tests/unrelated_helper.py", "VALUE = 1\n", 3),
+                               ("tests/json.py", "def dumps(value): return str(value)\n", 4)):
         if source is None:
             (tmp_path / path).unlink()
         else:
