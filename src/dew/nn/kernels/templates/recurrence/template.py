@@ -617,17 +617,19 @@ class Mosaic(base.Template[mainloop.Tiles]):
         launches = (*self.launches(ba, joined, target, backward=True),
                     *self.launches(ba, joined.forward or joined, target, backward=False))
         owned = _owners(spilled, launches)
-        moving = {launch.name: launch for launch in launches if launch.name in owned
+        # Every instance of a raised launch (a name the training call's backward and the forward alone can
+        # each plan at their own tiles), each judged at its own schedule and residency.
+        moving = [launch for launch in launches if launch.name in owned
                   and resources.moves_registers(launch.registers, (launch.family or family).warpgroups(
-                      launch.consumers), launch.consumers, launch.resident)}
-        producers = joined.producers.raised(moving) if moving else None
+                      launch.consumers), launch.consumers, launch.resident)]
+        producers = joined.producers.raised({launch.name for launch in moving}) if moving else None
         if producers is None:
             return None
         least = resources.facts().raises().lowest
         # Each raised launch's consumers keep a share setmaxnreg can move them to.
         expressed = all(min(resources.role_registers((1,) * launch.consumers + (0,), launch.resident,
-                                                     floor=producers.of(name))[:-1]) >= least
-                        for name, launch in moving.items())
+                                                     floor=producers.of(launch.name))[:-1]) >= least
+                        for launch in moving)
         return producers if expressed else None
 
     def _derive(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, chunk: int, *,
