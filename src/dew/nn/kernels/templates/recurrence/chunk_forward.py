@@ -15,13 +15,12 @@ from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as alg
 from dew.nn.kernels.chunked_launch import zero_padded
 from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.recurrence import own_pairs
+from dew.nn.kernels.templates.recurrence.intra import _intra, _intra_solve
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Operand,
     Tiles,
     Walked,
-    _intra,
-    _intra_solve,
     _parts,
     _scan,
     _solved,
@@ -239,7 +238,7 @@ class _Run:
 
 
 def _paired(q, k, decays, beta, taken, call, *, scale: float, solves: bool) -> tuple:
-    """`mainloop._intra`'s scores, system where it `solves`, and prefix halves, each sub-chunk's own pairs
+    """`intra._intra`'s scores, system where it `solves`, and prefix halves, each sub-chunk's own pairs
     added from a launch of their own (`own_pairs.intra_own`), on the entries the walk leaves zero, each
     rounded once: their sums exact in the outputs' forms."""
     *walked, hi, lo = _intra(q, k, decays, beta, taken, call, scale=scale, solves=solves)

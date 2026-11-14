@@ -391,7 +391,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
             betas = family.rows_of(beta_ref.at[h, span])
             at = pl.ds(h * width + index * keys, keys)
             # The sub-chunks' first tokens' prefix halves read once a step into a plain tile, a row each, as
-            # the intra launch reads its own (`mainloop._intra`).
+            # the intra launch reads its own (`intra._intra`).
             for half, ref in enumerate((hi_ref, lo_ref)):
                 for sub in range(chunk // algebra.SUB):
                     referenced[half, sub, :] = family.columns_of(ref.at[row + sub * algebra.SUB, at])

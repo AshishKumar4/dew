@@ -1,5 +1,5 @@
 """Each sub-chunk's own pairs under a decay a key dimension, launches of their own beside the factored walks
-(`mainloop._intra_walk`, `key_backward._key_pairs_back`): the forward's bands (`algebra.key_diagonal_bands`)
+(`intra._intra_walk`, `key_backward._key_pairs_back`): the forward's bands (`algebra.key_diagonal_bands`)
 and the backward's transpose (`algebra.key_diagonal_pairs_back`), no products on the tensor cores, as
 fla_kda's token-parallel diagonal (chunk_kda_fwd_intra_token_parallel) and its gradient. In the walks, an
 H100's Kimi Linear intra launch took 1982 us against 492 and its pairs' backward 2268 against 672, each at 248
@@ -16,6 +16,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, resources
+from dew.nn.kernels.templates.recurrence.intra import intra_masked, intra_rows, intra_sums_stored, systems
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Held,
@@ -24,16 +25,12 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     f32,
     fp32_operand,
     held_tile,
-    intra_masked,
-    intra_rows,
-    intra_sums_stored,
     key_block,
     launch_kernel,
     masks,
     stream_blocks,
     stream_tile,
     stream_views,
-    systems,
 )
 
 
