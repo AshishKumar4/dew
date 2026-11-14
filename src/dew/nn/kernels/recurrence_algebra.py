@@ -1066,16 +1066,16 @@ def key_diagonal_pairs_back(strips: list, own: list, behind: Callable[[jax.Array
         keys, decays = behind(e)
         pair = pair * following
         # Selected, never scaled by zero: a row before its offset reads past the shifted tile's start, any
-        # value (an interpreter's NaN in shared memory left unwritten).
+        # value (an interpreter's NaN in shared memory left unwritten), its pair too. The keys' terms are
+        # moved up from the rows `e` below, each within its sub-chunk where selected.
         within = index % sub >= e
-        decay = jnp.where(within, pair, 0.0)
         bands = [strip(e) for strip in strips]
-        d_rows = tuple(total + jnp.where(within, strip * keys * decay, 0.0)
+        d_rows = tuple(total + jnp.where(within, strip * keys * pair, 0.0)
                        for total, strip in zip(d_rows, bands, strict=True))
         # The rows read where they are weighed, not held across the offsets: held, an sm100's own pairs'
         # backward needed all of its 248 registers, read here 232 (row 5298).
         weighted = functools.reduce(jnp.add, (strip * row() for strip, row in zip(bands, own, strict=True)))
-        return (d_rows, d_keys + jnp.where(index % sub + e < sub, lower(e, weighted * decay), 0.0), pair,
+        return (d_rows, d_keys + jnp.where(index % sub + e < sub, lower(e, weighted * pair), 0.0), pair,
                 decays)
 
     one = jnp.ones(index.shape, jnp.float32)
