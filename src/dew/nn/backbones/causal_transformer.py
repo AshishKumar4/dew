@@ -1969,20 +1969,26 @@ class CausalTransformer(LinearProducts):
         return jnp.result_type(streams.dtype, output.dtype)
 
     def first_layer_shapes(self) -> dict:
-        """Return the stack's first layer's variables as shape/dtype structs.
+        """Return the stack's first layer's variables as shape/dtype structs (`layer_shapes`)."""
+        return self.layer_shapes(0)
 
-        These are layer 0's variables, a bank's first row with the layer axis
-        dropped, or layer 0's variables completed by the bank's
+    def layer_shapes(self, run: int) -> dict:
+        """Return the first layer of the stack's run `run` (`groups`) as shape/dtype structs.
+
+        These are the layer's variables, a bank's first row with the layer axis
+        dropped, or the layer's variables completed by the bank's
         (`banked_collections`), or a stage-local store's first stage's first
-        row of the run that holds layer 0 (`StackView.stage_form`), on one
+        row of the run that holds the layer (`StackView.stage_form`), on one
         stage too. Nothing is read, fetched or sliced.
         """
         banked = self.banked_collections()
-        first = StackView(self.groups).bank_names()[0]
+        start, count = self.groups[run]
+        first = StackView(self.groups).bank_names()[run]
+        layer = f'layers_{start}'
         reader = self.variables.get('streaming', {}).get(first, {}).get('bank')
         if reader is not None:
             return reader.shapes()
-        stacked = self.groups[0][1] > 1
+        stacked = count > 1
 
         def shapes(leaf, drop: bool):
             return jax.ShapeDtypeStruct(leaf.shape[1:] if drop else leaf.shape, leaf.dtype)
@@ -1990,7 +1996,7 @@ class CausalTransformer(LinearProducts):
         variables = {}
         for collection, tree in self.variables.items():
             if collection in banked:
-                # A banked cache holds no entry for a first layer that caches nothing.
+                # A banked cache holds no entry for a layer that caches nothing.
                 if first in tree:
                     variables[collection] = jax.tree.map(
                         functools.partial(shapes, drop=stacked), tree[first])
@@ -1998,20 +2004,21 @@ class CausalTransformer(LinearProducts):
             held = {}
             if stacked and first in tree:
                 held = jax.tree.map(functools.partial(shapes, drop=True), tree[first])
-            if 'layers_0' in tree:
-                held = merge(held, jax.tree.map(functools.partial(shapes, drop=False), tree['layers_0']))
-            for name, run in tree.get('stages', {}).items():
+            if layer in tree:
+                held = merge(held, jax.tree.map(functools.partial(shapes, drop=False), tree[layer]))
+            for name, stage in tree.get('stages', {}).items():
                 layers = group_layers(name)
-                # A run that holds layer 0: a one-stage run its first group stacks, beside the leaves its
-                # stage-local state keeps on layer 0 itself (a frozen base joined in), or a pipeline's run
-                # where no layer 0 runs before it.
-                if layers is not None and layers.start == 0 and (stacked or 'layers_0' not in tree):
-                    # The stage axis, a run's own layer axis; a periodic run's layer 0 at its first position.
+                # A run that holds the layer: a one-stage run its group stacks, beside the leaves its
+                # stage-local state keeps on the layer itself (a frozen base joined in), or a pipeline's run
+                # where no such layer runs before it.
+                if layers is not None and layers.start == start and (stacked or layer not in tree):
+                    # The stage axis, a run's own layer axis; a periodic run's first layer at its first
+                    # position.
                     rows = 1 + (len(layers) > 1)
-                    if run_period(self.scan_keys, 0, len(layers)) > 1:
-                        run, rows = run['layers_0'], 2
+                    if run_period(self.scan_keys, start, len(layers)) > 1:
+                        stage, rows = stage['layers_0'], 2
                     held = merge(held, jax.tree.map(
-                        lambda leaf, rows=rows: jax.ShapeDtypeStruct(leaf.shape[rows:], leaf.dtype), run))
+                        lambda leaf, rows=rows: jax.ShapeDtypeStruct(leaf.shape[rows:], leaf.dtype), stage))
             if held:
                 variables[collection] = held
         return variables

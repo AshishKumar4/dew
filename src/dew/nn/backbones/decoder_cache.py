@@ -24,8 +24,13 @@ if TYPE_CHECKING:
 def trunk_cache(model: CausalTransformer, rows: int) -> CacheSpec:
     """`model`'s trunk's decode cache for `rows` rows: its layers', its loop's passes' and its own
     holders' (the module doc)."""
-    layers = [layer.cache_spec(rows) for layer in model.layers]
-    runs = _banked_runs(model) or tuple((index, 1) for index in range(model.num_layers))
+    banked = _banked_runs(model)
+    runs = banked or tuple((index, 1) for index in range(model.num_layers))
+    # A banked store's layers' specs read each run's first layer where its bank holds it (`layer_shapes`),
+    # every layer of a run alike.
+    layers = [layer.cache_spec(rows) for layer in model.layers] if banked is None else [
+        _banked_layer(model, run).cache_spec(rows)
+        for run, (_, count) in enumerate(banked) for _ in range(count)]
     entries = [(first, first, count) for first, count in runs]
     entries += [] if model.loop is None else pass_entries(model.loop, model.num_layers, runs)
     names = StackView(tuple((stored, count) for stored, _, count in entries)).bank_names()
@@ -50,6 +55,13 @@ def drafter_cache(model: CausalTransformer, rows: int) -> CacheSpec:
     """`model`'s block drafter's window caches for `rows` rows, each under its stage's name."""
     return {name: held for stage in model.dspark_stages
             if (name := stage.name) and (held := stage.cache_spec(rows))}
+
+
+def _banked_layer(model: CausalTransformer, run: int):
+    """The first layer of `model`'s run `run`, bound to its variables as the store's bank holds them, a
+    row of it (`CausalTransformer.layer_shapes`): a layer whose own scope the bank leaves empty."""
+    first = model.groups[run][0]
+    return model.layers[first].clone(parent=None).bind(model.layer_shapes(run))
 
 
 def _banked_runs(model: CausalTransformer) -> tuple[tuple[int, int], ...] | None:

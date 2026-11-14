@@ -1285,7 +1285,7 @@ class Server:
         assert blank is not None
         if self.prefill_mesh is None:
             return admitted_types(self.model, self.variables, self.pad_id, blank, self.rows.placement.plan,
-                                  self.progress)
+                                  self.prng, self.progress)
         rows = self._on_prefill_mesh(blank)
         with self._prefilling():
             traced = self._prefill.jitted.trace(self.model, self._prefill_variables, self.pad_id,

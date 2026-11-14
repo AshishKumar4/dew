@@ -188,19 +188,30 @@ class StateTypes:
         return jax.tree.unflatten(tree, [jnp.zeros((rows, *leaf.shape[1:]), leaf.dtype) for leaf in leaves])
 
 
-def admitted_types(model: nn.Module, params: Variables, pad_id: int, admission: Admission,
-                   plan: Speculative | None = None, progress: Progress = END) -> StateTypes:
-    """The types `admission`'s prefill leaves its rows (`prefill_state` over a fresh cache, as either
-    placement's admitting step prefills them), traced at the admission's own shape for those types alone:
-    the forward owns its outputs' types, the states' from the dtype its stack settles in, so no spec states
-    them. A server's start takes this trace once, at an admission it runs (`Server`); the admitting step
-    prefills inside its own program, whose inputs are the very slots these types make, so JAX's trace
-    cache, keyed on a function and its arguments' types, holds no trace of it to share."""
-    ops = decode_ops(model, params, pad_id, drafting_depths(model, plan), progress)
+def rows_prefilled(model: nn.Module, params: Variables, pad_id: int, admission: Admission,
+                   plan: Speculative | None, prng: str, progress: Progress = END
+                   ) -> tuple[DecoderState, jax.Array]:
+    """The admitted prompts' own decoder state, their rows prefilled over a fresh cache at their bucket
+    width, and their real slots: a dense admission's prefill (`Dense.rows_prefilled`), each row's keys
+    of `prng`'s implementation, its prediction depths' where `plan` drafts."""
+    narrow = cache_sized(model, admission.prompts.tokens.shape[1])
+    ops = decode_ops(narrow, params, pad_id, drafting_depths(model, plan), progress)
+    rounding = rounding_keys(jax.random.wrap_key_data(admission.keys, impl=prng))
+    return prefill_state(narrow, params, admission.prompts, ops, rounding=rounding, progress=progress,
+                         adapters=_rows_of(model, admission))
 
+
+def admitted_types(model: nn.Module, params: Variables, pad_id: int, admission: Admission,
+                   plan: Speculative | None, prng: str, progress: Progress = END) -> StateTypes:
+    """The types `admission`'s prefill leaves its rows (`rows_prefilled`, the dense admitting step's; a
+    paged pool's prefill and a mixed step leave its rows the same logits' and states' types), traced at the
+    admission's own shape for those types alone: the forward owns its outputs' types, the states' from the
+    dtype its stack settles in, so no spec states them. A server's start takes this trace once, at an
+    admission it runs (`Server`); the admitting step prefills inside its own program, whose inputs are the
+    very slots these types make, so JAX's trace cache, keyed on a function and its arguments' types, holds
+    no trace of it to share."""
     def prefilled(params: Variables, admission: Admission) -> DecoderState:
-        return prefill_state(model, params, admission.prompts, ops, progress=progress,
-                             adapters=_rows_of(model, admission))[0]
+        return rows_prefilled(model, params, pad_id, admission, plan, prng, progress)[0]
 
     _, state = jax.eval_shape(checkify.checkify(prefilled, errors=checkify.user_checks), params, admission)
     return StateTypes.of(state)
@@ -328,14 +339,9 @@ class Dense:
 
     def rows_prefilled(self, model: nn.Module, params: Variables, pad_id: int, admission: Admission,
                        progress: Progress = END) -> tuple[DecoderState, jax.Array]:
-        """The admitted prompts' own decoder state, their rows prefilled over a fresh cache at their bucket
-        width, and their real slots: what `prefilled` seats, which a server that prefills on a mesh of its
-        own runs there and moves (`Admission.prefilled`)."""
-        narrow = cache_sized(model, admission.prompts.tokens.shape[1])
-        ops = decode_ops(narrow, params, pad_id, drafting_depths(model, self.plan), progress)
-        rounding = rounding_keys(jax.random.wrap_key_data(admission.keys, impl=self.prng))
-        return prefill_state(narrow, params, admission.prompts, ops, rounding=rounding, progress=progress,
-                             adapters=_rows_of(model, admission))
+        """What `prefilled` seats, which a server that prefills on a mesh of its own runs there and moves
+        (`Admission.prefilled`): `rows_prefilled`."""
+        return rows_prefilled(model, params, pad_id, admission, self.plan, self.prng, progress)
 
 
 def _prefilled_rows(model: nn.Module, params: Variables, pad_id: int, placement: Dense, admission: Admission,
