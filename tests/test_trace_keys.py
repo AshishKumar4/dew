@@ -127,7 +127,7 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
         if event == "/jax/core/compile/jaxpr_trace_duration":
             traced.append(seconds)
 
-    rows = {"text": np.random.default_rng(0).integers(0, 8, size=(4, 17)).astype(np.int32)}
+    rows = {"text": np.random.default_rng(0).integers(0, 8, size=(8, 17)).astype(np.int32)}
 
     def refit(mesh: MeshSpec) -> tuple[dict, dict, int]:
         """The links each of two fits decided, and the programs JAX traced again for the second."""
@@ -137,7 +137,7 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
         fitted = []
         for _ in range(2):
             before = len(traced)
-            data = Loader(train=lambda partition: iter([rows] * 4), val=None, records=None, batch=4)
+            data = Loader(train=lambda partition: iter([rows] * 4), val=None, records=None, batch=8)
             trainer.fit(data, steps=2)
             fitted.append((dict(trainer.links), len(traced) - before))
         return fitted[0][0], fitted[1][0], fitted[1][1]
