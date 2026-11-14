@@ -325,6 +325,16 @@ _ELEMENTWISE: dict[str, Callable] = {
     "is_finite": lambda x: sympy.true if x.is_finite else (sympy.false if x.is_infinite else sympy.true),
 }
 
+def _truncated(x, y) -> int:
+    """An integer quotient as XLA's `div` takes it, toward zero."""
+    quotient = abs(int(x)) // abs(int(y))
+    return quotient if (int(x) >= 0) == (int(y) > 0) else -quotient
+
+
+_INTEGRAL: dict[str, Callable] = {"div": _truncated, "rem": lambda x, y: int(x) - int(y) * _truncated(x, y)}
+"""An integer division and remainder as XLA's `div` and `rem` take them, toward zero (a program's index
+arithmetic: a tile's rows by block, a mask's parity), where `_ELEMENTWISE`'s are the reals'."""
+
 _SAME = frozenset({"convert_element_type", "copy", "copy_p", "optimization_barrier", "stop_gradient",
                    "reduce_precision"})
 
@@ -340,6 +350,9 @@ def _equation(equation, values) -> list:
         return list(values)
     if name == "integer_pow":
         return [np.vectorize(lambda x: x ** params["y"], otypes=[object])(values[0])]
+    if name in _INTEGRAL and jnp.issubdtype(equation.outvars[0].aval.dtype, jnp.integer):
+        operands = np.broadcast_arrays(*values)
+        return [np.vectorize(_INTEGRAL[name], otypes=[object])(*operands)]
     if name in _ELEMENTWISE:
         operands = np.broadcast_arrays(*values)
         return [np.vectorize(_ELEMENTWISE[name], otypes=[object])(*operands)]
