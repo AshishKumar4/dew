@@ -126,8 +126,9 @@ def test_a_server_over_split_rows_takes_its_projections_on_each_devices_rows(sca
     """A bf16 decoder served on a two-device mesh whose slots split its rows, its layers each its own or
     scanned as one stack, the GEMM template named and interpreted as an H100's: its projections take the
     template's launch on each device's own rows, each weight entering whole (`dew.nn.sharding.FORWARD`,
-    traced under `placing`), as a trainer's step takes them per shard (train 818 F1: a served step traced
-    under no placement left every product to the partitioner, which no launch takes)."""
+    traced under `placing`), as a trainer's step takes them per shard, and every request draws what it
+    draws alone on one device (train 818 F1: a served step traced under no placement left every product to
+    the partitioner, which no launch takes; train 821 F2)."""
     from dew.nn.kernels import generation
 
     model = decoder().clone(dtype="bfloat16", emb_features=64, max_seq_len=128, num_layers=2,
@@ -139,9 +140,13 @@ def test_a_server_over_split_rows_takes_its_projections_on_each_devices_rows(sca
                                    Layout(min_shard=1, tolerance=1.0)))
     with (generation.assumed("sm90", interpreted=True), generation.chosen(grouped_matmul="mosaic"),
           generation.routes() as routes):
-        Server.from_task(placed, slots=2, capacity=128, admission=2)
+        _, tickets = served_alongside(placed, slots=2, admission=2)
+        alone = [served(prompt, budget, key=index)
+                 for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     assert any(route.choice is generation.Choice.GROUPED_MATMUL and route.kernel == "mosaic"
                for route in routes), routes
+    for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_draws(ticket.result(), lone)
 
 
 def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
