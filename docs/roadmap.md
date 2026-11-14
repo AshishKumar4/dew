@@ -76,7 +76,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Released checkpoints judged on GPUs. [1703, 1549]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - Every MAINPERF measurement since 2026-11-09. [6045]
-- The perf gate accepts a timing from a step that went non-finite. [6279]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Bit-level synthesis in dew.algebra. [3733]
 - Greedy extraction prices dearer than the exact optimum when a saturation aid is absent. [6254]
@@ -90,5 +89,5 @@ This page is generated from the maintainers' findings ledger as each change land
 ## CI and tooling
 
 - Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
-- Dewops/node/build.py:54-57 runs a build's commands through sh -c with set -e and keeps only the shell's status, so a build piped into tee records exit 0 when…. [6283]
+- The perf gate accepts a timing from a step that went non-finite. [6279]
 - The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
