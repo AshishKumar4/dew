@@ -126,8 +126,11 @@ def placed_leaves(tree: Variables, place: Callable[[KeyPath, Leaf], Leaf], *, in
     return mapping(tree, ())
 
 
-def stream(tree: Variables, placement, held: Variables | None = None) -> Variables:
-    """Move a variables tree into `placement`, one leaf at a time (`placed_leaves`, in place).
+def stream(tree: Variables, placement, held: Variables | None = None, *,
+           cast: Callable[[KeyPath, Leaf], Leaf] | None = None) -> Variables:
+    """Move a variables tree into `placement`, one leaf at a time (`placed_leaves`, in place), each leaf
+    as `cast(path, leaf)` makes it where given, just before it is placed, so a memory-mapped tree is read
+    and cast a leaf at a time, never whole.
 
     Each leaf is placed and written back into its parent dict before the
     next is read, so a tree of dicts is held twice one leaf at a time at most;
@@ -167,7 +170,7 @@ def stream(tree: Variables, placement, held: Variables | None = None) -> Variabl
             holder[key] = placed
 
     def landed(path: KeyPath, leaf):
-        placed = place_leaf(leaf, target(placement, path))
+        placed = place_leaf(leaf if cast is None else cast(path, leaf), target(placement, path))
         handed(leaf, placed)
         return placed
 

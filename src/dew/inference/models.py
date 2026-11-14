@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, ClassVar, Self
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 
 from dew._records import integer, record as named_fields, text
@@ -37,8 +38,10 @@ from dew.nn.precision import Numerics
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from jax.sharding import Mesh
+    from jax.tree_util import KeyPath
     from jax.typing import DTypeLike
 
+    from dew.distributed.host import Leaf
     from dew.distributed.placement import Layout, MeshSpec
     from dew.interop.layouts import Unwritable
     from dew.interop.pretrained import Pretrained
@@ -148,21 +151,17 @@ class ReleasedRun(SavedRun):
     def of(cls, directory: str | Path, trust: Sequence[str] = ()) -> Self:
         """The run step the release in `directory` holds, the packages `trust` names that its record imports
         imported first (`dew.registry.import_trusted`), as a run's are (`SavedRun.at`); a directory that
-        holds none is refused. A model's release written before it stated its run (its objective, model,
-        settings and numerics) reads as the declaration its run would have recorded, at step 0."""
+        holds none is refused."""
         from dew.config.release import Release
         from dew.inference.tasks import earlier_shapes
         from dew.registry import import_trusted
 
         release = Release.load(directory)
         task = None if release is None else release.task
-        if task is None or ("run" not in task and "objective" not in task):
+        if task is None or "run" not in task:
             raise ValueError(f"{directory} holds no native release: its release record states no run "
                              "(`dew export` of a run writes one)")
-        record = (named_fields(task["run"], "run") if "run" in task else
-                  {"objective": task["objective"], "model": task["model"],
-                   **named_fields(task.get("settings", {}), "settings"),
-                   **({} if task.get("numerics") is None else {"precision": task["numerics"]})})
+        record = named_fields(task["run"], "run")
         import_trusted(record, trust)
         held = cls.declared(str(directory), earlier_shapes(record), integer(task.get("step", 0), "step"))
         return replace(held, average=task.get("averaged") is True,
@@ -191,21 +190,36 @@ class ReleasedRun(SavedRun):
         if ema is not None:
             raise ValueError("a release holds the weights its export chose (`dew export --ema`); load the "
                              "run itself to choose its average")
-        variables = (unflatten(read_specs(self.directory)) if self.shapes
-                     else unflatten(read_weights(self.directory)))
-        if param_dtype is not None:
-            stored = jnp.dtype(resolve_dtype(param_dtype))
-
-            def stored_as(path, leaf):
-                if not (jnp.issubdtype(leaf.dtype, jnp.floating) and under_roots(path, parameter_roots)):
-                    return leaf
-                return jax.ShapeDtypeStruct(leaf.shape, stored) if self.shapes else leaf.astype(stored)
-
-            variables = jax.tree_util.tree_map_with_path(stored_as, variables)
         from dew.checkpoints import host_or_placed
+        from dew.interop.pretrained import on_default_device
 
         host_or_placed(on_host, mesh, layout)
-        return variables if self.shapes or on_host else place(variables, mesh, layout)
+        variables = (unflatten(read_specs(self.directory)) if self.shapes
+                     else unflatten(read_weights(self.directory)))
+        stored = None if param_dtype is None else jnp.dtype(resolve_dtype(param_dtype))
+
+        def stored_dtype(path: KeyPath, dtype: np.dtype) -> np.dtype:
+            return (stored if stored is not None and jnp.issubdtype(dtype, jnp.floating)
+                    and under_roots(path, parameter_roots) else dtype)
+
+        if self.shapes:
+            return jax.tree_util.tree_map_with_path(
+                lambda path, leaf: jax.ShapeDtypeStruct(leaf.shape, stored_dtype(path, leaf.dtype)),
+                variables)
+
+        def cast(path: KeyPath, leaf: Leaf) -> Leaf:
+            if not isinstance(leaf, (np.ndarray, np.generic)):
+                return leaf
+            dtype = stored_dtype(path, leaf.dtype)
+            return leaf if dtype == leaf.dtype else leaf.astype(dtype)
+
+        if on_host:
+            return jax.tree_util.tree_map_with_path(cast, variables)
+        # The memory-mapped release read and cast a leaf at a time as it is placed, never whole: on the
+        # mesh asked, else on JAX's default device, uncommitted, as a family's load places it (ledger 4798).
+        if mesh is None and layout is None:
+            return on_default_device(variables, cast=cast)
+        return place(variables, mesh, layout, cast=cast)
 
 
 class ReleasesModel:

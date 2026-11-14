@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import respelled
+from release_support import under_release
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained
@@ -320,7 +321,6 @@ def test_an_export_writes_the_releases_own_modules_at_its_commit(tmp_path):
     assert written == {file: path.read_bytes() for file, path in released.items()}
 
 
-@pytest.mark.release_env("transformers==5.18.0")
 def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_path):
     """LFM3-VL's processor is its release's own code (Lfm3VlProcessor and its image and video processors
     at f83d2b0), which a load that trusts the source's code runs (`trust_remote_code`, `Processor`): over a
@@ -330,7 +330,14 @@ def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_pat
     processor a run reloads from its recorded source (`load_processor`) in the process that trusts the
     source, the processor of the bundle's save, which writes the processor's own modules beside it, and
     the processor of a task the public pipeline loads where its caller trusts the source
-    (`dew.pipeline(trust=...)`); one loaded without that trust refuses to run the source's code."""
+    (`dew.pipeline(trust=...)`); one loaded without that trust refuses to run the source's code. Run in an
+    interpreter of its own under the transformers its release's code needs (`under_release`)."""
+    under_release("transformers==5.18.0", lfm3_vl_processor_lays_out_its_releases_own_output, str(tmp_path))
+
+
+def lfm3_vl_processor_lays_out_its_releases_own_output(directory: str) -> None:
+    """`test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output`'s check, in the interpreter its
+    release's transformers runs (`under_release`), its scratch under `directory`."""
     import shutil
 
     from tool_support import run_from
@@ -340,6 +347,7 @@ def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_pat
     from dew.inference.tasks import recorded_processor
     from dew.interop.pretrained import load_processor
 
+    tmp_path = Path(directory)
     source = tmp_path / 'source'
     shutil.copytree(VL, source)
     with run_from('remote_code_reference', 'tools') as reference:

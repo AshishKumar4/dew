@@ -272,7 +272,7 @@ The local process-pool tests run real `jax.distributed` processes. They do not c
 Before booking the GPUs, read what the run would hold on them. On a CPU host, build the trainer as the run will, over compile-only GPUs that state each GPU's memory (`compile_only_gpus`, which needs JAX's CUDA plugin installed and no GPU), and validate it with one global batch: Dew derives each GPU's allocator limit from the memory you state, 95% of it as a training process holds it. Here the run is the model above on eight 80 GB H100s, pooling four steps into each update:
 
 ```python
-from dew.training.ahead import compile_only_gpus
+from dew.nn.kernels import compile_only_gpus
 
 h100s = MeshSpec(fsdp=8).build(compile_only_gpus("sm90", 8, 80 * 10**9))
 trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0, mesh=h100s,

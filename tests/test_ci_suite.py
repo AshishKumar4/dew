@@ -23,7 +23,7 @@ def suite_maps(checkout: Path, tmp_path: Path) -> list[list[str]]:
     (tmp_path / "calls").unlink(missing_ok=True)
     environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "ARMADA": "armada",
                    "OUT": str(tmp_path / "out")}
-    for name in ("PROVEN", "GANGLESS", "DEW_WHOLE_SUITE"):
+    for name in ("PROVEN", "GANGLESS"):
         environment.pop(name, None)
     ran = subprocess.run(["bash", "tools/ci/suite.sh", "a" * 40], cwd=checkout, capture_output=True,
                          text=True, timeout=300, env=environment)
@@ -34,9 +34,9 @@ def suite_maps(checkout: Path, tmp_path: Path) -> list[list[str]]:
 
 def test_every_map_of_cis_suite_runs_on_the_cpus_its_tasks_are_pinned_to(tmp_path):
     """CI's suite gate (tools/ci/suite.sh) runs every armada job it sends on the CPUs .armada.json pins its
-    tasks to (task.cpu): its multi-host gangs as its suite and release checks do, as a CPU's arithmetic is its
-    own (2026-11-10: tasks of maps that named no CPU landed on AMD 25/1 x86-64-v3 hosts, where a dense sum and
-    a float64 rsqrt round apart from the pinned models'); and a checkout that pins none names none."""
+    tasks to (task.cpu): its multi-host gangs as its suite does, as a CPU's arithmetic is its own (2026-11-10:
+    tasks of maps that named no CPU landed on AMD 25/1 x86-64-v3 hosts, where a dense sum and a float64 rsqrt
+    round apart from the pinned models'); and a checkout that pins none names none."""
     cpu = json.loads((ROOT / ".armada.json").read_text())["task"]["cpu"]
     pinned = ",".join(f"{each['vendor']}/{each['family']}/{each['model']}"
                       for each in ([cpu] if isinstance(cpu, dict) else cpu))

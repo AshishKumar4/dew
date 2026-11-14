@@ -489,24 +489,27 @@ def followed_quantizers(model_module, decided: dict[str, np.ndarray]):
 
 
 def install_selection_probe():
-    """Wrap torch.Tensor.topk to record every selection: its scored rows, its
-    sorted picks and their margins."""
-    topk = torch.Tensor.topk
-    if getattr(topk, "probed", False):
+    """Wrap torch.Tensor.topk and torch.topk to record every selection: its scored rows, its sorted picks
+    and their margins. The releases select through the method, transformers' DeepSeek-V4 router through
+    the function (modeling_deepseek_v4.py:1039)."""
+    if getattr(torch.topk, "probed", False):
         return
 
-    def probe_topk(self, k, dim=-1, largest=True, sorted=True):
-        result = topk(self, k, dim=dim, largest=largest, sorted=sorted)
-        if RECORDS:
-            rows = self.detach().float().movedim(dim, -1)
-            rows = rows.reshape(-1, rows.size(-1)).clone()
-            picks = result.indices.movedim(dim, -1).reshape(-1, k).sort(dim=-1).values.int()
-            for record in RECORDS:
-                record.add("selection", rows=rows, picks=picks, **selection_margins(rows, k))
-        return result
+    def probed(topk):
+        def probe_topk(self, k, dim=-1, largest=True, sorted=True):
+            result = topk(self, k, dim=dim, largest=largest, sorted=sorted)
+            if RECORDS:
+                rows = self.detach().float().movedim(dim, -1)
+                rows = rows.reshape(-1, rows.size(-1)).clone()
+                picks = result.indices.movedim(dim, -1).reshape(-1, k).sort(dim=-1).values.int()
+                for record in RECORDS:
+                    record.add("selection", rows=rows, picks=picks, **selection_margins(rows, k))
+            return result
 
-    probe_topk.probed = True
-    torch.Tensor.topk = probe_topk
+        probe_topk.probed = True
+        return probe_topk
+
+    torch.Tensor.topk, torch.topk = probed(torch.Tensor.topk), probed(torch.topk)
 
 
 def cross_entropy(logits, ids):
@@ -651,12 +654,15 @@ def widened(model_module):
     model.py and the stand-ins widened, which are their `.float()` casts, the
     MoE accumulator's and the first pre-mix's float32 (model.py:893, :1161),
     and every cached table rebuilt in it, on entry and on exit: the rotary
-    tables' float32 frequencies (:376, :384) and the vision tower's cos and
-    sin (vision.py `get_vision_cos_sin`), which a float32 run left cached for a
-    float64 one to read (an fp64 span 1e-8 off the fp64 truth)."""
+    tables' float32 frequencies (:376, :384) and, where the release's model
+    reads a vision tower (V4.1's, model.py:21), its cos and sin (vision.py
+    `get_vision_cos_sin`), which a float32 run left cached for a float64 one
+    to read (an fp64 span 1e-8 off the fp64 truth)."""
     from _dew_torch.precision import default_dtype, dtype_widened, float_as, replaced
 
-    tables = (model_module.precompute_freqs_cis, importlib.import_module("vision").get_vision_cos_sin)
+    tables = [model_module.precompute_freqs_cis]
+    if hasattr(model_module, "ViT"):
+        tables.append(sys.modules[model_module.ViT.__module__].get_vision_cos_sin)
     for table in tables:
         table.cache_clear()
     try:
@@ -1117,10 +1123,11 @@ def write_padding() -> None:
                    json.loads((FIXTURE / "config.json").read_text()), FIXTURE)
 
 
-def clearing_rows(net, vocabulary: int, seed: int) -> np.ndarray:
+def clearing_rows(net, vocabulary: int, seed: int, *, reset=reset, factor: int = 1) -> np.ndarray:
     """The `seed`-th drawn rows `[2, LENGTH]` (from the seed's stream, redrawn until it does) whose every
-    top-k of the release's plain forward clears the gate's `MARGIN` (tests/selection_margins.py): rows a
-    float32 port selects over as the release does."""
+    top-k of the release's plain forward, its caches cleared by the release's `reset`, clears `factor` times
+    the gate's `MARGIN` (tests/selection_margins.py): rows a float32 port selects over as the release does;
+    twice, so a port's run held to them clears MARGIN as its own recording or test holds it to."""
     from selection_margins import MARGIN
 
     generator = torch.Generator().manual_seed(0x4241 + seed)
@@ -1133,7 +1140,7 @@ def clearing_rows(net, vocabulary: int, seed: int) -> np.ndarray:
             forward(net, ids)
         RECORDS.clear()
         margins = [call["margin"] for call in recorded.calls.get("selection", [])]
-        if all(bool((margin > MARGIN).all()) for margin in margins):
+        if all(bool((margin > factor * MARGIN).all()) for margin in margins):
             return ids.numpy().astype(np.int32)
 
 
@@ -1167,10 +1174,11 @@ CACHED_LEAVES = ("prompt_logits", "decode_logits", "draft_logits", "draft_confid
 rows' margins hold apart (`clearing_cached_rows`)."""
 
 
-def clearing_cached_rows(net, vocabulary: int, seed: int) -> np.ndarray:
+def clearing_cached_rows(net, vocabulary: int, seed: int, *, run=cached) -> np.ndarray:
     """The `seed`-th drawn rows `[2, LENGTH]` (a stream of their own, redrawn until it does) whose cached run
-    (`cached`) decides alike in a float32 port: every top-k clears twice the gate's `MARGIN`
-    (tests/selection_margins.py), and so does every argmax the run feeds on, its top two apart by that of
+    (`run`, the release's driver, `cached`) decides alike in a float32 port: every top-k clears twice the
+    gate's `MARGIN` (tests/selection_margins.py), and so does every argmax the run feeds on, its top two
+    apart by that of
     the row's largest finite logit: the main model's at the prompt's last position and at each step, which
     DSpark drafts from, and each draft's at every position but its last, whose token the next position's
     logits read (model.py:1149-1153). Twice, so a port's own run, whose decisions' inputs sit within
@@ -1184,7 +1192,7 @@ def clearing_cached_rows(net, vocabulary: int, seed: int) -> np.ndarray:
         recorded = Record()
         RECORDS[:] = [recorded]
         with torch.no_grad():
-            outputs = cached(net, ids)
+            outputs = run(net, ids)
         RECORDS.clear()
         fed = [outputs["prompt_logits"][:, -1], outputs["decode_logits"], outputs["draft_logits"][:, :, :-1]]
         margins = [call["margin"] for call in recorded.calls.get("selection", [])] + [
@@ -1206,8 +1214,9 @@ def twin_evaluated(model_module, net, wide, leaves):
     return evaluate
 
 
-def logits_from(start: int):
-    """A forward's leaves (`twin_evaluated`): each row's logits from position `start` on."""
+def logits_from(start: int, *, reset=reset):
+    """A forward's leaves (`twin_evaluated`): each row's logits from position `start` on, its caches cleared
+    by the release's `reset` first."""
     def leaves(net, ids):
         with torch.no_grad():
             reset(net)
@@ -1215,12 +1224,13 @@ def logits_from(start: int):
     return leaves
 
 
-def cached_leaves(net, ids):
+def cached_leaves(net, ids, *, run=cached):
     """A cached run's leaves (`twin_evaluated`): the release's prefill, teacher-forced steps and DSpark's
-    drafts after each (`cached`), their logits and confidence (`CACHED_LEAVES`)."""
+    drafts after each (`run`, the release's driver, `cached`), their logits and confidence
+    (`CACHED_LEAVES`)."""
     with torch.no_grad():
-        run = cached(net, ids)
-    return {name: run[name] for name in CACHED_LEAVES}
+        outputs = run(net, ids)
+    return {name: outputs[name] for name in CACHED_LEAVES}
 
 
 def step_leaves(net, ids):

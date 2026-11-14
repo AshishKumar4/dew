@@ -202,7 +202,7 @@ def bare_search(objective):
 
     from model_support import memory_limited_to
 
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     # A GPU whose stated memory limits its allocator to `LIMIT`, so the search judges its derivations.
     mesh = MeshSpec().build(compile_only_gpus("sm90", 1, memory_limited_to(LIMIT)))
@@ -658,8 +658,9 @@ def gated(layers: str, generation: str, remat: str, capacity: int, records, prec
     refused or not."""
     from model_support import memory_limited_to
 
+    from dew.nn.kernels.generation import compile_only_gpus
     from dew.registry import models
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead
 
     model = models.build("causal_transformer", vocab_size=128, emb_features=64, num_layers=2, num_heads=4,
                          num_kv_heads=2, mlp_features=128, max_seq_len=128,

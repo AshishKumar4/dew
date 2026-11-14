@@ -407,7 +407,7 @@ def _target():
     driver's: what its run's load holds the programs to (`BuildTarget.held`)."""
     from jax.experimental import topologies
 
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     # The CUDA plugin, which a serialized topology deserializes through, initialized with no GPU and no
     # client (`dew.training.ahead.host_gpus`).

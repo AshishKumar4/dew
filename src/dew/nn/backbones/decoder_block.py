@@ -119,10 +119,12 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float 
     `norm_gated` says: a layer's on the layers it names, the `routed` layer's
     among them or not, and a norm outside the layers (`routed` None) wherever
     it runs, its gate's maps at the model's `precision`. 'layer' keeps torch's
-    exact variance, the reference decoders' formula (`dew.nn.norms.LayerNorm`'s);
+    exact variance, every torch LayerNorm's (`dew.nn.norms.LayerNorm`'s);
     'fast_layer' is flax's E[x^2] - E[x]^2 (`use_fast_variance`), whose mean
-    and square reduce in one pass, which the vision towers run. An `epsilon` of None is an RMS
-    norm's input dtype's (`RMSNorm.epsilon`); a layer norm states its own."""
+    and square reduce in one pass, for a model that states it: it cancels in
+    fp32 wherever a row's mean dwarfs its spread, so no port of a torch norm
+    takes it. An `epsilon` of None is an RMS norm's input dtype's
+    (`RMSNorm.epsilon`); a layer norm states its own."""
 
     def build(*, name: str) -> nn.Module:
         # A site's own name, a plain string (`NormSite`'s value): the module's path holds no enum.
