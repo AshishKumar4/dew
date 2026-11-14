@@ -164,12 +164,16 @@ def test_a_server_decoding_on_one_device_prefills_its_split_rows_through_each_de
                             RunProcessor(Digits()), sampling=task().sampling)
     placed = dataclasses.replace(served, variables=jax.device_put(served.variables, jax.devices()[0]))
     prefilling = MeshSpec().build(jax.devices()[1:3])
+    # Prompts two at a time, each admission's rows split one a prefilling device: a lone row's admission
+    # splits over none, which no launch takes whole on that mesh and the chosen kernel would refuse.
+    requests = list(zip(PROMPTS[:4], BUDGETS[:4], strict=True))
     with (generation.assumed("sm90", interpreted=True), generation.chosen(grouped_matmul="mosaic")):
-        _, tickets = served_by(Server.from_task(placed, slots=4, capacity=128, admission=2,
-                                                prefill_mesh=prefilling))
-        alone = [served(prompt, budget, key=index)
-                 for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
+        server = Server.from_task(placed, slots=4, capacity=128, admission=2, prefill_mesh=prefilling)
+        tickets = [server.submit(prompt, budget, key=index)
+                   for index, (prompt, budget) in enumerate(requests)]
+        server.run()
+        alone = [served(prompt, budget, key=index) for index, (prompt, budget) in enumerate(requests)]
+    for ticket, lone in zip(tickets, alone, strict=True):
         assert_same_draws(ticket.result(), lone)
 
 
