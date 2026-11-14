@@ -207,7 +207,7 @@ class Cache:
         return f"filling {manifest.key}"
 
     def _root(self, manifest: DependencyManifest) -> Store:
-        if not manifest.clean:
+        if not manifest.environment.clean:
             raise ValueError("cache writes need a clean Dew revision")
         if not manifest.exact:
             raise ValueError("cache prefix contains a step without a stable identity")

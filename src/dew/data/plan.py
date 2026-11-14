@@ -479,15 +479,12 @@ class Manifest:
     source: Mapping[str, object]
     steps: tuple[StepIdentity, ...] = ()
     ran: tuple[StepIdentity, ...] = ()
-    revision: str = "unversioned"
-    lock: str = ""
-    python: str = platform.python_version()
-    platform: str = platform.platform()
     tokenizer: Mapping[str, object] = dataclasses.field(default_factory=dict)
     fill: Mapping[str, object] = dataclasses.field(default_factory=dict)
     codec: int = 1
     schema: int = 1
-    clean: bool = True
+    environment: _Environment = dataclasses.field(kw_only=True)
+    """The code and machine it was made under, which its record holds field by field beside its own."""
 
     @classmethod
     def of(
@@ -500,34 +497,30 @@ class Manifest:
     ) -> Manifest:
         """The manifest of `source` through `steps`, under this process's code and machine
         (`running_environment`)."""
-        environment = _Environment.now()
         return cls(
             source,
             tuple(steps),
             tuple(ran),
-            revision=environment.revision,
-            lock=environment.lock,
-            python=environment.python,
-            platform=environment.platform,
             fill={} if fill is None else fill,
             tokenizer={
                 f"{index}/{step.name}": step.dependencies
                 for index, step in enumerate(steps)
                 if step.dependencies
             },
-            clean=environment.clean,
+            environment=_Environment.now(),
         )
 
     def record(self) -> dict[str, JSON]:
         """The manifest as a plan or a cache's key records it, each step's identity as `StepIdentity.record`
-        does."""
+        does, and its environment's fields beside its own."""
         recorded: dict[str, JSON] = {
             field.name: json_value(getattr(self, field.name), field.name)
             for field in dataclasses.fields(self)
-            if field.name not in ("steps", "ran")
+            if field.name not in ("steps", "ran", "environment")
         }
         recorded["steps"] = [step.record() for step in self.steps]
         recorded["ran"] = [step.record() for step in self.ran]
+        recorded.update(json_value(dataclasses.asdict(self.environment), "environment"))
         return recorded
 
     def semantic(self) -> dict[str, JSON]:

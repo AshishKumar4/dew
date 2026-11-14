@@ -33,3 +33,14 @@ def test_a_position_written_with_its_environment_reads_on_and_warns_of_a_changed
     assert _taken(stream, 4) == recorded["after"]
     stream.close()
     assert any("data environment changed" in held.getMessage() for held in caplog.records)
+
+
+def test_a_manifest_holds_the_environment_its_process_runs_and_warns_of_none_of_it():
+    """A manifest made in this process records the code and machine the process runs, field by field as a
+    checkpoint step records them (`running_environment`), so a position of it read in the same process warns
+    of no changed environment (train 805's review: the manifest declared its own copy of the fields)."""
+    from dew.data.plan import Manifest, environment_changes, running_environment
+
+    recorded = Manifest.of({"sources": []}, ()).record()
+    assert {name: recorded[name] for name in running_environment()} == running_environment()
+    assert environment_changes(recorded) == ()
