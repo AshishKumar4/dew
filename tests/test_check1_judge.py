@@ -168,11 +168,20 @@ def test_a_judge_judges_a_tests_sites_from_its_map_tasks_records_alone(tmp_path,
     with pytest.raises(GateFailure) as from_body:
         judged(tmp_path / "halved", lambda: body(halved))
     assert sorted(found(from_records.value)) == sorted(found(from_body.value))
-    # A test no map task wrote a manifest of runs its body, and so does one whose body decides its site's
-    # verdict itself, a failure it expects.
+    # A test no map task wrote a manifest of runs its body.
     assert not judged(tmp_path / "halved", lambda: judged_from_records("tests/test_judged.py::test_other"))
+    # A body that raises on purpose, expecting its site's failure: undeclared, its judge decides from the
+    # records and the failure leaves the judge (above, red where the body expects it); declared
+    # (`judged_in_its_body`), its judge runs the body, which decides the failure it expects.
+
+    def expecting_the_failure():
+        with pytest.raises(GateFailure):
+            body(halved)
+        return True
+
     mapped(tmp_path / "expected", halved, [(0, 40), (40, 80)], expecting=True)
     assert not judged(tmp_path / "expected", lambda: judged_from_records(test))
+    assert judged(tmp_path / "expected", expecting_the_failure)
     # One map task's draws missing, or the first stage's seeds short: refused, naming what the pool holds.
     for path in (tmp_path / "halved" / "1").glob("*.pkl"):
         if ".manifest." not in path.name:
