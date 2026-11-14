@@ -989,6 +989,18 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     assert legal and stepped != first and taken == (stepped,)
 
 
+def _route_loss(options: dict):
+    """A loss over the chunked op's route to the template (`recurrence_chunk.template_rule`) under `options`,
+    as a training step takes its output and final memory."""
+    from dew.nn.kernels import recurrence_chunk
+
+    def loss(*given):
+        out, final = recurrence_chunk.template_rule(*given, **options)
+        return out.astype(jnp.float32).sum() + final.sum()
+
+    return loss
+
+
 def test_a_refusal_under_the_remat_rung_reaches_the_route():
     """Under the remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`), a refusal of
     every tile of the run's training call's launch (its identity as its lowering for an H100 names it,
@@ -1007,9 +1019,7 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
     options = {'max_segments': None, 'scale': None, 'delta': True, 'wide': False, 'bound': 1.0,
                'rounded': True}
 
-    def loss(*given):
-        out, final = recurrence_chunk.template_rule(*given, **options)
-        return out.astype(jnp.float32).sum() + final.sum()
+    loss = _route_loss(options)
 
     def named() -> str:
         return recurrence_chunk.port_kernel(*operands, bound=1.0, product='training', report=False)
@@ -1607,7 +1617,6 @@ def test_a_launch_whose_producer_must_rise_climbs_its_ladder_a_round_at_a_time()
     as many rungs a round as the host compiles at once (`report.rung_round`): the assembler answers only
     whether a rung holds, so the least that holds is a search. A rung at a time, the walk's producer rose 24
     to 80 over eight certification compiles, 95 s of the 4B's cold start."""
-    from dew.nn.kernels import recurrence_chunk
     from dew.nn.kernels.generation import compile_only_gpus
 
     # Qwen3.5-4B's linear attention: 16 key heads and 32 value heads, each 128 wide.
@@ -1617,9 +1626,7 @@ def test_a_launch_whose_producer_must_rise_climbs_its_ladder_a_round_at_a_time()
     options = {'max_segments': None, 'scale': None, 'delta': True, 'wide': False, 'bound': 1.0,
                'rounded': True}
 
-    def loss(*given):
-        out, final = recurrence_chunk.template_rule(*given, **options)
-        return out.astype(jnp.float32).sum() + final.sum()
+    loss = _route_loss(options)
 
     before = {id(certified) for certified in report.certifications()}
     with (report.refusals(), generation.assumed('sm100'), generation.chosen(gated_delta_rule='mosaic_gpu'),
