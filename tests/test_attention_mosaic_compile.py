@@ -507,9 +507,8 @@ def test_a_short_training_calls_backward_compiles_spill_free_for_an_a100(tokens,
 def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, width, accurate, hooks):
     """The backward at its derived tiles of a causal call `width` wide in the form `accurate` names under the
     score hook `hooks` names, lowered and compiled by ptxas for `generation_name` on this CPU
-    (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its register
-    model's decision ptxas's (`mosaic_failures`, each launch's model `resources.register_model` at its own
-    layout and consumers, `MosaicBackward._launch_registers`)."""
+    (tests/kernel_compile.py): every launch within its shared memory, spilling nothing
+    (`mosaic_failures`)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -559,8 +558,7 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
 def test_an_fp16_backward_compiles_spill_free_as_its_model_decides(width):
     """An fp16 call's backward at its derived tiles of a causal call `width` wide (the one launch's two parts
     at running scales, `attention_mosaic_fused._sixteen_step`, where its registers hold it), lowered and
-    compiled by ptxas for an H100 on this CPU: within its shared memory, spilling nothing, its register
-    model's decision ptxas's."""
+    compiled by ptxas for an H100 on this CPU: within its shared memory, spilling nothing."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 

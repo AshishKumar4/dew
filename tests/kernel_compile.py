@@ -627,7 +627,7 @@ def inherited(kernel: dict, compiled: dict[str, dict]) -> dict:
 
 PTX: dict[str, str] = {}
 """Each Mosaic GPU module's PTX this process printed, by its module, as `COMPILED` keeps its compile: a later
-compile of the same module prints none, and a least spill-free cap asked of it after (`_least`) reads this."""
+compile of the same module prints none, and its raise and its producer's decrease are read from this."""
 
 
 BUILD_NVCC = {"cuda12": ("nvidia.cuda_nvcc", "12.9"), "cuda13": ("nvidia.cu13", "13.0")}
@@ -661,13 +661,13 @@ def ptxas_of(build: str) -> Path:
 
 def assemblers(generation: str) -> tuple[Path, ...]:
     """The ptxas of each CUDA build a GPU of `generation` runs (`generation_builds`, newest first), the gate
-    judging its kernels under every one (`_compiled_reports`), its need scans reading the first's: a B200 runs
+    judging its kernels under every one (`_compiled_reports`): a B200 runs
     the cuda13 build alone, whose PTX compiler held kernels 12.9 spilled 4 to 16 bytes of and spilled kernels
     12.9 held (rows 5671, 5759 and 5761)."""
     return tuple(ptxas_of(build) for build in generation_builds(generation))
 
 RAISED = re.compile(r"setmaxnreg\.inc\.sync\.aligned\.u32 (\d+);")
-"""A raise's registers (`RAISE`'s), as a kernel record states them (`raised`)."""
+"""A raise's registers (`setmaxnreg.inc`'s), as a kernel record states them (`raised`)."""
 DECREASED = re.compile(r"setmaxnreg\.dec\.sync\.aligned\.u32 (\d+);")
 """A producer's decrease's registers, as a kernel record states them (`decreased`)."""
 
@@ -681,7 +681,8 @@ GPU ignores."""
 
 def _ptxas_text(ptx: str, generation: str, relocatable: bool, ptxas: Path | None = None) -> tuple[str, bool]:
     """ptxas's own report (`-v`) on the kernel `ptx` for the CUDA `generation`, compiled relocatably or
-    whole-program (`_ptxas`) by `ptxas` (`assemblers`' first by default), and whether it took the kernel."""
+    whole-program (`relocatable`, `RELOCATABLE`) by `ptxas` (`assemblers`' first by default), and whether it
+    took the kernel."""
     major, minor = capability(generation) or (0, 0)
     arch = f"sm_{major}{minor}{'a' if major >= 9 else ''}"
     with tempfile.NamedTemporaryFile("w", suffix=".ptx") as source:
@@ -702,7 +703,7 @@ def ptxas_notes(ptx: str, generation: str) -> str:
 
 def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
     """Each kernel's registers a thread and spilled bytes as the GPU compiles the PTX Mosaic printed into
-    `directory` (`_ptxas` at its own entry), by its name and launch (`report.launch_name`), the most of each
+    `directory` (`_ptxas_text`, at its own entry), by its name and launch (`report.launch_name`), the most of each
     under every CUDA build the gate judges the generation under (`assemblers`) and every build's notes: its
     binary is its compile in this process, which may not be the GPU's (`RELOCATABLE`)."""
     found = {}

@@ -664,18 +664,17 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
                                                                    tmp_path):
     """The derivation judges a step's fit as its compile does at 0.6 and 1.6 times what the compile needs,
     over decoders dense, hybrid and of experts, Ampere and Hopper, no recomputation and full, JAX's
-    default and highest matmul precision (row 2113's gate, in the kernel gate's evidence shape,
-    `compile_evidence`). The need is the program's as XLA lays it out on a roomy GPU, and the
-    derivation's, read off that compile, admits it at 1.6 times and refuses it at 0.6. A gate decoder's
-    peak is the program's own (`Footprint.exact`), an expert decoder's at both precisions too: its ragged
-    products run on CUDA as the grouped selector's native kernels (`grouped_matmul.GROUPED`: Triton's at
-    JAX's default precision, Mosaic GPU's at highest), custom calls that hold their outputs alone
-    (`dew.nn.programs.opaque`). On a GPU stating 1.6
+    default and highest matmul precision (row 2113's gate, its evidence `compile_evidence`'s). The need is
+    the program's as XLA lays it out on a roomy GPU, and the derivation's, read off that compile, admits
+    it at 1.6 times and refuses it at 0.6. A gate decoder's peak is the program's own (`Footprint.exact`),
+    an expert decoder's at both precisions too: its ragged products run on CUDA as the grouped selector's
+    native kernels (`grouped_matmul.GROUPED`: Triton's at JAX's default precision, Mosaic GPU's at
+    highest), custom calls that hold their outputs alone (`dew.nn.programs.opaque`). On a GPU stating 1.6
     times the compile is the roomy one, whose need it holds, XLA's rematerialization changing nothing in a
     module already within its limit (`RematerializeComputation`,
     xla/hlo/transforms/simplifiers/hlo_rematerialization.cc), so its fit is read off that compile, at 0.6
     times as at 1.6."""
-    from compile_evidence import Evidence, Facts, Measurement, Prediction
+    from compile_evidence import Evidence, Measurement, Prediction
 
     (roomy,) = gated(layers, generation, remat, 1 << 34, tmp_path / "roomy", precision)
     need, derived = (1 << 34) - roomy["headroom"], (1 << 34) - roomy["derived_headroom"]
@@ -683,12 +682,11 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
     for margin, admits in ((1.6, True), (0.6, False)):
         budget = int(need * margin)
         evidence = Evidence(
-            f"{layers} {generation} remat {remat} {precision} at {margin} of its need", "",
-            Facts((layers, remat), generation),
+            f"{layers} {generation} remat {remat} {precision} at {margin} of its need",
             Prediction({"peak": roomy["derived"]["peak"]}, derived, budget, derived <= budget, "bytes"),
-            Measurement({"temp": roomy["temp"]}, need <= budget, "xla", jax.__version__))
-        assert evidence.compiled.admits == admits, evidence.describe()
-        assert evidence.agrees, evidence.describe()
+            Measurement({"temp": roomy["temp"]}, need <= budget, "xla"))
+        assert evidence.compiled.admits == admits, evidence
+        assert evidence.agrees, evidence
 
 
 def wide(head_tile=None):

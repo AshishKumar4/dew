@@ -864,8 +864,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         depth (`_allocations`), its consumers, its registers a consumer thread (`registers`), and at most
         the stages its program's share of the GPU's block (`generation.shared_budget`) holds of a step's
         two operand blocks at an element a byte and its contraction has steps, at least two: the call's a
-        launch at `config` runs (`_ran`), the launch naming `config`."""
-        launched = config
+        launch at `config` runs (`_ran`)."""
         ba, config = self._ran(ba, config)
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
         depth = self._generated_extents(ba)[1]
@@ -892,8 +891,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # gathering rows, `mosaic_gpu.gmm_producer`), as its kernel lowers it.
         gathers = self.PRODUCER_GATHERS and ba.arguments.get('gather') is not None
         producer = mosaic_gpu.gmm_producer(family, gathers)
-        return resources.Launch(scope, roles, self.registers(ba, config), most=most, tile=launched,
-                                producer=producer)
+        return resources.Launch(scope, roles, self.registers(ba, config), most=most, producer=producer)
 
     def rewritten(self, ba, family: mosaic.Family) -> bool:
         """Whether the launch's staged rows are rewritten by `family`'s own role (`rewrites_in_persist`): its
