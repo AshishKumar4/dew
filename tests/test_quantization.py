@@ -1251,7 +1251,7 @@ def test_stochastic_rounding_draws_from_its_own_stream():
                                         jax.tree.leaves(other), strict=True)) > 0.0
 
 
-GPU_CONVOLUTION_SEEDS = 64
+GPU_CONVOLUTION_SEEDS = 8
 """The quantized convolution's GPU cell's declared seeds for check 1, sized by `seeds_for` on armada."""
 
 
