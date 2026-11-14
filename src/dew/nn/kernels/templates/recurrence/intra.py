@@ -333,7 +333,7 @@ def intra_rows(call: Call, name: str, operand: Callable[[str], jax.Array], beta)
     its write strength (`beta`, the chunk's `[C]`), its pairs strict; each formed as its products are."""
     if name == "scores":
         return operand("queries")
-    return operand("keys") * call.family.rows_of(beta)[:, None]
+    return algebra.write_gated(operand("keys"), call.family.rows_of(beta))
 
 
 def _intra_streamed(call: Call, keys: int, *, queries: bool) -> dict:
