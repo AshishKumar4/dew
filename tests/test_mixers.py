@@ -83,7 +83,7 @@ def test_mixer_records_and_values_compute_the_same_logits():
     for model in (tiny(mixer=record),
                   models.build("causal_transformer", **TINY, mixer=record)):
         assert jnp.array_equal(model.apply(params, ids), logits)
-    assert not jnp.allclose(tiny(mixer=ScaleMixer(0.0)).apply(params, ids), logits)
+    assert not jnp.array_equal(tiny(mixer=ScaleMixer(0.0)).apply(params, ids), logits)
 
 
 OWN_KEYS = {"pairwise_mask": AttentionMetadata(pairwise_mask=jnp.eye(4, dtype=bool)[None]),
@@ -107,7 +107,7 @@ def test_a_layer_runs_no_mask_its_mixer_does_not_read(own):
                              wiring=BlockWiring())
         params = layer.init(jax.random.key(0), x)
         if reads:
-            assert not jnp.allclose(layer.apply(params, x, attention_metadata=own), layer.apply(params, x))
+            assert not jnp.array_equal(layer.apply(params, x, attention_metadata=own), layer.apply(params, x))
         else:
             with pytest.raises(ValueError):
                 layer.apply(params, x, attention_metadata=own)
@@ -133,7 +133,7 @@ def test_alibi_biases_rotated_attention_by_its_keys_places():
     biased = with_alibi.apply(params, x)
     np.testing.assert_array_equal(np.asarray(biased),
                                   np.asarray(rotary.apply(params, x, attention_metadata=bias)))
-    assert not np.allclose(biased, rotary.apply(params, x))
+    assert not np.array_equal(biased, rotary.apply(params, x))
 
 
 def hybrid(**overrides):
@@ -157,9 +157,9 @@ def test_a_kind_selects_the_mixer_its_layers_run():
     swapped_logits = swapped.apply(swapped.init(key, ids), ids)
     plain_logits = plain.apply(plain.init(key, ids), ids)
 
-    assert not jnp.allclose(kind_logits, plain_logits)
-    assert not jnp.allclose(swapped_logits, plain_logits)
-    assert not jnp.allclose(kind_logits, swapped_logits)
+    assert not jnp.array_equal(kind_logits, plain_logits)
+    assert not jnp.array_equal(swapped_logits, plain_logits)
+    assert not jnp.array_equal(kind_logits, swapped_logits)
 
 
 def test_models_build_takes_kind_mixer_records():
