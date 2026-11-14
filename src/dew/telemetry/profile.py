@@ -28,6 +28,7 @@ from typing import Literal, Protocol, Self, runtime_checkable
 import jax
 
 from dew._records import JSON
+from dew.telemetry.benchmark import UNGRAPHED_FLAG
 
 
 @runtime_checkable
@@ -159,8 +160,8 @@ def _drain() -> None:
 
 COMMAND_BUFFERS = (
     "no device time is attributed to HLO ops (reports/hlo_stats.json): the kernels XLA ran as CUDA "
-    "command buffers stay under their module. Profile with "
-    "XLA_FLAGS=--xla_gpu_enable_command_buffer= for op-level reports, and time runs without it")
+    f"command buffers stay under their module. Profile with XLA_FLAGS={UNGRAPHED_FLAG} for op-level "
+    "reports, and time runs without it")
 
 
 def process_directory(directory: Path) -> Path:
@@ -326,8 +327,8 @@ class Profiler:
     and here does not; why is open, and tools/gpu_profile_check.py records
     whether it does on every GPU session. The manifest's `op_attribution`
     then says so and a warning names the fix, profiling with
-    `XLA_FLAGS=--xla_gpu_enable_command_buffer=`; time runs without that
-    flag, since launching kernels one by one costs time. Where hlo_stats has
+    `benchmark.UNGRAPHED_FLAG` in XLA_FLAGS; time runs without that flag,
+    since launching kernels one by one costs time. Where hlo_stats has
     no column naming the ops, `op_attribution` records that it could not tell.
 
     A capture whose reader reads its trace alone (`dew.telemetry.trace`), as a

@@ -1532,6 +1532,7 @@ objectives: Aliases[type[Objective], Objective] = Aliases("objective", {
 }, base="dew.objectives.base:Objective")
 mixers: Aliases[type[MixerBase], MixerBase] = Aliases("mixer", {
     "attention": "dew.nn.mixers.attention:AttentionMixer",
+    "block_sparse_attention": "dew.nn.block_sparse:BlockSparseAttentionMixer",
     "deepseek_v4": "dew.nn.deepseek_v4:DeepseekV4Mixer",
     "gated_delta_net": "dew.nn.mixers.gated_delta_net:GatedDeltaNetMixer",
     "kimi_delta_attention": "dew.nn.kda:KimiDeltaAttentionMixer",

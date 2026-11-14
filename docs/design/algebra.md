@@ -138,7 +138,9 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
   reads a link, and a rule set states its rounding class (§6.4). Error is measured per candidate, never held
   as a fact (§1.5).
 - **Rules,** in declared sets in one place, each set tagged with the modes it runs in:
-  - **linear algebra** (compile time and dev time): linearity of sums (`joined`), a laid factor hoisted out
+  - **linear algebra** (compile time and dev time): linearity of sums (`joined`: it changes no shipped
+    program today, and the pass runs 12% slower without it, the rule-set survey of 2026-11-14, which is its
+    receipt), a laid factor hoisted out
     of a sum, distributivity, a product's bilinearity (a shared operand out of two products, a power of two's
     scale on either operand), a row or column scale lifted out of a matrix product along the axis the product
     keeps (a dequant's: `(diag(s) X) Yᵀ ≡ diag(s) (X Yᵀ)`), and a positive scale out of a maximum or a minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign
@@ -353,10 +355,11 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
   object identity or string hashing. The e-graph is built in equation order and runs with one thread, and the
   prices read only pool-agreed facts (§1.6).
 - **Compile time:** the pass's seconds per program are recorded (`report.passes`, §6.8) and measured on the 4B
-  and 9B steps' compiles; the compiled step's record and perf_gate are to report them beside lowering and XLA
-  compile (row 5339). Today the compiled step's plan holds the pass's seconds and each probe's compile
-  seconds; a probe's `spent` (its traced, lowered and compiled seconds, JAX's own events summed for that
-  candidate) joins them with the planner's head on row 5556, and the perf gate's columns are not there yet. It is a reported measurement, not a gate.
+  and 9B steps' compiles. A step compiled ahead records its planning's seconds by part
+  (`AheadOfTime.planned_parts`: JAX's traces, the algebra's passes, JAX's lowerings and XLA's compiles, each
+  summed over the planning's threads) beside their whole (`planned_seconds`), for the perf gate's compile
+  rows to report (row 5339; their columns are Platform's, row 6108). It is a reported measurement, not a
+  gate.
 - **Report:** each region's rule sets that fired and each program's whole pass's seconds go in the one kernel
   report (`dew.nn.kernels.templates.report`: `report.rewrites`, `report.passes`; §6.8).
 
@@ -639,6 +642,10 @@ class Rules:
 RULES: Mapping[str, Rules]                   # every registered set, by name
 def register(rules: Rules) -> None: ...
 def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]   # the sets numerics and a mode allow
+ARMS: Mapping[str, Rules]                    # a derivation's own sets a receipt's arm may leave out (carried)
+def armed(sets: Rules) -> Rules: ...         # registers one in ARMS
+def nameable() -> frozenset[str]: ...        # every registered non-dev set and each of ARMS
+def admits(sets: Rules) -> bool: ...         # whether the pass runs it: none an arm leaves out
 ```
 
 - A set's rules are egglog `rewrite`/`birewrite`/`rule` objects in its `ruleset`.
@@ -649,6 +656,13 @@ def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]   # the 
   numerics where it traces (`generation.numerics`, in JAX's trace context), so a program held across the two
   traces afresh.
 - At dev time every set is admitted, and the declared accuracy (§1.5) decides which forms extraction may take.
+- A set's measured receipt (§1.6) compares programs with the set and without it: a receipt's arm leaves sets
+  out (`passes(without=...)`, §6.7), any of `nameable()`: a registered set but a dev-time one, which runs at
+  dev time alone, and a derivation's own set where the derivation still makes a program without it
+  (`ARMS`: the carry split's, which then extracts its traced forms). A derivation's defining set (the
+  attention derivation's `decoupled`, a scan's own identities, `linear_scan`'s, which no `Rules` holds)
+  makes its program, which no arm has without it, so no arm names it. Every nameable set's saturation reads
+  `admits`, and every derivation keys on the sets left out (`derive.context`), so arms share no derivation.
 
 ### 6.5 Cost and extraction
 
@@ -732,8 +746,8 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   - XLA's fusion (`cost.fused`; a fact XLA holds is read from XLA, §4: today `fused` restates XLA's fusion
     rather than reading it, row 5897), for the compile-time pass over a program, error-aware extraction and the
     derived scan's carry split (`carry.split`, whose carry runs as a loop XLA lowers, a chunk an iteration, its
-    span priced at that loop's step; today the split's work states no span, so only its work is priced: the
-    loop's step latency is in no rate `Fused` reads, an open gap). A program's operands are read from device memory once, however many
+    work that reads the state spanning that loop's one iteration, priced at the loop's step,
+    `GpuTarget.step_seconds`). A program's operands are read from device memory once, however many
     reductions read them (XLA's fusion reads a sibling reduction's inputs once), and elementwise work fuses
     into its consumer. Each unit's work runs at the whole device's rate, in series with the memory traffic.
   - The template's tile walk (`cost.walk`, `templates.cost.walked`), for a form a template's algebra interface
@@ -829,11 +843,13 @@ class Passes:                         # dew._cache
     on: bool = True                   # the pass runs
     target: str | None = None         # the GpuTarget whose facts it prices for; None: the process's own
     checked: bool = False             # each derivation's greedy extraction held to the exact optimum
+    without: frozenset[str] = frozenset()   # the sets a receipt's arm leaves out (rules.nameable, §6.4)
 
 ALGEBRA = jax.make_user_context(default_value=Passes())   # dew._cache, in JAX's trace context
 
 @contextlib.contextmanager
-def passes(on: bool = True, target: str | None = None) -> Iterator[None]: ...   # sets ALGEBRA
+def passes(on: bool = True, target: str | None = None,
+           without: Collection[str] = ()) -> Iterator[None]: ...   # sets ALGEBRA; refuses a name not nameable
 
 @dataclass(frozen=True)
 class Rewrite:                        # one region's
@@ -942,10 +958,15 @@ chunk algorithm side by side:
 The cheapest under the work-span model is the chunk's form, which `scan.py` evaluates and `carry.py`
 splits. At a kernel's chunk on an A100 or an H100 (64 tokens, 128 keys and values) the extraction is the
 compact WY form with its inverse by doubling, the hand-written chunk's form. Both rule sets are proven
-sound over the reals from their declarations (tests/test_linear_scan.py). Today that proof is a symbolic
-check at finite shapes (three tokens, the test's shape inventory), and the doubling is checked against the
-solved inverse it must equal, not derived from `scan`'s own implementation of it: a proof at every chunk
-size is an open gap.
+sound over the reals from their declarations (tests/test_linear_scan.py), at every chunk size by
+induction: each identity holds exactly at a symbolic chunk of three tokens (so at one, two and three, each
+output reading its own and earlier tokens alone), and each right side as declared, evaluated blockwise
+with each constructor's meaning at symbolic sizes, composes as its loop does over two blocks of `m` and `n`
+tokens (the dual form, along the state's keys or its values, and the WY form, the chunk's decays factoring
+at the split), so a chunk of any size is its loop. The inverse
+by doubling is proven from the template's own implementation (`recurrence_algebra.doubled`, evaluated over
+SymPy at two, four and eight rows) and its level's join at every block size (the block inverse over
+symbolic sizes), so at every chunk size.
 
 A derived algebra's laws are proven before its forms ship, in the suite (tests/algebra_laws.py; today at the
 extents it walks, two and three keys a tile over every kernel tile shape, for the attention forward's and

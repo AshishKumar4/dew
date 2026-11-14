@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import lowers
+from generation_support import COMPILES_ON_CPU, lowers
 from reference_error import (
     FEWEST_SEEDS,
     as_given,
@@ -165,12 +165,14 @@ two) and a chain, each document its predecessor's final; and one stored slot a r
 a document from a zero state among them, so the backward's given and stored slots are as many."""
 
 
-def the_template_is_as_exact_over_a_forked_call(layout: str, dtype=jnp.bfloat16):
+def the_template_is_as_exact_over_a_forked_call(layout: str, dtype=jnp.bfloat16, channels: int | None = None):
     """`FORKED[layout]` through the template (`selective_scan`'s `forked`): its output, the row's last state
     and every input's gradient, its given states' included, on par from float64 with the portable scan's
-    forked path (`dew.nn.mixers.mamba.selective_scan`'s), over check 1's fewest draws (row 5288)."""
+    forked path (`dew.nn.mixers.mamba.selective_scan`'s), over check 1's fewest draws (row 5288), its
+    `channels` the interpreted shape's where None."""
     forked = FORKED[layout]
-    _, length, channels, states = SHAPES["interpreted"]
+    _, length, shaped, states = SHAPES["interpreted"]
+    channels = shaped if channels is None else channels
     rows = forked.firsts.shape[0]
     template = functools.partial(selective.selective_scan, family=taken_family(dtype), interpret=INTERPRETED,
                                  forked=forked)
@@ -193,8 +195,12 @@ def the_template_is_as_exact_over_a_forked_call(layout: str, dtype=jnp.bfloat16)
 @pytest.mark.parametrize("layout", list(FORKED))
 @pytest.mark.check1_shards(seeds=8, per_task=4)
 def test_the_template_is_as_exact_over_a_forked_call_interpreted(layout):
-    """`the_template_is_as_exact_over_a_forked_call` off a GPU."""
-    the_template_is_as_exact_over_a_forked_call(layout)
+    """`the_template_is_as_exact_over_a_forked_call` off a GPU, over one forward program's block of 128
+    channels: its backward interprets a program a row's channel, and at the shape's 256 a draw took 621 s
+    of a CI task (row 6294), 99 s on an idle host against 50 at 128. A forked slot's reads and stores take
+    the program's columns as its other operands do, which the unforked sites hold over two blocks; the GPU
+    flow runs it at 256 (tests/test_gpu_recurrence.py)."""
+    the_template_is_as_exact_over_a_forked_call(layout, channels=128)
 
 
 @pytest.mark.parametrize("route", ROUTES)
@@ -411,11 +417,17 @@ def test_a_mamba_layer_from_a_held_state_out_of_the_template_is_as_exact_interpr
 def dispatched(forms: str, *, named: bool, c_dtype, target: str | None = None):
     """The selective scan's dispatch (`recurrence_chunk.selective_scan`) under the run's `forms`, the template
     named where `named` (interpreted off a GPU), `C` in `c_dtype` and every other operand as drawn, traced
-    for `target` where given (lowered for it, never run here): the output alone."""
+    for `target` where given (lowered for it on any host, its mesh's abstract devices stating that GPU,
+    `generation.gpu_mesh`: an A100 host's own device lowered a kernel for its cp.async copies, rows 6235 and
+    6236; never run here): the output alone."""
     def run(x, dt, a, b, c, skip):
         named_template = generation.chosen(selective_scan="mosaic_gpu") if named else contextlib.nullcontext()
-        assumed = contextlib.nullcontext() if target is None else generation.assumed(target)
-        with (assumed, named_template,
+        lowered_for = contextlib.ExitStack()
+        if target is not None:
+            lowered_for.enter_context(generation.assumed(target))
+            lowered_for.enter_context(jax.sharding.use_abstract_mesh(
+                generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), target)))
+        with (lowered_for, named_template,
               generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms))):
             return recurrence_chunk.selective_scan(x, dt, a, b, c.astype(c_dtype), skip, None, None,
                                                    portable=portable)[0]
@@ -472,6 +484,7 @@ def test_a_named_template_refuses_a_state_row_no_bulk_copy_takes(states):
     assert [refusal.code for refusal in refused.value.refusals] == ["state rows"]
 
 
+@COMPILES_ON_CPU
 @lowers('sm90')
 @pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
 def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):

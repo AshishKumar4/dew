@@ -80,6 +80,7 @@ from ..gemma3n import AltUp, clamped_predictions, rescale_to
 from ..host_memory import on_host
 from ..hyper_connections import Carried, HyperConnections, enter_streams, leave_streams, stream_head
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates_of
+from ..kernels import generation
 from ..kv_cache import DecodeCursor, KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
@@ -113,7 +114,7 @@ from ..rope import LongRopeScaling, Scaling
 from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, pipeline_stages
 from ..value_experts import ValueExperts
 from . import decoder_counts, decoder_refusals
-from .call_metadata import call_metadata
+from .call_metadata import call_metadata, prepared_embeddings
 from .decoder_block import (
     DECODER_REMAT,
     REMAT_POLICIES,
@@ -1349,7 +1350,7 @@ class CausalTransformer(LinearProducts):
             raise ValueError("prediction depths need a sequence longer than their depth count")
         documents, given, given_valid = ((None, None, None) if coordinates is None else
                                          (coordinates.segments, coordinates.positions, coordinates.valid))
-        embeds = self._prepared(self.stream_embeddings(tokens), input_embeddings)
+        embeds = prepared_embeddings(self.stream_embeddings(tokens), input_embeddings)
         # A depth restricts its keys only where the caller's validity or a document boundary does. With
         # neither, every shifted pair is real, and no validity says that: an all-true array would make the
         # depth build a mask and drop off the fused kernel.
@@ -1520,6 +1521,7 @@ class CausalTransformer(LinearProducts):
         return jnp.concatenate([prediction_inputs[f'layers_{layer}']['draft_context']
                                 for layer in self.dspark.target_layers], axis=-1)
 
+    @generation.unforced()
     def init_draft_cache(self, batch_size: int):
         """Allocate the drafter's window caches, separately from the trunk's cache."""
         assert self.dspark is not None
@@ -1527,6 +1529,7 @@ class CausalTransformer(LinearProducts):
         self.draft(jnp.zeros((batch_size, 1, width), self.dtype or jnp.float32),
                    jnp.zeros((batch_size,), jnp.int32), decode=True)
 
+    @generation.unforced()
     def init_mtp_cache(self, batch_size: int):
         """Allocate the prediction depths' caches, separately from the trunk's cache."""
         shape = ((batch_size, 1, self.emb_features) if self.mtp_hyper_connections is None else
@@ -1669,7 +1672,7 @@ class CausalTransformer(LinearProducts):
         """The stack's input: the tokens' scaled embeddings (or the caller's `input_embeddings`), their
         learned positions, the embeddings' norm and dropout; the unscaled embeddings a prediction depth
         reads sown where a caller opens their collection."""
-        x = constrain(self._prepared(self.scaled_embeddings(self.token_embeddings(tokens)),
+        x = constrain(prepared_embeddings(self.scaled_embeddings(self.token_embeddings(tokens)),
                                      input_embeddings), RESIDUAL)
         if self.position_embedding == 'learned':
             # The tokens' places as every layer reads them (`Coordinates`), whichever fields the
@@ -1693,7 +1696,7 @@ class CausalTransformer(LinearProducts):
         # computed only where a caller opens the collection, as a forward that
         # does not would trace a second input projection; init leaves it out.
         if not self.is_initializing() and self.is_mutable_collection("embeddings"):
-            prepared = self._prepared(self.stream_embeddings(tokens), input_embeddings)
+            prepared = prepared_embeddings(self.stream_embeddings(tokens), input_embeddings)
             self.sow("embeddings", "prepared", prepared,
                      reduce_fn=lambda _, value: value, init_fn=lambda: prepared)
         return x
@@ -2114,17 +2117,6 @@ class CausalTransformer(LinearProducts):
             context.reshape(*inputs_embeds.shape[:-1], self.num_layers, ple))
         return (context + table) * jnp.asarray(2.0 ** -0.5, context.dtype)
 
-    @staticmethod
-    def _prepared(x, input_embeddings):
-        """`x`, or in its place a caller's prepared `[B, S, D]` embeddings
-        (another encoder's outputs fused in), cast to the stream dtype."""
-        if input_embeddings is None:
-            return x
-        prepared = jnp.asarray(input_embeddings)
-        if prepared.shape != x.shape:
-            raise ValueError(f"input_embeddings are the whole {x.shape} sequence, got {prepared.shape}")
-        return prepared.astype(x.dtype)
-
     def output_table(self) -> OutputTable | None:
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables
         (`_head_table`). None where no matrix alone is the head: past a `head_transform` or a continuum
@@ -2162,6 +2154,7 @@ class CausalTransformer(LinearProducts):
                            input_quantizer=None if self.tie_embeddings else self._quantizer(self.lm_head),
                            scale=self._token_gains(), projection=projection)
 
+    @generation.unforced()
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.
 
@@ -2170,7 +2163,8 @@ class CausalTransformer(LinearProducts):
 
         It runs the forward pass in decode mode on a single dummy token, and
         that token's keys are never written: the first decode-mode call
-        allocates the cache, and the calls after it write to it.
+        allocates the cache, and the calls after it write to it. Traced for
+        its shapes alone, it takes no forced kernel (`generation.unforced`).
         """
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
 

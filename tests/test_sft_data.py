@@ -86,12 +86,13 @@ def test_render_matches_trl_ids_and_assistant_mask(tokenizer, reference):
 
 # --- packing -----------------------------------------------------------------
 
-def packed(path, *, window, bins, batch, read="memory", loading=None, records=None, **settings):
+def packed(path, *, window, bins, batch, read="memory", loading=None, records=None, tokenizer=TOKENIZER,
+           **settings):
     """The conversations at `path` packed by the sft preset into `window`-token rows, `bins` open, by
     its other `settings`, as a run reads them in batches of `batch`, and validating on the first
-    `records` rows they pack."""
+    `records` rows they pack, rendered by the tokenizer saved at `tokenizer`."""
     def rows(**options):
-        return Files(path).pipe(presets.sft, str(TOKENIZER), seq_len=window - 1, bins=bins, **settings,
+        return Files(path).pipe(presets.sft, str(tokenizer), seq_len=window - 1, bins=bins, **settings,
                                 **options)
 
     order = rows(batch=None).shuffle(0, window=64 if read == "streamed" else None).repeat()
@@ -196,3 +197,22 @@ def test_the_train_stream_runs_end_to_end(tmp_path, tokenizer):
     # Every conversation ends on an assistant turn, so a batch that lost the
     # roles crossing back from a worker would carry no targets at all.
     assert (batch[ROLES_KEY] == Role.ASSISTANT).any()
+
+
+def test_a_template_that_renders_a_turn_otherwise_once_later_ones_follow_is_refused(tmp_path):
+    """The SFT data path over a tokenizer whose chat template renders a conversation's earlier turns
+    differently once a later one follows (each turn stamped with the conversation's length) refuses the
+    conversation as it renders it, a ValueError, where the span its loss counts would not be the span the
+    model sees (row 6120)."""
+    import shutil
+
+    saved = tmp_path / "tokenizer"
+    shutil.copytree(TOKENIZER, saved)
+    (saved / "chat_template.jinja").write_text(
+        "{%- for message in messages %}<|im_start|>{{ message.role }} {{ messages|length }}\n"
+        "{{ message.content }}<|im_end|>\n{%- endfor %}"
+        "{%- if add_generation_prompt %}<|im_start|>assistant {{ messages|length + 1 }}\n{%- endif %}")
+    path = write_parquet(tmp_path, [SHORT])
+    with pytest.raises(ValueError):
+        next(packed(path, window=96, bins=2, batch=1, tokenizer=saved).train(DataPartition()))
+

@@ -38,7 +38,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -68,8 +68,10 @@ difference of two partials exact past them."""
 @dataclasses.dataclass(frozen=True)
 class Scan:
     """A recurrence over its `walked` axis (time): `update(h, **token)` the state after one token,
-    `readout(h, **token)` that token's output from the state after it, each in plain JAX on one token's
-    operands (`operands`' axes by name, the walked one dropped), the state of `state`'s shape and dtype.
+    `readout(h, **token)` that token's output from the state after it, or where `reads` is "before" from the
+    state entering it (before its decay and its write: RWKV-6's `q_t S_{t-1}`), each in plain JAX on one
+    token's operands (`operands`' axes by name, the walked one dropped), the state of `state`'s shape and
+    dtype.
     `reset`, where given, names an operand of `operands`, booleans along the walked axis alone that neither
     reads, marking each token a zero state enters (a packed document's first). `ranges` bounds operands by
     name, a magnitude, each element's (a sigmoid's gate 1, keys 1) or an interval (a log decay's `(-inf, 0)`),
@@ -88,6 +90,7 @@ class Scan:
     state: tuple[tuple[int, ...], jnp.dtype]
     reset: str | None = None
     ranges: Mapping[str, float | tuple[float, float]] = dataclasses.field(default_factory=dict)
+    reads: Literal["after", "before"] = "after"
 
 
 def _traced(declaration: Scan, function: Callable, names: tuple[str, ...], chunk: Mapping):
@@ -169,7 +172,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         affine, (exponent, *values) = parts(chunk)
         decays = _decays(exponent, affine.base2)
         natural = _walked(exponent, affine.base2)
-        tokens = dict(zip(TOKENS, values, strict=True))
+        tokens, entering = _read_entering(declaration, chunk, dict(zip(TOKENS, values, strict=True)))
         extents = linear_scan.Extents(tokens["B"].shape[0], shape[0], shape[1], exponent.shape[-1],
                                       affine.values_read)
         corrected = affine.correction is not None
@@ -189,7 +192,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             if len(splits) > splits_held:
                 splits.popitem(last=False)
         splits.move_to_end(key)
-        prepared = Prepared((natural, split.prepare(*given, issue=issue or _issued)), split, corrected)
+        prepared = Prepared((natural, split.prepare(*given, issue=issue or _issued)), split, corrected,
+                            entering=entering, values_read=affine.values_read)
         if not (corrected and transition):
             return prepared
         return dataclasses.replace(prepared, transition=_transition(prepared, jnp.zeros(shape, carried)))
@@ -197,7 +201,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     def mapped(prepared, state, issue=None):
         # Dew's products where no mainloop issues them (`_issued`): a readout's the portable math's.
         (outputs,) = prepared.split.emit(prepared.values[1], state[1], issue or _issued)
-        return outputs
+        entering = prepared.entering
+        return outputs if entering is None else _entered(outputs, entering, prepared.values_read, state[1])
 
     def merge(a, b, operands, issue=None):
         del operands
@@ -281,6 +286,12 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
 
     def token(h, step):
         z, b, u, strength, c, q, r = _at_token(declaration, names, affine, {**step, **every})
+        # A token that reads the state entering it (`Scan.reads`) reads it before its decay and its write: a
+        # reset's zero, any other's whole, a decay that vanishes at this token erasing nothing it reads.
+        entering = None
+        if declaration.reads == "before":
+            read = h if declaration.reset is None else jnp.where(step[declaration.reset], 0.0, h)
+            entering = _read(read, q, affine.values_read) + r
         floor = vanishing(z.dtype, affine.base2)
         h = jnp.where((z <= floor)[:, None], 0.0, h)
         decay = jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],))
@@ -296,17 +307,16 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             decayed = h * decay[:, None]
             correction = jnp.sum(c[:, None] * decayed, axis=0)
             h = decayed + b[:, None] * (u - strength * correction)[None, :]
-            read = jnp.sum(h * q[None, :], axis=1) if affine.values_read else jnp.sum(q[:, None] * h, axis=0)
-            output = read + r
-        return h, output
+            output = _read(h, q, affine.values_read) + r
+        return h, output if entering is None else entering
 
     carried = at_least_fp32(h.dtype)
     h, outputs = lax.scan(token, h.astype(carried), along)
     return outputs, h
 
 
-@functools.partial(jax.tree_util.register_dataclass, data_fields=["values", "transition"],
-                   meta_fields=["split", "corrected"])
+@functools.partial(jax.tree_util.register_dataclass, data_fields=["values", "transition", "entering"],
+                   meta_fields=["split", "corrected", "values_read"])
 @dataclasses.dataclass(frozen=True)
 class Prepared:
     """A chunk's values that read no state (`carry.Split.prepare`), batched as a walk computes them for every
@@ -318,6 +328,41 @@ class Prepared:
     split: carry.Split
     corrected: bool
     transition: jax.Array | None = None
+    entering: tuple | None = None
+    """Where its tokens read the state entering them (`Scan.reads`), its first token's reader and every
+    token's part free of the state, which its outputs take (`derive_scan`'s `mapped`); else None."""
+    values_read: bool = False
+    """Whether its readout reads the state along its values (`linear_scan.Parts.values_read`)."""
+
+
+def _read_entering(declaration: Scan, chunk: Mapping, tokens: dict) -> tuple[dict, tuple | None]:
+    """A chunk's token values (`TOKENS`) as the after-forms read them, and what its outputs take besides
+    (`Prepared.entering`), None where each token reads the state after it. A token that reads the state
+    entering it (`Scan.reads`) reads the one the token before it left: the forms' reader of each token its
+    next token's (none where that one enters a zero state, a reset's) and no part free of the state, so each
+    form's output is the next token's; the first token's reader, whose read of the state entering the chunk
+    `_entered` makes, and every token's free part, which it adds."""
+    if declaration.reads == "after":
+        return tokens, None
+    readers = tokens["Q"]
+    if declaration.reset is not None:
+        readers = jnp.where(_walked_tokens(declaration, chunk)[0][declaration.reset][:, None], 0, readers)
+    following = jnp.concatenate([readers[1:], jnp.zeros_like(readers[:1])])
+    return {**tokens, "Q": following, "R": jnp.zeros_like(tokens["R"])}, (readers[0], tokens["R"])
+
+
+def _entered(outputs, entering: tuple, values_read: bool, h):
+    """A chunk's outputs whose tokens read the state entering them (`_read_entering`, its `entering`): the
+    forms' outputs each the next token's, the first token's read of the state `h` entering the chunk before
+    them, and every token's part free of the state added."""
+    reader, free = entering
+    first = _read(h, reader, values_read)
+    return jnp.concatenate([first[None].astype(outputs.dtype), outputs[:-1]]) + free
+
+
+def _read(h, reader, values_read: bool):
+    """The state `h` read by a token's `reader`: along its keys, or along its values where `values_read`."""
+    return jnp.sum(h * reader[None, :], axis=1) if values_read else jnp.sum(reader[:, None] * h, axis=0)
 
 
 class Walk(NamedTuple):
