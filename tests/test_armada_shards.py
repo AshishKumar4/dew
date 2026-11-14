@@ -196,9 +196,10 @@ def test_a_sites_map_tasks_keep_their_declared_cut_within_two_targets_and_are_cu
     declared = ["test_site.draws-0-4", "test_site.draws-4-12", "test_site.draws-12-20"]
     # 4 seeds in 28 s: 7 s a seed, so a task of the declared 8 takes 56 s: past the 30 s target, within two.
     assert [split for split, _, _ in maps(30.0, 28.0)] == declared
-    # 4 seeds in 80 s: 20 s a seed, the declared 8 at 160 s past two targets: 3 a task within their 60 s.
+    # 4 seeds in 80 s: 20 s a seed, the declared 8 at 160 s past two targets: 3 a task within their 60 s, the
+    # first stage's 4 too.
     assert maps(30.0, 80.0) == [
-        ("test_site.draws-0-4", 80.0, False),
+        ("test_site.draws-0-3", 60.0, False), ("test_site.draws-3-4", 20.0, False),
         *((f"test_site.draws-{start}-{min(start + 3, 20)}", 20.0 * (min(start + 3, 20) - start), True)
           for start in range(4, 20, 3))]
     # 4 seeds in 4 s fit a task of the declared 8 within the target, and of no more.
