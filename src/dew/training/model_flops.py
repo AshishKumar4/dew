@@ -14,37 +14,10 @@ import numpy as np
 from dew.batch import CLOSES_WINDOW, EXAMPLES_CONSUMED, VALID_ROWS, Batch
 from dew.data.dataset import rows_of, take_batch
 from dew.objectives.base import Objective
+from dew.state import TokenCount
 
 TRAINING_FLOPS = "__dew_training_flops"
 TOKENS = "__dew_real_tokens"
-
-
-class _TokenCount:
-    """Unsigned 64-bit counts as low/high uint32 words, without enabling float64 in JAX."""
-
-    @staticmethod
-    def words(values) -> np.ndarray:
-        values = np.asarray(values, np.uint64)
-        return np.stack((values.astype(np.uint32), (values >> np.uint64(32)).astype(np.uint32)), axis=-1)
-
-    @staticmethod
-    def _plus(left, right):
-        low = left[0] + right[0]
-        return low, left[1] + right[1] + (low < left[0]).astype(jnp.uint32)
-
-    @classmethod
-    def add(cls, left, right) -> jax.Array:
-        return jnp.stack(cls._plus(left, right))
-
-    @classmethod
-    def sum(cls, rows: jax.Array) -> jax.Array:
-        return jnp.stack(jax.lax.reduce((rows[:, 0], rows[:, 1]),
-                                       (np.uint32(0), np.uint32(0)), cls._plus, (0,)))
-
-    @staticmethod
-    def host(words) -> int:
-        words = np.asarray(words)
-        return int(words[0]) + (int(words[1]) << 32)
 
 
 def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Batch, *,
@@ -62,7 +35,7 @@ def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Ba
     real = np.ones(rows, bool) if valid is None else np.asarray(valid).reshape(rows) > 0
     if objective.counts_tokens:
         tokens = np.asarray(objective.scored_tokens(batch), np.uint64).reshape(rows)
-        counted[TOKENS] = _TokenCount.words(np.where(real, tokens, 0))
+        counted[TOKENS] = TokenCount.words(np.where(real, tokens, 0))
     if count_model:
         # Partition the assembled scalar over the batch's real rows. A shared conditioning row is counted
         # once, not once per example.
@@ -84,13 +57,13 @@ def step_counts(batch: Batch) -> dict[str, jax.Array]:
     work = ({TRAINING_FLOPS: jnp.sum(batch[TRAINING_FLOPS], dtype=jnp.float32)}
             if TRAINING_FLOPS in batch else {})
     if TOKENS in batch:
-        work[TOKENS] = _TokenCount.sum(batch[TOKENS])
+        work[TOKENS] = TokenCount.sum(batch[TOKENS])
     return work
 
 
 def batch_tokens(batch: Batch) -> jax.Array:
     """The real tokens of `batch`'s rows (`TOKENS`), as two uint32 words; none where it carries no count."""
-    return _TokenCount.sum(batch[TOKENS]) if TOKENS in batch else jnp.zeros((2,), jnp.uint32)
+    return TokenCount.sum(batch[TOKENS]) if TOKENS in batch else jnp.zeros((2,), jnp.uint32)
 
 
 def batch_consumed(batch: Batch) -> jax.Array:

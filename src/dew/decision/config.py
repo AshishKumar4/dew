@@ -55,11 +55,11 @@ from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, SharedCrossAttention
 from dew.nn.protocols import RematChoosing
 from dew.optim import OptimConfig
-from dew.registry import ModelConfig, import_path, record_argument
+from dew.registry import ModelConfig, class_record, from_record, import_path, record_argument
 from dew.state import TrainState
 
 if TYPE_CHECKING:
-    pass
+    from dew.checkpoints import Checkpoints
 
 
 @dataclasses.dataclass(frozen=True)
@@ -149,7 +149,7 @@ class DecisionRunConfig(DecoderRunConfig):
     as the build resolved it (`layout_writing`); a run that leaves it None and resumes takes the saved
     run's (`BUILT`, `RunConfig.resumed`). A run saved before this field reads `named`, as it ran, and one
     whose record holds None the writing its checkpoint's layout states
-    (`dew.config.earlier.earlier_option_text`, `earlier_option_writing`). A joint row
+    (`dew.config.earlier.earlier_option_text`, `earlier_checkpointed`). A joint row
     names each option by its key beside its description in its schema, the named writing, and has no
     other."""
     segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
@@ -217,6 +217,28 @@ class DecisionRunConfig(DecoderRunConfig):
     feed-forward of its own drawn beside the layer (`CrossAttention`), or the
     layer's own attention reading the context behind a gate it adds, the only
     weights the form draws (`SharedCrossAttention`). With `context_layers` alone."""
+    @classmethod
+    def earlier_checkpointed(cls, record: Mapping[str, object], checkpoints: Checkpoints
+                             ) -> Mapping[str, object]:
+        """A saved decision run's record (`earlier_run`'s) whose option text is None, which a Dew before row
+        3867 recorded where the run left it to its layout: the writing the layout its last checkpoint in
+        `checkpoints` (its tiers, as the run keeps them) records wrote (`layout_writing`), so a resume writes
+        its rows as it did, whatever a later Dew's layout leaves; as it is where no checkpoint records one (a
+        run that trained no step, or a layout no record described), whose writing its build resolves again
+        (`RunConfig.check_resume`). Carried to 1.0 (ledger 1552)."""
+        from dew.inference.tasks import saved_artifact
+
+        named = class_record(record)
+        if named is None or "option_text" not in named[1] or named[1]["option_text"] is not None:
+            return record
+        step = checkpoints.latest
+        artifact = None if step is None else saved_artifact(checkpoints, step)
+        laid = None if artifact is None else artifact.get("layout")
+        if not isinstance(laid, Mapping):
+            return record
+        writing = layout_writing(from_record(Layout, laid))
+        return {**record, "fields": {**named[1], "option_text": writing}}
+
     def pinned(self) -> DecisionRunConfig:
         """This run with its Hub sources at their commits (`RunConfig.pinned`), its backbone's `revision`
         among them (`SourceReference.pinned`), so its record names the commit it read."""

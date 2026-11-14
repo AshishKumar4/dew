@@ -28,9 +28,9 @@ from interop_support import (
 from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact
 
 import dew
-from dew.inference.projections import inference_projections, pending, projection_groups
 from dew.interop import Pretrained
 from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.nn.projections import inference_projections, pending, projection_groups
 from dew.nn.sharding import pipeline_microbatches
 from dew.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
 from dew.registry import ModelConfig, wrapper_layers

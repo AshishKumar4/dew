@@ -1019,8 +1019,8 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
     """
 
     # dew.inference imports this module, so its packing is imported here.
-    from dew.inference.projections import packed_in_call
     from dew.nn.backbones.layer_names import stored_layers
+    from dew.nn.projections import packed_in_call
 
     def run(params, inputs, keys, budget, transforms, stopping, strategy, progress):
         # The groups a borrowed tree holds unpacked pack here, once a call (`packed_in_call`), a
@@ -1111,7 +1111,7 @@ def generate(model: nn.Module, params: Variables,
     capacity = model.max_seq_len if isinstance(model, Bounded) else None
     if isinstance(model, Layered) and capacity is not None:
         refuse_unassigned(model.kv_cache, plan.count, capacity)
-    from dew.inference.projections import pending
+    from dew.nn.projections import pending
 
     compiled = program(_checked, model, static_argnames=("model", "trips", "pad_id", "n", "packing"),
                        in_shardings=(None, plan.sharding, plan.sharding, None, None, None, None, None),

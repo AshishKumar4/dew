@@ -92,6 +92,7 @@ from dew.optim_schedules import (
     with_rates,
 )
 from dew.registry import Unrecordable
+from dew.scores import Summary
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, occupied, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
@@ -157,7 +158,7 @@ from dew.training.distributed import (
     step_reads,
     traced_start,
 )
-from dew.training.evaluation import EvalSuite, Evaluator, Summary, episodic
+from dew.training.evaluation import EvalSuite, Evaluator, episodic
 from dew.training.footprint import traced_loss
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, logged_scalars

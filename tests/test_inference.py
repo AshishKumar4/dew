@@ -35,8 +35,8 @@ from dew.data.sources import source
 from dew.data.sources.files import Files
 from dew.diffusion.presets import EDM, Flow
 from dew.inference import Images, RunProcessor, TextGeneration, TextToImage
-from dew.inference.projections import inference_projections
 from dew.inputs import Field, TextCondition, unit_range
+from dew.nn.projections import inference_projections
 from dew.registry import ModelConfig
 from dew.sampling import CFG, DPMSolverSDE, Euler, Heun
 from dew.telemetry.compiles import Compiles
@@ -552,8 +552,8 @@ def test_every_route_generates_through_the_same_packed_projections(tmp_path):
     export of it writes, the run's own tree, bit for bit."""
     from flax.core import unfreeze
 
-    from dew.inference.projections import projection_groups
     from dew.interop import Pretrained
+    from dew.nn.projections import projection_groups
     from dew.objectives.lm import LMObjective
     from dew.quantization import Quantization
     from dew.sampling import Sampling
@@ -603,8 +603,8 @@ def test_a_generation_reads_its_models_groups_once_for_every_call(tmp_path):
     tree's shapes, which binding a deep decoder to read took tens of milliseconds of every call.
     A decoder that counts its declarations is asked once over every call on one tree, draws what
     a task over its tree packed beforehand draws, and is asked again for a tree of another shape."""
-    from dew.inference.projections import projection_groups
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.projections import projection_groups
     from dew.sampling import Sampling
 
     asked = []

@@ -49,7 +49,7 @@ from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._files import write_atomically
 from dew._records import JSON
 from dew.checkpoints import RUN_FILE, Checkpoints
-from dew.config.earlier import earlier_option_writing, earlier_run
+from dew.config.earlier import earlier_run
 from dew.config.release import Release
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.config.trainer import (
@@ -88,6 +88,7 @@ from dew.registry import (
     trusted_packages,
     wants_tuple,
 )
+from dew.scores import Summary
 from dew.state import TrainState
 from dew.telemetry.profile import CaptureOptions
 from dew.telemetry.records import RunRecord, TrialFinished, packages_installed, tracker_json
@@ -95,7 +96,7 @@ from dew.training._fit import FitArguments
 from dew.training.ahead import AheadOfTime, CompiledAhead, LaterPhases, fit_plan
 from dew.training.budget import Pause
 from dew.training.display import TrainingDisplay
-from dew.training.evaluation import EvalSuite, Split, Summary
+from dew.training.evaluation import EvalSuite, Split
 from dew.training.profiling import ProfileReport, ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.rollout import Rollout
@@ -775,7 +776,7 @@ class RunConfig:
     val_summaries: Annotated[tuple[Summary, ...], record_argument(tuple[Summary, ...])] = ()
     """Scalars weighed from each evaluation's split scores, a board's weighted index, each formed at a
     step that scored every split it weighs and logged as `evaluation/summary/<name>`, which
-    `--trainer.best evaluation/summary/<name>` ranks by (`dew.training.evaluation.Summary`):
+    `--trainer.best evaluation/summary/<name>` ranks by (`dew.scores.Summary`):
     `--val-summaries '[{"name": "board", "weights": {"val/accuracy": 1, "test/accuracy": 2},
     "better": "higher"}]'`.
     """
@@ -961,7 +962,7 @@ class RunConfig:
         before, now = (_records.without_fields(record, self.EXECUTED)
                        for record in (recorded._fields_record(), self._fields_record()))
         # A field the saved run left to its build and its record holds unresolved, which no checkpoint
-        # states either (`earlier_option_writing`), is the one this build resolves (`BUILT`).
+        # states either (`earlier_checkpointed`), is the one this build resolves (`BUILT`).
         unresolved = {path for path in self.BUILT if "." not in path and before.get(path) is None}
         changed = sorted(name for name in now.keys() | before.keys()
                          if name not in self.RESUMABLE and name not in unresolved
@@ -993,11 +994,25 @@ class RunConfig:
     @staticmethod
     def _saved_record(directory: str, checkpoints: Checkpoints) -> Mapping[str, object] | None:
         """The record of the saved run in its checkpoints' `directory`, read as every earlier shape of a
-        saved run is (`earlier_run`); None where none was saved."""
+        saved run is (`earlier_run`), and as the run class it names reads its own from its checkpoints
+        (`earlier_checkpointed`); None where none was saved."""
         saved = epath.Path(directory) / RUN_FILE
         if not saved.exists():
             return None
-        return earlier_option_writing(earlier_run(json.loads(saved.read_text())), checkpoints)
+        record = earlier_run(json.loads(saved.read_text()))
+        named = registry.class_record(record)
+        run = None if named is None else registry.runs[named[0]]
+        if not (isinstance(run, type) and issubclass(run, RunConfig)):
+            return record
+        return run.earlier_checkpointed(record, checkpoints)
+
+    @classmethod
+    def earlier_checkpointed(cls, record: Mapping[str, object], checkpoints: Checkpoints
+                             ) -> Mapping[str, object]:
+        """A saved run's `record` of this class (`earlier_run`'s) with what an earlier Dew left to its
+        `checkpoints` stated in it, so a resume builds as the run trained; as it is for a class that left
+        none (a decision run's option writing does, `dew.decision.DecisionRunConfig`)."""
+        return record
 
     @classmethod
     def cli(cls, args: Sequence[str] | None = None, *, default: Self | None = None) -> Self:
@@ -1083,7 +1098,7 @@ class RunConfig:
         record = json.loads((path if named_file else path / RUN_FILE).read_text())
         # The packages trusted first, so the record's earlier shapes are read with its classes imported.
         registry.import_trusted(record, trust)
-        # A field its record left to its checkpoints (`earlier_option_writing`) is read where the run resumes
+        # A field its record left to its checkpoints (`earlier_checkpointed`) is read where the run resumes
         # (`resumed`, `check_resumed`), its process prepared: `dew train run.json` reads the run first, before
         # a pool of processes is joined, which no device opened before may be (train 589's review).
         return cls.read(earlier_run(record), trust=trust)
