@@ -178,6 +178,20 @@ def chosen(**kernels: str) -> Iterator[None]:
         yield
 
 
+@contextlib.contextmanager
+def unforced() -> Iterator[None]:
+    """Within the block, no kernel choice and no kernel config is forced (`chosen`'s choices and
+    `dew.nn.kernels.tuning.pinned`'s pins cleared): a trace that exists only for its shapes, whose
+    selections never run, takes each selector's own pick and each launch its own config, since nothing it
+    selects ever runs, so a choice or pin a caller forces for the programs that run is not met by a product
+    no launch takes or a launch its pin does not fit (Main, 11-14). Its one user is such a trace, a decode
+    cache's allocating forward (`dew.sampling.text._empty_cache`), which row 6082 deletes."""
+    from dew import _cache
+
+    with _cache.KERNEL_CHOICES(()), _cache.KERNEL_PINS(()):
+        yield
+
+
 def numerics() -> Numerics:
     """The run's numerics in effect (`run_precision`), the defaults outside any: JAX keys its trace and
     compile caches on them (`dew._cache.NUMERICS`), so a function jitted under one run's traces again

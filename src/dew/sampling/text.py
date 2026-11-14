@@ -49,6 +49,7 @@ from dew.batch import (
 from dew.inputs.spec import Field
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
+from dew.nn.kernels import generation
 from dew.nn.kernels.options import program
 from dew.nn.kv_cache import (
     gather_cache_rows,
@@ -472,7 +473,10 @@ def _empty_cache(model: nn.Module, params: Variables, batch: int, depths: int, d
     as a forward allocates it. A decoder whose every mixer is tokenwise (`MLPMixer`) keeps no cache, and
     its collection is empty."""
     def initialized(method: str) -> dict:
-        _, mutated = model.apply(params, batch, method=method, mutable=["cache"], **adapter_field(adapters))
+        # A forward traced for its cache's shapes alone, whose products never run (`generation.unforced`).
+        with generation.unforced():
+            _, mutated = model.apply(params, batch, method=method, mutable=["cache"],
+                                     **adapter_field(adapters))
         return flatten_dict(dict(mutated["cache"])) if "cache" in mutated else {}
 
     cache = initialized("init_cache")
