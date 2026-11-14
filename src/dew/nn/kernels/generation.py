@@ -184,12 +184,15 @@ def unforced() -> Iterator[None]:
     `dew.nn.kernels.tuning.pinned`'s pins cleared): a trace that exists only for its shapes takes each
     selector's own pick and each launch its own config, since nothing it selects ever runs, so a choice or
     pin a caller forces for the programs that run is not met by a product no launch takes or a launch its
-    pin does not fit. Its users are such traces alone: a decoder's cache allocation, whose forward over a
-    dummy token writes nothing (`CausalTransformer.init_cache`, `init_mtp_cache`, `init_draft_cache`), which
-    row 6082 replaces with each mixer's own cache spec."""
+    pin does not fit; and what it selects and launches is reported to no `routes` block and recorded as no
+    launch (`dew._cache.KERNEL_ROUTES`, `KERNEL_SEEN`), so a program's routes and launches are the ones it
+    runs. Its users are such traces alone: a decoder's cache allocation, whose forward over a dummy token
+    writes nothing (`CausalTransformer.init_cache`, `init_mtp_cache`, `init_draft_cache`), which row 6082
+    replaces with each mixer's own cache spec."""
     from dew import _cache
 
-    with _cache.KERNEL_CHOICES(()), _cache.KERNEL_PINS(()):
+    with (_cache.KERNEL_CHOICES(()), _cache.KERNEL_PINS(()), _cache.KERNEL_ROUTES(()),
+          _cache.KERNEL_SEEN(None)):
         yield
 
 
