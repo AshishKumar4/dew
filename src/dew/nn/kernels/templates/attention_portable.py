@@ -38,6 +38,7 @@ from dew.nn.kernels.templates.attention import (
     key_tiles,
     padded_call,
     prescaled,
+    prologues_taken,
     ranges_walk,
     shared_place,
     within,
@@ -211,7 +212,7 @@ def xla_mainloop(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Arr
     the keys `spans` leaves each query, padded and walked at the config's tiles; with `residuals`, the
     running maxima and denominators `[B, H, Q]`, the anchor keys and the split sums too; `natural` keeps
     the logits natural (`algebra.Forward.base2`)."""
-    hooks = Hooks() if hooks is None else hooks
+    query, key, hooks = prologues_taken(query, key, Hooks() if hooks is None else hooks)
     block_q, block_k = config.block_q, config.block_k
     # The query taken by its scale's power of two before its products (`prescale`).
     query, scale, power = prescaled(query, scale)
@@ -620,6 +621,8 @@ def backward(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Array, 
     Triton mainloop's `backward`, `natural` keeping the forward's logits natural and `accurate` taking the
     backward's accurate form (`ACCURATE`)."""
     block_q, block_k, pad = config.block_q, config.block_k, config.pad
+    # Its gradients the query's and key's under their prologues (`attention_route._pulled` takes them back).
+    query, key, hooks = prologues_taken(query, key, hooks)
     if residuals is None:
         plain = Hooks() if hooks is None else Hooks(hooks.score_mod, hooks.score_params, hooks.initial,
                                                     drop=hooks.drop)

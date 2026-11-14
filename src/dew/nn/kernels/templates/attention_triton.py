@@ -56,6 +56,7 @@ from dew.nn.kernels.templates.attention import (
     output_split,
     padded_call,
     prescaled,
+    prologues_taken,
     scored,
     within,
 )
@@ -623,6 +624,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     `interpret` runs it on the CPU. A call over runs or under dropout is refused (`refused`)."""
     if reason := refused(spans, hooks):
         raise NotImplementedError(reason)
+    # The prologues taken as XLA's program before the launch (`prologues_taken`).
+    query, key, hooks = prologues_taken(query, key, hooks)
     op, args, queries = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
     value_width = value.shape[-1]
     kept = _kept(residuals)
@@ -1211,9 +1214,12 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     where None). With `split`, D comes from the split sums; without, the dQ launch takes its own first pass
     over the keys (`gradient.off_anchor`). `natural` keeps the forward's logits natural; `accurate` takes
     the backward's accurate form (`ACCURATE`). `interpret` runs it on the CPU. A call over runs or under
-    dropout is refused (`refused`)."""
+    dropout is refused (`refused`). Its query's and key's gradients are under their prologues
+    (`attention_route._pulled` takes them back)."""
     if reason := refused(spans, hooks):
         raise NotImplementedError(reason)
+    # The prologues taken as XLA's program before the launch (`prologues_taken`).
+    query, key, hooks = prologues_taken(query, key, hooks)
     if residuals is None:
         plain = Hooks() if hooks is None else Hooks(hooks.score_mod, hooks.score_params, hooks.initial)
         _, maxima, totals, anchors, sums = forward(query, key, value, spans, plain, scale=scale,
