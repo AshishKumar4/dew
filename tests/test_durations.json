@@ -24365,6 +24365,8 @@
 "tests/test_quantization.py::test_an_int8_image_task_walks_as_the_host_does": 38.612,
 "tests/test_quantization.py::test_an_int8_models_masked_attention_runs_none_of_its_own_orders_whole_product_kernels[sm100]": 0.779,
 "tests/test_quantization.py::test_an_int8_models_masked_attention_runs_none_of_its_own_orders_whole_product_kernels[sm90]": 0.071,
+"tests/test_quantization.py::test_an_int8_models_paged_decode_step_reads_its_rows_through_the_layers_attention[sm100]": 1.193,
+"tests/test_quantization.py::test_an_int8_models_paged_decode_step_reads_its_rows_through_the_layers_attention[sm90]": 0.552,
 "tests/test_quantization.py::test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention[decode]": 9.474,
 "tests/test_quantization.py::test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention[mixed]": 12.497,
 "tests/test_quantization.py::test_an_int8_training_step_moves_the_weights_by_the_hosts_gradient": 55.632,
