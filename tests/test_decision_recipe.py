@@ -17,8 +17,8 @@ from dew.decision import Choice, Decide, decisions, mixture
 from dew.decision.config import DecisionRunConfig
 from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
+from dew.scores import Summary
 from dew.training import LocalTracker
-from dew.training.evaluation import Summary
 
 pytestmark = pytest.mark.mesh
 

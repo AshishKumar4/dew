@@ -21,9 +21,10 @@ from dew.artifacts import TokenScores
 from dew.checkpoints import Checkpoints, Keep, Metrics, Ranking
 from dew.data.dataset import DataPartition
 from dew.objectives.base import Aux, Objective, Shown
+from dew.scores import Summary
 from dew.telemetry.records import FitEnded
 from dew.training import Best, Plateau, Trainer
-from dew.training.evaluation import Evaluation, MetricScores, Summary
+from dew.training.evaluation import Evaluation, MetricScores
 
 
 class Overfit(Objective):

@@ -1658,12 +1658,9 @@ def unadapted(model: nn.Module) -> nn.Module:
 
 @runtime_checkable
 class AdaptedClass(Protocol):
-    """Marks a module class an adapter already wrapped, at any depth of its wrappers.
-
-    The wrapper subclass declares the interceptor its `apply` and `init` run
-    under, which is the whole record that a class was adapted: a second
-    adapter over it would run one branch inside the other.
-    """
+    """An adapted module class with its marks as the adapter states them, the interceptor its `apply` and
+    `init` run under and the names it binds: `dew.nn.protocols.Adapted`, which a reader below the adapters
+    asks, typed."""
 
     _dew_lora_interceptor: ClassVar[Interceptor]
     _dew_lora_bound: ClassVar[_Bound]

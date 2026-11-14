@@ -415,14 +415,14 @@ def test_the_layout_tools_step_counts_the_work_a_runs_step_counts(monkeypatch):
     """The layout tool's step (`compiled_step`) reads its batch as `fit` hands one to its step
     (`dew.training.ahead.step_batch`, row 3832): its rows' real tokens counted, so the step it compares
     commits the work a run's step commits; compiled on the loader's raw batch, it committed none."""
-    from dew.training.model_flops import _TokenCount
+    from dew.state import TokenCount
 
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
     tool = load('layout_parity')
     case, _ = tool.model_case("dense", "float32", {}, {})
     state, data, step, _, _ = tool.compiled_step(case, {}, tool.drawn_batch(case, 0), one_device=True)
     *_, committed = step(state, data)
-    tokens = int(_TokenCount.host(committed.tokens))
+    tokens = int(TokenCount.host(committed.tokens))
     assert tokens == case.batch_size * case.seq_len, (tokens, case.batch_size, case.seq_len)
 
 

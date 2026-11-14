@@ -53,13 +53,13 @@ from dew.batch import (
 )
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, Confident, DiscreteProcess, Unmask, refuse_causal
-from dew.inference.projections import packed_owned
 from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, pad_token_rows, request_key
 from dew.nn.kernels import generation
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
+from dew.nn.projections import packed_owned
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel, refuse_prefix
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping, id_row
@@ -539,7 +539,7 @@ def saved_artifact(checkpoints: Checkpoints, step: int) -> Mapping[str, object] 
     """The inference declaration `step` of `checkpoints` records, in the shapes Dew writes now
     (`earlier_shapes`); None where its objective declares none. The one reader of a step's declaration:
     a saved run's (`SavedRun.at`) and the option writing its run record reads from it
-    (`dew.config.earlier.earlier_option_writing`). The packages it trusts are imported first, by its
+    (`dew.decision.DecisionRunConfig.earlier_checkpointed`). The packages it trusts are imported first, by its
     reader."""
     record = checkpoints.artifact(step)
     return None if record is None else earlier_shapes(named_fields(record, 'checkpoint artifact'))
@@ -1056,7 +1056,7 @@ class TextGeneration(_NativeTextTask):
     variables: Variables
     """The weights generations read. A task loaded from a source (`dew.pipeline`) or a saved run
     (`from_run`) holds them in the serving layout, its projections packed
-    (`dew.inference.projections`); one over a live objective's arrays holds those as they are. An
+    (`dew.nn.projections`); one over a live objective's arrays holds those as they are. An
     objective built over them, and an export of them, read the model's own tree
     (`projections.unpacked`)."""
     processor: Processor | None = None

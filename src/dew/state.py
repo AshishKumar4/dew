@@ -159,6 +159,35 @@ class ReplicaState(Protocol):
     deferred: jax.Array | None
 
 
+class TokenCount:
+    """Unsigned 64-bit counts (a run's tokens) as low/high uint32 words, without enabling float64 in JAX:
+    how a state holds the tokens it has consumed (`TrainState.pending_tokens`) and a step counts them."""
+
+    @staticmethod
+    def words(values) -> np.ndarray:
+        values = np.asarray(values, np.uint64)
+        return np.stack((values.astype(np.uint32), (values >> np.uint64(32)).astype(np.uint32)), axis=-1)
+
+    @staticmethod
+    def _plus(left, right):
+        low = left[0] + right[0]
+        return low, left[1] + right[1] + (low < left[0]).astype(jnp.uint32)
+
+    @classmethod
+    def add(cls, left, right) -> jax.Array:
+        return jnp.stack(cls._plus(left, right))
+
+    @classmethod
+    def sum(cls, rows: jax.Array) -> jax.Array:
+        return jnp.stack(jax.lax.reduce((rows[:, 0], rows[:, 1]),
+                                       (np.uint32(0), np.uint32(0)), cls._plus, (0,)))
+
+    @staticmethod
+    def host(words) -> int:
+        words = np.asarray(words)
+        return int(words[0]) + (int(words[1]) << 32)
+
+
 @struct.dataclass
 class TrainState:
     """Holds everything a run must checkpoint to resume where it stopped.
@@ -194,7 +223,7 @@ class TrainState:
     none restores (`OPTIONAL`)."""
     deferred: jax.Array | None = dataclasses.field(default=None, metadata={"optional": True, **REPLICA})
     """The real tokens of the calls whose updates the optimizer holds back
-    (`dew.held_updates.update_applied`), two uint32 words (`dew.training.model_flops._TokenCount`),
+    (`dew.held_updates.update_applied`), two uint32 words (`TokenCount`),
     committed with the update that applies them; None for an optimizer that applies every update, which
     a checkpoint that holds none restores."""
     inner: ReplicaState | None = dataclasses.field(default=None, metadata={"optional": True})
@@ -242,9 +271,7 @@ class TrainState:
             windowed, held = (None if words is None else words[0] for words in (windowed, held))
         if windowed is None or held is None:
             return held if windowed is None else windowed
-        from dew.training.model_flops import _TokenCount
-
-        return _TokenCount.add(windowed, held)
+        return TokenCount.add(windowed, held)
 
     def with_window(self, window: Accumulation | None) -> TrainState:
         """This state with `window` as the window its step reads (`window`)."""

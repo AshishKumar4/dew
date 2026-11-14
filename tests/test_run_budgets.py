@@ -1751,8 +1751,8 @@ def test_each_split_evaluated_at_a_step_records_its_own_counts():
     that step, nor a summary's named as a count is (`evaluation/summary/records`); a cooldown branch's
     suites, scored at the step it branched at, record theirs apart from the run's own: no scalar takes
     two values at one step."""
+    from dew.scores import Summary
     from dew.training import Cooldowns
-    from dew.training.evaluation import Summary
 
     (x,) = clocked_records(0)
     small = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
