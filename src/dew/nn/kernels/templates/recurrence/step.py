@@ -13,6 +13,7 @@ columns. The arithmetic is `recurrence.step_reference`'s, fp32 throughout, the h
 """
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -168,7 +169,7 @@ def _launched(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, fami
                              grid=(rows, value_heads // block.heads, value_width // block.columns),
                              grid_names=("rows", "heads", "columns"), warpgroups=halves, resident=resident,
                              interpret=interpret, family=family.name, name="recurrence_step",
-                             scratch=(plgpu.SMEM((block.heads, 3, key_width), jnp.float32),
+                             scratch=(plgpu.SMEM((block.heads, 3 + hooks.own_weight, key_width), jnp.float32),
                                       plgpu.SMEM((halves, 2, scan.THREADS // scan.WARP), jnp.float32),
                                       *_joining(halves, block)))
     state_out, *moved, out = launched(active, *given.values())
@@ -402,8 +403,9 @@ class _Conv:
 
 def _staged(hooks, inputs, token: _Token, index: int, query, key, vectors, exchanged, *, interpret: bool):
     """The block's `index`-th head's key vectors in `vectors[index]`, fp32: its queries normed and scaled,
-    its keys normed (rows 0 and 1) and its decay a key dimension (row 2), as `recurrence.step_reference`'s
-    prologue and gates form them; its write gate returned, a scalar."""
+    its keys normed (rows 0 and 1), its decay a key dimension (row 2) and the readout's weight of its own
+    write where the hooks read one (row 3, `Hooks.own_weight`), as `recurrence.step_reference`'s prologue
+    and gates form them; its write gate returned, a scalar."""
     key_width = vectors.shape[2]
     layout = scan.blocked(key_width)
     if hooks.l2norm:
@@ -413,7 +415,9 @@ def _staged(hooks, inputs, token: _Token, index: int, query, key, vectors, excha
     elif hooks.scale is not None:
         query = query * hooks.scale
     decay, write = _gates(hooks, inputs, token.row, token.heads[index], layout)
-    for row, value in enumerate((query, key, jnp.broadcast_to(decay, (key_width,)))):
+    own = ((plgpu.load(inputs['own'].at[token.heads[index]], layout=layout, optimized=False)
+            .astype(jnp.float32),) if hooks.own_weight else ())
+    for row, value in enumerate((query, key, jnp.broadcast_to(decay, (key_width,)), *own)):
         plgpu.store(vectors.at[index, row], value, optimized=False)
     return write
 
@@ -478,7 +482,15 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token, 
         return token.tile(state_ref, start + k)
 
     def read(k, tile):
-        return (entry(0, k) * entry(2, k)) * tile
+        """The query's read of the state: decayed where it reads the state after the update."""
+        return (entry(0, k) * entry(2, k) if hooks.reads == 'after' else entry(0, k)) * tile
+
+    # The query's read of the write: whole where it reads the state after the update, weighed by its own
+    # weight where given (row 3), none where it reads the state entering the token alone.
+    reads_write = hooks.reads == 'after' or hooks.own_weight
+
+    def read_write(k, written):
+        return (entry(0, k) * entry(3, k) if hooks.own_weight else entry(0, k)) * written
 
     corrected = value
 
@@ -491,7 +503,9 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token, 
         kept = (recurrence.salted_bf16(entry_k, keyed_k, value) if state_out.dtype == jnp.bfloat16
                 else entry_k)
         token.stored(state_out, kept, start + k)
-        return entry(0, k) * written if hooks.delta else (read(k, tile), entry(0, k) * written)
+        if hooks.delta:
+            return read_write(k, written) if reads_write else jnp.zeros_like(written)
+        return (read(k, tile), read_write(k, written)) if reads_write else (read(k, tile),)
 
     if hooks.delta:
         sums = _summed_keys(span, row, lambda k, tile: (read(k, tile), (entry(1, k) * entry(2, k)) * tile),
@@ -500,11 +514,10 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token, 
         # The update's writes take the corrected value (`updated` reads it when the walk below calls it).
         corrected = value - keyed
         (written,) = _summed_keys(span, row, updated, value)
-        return before + halves.joined_sums(written, 2, layout, interpret)
-    after = _summed_keys(span, row, updated, value, count=2)
-    state_read, write_read = (halves.joined_sums(part, slot, layout, interpret)
-                              for slot, part in enumerate(after))
-    return state_read + write_read
+        return before + halves.joined_sums(written, 2, layout, interpret) if reads_write else before
+    after = _summed_keys(span, row, updated, value, count=1 + reads_write)
+    return functools.reduce(jnp.add, (halves.joined_sums(part, slot, layout, interpret)
+                                      for slot, part in enumerate(after)))
 
 UNROLLED = 16
 """The keys a turn of the step's loops reads at once, each turn's state rows loaded before any is used so
