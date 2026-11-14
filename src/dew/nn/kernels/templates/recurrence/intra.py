@@ -127,6 +127,14 @@ def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
     return (*walked, hi, lo)
 
 
+def _named(launch: str, products: tuple[str, ...]) -> str:
+    """The name of `launch`'s walk of `products`: its own where it walks every output (the scores and the
+    system), else `<launch>_<output>`, so a walk of one output is a kernel of its own name beside the walk of
+    both, which a training call's backward and forward each launch (a kernel's name is its identity,
+    `report.named`: Kimi's sm90 training call ran two `recurrence_intra` bodies under one name)."""
+    return launch if len(products) > 1 else "_".join((launch, *products))
+
+
 def _intra_merges(call: Call) -> bool:
     """Whether the scores and the system take one intra walk (`_intra_walk`): where the family's products
     read their operands from shared memory (wgmma's, tcgen05's), at a key block at which a multiprocessor
@@ -313,7 +321,7 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                          grid_names=("chunks", "heads"), blocks=blocks, stages=(1, 2),
                          live=chunk_liveness(4), steps=steps, model=model,
                          held=_intra_held(call, keys, outputs), staging=staging, landing=landing,
-                         name="recurrence_intra" if scored else "recurrence_intra_system",
+                         name=_named("recurrence_intra", products),
                          sums=(chunk,) * outputs,
                          # Each stream staged at its key block's row: a tile slices only whole swizzle rows.
                          swizzles={name: resources.widest_swizzle(dtype, keys)
