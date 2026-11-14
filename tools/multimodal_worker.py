@@ -12,10 +12,7 @@ that hears, its `<draw>.audio_<clip>` waveforms; a text site's (multimodal_famil
 (`multimodal_reference._encode`: one image in the first row, two in the second), and the model runs one
 row of it at a time (`multimodal_reference.numerics`). OUT gets `<draw>.reference.<leaf>` and
 `<draw>.truth.<leaf>` (multimodal_families.OUTPUTS) in float32 and float64, the latter the model's float64
-twin (`_dew_torch.precision.float64_twin`) inside `float64` over the encoding widened. A draw asked its
-`<draw>.scale_seed` gets instead `<draw>.scale.<leaf>`, the reference's own rounding scale at it (the
-twin's run with every operation tapped, `_dew_torch.rounding.rounding_scale`, at float32's unit), which a
-weighed site records (tools/venv_reference.py's `weighed`).
+twin (`_dew_torch.precision.float64_twin`) inside `float64` over the encoding widened.
 """
 
 import json
@@ -33,12 +30,9 @@ ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 def run(family: str, text: bool, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every draw's leaves under the family's checkpoint, in float32 and float64, over its images and audio,
     or with `text` its token rows alone (`multimodal_families.text_rows`)."""
-    import copy
-
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     from _dew_torch.precision import float64, float64_twin
-    from _dew_torch.rounding import rounding_scale
 
     references, checkpoint = FAMILIES[family]
     source = ROOT / checkpoint
@@ -56,15 +50,6 @@ def run(family: str, text: bool, cases: dict[str, np.ndarray]) -> dict[str, np.n
         with float64():
             widened = {key: value.double() if value.is_floating_point() else value
                        for key, value in encoded.items()}
-            if "scale_seed" in inputs:
-                # Each tapped run steps its own copy: `numerics` trains the model it is given in place.
-                def stepped(twin=twin, widened=widened):
-                    return numerics(copy.deepcopy(twin), widened)
-
-                unit, seed = float(np.finfo(np.float32).eps) / 2, int(inputs["scale_seed"])
-                _, scales = rounding_scale(stepped, unit, seed)
-                out.update({f"{name}.scale.{leaf}": value for leaf, value in scales.items()})
-                continue
             truth = numerics(twin, widened)
         # The float32 run after its truth, as each trains its own model in place; the answer's arrays in that
         # order, the truth's first.
