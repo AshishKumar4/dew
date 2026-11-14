@@ -24,7 +24,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.training.inspection import Inspection, inspected
     from dew.training.observe import Observe
     from dew.training.profiling import ProfileWindow, RunProfile
-    from dew.training.runtime import Preempted, prepare_process, run_timestamp
+    from dew.training.runtime import Preempted, prepare_process, run_timestamp, share_pool
     from dew.training.selection import Best
     from dew.training.tracker import (
         LocalTracker,
@@ -76,6 +76,7 @@ _EXPORTS = {
     "ema_update": "dew.averaging",
     "prepare_process": "dew.training.runtime",
     "run_timestamp": "dew.training.runtime",
+    "share_pool": "dew.training.runtime",
 }
 
 
@@ -121,4 +122,5 @@ __all__ = [
     "inspected",
     "prepare_process",
     "run_timestamp",
+    "share_pool",
 ]

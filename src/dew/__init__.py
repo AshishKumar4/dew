@@ -25,8 +25,9 @@ GH200's were made against 70.88 GiB of its 94.5). Your own fraction, in either
 of JAX's names, is kept, and the platform's allocator, which holds no pool, gets
 none. A process whose JAX backend opened before `import dew` keeps 75%; its plans
 record that limit as JAX's, and its run says once how to get Dew's. A process that
-shares its GPU with another program (an inference server beside it) names its own
-fraction; Dew places no other engine on a GPU it trains on. Where jax was
+shares its GPU with another program (an inference engine beside it, as
+examples/train_rlvr.py's vLLM and SGLang backends do) names the trainer's share
+before its first JAX computation (`dew.training.share_pool`). Where jax was
 imported before Dew, XLA may have parsed its flags already and Dew's are
 unproven; where the JAX backend has already opened, they cannot take effect,
 and Dew logs a warning.
