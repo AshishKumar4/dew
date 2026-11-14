@@ -15,7 +15,7 @@ import math
 import threading
 import time
 import weakref
-from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -94,12 +94,15 @@ class Rewrite:
 
 
 @contextlib.contextmanager
-def passes(on: bool = True, target: str | None = None) -> Iterator[None]:
+def passes(on: bool = True, target: str | None = None, without: Collection[str] = ()) -> Iterator[None]:
     """Within the block, the programs Dew compiles are rewritten (`on`) or not, priced for the GPU `target`
-    names (None: the process's own): a context of JAX's trace, so a program held across the switch traces
-    afresh (`dew._cache.ALGEBRA`). The accuracy gate holds it off for a reference arm and the float64
-    truth."""
-    with ALGEBRA(dataclasses.replace(ALGEBRA.value, on=on, target=target)):
+    names (None: the process's own), by every registered rule set but those `without` names (a receipt's
+    arm, §1.6; a name no set registers is refused, as an arm without it would measure nothing): a context of
+    JAX's trace, so a program held across the switch traces afresh (`dew._cache.ALGEBRA`). The accuracy gate
+    holds it off for a reference arm and the float64 truth."""
+    if unknown := sorted(set(without) - set(rules.RULES)):
+        raise ValueError(f"no rule set registers {unknown}: the registered sets are {sorted(rules.RULES)}")
+    with ALGEBRA(dataclasses.replace(ALGEBRA.value, on=on, target=target, without=frozenset(without))):
         yield
 
 

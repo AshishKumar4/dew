@@ -337,13 +337,15 @@ context only beside no other JAX call."""
 @dataclasses.dataclass(frozen=True)
 class Passes:
     """Whether the algebra pass rewrites the programs Dew compiles (`dew.algebra.passes`), the GPU whose
-    facts it prices them for (a `GpuTarget` name; None for the process's own), and whether each template
+    facts it prices them for (a `GpuTarget` name; None for the process's own), whether each template
     derivation's greedy extraction is held to the exact optimum (`checked`, the test suite's oracle,
-    `dew.algebra.extract.cheapest`)."""
+    `dew.algebra.extract.cheapest`), and the registered rule sets it leaves out (`without`, by name: a
+    receipt's arm without a set, docs/design/algebra.md §1.6)."""
 
     on: bool = True
     target: str | None = None
     checked: bool = False
+    without: frozenset[str] = frozenset()
 
 
 ALGEBRA = _context(Passes())

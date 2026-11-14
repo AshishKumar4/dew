@@ -336,6 +336,11 @@ class AheadOfTime:
     planned_seconds: float | None = None
     """The seconds that search took, its derivations and every compile: the time a run spends planning
     before its first step on those GPUs."""
+    planned_parts: Mapping[str, float] = dataclasses.field(default_factory=dict)
+    """The seconds of that search's work by part, summed over its threads (a compile at once runs several):
+    JAX's traces (`traced`), the algebra's passes over the traced programs (`algebra`, `report.passes`),
+    JAX's lowerings (`lowered`) and XLA's compiles (`compiled`; the planner's reading,
+    `planning.spending`)."""
     capacity: int | None = None
     """The allocator's limit each target GPU holds the plan to, derived from the memory stated for it
     (`dew._devices.allocator_limit`); None for a TPU's, whose topology states its own."""
@@ -422,10 +427,11 @@ class AheadOfTime:
     def load(path: str | Path) -> AheadOfTime:
         """The step `save` wrote to `path`."""
         step = _saved(path, AheadOfTime, "step")
-        if "starts" not in vars(step) or "autotuned" not in record(step.plan, "plan"):
+        if ("starts" not in vars(step) or "planned_parts" not in vars(step)
+                or "autotuned" not in record(step.plan, "plan")):
             raise ValueError(f"{path} holds a step compiled ahead before steps carried their start's "
-                             "programs (`starts`) and said whether XLA tuned them (`autotuned`); compile it "
-                             "ahead again")
+                             "programs (`starts`), said whether XLA tuned them (`autotuned`) and recorded "
+                             "their planning by part (`planned_parts`); compile it ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
         _current(path, "step", [step.executable, *sampled])
         return step
@@ -1324,7 +1330,20 @@ def fit_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], dataset: Datase
 def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool,
                                      plan: FitPlan | None, topology: bytes | None = None) -> AheadOfTime:
     """`compile_ahead`'s step and programs, the evaluations' with `plan`, what the run's `fit` is asked for
-    (`Trainer._fit_plan`), over its own data or a configured run's loader (`AheadTarget.compiled`)."""
+    (`Trainer._fit_plan`), over its own data or a configured run's loader (`AheadTarget.compiled`), with its
+    planning's seconds by their parts (`AheadOfTime.planned_parts`)."""
+    from dew.training.planning import spending
+
+    with report.recording() as recorded, spending() as spent:
+        ahead = _planned_ahead(trainer, batch, frontier=frontier, plan=plan, topology=topology)
+    # The planning's seconds by its parts, which perf_gate reports beside its whole (row 5339): JAX's traces,
+    # lowerings and compiles (the planner's own reading of them, `spending`) and the algebra's passes.
+    return dataclasses.replace(ahead, planned_parts={**spent, "algebra": sum(recorded.passes)})
+
+
+def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool,
+                                    plan: FitPlan | None, topology: bytes | None) -> AheadOfTime:
+    """`_compiled_ahead`'s planning and compile: the step's plan, its programs and their record."""
     if trainer.host_master or trainer.rollout is not None or trainer.lower_for is not None:
         raise ValueError("compile-ahead needs a device-resident step over its loader, with no lower_for")
     if trainer.tune_kernels or pgle_runs():

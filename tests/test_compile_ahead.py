@@ -579,6 +579,10 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     seconds = probe["compile_seconds"]
     assert isinstance(seconds, float) and ahead.planned_seconds is not None
     assert ahead.planned_seconds >= seconds > 0
+    # Its seconds by part, as the perf gate reports them (row 5339): the step was traced, passed through the
+    # algebra, lowered and compiled, and its compile is at least its probe's.
+    parts = ahead.planned_parts
+    assert all(parts[part] > 0 for part in ("traced", "algebra", "lowered")) and parts["compiled"] >= seconds
     destination = tmp_path / "planned.dew-aot"
     ahead.save(destination)
     saved = AheadOfTime.load(destination)
