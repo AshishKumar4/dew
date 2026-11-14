@@ -28,6 +28,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product. [4860]
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5278, 5327]
 - Derived resources: tiles, registers, residency and issued work. [5567]
+- Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm. [6030]
 - Exact on every path, every edge and every derivative order. [2656]
 - The suite's wall. [5478]
 
@@ -49,7 +50,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Time to first step: the compile path's re-derivations. [5556, 5558, 5669]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
-- The saved data plan as recorded rules, one last version, and the resume modes. [6022]
 - Training & Data's tests on check 1. [708]
 - XLA:CPU edges. [1591]
 
