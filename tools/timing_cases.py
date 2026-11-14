@@ -180,6 +180,9 @@ def flowed(cell: dict, implementation: str) -> tuple:
     from dew.nn.kernels.options import program
 
     flow, without = model_flows.flow_named(cell["flow"]), _left_out(implementation)
+    # Its process the flow's variant (its XLA flags and matmul precision, which the cell's arms' env state:
+    # `model_flows.flow_flags`, `Flow.precision`), as its GPU tier's run holds it.
+    model_flows.held_process(flow)
     flat, _ = model_flows.programs_of(flow)[f"{cell['kind']} dew"]
     params, ids = flow.draw(0)
     inputs = jax.device_put((*jax.tree.leaves(params), ids))
