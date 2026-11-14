@@ -30,6 +30,12 @@ def tile_columns(tiles: "Tiles", family: mosaic.Family) -> int:
     return tiles.block_n * (tiles.cluster if family.pairs_product else 1)
 
 
+def walk_columns(tiles: "Tiles", family: mosaic.Family) -> int:
+    """The output columns a cluster's tile spans: each program's `tile_columns`, side by side along the
+    cluster's columns (`Tiles.cluster_columns`)."""
+    return tile_columns(tiles, family) * tiles.cluster_columns
+
+
 def tile_rows(tiles: "Tiles", family: mosaic.Family) -> int:
     """The output rows a cluster's tile spans: each CTA's `block_m` its own, side by side, whether a pair's
     products span them (`tile_columns`) or its CTAs multicast the blocks they read alike."""

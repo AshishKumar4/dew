@@ -2161,6 +2161,17 @@ def test_a_tile_states_a_schedule_the_kernels_run():
                                 "family": "wgmma"} | fields)
 
 
+def pinned_gradient(tile: mosaic_gpu.Tiles, sizes):
+    """The kernel gradient of a Hopper's template pinned to `tile`, of groups `sizes` (dense where None),
+    interpreted."""
+    def dew(x, dy):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
+                {grouped_matmul.MosaicTgmm: tile}):
+            return gemm.gemm_t(x, dy, None if sizes is None else jnp.asarray(sizes), out_dtype=jnp.float32,
+                               interpret_on_cpu=True)
+    return dew
+
+
 @runs("sm90")
 @pytest.mark.parametrize("sizes", [None, (0, 70, 1, 129, 100, 0)], ids=["dense", "grouped"])
 def test_a_kernel_gradient_on_a_multicast_cluster_holds_check_1(sizes):
@@ -2173,16 +2184,11 @@ def test_a_kernel_gradient_on_a_multicast_cluster_holds_check_1(sizes):
         return (jnp.asarray(rng.normal(size=(ROWS, 256)), jnp.bfloat16),
                 jnp.asarray(rng.normal(size=(ROWS, WIDTH)), jnp.bfloat16))
 
-    def dew(x, dy):
-        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
-                {grouped_matmul.MosaicTgmm: PAIRED}):
-            return gemm.gemm_t(x, dy, None if sizes is None else jnp.asarray(sizes), out_dtype=jnp.float32,
-                               interpret_on_cpu=True)
-
     def plain(x, dy, wide=jnp.float32):
         return _kernel_gradient(x.astype(wide), dy.astype(wide), sizes)
 
-    assert_as_exact(dew, jax.jit(plain), draw, "a kernel gradient on a multicast cluster", seeds=SEEDS,
+    assert_as_exact(pinned_gradient(PAIRED, sizes), jax.jit(plain), draw,
+                    "a kernel gradient on a multicast cluster", seeds=SEEDS,
                     truth_fn=functools.partial(plain, wide=jnp.float64))
 
 

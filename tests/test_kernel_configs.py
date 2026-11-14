@@ -237,6 +237,39 @@ def test_a_pingpong_tile_compiles_within_its_resources_as_its_register_model_pri
 
 
 @lowers("sm90")
+@pytest.mark.parametrize("cluster", [(1, 2), (2, 2), (2, 4)], ids=["1 x 2", "2 x 2", "2 x 4"])
+def test_a_kernel_gradient_on_a_cluster_of_column_tiles_compiles_within_its_resources(cluster):
+    """A Hopper kernel gradient pinned to a cluster along its output's columns too (`Tiles.cluster_columns`,
+    cuBLASLt's 2 x 4 on the 4B's up dW), dense and grouped, compiled by Mosaic and ptxas for a compile-only
+    H100: spilling nothing, its multicast barriers within its planned shared memory (`mosaic_failures`)."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    rows, columns = cluster
+    tile = mosaic_gpu.Tiles(128, 128, 64, 4, 1, warpgroups=2, cluster=rows, cluster_columns=columns,
+                            family='wgmma')
+    launch = grouped_matmul.MosaicTgmm()
+    calls = {"grouped kernel gradient": (bf16((4096, 1024)), bf16((4096, 1024)),
+                                         jax.ShapeDtypeStruct((4,), jnp.int32), False),
+             "dense kernel gradient": (bf16((4096, 1024)), bf16((4096, 1024)),
+                                       jax.ShapeDtypeStruct((1,), jnp.int32), True)}
+    cases = []
+    for name, (x, dy, sizes, dense) in calls.items():
+        with generation.assumed("sm90"):
+            ba = launch.bind(x, dy, sizes, out_dtype="float32", interpret=False, dense=dense)
+            model = _model(launch, ba, tile)
+            assert launch.legal(ba, tile, generation.gpu_target()), name
+        cases.append(support.KernelCase(f"{name} {tile}", lambda ba=ba: launch.lowering(ba, tile),
+                                        {"dew_tgmm": model}))
+    found = compile_mosaic_kernels(cases, "sm90")
+    assert len(found) == len(cases) and all(record.get("kernels") for record in found), found
+    failed = mosaic_failures(found)
+    assert not failed, "\n".join(failed)
+
+
+@lowers("sm90")
 def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
     """The dense GEMM's mainloop at a cluster pair's 128 x 256 tile, compiled for a compile-only H100 as the
     GPU compiles it, has its HGMMAs left running while the next step's operands are awaited: ptxas
