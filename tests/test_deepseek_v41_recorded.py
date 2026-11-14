@@ -11,7 +11,6 @@ rounds for itself holds every arm. step_truths.npz and quantized_step_truths.npz
 hold the training step's float64 truth alone at a few draws, which Dew's float64 step is held to leaf by
 leaf: the step's float32 errors no count of draws resolves (testing.md, the training step's finding)."""
 
-import functools
 
 import deepseek_v41_support
 import jax
@@ -19,6 +18,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from arm_arithmetic import float64_held
+from deepseek_recorded import (
+    assert_cached_run_as_recorded,
+    assert_selections_clear,
+    cleared_rows,
+    held_to_the_release,
+)
 from deepseek_v41_support import TINY, training_step
 from reference_error import as_given, assert_as_exact
 
@@ -36,40 +41,74 @@ every position's and a cached walk's past its prompt, summarized over seeds, bes
 
 @pytest.fixture(scope="module")
 def recorded_rows(source):
-    """The rows the recording drew (recording_rows.npz), each of whose selections, the release's cleared
-    when it was recorded, Dew's plain forward clears `selection_margins.MARGIN` by too: so Dew's float32
-    runs over them, its float64 one and the release's select alike, whichever positions a variant of the
-    forward computes them at (a gap, shifted positions, a cached walk), each of whose selections is one
-    of the plain forward's."""
-    import selection_margins
-
+    """The rows the recording drew (recording_rows.npz), each of whose selections Dew's plain forward clears
+    `selection_margins.MARGIN` by too (`cleared_rows`)."""
     loaded, plain, _ = source
     with np.load(TINY / "recording_rows.npz") as stored:
-        rows = stored["rows"]
-    selecting = jax.jit(functools.partial(selection_margins.capturing, plain))
-    for index, row in enumerate(rows):
-        _, captured = selecting(loaded.variables, jnp.asarray(row))
-        smallest = selection_margins.margin(loaded.model_config, captured, f"recorded row {index}")
-        assert smallest > selection_margins.MARGIN, (
-            f"Dew's selections over recorded row {index} clear {smallest:.3g}, not MARGIN")
-    return rows
+        return cleared_rows(plain, loaded.variables, loaded.model_config, stored["rows"], "recorded row")
 
 
-def held_to_the_release(plain, variables, rows, site: str, start: int = 0):
-    """A recorded site's draw of `rows`, the release's evidence and truth over its declared seeds, Dew's
-    plain forward in float64 past `start` its truth, held to the release's (`recorded_site`), and the
-    count."""
+VISION_RECORDING = TINY / "vision_recording.npz"
+"""The vision half's recording (tools/deepseek_v41_reference.py --record-vision): the release's span, prefill
+and teacher-forced steps over drawn image prompts its selections clear, summarized over seeds, the prompts
+in vision_rows.npz."""
+
+
+@pytest.fixture(scope="module")
+def vision_source(tmp_path_factory):
+    """The tiny with its vision half, loaded as the release ships the bundle (`vision_bundle`), and the
+    recording's image prompts, each of whose selections, the release's cleared when it was recorded,
+    Dew's plain forward over the whole prompt clears `selection_margins.MARGIN` by too, its prefill's and
+    every step's among them (`assert_selections_clear`)."""
+    from dew.interop import Pretrained
+    from tools.deepseek_v41_numerics import unquantized, vision_bundle
+
+    loaded = Pretrained.load(vision_bundle(tmp_path_factory.mktemp("bundle")), dtype="float32",
+                             attention_impl="reference")
+    plain = loaded.model.clone(language_model=unquantized(loaded.model.language_model))
+    with np.load(TINY / "vision.npz") as fixture:
+        # The site's shape, alike for every prompt (tools/deepseek_v41_reference.py `vision_layout`).
+        shape = {"token_types": fixture["token_types"], "decode_prompt": fixture["decode_prompt"]}
+    with np.load(TINY / "vision_rows.npz") as stored:
+        prompts = [{name: stored[name][index] for name in stored.files}
+                   for index in range(len(stored["input_ids"]))]
+    media = shape["token_types"] >= 0
+    indices = jnp.asarray(np.where(media, np.cumsum(media, -1) - 1, -1))
+    calls = (((jnp.asarray(prompt["input_ids"]),),
+              {"image_indices": indices,
+               "conditioning": {"pixel_values": jnp.asarray(prompt["pixels"])[None, None]}})
+             for prompt in prompts)
+    assert_selections_clear(plain, loaded.variables, loaded.model_config, calls, "image prompt")
+    return loaded, prompts, shape
+
+
+def test_an_image_prompt_is_on_par_with_the_releases(vision_source):
+    """The vision half over drawn image prompts its selections clear: the span the image fills, the
+    prefill's logits with it and each teacher-forced text step's after it, through Dew's cache
+    (`vision_run`), on par with the release's from its float64 run's (check 1, the recording's), Dew's
+    own float64 run of the bundle its truth (row 354)."""
     from model_support import float64_twin, recorded_site
 
-    wide = jax.jit(float64_twin(plain).apply)
+    from tools.deepseek_v41_numerics import vision_run
+
+    loaded, prompts, shape = vision_source
+    wide = float64_twin(loaded.model)
+
+    def leaves(model, variables, prompt) -> dict:
+        span, prompt_logits, steps = vision_run(model, variables, {**prompt, **shape})
+        return {"vision_span": span, "vision_prompt_logits": prompt_logits, "vision_decode_logits": steps}
 
     def twin(inputs):
         with jax.enable_x64(new_val=True):
-            held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
-                                if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
-            return {"logits": wide(held, jnp.asarray(inputs["input_ids"]))[:, start:]}
+            return leaves(wide, float64_held(loaded.variables),
+                          {**inputs, "pixels": jnp.asarray(inputs["pixels"], jnp.float64)})
 
-    return recorded_site(RECORDING, site, lambda seed: {"input_ids": rows[int(seed)]}, twin)
+    site = "deepseek v41 vision"
+    draw, recorded, truth, seeds = recorded_site(VISION_RECORDING, site, lambda seed: prompts[int(seed)],
+                                                 twin)
+    # Dew's run compiled as its users compile it, one program a draw's shape.
+    assert_as_exact(lambda index, inputs: leaves(loaded.model, loaded.variables, inputs), recorded, draw,
+                    site, seeds=seeds, truth_fn=truth)
 
 
 @pytest.mark.shared_setup("recorded_rows")
@@ -82,7 +121,7 @@ def test_an_interior_gap_leaves_every_window_on_its_rows_real_tokens(source, rec
     NN-02)."""
     loaded, plain, _ = source
     at, gap = 5, 3
-    draw, reference, truth, seeds = held_to_the_release(plain, loaded.variables, recorded_rows,
+    draw, reference, truth, seeds = held_to_the_release(RECORDING, plain, loaded.variables, recorded_rows,
                                                          "deepseek v41 plain rows")
 
     @jax.jit
@@ -112,7 +151,7 @@ def test_shifted_positions_compute_the_unshifted_rows_logits(source, recorded_ro
     entries visible by the given places showed each query windows of later tokens, and entries rotated
     at zero-based origins sat SHIFT away from their queries (audit NN-03)."""
     loaded, plain, _ = source
-    draw, reference, truth, seeds = held_to_the_release(plain, loaded.variables, recorded_rows,
+    draw, reference, truth, seeds = held_to_the_release(RECORDING, plain, loaded.variables, recorded_rows,
                                                          "deepseek v41 plain rows")
 
     @jax.jit
@@ -136,7 +175,7 @@ def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(source, recorded_row
 
     loaded, plain, reference = source
     prompt = int(reference["decode_prompt"])
-    draw, recorded, truth, seeds = held_to_the_release(plain, loaded.variables, recorded_rows,
+    draw, recorded, truth, seeds = held_to_the_release(RECORDING, plain, loaded.variables, recorded_rows,
                                                        "deepseek v41 plain walk", prompt - 1)
 
     @jax.jit
@@ -163,18 +202,10 @@ def quantized_rows(source):
     the release's cleared when it was recorded (`clearing_quantized_rows`), and Dew's clear
     `selection_margins.MARGIN` by too, in its own forward with its quantizers on: so Dew's float32 run and
     its float64 one, following its roundings, select alike."""
-    import selection_margins
-
     loaded, _, _ = source
     with np.load(TINY / "recording_rows.npz") as stored:
-        rows = stored["quantized_rows"]
-    selecting = jax.jit(functools.partial(selection_margins.capturing, loaded.model))
-    for index, row in enumerate(rows):
-        label = f"quantized row {index}"
-        captured = selecting(loaded.variables, jnp.asarray(row))[1]
-        smallest = selection_margins.margin(loaded.model_config, captured, label)
-        assert smallest > selection_margins.MARGIN, f"{label}: Dew's selections clear {smallest:.3g}"
-    return rows
+        return cleared_rows(loaded.model, loaded.variables, loaded.model_config, stored["quantized_rows"],
+                            "quantized row")
 
 
 @pytest.mark.shared_setup("quantized_rows")
@@ -258,42 +289,6 @@ def test_a_quantization_aware_training_steps_float64_gradients_are_the_releases(
                               truth)
 
 
-CACHED_LEAVES = ("prompt_logits", "decode_logits", "draft_logits", "draft_confidence")
-"""The recorded cached run's leaves (tools/deepseek_v41_reference.py `cached_leaves`): its draft ids are
-its draft logits' argmax, which the rows' margins hold apart (`cleared_cached_run`)."""
-
-
-def cached_leaves(model, variables, ids, prompt: int, captured: list | None = None) -> dict[str, np.ndarray]:
-    """Dew's cached run of `ids` (`deepseek_v41_numerics.cached_run`, the release's driver: the prefill of
-    `prompt` tokens, teacher-forced steps after it, DSpark's draft after each fed the step's argmax), its
-    `CACHED_LEAVES`; with `captured`, every call's selections appended to it."""
-    from tools.deepseek_v41_numerics import cached_run
-
-    prompt_logits, steps, _, draft_logits, confidence = cached_run(model, variables, jnp.asarray(ids), prompt,
-                                                                   captured)
-    return dict(zip(CACHED_LEAVES, (prompt_logits, steps, draft_logits, confidence), strict=True))
-
-
-def cleared_cached_run(model, variables, config, ids, prompt: int, label: str) -> dict:
-    """Dew's cached run of `ids` (`cached_leaves`), each of whose selections and fed argmaxes clears
-    `selection_margins.MARGIN`: every selection its calls make, the trunk's top-k and each DSpark stage's
-    experts, captured as they run (`cached_run`'s `captured`), the main logits' argmax at the prompt's last
-    position and every step, which DSpark drafts from, and each draft's at every position but its last,
-    which the next position reads. The release's cleared twice MARGIN where it recorded the rows
-    (`clearing_cached_rows`), so Dew's float32 run and its float64 one decide alike; a row Dew's run does
-    not clear is refused, its verdict not one of the release's computation."""
-    import selection_margins
-
-    captured: list = []
-    leaves = cached_leaves(model, variables, ids, prompt, captured)
-    fed = (np.asarray(leaves["prompt_logits"])[:, -1:], np.asarray(leaves["decode_logits"]),
-           np.asarray(leaves["draft_logits"])[:, :, :-1])
-    smallest = min(min(selection_margins.margin(config, call, label) for call in captured),
-                   *(float(selection_margins.top_margin(logits, 1).min()) for logits in fed))
-    assert smallest > selection_margins.MARGIN, f"{label}: Dew's clear {smallest:.3g}"
-    return leaves
-
-
 # The recording's declared 32 seeds, a stage's 32 draws a map task: a draw takes about 4.5 s in the two arms
 # (2026-11-13, cached-cost1) beside a task's 85 s of setup, so a task of 32 draws runs within the plan's site
 # targets (v41-fit2: 226 to 233 s) where 8 a task spent half its seconds on setup (v41-fit1).
@@ -303,21 +298,8 @@ def test_a_cached_run_and_its_drafts_are_on_par_with_the_releases(source):
     teacher-forced step's logits after it and DSpark's draft after each, fed the step's argmax, its logits
     and confidence, over drawn rows whose every selection and fed argmax clears (`cleared_cached_run`), on
     par with the release's from its float64 run's (check 1, the recording's)."""
-    from model_support import float64_twin, recorded_site
-
     loaded, plain, reference = source
-    prompt = int(reference["decode_prompt"])
-    wide = float64_twin(plain)
     with np.load(TINY / "recording_rows.npz") as stored:
         rows = stored["cached_rows"]
-
-    @as_given
-    def twin(inputs):
-        return cached_leaves(wide, float64_held(loaded.variables), inputs["input_ids"], prompt)
-
-    site = "deepseek v41 plain cached"
-    draw, recorded, truth, seeds = recorded_site(RECORDING, site, lambda seed: {"input_ids": rows[int(seed)]},
-                                                 twin)
-    assert_as_exact(as_given(lambda index, inputs: cleared_cached_run(
-        plain, loaded.variables, loaded.model_config, inputs["input_ids"], prompt, f"cached row {index}")),
-        recorded, draw, site, seeds=seeds, truth_fn=truth)
+    assert_cached_run_as_recorded(RECORDING, loaded, plain, rows, int(reference["decode_prompt"]),
+                                  "deepseek v41 plain cached")

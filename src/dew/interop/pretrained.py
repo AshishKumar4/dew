@@ -112,7 +112,9 @@ from dew.sampling.text import Sampling, with_ids_of
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
+    from jax.tree_util import KeyPath
 
+    from dew.distributed.host import Leaf
     from dew.inference.tasks import SavedRun, TaskSettings
     from dew.interop.releases import ReleasePlan
     from dew.lora import Adapter, LoRA
@@ -194,17 +196,23 @@ def _share_quantized_aliases(tensors: dict[str, unread.Stored], aliases: tuple[t
                 tensors[name] = value
 
 
-def on_default_device(variables: Variables) -> Variables:
+def on_default_device(variables: Variables, *, cast: Callable[[KeyPath, Leaf], Leaf] | None = None
+                      ) -> Variables:
     """`variables` with each host leaf on JAX's default device as a `jnp` array is, uncommitted, so a
     jitted call reads it where it is and a placement moves it, one leaf at a time: a leaf's transfer
     completes before the next starts, and its host copy is released (a memory-mapped one's pages
-    evicted, `dew.distributed.host.evict`) once its device copy is written back in its place."""
+    evicted, `dew.distributed.host.evict`) once its device copy is written back in its place. A leaf is
+    as `cast(path, leaf)` makes it where given, cast as it is placed."""
     from dew.distributed.host import placed_leaves
+
+    def placed(path: KeyPath, leaf: Leaf) -> Leaf:
+        if not isinstance(leaf, (np.ndarray, np.generic)):
+            return leaf
+        return jax.device_put(leaf if cast is None else cast(path, leaf))
 
     # A freshly loaded tree's nodes are its own plain dicts, written in place so that no host leaf
     # outlives its device copy.
-    return placed_leaves(variables, lambda _, leaf: jax.device_put(leaf)
-                         if isinstance(leaf, (np.ndarray, np.generic)) else leaf, in_place=True)
+    return placed_leaves(variables, placed, in_place=True)
 
 
 @dataclass(frozen=True)
@@ -428,10 +436,8 @@ class Pretrained:
                                                export_adapter=_unwritten(stated), tokenizer=tokenizer)
                 else:
                     # Resolved once: the bundle is written in the layout just found.
-                    source = PretrainedDecoder.from_model(decoder.with_cross_attention(None), variables,
-                                                          tokenizer=tokenizer, generation_config=generation,
-                                                          layout=stated)
-                    bundle = replace(source, model=decoder)
+                    bundle = PretrainedDecoder.carrying(decoder, variables, tokenizer=tokenizer,
+                                                        generation_config=generation, layout=stated)
             bundle = replace(bundle, processor=processor)
             if isinstance(held, MaskedSettings):
                 # A masked run's model is a decoder: no wrapper denoises.
@@ -922,6 +928,24 @@ class PretrainedDecoder(Pretrained):
             raise decoder_parts.ExportRefused(
                 f"{type(model).__name__} has no Hugging Face layout Dew writes: {resolved.reason}")
         return cls._of_layout(model, variables, resolved, tokenizer, generation_config)
+
+    @classmethod
+    def carrying(cls, model: nn.Module, variables: Variables, *,
+                 tokenizer: str | decoders.ExportTokenizer | None = None,
+                 generation_config: Mapping[str, object] | None = None,
+                 layout: SourceLayout | None = None) -> PretrainedDecoder:
+        """The bundle a run or a decision release holds of `model` (`Pretrained.from_saved`,
+        `dew.decision.sources.PretrainedDecision.of`): a model that reads a context through cross-attention
+        (`CrossAttending`) is its source's extension, which no family writes, so it is laid out as the
+        model without it (`from_model`) and carries the model, a run starting from it reading it and its
+        export refusing it (`Pretrained.export`); any other model is `from_model`'s. `layout` is the
+        laid-out model's where the caller has resolved it already."""
+        from dew.nn.protocols import CrossAttending
+
+        crossing = isinstance(model, CrossAttending) and model.cross_attention is not None
+        bundle = cls.from_model(model.with_cross_attention(None) if crossing else model, variables,
+                                tokenizer=tokenizer, generation_config=generation_config, layout=layout)
+        return replace(bundle, model=model) if crossing else bundle
 
     @classmethod
     def _of_layout(cls, model: nn.Module, variables: Variables, layout: SourceLayout,

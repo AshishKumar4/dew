@@ -60,7 +60,7 @@ from dew.objectives.base import (
     with_projected,
 )
 from dew.objectives.routing import refuse_fixed_routers
-from dew.optim import clips_qk, stepped
+from dew.optim import clips_qk, post_step_order, stepped
 from dew.state import Accumulation, TokenCount, TrainState, apart, occupancy, together
 from dew.training.compiled_program import gradients_read
 from dew.training.distributed import microbatch
@@ -1015,7 +1015,8 @@ class Transaction:
                 progress=None if self.bound is None else self.progress(current))
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
             # rescale, a bounded group's clamp) acts on them (`stepped`).
-            params = {**current.variables, "params": stepped(stored, update, current.opt_state, opt_state)}
+            params = {**current.variables, "params": stepped(stored, update, current.opt_state, opt_state,
+                                                             post_step_order(self.optimizer, stored))}
             if applied is not None:
                 # The runs that updated in their backward take what their backward wrote, and the update's
                 # own of them, read by nothing, is never computed.
@@ -1250,7 +1251,7 @@ class Transaction:
             slots = [slot for copy in copies
                      for slot, node in enumerate(jax.tree.leaves(before, is_leaf=laid)) if node is copy]
             stepped_copies = [jax.tree.leaves(after, is_leaf=laid)[slot] for slot in slots]
-            return (unlayer(stepped(held, moved, before, after)),
+            return (unlayer(stepped(held, moved, before, after, post_step_order(self.optimizer, held))),
                     {name: unlayer(copy) for name, copy in zip(names, stepped_copies, strict=True)})
 
         norms = {}

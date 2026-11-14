@@ -212,10 +212,11 @@ def main(config: Config) -> None:
     text = corpus(np.random.default_rng(config.seed), 20000)
     data = compile(Memory([{"text": text}]).repeat().pipe(
         presets.lm, "byte", seq_len=config.sequence_length, batch=config.batch_size, pack=None, eos=False))
+    mixture = Mixture(experts=config.experts, top_k=config.top_k, dispatch=config.dispatch)
     model = CausalTransformer(
         vocab_size=256, emb_features=64, num_layers=2, num_heads=4,
         mlp_features=128, max_seq_len=64, dtype=jnp.float32, attention_impl="xla",
-        mixture=Mixture(experts=config.experts, top_k=config.top_k, dispatch=config.dispatch))
+        mixture=mixture)
     objective = LMObjective(model, config.sequence_length, balance=ExpertBalance(aux_loss_alpha=0.01))
     optimizer = OptimConfig(optimizer="adam", learning_rate=config.learning_rate).build(config.steps)
     trainer = Trainer(objective, optimizer, key=jax.random.key(config.seed),
@@ -239,9 +240,10 @@ def main(config: Config) -> None:
         operations, groups = all_to_all_ops(trainer.executable.as_text())
         print(f"The compiled training step holds {operations} all-to-all operations"
               + (f" over {groups}" if groups else ""))
-        # The dispatch the model ran on this mesh, as its compiled step shows it: `auto`, the model's
-        # default, exchanges where an expert axis divides the experts.
-        dispatch = "exchange" if operations else "global"
+        # The dispatch the model ran on this mesh, by the rule its layers resolve it with: `auto`, the
+        # model's default, exchanges where an expert axis divides the experts. The compiled step's
+        # all-to-all count above is a diagnostic: XLA may add one resharding under the global dispatch.
+        dispatch = mixture.dispatch_over(shards)
         where = placement(mesh, kernel, (config.batch_size, config.sequence_length, 64), trainer.layout,
                           dispatch)
         for current in range(1, config.steps + 1):

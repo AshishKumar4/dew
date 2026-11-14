@@ -103,8 +103,8 @@ class Launch:
     padded: float | None = None
     kernels: dict[str, "RegisterModel"] = dataclasses.field(default_factory=dict, compare=False)
     """Each kernel the launch traced that stated its register model as it was named (`named`'s `model`), by
-    its name less the launch's suffix (`kernel_of`'s): the decision the compile point checks the kernel's
-    registers against."""
+    its name less the launch's suffix (`kernel_of`'s): the launch's stated register allocation, whose
+    producer the compile gate checks its emission lowers to."""
 
 
 @dataclasses.dataclass
@@ -399,10 +399,12 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     launch's derivation refuses a config that spills and takes its next (`tuning`'s `_chosen`), with no
     program retraced, where a compile's refusal retraces the whole program (`settled`): a B200's 4B step
     stepped its attention forward 19 times that way, 42 minutes, every rewalk a step's trace. None on a
-    process compiling for no GPU or an interpreted launch; none for a launch XLA does not compile alone (a
-    collective's, a block past its shared memory), which its program's compile reads as before (`settled`)
-    and `uncertified` names. Once a process, by launch (`certifications`), and once a GPU model a machine:
-    each verdict, an accepted config's and a refused one's, is stored with the kernel picks
+    process compiling for no GPU or an interpreted launch; none for a launch XLA or the GPU's compiler
+    refuses to compile alone though it lowered (a collective's, its devices the program's; an assembly the
+    PTX compiler rejects), which its program's compile reads as before (`settled`) and `uncertified` names;
+    a launch Mosaic refuses as it lowers (a block past its shared memory) raises here as its program's
+    lowering would. Once a process, by launch (`certifications`), and once a GPU model a
+    machine: each verdict, an accepted config's and a refused one's, is stored with the kernel picks
     (`_verdict_key`), so a warm start traces and compiles nothing to certify."""
     device = _certifying_device()
     if device is None or arguments.arguments.get("interpret"):
@@ -422,9 +424,8 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
         try:
             kernels = _compiled_launch(op, arguments, config, device, reverse)
         except jax.errors.JaxRuntimeError as error:
-            # XLA refuses the launch alone (its block's shared memory, a collective's devices): its program's
-            # compile refuses it as it did before certification (`settled`), and the gate names it
-            # (`uncertified`).
+            # XLA refuses the launch alone (a collective's devices): its program's compile reads it as it did
+            # before certification (`settled`), and the gate names it (`uncertified`).
             _log.warning("launch %s at %s is not certified: XLA does not compile it alone (%s)",
                          type(op).__name__, config, str(error)[:200])
             with _GUARD:
@@ -666,13 +667,7 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
              ) -> jax.stages.Compiled:
     """`lowered` compiled (`kept`), its communicators admitted against the room the process's pool left
     them before it runs (`dew.communicators.admit`): every program Dew compiles passes here. `first` is
-    its first compile where another thread made it (`attempts`). A program whose launch reads ahead of its
-    wait an operand it produces is refused (`lowered.unsettled`)."""
-    from dew.nn.kernels.lowered import Unsettled, unsettled
-
-    if found := unsettled(lowered):
-        raise Unsettled("a launch reads ahead of its wait an operand its program produces, which the launch "
-                        f"before it may still be writing: {', '.join(found)}")
+    its first compile where another thread made it (`attempts`)."""
     executable = kept(lowered, options, relower=relower, first=first)
     communicators.admit(executable)
     return executable

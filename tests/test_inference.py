@@ -1457,7 +1457,7 @@ def test_a_served_walks_initial_state_traces_under_a_compile_only_mesh():
     compile-only GPU's whose devices run nothing here, makes its grid on this host (`programs.on_host`)."""
     from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
     from dew.inference.images import _initial
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     process = Process(FlowMatchingScheduler(shift=2), FlowMatchPredictionTransform())
     grid = tuple(float(time) for time in np.asarray(process.times(4)))

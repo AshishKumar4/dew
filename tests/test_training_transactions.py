@@ -172,7 +172,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     from dew.objectives import Step
     from dew.objectives.lm import LMObjective
     from dew.objectives.routing import ExpertBalance
-    from dew.optim import scale_by_qk_clip, stepped
+    from dew.optim import post_step_order, scale_by_qk_clip, stepped
 
     # QK-Clip bounds logits only where no QK-norm divides the kernels' scale
     # back out, and refuses a normed layer.
@@ -217,7 +217,8 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
         has_aux=True)(start["params"])
     updates, clipped = optimizer.update(gradient, opt_state, start["params"], qk_stats=aux.qk_stats)
     # The clip rescales the stepped weights, as the step stores them (`stepped`).
-    expected = stepped(start["params"], updates, opt_state, clipped)
+    expected = stepped(start["params"], updates, opt_state, clipped,
+                       post_step_order(optimizer, start["params"]))
     np.testing.assert_allclose(actual_loss, expected_loss, rtol=1e-6, atol=2e-6)
     for want, got in zip(jax.tree.leaves(expected), jax.tree.leaves(actual.variables["params"]), strict=True):
         np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
@@ -261,7 +262,7 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
     from dew.diffusion.discrete import MDLM
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-    from dew.optim import scale_by_qk_clip, stepped
+    from dew.optim import post_step_order, scale_by_qk_clip, stepped
     from dew.training import MeshSpec
 
     # QK-Clip bounds logits only where no QK-norm divides the kernels' scale back out.
@@ -323,7 +324,7 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
     def clipped(start, opt_state, pooled, final):
         updates, after = jax.jit(clip(.05).update)(jax.tree.map(jnp.zeros_like, start), opt_state, start,
                                                    qk_stats=heard(pooled))
-        return stepped(start, updates, opt_state, after)
+        return stepped(start, updates, opt_state, after, post_step_order(clip(.05), start))
 
     assert_as_exact(as_given(lambda start, opt_state, pooled, final: final), as_given(clipped), draw,
                     "a QK-Clip at a window's pooled maxima", seeds=QK_CLIP_SEEDS,

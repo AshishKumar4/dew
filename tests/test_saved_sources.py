@@ -110,8 +110,9 @@ def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(t
     """A language model run whose decoder no family's layout holds (GPT-J's parallel layout under a gated
     MLP, its positions a learned table) exports as its native release, and loads (`Pretrained.load(run)`,
     at the attention a run asks and twice the context, its learned table keeping its rows, as every
-    task resizes a cache) as its model in Dew's own layout, its parameters the run's final ones, whose own
-    export refuses, stating why; asked no weights, it reads their shapes and dtypes alone; on the host, its
+    task resizes a cache) as its model in Dew's own layout on JAX's default device, its parameters the
+    run's final ones, whose own export refuses, stating why; asked no weights, it reads their shapes and
+    dtypes alone; on the host, its
     weights as host arrays read from storage, nothing transferred to a device on the way; a second run
     naming it (`--pretrained <run>`) starts from it and trains its step (row 4785: a token run's native
     release declared no task a run starts from)."""
@@ -134,6 +135,10 @@ def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(t
     assert not source_layout(saved_model(SavedRun.pinned(str(source)).record, None).build())
     loaded = Pretrained.load(str(source), max_seq_len=2 * SEQ, attention_impl="xla")
     assert (loaded.model.max_seq_len, loaded.model.attention_impl) == (2 * SEQ, "xla")
+    # Asked no mesh, its weights lie on JAX's default device, as a family's load places them, not on
+    # every device of a default mesh (ledger 4798).
+    assert {frozenset(leaf.sharding.device_set) for leaf in jax.tree.leaves(loaded.variables)} == {
+        frozenset({jax.devices()[0]})}
     leaves_alike(loaded.variables["params"], state.variables["params"])
     # The model built at the larger context holds the parameters the run trained, its table's rows kept.
     ids = jax.ShapeDtypeStruct((1, 2), "int32")
@@ -531,6 +536,33 @@ def test_a_pool_reads_a_saved_runs_release_through_one_publisher(tmp_path, monke
     for report in (publisher, reader):
         assert report["read"][0]["growth"] < whole / 2 <= report["held"]
 
+    assert publisher["export_code"] == reader["export_code"] == 0
+    assert [scope["writes"] for scope in reader["exported"]] == [False]
+    assert main(["export", str(source), str(tmp_path / "alone")]) == 0
+    assert exported_tensors(source.parent / "exported") == exported_tensors(tmp_path / "alone")
+
+
+@pytest.mark.distributed
+@pytest.mark.mesh
+def test_a_pool_reads_a_saved_decision_runs_release_through_one_publisher(tmp_path, monkeypatch):
+    """Two real processes sharing Dew's cache read a saved decision run as a source (`released_run`), its
+    release its task's own (a Laya checkpoint, `run_plan`'s decision branch), as they read a language model
+    run's (ledger 3102): the release is written once, the first process publishing it and the other
+    reading every tensor as it does, writing none, and both read the one release; `dew export` to a
+    destination they share writes it once likewise, the tensors one process's export writes. The tiny Laya
+    backbone's release is a few megabytes, below what a host's allocated bytes resolve, so the bound on
+    what a host holds is the language model run's to show (above), over the writer both share."""
+    from dew._cli.main import main
+
+    trained(decision(tmp_path, drawn=False), tmp_path, "first", trainer={"checkpoint_final": True})
+    source = tmp_path / "runs" / "first"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "shared_cache"))
+    publisher, reader = run_pool("released", tmp_path / "pool", processes=2, script=WORKER, devices=2,
+                                 fsdp_size=4, run_dir=str(source))
+    assert publisher["processes"] == 2 and publisher["release"] == reader["release"]
+    assert publisher["release_files"] == reader["release_files"] and publisher["release_files"]
+    assert [scope["writes"] for scope in publisher["read"]] == [True]
+    assert [scope["writes"] for scope in reader["read"]] == [False]
     assert publisher["export_code"] == reader["export_code"] == 0
     assert [scope["writes"] for scope in reader["exported"]] == [False]
     assert main(["export", str(source), str(tmp_path / "alone")]) == 0

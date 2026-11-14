@@ -932,7 +932,7 @@
      "runs": "transformers"
     }
    ],
-   "note": "The release's inference/model.py over the V4.1 tool's kernel stand-ins with the quantizers and the indexer's rotation off for DSpark's drafts, transformers for the trunk's logits; both in float64 for reference_f64.npz (tools/deepseek_v4_dspark_reference.py:1)."
+   "note": "The release's inference/model.py over the V4.1 tool's kernels with the quantizers and the indexer's rotation off, and transformers over the same checkpoint for the trunk: recording.npz their trunk logits and the release's cached run with DSpark's drafts over drawn rows every selection clears, summarized over seeds with their float64 truth (tools/deepseek_v4_dspark_reference.py --record)."
   },
   "hf/deepseek-v4-tiny/logits.npy": {
    "tool": "tools/hf_reference_b.py",

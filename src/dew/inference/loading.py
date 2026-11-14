@@ -12,7 +12,7 @@ uses the current pool's devices. A just-trained state needs no reload; its objec
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Literal
 
@@ -31,7 +31,9 @@ from dew.registry import dtype_name, import_trusted
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
+    from jax.tree_util import KeyPath
 
+    from dew.distributed.host import Leaf
     from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
 
@@ -145,9 +147,7 @@ def released_model(root: epath.Path) -> bool:
     from dew.config.release import Release
 
     release = Release.load(str(root))
-    # A model's release written before it stated its run names its objective (`ReleasedRun.of`).
-    return release is not None and release.task is not None and ("run" in release.task
-                                                                 or "objective" in release.task)
+    return release is not None and release.task is not None and "run" in release.task
 
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
@@ -202,9 +202,10 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
     return loaded.pipeline()
 
 
-def place(variables: Variables, mesh: MeshSpec | Mesh | None, layout: Layout | None) -> Variables:
+def place(variables: Variables, mesh: MeshSpec | Mesh | None, layout: Layout | None, *,
+          cast: Callable[[KeyPath, Leaf], Leaf] | None = None) -> Variables:
     """Place `variables` on `mesh`, a native mesh or the one a `MeshSpec`
-    describes, one leaf at a time.
+    describes, one leaf at a time, each as `cast(path, leaf)` makes it where given (`stream`).
 
     The sharding is the one the trainer gives a train state's parameters under
     `layout`; `dew.distributed.host.stream` places the leaves, updating the
@@ -222,4 +223,4 @@ def place(variables: Variables, mesh: MeshSpec | Mesh | None, layout: Layout | N
     chosen_layout = DefaultLayout() if layout is None else layout
     shardings = chosen_layout.shardings(placed_on, variables)
     chosen_layout.check(variables, shardings, placed_on)
-    return stream(variables, shardings)
+    return stream(variables, shardings, cast=cast)

@@ -394,8 +394,16 @@ def held(task) -> dict[str, object]:
 
 
 def answers(task) -> list[object]:
-    """What one request of `task` answers (`requested`), each leaf a host value, in order."""
+    """What one request of `task` answers (`requested`), each leaf a host value, in order: a result's real
+    rows as a process reads them (`host`), not the padding rows a mesh's devices hold, which its placement
+    alone decides."""
+    from dew.diffusion.block import CanvasGeneration
+    from dew.inference.images import Images
+    from dew.sampling.text import Generation
+
     def leaves(value) -> list[object]:
+        if isinstance(value, Generation | CanvasGeneration | Images):
+            value = value.host()
         if isinstance(value, Mapping):
             return [leaf for name in sorted(value) for leaf in leaves(value[name])]
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
