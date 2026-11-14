@@ -43,6 +43,7 @@ __all__ = [
     "Protected",
     "Surrogate",
     "TangentKind",
+    "WalkStep",
     "bound_span",
     "contracted",
     "declared_derivative",
@@ -184,8 +185,15 @@ class Algebra:
     retires once it derives the form itself."""
 
 
-type Kind = Protected | Surrogate | KernelGlue | Algebra
-"""What a marked span is to the algebra pass, read as an object, never a name."""
+@dataclasses.dataclass(frozen=True)
+class WalkStep:
+    """A kernel walk's step (`dew.nn.kernels.templates.mosaic.stepped`): its index through a marked call,
+    which a count of the kernel's work by emission reads as one step (`templates.emission`), whatever loop
+    or unrolled rotation holds it; inlined, it lowers to its index."""
+
+
+type Kind = Protected | Surrogate | KernelGlue | Algebra | WalkStep
+"""What a marked span is, read as an object, never a name: to the algebra pass, or to a kernel's count."""
 
 type TangentKind = Protected | KernelGlue | Algebra
 """The kinds a tangent rule is declared as (`declared_tangent`): a surrogate's forward mode is `surrogate`'s

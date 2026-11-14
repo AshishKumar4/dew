@@ -92,6 +92,12 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "gate": ("plain", "scaled"),
         "dtype": ("bfloat16", "float16", "float32"),
     },
+    "gated_mlp": {
+        "generation": ("sm90", "sm100"),
+        "activation": ("swiglu", "geglu"),
+        "limit": ("none", "clamped"),
+        "dtype": ("bfloat16", "float16"),
+    },
     "recurrence": {
         "generation": ("sm90", "sm80"),
         "form": ("gated delta net", "kimi delta attention", "write gate", "rated scan"),
@@ -153,7 +159,9 @@ or a SiLU of twice the product plus a residual; the operands' dtype. The joined 
 `gate_up` and `delta_gates`): the GPU; a gated MLP's gate and up projections joined, or a gated delta net's b
 and a; the MLP's activation, SwiGLU or GeGLU (`none` for the delta net, which has no gated product);
 projections with no bias or one; a gate times its multiplier or not (`plain` for the delta net); the operands'
-dtype. The adapted product's (the choice `low_rank`): the GPU; the adapter's rank; a projection with no bias
+dtype. The fused gated MLP's (the choice `gated_mlp`): the GPU; its gated product, SwiGLU or GeGLU; its
+projections unclamped or clamped (`swiglu_limit`); the operands' dtype. The adapted product's (the choice
+`low_rank`): the GPU; the adapter's rank; a projection with no bias
 or one; the operands' dtype. The blockwise-scaled FP8 product's (the choice `blockwise_fp8`): the GPU (an
 H100's FP8 tensor cores); the columns a column scale covers (a weight block's 128, or one); the groups;
 the output's dtype. The block-scaled product's (the choices `mxfp8` and `nvfp4_block`): the GPU (a B200's
@@ -225,6 +233,7 @@ CELLS: dict[str, tuple[str, str]] = {
     "gemm": ("gemm_matrix", "a_gemm_training_step_is_on_par"),
     "fused_gemm": ("fused_gemm_matrix", "a_fused_gemm_training_step_is_on_par"),
     "join": ("join_matrix", "a_joined_layers_training_step_is_on_par"),
+    "gated_mlp": ("gated_mlp_matrix", "a_fused_mlps_training_step_is_on_par"),
     "low_rank": ("low_rank_matrix", "an_adapted_projections_training_step_is_on_par"),
     "nvfp4": ("nvfp4_matrix", "an_nvfp4_products_training_step_is_on_par"),
     "blockwise_fp8": ("blockwise_matrix", "a_blockwise_fp8_product_is_on_par"),

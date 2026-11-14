@@ -41,7 +41,7 @@ import contextvars
 import dataclasses
 import math
 import types
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import jax
@@ -303,6 +303,20 @@ def measured_links(links: Mapping[str, Link]) -> Iterator[Mapping[str, Link]]:
         yield links
     finally:
         _LINKS.reset(token)
+
+
+def spread_axes() -> tuple[str, ...]:
+    """The axes of the links traced under (`measured_links`) that a projection spread over so far."""
+    return tuple(sorted(axis for axis, link in _LINKS.get().items() if link.spread))
+
+
+def spread_over(axes: Iterable[str]) -> None:
+    """Mark the links traced under as spread over `axes`, as a trace that read them would have
+    (`_spreads`): a step kept from an earlier trace, read again under links of the same figures."""
+    links = _LINKS.get()
+    for axis in axes:
+        if axis in links:
+            links[axis].spread = True
 
 
 def trace_context() -> tuple:

@@ -22,7 +22,17 @@ from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import launches
-from dew.nn.kernels.templates import bodies, handoffs, mosaic, persistent, report, resources, swizzling
+from dew.nn.kernels.templates import (
+    bodies,
+    emission,
+    handoffs,
+    mosaic,
+    persistent,
+    report,
+    resources,
+    swizzling,
+)
+from dew.nn.kernels.templates.cost import Stated
 
 
 def _staging(block: tuple, swizzle: int | None) -> tuple:
@@ -544,7 +554,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
+               cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
+               model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None,
                producer: int | None = None, shared: int | None = None,
@@ -564,8 +575,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                                     name, model=(None if registers is None
                                                  else resources.register_model(self, consumers, registers,
                                                                                shared=shared))),
-                                cost_estimate=cost)
-        return mosaic.checked(built, name or self.name, resident, model_flops)
+                                cost_estimate=emission.built_with(cost))
+        return mosaic.checked(emission.costed(built, cost), name or self.name, resident, model_flops)
 
     def program_scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
@@ -644,6 +655,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         if ahead:
             raise NotImplementedError(f"{self.name}'s pipeline reads no stream ahead")
         del first, in_flight, unrolled
+        segments = mosaic.stepped(segments)
         blocks = streams.pipeline.blocks
         names = tuple(blocks)
         carry = (start, self.started(shapes, initial))

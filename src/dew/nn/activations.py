@@ -219,16 +219,57 @@ def _gate_function(activation: str, implementation: str) -> Callable[[jax.Array]
     return gates[activation]
 
 
-def _rounded(activate: Callable[[jax.Array], jax.Array]) -> Callable[[jax.Array, jax.Array], jax.Array]:
-    """`gated_product`'s rounded arithmetic over `activate`."""
+def _rounded(activate: Callable[[jax.Array], jax.Array], rounding: Callable = rounded_to
+             ) -> Callable[[jax.Array, jax.Array], jax.Array]:
+    """`gated_product`'s rounded arithmetic over `activate`, each rounding `rounding`'s (`rounded_to`, or a
+    kernel's `cast_rounded`)."""
     def rounded(gate: jax.Array, up: jax.Array) -> jax.Array:
         dtype = jnp.result_type(gate, up)
-        gate_fp32 = rounded_to(gate.astype(jnp.float32), gate.dtype)
-        up_fp32 = rounded_to(up.astype(jnp.float32), up.dtype)
-        activated = rounded_to(activate(gate_fp32), gate.dtype)
-        return rounded_to(activated * up_fp32, dtype).astype(dtype)
+        gate_fp32 = rounding(gate.astype(jnp.float32), gate.dtype)
+        up_fp32 = rounding(up.astype(jnp.float32), up.dtype)
+        activated = rounding(activate(gate_fp32), gate.dtype)
+        return rounding(activated * up_fp32, dtype).astype(dtype)
 
     return rounded
+
+
+def cast_rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
+    """`x` rounded to `dtype` and held in its own dtype by a cast there and back: a kernel's rounding, as no
+    Pallas GPU lowering takes `reduce_precision` (`rounded_to`'s), the same value where no compiler deletes
+    the pair (a kernel's body; XLA under Dew's `--xla_allow_excess_precision=false`), and its derivative,
+    the casts' own, rounding the cotangent where the value rounds."""
+    return x.astype(dtype).astype(x.dtype)
+
+
+def gated_hook(activation: str, limit: float | None = None) -> Callable[[jax.Array, jax.Array], jax.Array]:
+    """A gated MLP's product of its gate and up projections as a GEMM hook traces it (`dew.nn.gated_mlp`):
+    the projections clamped by `limit` (`swiglu_clamped`), then `gated_product`'s arithmetic of
+    `activation`'s gate ('swiglu', 'geglu', 'geglu_exact'), each rounding a cast pair (`cast_rounded`)."""
+    product = _gated(_gate_function(activation, 'xla'), cast_rounded)
+
+    def hook(gate: jax.Array, up: jax.Array) -> jax.Array:
+        return product(*swiglu_clamped(gate, up, limit))
+
+    return hook
+
+
+def _gated(activate: Callable[[jax.Array], jax.Array], rounding: Callable = rounded_to
+           ) -> Callable[[jax.Array, jax.Array], jax.Array]:
+    """`gated_product`'s arithmetic of a gate and an up projection: `activate(gate) * up` at fp32 and wider,
+    else the rounded arithmetic (`_rounded`, each rounding `rounding`'s)."""
+    rounded = _rounded(activate, rounding)
+
+    def product(gate: jax.Array, up: jax.Array) -> jax.Array:
+        if _wide(gate, up):
+            return activate(gate) * up
+        return rounded(gate, up)
+
+    return product
+
+
+def _wide(*operands: jax.Array) -> bool:
+    """Whether the operands' product is fp32 or wider, which rounds nowhere (`gated_product`)."""
+    return jnp.finfo(jnp.result_type(*operands)).bits >= 32
 
 
 # Recomputed in the backward pass, as the norms are (`normalized_in_fp32`):
@@ -286,14 +327,11 @@ def _portable(activate, halves):
     (the two projections, or one packed output's two halves): `activate(gate) * up` at fp32 and
     wider, else rounded where torch rounds it (`_rounded`) and recomputed from the operands
     themselves in the backward, so a packed output is never copied into halves."""
-    rounded = _rounded(activate)
-    rounded_product = _recomputed(lambda *operands: rounded(*halves(*operands)))
+    product = _gated(activate)
+    rounded_product = _recomputed(lambda *operands: product(*halves(*operands)))
 
     def portable(*operands: jax.Array) -> jax.Array:
-        if jnp.finfo(jnp.result_type(*operands)).bits >= 32:
-            gate, up = halves(*operands)
-            return activate(gate) * up
-        return rounded_product(*operands)
+        return product(*halves(*operands)) if _wide(*operands) else rounded_product(*operands)
 
     return portable
 

@@ -95,11 +95,10 @@ def test_a_lazy_lookup_runs_the_module_its_name_resolves_to(tmp_path, modules, c
         layers.Crossing("telemetry imports no trainer", "dew.telemetry.sink", "dew.training", chain)]
 
 
-def test_the_contracts_hold_telemetry_and_the_algebra_over_their_closure_and_the_network_layer_directly(
-        tmp_path):
-    """The contracts as declared (`LAYERS`): telemetry's and the algebra's are crossed by a chain through a
-    package whose initializer alone imports the trainer; the network layer's no-trainer contract by its own
-    import of it, not by that chain (row 5992's bridge still open)."""
+def test_the_contracts_hold_telemetry_the_algebra_and_the_network_layer_over_their_closure(tmp_path):
+    """The contracts as declared (`LAYERS`): telemetry's, the algebra's and the network layer's no-trainer
+    contract are each crossed by a chain through a package whose initializer alone imports the trainer, and
+    the network layer's by its own import of it too."""
     root = tree(tmp_path, {"dew.telemetry.sink": "import dew.bridge.child\n",
                            "dew.algebra.terms": "import dew.bridge.child\n",
                            "dew.nn.client": "import dew.bridge.child\n",
@@ -108,9 +107,11 @@ def test_the_contracts_hold_telemetry_and_the_algebra_over_their_closure_and_the
                            "dew.training.__init__": ""})
     held = ("telemetry imports nothing above the network layer",
             "the algebra imports nothing above the network layer", "the network layer imports no trainer")
+    through = ("dew.bridge", "dew.training")
     assert sorted(crossing for crossing in layers.crossings(root) if crossing.contract in held) == sorted([
-        layers.Crossing(held[0], "dew.telemetry.sink", "dew.training", ("dew.bridge", "dew.training")),
-        layers.Crossing(held[1], "dew.algebra.terms", "dew.training", ("dew.bridge", "dew.training")),
+        layers.Crossing(held[0], "dew.telemetry.sink", "dew.training", through),
+        layers.Crossing(held[1], "dew.algebra.terms", "dew.training", through),
+        layers.Crossing(held[2], "dew.nn.client", "dew.training", through),
         layers.Crossing(held[2], "dew.nn.direct", "dew.training")])
 
 

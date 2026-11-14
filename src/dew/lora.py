@@ -45,7 +45,7 @@ from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path as FilePath
-from typing import ClassVar, Protocol, runtime_checkable
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -85,6 +85,7 @@ from dew.nn.flops import (
 from dew.nn.kernels import low_rank, selection
 from dew.nn.precision import accumulated, at_least_fp32, biased, float32_dot_general
 from dew.nn.protocols import (
+    Adapted,
     Counted,
     CountedConditionedSpatial,
     CountedImages,
@@ -430,7 +431,7 @@ class Adapter:
         """The settings `model` was adapted with (`_Bound`), the one record its branch computes from and
         `merge` and `save` read."""
         adapted = type(self.model)
-        if not isinstance(adapted, AdaptedClass):
+        if not isinstance(adapted, Adapted):
             raise TypeError(f"{adapted.__name__} is not adapted, so it carries no adapter")
         return adapted._dew_lora_bound
 
@@ -508,7 +509,7 @@ class Adapter:
         with is refused rather than read past.
         """
         adapted = type(model)
-        if not isinstance(adapted, AdaptedClass):
+        if not isinstance(adapted, Adapted):
             raise ValueError(f"{adapted.__name__} is not adapted, so it carries no adapter")
         if _record(adapted._dew_lora_bound) != adapter:
             raise ValueError(f"the record's adapter is not the one {adapted.__name__} was adapted with")
@@ -713,14 +714,14 @@ def _rank_padded(leaf: jax.Array | None, axis: int, shape: tuple[int, ...], rank
 def adapter_names(model: nn.Module) -> tuple[str, ...]:
     """The adapters an adapter set's model serves by name (`AdapterSet.names`); none for any other model."""
     adapted = type(model)
-    return adapted._dew_lora_bound.names if isinstance(adapted, AdaptedClass) else ()
+    return adapted._dew_lora_bound.names if isinstance(adapted, Adapted) else ()
 
 
 def _refuse_unadaptable(model: nn.Module) -> None:
     """Refuse a model already adapted, and an NNX model behind Flax's bridge,
     whose `nnx.Linear` makes no `Dense` call the branch could join: its
     factors would train while its forward never read them."""
-    if isinstance(type(model), AdaptedClass):
+    if isinstance(type(model), Adapted):
         raise ValueError("The model is already adapted")
     if isinstance(model, bridge.ToLinen):
         raise TypeError(f"{model.nnx_class.__name__} is an NNX model behind flax.nnx.bridge.ToLinen; an "
@@ -1137,13 +1138,13 @@ def _adapted(model: nn.Module, bound: _Bound) -> nn.Module:
     `FROZEN`. The class's record (`AdapterRecord`) is `bound`'s, written when a run asks for it.
     """
     base = type(model)
-    if isinstance(base, AdaptedClass):
+    if isinstance(base, Adapted):
         raise ValueError("The model is already adapted")
     branch = _Branch(bound)
     factors = {(*path, factor) for path in bound.targets for factor in FACTORS}
     adapted_base = _counted_adapter(model, branch)
 
-    class Adapted(adapted_base):
+    class Wrapped(adapted_base):
         # Staticmethods, or Flax would wrap the callables as module methods.
         _dew_lora_interceptor: ClassVar[Interceptor] = staticmethod(branch)
         _dew_lora_bound: ClassVar[_Bound] = bound
@@ -1163,8 +1164,8 @@ def _adapted(model: nn.Module, bound: _Bound) -> nn.Module:
                 output, variables = super().init_with_output(*args, **kwargs)
             return output, _fp8_packed(model, dict(freeze(variables, lambda path: path in factors)))
 
-    Adapted.__name__ = Adapted.__qualname__ = base.__name__
-    return rebuilt(Adapted, model)
+    Wrapped.__name__ = Wrapped.__qualname__ = base.__name__
+    return rebuilt(Wrapped, model)
 
 
 @dataclass(frozen=True)
@@ -1654,16 +1655,6 @@ def unadapted(model: nn.Module) -> nn.Module:
         if "_dew_lora_interceptor" not in vars(layer):
             model = layer._dew_wrapper().apply(model)
     return model
-
-
-@runtime_checkable
-class AdaptedClass(Protocol):
-    """An adapted module class with its marks as the adapter states them, the interceptor its `apply` and
-    `init` run under and the names it binds: `dew.nn.protocols.Adapted`, which a reader below the adapters
-    asks, typed."""
-
-    _dew_lora_interceptor: ClassVar[Interceptor]
-    _dew_lora_bound: ClassVar[_Bound]
 
 
 __all__ = ["Adapter", "AdapterRecord", "AdapterSet", "LoRA", "Target", "adapter_names",

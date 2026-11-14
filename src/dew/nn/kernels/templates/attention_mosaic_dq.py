@@ -19,7 +19,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     issued_into,
     modelled,
-    part_count,
     reducing,
     staged_after,
     stages_after_walks,
@@ -254,13 +253,9 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         name=name,
         reducing_warpgroups=reducing(family, consumers, walk.reduces),
         registers=walk.registers(dq=True),
-        # The products this launch issues (`stated`): its `S` and `dP` recomputed, each part of its share of
-        # dQ's (`part_count`) and, in the accurate form, of the keyed sums'; its share of dQ's product the
-        # model's it owns (`modelled`).
-        cost=stated(walk.spec, batch, heads,
-                    width + value_width
-                    + (part_count(key.dtype, walk.accurate) + walk.accurate) * share[1],
-                    query, key, value, dout,
+        # Its walk's statement, its work its emission's (`stated`); its share of dQ's product the model's it
+        # owns (`modelled`).
+        cost=stated(walk.spec, batch, heads, query, key, value, dout,
                     tile_walk=TileWalk((queries, key.shape[1]), (block_q, block_k), consumers,
                                        common=family.feeds_itself)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries, share[1]))(

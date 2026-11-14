@@ -12,6 +12,7 @@ import pytest
 from generation_support import generations
 from reference_error import assert_as_exact, with_gradients
 
+from dew.nn.gated_mlp import fused_products
 from dew.nn.kernels import gemm, generation
 
 ROWS, FEATURES, HIDDEN = 136, 128, 256
@@ -36,22 +37,11 @@ def _glu(gate, up):
 
 
 def _composed(x, gate, up, down, *, names=None, interpret: bool = False):
-    """A gated MLP's three products on the template's hooks: the paired gate|up product whose epilogue
-    writes the projections and their SwiGLU (`_glu`), then the down product of that formed operand
-    (`applied`) with the SwiGLU its prologue over the gate and the up projection."""
-    dtype = x.dtype
-
-    def projected(gate_acc, up_acc):
-        g, u = gate_acc.astype(dtype), up_acc.astype(dtype)
-        return g, u, _glu(g, u)
-
-    g, u, hidden = gemm.gemm(x, gate, paired=up, epilogue=projected, out_dtype=dtype, out_dtypes=(dtype,) * 3,
-                             interpret_on_cpu=interpret)
-    if names is not None:
-        g, u = jax.ad_checkpoint.checkpoint_name(g, names[0]), jax.ad_checkpoint.checkpoint_name(u, names[1])
-    out = gemm.gemm(g, down, prologue=_glu, prologue_operands=((u, ("rows", "depth")),), applied=hidden,
-                    out_dtype=dtype, interpret_on_cpu=interpret)
-    return out if names is None else jax.ad_checkpoint.checkpoint_name(out, names[2])
+    """A gated MLP's three products on the template's hooks (`dew.nn.gated_mlp.fused_products`, SwiGLU's,
+    whose rounded arithmetic is `_glu`'s): the paired gate|up product whose epilogue writes the projections
+    and their SwiGLU, then the down product of that formed operand (`applied`) with the SwiGLU its prologue
+    over the gate and the up projection."""
+    return fused_products(x, (gate, up, down), "swiglu", names=names, interpret_on_cpu=interpret)
 
 
 def _apart(x, gate, up, down, *, truth: bool = False):

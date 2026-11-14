@@ -2068,9 +2068,10 @@ def _counted(fn, *arrays) -> tuple[float, float]:
     ids=["causal", "causal-fewer-queries", "causal-more-queries", "causal-padded", "full", "full-padded"])
 def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, keys, pairs):
     """A bf16 call's plain forward, training forward and backward through the Mosaic mainloop, each lowered
-    for an H100: every launch states its hardware work (`attention_mosaic_program.stated`), which Dew's FLOP
-    count reads to size it (`instrumentation._stated_flops`: no launch unsized), and declares the model's
-    share of it; together the model's are the library's fused attention's own count, a multiply-add a
+    for an H100: every launch states its hardware work, counted from its kernel's emission
+    (`emission.costed`), which Dew's FLOP count reads to size it (`instrumentation._stated_flops`: no launch
+    unsized), and declares the model's share of it; together the model's are the library's fused
+    attention's own count, a multiply-add a
     reached pair, head and product column (a causal call's `pairs` each query's keys up to its own place,
     written out: the first key aligned to the first query, as the mainloop masks them): the forward's two
     products, the training forward's two and the backward's four (`instrumentation._fused_attention_flops`).
@@ -2138,7 +2139,7 @@ def test_a_common_walk_states_every_tile_each_holder_walks():
     """The fast backward's one launch fed by its consumers (`wgmma.fed`, a program two key blocks, each
     consumer walking every query tile either block is read by, `Family.walk_own`) over a causal call of 128
     queries and 192 keys, its keys padded to 256, lowered for an H100: the launch states the tiles each
-    consumer walks (`attention_mosaic_program.issued`), one its own keys are not seen by too. The first
+    consumer walks (`attention_mosaic_program.walked_steps`), one its own keys are not seen by too. The first
     program's consumers walk both 64-row query tiles each, the second keys' tile read by the second alone;
     the second program's none, its first keys past every query's and its second past the keys."""
     rows, heads, width, block = 1, 2, 64, 64

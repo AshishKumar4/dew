@@ -52,7 +52,10 @@ from dew.nn.inputs import ModelKwarg
 from dew.nn.precision import capped_logits, head_product, scaled_logits
 
 if TYPE_CHECKING:
+    from flax.linen.module import Interceptor
+
     from dew._records import JSON
+    from dew.lora import _Bound
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.backbones.decoder_stack import DecoderBank, Loop, StackView
     from dew.nn.continuum import HeadTerms, LevelTerms
@@ -1339,8 +1342,8 @@ class TimeScaled(Protocol):
 
 @runtime_checkable
 class Adapted(Protocol):
-    """Marks a module class an adapter already wrapped, at any depth of its wrappers (`dew.lora.AdaptedClass`
-    states what its marks hold).
+    """Marks a module class an adapter already wrapped, at any depth of its wrappers (`dew.lora`): the
+    interceptor its `apply` and `init` run under and the names it binds.
 
     The wrapper subclass declares the interceptor its `apply` and `init` run
     under, which is the whole record that a class was adapted: a second
@@ -1348,5 +1351,5 @@ class Adapted(Protocol):
     the adapters, so a reader of a model's tree asks it without importing them.
     """
 
-    _dew_lora_interceptor: ClassVar[object]
-    _dew_lora_bound: ClassVar[object]
+    _dew_lora_interceptor: ClassVar[Interceptor]
+    _dew_lora_bound: ClassVar[_Bound]

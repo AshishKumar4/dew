@@ -1859,18 +1859,17 @@ def _program_views(family: mosaic.Family, refs, read: _Read, *, peaks: bool, gro
 def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, value, keys_count: int,
                   value_width: int, tiles: Tiles, *, peaks: bool, training: bool, counted: bool,
                   shared_by: int) -> tuple:
-    """A launch's cost and the model's FLOPs it owns (`_launched`'s `cost` and `model_flops`): the products it
-    issues (`stated`), and the model's of them it owns (`modelled`): the forward's two, a peak walk's
-    `Q K^T`, a training walk's `P V` beside its `Q K^T` recomputed, a block of an inference call's columns
-    its `P V` and its share of `Q K^T` (`shared_by`); a launch not `counted` none: a rerun (a guarded launch,
-    the fold's natural walk), whose loop of at most one trip the FLOP count bounds by its trip, and a rare
-    call's scaled op (`MosaicForward.scaled`), whose branch it takes where it is the larger, either counting
-    work every step that runs at most rarely."""
+    """A launch's cost and the model's FLOPs it owns (`_launched`'s `cost` and `model_flops`): its walk's
+    statement, its work its emission's (`stated`), and the model's products it owns (`modelled`): the
+    forward's two, a peak walk's `Q K^T`, a training walk's `P V` beside its `Q K^T` recomputed, a block of
+    an inference call's columns its `P V` and its share of `Q K^T` (`shared_by`); a launch not `counted`
+    none: a rerun (a guarded launch, the fold's natural walk), whose loop of at most one trip the FLOP count
+    bounds by its trip, and a rare call's scaled op (`MosaicForward.scaled`), whose branch it takes where it
+    is the larger, either counting work every step that runs at most rarely."""
     batch, queries, heads, width = query.shape
-    columns = width if peaks else width + value_width
     owned_value = 0 if peaks else value_width
     owned_query = 0 if training and not peaks else width
-    cost = (stated(spec, batch, heads, columns, query, key, value,
+    cost = (stated(spec, batch, heads, query, key, value,
                    tile_walk=TileWalk((queries, keys_count), (tiles.block_q, tiles.block_k), tiles.consumers,
                                       common=family.feeds_itself)) if counted
             else estimate(0))

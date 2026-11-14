@@ -301,21 +301,24 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
     assert_as_exact(lone, reference, drawn_alone, f"{label} alone", seeds=seeds[1], truth_fn=truth)
 
 
-def assert_served_through_its_cache_as_exact(task: TextGeneration, lengths: Sequence[int], label: str, *,
-                                             serving: dict, budget: int, seeds: int) -> None:
+def assert_served_through_its_cache_as_exact(task: TextGeneration, requests: Sequence[Served], label: str, *,
+                                             serving: dict, budget: int, seeds: int,
+                                             hits: Sequence[int] | None = None) -> None:
     """Check 1 of a server over a quantized cache (`serving`'s `kv_cache`, `KVCache.quantized`; ledger 5681):
-    requests of the prompt `lengths` of a drawn row (`served_row`), served one a round, score their own draws'
+    `requests` of a drawn row (`served_row`), served one a round, score their own draws'
     raw log probabilities on par with the decoder's own cached decode of each prompt and its draws through
     a cache of the same format. Each arm gives the values its cache rounded and the codes and scales it
     stored (`cache_roundings`), and is held to the float64 forward over the request's tokens that reads the
     codes and scales its own cache held (`Followed`): a float32 rounding a value within its noise of a
     code's boundary decides it either way, so no truth that rounds for itself holds every arm
-    (docs/design/testing.md, a quantized computation's truth). A request starts its row's slots afresh in
-    a round of its own, so the roundings a round reports are its own (`Written.started`). `seeds` is the
-    site's declared count, sized paired by `seeds_for` on armada."""
+    (docs/design/testing.md, a quantized computation's truth). Each request is served in a round of its
+    own, so the roundings a round reports are its own row's (`Written.row`). Where `hits` is given (a prefix
+    cache's: `serving`'s `prefix_cache`), each round reads that many prompt tokens from the pages earlier
+    rounds left, and a request's slots before its own writes hold the codes those rounds wrote
+    (`cache_roundings.held`). `seeds` is the site's declared count, sized paired by `seeds_for` on armada."""
     quantized = serving["kv_cache"].quantized
     decoder, variables, vocab = task.model, task.variables, task.model.vocab_size
-    width = max(lengths)
+    width = max(request.length for request in requests)
 
     def named(prefix: str, held: dict) -> dict:
         """A request's roundings by name as the site names them: its values under `rounded/<request>`, its
@@ -331,17 +334,21 @@ def assert_served_through_its_cache_as_exact(task: TextGeneration, lengths: Sequ
         """The server's scores of `row`'s requests' draws with its cache's roundings, and the draws: each row
         served once, as a deployment serves a prompt (`assert_served_as_exact`'s `serve`)."""
         if (key := row.tobytes()) not in services:
-            scores, drawn, rounded, decisions = [], [], {}, {}
-            for index, length in enumerate(lengths):
+            scores, drawn, rounded, decisions, rounds, shared = [], [], {}, {}, [], []
+            for index, request in enumerate(requests):
+                before = server.prefix_hits
                 with cache_roundings.traced(), cache_roundings.collected() as written:
-                    ticket = server.submit(served_inputs(row, Served(length), vocab), budget, key=index)
+                    ticket = server.submit(served_inputs(row, request, vocab), budget, key=index)
                     server.run()
                     generation, = to_budgets([ticket.result().host()], budget, label)
+                shared.append(server.prefix_hits - before)
+                rounds.append(written)
                 drawn.append(np.asarray(generation.tokens)[0, -budget:])
                 scores.append(np.asarray(generation.raw_log_probs[0], np.float32))
-                values, decided = written.held(written.started(), length + budget - 1)
+                values, decided = cache_roundings.held(rounds, request.length + budget - 1)
                 rounded.update(named(f"rounded/{index}", values))
                 decisions.update(named(str(index), decided))
+            assert hits is None or shared == list(hits), shared
             services[key] = Rounded({"scores": tuple(scores), **rounded}, decisions), tuple(drawn)
         return services[key]
 
@@ -369,16 +376,15 @@ def assert_served_through_its_cache_as_exact(task: TextGeneration, lengths: Sequ
         """The decoder's own cached decode of each prompt and the tokens the server drew after it, a call a
         token, and its cache's roundings."""
         scores, rounded, decisions = [], {}, {}
-        for index, (length, tokens) in enumerate(zip(lengths, drawn, strict=True)):
+        for index, (request, tokens) in enumerate(zip(requests, drawn, strict=True)):
             with cache_roundings.collected() as written:
-                prompt = served_inputs(row, Served(length), vocab).tokens
-                read, cache = stepped(variables, opened(variables), prompt)
+                read, cache = stepped(variables, opened(variables), served_inputs(row, request, vocab).tokens)
                 laws = [read]
                 for token in tokens[:-1]:
                     read, cache = stepped(variables, cache, jnp.asarray([[token]], jnp.int32))
                     laws.append(read)
             scores.append(np.asarray(jnp.stack(laws))[np.arange(budget), tokens])
-            values, decided = written.held(0, length + budget - 1)
+            values, decided = cache_roundings.held([written], request.length + budget - 1)
             rounded.update(named(f"rounded/{index}", values))
             decisions.update(named(str(index), decided))
         return Rounded({"scores": tuple(scores), **rounded}, decisions)
@@ -398,14 +404,15 @@ def assert_served_through_its_cache_as_exact(task: TextGeneration, lengths: Sequ
         """Each request's tokens through the float64 twin in one call, its cache reading the codes and scales
         an arm's cache held (`decisions`), and the values its own roundings would have rounded."""
         weights, scores, rounded = widened(variables), [], {}
-        for index, (length, tokens) in enumerate(zip(lengths, drawn, strict=True)):
-            whole = np.concatenate([row[:length], tokens[:-1]])[None]
+        for index, (request, tokens) in enumerate(zip(requests, drawn, strict=True)):
+            prompt = np.asarray(served_inputs(row, request, vocab).tokens)[0]
+            whole = np.concatenate([prompt, tokens[:-1]])[None]
             own = {name.split("/", 1)[1]: held for name, held in decisions.items()
                    if name.split("/", 1)[0] == str(index)}
             with cache_roundings.collected() as written:
                 laws = forward(weights, jnp.asarray(whole, jnp.int32), own)
-            scores.append(np.asarray(laws[length - 1:])[np.arange(budget), tokens])
-            rounded.update(named(f"rounded/{index}", written.held(0, whole.shape[1])[0]))
+            scores.append(np.asarray(laws[request.length - 1:])[np.arange(budget), tokens])
+            rounded.update(named(f"rounded/{index}", cache_roundings.held([written], whole.shape[1])[0]))
         return {"scores": tuple(scores), **rounded}
 
     followed = Followed(truth, cache_roundings.rounds(quantized))

@@ -384,10 +384,9 @@ class Resident:
 
 @dataclasses.dataclass(frozen=True)
 class Loaded:
-    """A program's code as its GPUs hold it outside XLA's pool from its first run on: its executable's
-    fingerprint, the GPUs it runs on, and the bytes of its generated code on each (`memory_analysis`)."""
+    """A program's code as its GPUs hold it outside XLA's pool from its first run on: the GPUs it runs on
+    and the bytes of its generated code on each (`memory_analysis`)."""
 
-    fingerprint: bytes
     gpus: tuple[int, ...]
     code: int
 
@@ -506,7 +505,7 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
         made = collectives_kept(fingerprint, gpus, lambda: executable)
         memory = compiled_memory(executable)
         # A backend that states no memory analysis states no code of the program's either.
-        loaded = None if memory is None else Loaded(fingerprint, gpus, memory.generated_code)
+        loaded = None if memory is None else Loaded(gpus, memory.generated_code)
     _RESIDENT.admit(made, _HELD.needs, _HELD.room, free, loaded)
 
 

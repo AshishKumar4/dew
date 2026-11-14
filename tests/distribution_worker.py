@@ -150,23 +150,6 @@ class Losses:
         pass
 
 
-def widened_start(trainer_of, steps: int):
-    """What every draw of the float64 run starts from, drawn once: the run's own initial state as the float32
-    run draws it, widened exactly, so every launch's draws start from the same values. A pool's fits draw
-    their own instead: a state handed to a fit is placed from the host, which a pool's arrays across
-    processes are not."""
-    import jax
-    from arm_arithmetic import float64_held
-
-    with jax.enable_x64(new_val=False):
-        # Its optimizer built over the run's length, as each fit builds the run's (`Trainer.scheduled`).
-        narrowed = trainer_of(None)
-        narrowed.scheduled(steps)
-        narrow = narrowed.initial_state()
-    return narrow.replace(variables=float64_held(narrow.variables), opt_state=float64_held(narrow.opt_state),
-                          ema=float64_held(narrow.ema))
-
-
 def copied(state):
     """`state` copied, for a fit that consumes the state it steps."""
     import jax
@@ -201,6 +184,7 @@ def main() -> None:
     prepare_process()
 
     import jax
+    from placement_parity import widened_start
     from sharded import split_axes
 
     if args.float64:
@@ -250,9 +234,15 @@ def main() -> None:
         return state, {"losses": losses.losses[before:], "loss_steps": losses.steps[before:]}
 
     if args.draws:
-        # Every judged run is a draw: from the one initial state (`started`) on a packed batch of its own,
+        # Every judged run is a draw: from the one initial state on a packed batch of its own,
         # the record's state the first draw's. Each fit is handed a copy, as it consumes the state it steps.
-        initial = widened_start(trainer_of, args.steps) if args.float64 else None
+        initial = None
+        if args.float64:
+            # The float32 run's start, drawn by a trainer of the float32 model, its optimizer built over the
+            # run's length as each fit builds the run's (`Trainer.scheduled`), widened.
+            narrowed = trainer_of(None)
+            narrowed.scheduled(args.steps)
+            initial = widened_start(narrowed)
         seeds = range(args.first_draw, args.first_draw + args.draws)
         runs = (run(drawn(seed), **({} if initial is None else {"state": copied(initial)})) for seed in seeds)
         state, logged = next(runs)

@@ -156,8 +156,7 @@ seams: "grouped-cells": {
 		"(mma.sync, Kind(dense=True, made=Made.FORWARD))":          "XLA's dense forward on an A100 (DENSE1)"
 		"(mma.sync, Kind(dense=True, made=Made.INPUT_GRADIENT))":   "XLA's dense input gradient on an A100 (DENSE1)"
 		"(mma.sync, Kind(dense=True, made=Made.KERNEL_GRADIENT))":  "XLA's dense kernel gradient on an A100 (DENSE1)"
-		"(wgmma, Kind(dense=False, made=Made.FORWARD))":           "CUTLASS's grouped forward on an H100 (PAIR1-h100)"
-		"(wgmma, Kind(dense=False, made=Made.INPUT_GRADIENT))":    "CUTLASS's grouped input gradient on an H100 (PAIR1-h100)"
+		"(mma.sync, Kind(dense=False, made=Made.FORWARD))":        "CUTLASS's grouped forward on an A100 (M-EM-2, 1.07x)"
 		"(wgmma, Kind(dense=True, made=Made.FORWARD))": "XLA's dense forward on an H100 (DENSE1)"
 		"(wgmma, Kind(dense=True, made=Made.INPUT_GRADIENT))": "XLA's dense input gradient on an H100 (DENSE1)"
 		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT))": "XLA's dense kernel gradient on an H100 (DENSE1)"
@@ -190,6 +189,14 @@ seams: "join-cells": {
 		"(delta_gates, sm80)": "a delta net's gates joined on an A100 (e5198da4e)"
 		"(delta_gates, sm90)": "a delta net's gates joined on an H100 (e5198da4e)"
 	}
+}
+
+seams: "gated-mlp-cells": {
+	kind:    "declared-set"
+	purpose: "each cell runs a gated MLP's three products fused on a device whose receipt shows the fused MLP faster"
+	paths:   ["src/dew/nn/gated_mlp.py"]
+	entries: "FUSED_CELLS"
+	declared: {}
 }
 
 seams: "nvfp4-cells": {
@@ -242,6 +249,7 @@ seams: "kernel-choices": {
 		delta_decode:       "the delta_decode kernel, a choice a dispatch reports"
 		delta_gates:        "the delta_gates kernel, a choice a dispatch reports"
 		gate_up:            "the gate_up kernel, a choice a dispatch reports"
+		gated_mlp:          "the gated_mlp kernel, a choice a dispatch reports"
 		gated_delta_rule:   "the gated_delta_rule kernel, a choice a dispatch reports"
 		gemm_epilogue:      "the gemm_epilogue kernel, a choice a dispatch reports"
 		gemm_prologue:      "the gemm_prologue kernel, a choice a dispatch reports"
