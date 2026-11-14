@@ -668,12 +668,14 @@ class Trainer(Generic[Loss, Effects]):
         """Take the step compiled ahead this trainer was handed, once the process is readied
         (`ready_process`, the backend opened at the run's share): the compiler runs it where it is tuned or
         the run's compile would tune nothing either, a step of another target refused
-        (`AheadOfTime.runnable`); a fit takes it before it reads a batch, a placement before it places."""
+        (`AheadOfTime.runnable`), again at each try; a fit takes it before it reads a batch, a placement
+        before it places, a compile before it compiles."""
         if self._ahead_handed is None:
             return
         ready_process()
-        handed, self._ahead_handed = self._ahead_handed, None
-        self._compiler.ahead = handed.runnable(list(self.device_mesh.devices.flat))
+        # Held until it is taken: a step refused here is refused again at the next fit or compile.
+        self._compiler.ahead = self._ahead_handed.runnable(list(self.device_mesh.devices.flat))
+        self._ahead_handed = None
 
     def _started(self, resume: Resume = "auto") -> Start:
         """What placing the state reads before it places anything: the objective's held tree and
@@ -1004,6 +1006,7 @@ class Trainer(Generic[Loss, Effects]):
         the fewest microbatches at least recomputation, a compile-only GPU holding the memory stated for it.
         Built at the pass count of the phase its batch was read in (`PhasePasses.scoped`).
         """
+        self._handed_ahead()
         with self.phase_passes.scoped(self, self._compiler):
             compiled = self._took(self._compiler.compile(self._stepping(), state, batch, trials))
         assert compiled.step is not None
