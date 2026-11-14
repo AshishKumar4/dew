@@ -335,56 +335,34 @@ def test_a_phased_runs_later_phase_is_compiled_off_its_loop(monkeypatch, tmp_pat
     a thread of its own once its first step is dispatched (`dew.training.ahead.LaterPlans`): the plan at the
     phase's boundary, made there against the devices, takes the executable that thread compiled, compiling
     none of its own (`Probe.ahead`), where a 4B decision run's GPUs idled 336 s while its second phase
-    compiled at its boundary (M-MC-3q). It lands where the run stopped at the end of its first phase and
-    resumed lands, bit for bit, that run's second phase planned and compiled as it resumes."""
+    compiled at its boundary (M-MC-3q). The thread traces under the states the loop traces under, which
+    JAX holds per thread (`dew._cache.carried`): a run with x64 on, its numerics and a kernel choice of its
+    own.
+    It lands where the run stopped at the end of its first phase and resumed lands, bit for bit, that run's
+    second phase planned and compiled as it resumes."""
     from recording import bits
     from test_plan import LIMIT, free
 
     from dew.checkpoints import Checkpoints
-
-    free(monkeypatch, LIMIT)
-    tokens, _ = phased_draw(0)
-    trainer = phased_trainer(looped(), 0)
-    landed = phased_params(trainer, tokens)
-    assert [probe["ahead"] for probe in trainer.plan["probes"]] == [True]
-    directory = str(tmp_path / "stopped")
-    phased_params(phased_trainer(looped(), 0, checkpoints=Checkpoints(directory)), tokens, steps=2,
-                  checkpoint_every=2)
-    resumed = phased_trainer(looped(), 0, checkpoints=Checkpoints(directory))
-    planned = phased_params(resumed, tokens)
-    assert [probe["ahead"] for probe in resumed.plan["probes"]] == [False]
-    for mine, theirs in zip(bits(landed), bits(planned), strict=True):
-        np.testing.assert_array_equal(mine, theirs)
-
-
-def test_a_plan_off_the_loop_traces_under_the_loops_thread_states():
-    """A later phase's plan off the loop (`dew.training.ahead.LaterPlans`) traces under the states the loop
-    traces under, which JAX holds per thread and a copied context does not carry: the run's numerics and
-    kernel choices (`dew.config.RunConfig.traced`) and JAX's default matmul precision, carried
-    (`dew._cache.carried`) and entered again in the worker (train 822 review F1)."""
-    import threading
-
-    from jax._src import config
-
-    from dew import _cache
     from dew.nn.kernels import generation
     from dew.nn.precision import Numerics
 
-    numerics = Numerics(matmul="highest")
-    with generation.run_precision(numerics), generation.chosen(attention="xla"):
-        entered = _cache.carried()
-        expected = (_cache.NUMERICS.value, _cache.KERNEL_CHOICES.value, config.default_matmul_precision.value)
-    seen = []
-
-    def worker() -> None:
-        with entered():
-            seen.append((_cache.NUMERICS.value, _cache.KERNEL_CHOICES.value,
-                         config.default_matmul_precision.value))
-
-    thread = threading.Thread(target=worker)
-    thread.start()
-    thread.join()
-    assert seen == [expected] and expected[0] == numerics and expected[1]
+    free(monkeypatch, LIMIT)
+    tokens, _ = phased_draw(0)
+    the_runs = Numerics(matmul="highest", forms="accurate")
+    trainer = phased_trainer(looped(), 0)
+    with jax.enable_x64(new_val=True), generation.run_precision(the_runs), generation.chosen(rms_norm="xla"):
+        landed = phased_params(trainer, tokens)
+    assert [probe["ahead"] for probe in trainer.plan["probes"]] == [True]
+    directory = str(tmp_path / "stopped")
+    with jax.enable_x64(new_val=True), generation.run_precision(the_runs), generation.chosen(rms_norm="xla"):
+        phased_params(phased_trainer(looped(), 0, checkpoints=Checkpoints(directory)), tokens, steps=2,
+                      checkpoint_every=2)
+        resumed = phased_trainer(looped(), 0, checkpoints=Checkpoints(directory))
+        planned = phased_params(resumed, tokens)
+    assert [probe["ahead"] for probe in resumed.plan["probes"]] == [False]
+    for mine, theirs in zip(bits(landed), bits(planned), strict=True):
+        np.testing.assert_array_equal(mine, theirs)
 
 
 def test_a_phase_whose_program_plans_other_copies_counts_them_built_in_its_fit(monkeypatch):

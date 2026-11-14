@@ -7,6 +7,19 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A compile-ahead target with no path (`--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY`, its generation
+  and devices) compiles the run's first step and every later data phase's step into the run's persistent
+  compilation cache and exits 0, as a job's prepare compiles its node's run, where it refused for want of a
+  path. Those steps take every tuned choice a run on such a GPU left in the autotune cache beside it, or are
+  said not preparable until one has; a step compiled ahead into a file is XLA's untuned program, which its
+  record (`AheadOfTime.tuned`), its save and its load say.
+
+- A run whose data phases run other steps (`phase_passes`) plans and compiles each later phase's step on a
+  thread of its own once its first step is dispatched, so the phase's boundary takes the executable
+  compiled off the loop and the GPUs no longer idle while it compiles. Its plan is still made at the
+  boundary, against the devices as they stand. The separate `dew train` process a configured run started
+  for this is removed, and so is `dew.registry.trusted_packages`, which only it read.
+
 - The condition encoders that bind a released checkpoint are dew.interop's: `CLIPText`, `T5Text` and
   `HFAudio` in `dew.interop.encoders`, and `DiffusionConditioner`, `QwenImageConditioner`,
   `HiddenStatesConditioner` and `WanConditioner` in `dew.interop.conditioners`, each with its
