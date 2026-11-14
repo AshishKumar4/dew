@@ -11,6 +11,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import wheels
 
 ROOT = Path(__file__).resolve().parents[1]
 UV = """#!/bin/sh
@@ -121,45 +122,6 @@ def test_a_gpu_extra_that_does_not_install_on_a_python_pyproject_admits_fails_th
     assert len(asked) == 12
 
 
-BACKEND = """
-import base64, hashlib, zipfile
-
-
-def _digest(data):
-    return base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
-
-
-def _wheel(directory, name):
-    path = f"{directory}/{name}-0.1-py3-none-any.whl"
-    info = f"{name}-0.1.dist-info"
-    files = {f"{name}.py": b"",
-             f"{info}/METADATA": f"Metadata-Version: 2.1\\nName: {name}\\nVersion: 0.1\\n".encode(),
-             f"{info}/WHEEL": b"Wheel-Version: 1.0\\nGenerator: t\\nRoot-Is-Purelib: true\\n"
-                              b"Tag: py3-none-any\\n"}
-    record = "".join(f"{file},sha256={_digest(data)},{len(data)}\\n" for file, data in files.items())
-    with zipfile.ZipFile(path, "w") as wheel:
-        for file, data in {**files, f"{info}/RECORD": (record + f"{info}/RECORD,,\\n").encode()}.items():
-            wheel.writestr(file, data)
-    return path.rsplit("/", 1)[1]
-
-
-def build_wheel(directory, config_settings=None, metadata_directory=None):
-    return _wheel(directory, "checkout")
-
-
-build_editable = build_wheel
-"""
-"""A build backend of the stand-in checkout's own (pyproject's backend-path), needing no network: one empty
-module's wheel, editable or not."""
-
-
-def wheel_of(directory: Path, name: str) -> Path:
-    """A wheel of one empty module `name`, version 0.1, written into `directory`."""
-    namespace: dict = {}
-    exec(BACKEND, namespace)
-    return directory / namespace["_wheel"](str(directory), name)
-
-
 @pytest.mark.parametrize("case", ["as-locked", "bytes-changed", "unhashed"])
 def test_dews_installer_installs_a_locked_file_only_where_its_bytes_hash_to_the_lock(tmp_path, case):
     """tools/install_environment.sh, the path armada, the GPU nodes and Colab take, installs a lock's file
@@ -173,10 +135,11 @@ def test_dews_installer_installs_a_locked_file_only_where_its_bytes_hash_to_the_
     (tree / "tools").mkdir()
     store.mkdir()
     shutil.copy(ROOT / "tools" / "install_environment.sh", tree / "tools")
-    (tree / "backend.py").write_text(BACKEND)
+    # The checkout's build backend: tests/wheels.py, whose hooks build it with no network.
+    shutil.copy(ROOT / "tests" / "wheels.py", tree / "wheels.py")
     (tree / "pyproject.toml").write_text('[project]\nname = "checkout"\nversion = "0.1"\n\n[build-system]\n'
-                                         'requires = []\nbuild-backend = "backend"\nbackend-path = ["."]\n')
-    wheel = wheel_of(store, "locked")
+                                         'requires = []\nbuild-backend = "wheels"\nbackend-path = ["."]\n')
+    wheel = wheels.wheel(store, "locked")
     digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     hashed = "" if case == "unhashed" else f" \\\n    --hash=sha256:{digest}"
     (tree / "locks" / "t.txt").write_text(f"locked @ {wheel.as_uri()}{hashed}\n")
