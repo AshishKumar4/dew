@@ -91,7 +91,9 @@ def test_a_python_child_uv_runs_over_this_environment_joins_its_files_record(ci,
                            "    subprocess.run(words, check=True, cwd='tests')\n"})
     interpreter(tmp_path, "3.12")
     ci.task("3.12", ["tests/test_layered.py"], "", tmp_path / "verdict.json", 600.0)
-    assert reusable_now(ci, ["tests/test_layered.py"]) == [True]
+    [row] = json.loads((tmp_path / "verdict.json").read_text())["rows"]
+    assert row["exitCode"] == 0, row["output"]
+    assert reusable_now(ci, ["tests/test_layered.py"]) == [True], list(tmp_path.glob("**/*.jsonl"))
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
     assert reusable_now(ci, ["tests/test_layered.py"]) == [False]
 
