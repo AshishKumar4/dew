@@ -23,8 +23,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import PartitionSpec
 from model_support import two_documents
-from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
+from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
+from sharded import MOVES, assert_runs_per_shard
 from token_support import token_rows
 
 from dew.nn.attention import attention_kernel, scaled_dot_product_attention
@@ -123,25 +125,23 @@ def test_the_seam_agrees_with_whole_sequences(name, implementation, exchange):
     the mask follows the positions through either exchange, and the output
     comes back in sequence order, on par with whole sequences' (check 1)."""
     call = dict(CALLS[name], implementation=implementation)
-    assert_split_on_par(lambda q, k, v: through(exchange, q, k, v, **call),
-                        lambda q, k, v: scaled_dot_product_attention(q, k, v, **call), SPLIT,
-                        lambda seed: heads(jax.random.key(seed), kv_heads=2),
-                        f"{exchange} exchange, {name}, {implementation}")
+    assert_exchanged_on_par(lambda q, k, v: through(exchange, q, k, v, **call),
+                            lambda q, k, v: scaled_dot_product_attention(q, k, v, **call), SPLIT,
+                            lambda seed: heads(jax.random.key(seed), kv_heads=2),
+                            f"{exchange} exchange, {name}, {implementation}")
 
 
-def assert_split_on_par(split, whole, mesh_spec, draw, label: str) -> None:
-    """`split`, a call compiled and run under `mesh_spec`'s mesh, on par with `whole`, the same call on one
-    device, over `draw`'s seeds (check 1, its truth `whole` on the inputs widened): every site of this file
-    sized by `seeds_for` on armada's CPUs at the fewest (2026-11-14, size-sp at 3542142a26e)."""
-    mesh = mesh_spec.build()
-    compiled = jax.jit(split)
-
-    @as_given
-    def under_the_mesh(*operands):
-        with jax.set_mesh(mesh):
-            return compiled(*operands)
-
-    assert_as_exact(under_the_mesh, jax.jit(whole), draw, label, seeds=FEWEST_SEEDS)
+def assert_exchanged_on_par(split, whole, mesh_spec, draw, label: str) -> None:
+    """`split`, a call through an exchange over `mesh_spec`'s sequence axis, held as the gate holds a
+    split arm (`sharded.assert_runs_per_shard`): compiled once in the scope the gate runs its arms, and on
+    par with `whole`, the same call on one device over whole sequences, over `draw`'s seeds (check 1, its
+    truth `whole` on the inputs widened). An exchange moves rows by whichever collectives XLA lowers it to
+    (an all-to-all, its collective-permutes on a CPU, the gather of whole operands), so every one of
+    `sharded.MOVES` is the call's own. Every site of this file is sized by `seeds_for` on armada's CPUs at
+    the fewest (2026-11-14). The operands are placed whole, the exchange's own shard_map splitting them."""
+    specs = [PartitionSpec()] * len(draw(0))
+    assert_runs_per_shard(split, draw, specs, mesh_spec.build(), label, seeds=FEWEST_SEEDS, truth_fn=whole,
+                          moves=MOVES, arm=whole)
 
 
 # Heads split over tensor then sequence (2x2), and four sequence shards over
@@ -182,17 +182,11 @@ def test_row_arguments_split_as_the_query_rows_do_where_the_heads_contend_for_th
     def whole(query, key, value):
         return scaled_dot_product_attention(query, key, value, **call)
 
-    mesh = MeshSpec(tensor=2, expert=2, sequence=2).build()
-    exchanged = jax.jit(lambda q, k, v: through(exchange, q, k, v, **call))
-
-    @as_given
-    def split(query, key, value):
-        # The exchange under the mesh and the contending rules; the whole sequence outside them.
-        with jax.set_mesh(mesh), nn.logical_axis_rules((*HEADS_BEFORE_ROWS, *DEFAULT_RULES)):
-            return exchanged(query, key, value)
-
-    assert_as_exact(split, jax.jit(whole), draw, f"{exchange} exchange, {name}, under contending heads",
-                    seeds=FEWEST_SEEDS)
+    # The exchange compiled under the mesh and the contending rules; the whole sequence outside them.
+    with nn.logical_axis_rules((*HEADS_BEFORE_ROWS, *DEFAULT_RULES)):
+        assert_exchanged_on_par(lambda q, k, v: through(exchange, q, k, v, **call), whole,
+                                MeshSpec(tensor=2, expert=2, sequence=2), draw,
+                                f"{exchange} exchange, {name}, under contending heads")
 
 
 @pytest.mark.mesh
@@ -209,10 +203,10 @@ def test_the_exchange_agrees_forward_and_backward_where_heads_split_further(spec
         query, key, value = heads(jax.random.key(seed), kv_heads=2)
         return query, key, value, jax.random.normal(jax.random.fold_in(jax.random.key(seed), 1), query.shape)
 
-    assert_split_on_par(with_gradients(lambda q, k, v: through("all_to_all", q, k, v, **call)),
-                        with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call)), spec,
-                        draw, f"all_to_all exchange, {name}, heads over tensor {spec.tensor} and sequence "
-                              f"{spec.sequence}")
+    assert_exchanged_on_par(with_gradients(lambda q, k, v: through("all_to_all", q, k, v, **call)),
+                            with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call)),
+                            spec, draw, f"all_to_all exchange, {name}, heads over tensor {spec.tensor} and "
+                                        f"sequence {spec.sequence}")
 
 
 def _dropping_draw(seed):
@@ -233,18 +227,10 @@ def test_a_dropping_call_drops_what_one_device_drops(name, exchange):
     too: its output and its query, key and value gradients are on par with the
     whole sequence's (row 1709: a split sequence refused dropout)."""
     call = dict(CALLS[name], dropout_rate=0.3, dropout_rng=jax.random.key(7))
-    mesh = SPLIT.build()
-    exchanged = jax.jit(with_gradients(lambda q, k, v: through(exchange, q, k, v, **call)))
-
-    @as_given
-    def split(*arrays):
-        with jax.set_mesh(mesh):
-            return exchanged(*arrays)
-
-    whole = jax.jit(with_gradients(
-        lambda q, k, v: scaled_dot_product_attention(q, k, v, deterministic=False, **call)))
-    assert_as_exact(split, whole, _dropping_draw, f"{exchange} exchange, {name}, dropping",
-                    seeds=FEWEST_SEEDS)
+    assert_exchanged_on_par(
+        with_gradients(lambda q, k, v: through(exchange, q, k, v, **call)),
+        with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, deterministic=False, **call)),
+        SPLIT, _dropping_draw, f"{exchange} exchange, {name}, dropping")
 
 
 @pytest.mark.mesh
@@ -267,16 +253,8 @@ def test_the_entry_drops_over_a_split_sequence():
     """`scaled_dot_product_attention` under a split sequence takes a dropping
     call (it refused one) and drops what the whole sequence does."""
     call = {"causal": True, "dropout_rate": 0.3, "dropout_rng": jax.random.key(7), "deterministic": False}
-    mesh = SPLIT.build()
-    entry = jax.jit(with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call)))
-
-    @as_given
-    def split(*arrays):
-        with jax.set_mesh(mesh):
-            return entry(*arrays)
-
-    assert_as_exact(split, entry, _dropping_draw, "the entry, dropping over a split sequence",
-                    seeds=FEWEST_SEEDS)
+    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+    assert_exchanged_on_par(entry, entry, SPLIT, _dropping_draw, "the entry, dropping over a split sequence")
 
 
 @pytest.mark.mesh
@@ -289,9 +267,9 @@ def test_splash_runs_inside_the_exchange():
         keys = jax.random.split(jax.random.key(seed), 3)
         return tuple(jax.random.normal(k, (2, 256, 4, 8), jnp.float32) for k in keys)
 
-    assert_split_on_par(lambda q, k, v: through("all_to_all", q, k, v, causal=True, implementation="tpu"),
-                        lambda q, k, v: scaled_dot_product_attention(q, k, v, causal=True),
-                        MeshSpec(fsdp=2, sequence=2), draw, "splash inside the all-to-all exchange")
+    assert_exchanged_on_par(lambda q, k, v: through("all_to_all", q, k, v, causal=True, implementation="tpu"),
+                            lambda q, k, v: scaled_dot_product_attention(q, k, v, causal=True),
+                            MeshSpec(fsdp=2, sequence=2), draw, "splash inside the all-to-all exchange")
 
 
 def cudnn_runs_inside_either_exchange(exchange, causal):
@@ -367,18 +345,10 @@ def test_rotary_positions_survive_the_exchange():
         return lambda variables, x: module.apply(
             variables, x, freqs_cis=rotary_freqs(jnp.arange(SEQ_LEN), 8, 10000.0, dtype=dtype))
 
-    mesh = SPLIT.build()
-    compiled = jax.jit(applied(module, np.float32))
-
-    @as_given
-    def split(variables, x):
-        with jax.set_mesh(mesh):
-            return compiled(variables, x)
-
-    label = "rotary positions through the exchange"
-    assert_as_exact(split, jax.jit(applied(module, np.float32)), draw, label,
-                    seeds=FEWEST_SEEDS,
-                    truth_fn=applied(module.clone(dtype=jnp.float64), np.float64))
+    # The module's own exchange, its rows moved by whichever collectives XLA lowers it to.
+    assert_runs_per_shard(applied(module, np.float32), draw, [PartitionSpec()] * 2, SPLIT.build(),
+                          "rotary positions through the exchange", seeds=FEWEST_SEEDS,
+                          truth_fn=applied(module.clone(dtype=jnp.float64), np.float64), moves=MOVES)
 
 
 # --------------------------------------------------------------------------

@@ -231,12 +231,6 @@ def _source_identity(name: str) -> tuple[str, str]:
     return ("directory", str(path.resolve())) if path.is_dir() else ("hub", name)
 
 
-def trusted_packages() -> tuple[str, ...]:
-    """The packages outside Dew this process trusts beyond Flax's (`import_trusted`): what a run of its
-    record in another process is told to trust (`dew train --trust`)."""
-    return tuple(sorted(_TRUSTED - {"flax"}))
-
-
 def trusts_source(name: str) -> bool:
     """Whether the process trusts the source `name`, a Hub repository or a directory, to run its own
     code where a load reads it (`trust_remote_code`): as `trust=(name,)` and `--trust name` say where a
@@ -1490,13 +1484,13 @@ solvers: Aliases[type[Solver], Solver] = Aliases("solver", {
 # table admits an encoder of any, which only the encoder's run reads.
 encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {
     "char_table": "dew.inputs.encoders:CharTable",
-    "clip_text": "dew.inputs.encoders:CLIPText",
-    "diffusion_text": "dew.inputs.diffusion:DiffusionConditioner",
-    "hf_audio": "dew.inputs.encoders:HFAudio",
-    "hidden_states_text": "dew.inputs.diffusion:HiddenStatesConditioner",
-    "qwen_image_text": "dew.inputs.diffusion:QwenImageConditioner",
-    "t5": "dew.inputs.encoders:T5Text",
-    "wan_text": "dew.inputs.diffusion:WanConditioner",
+    "clip_text": "dew.interop.encoders:CLIPText",
+    "diffusion_text": "dew.interop.conditioners:DiffusionConditioner",
+    "hf_audio": "dew.interop.encoders:HFAudio",
+    "hidden_states_text": "dew.interop.conditioners:HiddenStatesConditioner",
+    "qwen_image_text": "dew.interop.conditioners:QwenImageConditioner",
+    "t5": "dew.interop.encoders:T5Text",
+    "wan_text": "dew.interop.conditioners:WanConditioner",
 }, base="dew.inputs.condition:ConditionEncoder")
 metrics: Aliases[Callable[..., Metric], Metric] = Aliases("metric", {
     "accuracy": "dew.decision.metrics:Accuracy",

@@ -96,6 +96,31 @@ def test_a_position_saved_under_14_resumes_and_saves_one_of_15_that_resumes_agai
         assert plan["version"] == 15 and stages and all(isinstance(stage, int) for stage in stages)
 
 
+SAVED_BEFORE_THE_MOVE = Path(__file__).with_name("fixtures") / "positions" / "main-cdc45f8f9"
+"""Positions main saved at cdc45f8f9, before the condition encoders moved to dew.interop (row 5996), of
+chains whose steps depend on one (`saved_positions_support.Conditioned`)."""
+
+
+@pytest.mark.parametrize("name", ["conditioned_phases", "conditioned_mixture"])
+def test_a_position_saved_before_an_encoder_moved_resumes_where_it_stopped(name):
+    """A position saved while a step's encoder was dew.inputs's resumes onto the rows a read of the same
+    chain reads next: a phased read past its first phase, whose finished phase's identity hashed its steps,
+    and a mix whose member holding the step is kept by its digest. Each holds the class's earlier path, in the
+    mix's manifest or hashed in a digest, which this Dew reads as its path now and hashes as the path it
+    had (`dew._records.MOVED_PATHS`)."""
+    import saved_positions_support
+
+    loader, steps = saved_positions_support.SAVED[name]
+    after = _read(loader(), steps, 3)
+    saved = (SAVED_BEFORE_THE_MOVE / f"{name}.position").read_bytes()
+    resumed = loader().train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert _ids(resumed, 3) == after
+    finally:
+        resumed.close()
+
+
 def _saved(chain, **options) -> tuple[bytes, list[list[int]]]:
     """A streamed per-share read of `chain`, saved after two batches, and the two it reads next."""
     stream = compile(chain, read="streamed", loading=Loading(workers=0), **options).train(DataPartition())

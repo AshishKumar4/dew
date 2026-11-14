@@ -9,6 +9,7 @@ from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 from flax import linen as nn
 
@@ -114,6 +115,18 @@ def gate_margin(values: np.ndarray, sparsity: float) -> float:
     kept = np.min(np.where(values > cutoff, values, np.inf), axis=-1, keepdims=True)
     dropped = np.max(np.where(values > cutoff, -np.inf, values), axis=-1, keepdims=True)
     return float(np.min(np.minimum(kept - cutoff, cutoff - dropped) / deviation))
+
+
+def rounding_margin(values: np.ndarray, dtype) -> np.ndarray:
+    """Each float64 value's distance from the nearest midpoint between two neighbours in `dtype`, where
+    its rounding to `dtype` turns: the margin by which a rounding to `dtype` is decided, as a top-k's
+    is by its gap (`top_margin`); zero for a value exactly between two, a zero's its own. Normal
+    values of `dtype` alone (no draw nears its subnormals)."""
+    magnitude = np.abs(np.asarray(values, np.float64))
+    exponent = np.floor(np.log2(np.where(magnitude > 0, magnitude, 1.0)))
+    spacing = 2.0 ** (exponent - ml_dtypes.finfo(dtype).nmant)
+    position = magnitude / spacing
+    return np.where(magnitude > 0, np.abs(position - np.floor(position) - 0.5) * spacing, np.inf)
 
 
 def scale_of(ranked: np.ndarray) -> np.ndarray:

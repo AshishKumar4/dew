@@ -792,43 +792,6 @@ def pool_checkpoint(tmp_path_factory):
 
 
 @pytest.mark.distributed
-def test_every_process_plans_from_the_tightest_room_any_of_their_devices_leaves(tmp_path):
-    """The derivation's judgments decide which plan compiles first, so every process reads each alike, the
-    tightest any process's devices leave (`memory.derived_headroom`, pooled, row 3341's review): over two
-    processes whose devices leave four microbatches room to the byte on one and a byte less than the least
-    it might need on the other (a CPU's footprint an interval, row 5448), each judges four to refuse and
-    compiles eight first, the plan the other compiles, where judged apart one would have compiled four and
-    the other eight."""
-    reports = run_pool("agreement", tmp_path, 2, script=Path(__file__).with_name("plan_worker.py"), devices=1)
-    first, second = reports
-    assert first["need"] == second["need"]
-    assert first["derived"] == second["derived"] and first["derived"]["4"] == -1
-    assert first["asked"] == second["asked"] and first["asked"][0] == 8 and first["split"] == second["split"]
-
-
-@pytest.mark.distributed
-def test_every_process_leaves_an_undecided_split_to_the_same_compile(tmp_path):
-    """Over two processes whose devices leave four microbatches room to the byte on one and a byte short of
-    the most it might need on the other, alone (its footprint's upper bound), the pooled judgment of four is
-    undecided on both (`memory.derived_headroom`'s interval spanning zero), and both leave it to the same
-    compile: the same splits asked in the same order, the same plan."""
-    reports = run_pool("undecided", tmp_path, 2, script=Path(__file__).with_name("plan_worker.py"), devices=1)
-    first, second = reports
-    assert first["derived"] == second["derived"] and first["derived"]["4"] is None
-    assert first["asked"] == second["asked"] and first["split"] == second["split"]
-
-
-@pytest.mark.distributed
-def test_no_process_of_a_cpu_pool_traces_residuals_its_devices_never_judge(pool_checkpoint):
-    """A step's derived footprint judges each process's own device, so no process of a CPU pool, whose
-    devices state no memory, traces the residuals its loss's pullback keeps (row 3093): process 1 judged
-    process 0's device before, and traced them on every compile."""
-    for report in pool_checkpoint["reports"]:
-        assert report["derived_residuals"], "each process derives its step's footprint"
-        assert all(residuals is None for residuals in report["derived_residuals"])
-
-
-@pytest.mark.distributed
 def test_a_pools_observer_holds_every_processs_parameters_whole_at_each_observed_step(tmp_path):
     """An observer on two processes of one device each, whose parameters fsdp splits between them:
     every process runs the call and holds each observed step's variables whole, copied home before

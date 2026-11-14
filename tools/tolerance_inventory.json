@@ -309,10 +309,6 @@
    "comparisons": 18,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_linear_attention.py": {
-   "comparisons": 2,
-   "lane": "Kernels"
-  },
   "tests/test_llama4.py": {
    "comparisons": 6,
    "lane": "Models, Serving & RL"
@@ -389,16 +385,12 @@
    "comparisons": 6,
    "lane": "Training"
   },
-  "tests/test_moe_precision.py": {
-   "comparisons": 13,
-   "lane": "Kernels"
-  },
   "tests/test_mtp.py": {
    "comparisons": 3,
    "lane": "Training"
   },
   "tests/test_multimodal_model.py": {
-   "comparisons": 17,
+   "comparisons": 13,
    "lane": "Kernels"
   },
   "tests/test_multiprocess.py": {
@@ -412,10 +404,6 @@
   "tests/test_native_rollout_server.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL"
-  },
-  "tests/test_norm_swiglu.py": {
-   "comparisons": 6,
-   "lane": "Kernels"
   },
   "tests/test_ollama_interop.py": {
    "comparisons": 1,
@@ -644,10 +632,6 @@
   "tools/diffusers_source_reference.py": {
    "comparisons": 3,
    "lane": "Training"
-  },
-  "tools/gated_product_reference.py": {
-   "comparisons": 1,
-   "lane": "Kernels"
   },
   "tools/landing_visuals.py": {
    "comparisons": 1,

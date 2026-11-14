@@ -38,6 +38,7 @@ from dew._devices import (
     preallocate_gpu_pool,
     refuse_cpu_only_jax,
     refuse_unsafe_cublas,
+    write_share,
     xla_flag,
 )
 from dew._logging import configure as configure_logging
@@ -140,6 +141,19 @@ _POOLED: list[bool] = []
 """Whether this process's pool was decided (`pooled`), by its preparation or its first run."""
 
 
+def share_pool(share: float) -> None:
+    """Hold this process's GPU pool to `share` of each GPU, before its backend opens: a run that leaves the
+    rest to another engine on its GPUs (vLLM or SGLang beside the trainer, examples/train_rlvr.py), in
+    place of Dew's 95% (`preallocate_gpu_pool`), stated as the run's own (`pool_statement`: `named`). A
+    backend already open keeps the pool it took, and is refused here."""
+    if not 0 < share <= 1:
+        raise ValueError(f"a pool's share of each GPU is in (0, 1], not {share}")
+    if backend_open():
+        raise RuntimeError("JAX's backend has opened, and its pool is fixed: share the GPU before the "
+                           "process's first JAX computation")
+    write_share(share, "named")
+
+
 def pooled(*, joins: bool) -> None:
     """Decide XLA's pool once, before the backend opens: Dew's share written unless the run named a fraction
     (`preallocate_gpu_pool`), sized on a host of several GPUs to leave its communicators room
@@ -150,7 +164,7 @@ def pooled(*, joins: bool) -> None:
         return
     _POOLED.append(True)
     if backend_open():
-        if pool_statement()["source"] == "jax" and cuda_plugin():
+        if pool_statement()["source"] == "jax":
             _log.warning("JAX's backend opened before Dew sized its GPU pool, so this run's plans are held "
                          "to JAX's 75%% of each GPU; import dew before any JAX computation, or set %s=%s "
                          "before the process starts, for Dew's", FRACTIONS[1], DEW_SHARE)

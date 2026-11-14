@@ -1276,6 +1276,24 @@ def test_dependency_change_preserves_global_resume_only_when_derived_order_match
         changed.check(plan.record())
 
 
+def test_a_saved_plan_naming_an_encoder_by_its_earlier_path_resumes_as_one_naming_its_path_now():
+    """A position saved before the encoders that bind a released checkpoint moved to dew.interop (row 5996)
+    names an encoder step's dependency by its dew.inputs path: its plan reads as one naming the path it has
+    now, so the run resumes where it stopped; another class there is another step's, which it refuses."""
+    encode = StepIdentity("encode", "{}", exact=True, dependencies={
+        "encoder": {"class": "dew.interop.encoders:CLIPText", "fields": {"checkpoint": "clip"}}})
+    plan = Plan("global", Manifest({"name": "test"}, (encode,)), {"seed": 0}, {})
+
+    def saved(path: str) -> dict:
+        held = json.loads(json.dumps(plan.record()))
+        held["manifest"]["steps"][0]["dependencies"]["encoder"]["class"] = path
+        return held
+
+    assert plan.check(saved("dew.inputs.encoders:CLIPText")) == ()
+    with pytest.raises(ValueError):
+        plan.check(saved("dew.interop.encoders:T5Text"))
+
+
 def test_an_exact_resume_refuses_a_step_that_makes_other_values():
     """Shift(1) and Shift(2) keep every row in its place, so the order and its
     derived facts agree; the step's identity is what says the rows differ."""

@@ -270,7 +270,7 @@ def test_the_prompt_states_are_the_decoders_own_last_layer_output():
     """The conditioner reads the decoder's layers through its own forward (`LayerStates`), so a
     decoder that scales its embeddings, by Gemma's sqrt(d) or a muP multiplier, gives the
     conditioner the last layer's output: the decoder's layers over its own scaled embeddings."""
-    from dew.inputs.diffusion import _layer_states
+    from dew.interop.conditioners import _layer_states
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
     model = CausalTransformer(vocab_size=37, emb_features=32, num_layers=2, num_heads=4, mlp_features=64,
@@ -289,7 +289,7 @@ def test_the_prompt_states_are_the_decoders_own_last_layer_output():
 def test_a_looped_layer_is_read_at_its_last_pass():
     """A layer a loop runs twice is read at its last pass, which the final norm reads: the looped
     stack's last layer, normed, is the model's hidden states, and its first pass is not."""
-    from dew.inputs.diffusion import _layer_states
+    from dew.interop.conditioners import _layer_states
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_stack import Loop
 
@@ -311,7 +311,7 @@ def test_a_hidden_states_conditioner_reads_a_looped_tower_at_its_last_pass():
     """FLUX.2's and Z-Image's conditioning (`HiddenStatesConditioner`) reads its tower's last layer
     as the forward left it: a layer a loop runs twice gives its last pass, which the final norm
     turns into the tower's hidden states, not its first."""
-    from dew.inputs.diffusion import HiddenStatesConditioner
+    from dew.interop.conditioners import HiddenStatesConditioner
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_stack import Loop
 
@@ -336,7 +336,7 @@ def test_every_layer_reads_as_the_layer_returned_it_with_or_without_residual_cop
     collapses them for its final norm; the last layer's is what its capture kept too."""
     from model_support import decoder
 
-    from dew.inputs.diffusion import _layer_states
+    from dew.interop.conditioners import _layer_states
     from dew.nn.gemma3n import AltUp
 
     # Two layers, so the first is read from its capture and the last from the stack's output.
@@ -413,7 +413,7 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, record, t
     from flax.traverse_util import flatten_dict
 
     from dew.checkpoints import Checkpoints
-    from dew.inputs.diffusion import QwenImageConditioner
+    from dew.interop.conditioners import QwenImageConditioner
     from dew.interop.diffusion import component_tensors
     from dew.interop.pretrained import Pretrained
     from dew.objectives.diffusion import DiffusionObjective

@@ -164,10 +164,11 @@ def narrow_copies(state, traced: core.Jaxpr) -> dict:
     """The parameters a step the trainer composes reads through narrow copies, by path under `params`
     (`cast_paths`): on every GPU but one whose row measured them off, for a state that holds no frozen
     collection. `traced` is the loss its first attempt reads as the trainer traced it for its shapes
-    (`footprint.traced_loss`: its update a window of microbatches, each step read in its split, its
-    committed updates among its inputs, the state's variables its first inputs), whose casts are read in
-    place of a trace of its own, so a parameter the step computes on before its cast (a DEX lambda's
-    anneal) is not copied: a trace of a Qwen3.5-4B step's loss is seconds of its compile (row 4260)."""
+    (`dew.training.transaction.traced_loss`: its update a window of microbatches, each step read in its
+    split, its committed updates among its inputs, the state's variables its first inputs), whose casts are
+    read in place of a trace of its own, so a parameter the step computes on before its cast (a DEX
+    lambda's anneal) is not copied: a trace of a Qwen3.5-4B step's loss is seconds of its compile (row
+    4260)."""
     from dew.nn.kernels.generation import Choice, backend, chosen_kernel
 
     if (chosen_kernel(Choice.NARROW_COPIES, 'on' if backend() == 'gpu' else 'off') == 'off'
