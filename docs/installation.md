@@ -58,7 +58,7 @@ source .venv/bin/activate
 uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple
 ```
 
-To install the current revision of the repository instead of the release, name it: `uv pip install "dewml @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`, and pin a commit, `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`, to reproduce a run later. Dew installs its JAX build and the Flax release pyproject.toml's dependencies allow.
+To install the current revision of the repository instead of the release, name it: `uv pip install "dewml @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`, and pin a commit, `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`, to reproduce a run later. An install that names dewml resolves its dependencies afresh, unpinned and unhashed; one whose every file is verified installs a lock from a checkout instead, `sh tools/install_environment.sh cpu` (or `cuda12`, `cuda13`), which requires every hash and installs the checkout itself last, the one part no hash holds. Dew installs its JAX build and the Flax release pyproject.toml's dependencies allow.
 
 The CPU install is enough for the [Quickstart](getting-started.md).
 
@@ -282,7 +282,7 @@ source .venv/bin/activate
 sh tools/install_environment.sh cpu   # cuda12 or cuda13 on a GPU host
 ```
 
-The `ci` extra is the test suite's environment, every package a test file imports. `tools/lock_environment.sh` locks it in `locks/`, and CI, the GPU nodes and the kernel lab's GPU jobs all install the lock for their host, with the same JAX build CI uses: `constraints.txt` names Dew's JAX build, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
+The `ci` extra is the test suite's environment, every package a test file imports. `tools/lock_environment.sh` locks it in `locks/`, every file with its sha256, and CI, the GPU nodes and the kernel lab's GPU jobs all install the lock for their host (`tools/install_environment.sh`, which requires each hash, so a file whose bytes changed under its name and version fails to install by name), with the same JAX build CI uses: `constraints.txt` names Dew's JAX build, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
 
 ## Bumping JAX
 

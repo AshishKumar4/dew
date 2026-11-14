@@ -1,11 +1,13 @@
 """tools/lock_environment.sh's resolution, with uv's resolver standing in: what it asks uv for each lock."""
 
 import functools
+import hashlib
 import http.server
 import os
 import shutil
 import subprocess
 import threading
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -117,3 +119,79 @@ def test_a_gpu_extra_that_does_not_install_on_a_python_pyproject_admits_fails_th
              if f"--extra {extra} " in call and f"--python-version {minor} " in call
              and f"--python-platform {machine}-manylinux_2_35" in call}
     assert len(asked) == 12
+
+
+BACKEND = """
+import base64, hashlib, zipfile
+
+
+def _digest(data):
+    return base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+
+
+def _wheel(directory, name):
+    path = f"{directory}/{name}-0.1-py3-none-any.whl"
+    info = f"{name}-0.1.dist-info"
+    files = {f"{name}.py": b"",
+             f"{info}/METADATA": f"Metadata-Version: 2.1\\nName: {name}\\nVersion: 0.1\\n".encode(),
+             f"{info}/WHEEL": b"Wheel-Version: 1.0\\nGenerator: t\\nRoot-Is-Purelib: true\\n"
+                              b"Tag: py3-none-any\\n"}
+    record = "".join(f"{file},sha256={_digest(data)},{len(data)}\\n" for file, data in files.items())
+    with zipfile.ZipFile(path, "w") as wheel:
+        for file, data in {**files, f"{info}/RECORD": (record + f"{info}/RECORD,,\\n").encode()}.items():
+            wheel.writestr(file, data)
+    return path.rsplit("/", 1)[1]
+
+
+def build_wheel(directory, config_settings=None, metadata_directory=None):
+    return _wheel(directory, "checkout")
+
+
+build_editable = build_wheel
+"""
+"""A build backend of the stand-in checkout's own (pyproject's backend-path), needing no network: one empty
+module's wheel, editable or not."""
+
+
+def wheel_of(directory: Path, name: str) -> Path:
+    """A wheel of one empty module `name`, version 0.1, written into `directory`."""
+    namespace: dict = {}
+    exec(BACKEND, namespace)
+    return directory / namespace["_wheel"](str(directory), name)
+
+
+@pytest.mark.parametrize("case", ["as-locked", "bytes-changed", "unhashed"])
+def test_dews_installer_installs_a_locked_file_only_where_its_bytes_hash_to_the_lock(tmp_path, case):
+    """tools/install_environment.sh, the path armada, the GPU nodes and Colab take, installs a lock's file
+    where its bytes hash to the lock's sha256, and refuses it before Dew's checkout is installed,
+    where they changed under its name and version, or where the lock gives it no hash at all (ledger 6204's
+    audit: the locks pinned no hash, so a replaced wheel installed)."""
+    if shutil.which("uv") is None:
+        raise AssertionError("uv, which Dew's installer runs, is not on PATH")
+    tree, store = tmp_path / "tree", tmp_path / "store"
+    (tree / "locks").mkdir(parents=True)
+    (tree / "tools").mkdir()
+    store.mkdir()
+    shutil.copy(ROOT / "tools" / "install_environment.sh", tree / "tools")
+    (tree / "backend.py").write_text(BACKEND)
+    (tree / "pyproject.toml").write_text('[project]\nname = "checkout"\nversion = "0.1"\n\n[build-system]\n'
+                                         'requires = []\nbuild-backend = "backend"\nbackend-path = ["."]\n')
+    wheel = wheel_of(store, "locked")
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    hashed = "" if case == "unhashed" else f" \\\n    --hash=sha256:{digest}"
+    (tree / "locks" / "t.txt").write_text(f"locked @ {wheel.as_uri()}{hashed}\n")
+    if case == "bytes-changed":
+        with zipfile.ZipFile(wheel, "a") as changed:
+            changed.writestr("locked_extra.py", b"")
+    venv = tmp_path / "venv"
+    subprocess.run(["uv", "venv", "-q", str(venv)], check=True)
+    python = venv / "bin" / "python"
+    done = subprocess.run(["sh", "tools/install_environment.sh", "t", "-q", "--offline", "--python",
+                           str(python)], cwd=tree, capture_output=True, text=True)
+    installed = subprocess.run([str(python), "-c", "import locked, checkout"], capture_output=True)
+    if case != "as-locked":
+        assert done.returncode != 0, done.stderr
+        assert installed.returncode != 0
+    else:
+        assert done.returncode == 0, done.stderr
+        assert installed.returncode == 0

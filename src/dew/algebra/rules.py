@@ -37,6 +37,7 @@ from egglog import (
     vars_,
 )
 
+from dew._cache import ALGEBRA
 from dew.algebra import terms
 from dew.algebra.terms import Term
 
@@ -727,9 +728,11 @@ def reorderable(region: terms.Region) -> bool:
 def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]:
     """The rule sets a program's numerics admit: every set under default numerics, the `exact` ones alone
     under the accurate numerics (`precision="accurate"`); the dev-time sets (`Rules.dev`) only where `dev`,
-    whose choice measures each candidate's error instead."""
+    whose choice measures each candidate's error instead; none the pass leaves out (`dew._cache.Passes`'
+    `without`, a receipt's arm)."""
     return tuple(rules for rules in RULES.values()
-                 if (dev or not rules.dev) and (dev or not accurate or rules.rounding == "exact"))
+                 if (dev or not rules.dev) and (dev or not accurate or rules.rounding == "exact")
+                 and rules.name not in ALGEBRA.value.without)
 
 
 def admitted_names(accurate: bool) -> tuple[str, ...]:

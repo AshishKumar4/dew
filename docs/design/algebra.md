@@ -354,10 +354,11 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
   object identity or string hashing. The e-graph is built in equation order and runs with one thread, and the
   prices read only pool-agreed facts (§1.6).
 - **Compile time:** the pass's seconds per program are recorded (`report.passes`, §6.8) and measured on the 4B
-  and 9B steps' compiles; the compiled step's record and perf_gate are to report them beside lowering and XLA
-  compile (row 5339). Today the compiled step's plan holds the pass's seconds and each probe's compile
-  seconds; a probe's `spent` (its traced, lowered and compiled seconds, JAX's own events summed for that
-  candidate) joins them with the planner's head on row 5556, and the perf gate's columns are not there yet. It is a reported measurement, not a gate.
+  and 9B steps' compiles. A step compiled ahead records its planning's seconds by part
+  (`AheadOfTime.planned_parts`: JAX's traces, the algebra's passes, JAX's lowerings and XLA's compiles, each
+  summed over the planning's threads) beside their whole (`planned_seconds`), for the perf gate's compile
+  rows to report (row 5339; their columns are Platform's, row 6108). It is a reported measurement, not a
+  gate.
 - **Report:** each region's rule sets that fired and each program's whole pass's seconds go in the one kernel
   report (`dew.nn.kernels.templates.report`: `report.rewrites`, `report.passes`; §6.8).
 
@@ -963,11 +964,15 @@ chunk algorithm side by side:
 The cheapest under the work-span model is the chunk's form, which `scan.py` evaluates and `carry.py`
 splits. At a kernel's chunk on an A100 or an H100 (64 tokens, 128 keys and values) the extraction is the
 compact WY form with its inverse by doubling, the hand-written chunk's form. Both rule sets are proven
-sound over the reals from their declarations (tests/test_linear_scan.py). Today that proof is a symbolic
-check at finite shapes (three tokens, the test's shape inventory): a proof of the chunk identities at
-every chunk size is an open gap. The inverse by doubling is proven from the template's own
-implementation (`recurrence_algebra.doubled`, evaluated over SymPy at two, four and eight rows) and its
-level's join at every block size (the block inverse over symbolic sizes), so at every chunk size.
+sound over the reals from their declarations (tests/test_linear_scan.py), at every chunk size by
+induction: each identity holds exactly at a symbolic chunk of three tokens (so at one, two and three, each
+output reading its own and earlier tokens alone), and each right side as declared, evaluated blockwise
+with each constructor's meaning at symbolic sizes, composes as its loop does over two blocks of `m` and `n`
+tokens (the dual form, along the state's keys or its values, and the WY form, the chunk's decays factoring
+at the split), so a chunk of any size is its loop. The inverse
+by doubling is proven from the template's own implementation (`recurrence_algebra.doubled`, evaluated over
+SymPy at two, four and eight rows) and its level's join at every block size (the block inverse over
+symbolic sizes), so at every chunk size.
 
 A derived algebra's laws are proven before its forms ship, in the suite (tests/algebra_laws.py; today at the
 extents it walks, two and three keys a tile over every kernel tile shape, for the attention forward's and
