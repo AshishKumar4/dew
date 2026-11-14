@@ -854,12 +854,14 @@ class FitSearch[LossT, EffectsT]:
         # Its derivation is its trace's (row 5479's 47 minutes were the derivation's own, 13 s since).
         # A rung fits where its most microbatches do; the derivation then finds its split there, which
         # alone is compiled where it is right (`derived_split`). A step that fits at its fewest fits at
-        # every split, at the rung it stands on: one derivation says so, and no rung is walked.
+        # every split, at the rung it stands on: one derivation says so, and no rung is walked. The plan's
+        # spills and refusals are those of its derivation's traces too: a launch certified as it traces
+        # (`report.certified`) refuses a spilling config there, before any compile.
+        seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
+        passed = len(report.passes())
         if not self.fits_at_fewest(candidates, first):
             self.derived_start(candidates[-1])
         first = self.derived_split(candidates, first)
-        seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
-        passed = len(report.passes())
         split = planned(candidates, first, self.fits, self.climb, self.likely,
                         functools.partial(self.fits, pruned=True))
         spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
