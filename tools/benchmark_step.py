@@ -596,6 +596,9 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
         (state, loss, is_finite), synced = carried(lambda carry: step(carry[0]), (state, loss, is_finite),
                                                    config.steps, each=True)
         p10, p50, p90 = np.percentile(np.asarray(synced) * 1e3, [10, 50, 90])
+        # Every step of the warm, timed and synced windows valid, read once they are over (`nonfinite`): a
+        # timing from a window any step of which went non-finite is no measurement.
+        nonfinite = compiled.nonfinite()
 
         timeline = {}
         if config.profile_dir:
@@ -665,7 +668,8 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
             "mfu": mfu,
             "planned_device_bytes": planned,
             "loss": float(loss),
-            "finite": bool(is_finite),
+            "finite": nonfinite == 0 and bool(is_finite),
+            "nonfinite_steps": nonfinite,
             **timeline,
         }
     measured = None if peaks is None or None in peaks else max(peaks)
@@ -810,4 +814,6 @@ def main(config: BenchmarkConfig) -> list[Row]:
 
 
 if __name__ == "__main__":
-    main(tyro.cli(BenchmarkConfig))
+    # A row any of whose steps went non-finite fails the run, its rows written first.
+    if invalid := [row["architecture"] for row in main(tyro.cli(BenchmarkConfig)) if not row["finite"]]:
+        sys.exit(f"steps went non-finite in {', '.join(invalid)}: no timing of theirs is a measurement")

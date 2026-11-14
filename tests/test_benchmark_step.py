@@ -327,3 +327,18 @@ def test_a_windows_parts_are_stamped_as_each_becomes_ready_whether_dispatch_or_d
     assert all(seconds >= 0.03 for _, seconds, _ in parts), parts
     # The host's dispatch was the slow part: each part's dispatch takes its two steps' sleeps.
     assert all(sent >= 0.03 for _, _, sent in parts), parts
+
+
+def test_a_window_reads_invalid_where_any_of_its_steps_went_non_finite_not_only_its_last():
+    """A compiled step's windows keep every step's loss and finiteness on the device and read them once the
+    window is over: one step that went non-finite (its own flag, or its loss) makes the window's count
+    nonzero, though the steps after it recovered; the count is of the steps since the last read (audit,
+    2026-11-14: only the last step's finiteness was kept, so a NaN mid-window was timed)."""
+    import jax.numpy as jnp
+
+    compiled = load("benchmark_models").CompiledStep(None, None, 0.0)
+    for loss, finite in ((1.0, True), (float("nan"), True), (2.0, False), (0.5, True)):
+        compiled.taken.append((jnp.float32(loss), jnp.asarray(finite)))
+    assert compiled.nonfinite() == 2
+    compiled.taken.append((jnp.float32(0.4), jnp.asarray(1, dtype=bool)))
+    assert compiled.nonfinite() == 0

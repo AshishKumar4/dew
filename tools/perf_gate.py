@@ -199,6 +199,11 @@ def _stepped(out: Path) -> tuple:
     shows unmeasured. Its compile, which an arm's cache holds from its first round on, is judged ahead of
     the run on any host (`compile`)."""
     [step] = json.loads(out.read_text())
+    # A timing from a window whose steps went non-finite (its loss, or its step's own finiteness) is no
+    # measurement: refused, as the probe's failure, never a sample (audit, 2026-11-14).
+    if step.get("finite") is False or not math.isfinite(float(step.get("loss", 0.0))):
+        raise ValueError(f"its step went non-finite ({step.get('nonfinite_steps', 'some')} steps; loss "
+                         f"{step.get('loss')}): no timing of it is a measurement")
     mfu = step.get("mfu")
     # The window's whole elapsed time a step: a pause a head adds is a regression, never averaged past; a
     # part that stalled is said beside it (`stalled`), its row's diagnostics.

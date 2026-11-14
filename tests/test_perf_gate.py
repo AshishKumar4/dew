@@ -859,3 +859,17 @@ def test_a_step_whose_window_stalled_in_one_part_keeps_its_elapsed_time_and_says
     steady = [27.1, 26.9, 27.0, 27.2, 26.8, 27.0]
     out.write_text(json.dumps([{"ms_per_step": 27.0, "window_ms_series": steady}]))
     assert gate.stalled(out) is None
+
+
+@pytest.mark.parametrize("record", [{"finite": False, "nonfinite_steps": 3, "loss": 1.5},
+                                    {"finite": True, "loss": float("nan")}], ids=["flagged", "nan-loss"])
+def test_a_step_timing_from_a_window_that_went_non_finite_is_refused_not_a_sample(gate, tmp_path, record):
+    """A step record whose window went non-finite (its steps' count, or its loss) is refused by the gate's
+    reader, the probe's failure, never a timing sample: a head that makes a step NaN never reads as fast
+    (audit, 2026-11-14)."""
+    out = tmp_path / "step.json"
+    out.write_text(json.dumps([{"ms_per_step": 12.0, "mfu": 0.4, **record}]))
+    with pytest.raises(ValueError, match="went non-finite"):
+        gate._stepped(out)
+    out.write_text(json.dumps([{"ms_per_step": 12.0, "mfu": 0.4, "finite": True, "loss": 1.5}]))
+    assert gate._stepped(out)[0] == 12.0
