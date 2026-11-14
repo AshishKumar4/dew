@@ -351,11 +351,12 @@ def drawn_forward(case: str, dtype: str) -> Callable:
                   COVERED[case, dtype, 'forward'])
 
 
-@pytest.mark.check1_shards(seeds=256, per_task=16)
+@pytest.mark.check1_shards(seeds=256, per_task=8)
 @drawn_forward('one sequence', 'fp32')
 def test_the_mosaic_forward_over_one_fp32_sequence_is_as_exact_as_its_reference():
     """`the_mosaic_forward_is_as_exact_as_its_reference` at an fp32 call over one sequence, under either
-    forms."""
+    forms: eight draws a task, an fp32 draw over its routes 42 s at CI's rate (sixteen took 670 s, past a
+    train's bound, train 860's CI)."""
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=16)
