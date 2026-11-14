@@ -2312,9 +2312,22 @@ call) to (that route's kernel, the receipt). A product of a matrix a receipt tim
 its own, which that receipt's winner holds: the template's where it won (on Hopper, over its kind's XLA
 cell), XLA's where it lost (on Blackwell, where the template is the kind's default); one timed whose cell is
 undeclared takes the template. A cell leaves the list once the template measures at least as fast on it.
+Its price includes the step memory its route holds (`HELD`), which no per-call time sees.
 Nothing is ranked at runtime. A
 call the template cannot run (its legality) takes the next route in `GROUPED`'s order, which is no cell of
 this list."""
+
+HELD: dict[tuple[str | None, Kind], tuple[int, str]] = {
+    ('mma.sync', Kind(dense=True, made=Made.KERNEL_GRADIENT)): (
+        1, "XLA's dot of each layer's kernel gradient deferred to the backward's end, each layer's cotangent "
+           "held to it: Llama-3-8B's MLP at 8192 tokens 32 x 2 x 8192 x 14336 bf16, 15 GiB"),
+}
+"""The step memory a declared cell's route holds beyond the template's, which its receipt states beside its
+time (row 5972's P0: the B200's and GH200's kernel-gradient cells held the 4B's every layer's dgate and dup to
+the backward's end, a four-row step's temporaries 22.25 GB against 11.06 on the template): (instruction
+family, kind of call) to (the outputs of its call each layer holds, the receipt's statement). A cell absent
+holds none (tests/test_declared_cells_memory.py)."""
+
 
 GROUPED: selection.Op[GroupedCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
     MOSAIC, TRITON, CUTLASS,
