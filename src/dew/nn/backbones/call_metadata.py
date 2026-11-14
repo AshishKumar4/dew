@@ -100,3 +100,14 @@ def call_metadata(model: CausalTransformer, tokens, decode: bool, image_groups, 
             jnp.asarray(progress.updates, jnp.int32), tokens.shape[:1]),
         routing_block=block,
         whole_blocks=whole_blocks and block_groups is not None)
+
+
+def prepared_embeddings(x: jax.Array, input_embeddings) -> jax.Array:
+    """`x`, or in its place a caller's prepared `[B, S, D]` embeddings (another encoder's outputs fused in),
+    cast to the stream dtype."""
+    if input_embeddings is None:
+        return x
+    prepared = jnp.asarray(input_embeddings)
+    if prepared.shape != x.shape:
+        raise ValueError(f"input_embeddings are the whole {x.shape} sequence, got {prepared.shape}")
+    return prepared.astype(x.dtype)
