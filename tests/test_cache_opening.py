@@ -135,22 +135,28 @@ def test_prediction_depths_open_their_caches_as_their_steps_write_them(kind):
 
 def test_a_servers_free_slots_open_with_no_forward_traced():
     """The program a server compiles and runs to open its free slots (`serving_kernel.opened`) holds no
-    product: their cache opens as the model states it, and the rest of their state takes the types its
-    admissions' prefill leaves (`StateTypes`, traced once at an admission the server runs), where it traced
-    a blank prompt's prefill for them, in that program."""
+    product, and traces none: their cache opens as the model states it, and the rest of their state takes
+    the types its admissions' prefill leaves (`StateTypes`, traced once at an admission the server runs,
+    `Server._admitted_types`), where each trace of the program traced a blank prompt's prefill for them
+    within it."""
     from jax.experimental import checkify
 
     from dew.inference.serving_kernel import StateTypes, opened
     from dew.nn.inputs import ModelInputs
+    from dew.nn.kernels import generation
     from dew.sampling.text import decode_ops, prefill_state
 
     model, slots = decoder().clone(max_seq_len=32), 4
     variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, PROMPT), jnp.int32)))
     prompts = ModelInputs(jnp.ones((ROWS, PROMPT), jnp.int32))
+
     def prefilled(variables):
         return prefill_state(model, variables, prompts, decode_ops(model, variables, 0, None))[0]
 
     _, state = jax.eval_shape(checkify.checkify(prefilled, errors=checkify.user_checks), variables)
-    program = jax.make_jaxpr(lambda variables: opened(model, variables, 0, slots, 32,
-                                                      types=StateTypes.of(state)))(variables).jaxpr
+    with generation.routes() as routes:
+        program = jax.make_jaxpr(lambda variables: opened(model, variables, 0, slots, 32,
+                                                          types=StateTypes.of(state)))(variables).jaxpr
     assert not primitives(program) & PRODUCTS, primitives(program) & PRODUCTS
+    # No forward is traced within it, abstractly or not: no layer selects a kernel.
+    assert not routes, routes
