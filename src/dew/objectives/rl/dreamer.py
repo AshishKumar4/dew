@@ -46,6 +46,7 @@ from dew.objectives.base import (
     Aux,
     EMASpec,
     Objective,
+    Pooled,
     Ratio,
     Shown,
     Step,
@@ -838,13 +839,13 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio, Variables]):
         return moved("low", 5), moved("high", 95)
 
     def _weighed(self, losses: Mapping[str, jax.Array],
-                 batch: Batch) -> tuple[Ratio, dict[str, jax.Array]]:
+                 batch: Batch) -> tuple[Ratio, dict[str, jax.Array | Pooled]]:
         """The weighted loss `Ratio` over `batch`'s real windows, each loss `[B, ...]` averaged over
         its window first so every term shares the real windows' mass, and each term's mean metric."""
         wide = at_least_fp32(self.model.dtype)
         terms = {name: self.row_mean(jnp.mean(value, tuple(range(1, value.ndim))), batch)
                  for name, value in losses.items()}
-        metrics = {f"loss_{name}": term.mean()[0] for name, term in terms.items()}
+        metrics: dict[str, jax.Array | Pooled] = {f"loss_{name}": term for name, term in terms.items()}
         if not any(self.scales[name] for name in terms):
             zero = jnp.zeros((), wide)
             return Ratio(zero, zero), metrics
@@ -951,7 +952,7 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio, Variables]):
         losses["replay_value"] = (1 - last)[:, :-1] * replay_value[:, :-1]
 
         total, metrics = self._weighed(losses, batch)
-        metrics.update(return_scale=scale, imagined_return=self.row_mean(row_returns, batch).mean()[0])
+        metrics.update(return_scale=scale, imagined_return=self.row_mean(row_returns, batch))
         real_mass = jnp.sum(real.astype(low.dtype))
         stopped_low, stopped_high = jax.lax.stop_gradient(low), jax.lax.stop_gradient(high)
         effects: Variables = {

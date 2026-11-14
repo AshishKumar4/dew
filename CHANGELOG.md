@@ -628,9 +628,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 - A training step logs the loss and metrics of the rows it consumed, whatever split the planner reads it
   in: a step that commits no update logs its own batch's loss, and a metric an objective states as a
-  statistic (`Aux.metrics` given a `Ratio`, an `Exponentiated` perplexity or a batch's `Moments`) is pooled
-  across the step's microbatches by it. `Aux.metrics` holds numbers to every caller, the stated statistics
-  kept in the new `Aux.pooled`; a metric that states no pooling logs at a split step as
+  statistic (`Aux.metrics` given a `Ratio`, an `Exponentiated` perplexity, a `Summed` sum of ratios or a
+  batch's `Moments`, all exported from `dew.objectives` with their base, `Pooled`) is pooled across the
+  step's microbatches by it. `Aux.metrics` holds numbers to every caller, the stated statistics kept in the
+  new `Aux.pooled`; a metric that states no pooling logs at a split step as
   `<name>/last_microbatch`. A data position holds what decides its rows and none of the checkout or the
   machine, which each checkpoint step records beside it (`Checkpoints.environment`) and a resume warns of; a
   relaxed resume names each step outside Dew whose code changed (`code.<step>`). Positions saved before read

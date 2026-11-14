@@ -41,7 +41,19 @@ from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import progressed
 from dew.nn.protocols import Lacks, TokenModel
-from dew.objectives.base import OMITTED, Aux, EMASpec, Omitted, Ratio, Shown, Source, Step, ended, model_rngs
+from dew.objectives.base import (
+    OMITTED,
+    Aux,
+    EMASpec,
+    Omitted,
+    Pooled,
+    Ratio,
+    Shown,
+    Source,
+    Step,
+    ended,
+    model_rngs,
+)
 from dew.objectives.lm.chunked import final_read, refuse_without_logits
 from dew.objectives.lm.head import HeadedObjective
 from dew.objectives.lm.objective import batch_text, text_preview
@@ -222,7 +234,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         prediction = Ratio(self.row_mean(losses, batch, weights=weights).total,
                            self.row_mean(real.astype(at_least_fp32(losses.dtype)), batch).total)
         correct = predicted == tokens
-        reported: dict[str, jax.Array | Ratio] = {
+        reported: dict[str, jax.Array | Pooled] = {
             "masked_accuracy": self.accuracy(correct.astype(losses.dtype), batch, counted),
             "masked_fraction": Ratio(jnp.sum(counted, dtype=losses.dtype), jnp.sum(real, dtype=losses.dtype)),
         }
