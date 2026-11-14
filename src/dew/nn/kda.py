@@ -207,7 +207,8 @@ class KimiDeltaAttention(nn.Module):
         gate = gate.reshape(B, S, self.num_heads, self.head_dim)
         token = None
         forked = tokens.forks is not None
-        if decode and S == 1 and not forked and decode_kernel(
+        # An initialization runs the general path, where the layer makes its parameters.
+        if decode and S == 1 and not forked and not self.is_initializing() and decode_kernel(
                 jax.ShapeDtypeStruct((B, self.num_heads, self.head_dim, self.head_dim), wide),
                 groups=self.num_heads, fuses=True) == 'fused':
             token = self._fused_token(taps, g, beta, gate, valid, tokens.starts)

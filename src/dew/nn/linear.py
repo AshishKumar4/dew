@@ -442,8 +442,7 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
                        parts=parts, dtype=dtype)
     if decode:
         assert conv_state is not None and held is not None
-        # An initialization runs the general path, where the layer makes its parameters.
-        if token is not None and not module.is_initializing():
+        if token is not None:
             out, history, final = token(mixed, conv_state.value, held.value)
             # The history and the state kept in the cache's dtypes, as they always were.
             kept(conv_state, history.astype(conv_state.value.dtype), 'conv_state')
@@ -1247,7 +1246,8 @@ class GatedDeltaNet(nn.Module):
         operand = mixed.dtype
         token, stepped = None, False
         forked = tokens.forks is not None
-        if decode and S == 1 and not forked:
+        # An initialization runs the general path, where the layer makes its parameters.
+        if decode and S == 1 and not forked and not self.is_initializing():
             kernel = self._decode_kernel(x, operand)
             token = self._fused_token(z, b, a, valid) if kernel == 'fused' else None
             stepped = kernel == 'step'

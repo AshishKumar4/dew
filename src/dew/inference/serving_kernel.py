@@ -203,16 +203,23 @@ def rows_prefilled(model: nn.Module, params: Variables, pad_id: int, admission: 
 
 
 def admitted_types(model: nn.Module, params: Variables, pad_id: int, admission: Admission,
-                   plan: Speculative | None, prng: str, progress: Progress = END) -> StateTypes:
-    """The types `admission`'s prefill leaves its rows (`rows_prefilled`, the dense admitting step's; a
-    paged pool's prefill and a mixed step leave its rows the same logits' and states' types), traced at the
-    admission's own shape for those types alone: the forward owns its outputs' types, the states' from the
-    dtype its stack settles in, so no spec states them. A server's start takes this trace once, at an
-    admission it runs (`Server`); the admitting step prefills inside its own program, whose inputs are the
-    very slots these types make, so JAX's trace cache, keyed on a function and its arguments' types, holds
-    no trace of it to share."""
+                   placement: Placement, progress: Progress = END) -> StateTypes:
+    """The types `admission`'s prefill leaves its rows, as `placement`'s admitting step prefills them: a
+    dense one's over a fresh cache at their bucket width (`rows_prefilled`), a paged one's over a fresh
+    cache of its pool's layout, which its step reads the pool's pages through (`Paged.prefilled`); a mixed
+    step leaves its rows the same logits' and states' types. Traced at the admission's own shape for those
+    types alone: the forward owns its outputs' types, the states' from the dtype its stack settles in, so
+    no spec states them. A server's start takes this trace once, at an admission it runs (`Server`); the
+    admitting step prefills inside its own program, whose inputs are the very slots these types make, so
+    JAX's trace cache, keyed on a function and its arguments' types, holds no trace of it to share."""
     def prefilled(params: Variables, admission: Admission) -> DecoderState:
-        return rows_prefilled(model, params, pad_id, admission, plan, prng, progress)[0]
+        if isinstance(placement, Dense):
+            return rows_prefilled(model, params, pad_id, admission, placement.plan, placement.prng,
+                                  progress)[0]
+        ops = decode_ops(model, params, pad_id, drafting_depths(model, placement.plan), progress)
+        rounding = rounding_keys(jax.random.wrap_key_data(admission.keys, impl=placement.prng))
+        return prefill_state(model, params, admission.prompts, ops, rounding=rounding, progress=progress,
+                             adapters=_rows_of(model, admission))[0]
 
     _, state = jax.eval_shape(checkify.checkify(prefilled, errors=checkify.user_checks), params, admission)
     return StateTypes.of(state)

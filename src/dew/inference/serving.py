@@ -1284,8 +1284,8 @@ class Server:
         blank = self._admit([[] for _ in range(self.groups)], share, 1, [])
         assert blank is not None
         if self.prefill_mesh is None:
-            return admitted_types(self.model, self.variables, self.pad_id, blank, self.rows.placement.plan,
-                                  self.prng, self.progress)
+            return admitted_types(self.model, self.variables, self.pad_id, blank, self.rows.placement,
+                                  self.progress)
         rows = self._on_prefill_mesh(blank)
         with self._prefilling():
             traced = self._prefill.jitted.trace(self.model, self._prefill_variables, self.pad_id,

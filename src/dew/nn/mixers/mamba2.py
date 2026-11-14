@@ -420,7 +420,8 @@ class Mamba2(nn.Module):
             return self.out_proj(self._gated(out, gate))
         state = (self.num_heads, self.state_size, self.head_dim)
         token = None
-        if decode and length == 1 and tokens.forks is None and decode_kernel(
+        # An initialization runs the general path, where the layer makes its parameters.
+        if decode and length == 1 and tokens.forks is None and not self.is_initializing() and decode_kernel(
                 jax.ShapeDtypeStruct((batch, *state), wide), groups=self.n_groups, fuses=True,
                 normed=False) == 'fused':
             token = self._fused_token(taps, bias, dt, valid, tokens.starts)
