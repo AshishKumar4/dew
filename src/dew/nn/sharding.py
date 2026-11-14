@@ -324,29 +324,33 @@ class Placed:
     map per shard where its weights already lie, the layout that placed them read off the weights
     themselves."""
 
-    specs: tuple[tuple[tuple, jax.sharding.PartitionSpec], ...]
-    """Each leaf's path and spec, in the variables' order."""
+    specs: tuple[tuple[tuple[str, ...], tuple], ...]
+    """Each leaf's path, by its keys' names, and its spec's entries, in the variables' order: plain values
+    a call's identity states (`dew.training.identity`)."""
 
     @classmethod
     def of(cls, variables) -> Placed:
         """`variables`' placement, read off its leaves."""
         return cls(tuple(
-            (tuple(path), leaf.sharding.spec if isinstance(getattr(leaf, "sharding", None), jax.NamedSharding)
-             else jax.sharding.PartitionSpec())
+            (_named(path), tuple(leaf.sharding.spec) if isinstance(getattr(leaf, "sharding", None),
+                                                                   jax.NamedSharding) else ())
             for path, leaf in jax.tree_util.tree_flatten_with_path(variables)[0]))
 
     @functools.cached_property
-    def _by_path(self) -> dict[tuple, jax.sharding.PartitionSpec]:
+    def _by_path(self) -> dict[tuple[str, ...], tuple]:
         return dict(self.specs)
 
     def leaf_spec(self, mesh, path, value) -> jax.sharding.PartitionSpec:
-        """The spec of the leaf at `path`, as it is placed (`mesh` and `value` the protocol's, its placement
-        already the leaf's own); a path the variables do not hold is refused by its name."""
+        """The spec of the leaf at `path` (`('params', ..., 'kernel')`, a variables tree's), as it is placed
+        (`mesh` and `value` the protocol's, its placement already the leaf's own); a path the variables do
+        not hold is refused by its name."""
         del mesh, value
-        return self._by_path[tuple(path)]
+        return jax.sharding.PartitionSpec(*self._by_path[_named(path)])
 
 
-_PLACING: contextvars.ContextVar[Placing | None] = contextvars.ContextVar('placing', default=None)
+def _named(path) -> tuple[str, ...]:
+    """A variables path (`jax.tree_util`'s keys) by its keys' names."""
+    return tuple(str(getattr(key, "key", key)) for key in path)
 
 
 @contextlib.contextmanager
@@ -356,17 +360,15 @@ def placing(layout: Placing | None) -> Iterator[None]:
     where the layout places it; None, as outside a trainer's trace, none: such a projection stays with the
     partitioner (a reference arm traced inside a step opts out so). The trainer's step and its evaluations
     trace under it (`Trainer._traced_on`, `Evaluator.scoring`); a program cached by what it traced under
-    keys on it (`trace_context`)."""
-    token = _PLACING.set(layout)
-    try:
+    keys on it (`trace_context`), and a call's identity states it (`dew._cache.PLACING`, a JAX user
+    context)."""
+    with _cache.PLACING(new_value=layout):
         yield
-    finally:
-        _PLACING.reset(token)
 
 
 def placed_layout() -> Placing | None:
     """The layout traced under (`placing`), None outside one."""
-    return _PLACING.get()
+    return _cache.PLACING.value
 
 
 def spread_axes() -> tuple[str, ...]:
@@ -391,7 +393,7 @@ def trace_context() -> tuple:
     schedule = _SCHEDULE.get()
     links = tuple(sorted((axis, link.bytes_per_second, link.flops_per_second)
                          for axis, link in _LINKS.get().items()))
-    return (None if schedule is None else schedule.count, axis_rules(), links, _PLACING.get())
+    return (None if schedule is None else schedule.count, axis_rules(), links, _cache.PLACING.value)
 
 
 def _spreads(axis: str, x: jax.Array, latent: int, tokens: float, *, padding: float = 0.0) -> bool:
