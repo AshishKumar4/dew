@@ -327,8 +327,8 @@ class Profiler:
     and here does not; why is open, and tools/gpu_profile_check.py records
     whether it does on every GPU session. The manifest's `op_attribution`
     then says so and a warning names the fix, profiling with
-    `XLA_FLAGS=--xla_gpu_enable_command_buffer=`; time runs without that
-    flag, since launching kernels one by one costs time. Where hlo_stats has
+    `benchmark.UNGRAPHED_FLAG` in XLA_FLAGS; time runs without that flag,
+    since launching kernels one by one costs time. Where hlo_stats has
     no column naming the ops, `op_attribution` records that it could not tell.
 
     A capture whose reader reads its trace alone (`dew.telemetry.trace`), as a
