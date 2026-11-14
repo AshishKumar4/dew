@@ -783,7 +783,7 @@ def regression_fit(x, directory, split: int, steps: int):
                    loading=Loading(workers=0, threads=1, read_buffer=1))
     # The optimizer stated as a config, which keys the step, so each seed's fits read the step the first
     # traced (`Trainer._step_key`).
-    trainer = one_device(Trainer(Regression(), OptimConfig(optimizer="sgd", learning_rate=0.1),
+    trainer = one_device(Trainer(Regression(), OptimConfig(optimizer="optax:sgd", learning_rate=0.1),
                                  key=jax.random.key(0), split=split, checkpoints=Checkpoints(str(directory))))
     return trainer.fit(data, steps=steps, checkpoint_every=2).variables["params"]
 
