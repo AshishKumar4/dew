@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import NAMES, checkpointed, fla_side, math as portable, recurrence, rule_math, through
+from delta_rule_support import NAMES, checkpointed, fla_math, fla_side, math as portable, recurrence, through
 from flax import linen as nn
 from gdn_cases import CASES
 from port_support import row_names_port
@@ -46,11 +46,6 @@ head and per key dimension, sized by `seeds_for`: the fewest for which one devic
 resolves the factor."""
 
 
-def relative(got, want) -> float:
-    want = np.asarray(want, np.float64)
-    return float(np.max(np.abs(np.asarray(got, np.float64) - want)) / max(np.max(np.abs(want)), 1e-6))
-
-
 def cumulated_decay(key, batch, length, value_heads, width=None):
     """A base-2 decay cumulated within each 64-token chunk, per head `[B, T, HV]` or per key dimension
     `[B, T, HV, K]` (fla's gk), as the kernels take it: fp32 (`cumulated`), from a
@@ -59,6 +54,35 @@ def cumulated_decay(key, batch, length, value_heads, width=None):
     step = np.asarray(-jnp.exp(jax.random.normal(key, shape) - 3.0) * fla_gdn.RCP_LN2, np.float64)
     return jnp.asarray(np.cumsum(step.reshape(batch, length // 64, 64, *shape[2:]), axis=2).reshape(shape),
                        jnp.float32)
+
+
+def drawn_keys(stream: int, seed: int, count: int):
+    """`count` keys of `seed`'s own stream among a site's (`stream`), keyed by the whole seed, as check 1's
+    sizing needs (`seeds_for`)."""
+    return jax.random.split(jax.random.fold_in(jax.random.key(stream), seed), count)
+
+
+def assert_kernel_on_par(kernel, reference, draw, label: str) -> None:
+    """A kernel against its expression in XLA with the same roundings (`fla_gdn_support`'s reference): the
+    same shapes and dtypes, and every output on par with the reference's from float64 over the site's
+    declared draws (check 1, `KERNEL_SEEDS`), the reference's expression on the inputs widened its truth
+    (`support.computed_at`)."""
+    def laid(arm):
+        return jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), jax.eval_shape(arm, *draw(0)))
+
+    assert laid(kernel) == laid(reference)
+    assert_as_exact(kernel, reference, draw, label, seeds=KERNEL_SEEDS.get(label, FEWEST_SEEDS))
+
+
+def site_label(kernel: str, shape, dtype, *details: str) -> str:
+    """A kernel site's label: the kernel, its shape and dtype, and what else its parameters pick."""
+    return " ".join((kernel, "x".join(map(str, shape)), jnp.dtype(dtype).name, *details))
+
+
+KERNEL_SEEDS = {"prepare_wy_repr_bwd 1x128x2x2x64x64 float32": 16}
+"""The kernel sites' declared seeds for check 1 (`assert_kernel_on_par`) past the fewest, by label: every
+kernel site sized by `seeds_for` on armada's CPUs (2026-11-14, fla-size at 1cc5e78a05e), each the fewest
+(`FEWEST_SEEDS`) but these."""
 
 
 def separated_prefix(g):
@@ -73,7 +97,7 @@ def no_terms(g, chunk=64):
 
 
 def output_operands(batch, length, key_heads, value_heads, width, columns, dtype, chunk=64, seed=0):
-    keys = jax.random.split(jax.random.key(seed), 5)
+    keys = drawn_keys(0, seed, 5)
     q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
     k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width))).astype(dtype)
     v = jax.random.normal(keys[2], (batch, length, value_heads, columns)).astype(dtype)
@@ -90,17 +114,19 @@ def output_operands(batch, length, key_heads, value_heads, width, columns, dtype
 ])
 def test_the_output_kernel_computes_flas_expression(dtype, shape, tiles):
     """fla's chunk_fwd_o per chunk and head, grouped value heads included, at each of fla's block
-    configs, the launch configured with it: within one rounding of its dtype of the same expression in
-    XLA."""
-    q, k, v, h, g = output_operands(*shape, dtype)
+    configs, the launch configured with it: on par with the same expression in XLA
+    (`assert_kernel_on_par`)."""
     scale = shape[4] ** -0.5
     launch = fla_gdn.ChunkFwdO(config=tiles)
     spans = chunked_launch.sequences(*shape[:2])
-    got = launch(q, k, v, support.entered_states(h), *separated_prefix(g), *spans, scale=scale, chunk=64,
-                 interpret=INTERPRETED)
-    want = support.reference_o(q, k, v, h, g, scale=scale)
-    assert got.shape == want.shape and got.dtype == want.dtype
-    assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 1e-5)
+
+    def kernel(q, k, v, h, g):
+        return launch(q, k, v, support.entered_states(h), *separated_prefix(g), *spans, scale=scale, chunk=64,
+                      interpret=INTERPRETED)
+
+    label = site_label("chunk_fwd_o", shape, dtype)
+    assert_kernel_on_par(kernel, functools.partial(support.reference_o, scale=scale),
+                         lambda seed: output_operands(*shape, dtype, seed=seed), label)
 
 
 @pytest.mark.parametrize("columns", [(), (128,)])
@@ -108,88 +134,100 @@ def test_the_output_kernel_computes_flas_expression(dtype, shape, tiles):
 def test_the_cumsum_kernel_is_flas_chunk_local_cumsum(reverse, columns):
     """Within each chunk of each head, and each key dimension of a decay per key dimension (fla's
     vector kernel), the inclusive sum of the tokens times the base-2 scale, from the end for the
-    gradient, within fp32 rounding of numpy's float64 sum: forward the prefix in float64, scaled after
-    the sum and rounded once (fla's is plain fp32), and the gradient's from the end compensated
-    (`compensated_add`), rounded once."""
-    g = -jnp.exp(jax.random.normal(jax.random.key(3), (2, 192, 3, *columns)) - 3.0)
-    tokens = np.asarray(g, np.float64).reshape(2, 3, 64, 3, *columns)
-    kernel = functools.partial(cumulated, scale=fla_gdn.RCP_LN2, reverse=reverse,
-                               interpret=INTERPRETED)
-    if reverse:
-        want = np.cumsum(tokens[:, :, ::-1] * fla_gdn.RCP_LN2, axis=2)[:, :, ::-1].reshape(g.shape)
-        bound = 1e-6
-    else:
-        want = (np.cumsum(tokens, axis=2) * fla_gdn.RCP_LN2).reshape(g.shape)
-        # fla's prefix rounds once a token: up to 64 roundings of the running sum.
-        bound = 64 * np.finfo(np.float32).eps
-    got = kernel(g)
-    assert got.dtype == jnp.float32
-    assert relative(got, want) < bound
+    gradient: on par with the same sums in XLA at fp32, fla's own (`assert_kernel_on_par`). The port's
+    forward takes the prefix in float64, scaled after the sum and rounded once, and its gradient's from
+    the end compensated (`compensated_add`), rounded once."""
+    shape = (2, 192, 3, *columns)
+
+    def draw(seed):
+        return (-jnp.exp(jax.random.normal(drawn_keys(3, seed, 1)[0], shape) - 3.0),)
+
+    def summed(g):
+        # Each chunk's inclusive sum in XLA at the decay's width: from the end, the tokens scaled first,
+        # forward, scaled after (fla's own order).
+        tokens = g.reshape(2, 3, 64, 3, *columns)
+        if reverse:
+            return jnp.flip(jnp.cumsum(jnp.flip(tokens * fla_gdn.RCP_LN2, 2), axis=2), 2).reshape(g.shape)
+        return (jnp.cumsum(tokens, axis=2) * fla_gdn.RCP_LN2).reshape(g.shape)
+
+    kernel = functools.partial(cumulated, scale=fla_gdn.RCP_LN2, reverse=reverse, interpret=INTERPRETED)
+    label = site_label("chunk_local_cumsum", shape, jnp.float32, "reverse" if reverse else "forward")
+    assert_kernel_on_par(kernel, summed, draw, label)
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape", [(2, 128, 2, 2, 64, 64), (1, 128, 2, 4, 128, 128)])
 def test_the_w_u_kernel_is_flas_recompute(dtype, shape):
-    """fla's recompute_w_u per chunk and head, grouped keys included: within one rounding of its
-    dtype of the same products in XLA."""
+    """fla's recompute_w_u per chunk and head, grouped keys included: `w` and `u` on par with the same
+    products in XLA (`assert_kernel_on_par`)."""
     batch, length, key_heads, value_heads, width, columns = shape
-    keys = jax.random.split(jax.random.key(4), 5)
-    k = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
-    v = jax.random.normal(keys[1], (batch, length, value_heads, columns)).astype(dtype)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, value_heads))).astype(dtype)
-    lower = jnp.tril(jax.random.normal(keys[3], (batch, length // 64, value_heads, 64, 64)) * 0.1)
-    a = jnp.moveaxis(lower, 3, 2).reshape(batch, length, value_heads, 64).astype(dtype)
-    g = cumulated_decay(keys[4], batch, length, value_heads)
-    want = support.reference_w_u(k, v, beta, a, g)
-    kernel = functools.partial(fla_gdn.recompute_w_u, interpret=INTERPRETED)
-    whole, fraction = separated_prefix(g)
-    got = kernel(k, v, beta, a, whole, g_lo=fraction)
-    for name, mine, theirs in zip(("w", "u"), got, want, strict=True):
-        assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
-        assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
+
+    def draw(seed):
+        keys = drawn_keys(4, seed, 5)
+        k = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
+        v = jax.random.normal(keys[1], (batch, length, value_heads, columns)).astype(dtype)
+        beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, value_heads))).astype(dtype)
+        lower = jnp.tril(jax.random.normal(keys[3], (batch, length // 64, value_heads, 64, 64)) * 0.1)
+        a = jnp.moveaxis(lower, 3, 2).reshape(batch, length, value_heads, 64).astype(dtype)
+        return k, v, beta, a, cumulated_decay(keys[4], batch, length, value_heads)
+
+    def kernel(k, v, beta, a, g):
+        whole, fraction = separated_prefix(g)
+        return fla_gdn.recompute_w_u(k, v, beta, a, whole, g_lo=fraction, interpret=INTERPRETED)
+
+    label = site_label("recompute_w_u", shape, dtype)
+    assert_kernel_on_par(kernel, support.reference_w_u, draw, label)
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape", [(1, 128, 2, 2, 64), (1, 64, 1, 2, 128)])
 def test_the_kkt_solve_kernel_inverts_flas_matrix(dtype, shape):
     """fla's fused kkt and solve: the inverse of `I + tril(beta k k^T exp2(g_s - g_t), -1)` per
-    chunk and head, as a direct inverse of the same matrix gives it, within the TF32 merge's
-    rounding (fp32) or one bf16 rounding."""
+    chunk and head, on par with a direct inverse of the same matrix in XLA (`assert_kernel_on_par`)."""
     batch, length, key_heads, value_heads, width = shape
-    keys = jax.random.split(jax.random.key(6), 3)
-    k = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[1], (batch, length, value_heads))).astype(dtype)
-    g = cumulated_decay(keys[2], batch, length, value_heads)
-    want = support.reference_kkt_solve(k, g, beta)
-    kernel = functools.partial(fla_gdn.kkt_solve, interpret=INTERPRETED)
-    whole, fraction = separated_prefix(g)
-    got = kernel(k, whole, beta, g_lo=fraction)
-    assert got.shape == want.shape and got.dtype == want.dtype
-    assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 2e-3)
+
+    def draw(seed):
+        keys = drawn_keys(6, seed, 3)
+        k = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
+        beta = jax.nn.sigmoid(jax.random.normal(keys[1], (batch, length, value_heads))).astype(dtype)
+        return k, cumulated_decay(keys[2], batch, length, value_heads), beta
+
+    def kernel(k, g, beta):
+        whole, fraction = separated_prefix(g)
+        return fla_gdn.kkt_solve(k, whole, beta, g_lo=fraction, interpret=INTERPRETED)
+
+    label = site_label("kkt_solve", shape, dtype)
+    assert_kernel_on_par(kernel, support.reference_kkt_solve, draw, label)
 
 
 @pytest.mark.parametrize("per_key", [False, True])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape", [(1, 192, 2, 2, 64, 64), (1, 128, 1, 2, 128, 64)])
 def test_the_h_kernel_is_flas_recurrence(dtype, shape, per_key):
-    """fla's fwd_h, the memory each chunk enters, the corrected values and the final memory, against
-    a scan over chunks with the same roundings: a decay per head, or per key dimension (USE_GK)."""
+    """fla's fwd_h, the memory each chunk enters, the corrected values and the final memory, on par with
+    a scan over chunks with the same roundings (`assert_kernel_on_par`): a decay per head, or per key
+    dimension (USE_GK)."""
     batch, length, key_heads, value_heads, width, columns = shape
-    keys = jax.random.split(jax.random.key(8), 5)
-    k = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
-    w = (0.1 * jax.random.normal(keys[1], (batch, length, value_heads, width))).astype(dtype)
-    u = jax.random.normal(keys[2], (batch, length, value_heads, columns)).astype(dtype)
-    g = cumulated_decay(keys[3], batch, length, value_heads, width if per_key else None)
-    h0 = 0.1 * jax.random.normal(keys[4], (batch, value_heads, width, columns))
-    h, corrected, final = support.reference_h(k, w, u, g, h0)
-    # The port stores each memory at its slot (`chunked_launch.Sequences`).
-    want = support.entered_states(h), corrected, final
-    kernel = functools.partial(fla_gdn.chunk_fwd_h, interpret=INTERPRETED)
-    whole, fraction = separated_prefix(g)
-    got = kernel(k, w, u, whole, h0, g_lo=fraction)
-    for name, mine, theirs in zip(("h", "v_new", "final"), got, want, strict=True):
-        assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
-        assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
+
+    def draw(seed):
+        keys = drawn_keys(8, seed, 5)
+        k = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
+        w = (0.1 * jax.random.normal(keys[1], (batch, length, value_heads, width))).astype(dtype)
+        u = jax.random.normal(keys[2], (batch, length, value_heads, columns)).astype(dtype)
+        g = cumulated_decay(keys[3], batch, length, value_heads, width if per_key else None)
+        return k, w, u, g, 0.1 * jax.random.normal(keys[4], (batch, value_heads, width, columns))
+
+    def kernel(k, w, u, g, h0):
+        whole, fraction = separated_prefix(g)
+        return fla_gdn.chunk_fwd_h(k, w, u, whole, h0, g_lo=fraction, interpret=INTERPRETED)
+
+    def reference(k, w, u, g, h0):
+        h, corrected, final = support.reference_h(k, w, u, g, h0)
+        # The port stores each memory at its slot (`chunked_launch.Sequences`).
+        return support.entered_states(h), corrected, final
+
+    label = site_label("chunk_fwd_h", shape, dtype, "per key" if per_key else "per head")
+    assert_kernel_on_par(kernel, reference, draw, label)
 
 
 @pytest.mark.parametrize("per_key", [False, True])
@@ -197,75 +235,93 @@ def test_the_h_kernel_is_flas_recurrence(dtype, shape, per_key):
 @pytest.mark.parametrize("shape", [(1, 192, 2, 2, 64, 64), (1, 128, 1, 2, 128, 64)])
 def test_the_dhu_kernel_is_flas_reverse_recurrence(dtype, shape, per_key):
     """fla's bwd_dhu: the memory gradient each chunk leaves into, the initial memory's gradient and
-    the corrected values' full gradient, against a reverse scan with the same roundings: a decay per
-    head, or per key dimension (USE_GK)."""
+    the corrected values' full gradient, on par with a reverse scan with the same roundings
+    (`assert_kernel_on_par`): a decay per head, or per key dimension (USE_GK)."""
     batch, length, key_heads, value_heads, width, columns = shape
-    keys = jax.random.split(jax.random.key(9), 7)
-    q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
-    k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width))).astype(dtype)
-    w = (0.1 * jax.random.normal(keys[2], (batch, length, value_heads, width))).astype(dtype)
-    g = cumulated_decay(keys[3], batch, length, value_heads, width if per_key else None)
-    dht = 0.1 * jax.random.normal(keys[4], (batch, value_heads, width, columns))
-    do = jax.random.normal(keys[5], (batch, length, value_heads, columns)).astype(dtype)
-    dv = jax.random.normal(keys[6], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
-    dh, dh0, dv2 = support.reference_dhu(q, k, w, g, dht, do, dv, scale=scale)
-    # The port stores each memory's gradient at its slot (`chunked_launch.Sequences`).
-    want = support.left_grads(dh), dh0, dv2
-    kernel = functools.partial(fla_gdn.chunk_bwd_dhu, scale=scale, interpret=INTERPRETED)
-    whole, fraction = separated_prefix(g)
-    got = kernel(q, k, w, whole, dht, do, dv, g_lo=fraction)
-    for name, mine, theirs in zip(("dh", "dh0", "dv2"), got, want, strict=True):
-        assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
-        assert relative(mine, theirs) < (2e-2 if dtype == jnp.bfloat16 else 1e-5), name
+
+    def draw(seed):
+        keys = drawn_keys(9, seed, 7)
+        q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
+        k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width))).astype(dtype)
+        w = (0.1 * jax.random.normal(keys[2], (batch, length, value_heads, width))).astype(dtype)
+        g = cumulated_decay(keys[3], batch, length, value_heads, width if per_key else None)
+        dht = 0.1 * jax.random.normal(keys[4], (batch, value_heads, width, columns))
+        do = jax.random.normal(keys[5], (batch, length, value_heads, columns)).astype(dtype)
+        dv = jax.random.normal(keys[6], (batch, length, value_heads, columns)).astype(dtype)
+        return q, k, w, g, dht, do, dv
+
+    def kernel(q, k, w, g, dht, do, dv):
+        whole, fraction = separated_prefix(g)
+        return fla_gdn.chunk_bwd_dhu(q, k, w, whole, dht, do, dv, g_lo=fraction, scale=scale,
+                                     interpret=INTERPRETED)
+
+    def reference(q, k, w, g, dht, do, dv):
+        dh, dh0, dv2 = support.reference_dhu(q, k, w, g, dht, do, dv, scale=scale)
+        # The port stores each memory's gradient at its slot (`chunked_launch.Sequences`).
+        return support.left_grads(dh), dh0, dv2
+
+    label = site_label("chunk_bwd_dhu", shape, dtype, "per key" if per_key else "per head")
+    assert_kernel_on_par(kernel, reference, draw, label)
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape", [(1, 128, 2, 2, 64, 64), (1, 128, 1, 2, 128, 128)])
 def test_the_dv_local_kernel_is_flas(dtype, shape):
-    """fla's bwd_dv_local per chunk and head against the same products in XLA."""
+    """fla's bwd_dv_local per chunk and head, on par with the same products in XLA
+    (`assert_kernel_on_par`)."""
     batch, length, key_heads, value_heads, width, columns = shape
-    keys = jax.random.split(jax.random.key(10), 4)
-    q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
-    k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width))).astype(dtype)
-    g = cumulated_decay(keys[2], batch, length, value_heads)
-    do = jax.random.normal(keys[3], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
-    want = support.reference_dv_local(q, k, g, do, scale=scale)
-    kernel = functools.partial(fla_gdn.chunk_bwd_dv_local, scale=scale, interpret=INTERPRETED)
-    whole, fraction = separated_prefix(g)
-    got = kernel(q, k, whole, do, g_lo=fraction)
-    assert got.shape == want.shape and got.dtype == want.dtype
-    assert relative(got, want) < (2e-2 if dtype == jnp.bfloat16 else 1e-5)
+
+    def draw(seed):
+        keys = drawn_keys(10, seed, 4)
+        q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
+        k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width))).astype(dtype)
+        g = cumulated_decay(keys[2], batch, length, value_heads)
+        return q, k, g, jax.random.normal(keys[3], (batch, length, value_heads, columns)).astype(dtype)
+
+    def kernel(q, k, g, do):
+        whole, fraction = separated_prefix(g)
+        return fla_gdn.chunk_bwd_dv_local(q, k, whole, do, g_lo=fraction, scale=scale, interpret=INTERPRETED)
+
+    label = site_label("chunk_bwd_dv_local", shape, dtype)
+    assert_kernel_on_par(kernel, functools.partial(support.reference_dv_local, scale=scale), draw, label)
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape", [(1, 128, 2, 2, 128, 64), (1, 128, 1, 2, 128, 128)])
 def test_the_dqkwg_kernel_is_flas(dtype, shape):
     """fla's bwd_dqkwg per chunk and head, its key blocks' decay gradient terms summed and grouped value
-    heads summed onto their key head, against the same products in XLA."""
+    heads summed onto their key head, on par with the same products in XLA (`assert_kernel_on_par`)."""
     batch, length, key_heads, value_heads, width, columns = shape
-    keys = jax.random.split(jax.random.key(11), 8)
     chunks = length // 64
-    q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
-    k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width))).astype(dtype)
-    v = jax.random.normal(keys[2], (batch, length, value_heads, columns)).astype(dtype)
-    w = (0.1 * jax.random.normal(keys[3], (batch, length, value_heads, width))).astype(dtype)
-    g = cumulated_decay(keys[4], batch, length, value_heads)
-    h = (0.1 * jax.random.normal(keys[5], (batch, chunks, value_heads, width, columns))).astype(dtype)
-    dh = (0.1 * jax.random.normal(keys[6], (batch, chunks, value_heads, width, columns))).astype(dtype)
-    dv = jax.random.normal(keys[7], (batch, length, value_heads, columns)).astype(dtype)
-    do = jax.random.normal(keys[0], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
-    want = support.reference_dqkwg(q, k, v, w, g, h, dv, do, dh, scale=scale)
-    kernel = functools.partial(fla_gdn.chunk_bwd_dqkwg, scale=scale, interpret=INTERPRETED)
-    states = (support.entered_states(h), dv, do, support.left_grads(dh))
-    whole, fraction = separated_prefix(g)
-    got = kernel(q, k, v, w, whole, *states, g_lo=fraction)
-    names = ("dq", "dk", "dw", "decay pairs", "decay from the start")
-    for name, mine, theirs in zip(names, jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
-        assert mine.shape == theirs.shape and mine.dtype == theirs.dtype, name
-        assert relative(mine, theirs) < (3e-2 if dtype == jnp.bfloat16 else 1e-5), name
+
+    def draw(seed):
+        keys = drawn_keys(11, seed, 9)
+        q = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
+        k = l2norm(jax.random.normal(keys[1], (batch, length, key_heads, width))).astype(dtype)
+        v = jax.random.normal(keys[2], (batch, length, value_heads, columns)).astype(dtype)
+        w = (0.1 * jax.random.normal(keys[3], (batch, length, value_heads, width))).astype(dtype)
+        g = cumulated_decay(keys[4], batch, length, value_heads)
+        h = (0.1 * jax.random.normal(keys[5], (batch, chunks, value_heads, width, columns))).astype(dtype)
+        dh = (0.1 * jax.random.normal(keys[6], (batch, chunks, value_heads, width, columns))).astype(dtype)
+        dv = jax.random.normal(keys[7], (batch, length, value_heads, columns)).astype(dtype)
+        do = jax.random.normal(keys[8], (batch, length, value_heads, columns)).astype(dtype)
+        return q, k, v, w, g, h, dv, do, dh
+
+    def kernel(q, k, v, w, g, h, dv, do, dh):
+        whole, fraction = separated_prefix(g)
+        states = (support.entered_states(h), dv, do, support.left_grads(dh))
+        return tuple(jax.tree.leaves(fla_gdn.chunk_bwd_dqkwg(q, k, v, w, whole, *states, g_lo=fraction,
+                                                             scale=scale, interpret=INTERPRETED)))
+
+    def reference(*operands):
+        # dq, dk, dw, then the decay's gradient terms: its pairs and each token's from its chunk's start.
+        return tuple(jax.tree.leaves(support.reference_dqkwg(*operands, scale=scale)))
+
+    label = site_label("chunk_bwd_dqkwg", shape, dtype)
+    assert_kernel_on_par(kernel, reference, draw, label)
 
 
 def test_a_tokens_decay_gradient_sums_only_the_terms_through_it():
@@ -292,93 +348,119 @@ def wy_math(k, v, beta, g, chunk=64):
     return support.wy(*(support.head_chunks(x, chunk) for x in (k, v, beta, g)))
 
 
-@pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 2e-2)])
-def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation(dtype, bound):
-    """fla's prepare_wy_repr_bwd gives the gradients of `w` and `u`'s cotangents with respect to the
-    keys, values, beta and each token's decay through the inverse: as float64 autodiff of the same
-    representation, within fp32 rounding of fp32 operands and bf16 storage's of bf16. The kernels
-    read the cumulated decay in base 2 and give each token's decay's gradient in the natural-log
-    units the caller's gate is in, so the reference's gradient with respect to the base-2 cumulated
-    decay is scaled by 1 / ln 2 (fla's RCP_LN2) and summed back over each chunk to compare."""
-    batch, length, heads, width, columns = 1, 128, 2, 64, 64
-    keys = jax.random.split(jax.random.key(12), 6)
-    k = l2norm(jax.random.normal(keys[0], (batch, length, heads, width))).astype(dtype)
-    v = jax.random.normal(keys[1], (batch, length, heads, columns)).astype(dtype)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, heads))).astype(dtype)
-    g = cumulated_decay(keys[3], batch, length, heads)
-    dw = jax.random.normal(keys[4], (batch, length, heads, width)).astype(dtype)
-    du = jax.random.normal(keys[5], (batch, length, heads, columns)).astype(dtype)
-    def chunks(x):
-        return jnp.moveaxis(x.reshape(batch, length // 64, 64, heads, *x.shape[3:]), 3, 2)
-
+def wy_operands(stream: int, seed: int, batch, length, key_heads, value_heads, width, columns, dtype):
+    """A WY backward's operands, `(k, v, beta, g, a, dw, du)`: `a` the inverse its matrix has, rounded to
+    `dtype` as the forward stores it."""
+    keys = drawn_keys(stream, seed, 6)
+    k = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width))).astype(dtype)
+    v = jax.random.normal(keys[1], (batch, length, value_heads, columns)).astype(dtype)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, value_heads))).astype(dtype)
+    g = cumulated_decay(keys[3], batch, length, value_heads)
+    dw = jax.random.normal(keys[4], (batch, length, value_heads, width)).astype(dtype)
+    du = jax.random.normal(keys[5], (batch, length, value_heads, columns)).astype(dtype)
     with jax.enable_x64(new_val=True):
-        operands = widened((k, v, beta, np.asarray(g, np.float64)))
+        group = value_heads // key_heads
+        operands = widened((jnp.repeat(k, group, axis=2), v, beta, np.asarray(g, np.float64)))
         inverse = np.asarray(wy_math(*operands)[2])
-        cot_w, cot_u = (chunks(x) for x in widened((dw, du)))
+    a = jnp.asarray(np.moveaxis(inverse, 2, 3).reshape(batch, length, value_heads, 64), dtype)
+    return k, v, beta, g, a, dw, du
 
-        def scored(*args):
-            w, u, _ = wy_math(*args)
-            return jnp.sum(w * cot_w) + jnp.sum(u * cot_u)
 
-        want = [np.asarray(x) for x in jax.grad(scored, argnums=(0, 1, 2, 3))(*operands)]
-    cumulated = (want[3] * fla_gdn.RCP_LN2).reshape(batch, length // 64, 64, heads)
-    want[3] = np.flip(np.cumsum(np.flip(cumulated, 2), 2), 2).reshape(want[3].shape)
-    a = jnp.asarray(np.moveaxis(inverse, 2, 3).reshape(batch, length, heads, 64), dtype)
-    kernel = functools.partial(fla_gdn.prepare_wy_repr_bwd, interpret=INTERPRETED)
+def wy_backward(k, v, beta, g, a, dw, du, dk=None):
+    """The port's WY backward (`fla_gdn.prepare_wy_repr_bwd`) as fla calls it, with no query-side decay
+    terms."""
     whole, fraction = separated_prefix(g)
-    got = kernel(k, v, beta, whole, a, dw, du, terms=no_terms(g), g_lo=fraction)
-    for name, mine, theirs in zip(("dk", "dv", "db", "dg"), got, want, strict=True):
-        assert mine.shape == theirs.shape, name
-        assert relative(mine, theirs) < bound, name
+    return fla_gdn.prepare_wy_repr_bwd(k, v, beta, whole, a, dw, du, dk, terms=no_terms(g), g_lo=fraction,
+                                       interpret=INTERPRETED)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation(dtype):
+    """fla's prepare_wy_repr_bwd gives the gradients of `w` and `u`'s cotangents with respect to the
+    keys, values, beta and each token's decay through the stored inverse, on par with the same gradient
+    in XLA with fla's roundings (`support.reference_wy_bwd`, `assert_kernel_on_par`). The kernels read the
+    cumulated decay in base 2 and give each token's decay's gradient in the natural-log units the caller's
+    gate is in."""
+    shape = (1, 128, 2, 2, 64, 64)
+    label = site_label("prepare_wy_repr_bwd", shape, dtype)
+    assert_kernel_on_par(wy_backward, support.reference_wy_bwd,
+                         lambda seed: wy_operands(12, seed, *shape, dtype), label)
 
 
 @pytest.mark.parametrize("value_heads", [2, 4])
 def test_the_wy_backward_adds_the_keys_gradient_so_far_once_per_key_head(value_heads):
     """Given the query-side kernel's key gradient, the WY backward returns its own plus that one,
     summed in fp32 before the one rounding, the earlier gradient counted once for each key head
-    whatever its group of value heads; the rest of its outputs are unchanged."""
-    batch, length, key_heads, width, columns = 1, 128, 2, 64, 64
-    keys = jax.random.split(jax.random.key(14), 8)
-    k = l2norm(jax.random.normal(keys[0], (batch, length, key_heads, width)))
-    v = jax.random.normal(keys[1], (batch, length, value_heads, columns))
-    beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, value_heads)))
-    g = cumulated_decay(keys[3], batch, length, value_heads)
-    a = jnp.tril(jax.random.normal(keys[4], (batch, length, value_heads, 64)) * 0.1)
-    dw = jax.random.normal(keys[5], (batch, length, value_heads, width))
-    du = jax.random.normal(keys[6], (batch, length, value_heads, columns))
-    earlier = jax.random.normal(keys[7], k.shape)
-    whole, fraction = separated_prefix(g)
-    backward = functools.partial(fla_gdn.prepare_wy_repr_bwd, terms=no_terms(g), g_lo=fraction,
-                                 interpret=INTERPRETED)
-    alone = backward(k, v, beta, whole, a, dw, du)
-    joined = backward(k, v, beta, whole, a, dw, du, earlier)
-    assert relative(joined[0], alone[0] + earlier) < 1e-6
-    for name, mine, theirs in zip(("dv", "db", "dg"), joined[1:], alone[1:], strict=True):
+    whatever its group of value heads: its keys' gradient on par with its own plus the earlier one, added
+    after (check 1, `support.reference_wy_bwd` in float64 plus the earlier gradient the truth); the rest
+    of its outputs are the same bits."""
+    shape = (1, 128, 2, value_heads, 64, 64)
+
+    def draw(seed):
+        operands = wy_operands(14, seed, *shape, jnp.float32)
+        return *operands, jax.random.normal(drawn_keys(15, seed, 1)[0], operands[0].shape)
+
+    def joined(*operands):
+        return wy_backward(*operands)[0]
+
+    def added(*operands):
+        return wy_backward(*operands[:-1])[0] + operands[-1]
+
+    def truth(*operands):
+        return support.reference_wy_bwd(*operands[:-1])[0] + operands[-1]
+
+    operands = draw(0)
+    for name, mine, theirs in zip(("dv", "db", "dg"), wy_backward(*operands)[1:],
+                                  wy_backward(*operands[:-1])[1:], strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=name)
+    label = site_label("prepare_wy_repr_bwd", shape, jnp.float32, "with the keys' gradient so far")
+    assert_as_exact(joined, added, draw, label, seeds=FEWEST_SEEDS, truth_fn=truth)
 
 
-@pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])
-def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype, bound):
-    """The whole ported rule through its custom VJP, output, final memory and the six gradients,
-    against the token recurrence in float64: within fp32 rounding of the chunked algebra for fp32
-    operands, and within bf16 storage's rounding for bf16, fla's numerics."""
+def through_operands(rule):
+    """`rule` as an arm of a rule site: its output, final memory and six gradients (`through`) of the eight
+    operands `support.delta_operands` draws."""
+    def run(q, k, v, g, beta, h0, do, dht):
+        return through(rule, do, dht)(q, k, v, g, beta, h0)
+    return run
+
+
+def rule_seeds(label: str) -> int:
+    """A rule site's declared seeds for check 1 (`RULE_SEEDS`)."""
+    return RULE_SEEDS.get(label, FEWEST_SEEDS)
+
+
+RULE_SEEDS = {"the ported rule float32": 32,
+              "fla_rule at heads, widths and length (1, 2, 64, 64, 100)": 32,
+              "fla_rule at heads, widths and length (1, 3, 64, 64, 64)": 32,
+              "fla_rule at heads, widths and length (2, 6, 32, 96, 70)": 16,
+              "fla_rule at heads, widths and length (1, 2, 96, 160, 64)": 64,
+              "a gated delta net on fla against it on xla, float32": 128,
+              "a gated delta net on fla against it on xla, bfloat16": 64}
+"""The rule sites' declared seeds for check 1 past the fewest, by label: every rule site sized by `seeds_for`
+on armada's CPUs (2026-11-14, fla-size at 4dd1acd05ea and 1cc5e78a05e), each the fewest (`FEWEST_SEEDS`) but
+these."""
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype):
+    """The whole ported rule through its custom VJP, output, final memory and the six gradients, on par
+    with fla's chunked rule in XLA with fla's roundings (`support.reference_rule`) by check 1, truth the
+    token recurrence in float64."""
     batch, length, heads, width = 1, 128, 2, 64
-    q, k, v, g, beta, h0, do, dht = support.delta_operands(13, batch, length, heads, heads, width, width,
-                                                           dtype)
-    scale = width ** -0.5
 
     def ported(*args):
-        return fla_gdn.chunk_gated_delta_rule(*args, None, scale, 64, INTERPRETED)
+        return fla_gdn.chunk_gated_delta_rule(*args, None, width ** -0.5, 64, INTERPRETED)
 
-    out, final, *grads = through(ported, do.astype(jnp.float32), dht)(q, k, v, g, beta, h0)
-    with jax.enable_x64(new_val=True):
-        operands = widened((q, k, v, g, beta, h0, do, dht))
-        want_out, want_final, *want_grads = (np.asarray(x) for x in
-                                             through(rule_math, *operands[6:])(*operands[:6]))
-    assert relative(out, want_out) < bound
-    assert relative(final, want_final) < bound
-    for name, mine, theirs in zip(("q", "k", "v", "g", "beta", "h0"), grads, want_grads, strict=True):
-        assert relative(mine, theirs) < bound, name
+    def theirs(*args):
+        return support.reference_rule(*args, width ** -0.5)
+
+    def draw(seed):
+        return support.delta_operands(seed, batch, length, heads, heads, width, width, dtype)
+
+    label = f"the ported rule {jnp.dtype(dtype).name}"
+    assert_as_exact(through_operands(ported), through_operands(theirs), draw, label,
+                    seeds=rule_seeds(label), truth_fn=through_operands(recurrence))
 
 
 def test_the_oracle_a_chunk_at_a_time_computes_the_token_recurrence():
@@ -437,24 +519,21 @@ def test_a_sequences_first_decay_gradient_is_exactly_zero_from_no_memory(per_key
 def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
         key_heads, value_heads, width, columns, length):
     """`fla_rule`, the port as a GPU runs it, for calls its blocks do not fit as they come: padded to
-    them and cut back, through the custom VJP, its output, final memory and gradients within fp32
-    rounding of the token recurrence in float64. The padding is exact, so this checks the shaping;
-    the port trained natively at a training shape is held to float64 on a GPU by
-    tests/test_gpu_recurrence.py's port cells.
-    (Its decay gradient, fla's base-2 sum, sits 2.0x the portable IEEE math's distance here, so the
-    math is no budget for it.)"""
-    q, k, v, g, beta, h0, do, dht = support.delta_operands(17, 1, length, key_heads, value_heads, width,
-                                                           columns)
+    them and cut back, through the custom VJP, its output, final memory and gradients on par with the
+    portable rule on fla's plain prefix (`fla_math`) by check 1, truth the token recurrence in float64. The
+    padding is exact, so this checks the shaping; the port trained natively at a training shape is held
+    to float64 on a GPU by tests/test_gpu_recurrence.py's port cells."""
+    geometry = (key_heads, value_heads, width, columns, length)
 
-    port = through(fla_rule, do, dht)(q, k, v, g, beta, h0)
-    assert port[0].shape == v.shape and port[1].shape == h0.shape and port[1].dtype == jnp.float32
-    with jax.enable_x64(new_val=True):
-        operands = widened((q, k, v, g, beta, h0, do, dht))
-        truth = jax.tree.map(np.asarray, through(recurrence, *operands[6:])(*operands[:6]))
-    names = ("out", "final", "q", "k", "v", "g", "beta", "h0")
-    for name, mine, theirs in zip(names, port, truth, strict=True):
-        assert mine.shape == theirs.shape, name
-        assert relative(mine, theirs) < 1e-4, name
+    def draw(seed):
+        return support.delta_operands(seed, 1, length, key_heads, value_heads, width, columns)
+
+    shapes = jax.eval_shape(through_operands(fla_rule), *draw(0))
+    assert shapes[0].shape == draw(0)[2].shape and shapes[1].shape == draw(0)[5].shape
+    assert shapes[1].dtype == jnp.float32
+    label = f"fla_rule at heads, widths and length {geometry}"
+    assert_as_exact(through_operands(fla_rule), through_operands(fla_math), draw, label,
+                    seeds=rule_seeds(label), truth_fn=through_operands(recurrence))
 
 
 @pytest.mark.parametrize("per_key", [False, pytest.param(True, marks=pytest.mark.skipif(
@@ -466,7 +545,9 @@ def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key, beg
     """Packed documents (`starts`, each a sequence of its own, fla's varlen), with a
     decay per head or per key dimension (Kimi's delta attention): each document from a zero memory but
     a row's first, from the row's, the row's final memory its last document's; output, final memory
-    and gradients within fp32 rounding of the token recurrence run document by document in float64.
+    and gradients on par with the portable rule on fla's plain prefix over the same documents
+    (`fla_math`, its prefix chunked from each row's start) by check 1, truth the token recurrence run
+    document by document in float64.
     Documents start on and off the chunk grid, one shorter than a chunk and one longer. Where a row's
     first token is `begun`, marked as a document's start, that row drops its memory, whose gradient
     is zero."""
@@ -476,21 +557,21 @@ def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key, beg
     for row, begins in enumerate(cuts):
         starts[row, list(begins[1:])] = True
     starts[1, 0] = begun
-    q, k, v, g, beta, h0, do, dht = support.delta_operands(19, batch, length, key_heads, value_heads, width,
-                                                           width, per_key=per_key)
 
     packed = functools.partial(fla_rule, starts=jnp.asarray(starts), max_segments=max(map(len, cuts)))
-    port = through(packed, do, dht)(q, k, v, g, beta, h0)
-    with jax.enable_x64(new_val=True):
-        operands = widened((q, k, v, g, beta, h0, do, dht))
-        def documents(*operands):
-            memory = jnp.where(jnp.asarray(starts[:, 0])[:, None, None, None], 0.0, operands[-1])
-            return recurrence(*operands[:-1], memory, cuts=cuts)
 
-        truth = jax.tree.map(np.asarray, through(documents, *operands[6:])(*operands[:6]))
-    names = ("out", "final", "q", "k", "v", "g", "beta", "h0")
-    for name, mine, theirs in zip(names, port, truth, strict=True):
-        assert relative(mine, theirs) < 1e-4, name
+    def documents(*operands):
+        memory = jnp.where(jnp.asarray(starts[:, 0])[:, None, None, None], 0.0, operands[-1])
+        return recurrence(*operands[:-1], memory, cuts=cuts)
+
+    def draw(seed):
+        return support.delta_operands(seed, batch, length, key_heads, value_heads, width, width,
+                                      per_key=per_key)
+
+    decay = "per key" if per_key else "per head"
+    label = f"fla_rule over packed documents, {decay}, {'begun' if begun else 'carried'}"
+    assert_as_exact(through_operands(packed), through_operands(functools.partial(fla_math, starts=starts)),
+                    draw, label, seeds=rule_seeds(label), truth_fn=through_operands(documents))
 
 
 @pytest.mark.mesh(devices=2)
@@ -556,48 +637,66 @@ def test_a_cached_continuation_whose_history_varies_in_a_checked_map_runs(kind):
     assert np.isfinite(np.asarray(got)).all()
 
 
-@pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])
-def test_a_gated_delta_net_on_fla_matches_it_on_xla(dtype, bound):
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_a_gated_delta_net_on_fla_matches_it_on_xla(dtype):
     """The layer where a GPU runs the port hands it its projections' dtype and its keys on their own
-    heads: its output and parameter gradients are the portable rule's, within fp32 rounding in
-    float32 and within bf16 storage's rounding in bfloat16, fla's numbers."""
-    x = jax.random.normal(jax.random.key(23), (2, 72, 64)).astype(dtype)
+    heads: its output and its parameters' and input's gradients on par with the same layer on the portable
+    rule (check 1), each held to the layer in float64, the portable rule's, as the truth."""
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64,
                           dtype=dtype)
-    with row_names_port("gated_delta_rule", "fla", port=False):
-        params = nn.unbox(layer.init(jax.random.key(29), x))
+    wide = layer.clone(dtype=jnp.float64)
 
-    def loss(params, *, port):
-        with row_names_port("gated_delta_rule", "fla", port=port):
-            out = layer.apply(params, x)
-        return jnp.sum(out.astype(jnp.float32) ** 2), out
+    def draw(seed):
+        keys = drawn_keys(23, seed, 3)
+        x = jax.random.normal(keys[0], (2, 72, 64)).astype(dtype)
+        with row_names_port("gated_delta_rule", "fla", port=False):
+            params = nn.unbox(layer.init(keys[1], x))
+        return params, x, jax.random.normal(keys[2], x.shape).astype(dtype)
 
-    (_, want), want_grads = jax.value_and_grad(loss, has_aux=True)(params, port=False)
-    (_, got), got_grads = jax.value_and_grad(loss, has_aux=True)(params, port=True)
-    assert got.dtype == want.dtype == dtype
-    assert relative(got, want) < bound
-    for path, mine in jax.tree_util.tree_leaves_with_path(got_grads):
-        theirs = functools.reduce(lambda node, key: node[key.key], path, want_grads)
-        assert relative(mine, theirs) < bound, jax.tree_util.keystr(path)
+    def on(module, *, port: bool):
+        def applied(params, x):
+            with row_names_port("gated_delta_rule", "fla", port=port):
+                return module.apply(params, x)
+        return with_gradients(applied)
+
+    def laid(*, port: bool):
+        shapes = jax.eval_shape(on(layer, port=port), *draw(0))
+        return jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes)
+
+    assert laid(port=True)[0][1] == dtype
+    assert laid(port=True) == laid(port=False)
+    label = f"a gated delta net on fla against it on xla, {jnp.dtype(dtype).name}"
+    assert_as_exact(on(layer, port=True), on(layer, port=False), draw, label, seeds=rule_seeds(label),
+                    truth_fn=on(wide, port=False))
 
 
 @pytest.mark.parametrize("width", [192, 256])
 def test_dews_fla_rule_takes_wide_keys_up_to_fla_s_256_in_bf16(width):
     """192- and 256-wide bf16 keys on the port, the 192 padded to 256, a width every key block of
-    the configs divides: the output and final memory of the token recurrence in float64, within
-    bf16 storage's rounding. A coverage check of the shapes; the port trained natively is held to
-    float64 on a GPU by tests/test_gpu_recurrence.py's port cells."""
-    keys = jax.random.split(jax.random.key(59), 5)
-    q = l2norm(jax.random.normal(keys[0], (1, 64, 1, width))).astype(jnp.bfloat16)
-    k = l2norm(jax.random.normal(keys[1], q.shape)).astype(jnp.bfloat16)
-    v = jax.random.normal(keys[2], (1, 64, 2, 64)).astype(jnp.bfloat16)
-    g = -jnp.exp(jax.random.normal(keys[3], v.shape[:3]) - 3.0)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], v.shape[:3])).astype(jnp.bfloat16)
-    out, final = fla_rule(q, k, v, g, beta)
-    with jax.enable_x64(new_val=True):
-        operands = widened((jnp.repeat(q, 2, axis=2), jnp.repeat(k, 2, axis=2), v, g, beta))
-        want_out, want_final = (np.asarray(x) for x in rule_math(*operands, jnp.zeros((1, 2, width, 64))))
-    assert relative(out, want_out) < 2e-2 and relative(final, want_final) < 2e-2
+    the configs divides: the output and final memory on par with fla's chunked rule in XLA with fla's
+    roundings (`support.reference_rule`) by check 1, truth the token recurrence in float64. A coverage check
+    of the shapes; the port trained natively is held to float64 on a GPU by tests/test_gpu_recurrence.py's
+    port cells."""
+    def draw(seed):
+        keys = drawn_keys(59, seed, 5)
+        q = l2norm(jax.random.normal(keys[0], (1, 64, 1, width))).astype(jnp.bfloat16)
+        k = l2norm(jax.random.normal(keys[1], q.shape)).astype(jnp.bfloat16)
+        v = jax.random.normal(keys[2], (1, 64, 2, 64)).astype(jnp.bfloat16)
+        g = -jnp.exp(jax.random.normal(keys[3], v.shape[:3]) - 3.0)
+        beta = jax.nn.sigmoid(jax.random.normal(keys[4], v.shape[:3])).astype(jnp.bfloat16)
+        return q, k, v, g, beta
+
+    def from_zero(rule):
+        def run(q, k, v, g, beta):
+            return rule(q, k, v, g, beta, jnp.zeros((1, 2, width, 64), jnp.result_type(v, jnp.float32)))
+        return run
+
+    label = f"fla_rule with bf16 keys {width} wide"
+    def theirs(*args):
+        return support.reference_rule(*args, width ** -0.5)
+
+    assert_as_exact(fla_rule, from_zero(theirs), draw, label, seeds=rule_seeds(label),
+                    truth_fn=from_zero(recurrence))
 
 
 ROUTES = {

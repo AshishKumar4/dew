@@ -498,6 +498,15 @@ def plain_prefix(g, chunk: int = CHUNKED):
     return g + jax.lax.stop_gradient(recut - g)
 
 
+def fla_math(q, k, v, g, beta, h0, starts=None):
+    """The portable rule (`math`) on fla's plain prefix (`plain_prefix`): a float32 sample of the formula the
+    port runs, fla's arithmetic (its decay cumulated in base 2 in fp32 within each chunk), which check 1 holds
+    the port to on the host, where fla does not run. Its prefix chunks each row from the row's start, where
+    fla chunks a packed row's documents each from its own (`starts`): the same rounding, at most a chunk's
+    terms a sum, at other places."""
+    return math(q, k, v, plain_prefix(g), beta, h0, starts)
+
+
 def fused_step(token, held, taps, gate, beta, log_a, bias, z, weight, state, *, epsilon: float,
                activation: str, dtype, active=None):
     """`(output, history', state')` of a gated delta net's decode token whole in the recurrence's step
