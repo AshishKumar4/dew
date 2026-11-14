@@ -354,7 +354,8 @@ class Probe:
     temp: int | None
     argument: int | None
     ahead: bool = False
-    """Whether the executable is the step compiled ahead (`FitSearch.ahead`), not the search's own."""
+    """Whether the executable was compiled before this search, not by it: the step compiled ahead
+    (`FitSearch.ahead`), or one a search before it compiled (`FitSearch.compiled`)."""
     compile_seconds: float = 0.0
     """Time spent compiling or loading this program, apart from its shape trace and lowering."""
     spent: Mapping[str, float] = dataclasses.field(default_factory=dict)
@@ -936,7 +937,7 @@ class FitSearch[LossT, EffectsT]:
             if ahead is not None:
                 executable, self.ahead = ahead.taken(candidate.lowered), None
             elif candidate.sampled is None and kept is not None:
-                executable = kept
+                executable, taken = kept, True
             else:
                 # A run that inspects compiles its sampled step beside the step, at once (`report.attempts`),
                 # its compile kept only where the step fits, as the step's own is kept first.

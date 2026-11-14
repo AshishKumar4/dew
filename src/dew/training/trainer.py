@@ -203,7 +203,7 @@ _input_log = logging.getLogger("dew.training.input")
 if TYPE_CHECKING:
     from dew.optim import OptimConfig
     from dew.telemetry.profile import Profiler
-    from dew.training.ahead import AheadOfTime, LaterPhases
+    from dew.training.ahead import AheadOfTime, LaterPlans
 
 StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
 """A compiled step's body: the state and the global batch in, the new state,
@@ -313,9 +313,8 @@ class Trainer(Generic[Loss, Effects]):
         self.lower_for, self.tune_kernels = lower_for, tune_kernels
         self.inspection, self.param_dtype, self.diloco = inspection, param_dtype, diloco
         self.phase_passes = PhasePasses.of(objective, phase_passes)
-        # A configured run trained again to compile its later phases' steps ahead (`LaterPhases`, set by
-        # `dew.config.RunConfig.train`); none for a trainer used directly.
-        self.later_phases: LaterPhases | None = None
+        # The later data phases' steps of the fit in progress, planned off its loop (`LaterPlans`).
+        self._later: LaterPlans | None = None
         if diloco is not None:
             diloco.admits(self.layout.host, record)
         # Where the fit ladder stands and the links its traces read (`StepCompiler`), and what the last
@@ -343,10 +342,11 @@ class Trainer(Generic[Loss, Effects]):
         (`StepSettings.optimizer`)."""
         return self._settings().optimizer
 
-    def _settings(self) -> StepSettings[Loss, Effects]:
+    def _settings(self, objective: Objective[Loss, Effects] | None = None) -> StepSettings[Loss, Effects]:
         """What this trainer states of the step it compiles, as it stands (`StepSettings`): the one place a
         compile reads them from."""
-        return StepSettings(self.objective, self._optimizer, self.layout, self.device_mesh, self.accumulation,
+        return StepSettings(self.objective if objective is None else objective, self._optimizer, self.layout,
+                            self.device_mesh, self.accumulation,
                             self.step, self.dynamic_scale, self.diloco, self.tune_kernels, self.inspection,
                             self.microbatches, self.record, self.lower_for, self.state_mesh)
 
@@ -473,7 +473,7 @@ class Trainer(Generic[Loss, Effects]):
         from dew.distributed.host import companion_mesh
         return companion_mesh(self.device_mesh)
 
-    def _step_key(self) -> Hashable | None:
+    def _step_key(self, objective: Objective[Loss, Effects], compiler: StepCompiler) -> Hashable | None:
         """A value of everything this trainer's step traces from beside its arguments, equal for two trainers
         whose steps trace alike, so a refit or a resume in the same process that builds its trainer and
         objective anew reads the step its equal traced (`dew.training._candidates.candidate_for`; row 3873):
@@ -484,29 +484,37 @@ class Trainer(Generic[Loss, Effects]):
         decided key nothing (row 6022: every refit on a tensor- or sequence-split mesh traced its step again).
         None where a value states none of it: an objective that states no trace, an optimizer given built, a
         custom step, a device step or a setting compared by identity (`frozen_value`), a loss scale given
-        built, stated links, or a run that measures its kernels' configs as it lowers."""
+        built, stated links, or a run that measures its kernels' configs as it lowers. `objective` and
+        `compiler` are those the step is built from and climbs on (`_stepping`)."""
         from dew.objectives.base import UNKEYED, frozen_value, stated_trace
 
-        objective = stated_trace(self.objective)
-        if (objective is None or self._config is None or self.step is not None or self._scaled is None
-                or self._compiler.stated_links or self.tune_kernels):
+        stated = stated_trace(objective)
+        if (stated is None or self._config is None or self.step is not None or self._scaled is None
+                or compiler.stated_links or self.tune_kernels):
             return None
         settings = frozen_value((self._config, self._shape.device, self.mesh, self.layout, self.inspection,
                                  self.param_dtype, self.diloco))
         if settings is UNKEYED:
             return None
-        return (type(self.objective), objective, settings, self._shape.updates, self._shape.examples,
+        return (type(objective), stated, settings, self._shape.updates, self._shape.examples,
                 self._microbatches,
-                self.accumulation, self.split, self._scaled, self.lower_for, self._compiler.narrow,
+                self.accumulation, self.split, self._scaled, self.lower_for, compiler.narrow,
                 self.record)
 
-    def _stepping(self) -> Stepping[Loss, Effects]:
+    def _stepping(self, objective: Objective[Loss, Effects] | None = None,
+                  compiler: StepCompiler | None = None) -> Stepping[Loss, Effects]:
         """What a fit search's candidates read of this trainer beside its public fields, as it stands
-        (`dew.training._candidates.Stepping`)."""
-        return Stepping(self._settings(), self._step_key, self.shardings, self._loss_shape, self._staging,
-                        self._initialize_accumulation, self._model_batch, self._model_shapes, self._step_body,
-                        functools.partial(fetched_state, layout=self.layout), self._traced_on, self._shape,
-                        self._validation, self._builds_window, self._window_of)
+        (`dew.training._candidates.Stepping`): its step built from `objective` and climbed on `compiler`,
+        the trainer's own where not given (a later phase's off the loop, `dew.training.ahead.LaterPlans`)."""
+        objective = self.objective if objective is None else objective
+        compiler = self._compiler if compiler is None else compiler
+        bound = functools.partial
+        return Stepping(self._settings(objective), bound(self._step_key, objective, compiler), self.shardings,
+                        bound(self._loss_shape, objective=objective), self._staging,
+                        bound(self._initialize_accumulation, objective=objective), self._model_batch,
+                        self._model_shapes, bound(self._step_body, objective=objective),
+                        bound(fetched_state, layout=self.layout), self._traced_on, self._shape,
+                        self._validation, self._builds_window, bound(self._window_of, objective=objective))
 
     @functools.cached_property
     def _staging(self) -> StageLocal:
@@ -804,14 +812,16 @@ class Trainer(Generic[Loss, Effects]):
             aval.shape, aval.dtype, sharding=aval.sharding if aval.sharding.mesh.explicit_axes else None,
             weak_type=aval.weak_type), jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals))
 
-    def _loss_shape(self, state: TrainState, batch: Batch, window: int, split: int = 1):
+    def _loss_shape(self, state: TrainState, batch: Batch, window: int, split: int = 1, *,
+                    objective: Objective[Loss, Effects]):
         """The loss's program (`dew.training.transaction.traced_loss`, which narrow copies read) and its
         shapes."""
-        loss, (variables, *rest) = traced_loss(self.objective, state, window, split)
+        loss, (variables, *rest) = traced_loss(objective, state, window, split)
         return jax.make_jaxpr(loss, return_shape=True)(variables, self._model_shapes(batch), *rest)
 
     def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, window: int,
-                                 split: int = 1, shape_only=False, donor: Accumulation | None = None):
+                                 split: int = 1, shape_only=False, donor: Accumulation | None = None,
+                                 objective: Objective[Loss, Effects]):
         """The state with the accumulation a `window` of microbatches of `batch`'s shapes pools in, empty;
         unchanged under a custom step or a held one that replays such batches (`Accumulation.replays`): a
         ramp's stage begins with a window (`Ramp.stages`). Under a window of one, the state holds none: an
@@ -835,7 +845,7 @@ class Trainer(Generic[Loss, Effects]):
         records = jax.tree.map(shape, self._model_shapes(batch))
         mutable = (None if shared or aux.variables is None else
                    jax.tree.map(shape, {name: state.variables[name] for name in aux.variables}))
-        batch_stats = batch_statistics_shapes(self.objective, state, records, window, split)
+        batch_stats = batch_statistics_shapes(objective, state, records, window, split)
 
         def zeros(leaf):
             wide = at_least_fp32(leaf.dtype)
@@ -901,13 +911,16 @@ class Trainer(Generic[Loss, Effects]):
             held is None or (bool(staged) and not held.replays(candidate.prepared.window)))
 
     def _window_of(self, state: TrainState, candidate: Candidate, window: int,
-                   donor: Accumulation | None = None) -> TrainState:
+                   donor: Accumulation | None = None, *,
+                   objective: Objective[Loss, Effects] | None = None) -> TrainState:
         """`state` with the accumulation `window` microbatches of `candidate`'s pool in, empty, on its shards
         (`windowed`), built over `donor`, the empty window it replaces, where given: what a run's first step
         of a window builds, and a run compiled ahead compiles (`dew.training.ahead.started`)."""
         return windowed(lambda state, rows, *, shape_only: self._initialize_accumulation(
             state, rows, candidate.shapes, window=window, split=window // self.accumulation,
-            shape_only=shape_only, donor=donor), state, candidate.micro, self.shardings)
+            shape_only=shape_only, donor=donor,
+            objective=self.objective if objective is None else objective), state, candidate.micro,
+            self.shardings)
 
     @contextlib.contextmanager
     def _traced_on(self, mesh: Mesh | AbstractMesh,
@@ -927,19 +940,19 @@ class Trainer(Generic[Loss, Effects]):
             yield schedule
 
     def _step_body(self, shapes, copies, split: int, resting: Mapping[str, object] | None = None,
-                   sampled: bool = False, placed=None):
+                   sampled: bool = False, placed=None, *, objective: Objective[Loss, Effects]):
         """The objective transaction over a step's batch read in `split` microbatches, which brings the
         state's fields `resting` places in host memory to the device only once its gradient is ready, a
         chunk at a time (`Transaction.past`), and, `sampled`, summarizes what the run inspects at its
         commit; or a custom step with no invented commit telemetry, which reads it whole."""
         if self.step is None:
-            return Transaction(self.objective, self.optimizer, split * self.accumulation, shapes, copies,
+            return Transaction(objective, self.optimizer, split * self.accumulation, shapes, copies,
                                split=split, record=self.record, resting=resting,
                                examples=self._shape.examples,
                                inspection=self.inspection if sampled else None, placed=placed).step()
         # A custom step need not run the objective's loss, which passes a model the run's progress.
-        refuse_unpassed_progress(self.objective, passes=isinstance(self.step, PassesProgress))
-        custom = self.step(self.objective, self.optimizer)
+        refuse_unpassed_progress(objective, passes=isinstance(self.step, PassesProgress))
+        custom = self.step(objective, self.optimizer)
 
         def run(current, batch, part, tokens, closes=None, whole=None):
             advanced, loss, aux = custom(current, batch)
@@ -1147,8 +1160,9 @@ class Trainer(Generic[Loss, Effects]):
                 if plan.restore_best and run.preempted is None:
                     trained = self._best_model(trained, run)
             finally:
-                if self.later_phases is not None:
-                    self.later_phases.stopped()
+                if self._later is not None:
+                    self._later.stopped()
+                    self._later = None
                 primary = sys.exception()
                 error = self._closed(run, primary, profiler)
                 if primary is None and error is not None:
@@ -1307,9 +1321,11 @@ class Trainer(Generic[Loss, Effects]):
                     state, loss, aux, finite, accepted, committed = train_step(
                         state, device, sampled=self.inspection is not None and self.inspection.samples(
                             run.current + 1, self.accumulation))
-                if not seen and self.later_phases is not None:
-                    # Once the first step is dispatched, its later phases' steps compile ahead off the run.
-                    self.later_phases.started(self, batch)
+                if not seen and self.phase_passes.counts:
+                    # Once the first step is dispatched, its later phases' steps are planned off the loop.
+                    from dew.training.ahead import LaterPlans
+
+                    self._later = LaterPlans.started(self, batch, state)
                 # Written off the loop, which never waits on it (row 2313), its clock the step it sees done.
                 interval.seen()
                 self._read_taken(run, wait=False)
@@ -2095,6 +2111,9 @@ class Trainer(Generic[Loss, Effects]):
                 state = freshly_held(state)
                 # Its empty window binds no split: the new step's window is built over it.
                 self._compiler.afresh = True
+            if self._later is not None:
+                # What the phase's plan off the loop compiled, which its plan here takes (`LaterPlans`).
+                self._compiler.taken_executables(self._later.taken(self.phase_passes.current))
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.
         trials = Trials(state, batch)
         if signature not in compiled:

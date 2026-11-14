@@ -85,7 +85,6 @@ from dew.registry import (
     parameters,
     record_argument,
     to_record,
-    trusted_packages,
     wants_tuple,
 )
 from dew.scores import Summary
@@ -93,7 +92,7 @@ from dew.state import TrainState
 from dew.telemetry.profile import CaptureOptions
 from dew.telemetry.records import RunRecord, TrialFinished, packages_installed, tracker_json
 from dew.training._fit import FitArguments
-from dew.training.ahead import AheadOfTime, CompiledAhead, LaterPhases, fit_plan
+from dew.training.ahead import AheadOfTime, CompiledAhead, fit_plan
 from dew.training.budget import Pause
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Split
@@ -1495,10 +1494,6 @@ class RunConfig:
             # state restored.
             self._agree_resume(checkpoints, built, dataset, steps)
             agreed("run metadata", record_run)
-            # Its later phases' steps compile ahead in a run of its record (`LaterPhases`), where one
-            # rebuilds it.
-            if not self.unrecorded():
-                built.later_phases = LaterPhases(self, trusted_packages())
             with self.traced():
                 state = built.fit(dataset, resume=trainer.resume, **fitted)
                 if after is not None:
