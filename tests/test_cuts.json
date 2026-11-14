@@ -661,9 +661,6 @@
 "tests/test_contracts_recurrence.py::test_the_ssd_port_holds_its_orders[near the least normal-jvp of grad]",
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[near the least normal-second orders, staged]"
 ],
-"tests/test_cpu_only_jax.py": [
-"tests/test_cpu_only_jax.py::test_a_run_stops_where_the_gpu_would_sit_idle_and_import_dew_does_not[prepare-cpu]"
-],
 "tests/test_cross_attention.py": [
 "tests/test_cross_attention.py::test_a_decoder_reads_a_context_of_its_own_tokens_by_its_table_or_its_own_pass",
 "tests/test_cross_attention.py::test_a_wider_context_enters_in_the_decoders_context_dtype",
@@ -1257,9 +1254,6 @@
 "tests/test_fresh_rate.py::test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one",
 "tests/test_fresh_rate.py::test_under_muon_a_fresh_groups_rate_reaches_its_vector_and_its_matrix"
 ],
-"tests/test_gemm_formed.py": [
-"tests/test_gemm_formed.py::test_a_composed_mlps_training_step_compiles_within_its_resources[sm90]"
-],
 "tests/test_gemm_gather.py": [
 "tests/test_gemm_gather.py::test_a_gathered_grouped_product_reads_each_row_where_its_table_says"
 ],
@@ -1633,11 +1627,11 @@
 "tests/test_layer_stack.py::test_runs_of_like_layers_scan_and_the_rest_unroll[deepseek_widths]",
 "tests/test_layer_stack.py::test_runs_of_like_layers_scan_and_the_rest_unroll[gemma4]"
 ],
-"tests/test_layout_counts.py": [
-"tests/test_layout_counts.py::test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupted_read[first-fit-2-indexed]"
-],
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp4]"
+],
+"tests/test_level_stacking.py": [
+"tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[slower-first-layers]"
 ],
 "tests/test_linear_attention.py": [
 "tests/test_linear_attention.py::test_a_cached_layer_traced_for_a_jvp_decodes_its_token[plain]",
@@ -1970,9 +1964,6 @@
 "tests/test_mosaic_toolkit.py": [
 "tests/test_mosaic_toolkit.py::test_a_quantized_stage_converts_into_the_tile_its_products_read[sm80-int8-unscaled]"
 ],
-"tests/test_mtp.py": [
-"tests/test_mtp.py::test_the_term_adds_the_weighted_mean_depth_cross_entropy[mean_stream_trunk]"
-],
 "tests/test_multimodal_model.py": [
 "tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[llama4-gradient]",
 "tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[llama4-inputs]",
@@ -2147,9 +2138,6 @@
 "tests/test_perturbation.py::test_an_indexer_warmup_trains_its_indexer_alone_without_backpropagation",
 "tests/test_perturbation.py::test_an_update_read_in_two_microbatches_estimates_what_its_batch_whole_does",
 "tests/test_perturbation.py::test_the_estimate_is_the_gradient_in_expectation[trailing-general]"
-],
-"tests/test_pipeline_core.py": [
-"tests/test_pipeline_core.py::test_a_memory_loader_holds_the_rows_it_made_and_lets_the_read_it_made_them_from_go[False]"
 ],
 "tests/test_pipeline_golden.py": [
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[images_arrayrecord-workers=2,shares=2]",
@@ -2532,9 +2520,6 @@
 "tests/test_samplers.py::test_every_registered_solver_samples_its_processes_and_refuses_the_rest[unmask]",
 "tests/test_samplers.py::test_heun_walks_edms_algorithm_2_with_its_churn[deterministic]",
 "tests/test_samplers.py::test_solver_matches_diffusers_latents_and_gradient[deis.3_short]"
-],
-"tests/test_saved_models.py": [
-"tests/test_saved_models.py::test_a_jepa_run_exports_and_loads_as_its_encoder"
 ],
 "tests/test_saved_runs.py": [
 "tests/test_saved_runs.py::test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_from_its_record[decision]",
