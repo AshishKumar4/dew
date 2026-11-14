@@ -115,10 +115,9 @@ class ScheduleBase:
     def values(self, horizons: Mapping[str, Horizon], rates: Rates | None = None
                ) -> optax.Schedule:
         """Return the value at each of the schedule's own steps, from its step horizons (`horizons`) and
-        its rate-valued fields `rates` (`rates()`), either Python numbers or a solver's operands. A value
-        derived from the rates alone, as a ratio of
-        two, is the configured fields', which a solver's operands keep: they differ from them by
-        one factor, a param group's multiplier."""
+        its rate-valued fields `rates` (`rates()`), either Python numbers or a solver's operands. A ratio
+        of two rates is formed from them (a cosine's floor), or where its rounding would pass Optax's is the
+        configured fields' (an exponential decay's), which a param group's multiplier leaves as it is."""
         raise NotImplementedError
 
     def peak(self) -> float:

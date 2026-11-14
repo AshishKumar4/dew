@@ -78,7 +78,15 @@ from dew.nn.kernels.generation import (
     gpu_target,
     tpu,
 )
-from dew.nn.kernels.options import OuterProgram, collecting, owned_program, program_digest, shapes_of, taking
+from dew.nn.kernels.options import (
+    OuterProgram,
+    attempting,
+    collecting,
+    owned_program,
+    program_digest,
+    shapes_of,
+    taking,
+)
 from dew.nn.kernels.selection import Unlowerable
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
@@ -1326,8 +1334,17 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
     began = time.perf_counter()
     start = trainer._started()
     if start.resume is not None and trainer.checkpoints is not None:
-        # A resumed run's step compiles at the rung its checkpoint records, as its resume would.
+        # A resumed run's step compiles at the rung its checkpoint records and the split its state was saved
+        # at (a checkpoint keeps a window only part filled, `dew.state.without_empty_window`), as its resume
+        # would: a split-2 checkpoint compiled at split 1 was another program than the resume's.
+        from dew.training.compiler import resumed_stepping
+
         trainer._compiler.resume_rung(trainer.checkpoints.rung(start.resume))
+        resumed = resumed_stepping(
+            trainer._stepping(), trainer.checkpoints.window_size(start.resume),
+            held=start.abstract.window is not None, pools=start.abstract.window is not None,
+            replicas=start.abstract.inner is not None and start.resume > 0)
+        trainer._shape = resumed.shape
     on = generation if stated is None else stated
     # A canonical target's devices stand for any GPU of the generation; a host's own topology's, for its own.
     portable = not on_tpus and not set(trainer.device_mesh.devices.flat) <= _HOSTS_GPUS
@@ -1336,8 +1353,15 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
     try:
         with assumed(on, portable=portable), trainer.phase_passes.scoped(trainer, trainer._compiler):
             target = gpu_target()
+            # A fresh run's start compiles beside its step's planning, which reads none of it.
+            from dew.training.distributed import start_compiling
+
+            begun = None if start.resume is not None or trainer.host_master else start_compiling(
+                start.build, start.initializer, jax.ShapeDtypeStruct(start.key.shape, start.key.dtype),
+                start.abstract, start.shardings, start.through, trainer.device_mesh)
             planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, frontier)
-            starts = started(trainer, start, planned, plan)
+            with attempting(begun):
+                starts = started(trainer, start, planned, plan)
     except Unlowerable as refused:
         raise refused.refusing("step") from refused
     # The sampled step as the search compiled it, its program what it lowered then.
@@ -1376,7 +1400,7 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
     candidate = planned.candidate
     with collecting() as collected:
         if start.resume is None and not trainer.host_master:
-            start_compiled(trainer._staged_start, start.initializer,
+            start_compiled(start.build, start.initializer,
                            jax.ShapeDtypeStruct(start.key.shape, start.key.dtype), start.abstract,
                            start.shardings, start.through, trainer.device_mesh)
         if candidate.copies:

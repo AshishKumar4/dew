@@ -296,6 +296,53 @@ class Watched(LMObjective):
         return nn.unbox(super().init(key, variables))
 
 
+TRACED: list[bool] = []
+"""One entry each time a `Traced` objective's initializer is traced."""
+
+
+class Traced(LMObjective):
+    """An LM objective that notes each time its initializer is traced (`TRACED`)."""
+
+    def init(self, key, variables=None):
+        TRACED.append(True)
+        return super().init(key, variables)
+
+
+def test_a_fresh_state_is_built_from_the_one_trace_of_its_init():
+    """Placing a fresh state traces the objective's init once: its shapes, the run's layout read off its
+    draw's shapes (`Objective.drawn_shapes`, `StageLocal.of`) and the program that builds it on the devices
+    come from one trace (`traced_start`), the program replaying it, where a 4B decoder's start traced its
+    draw for the layout and again for the shapes (9.5 and 6.2 s on a CPU host), and once more for the
+    program (36 s on a B200 host)."""
+    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
+    run = Trainer(Traced(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
+                  mesh=MeshSpec().build(jax.devices()[:1]), split=1)
+    TRACED.clear()
+    state, _, _ = run.place()
+    assert len(TRACED) == 1 and int(state.step) == 0
+
+
+@pytest.mark.parametrize("bound", [{"steps": 2}, {"examples": 2 * BATCH}])
+def test_a_fresh_fit_compiles_its_step_and_its_start_once_each_before_placing_its_state(bound):
+    """A fresh run's first step is planned and compiled over its state's shapes before the state is placed
+    (`Trainer._planned_unplaced`), its start's program compiling beside it in a thread of its own
+    (`start_compiling`), where the start compiled, ran, and only then did the step compile: the loop's
+    first compile takes that plan, so the step and the start each compile once, a run bounded in steps
+    and one on the examples clock, whose batch is marked whether it closes its window, alike."""
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+    from dew.telemetry.compiles import Compiles
+
+    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
+    run = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
+                  mesh=MeshSpec().build(jax.devices()[:1]), split=1)
+    # A chain of four batches, bounded as a run on the examples clock reads one.
+    chain = Pipeline(Memory(token_rows(VOCAB, 4 * BATCH, SEQ_LEN + 1))).batch(BATCH)
+    with Compiles("step") as steps, Compiles("joined") as starts:
+        assert int(run.fit(chain, **bound).step) == 2
+    assert steps.count == 1 and starts.count == 1
+
+
 @pytest.mark.mesh(devices=8)
 def test_a_fit_whose_whole_state_overflows_its_devices_is_refused_before_it_initializes_any():
     """`fit` reads its first batch before it places the state, and checks against it the whole state
@@ -313,6 +360,21 @@ def test_a_fit_whose_whole_state_overflows_its_devices_is_refused_before_it_init
                        records=None, batch=BATCH), steps=2 * accumulation)
     jax.effects_barrier()
     assert INITIALIZED == []
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_fit_given_a_state_whose_whole_overflows_its_devices_is_refused_before_placing_it():
+    """A run given its state (`fit(state=)`) is checked against its first batch as a fresh one is
+    (docs/design/training.md: fit validates the state it builds, restores or is given before placing
+    it): on devices that hold the given state alone but not the whole its steps keep, the accumulator
+    its window pools beside it, it is refused before the state is placed on them."""
+    mesh, layout, accumulation = CASES["fsdp_tensor_accumulating"]
+    whole = max(fine_tune(mesh(), layout, accumulation).validate(step_batch()).device_bytes.values())
+    given, _, _ = fine_tune(mesh(), layout, accumulation).place()
+    run = fine_tune(holding(mesh(), whole - 1), layout, accumulation)
+    with pytest.raises(LayoutRefused):
+        run.fit(Loader(train=lambda partition: repeated_token_batch(VOCAB, BATCH, SEQ_LEN + 1), val=None,
+                       records=None, batch=BATCH), steps=2 * accumulation, state=given)
 
 
 @pytest.mark.mesh(devices=8)

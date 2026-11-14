@@ -17,6 +17,30 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   (`PlanRefused.allocators`, the tightest in its message: its limit, its bytes in use, its largest free
   block and its pool), so a refusal at a phase's boundary names what holds the device.
 
+- A run's start reaches its first step sooner and keeps what it states: a fresh state's init is traced once,
+  its shapes, its layout (`Objective.drawn_shapes`, the shapes the objective's first draw recorded, which a
+  config's trained modules and a traced update's work read too) and the program that builds it on the
+  devices from that one trace; a fresh run's start compiled ahead compiles beside its step's planning, in a
+  thread of its own (`dew.nn.kernels.options.compiling`), and a fresh run's first step is planned and
+  compiled over its state's shapes before the state is placed, its start's program compiling beside it:
+  judged on the devices' free bytes in all, not on a pool's largest free block, which placing the state
+  reshapes, and on their allocators once the state is on them. A run that sets its remat keeps it where a
+  compile misses: the plan climbs its head's rungs alone, as its derivation does, and refuses where none
+  fits, where it compiled again under a remat the run did not ask for. A state given to `fit(state=)` is
+  checked against its first batch, its accumulator among it, before it is placed, as a fresh or resumed one
+  is. A run's sampled step compiled ahead is admitted by the plan as one compiled on its devices is.
+
+- A post-step effect acts in the order its optimizer's chain declares, read from the chain itself
+  (`dew.optim.post_step_order`), which `stepped` now takes: under `optax.MultiSteps` the chain's state came
+  back sorted by name, and a clamp acted before the rescale it follows. A fresh run's first step, planned
+  before its state is placed, counts the state as the layout places it, a field kept in host memory not
+  among a device's bytes, and records its rung only once the devices hold it placed.
+
+- A run's post-step effects act on its stepped weights in the order its chain declares them, a named chain's
+  as named, where JAX's flattening of its state took them by their sorted names. A cosine's floor is formed
+  from its solver's rate operands and an exponential's offset is always one, so a solver set to another end
+  value or offset reaches it, where its program held the ones it was built at.
+
 - A compile-only GPU states its memory once: `compile_only_gpus(generation, count, memory)` takes each GPU's
   memory, its total as the GPU states it, which XLA compiles for and every admission of a program compiled
   for it reads as the allocator's limit derived from it (`dew._devices.allocator_limit`, the run's pool

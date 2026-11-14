@@ -662,6 +662,13 @@ class Forecast:
         return min(guesses, default=None)
 
 
+def compiled_key(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None) -> tuple[str, str]:
+    """A search's key of the executable it compiles from `lowered` under `options` (`FitSearch.compiled`):
+    the program's digest (`program_digest`), one for a lowering over a state's shapes before it is placed
+    and over the placed state, and the options as text."""
+    return program_digest(lowered), repr(sorted((options or {}).items()))
+
+
 def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch,
             frontier: Sequence[Probe] | None = None) -> dict[str, JSON]:
     """The admitted plan, its kernel report, every compile needed to find it, each rung the derivation
@@ -793,6 +800,20 @@ class FitSearch[LossT, EffectsT]:
     """The step at a split, at the objective's rung and `narrow`, traced and not lowered, for its derived
     footprint (`dew.training.footprint`), which picks the search's first rung (`derived_start`); None
     for a run that starts from a plan, recorded, compiled ahead or resumed, which the search tries first."""
+    compiled: dict[tuple[str, str], jax.stages.Compiled] = dataclasses.field(default_factory=dict)
+    """Each executable this search, or one before it over the same candidates, compiled, by its program and
+    its options (`compiled_key`): one a search before the state was placed compiled is taken
+    here in place of compiling it again (`dew.training.compiler.StepCompiler.planned_unplaced`), judged on
+    these devices as one compiled here is."""
+    unplaced: int | None = None
+    """The bytes a device holds of the state the search plans over that the devices hold none of yet, None
+    where they hold it (`dew.training.compiler.StepCompiler.planned_unplaced`): each candidate is judged with
+    them beside it, which its step's first call needs as it needs the copies and accumulators it builds,
+    on the devices' free bytes in all (`memory.available`), not on their allocators' largest block, which
+    placing the state reshapes (a GH200's fresh 4B run, its 52.56 GiB of state read beside the step in the
+    one 38.88 GiB block its pool could give of 70.88 GiB free, 22.41 GiB short, fits). A candidate holds
+    none of them (`Candidate.held`), so one cached for a
+    placed state serves an unplaced one."""
     derived: list[dict[str, JSON]] = dataclasses.field(default_factory=list)
     split_stated: bool = False
     """Whether the run states its split (`Trainer(split=...)`), which the search then reads alone."""
@@ -1036,7 +1057,7 @@ class FitSearch[LossT, EffectsT]:
 
         bounded = dataclasses.replace(footprint, resident=resident, held=footprint.held - copies,
                                       peak=most + copies, peak_lower=least)
-        return derived_headroom(bounded, devices, last.built - copies)
+        return self._derived(bounded, devices, last.built - copies)
 
     def judged(self, split: int, narrow: bool) -> int | None:
         """The derived headroom of the step at `split` and `narrow` at the objective's rung, traced once a
@@ -1077,7 +1098,23 @@ class FitSearch[LossT, EffectsT]:
     def headroom_bounds(self, candidate: Candidate) -> tuple[int, int] | None:
         """The least and most headroom `candidate`'s derived footprint leaves the pool (`derived_headroom`,
         the same on every process), None where it has none or no device states memory."""
-        return derived_headroom(candidate.footprint, local_devices(self.mesh), candidate.built)
+        return self._derived(candidate.footprint, local_devices(self.mesh), candidate.built)
+
+    def _derived(self, footprint: Footprint | None, devices: Sequence, built: int) -> tuple[int, int] | None:
+        """`derived_headroom` of `footprint` on `devices`, `built` of its held bytes built by the step's
+        first call, with the state's `unplaced` bytes beside it where the devices hold none of it yet."""
+        unplaced = self.unplaced or 0
+        if footprint is not None and unplaced:
+            footprint = dataclasses.replace(footprint, held=footprint.held + unplaced)
+        return derived_headroom(footprint, devices, built + unplaced, placed=self.unplaced is None)
+
+    def fitting(self, executable: jax.stages.Compiled | None,
+                candidate: Candidate) -> tuple[bool, int | None]:
+        """`step_fits` of `executable`, `candidate`'s compiled step or its sampled twin, with the state's
+        `unplaced` bytes beside it where the devices hold none of it yet."""
+        unplaced = self.unplaced or 0
+        return step_fits(executable, self.mesh, candidate.held + unplaced, candidate.built + unplaced,
+                         placed=self.unplaced is None)
 
     def lowering(self, split: int) -> Candidate:
         """The step at `split` at the objective's rung and the search's `narrow`, lowered: from the
@@ -1228,10 +1265,10 @@ class FitSearch[LossT, EffectsT]:
     def fits(self, split: int, *, pruned: bool = False) -> bool:
         """Whether the step at `split` fits, at the objective's rung or its half rung (`remat_half`), a
         compile asked at each; `pruned`, a rung the derivation judges short asks none (`refused`), the
-        half rung judged on its own."""
+        half rung judged on its own. A run that states its remat has no half rung: its remat is its own."""
         if self.fits_here(split, pruned):
             return True
-        missed, held = self.rung(), remat_half(self.objective)
+        missed, held = self.rung(), None if self.remat_set else remat_half(self.objective)
         self.forecast.half_of[missed] = None if held is None else self.rung()
         if held is None:
             return False
@@ -1263,8 +1300,12 @@ class FitSearch[LossT, EffectsT]:
         with spending(candidate) as spent:
             began = time.perf_counter()
             early, firsts, relowered = None, [], None
+            key = compiled_key(candidate.lowered, options)
+            kept = self.compiled.get(key)
             if ahead is not None:
                 executable, self.ahead = ahead.taken(candidate.lowered), None
+            elif candidate.sampled is None and kept is not None:
+                executable = kept
             else:
                 # A run that inspects compiles its sampled step beside the step, at once (`report.attempts`),
                 # its compile kept only where the step fits, as the step's own is kept first.
@@ -1275,40 +1316,48 @@ class FitSearch[LossT, EffectsT]:
                 executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered,
                                                  first=firsts[0])
                 candidate = relowered.candidate(candidate)
+                if executable is not None and relowered.last is None:
+                    self.compiled[key] = executable
                 if relowered.last is not None:
                     # A spill's refusal changes the configs every derivation traced: each is traced again, the
                     # kept step's here, and none is lowered from its derivation's trace.
                     self.footprints.clear()
                     self.derivations.clear()
                     candidate = self.footprinted(split, candidate)
-            fit, headroom = step_fits(executable, self.mesh, candidate.held, candidate.built)
+            fit, headroom = self.fitting(executable, candidate)
             self.sampled = None
-            if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:
-                # The sampled step compiled ahead with the step, lowered as its compile lowered it (`handed`),
-                # which its target compiles none of.
-                with handed(ahead):
-                    sampled = candidate.sampled()
-                self.sampled = SampledStep(ahead.sampled.program, ahead.sampled.taken(sampled, jax.devices()))
-            elif fit and candidate.sampled is not None:
-                # The one compiled beside the step's, but where the step was lowered afresh past a spill,
-                # which its sampled step is then too, as one lowered after the step's compile would be.
-                beside = early if relowered is not None and relowered.last is None else None
-                lowered = [candidate.sampled() if beside is None else beside]
+            if fit and candidate.sampled is not None:
+                if ahead is not None and ahead.sampled is not None:
+                    # The sampled step compiled ahead with the step, lowered as its compile lowered it
+                    # (`handed`), which its target compiles none of.
+                    with handed(ahead):
+                        sampled = candidate.sampled()
+                    self.sampled = SampledStep(ahead.sampled.program,
+                                               ahead.sampled.taken(sampled, jax.devices()))
+                else:
+                    # The one compiled beside the step's, but where the step was lowered afresh past a spill,
+                    # which its sampled step is then too, as one lowered after the step's compile would be.
+                    beside = early if relowered is not None and relowered.last is None else None
+                    lowered = [candidate.sampled() if beside is None else beside]
 
-                def resampled() -> jax.stages.Lowered:
-                    """The sampled step lowered afresh, its launches derived past a spilled one's config."""
-                    again = self.relowering(split).sampled
-                    assert again is not None
-                    lowered.append(again())
-                    return lowered[-1]
-                compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled,
-                                               first=None if beside is None else firsts[1])
-                if len(lowered) > 1:
-                    self.footprints.clear()
-                    self.derivations.clear()
-                self.sampled = (None if compiled is None
-                                else SampledStep(program_digest(lowered[-1]), compiled))
-                fit, headroom = step_fits(compiled, self.mesh, candidate.held, candidate.built)
+                    def resampled() -> jax.stages.Lowered:
+                        """The sampled step lowered afresh, its launches derived past a spilled one's
+                        config."""
+                        again = self.relowering(split).sampled
+                        assert again is not None
+                        lowered.append(again())
+                        return lowered[-1]
+                    compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled,
+                                                   first=None if beside is None else firsts[1])
+                    if len(lowered) > 1:
+                        self.footprints.clear()
+                        self.derivations.clear()
+                    self.sampled = (None if compiled is None
+                                    else SampledStep(program_digest(lowered[-1]), compiled))
+                # Admitted by the plan whichever compiled it, ahead or here (training.md: the sampled step is
+                # admitted by the same memory plan).
+                fit, headroom = self.fitting(None if self.sampled is None else self.sampled.executable,
+                                             candidate)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
         foreseen = _judged_headroom(self.headroom_bounds(candidate))
@@ -1388,8 +1437,9 @@ class FitSearch[LossT, EffectsT]:
 
     def compiled_again(self) -> bool:
         """Climb the objective one rung, as `recompute_more` does, saying it compiles the step again
-        there."""
-        moved = climbed(self.objective, self.base)
+        there: a run that states its remat climbs its head's rungs alone, as its derivation's walk does
+        (`headed_more`)."""
+        moved = climbed(self.objective, self.base, remat=not self.remat_set)
         if moved is not None:
             _log.warning("the step does not fit the devices %s", moved)
         return moved is not None

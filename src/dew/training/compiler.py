@@ -7,17 +7,17 @@ from __future__ import annotations
 import dataclasses
 import functools
 import logging
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Protocol
+from collections.abc import Callable, Hashable, Mapping
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
 import numpy as np
 from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew._records import JSON, boolean, json_value, record
+from dew._records import JSON, boolean, json_value, listed, record
 from dew.batch import CLOSES_WINDOW, Batch
-from dew.distributed.batches import batch_layout, batch_shardings
+from dew.distributed.batches import batch_layout, batch_shardings, batch_signature
 from dew.distributed.placement import Validation
 from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.kernels.generation import gpu_target
@@ -36,6 +36,7 @@ from dew.training.memory import (
     local_devices,
     memory_record,
     rung_record,
+    step_fits,
     step_options,
 )
 from dew.training.model_flops import batch_consumed, batch_tokens, model_batch
@@ -45,6 +46,7 @@ from dew.training.planning import (
     Candidate,
     FitSearch,
     Planned,
+    PlanRefused,
     Trials,
     held_objects,
     settled,
@@ -84,6 +86,28 @@ def laid_out(state: TrainState, window: int) -> TrainState:
         window_size=jax.device_put(np.int32(window), state.window_size.sharding))
 
 
+def admitted_placed(planned: Planned, mesh: Mesh) -> tuple[bool, int | None]:
+    """Whether `planned`, compiled before the state was placed (`StepCompiler.planned_unplaced`), fits the
+    devices of `mesh` now that it is (`step_fits`), its step and, where it samples, its sampled step, and
+    the step's headroom there."""
+    held, built = planned.candidate.held, planned.candidate.built
+    fit, headroom = step_fits(planned.executable, mesh, held, built)
+    if fit and planned.sampled is not None:
+        fit = step_fits(planned.sampled.executable, mesh, held, built)[0]
+    return fit, headroom
+
+
+class Unplaced(NamedTuple):
+    """A fresh run's first step planned before its state was placed (`StepCompiler.planned_unplaced`): the
+    signature of the batch it was planned over, its plan and what its compile found, and the record of its
+    rung (`keep_rung`), kept only once the devices hold it with the state placed (`admitted_placed`)."""
+
+    signature: Hashable
+    planned: Planned
+    compiled: Compiled
+    keep: Callable[[], None]
+
+
 class CompiledStep(Protocol):
     """A call returns the stepped state, the scalar loss, the objective's whole
     report (`Aux.metrics`), whether that loss was finite, and whether the
@@ -114,6 +138,24 @@ class Compiled:
     step: CompiledStep | None = None
 
 
+def resumed_stepping[L, E](stepping: Stepping[L, E], window_size: int, *, held: bool, pools: bool,
+                           replicas: bool) -> Stepping[L, E]:
+    """`stepping` at the split a state of `window_size` microbatches an update steps at: a state that pools
+    a window part filled (`pools`), or DiLoCo's `replicas` once they have stepped, each counting their
+    microbatches in their split's windows, which no other split reads, bind it, a stated other refused; a
+    state that holds an empty window (`held`), or was laid out at more than one microbatch, takes it unless
+    the run states another, the step it is handed then laying its own window out (`laid_out`). A run's
+    compile and a resume's step compiled ahead (`dew.training.ahead.compile_ahead`) both read it."""
+    accumulation = stepping.settings.accumulation
+    split, unaligned = divmod(window_size, accumulation)
+    if unaligned or ((pools or replicas) and stepping.shape.split not in (None, split)):
+        raise ValueError(f"the state pools windows of {window_size} microbatches, and this run updates "
+                         f"every {accumulation} steps of {stepping.shape.split} microbatches")
+    if pools or replicas or ((held or split > 1) and stepping.shape.split is None):
+        return dataclasses.replace(stepping, shape=dataclasses.replace(stepping.shape, split=split))
+    return stepping
+
+
 class StepCompiler[L, E]:
     """Where a run's fit ladder stands and the links its traces read, and the compile of its step
     (`compile`): its objective's rung as the first compile found it and as each shape compiled at it, the
@@ -140,6 +182,12 @@ class StepCompiler[L, E]:
         self._shape_rungs: dict[str, JSON] = {}
         self._resumed_shapes: dict[str, JSON] = {}
         self._resumed_links: dict[str, float | None] = {}
+        # A fresh run's first step planned over its state's shapes before the state is placed
+        # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.
+        self._unplaced: Unplaced | None = None
+        # The executables a search before the state was placed compiled where it held no plan
+        # (`planned_unplaced`), which the run's first compile's search takes in place of compiling them again.
+        self._executables: dict | None = None
 
     @property
     def narrow(self) -> bool:
@@ -274,7 +322,7 @@ class StepCompiler[L, E]:
         none are given, a copy of the state beside it, refused where the devices hold no room for it
         (`Trials.profiled`), and its program compiles again guided by their profile (`Planned.guided`),
         the executable it replaces released with its program (`Planned.released`). A compile-only GPU holds
-        the memory stated for it (`dew.training.memory.device_memory`).
+        the memory stated for it (`dew._devices.device_memory`).
         """
         settings = stepping.settings
         if (target := settings.lower_for) is not None:
@@ -282,25 +330,12 @@ class StepCompiler[L, E]:
             # the base rung.
             self.at_base_rung(batch)
             raise Lowered(target, *routed(lambda: lowered_for(stepping, state, batch, target, self.narrow)))
-        split, unaligned = divmod(int(state.window_size), settings.accumulation)
         # A state pools its window's microbatches where it holds one part filled: the window, laid out for
         # its split, binds it. Read on the host: a reduction on the devices compiles a program of the
         # occupancy's placement, a restored one's another than a fresh one's, which a resume compiles anew.
         pools = bool(occupied(state.window))
-        held = state.window is not None or split > 1
-        # DiLoCo's replicas, once they have stepped, each count their microbatches in their split's windows,
-        # which no other split reads: it binds the split, a stated other refused.
-        replicas = state.inner is not None and int(state.step) > 0
-        if unaligned or ((pools or replicas) and stepping.shape.split not in (None, split)):
-            raise ValueError(f"the state pools windows of {int(state.window_size)} microbatches, and this "
-                             f"run updates every {settings.accumulation} steps of {stepping.shape.split} "
-                             "microbatches")
-        if pools or replicas or (held and stepping.shape.split is None):
-            # The open window's split, or the split a state at an update's end was laid out at, its empty
-            # window's or, saved between updates, where its checkpoint holds none
-            # (`dew.state.without_empty_window`), the one it was saved at, unless the run states another:
-            # the step it is handed then lays its own window out (`laid_out`).
-            stepping = dataclasses.replace(stepping, shape=dataclasses.replace(stepping.shape, split=split))
+        stepping = resumed_stepping(stepping, int(state.window_size), held=state.window is not None,
+                                    pools=pools, replicas=state.inner is not None and int(state.step) > 0)
         if (state.scale is not None) != settings.dynamic_scale:
             raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")
         if settings.host_master:
@@ -308,28 +343,91 @@ class StepCompiler[L, E]:
                 raise ValueError("a step compiled ahead or inspected runs where the devices hold the state; "
                                  "this layout keeps the variables on the host")
             return Compiled(stepping.shape.split, step=self._compile_host(stepping, state, batch))
-        planned, compiled = self.plan(stepping, state, batch, trials)
+        held, self._unplaced = self._unplaced, None
+        executables, self._executables = self._executables, None
+        mesh = settings.device_mesh
+        fit, headroom = (False, None) if held is None or held.signature != batch_signature(batch) else (
+            admitted_placed(held.planned, mesh))
+        if held is not None and fit:
+            # Planned and compiled while the state was built (`planned_unplaced`), and judged now the state is
+            # placed: its plan, kept and its rung recorded, its record holding what the devices read.
+            planned, compiled = held.planned, held.compiled
+            held.keep()
+            plan = record(compiled.plan, "plan")
+            *earlier, kept = listed(plan["probes"], "probes", read=record, what="probes")
+            probes = [*earlier, {**kept, "headroom": headroom}]
+            memory = memory_record(planned.executable, local_devices(mesh), planned.candidate.held, fits=True)
+            compiled = dataclasses.replace(compiled, plan={**plan, "probes": probes}, memory=memory)
+        else:
+            # Where the devices, the state placed, hold no block for it, the plan's search runs here, on them.
+            planned, compiled, keep = self._plan(stepping, state, batch, trials, executables=executables)
+            keep()
         return dataclasses.replace(compiled, step=self.runner(stepping, planned.released(),
                                                               settings.device_mesh))
+
+    def planned_unplaced(self, stepping: Stepping, state: TrainState, batch: Batch,
+                         unplaced: int) -> None:
+        """A fresh run's first step planned and compiled over `state`, its shapes, before the `unplaced`
+        bytes a device holds of it are placed, so the step compiles while the run's start builds the state
+        (`Trainer._opened`), not after it: each candidate is judged on the devices' free bytes in all beside
+        the state's (`FitSearch.unplaced`), and the run's first compile over `batch` judges the one taken
+        against their allocators once the state is on them (`compile`, `admitted_placed`). It holds a plan
+        only where its search refused nothing on the way to it, compiled or derived: the bytes the devices
+        hold before the state is placed may include arrays the start copies and lets go, so a candidate
+        refused then may fit once it is, and the plan the run takes is the one its placed devices pick
+        (a phased run's first phase read whole, bit for bit the run planned once its state was placed). Where
+        it refused one, or none fits, that compile plans once the state is placed, over the traces this
+        search kept (`candidate_for`), and the executables it compiled (`FitSearch.compiled`): nothing is
+        traced or compiled twice."""
+        executables: dict = {}
+        self._executables = executables
+        try:
+            planned, compiled, keep = self._plan(stepping, state, batch, None, unplaced=unplaced,
+                                                 executables=executables)
+        except PlanRefused as refused:
+            _log.info("the step fits no plan before its state is placed, planned once it is: %s", refused)
+            return
+        plan = record(compiled.plan, "plan")
+        probes = listed(plan["probes"], "probes", read=record, what="probes")
+        derived = listed(plan["derived"], "derived", read=record, what="derived rungs")
+        if any(not boolean(probe["fits"], "fits") for probe in probes) or any(
+                str(rung["label"]).startswith("refuses") for rung in derived):
+            _log.info("the step's plan before its state is placed refused a candidate on the way; planned "
+                      "once the state is placed")
+            return
+        self._unplaced = Unplaced(batch_signature(batch), planned, compiled, keep)
 
     def plan(self, stepping: Stepping, state: TrainState, batch: Batch,
              trials: Trials | None, frontier: bool = False) -> tuple[Planned, Compiled]:
         """The shared device-step planner: the plan it admitted and what its compile found (`Compiled`, its
         step none: the caller reads its lowering before releasing it, `compile`, or serializing its
-        executable, `compile_ahead`), with `frontier` the rungs above it (`FitSearch.above`)."""
+        executable, `compile_ahead`), with `frontier` the rungs above it (`FitSearch.above`), its rung
+        recorded (`keep_rung`)."""
+        planned, compiled, keep = self._plan(stepping, state, batch, trials, frontier)
+        keep()
+        return planned, compiled
+
+    def _plan(self, stepping: Stepping, state: TrainState, batch: Batch, trials: Trials | None,
+              frontier: bool = False, *, unplaced: int | None = None, executables: dict | None = None
+              ) -> tuple[Planned, Compiled, Callable[[], None]]:
+        """`plan`, over a state whose devices hold `unplaced` bytes a device holds of it none of yet where
+        given (`FitSearch.unplaced`), its search taking and keeping its executables in `executables` where
+        given (`FitSearch.compiled`), and the record of its rung, which the caller keeps once it takes the
+        plan (`keep_rung`)."""
         settings = stepping.settings
         mesh = settings.device_mesh
         links = self.links(mesh)
         shaped = self.at_base_rung(batch)
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with stepping.traced_on(mesh, links) as schedule, held_objects():
-            planned, flops, plan, validation = self._planned(stepping, state, batch, mesh, schedule,
-                                                             resumed, trials, frontier)
+            planned, flops, plan, validation, keep = self._planned(stepping, state, batch, mesh, schedule,
+                                                                   resumed, trials, frontier, unplaced,
+                                                                   executables)
             split, candidate = planned.split, planned.candidate
             self._shape_rungs[batch_layout(batch)] = self.rung()
             memory = memory_record(planned.executable, local_devices(mesh), candidate.held, fits=True)
         return planned, Compiled(split, plan, memory, planned.executable, flops and split * flops, links,
-                                 validation)
+                                 validation), keep
 
     def runner(self, stepping: Stepping, planned: Planned,
                mesh: Mesh) -> CompiledStep:
@@ -391,7 +489,8 @@ class StepCompiler[L, E]:
 
     def _planned(self, stepping: Stepping, state: TrainState, batch: Batch,
                  mesh: Mesh, schedule: Schedule, resumed: JSON, trials: Trials | None,
-                 frontier: bool) -> tuple[Planned, StepFlops | None, JSON, Validation]:
+                 frontier: bool, unplaced: int | None, executables: dict | None
+                 ) -> tuple[Planned, StepFlops | None, JSON, Validation, Callable[[], None]]:
         """The plan `compile` reads `batch` in (`FitSearch`), from the run's splits (`splits`), the first that
         fits, guided under AutoPGLE (`Planned.guided`), with `plan` its record and the objective at its rung,
         a microbatch's FLOPs (`plan_flops`) and the state it holds between steps, as the layout validates
@@ -428,7 +527,8 @@ class StepCompiler[L, E]:
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self.ahead,
             derive=None if recorded is not None else functools.partial(lower, lowering=False, floored=True),
-            split_stated=stepping.shape.split is not None)
+            split_stated=stepping.shape.split is not None, unplaced=unplaced,
+            compiled={} if executables is None else executables)
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         above = search.above(candidates, planned.split) if frontier else None
@@ -451,8 +551,8 @@ class StepCompiler[L, E]:
         validation = stepping.validation(planned.candidate.prepared)
         chosen = {**self.rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)
-        if record_path is not None:
-            keep_rung(record_path, key, {**chosen, 'flops': counted})
+        keep = (functools.partial(keep_rung, record_path, key, {**chosen, 'flops': counted})
+                if record_path is not None else lambda: None)
         plan = settled(planned, probes, search, above)
         if stepping.staging.read_whole:
             # A transformation given built that kept every layer whole on every stage (`StageLocal.of`).
@@ -460,7 +560,7 @@ class StepCompiler[L, E]:
         search.told(planned)
         if planned.split != candidates[0]:
             _log.info("the step fits the devices in the plan %s", plan)
-        return planned, flops, plan, validation
+        return planned, flops, plan, validation, keep
 
     def _compile_host(self, stepping: Stepping, state: TrainState, batch: Batch
                       ) -> CompiledStep:

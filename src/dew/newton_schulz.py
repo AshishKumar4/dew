@@ -23,8 +23,8 @@ Preconditioning = Literal["frobenius", "spectral", "aol", "schatten"]
 """How optax's Newton-Schulz scales a matrix before it iterates (`optax.contrib.muon`'s `preconditioning`)."""
 
 
-NEWTON_SCHULZ = (3.4445, -4.7750, 2.0315)
-"""Muon's quintic Newton-Schulz coefficients, Jordan's (modded-nanogpt), optax's default."""
+NEWTON_SCHULZ = tuple(_muon._DEFAULT_NS_COEFFS)
+"""Muon's quintic Newton-Schulz coefficients, Jordan's (modded-nanogpt): optax's default, read from it."""
 
 
 POLAR_EXPRESS_TABLE = (

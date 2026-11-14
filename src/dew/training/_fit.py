@@ -1195,7 +1195,7 @@ def stage_reached(plan: FitPlan, run: FitRun) -> tuple[PhasedStream, bytes, int]
 class Start:
     """What `Trainer.place` reads before it places the state (`Trainer._started`): the objective's
     held tree and the key, the state's shapes and which frozen leaves its init passes through
-    (`traced_start`), the checkpoint step a run resumes from, and the state's placement."""
+    (`traced_start`), the checkpoint step a run resumes from, the state's placement and its build."""
 
     initializer: Initializer
     key: jax.Array
@@ -1203,6 +1203,12 @@ class Start:
     through: dict[int, int]
     resume: int | None
     shardings: Placement[TrainState]
+    build: Callable[[Initializer, jax.Array], TrainState]
+    """The fresh state's build replayed from the program its shapes were traced from (`traced_start`),
+    which the start's program traces in place of the objective's init."""
+    held: Mapping[int, int]
+    """Each device's bytes of the state, by its id, as the layout validates its placement
+    (`Validation.device_bytes`): its own memory's alone, none of a field kept in the host's."""
 
 
 def _rollout_admitted(rollout: Rollout | None) -> Rollout | None:
