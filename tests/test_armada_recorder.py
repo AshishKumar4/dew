@@ -69,7 +69,8 @@ def test_a_python_child_uv_runs_over_this_environment_joins_its_files_record(ci,
     """uv's run of this very interpreter with a requirement layered over its environment (`uv run --python
     <this interpreter> --with ...`, a release's code under its own transformers) starts a Python child that
     records itself as any other does: its file keeps its key, which holds until a file it executed changes
-    (train 812's review: counted as unfollowed, its file and every one after it in their process kept none)."""
+    (train 812's review: counted as unfollowed, its file and every one after it in their process kept none).
+    """
     url, _, _ = cache_worker
     cached(monkeypatch, url)
     wheel = tmp_path / "layered-1.0-py3-none-any.whl"
@@ -85,7 +86,8 @@ def test_a_python_child_uv_runs_over_this_environment_joins_its_files_record(ci,
     written(tmp_path, {
         "plain.py": "def helper(): return 1\n",
         "test_layered.py": "import subprocess, sys\ndef test_layered():\n"
-                           f"    words = [sys.executable if word == '{{python}}' else word for word in {launched!r}]\n"
+                           f"    words = [sys.executable if word == '{{python}}' else word\n"
+                           f"             for word in {launched!r}]\n"
                            "    subprocess.run(words, check=True, cwd='tests')\n"})
     interpreter(tmp_path, "3.12")
     ci.task("3.12", ["tests/test_layered.py"], "", tmp_path / "verdict.json", 600.0)

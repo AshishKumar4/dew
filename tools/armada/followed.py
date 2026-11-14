@@ -367,16 +367,18 @@ def start(event: str, args: tuple, directory: str) -> str | None:
 
 
 def _launched_here(argv) -> bool:
-    """Whether `argv` is uv's run of this very interpreter (`uv run ... --python <this interpreter> ...`), which layers a
-    requirement over this environment and runs its Python with it, the `.pth` among its paths, so the child records
-    itself as any other does (tests/release_support.py: a release's code under its own transformers; train 812's
-    review: counted as unfollowed, its files and every file after them in their process kept no key)."""
+    """Whether `argv` is uv's run of this very interpreter (`uv run ... --python <this interpreter> ...`),
+    which layers a requirement over this environment and runs its Python with it, the `.pth` among its paths,
+    so the child records itself as any other does (tests/release_support.py: a release's code under its own
+    transformers; train 812's review: counted as unfollowed, its files and every file after them in their
+    process kept no key)."""
     if isinstance(argv, (str, bytes, os.PathLike)) or argv is None:
         return False
     words = [os.fsdecode(word) for word in argv if isinstance(word, (str, bytes, os.PathLike))]
     if len(words) < 4 or os.path.basename(words[0]) != "uv" or words[1] != "run" or "--python" not in words:
         return False
-    return _this_python(words[words.index("--python") + 1]) if words.index("--python") + 1 < len(words) else False
+    at = words.index("--python") + 1
+    return at < len(words) and _this_python(words[at])
 
 
 def _beneath_popen() -> bool:
