@@ -642,8 +642,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
             plgpu.TMEM(scale_memory(shape, stages), dtype, layout=plgpu.TMEMLayout.SCALES_LAYOUT)
             for shape, dtype in blocks.values() if tuple(shape[-2:]) == SCALE_TILE])
 
-    def streams(self, blocks: dict, stages: int, consumers: int,
-                multicast: dict[str, tuple[str, ...]] | None = None,
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
                 gathered: tuple[str, ...] = ()) -> dict:
         from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on `rings.Ring`
@@ -1394,8 +1393,7 @@ class Tcgen05Chunks(Tcgen05ChunksIssuer, mosaic.RingFamily):
 
     consumers = 3
 
-    def streams(self, blocks: dict, stages: int, consumers: int,
-                multicast: dict[str, tuple[str, ...]] | None = None,
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
                 gathered: tuple[str, ...] = ()) -> dict:
         # A 64-row product reads a transposed operand as two halves of 32 rows and splits its columns

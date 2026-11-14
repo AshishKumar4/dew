@@ -563,8 +563,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cluster_columns: int = 1,
-               cost: pl.CostEstimate | Stated | None = None,
+               cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None,
@@ -574,7 +573,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
         # Its programs read a table from global memory as any operand, and no producer runs beside them.
         del reducing_warpgroups, scalars, producer, moves  # one warpgroup: no roles to move registers between
-        _one(consumers, clustered=cluster * cluster_columns > 1)
+        _one(consumers, clustered=cluster > 1)
         built = launches.kernel(bodies.dependent(entry, interpret, prefetched=prefetched),
                                 name=name or self.name,
                                 out_type=out_type, grid=grid, grid_names=grid_names,
@@ -595,8 +594,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         _one(consumers)
         return handoffs.Schedule((handoffs.Role("consumer"),), axis=None)
 
-    def streams(self, blocks: dict, stages: int, consumers: int,
-                multicast: dict[str, tuple[str, ...]] | None = None,
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
                 gathered: tuple[str, ...] = ()):
         _one(consumers, clustered=bool(multicast))

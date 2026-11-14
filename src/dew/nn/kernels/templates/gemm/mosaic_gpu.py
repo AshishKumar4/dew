@@ -77,16 +77,8 @@ from dew.nn.kernels.templates.gemm import (
     sides_extended,
     sides_padded,
 )
-from dew.nn.kernels.templates.gemm.pricing import (
-    balanced_tail,
-    family_of,
-    fixes_up,
-    tile_columns,
-    tile_rows,
-    walk_columns,
-)
+from dew.nn.kernels.templates.gemm.pricing import balanced_tail, family_of, fixes_up, tile_columns, tile_rows
 from dew.nn.kernels.templates.product import SCALE_DEPTH, block_format
-from dew.nn.kernels.templates.rings import CLUSTER, CLUSTER_COLUMNS
 
 
 @dataclasses.dataclass(frozen=True)
@@ -110,10 +102,7 @@ class Tiles:
     consumers take alternate tiles whole (`pingpong`, CUTLASS's ping-pong sm90 schedule: each consumer's tile
     its own, their MMA phases alternating, so one's epilogue overlaps the other's products;
     `Family.persist`'s `pingpong`; on a cluster too, its programs multicasting the blocks they read alike)
-    rather than halving each tile's rows; and the cluster's programs along the output's columns
-    (`cluster_columns`, `tgmm`'s: each its own column tile of the cluster's rows, their rows' blocks loaded
-    once between them, as cuBLASLt's 2 x 4 cluster on the 4B's up kernel gradient), its programs in all at
-    most its family's (`mosaic.Family.cluster_programs`)."""
+    rather than halving each tile's rows."""
     block_m: int
     block_n: int
     block_k: int
@@ -121,7 +110,6 @@ class Tiles:
     grid_block_n: int
     warpgroups: int = 1
     cluster: int = 1
-    cluster_columns: int = dataclasses.field(default=1, kw_only=True)
     family: str = dataclasses.field(kw_only=True)
     programs: int = 1
     splits: int = 1
@@ -152,13 +140,6 @@ class Tiles:
                              "multiprocessors")
         if self.cluster > family.cluster:
             raise ValueError(f"{self}: a cluster of at most its bundle's (`mosaic.Family.cluster`)")
-        if self.cluster_columns > 1 and (self.cluster_columns & (self.cluster_columns - 1)
-                                         or self.cluster * self.cluster_columns > family.cluster_programs
-                                         or family.pairs_product or self.splits > 1):
-            # A power of two of programs along the columns, the cluster's at most its family's, each its own
-            # products and its whole depth.
-            raise ValueError(f"{self}: a cluster's columns, a power of two, its programs at most its "
-                             "bundle's (`mosaic.Family.cluster_programs`), unsplit")
         wide = family.widest_product is not None and self.block_n > family.widest_product
         if self.warpgroups == 2 and (self.share % family.role_rows or wide):
             # Each consumer's share of the rows is whole roles, and its columns at most one product's
@@ -527,9 +508,6 @@ class Allocations:
     """The streams a producer gathers (`GATHERED_STREAMS`, `mosaic.Family.streams`' `gathered`): their load
     barriers its family's own (`gathered.ring`'s 8-byte words at a 1024-byte alignment, which the planner
     counted as plain barriers: 976 bytes short of a B200's gathered input gradient's, row 5358)."""
-    shared_rows: tuple = ()
-    """The streams a cluster's programs along its columns read alike (`multicast`'s `rows`): `tgmm`'s rows,
-    each column tile's the same depth."""
 
     def scope(self, family: mosaic.Family, tiles: "Tiles", steps: int | None = None,
               rewritten: bool = False) -> resources.Scope:
@@ -544,7 +522,7 @@ class Allocations:
         rewrites = tuple(tiles.stages for _ in self.blocks) if rewritten else ()
         persisted, addresses = family.persist_scratch(consumers, rewrites, pingpong=tiles.pingpong)
         streams = family.streams(self.blocks, tiles.stages, tiles.sharing,
-                                 multicast=multicast(tiles, family, self), gathered=self.gathered)
+                                 multicast=multicast(tiles, family, self.shared), gathered=self.gathered)
         held, walks = family.lifetimes(streams, steps)
         # A core holding its values in scratch memory holds them beside (`mosaic.Issuer.value_scratch`).
         values = family.value_scratch(self.blocks, self.outputs)
@@ -641,13 +619,12 @@ SCALE_SWIZZLES = {'row_scales': swizzling.UNSWIZZLED, 'column_scales': swizzling
 def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dtype,
                      prologue_axes: tuple, prologue_dtypes: tuple, out_dtype, k_major: bool = False,
                      step_scaled: bool = False, unstaged: bool = False,
-                     gathered: bool = False, rows_gathered: bool = False) -> Allocations:
+                     gathered: bool = False) -> Allocations:
     """Dew: `tgmm`'s allocations at `tiles` (`Allocations`): a ring for the rows, the cotangent and each
     prologue side operand with rows that follows the steps (`_stepped`), each side operand without rows'
     staging, the consumers' meeting where they prepare their stages (not `unstaged`, `rows_unstaged`), and
     its output's share of the tile; a cluster's depth tiles reading the cotangent's blocks alike, which they
-    load once between them (`Allocations.shared`), but where it is `gathered` (a table's), and its column
-    tiles the rows' (`Allocations.shared_rows`), but where they are `rows_gathered`."""
+    load once between them (`Allocations.shared`), but where its rows are `gathered` (a table's)."""
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     stepped, _, fixed = _stepped(family, prologue_axes, 'rows')
     extent = {'rows': block_k, 'depth': block_m}
@@ -666,7 +643,7 @@ def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dt
     # (`tile_columns`), each stream's slot a multiprocessor's block.
     return Allocations(blocks, (held['fixed_smems'], held['fixed_barriers'], *meeting),
                        (((tiles.share, tile_columns(tiles, family)), jnp.dtype(out_dtype)),),
-                       () if gathered else ('ring_1',), shared_rows=() if rows_gathered else ('ring_0',))
+                       () if gathered else ('ring_1',))
 
 
 def _stepped(family: mosaic.Family, axes_of: tuple, stepping: str) -> tuple[tuple, tuple, tuple]:
@@ -814,8 +791,7 @@ def _dense_tail(tiles: Tiles, dtype, extents: tuple, itemsizes: tuple, multiproc
     adds; none for a depth split, which already shares its depth over the wave, its runs a schedule of their
     own (`_gmm_scheduled`), each into its own slice of the outputs, which no tail shares."""
     m, n, k = extents
-    if not (balanced and tiles.cluster == tiles.cluster_columns == 1 and tiles.splits == 1
-            and fixes_up(tiles, dtype)):
+    if not (balanced and tiles.cluster == 1 and tiles.splits == 1 and fixes_up(tiles, dtype)):
         return None
     columns = tile_columns(tiles, family_of(tiles, dtype))
     return balanced_tail(tiles, (-(-m // tiles.block_m), -(-n // columns)), -(-k // tiles.block_k), itemsizes,
@@ -963,7 +939,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, tiles.sharing,
-                                             multicast=multicast(tiles, family, allocations),
+                                             multicast=multicast(tiles, family, allocations.shared),
                                              swizzles=SCALE_SWIZZLES if step_scales is not None
                                              else None, **_gathered(gather, tiles, lhs.dtype, interpret)))
 
@@ -1389,20 +1365,14 @@ def depth_masked(prologue, tile, *sides):
     return jnp.where(valid > 0, transformed, jnp.zeros_like(transformed))
 
 
-def multicast(tiles: Tiles, family: mosaic.Family, allocations: "Allocations") -> dict[str, tuple[str, ...]]:
-    """Dew: the streams a cluster's programs share (`mosaic.Family.streams`' multicast), each with the
-    cluster axes its programs read it alike along: its `allocations`' `shared`, the blocks its row tiles
-    load once between them (`CLUSTER`), where its cluster's programs each run a tile of their own; their
-    `shared_rows`, the blocks its column tiles load once (`CLUSTER_COLUMNS`, `Tiles.cluster_columns`); none
-    on a family whose products span the pair (`mosaic.Transport.pairs_product`, each CTA loading its half of
-    the pair's block) or of one program a cluster. The one statement the kernel's streams and the planner's
-    (`Allocations.scope`) both read: the planner's multicast a pair's streams refused, so no pair's tile was
-    ever legal."""
-    if family.pairs_product:
-        return {}
-    rows = dict.fromkeys(allocations.shared, (CLUSTER,)) if tiles.cluster > 1 else {}
-    columns = dict.fromkeys(allocations.shared_rows, (CLUSTER_COLUMNS,)) if tiles.cluster_columns > 1 else {}
-    return {**rows, **columns}
+def multicast(tiles: Tiles, family: mosaic.Family, matrices: tuple[str, ...]) -> tuple[str, ...]:
+    """Dew: the streams a cluster's programs share (`mosaic.Family.streams`' multicast): its `matrices`, the
+    group's blocks its row tiles load once between them, where its cluster's programs each run a tile of
+    their own; none on a family whose products span the pair (`mosaic.Transport.pairs_product`, each CTA
+    loading its half of the pair's block) or of one program a cluster. The one statement the kernel's
+    streams and the planner's (`Allocations.scope`) both read: the planner's multicast a pair's streams
+    refused, so no pair's tile was ever legal."""
+    return matrices if tiles.cluster > 1 and not family.pairs_product else ()
 
 
 def pair_takes(tiles: Tiles, family: mosaic.Family) -> bool:
@@ -1875,10 +1845,10 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     g = group_sizes.shape[0]
     family = family_of(tiles, lhs.dtype)
     # Dew: a depth the tile's rows do not divide takes a partial last row tile (`ragged_rows`); a cluster's
-    # tiles (`tile_rows`, `walk_columns`: a pair's products spanning two CTAs, or a multicast's row or column
-    # tiles side by side) are whole, as `gmm`'s (`partial_runs`).
+    # tiles (`tile_rows`, `tile_columns`: a pair's products spanning two CTAs, or a multicast's row tiles
+    # side by side) are whole, as `gmm`'s (`partial_runs`).
     ragged = bool(m % tile_rows(tiles, family))
-    if (k != k2 or n % walk_columns(tiles, family) or tiles.cluster > family.cluster
+    if (k != k2 or n % tile_columns(tiles, family) or tiles.cluster > family.cluster
             or (ragged and (tiles.cluster > 1 or not ragged_rows(m, prologue=prologue, k_major=k_major)))):
         raise ValueError(f"a [{k}, {m}] by [{k2}, {n}] kernel gradient does not take {tiles}")
     # A stage read as loaded (`rows_unstaged`), or rewritten by the family's own role (`rewrites`).
@@ -2053,14 +2023,16 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     family's bundle (`family_of`), its streams running across the persistent loop's tiles where the family
     streams so (the next tile's first row blocks load while the consumers store this one, which a group's
     few rows, a tile's few steps, make most of the time). Each consumer reads its depth share of the rows'
-    stage, which it prepares (the prologue, neighbouring groups' rows zeroed), and the whole cotangent's, a
-    column share of which each zeroes, waiting for the other's where a group boundary falls in the step; an
-    `unstaged` stage (`rows_unstaged`) is read as loaded, prepared by none. A side operand with rows streams
-    beside the operands; one without is loaded once a tile. One multiprocessor a tile, but where a dense
-    call's last wave is balanced (`tail`): a tile then walked by several programs in turn, each but its
-    first leaving its fp32 partial in a workspace and signalling a semaphore, which the first waits on and
-    adds before storing the tile; interpreted, one program walks every program's tiles in turn, a balanced
-    tail's ordered so no semaphore is needed. `operands` padded, then each one's gather table (or None)."""
+    stage, which it prepares (the prologue, the neighbouring groups' rows zeroed), and the whole
+    cotangent's, a column share of which each zeroes, waiting for the other's where a group boundary falls
+    in the step; an `unstaged` stage (`rows_unstaged`) is read as loaded, prepared by none and met at no
+    boundary. A side operand with rows streams beside the operands; one without is loaded once a tile.
+    One multiprocessor a tile, but where a dense call's last wave is balanced (`tail`): a tile then walked
+    by several programs in turn, each but its first program's leaving its fp32 partial in a workspace and
+    signalling a semaphore, which the first waits on and adds before storing the tile. Interpreted, one
+    program walks every program's tiles in turn (the interpreter runs its programs one after another, each
+    paying its own setup), a balanced tail's programs ordered so no semaphore is needed (`tail.ordered`).
+    `operands` are padded, then each one's gather table (or None); `groups` `_group_blocks`' (`tgmm`)."""
     lhs, rhs, tables = operands[0], operands[1], tuple(operands[2:])
     family = family_of(tiles, lhs.dtype)
     rewritten = rewrites(family, k_major, tables, unstaged)
@@ -2070,13 +2042,13 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     atom, atoms_each = _zeroed_atoms(family, rhs.dtype, block_n, consumers)
     # A consumer's accumulators: its share of the rows by its columns (`tile_columns`); a cluster's tiles.
     part = (depth_half, tile_columns(tiles, family))
-    grid = (-(-m // tile_rows(tiles, family)), n // walk_columns(tiles, family))
+    grid = (-(-m // tile_rows(tiles, family)), n // tile_columns(tiles, family))
+    pair = tiles.cluster
     # A stream for each side operand with rows, but a vector a family does not copy, which its step reads
     # from global memory.
     stepped, read, fixed = _stepped(family, prologue_axes, 'rows')
     allocations = tgmm_allocations(tiles, family, lhs_dtype=lhs.dtype, rhs_dtype=rhs.dtype,
-                                   gathered=tables[1] is not None, rows_gathered=tables[0] is not None,
-                                   prologue_axes=prologue_axes,
+                                   gathered=tables[1] is not None, prologue_axes=prologue_axes,
                                    prologue_dtypes=_dtypes_of(prologue_operands),
                                    out_dtype=out_dtype, k_major=k_major, step_scaled=step_scales is not None,
                                    unstaged=unstaged)
@@ -2148,17 +2120,16 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers,
-                                             multicast=multicast(tiles, family, allocations),
+                                             multicast=multicast(tiles, family, allocations.shared),
                                              swizzles=SCALE_SWIZZLES if step_scales is not None else None,
                                              **_tgmm_gathered(tables, allocations.blocks, bool(interpret))))
 
     out_type = jax.ShapeDtypeStruct((g, m, n), out_dtype)
-    clusters = multiprocessors // (tiles.cluster * tiles.cluster_columns)
-    kernel = family.kernel(body, out_type=out_type, grid=(1 if interpret else clusters,),
-                           grid_names=("programs",), consumers=consumers + rewritten, interpret=interpret,
-                           approx_math=False, name="dew_tgmm", cluster=tiles.cluster,
-                           cluster_columns=tiles.cluster_columns, registers=registers, shared=shared,
-                           moves=MOVES, resident=tiles.programs, scalars=len(groups),
+    kernel = family.kernel(body, out_type=out_type,
+                           grid=(1 if interpret else multiprocessors // pair,), grid_names=("programs",),
+                           consumers=consumers + rewritten, interpret=interpret, approx_math=False,
+                           name="dew_tgmm", cluster=pair, registers=registers, shared=shared, moves=MOVES,
+                           resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
     return kernel(*groups, lhs, rhs, *(table for table in tables if table is not None), *(step_scales or ()),
                   *prologue_operands, *_workspace(tail, (multiprocessors, 2, consumers, *part), interpret))
@@ -2249,11 +2220,10 @@ def _tgmm_scheduled(index, *, groups: tuple, operands: tuple, tail: tail_of.Tail
     m_i, n_i = tail_of.planar_snake(snaked, grid, 1, tiles.grid_block_n)
     family = family_of(tiles, lhs_gmem.dtype)
     rows, width = tile_rows(tiles, family), tile_columns(tiles, family)
-    # This multiprocessor's rows of its tile (its pair's, `tile_rows`) and its columns, its accumulators' (a
-    # pair's both, `tile_columns`), its place among the cluster's column tiles (`walk_columns`).
+    # This multiprocessor's rows of its tile (its pair's, `tile_rows`) and the tile's columns, its
+    # accumulators' (a pair's both, `tile_columns`).
     depth = pl.ds(m_i * rows + mosaic.cluster_index(tiles.cluster) * tiles.block_m, tiles.block_m)
-    columns = pl.ds(n_i * walk_columns(tiles, family)
-                    + mosaic.cluster_index(tiles.cluster_columns, CLUSTER_COLUMNS) * width, width)
+    columns = pl.ds(n_i * width, width)
     first = pl.multiple_of(block_starts_gmem[g_i], tiles.block_k) // tiles.block_k + start
     steps = jnp.where(sizes_gmem[g_i] > 0, blocks_gmem[g_i], 0)
     walks = steps if count is None else count

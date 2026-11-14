@@ -21,6 +21,7 @@ from dew.distributed.batches import batch_layout, batch_shardings, batch_signatu
 from dew.distributed.placement import Validation
 from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.kernels.generation import gpu_target
+from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective
 from dew.state import Accumulation, TrainState, apart, occupied, together
@@ -565,7 +566,10 @@ class StepCompiler[L, E]:
             unplaced=unplaced, compiled={} if executables is None else executables)
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
-        above = search.above(candidates, planned.split) if frontier else None
+        # The rungs above the plan are read for their memory alone, no device ever running them: offline
+        # within a prepare too, as no device run has tuned their programs (`report.read_offline`).
+        with report.read_offline():
+            above = search.above(candidates, planned.split) if frontier else None
         for probe in above or ():
             _log.info("above the plan, fitting at fewer microbatches: %s", probe.named())
         # Consume the artifact only after its program was accepted; a refusal leaves it pending.

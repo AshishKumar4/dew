@@ -1173,9 +1173,6 @@ class MosaicGmm(_Mosaic):
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
         family = pricing.family_of(config, dtype)
         columns = pricing.tile_columns(config, family)
-        if config.cluster_columns > 1:
-            # A product's cluster stacks its programs along the rows alone (`mosaic_gpu.gmm`).
-            return False
         runs = mosaic_gpu.partial_runs(config, dtype, ba.arguments['interpret'],
                                        transpose_rhs=ba.arguments['trans_rhs'],
                                        gathered=ba.arguments.get('gather') is not None,
@@ -1791,8 +1788,7 @@ class MosaicTgmm(_Mosaic):
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
         whole = (rows % pricing.tile_rows(config, family) == 0
                  or (self._ragged(ba, family) and config.cluster == 1))
-        # A cluster's column tiles side by side, whole (`pricing.walk_columns`).
-        return whole and width % pricing.walk_columns(config, family) == 0
+        return whole and width % pricing.tile_columns(config, family) == 0
 
     def _ragged(self, ba, family: mosaic.Family) -> bool:
         # A depth no cooperative tile's rows divide takes a partial last row tile where the family's loads

@@ -52,17 +52,7 @@ from dew.nn.kernels.templates import (
     swizzling,
 )
 from dew.nn.kernels.templates.cost import Stated, Work
-from dew.nn.kernels.templates.rings import (
-    CLUSTER,
-    CLUSTER_COLUMNS,
-    Ref,
-    Ring,
-    Turn,
-    drain,
-    loads,
-    passed,
-    streamed,
-)
+from dew.nn.kernels.templates.rings import CLUSTER, Ref, Ring, Turn, drain, loads, passed, streamed
 from dew.nn.kernels.templates.stores import output_staging, staged_rows, written
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
@@ -88,28 +78,22 @@ def compiler_params(*, approx_math: bool = False, reduction_scratch: int = 0,
                                 reduction_scratch_bytes=reduction_scratch, min_blocks_per_sm=resident)
 
 
-def cluster_index(cluster: int, axis: str = CLUSTER) -> jax.Array | int:
-    """This program's index among its cluster's `cluster` programs along `axis` (`CLUSTER`, or
-    `CLUSTER_COLUMNS`): 0 alone."""
-    return lax.axis_index(axis) if cluster > 1 else 0
+def cluster_index(cluster: int) -> jax.Array | int:
+    """This program's index among its cluster's `cluster` programs (`CLUSTER`): 0 alone."""
+    return lax.axis_index(CLUSTER) if cluster > 1 else 0
 
 
 def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            interpret, family: str, name: str | None = None, scratch: tuple = (),
-           approx_math: bool = False, cluster: int = 1, cluster_columns: int = 1,
-           cost: pl.CostEstimate | Stated | None = None,
+           approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
            model_flops: int | None = None, reduction_scratch: int = 0, resident: int = 1,
            prefetched: Callable | None = None, model: resources.RegisterModel | None = None) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
     checked against the mesh it runs in (`launches.kernel`), named as the launch tracing it reports `name`
     with its register `model` where given (`report.named`), a launch lowered once for every call of its
     facts (`tuning.lowered_once`), its `cost` the hardware's work and `model_flops` the model's share of it,
-    its L2 `prefetched` views issued before its wait (`dependent`); its programs a cluster of `cluster` along
-    the output's rows (`CLUSTER`) by `cluster_columns` along its columns (`CLUSTER_COLUMNS`)."""
-    axes = tuple((size, axis) for size, axis in ((cluster, CLUSTER), (cluster_columns, CLUSTER_COLUMNS))
-                 if size > 1)
-    clustered = ({'cluster': tuple(size for size, _ in axes),
-                  'cluster_names': tuple(axis for _, axis in axes)} if axes else {})
+    its L2 `prefetched` views issued before its wait (`dependent`)."""
+    clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
     launched = bodies.dependent(entry, interpret, prefetched=prefetched)
     built = launches.kernel(launched, name=name or family, out_type=out_type, grid=grid,
                             grid_names=grid_names, num_threads=warpgroups, thread_name="wg",
@@ -1550,12 +1534,6 @@ class Transport[Allocated, Opened](abc.ABC):
     each loading its half of every step's blocks; 1 where a load reaches its own program's shared memory
     alone (cp.async's)."""
 
-    cluster_programs: int = 1
-    """The programs a cluster of the family's launch takes in all, its rows' (`cluster`) by its columns'
-    (`kernel`'s `cluster_columns`), each axis's programs loading the blocks they read alike once between
-    them: Hopper's portable cluster, 8 (cuBLASLt's 2 x 4 on the 4B's up kernel gradient); 1 where its
-    loads reach their own program alone."""
-
     pairs_product: bool = False
     """Whether a cluster's two programs share each product over both's rows and columns (tcgen05's two-CTA
     form, `mosaic_sm100.PAIR`): a pair's tile is twice a program's rows and columns, each program holds its
@@ -1608,8 +1586,7 @@ class Transport[Allocated, Opened](abc.ABC):
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cluster_columns: int = 1,
-               cost: pl.CostEstimate | Stated | None = None,
+               cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None,
@@ -1688,12 +1665,11 @@ class Transport[Allocated, Opened](abc.ABC):
 
     @abc.abstractmethod
     def streams(self, blocks: dict, stages: int, consumers: int,
-                multicast: dict[str, tuple[str, ...]] | None = None, swizzles: dict[str, int] | None = None,
+                multicast: tuple[str, ...] = (), swizzles: dict[str, int] | None = None,
                 copies: dict[str, int] | None = None, gathered: tuple[str, ...] = ()) -> Allocated:
         """The scoped allocations of a stream of each `blocks[name]` `(shape, dtype)` in `stages` slots read
         by `consumers` (`opened` once scoped), each stream `multicast` names one the programs of a cluster
-        share along its cluster axes, loaded once between them (`kernel`'s `cluster`, `cluster_columns`),
-        each `swizzles` names staged at its swizzle
+        share, loaded once between them (`kernel`'s `cluster`), each `swizzles` names staged at its swizzle
         (`swizzle_for`; inference's own otherwise), each `copies` names a step's tile loaded in that many
         copies (`Pieces`; one otherwise), each `gathered` names a step's tile whose rows a table gathers (a
         family that gathers rows alone, `gathers_rows`)."""
@@ -2161,8 +2137,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cluster_columns: int = 1,
-               cost: pl.CostEstimate | Stated | None = None,
+               cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None,
@@ -2170,13 +2145,11 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                moves: bool | None = None) -> Callable:
         # Its programs read a table from global memory as any operand.
         del scalars
-        if cluster > self.cluster or cluster * cluster_columns > max(self.cluster_programs, self.cluster):
-            raise ValueError(f"{self.name} launches a cluster of at most {self.cluster} along the rows and "
-                             f"{self.cluster_programs} programs, not {cluster} x {cluster_columns}")
+        if cluster > self.cluster:
+            raise ValueError(f"{self.name} launches a cluster of at most {self.cluster}, not {cluster}")
         return kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                       warpgroups=self.warpgroups(consumers), family=self.name, interpret=interpret,
-                      name=name, approx_math=approx_math, cluster=cluster, cluster_columns=cluster_columns,
-                      cost=cost,
+                      name=name, approx_math=approx_math, cluster=cluster, cost=cost,
                       model_flops=model_flops, resident=resident, prefetched=prefetched,
                       model=(None if registers is None
                              else resources.register_model(self, consumers, registers, producer=producer,
@@ -2194,16 +2167,14 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return handoffs.Schedule((handoffs.Role("consumer", consumers), handoffs.Role("producer", weight=0)),
                                  floor=producer)
 
-    def streams(self, blocks: dict, stages: int, consumers: int,
-                multicast: dict[str, tuple[str, ...]] | None = None,
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
                 gathered: tuple[str, ...] = ()) -> dict:
         from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on `Ring`
         from dew.nn.kernels.templates.rings import ring
 
         return {name: gathered_rows.ring(shape, dtype, stages, consumers=consumers) if name in gathered
-                else ring(shape, dtype, stages, consumers=consumers,
-                          multicast=(multicast or {}).get(name, ()),
+                else ring(shape, dtype, stages, consumers=consumers, multicast=name in multicast,
                           swizzle=(swizzles or {}).get(name), copies=(copies or {}).get(name, 1))
                 for name, (shape, dtype) in blocks.items()}
 
