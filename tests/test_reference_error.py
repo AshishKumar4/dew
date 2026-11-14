@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 from check1_wire import CENSUS
+from gate_cases import a_product_draw, cancelling, cancelling_draw, product_draws
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
@@ -124,9 +125,9 @@ def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_
     every matmul precision; check 1 decides, once before its draws, that both arms of that site take the
     fusions (`_ynn_decided`), the two still of one kind, names that decision in its stage's line
     (STAGES_LOG) and in the report CI reads (`SWITCHED`), and judges them."""
-    import json
 
-    from reference_error import STAGES_LOG, SWITCHED, without_ynn
+    from check1_judge import STAGES_LOG, SWITCHED
+    from reference_error import without_ynn
 
     with pytest.raises(jax.errors.JaxRuntimeError):
         without_ynn(pulled_by_itself(xla_attention))(*one_key_draw(0))
@@ -219,29 +220,6 @@ def noised_draw(seed):
     return rng.standard_normal(4096), *(1e-7 * rng.standard_normal(4096) for _ in range(3))
 
 
-def cancelling(split: bool, *, leak: bool = False, residue: float = 0.0):
-    """A leaf of rows that cancel, rows of no terms and plain rows: rows 0-7 a dot less itself (the
-    reference's the same dot twice, exactly zero; split, Dew's second dot summed in two halves, an ulp
-    or so off zero; leaked, one term dropped from it), rows 8-11 the dot of zero rows (`residue` added),
-    and the rest the plain dot, every arm alike."""
-    def halves(x, w):
-        return x[:, :32] @ w[:32] + (x[:, 33:] @ w[33:] if leak else x[:, 32:] @ w[32:])
-
-    def arm(x, w):
-        whole = x @ w
-        other = halves(x, w) if split else x @ w
-        return {"rows": jnp.concatenate([whole[:8] - other[:8], whole[8:12] + residue, whole[12:]])}
-    return arm
-
-
-def cancelling_draw(seed):
-    """A [64, 64] by [64, 4] dot's operands, rows 8-11 of the first zero."""
-    rng = np.random.default_rng([2440, seed])
-    x = rng.standard_normal((64, 64))
-    x[8:12] = 0
-    return jnp.asarray(x, jnp.float32), jnp.asarray(rng.standard_normal((64, 4)), jnp.float32)
-
-
 def test_check_1_sizes_a_cancelling_row_by_its_terms_and_admits_nothing_else():
     """Term sizing (`assert_as_exact`'s `terms`, owner 10-29): a row whose truth cancels exactly, Dew's an
     ulp or so off its zero where the reference's sum cancels to it, is judged at its terms' size by the
@@ -286,69 +264,6 @@ def test_a_sites_terms_decide_by_its_zero_leaves_beside_others(cancels):
     assert (_cancelling_terms(draw, truth) is truth) == cancels
 
 
-def found(failure: GateFailure) -> list[tuple[str, str, float]]:
-    """A gate failure's findings as data: each one's leaf, rule and measure (`Finding`), not its wording."""
-    return [(finding.leaf, finding.rule, finding.measure) for finding in failure.findings]
-
-
-def sharded_site(monkeypatch, root, shards, site):
-    """`site()` run as armada runs a sharded site: a map task for each range of `shards` (DRAWS), its
-    records under `root` (RECORDS), then their judge (POOL over `root`); what each map task's run
-    returned and what the judge's did."""
-    from check1_wire import DRAWS, POOL, RECORDS
-
-    drawn = []
-    for index, (start, stop) in enumerate(shards):
-        monkeypatch.setenv(DRAWS, f"{start}:{stop}")
-        monkeypatch.setenv(RECORDS, str(root / str(index)))
-        drawn.append(site())
-    monkeypatch.delenv(DRAWS)
-    monkeypatch.delenv(RECORDS)
-    monkeypatch.setenv(POOL, str(root))
-    try:
-        return drawn, site()
-    finally:
-        monkeypatch.delenv(POOL)
-
-
-def test_a_sharded_sites_map_tasks_size_its_cancelling_rows_and_its_judge_runs_no_truth(
-        tmp_path, monkeypatch):
-    """A site whose truth holds a row of float64 zero (`cancelling`) sized by its terms by default
-    (`_cancelling_terms`) is so in each map task (DRAWS), which runs the truth on its first draw to find
-    them, and its records carry each row's size; its judge (POOL) reads them, running no truth at all, and
-    judges as the site does whole: on par admitted, a leaked term refused alike."""
-    truths = []
-
-    def counted(x, w):
-        # Each run of the truth, compiled or not, on the host (a trace alone counts nothing).
-        jax.debug.callback(lambda: truths.append(1))
-        return cancelling(split=False)(x, w)
-
-    def site(dew, label):
-        def run():
-            truths.clear()
-            assert_as_exact(dew, cancelling(split=False), cancelling_draw, label, seeds=16,
-                            truth_fn=counted)
-            return len(truths)
-        return run
-
-    drawn, judged = sharded_site(monkeypatch, tmp_path / "on par", [(0, 40), (40, 80)],
-                                 site(cancelling(split=True), "on par"))
-    assert all(count >= 1 for count in drawn), "each map task sizes its rows from the truth"
-    assert judged == 0, "a judge runs no truth"
-    assert_as_exact(cancelling(split=True), cancelling(split=False), cancelling_draw, "whole", seeds=16,
-                    truth_fn=counted)
-    with pytest.raises(GateFailure) as whole:
-        assert_as_exact(cancelling(split=True, leak=True), cancelling(split=False), cancelling_draw,
-                        "leaked", seeds=16, truth_fn=counted)
-    with pytest.raises(GateFailure) as pooled:
-        sharded_site(monkeypatch, tmp_path / "leaked", [(0, 40), (40, 80)],
-                     site(cancelling(split=True, leak=True), "leaked"))
-    # The judge, the last to run, ran no truth before it refused.
-    assert truths == [], "a judge runs no truth"
-    assert sorted(found(pooled.value)) == sorted(found(whole.value))
-
-
 MIX = np.random.default_rng(2442).standard_normal((4, 4)).astype(np.float32)
 """A fixed [4, 4] product past `cancelling`'s rows (`mixed`)."""
 
@@ -368,19 +283,6 @@ def mixed_terms(x, w):
     sizes = np.sqrt(np.square(np.asarray(x)) @ np.square(np.asarray(w)))
     sizes[:8] *= np.sqrt(2.0)
     return {"rows": np.sqrt(np.square(sizes) @ np.square(MIX.astype(np.float64)))}
-
-
-def product_draws(key: int, inner: int):
-    """Draws of a [16, `inner`] by [`inner`, 8] fp32 product's operands, a stream of their own by `key`."""
-    def draw(seed):
-        rng = np.random.default_rng([key, seed])
-        return (jnp.asarray(rng.standard_normal((16, inner)), jnp.float32),
-                jnp.asarray(rng.standard_normal((inner, 8)), jnp.float32))
-    return draw
-
-
-a_product_draw = product_draws(2641, 64)
-"""A [16, 64] by [64, 8] fp32 product's operands."""
 
 
 def test_the_tail_tests_floor_is_derived_from_its_faults_at_the_leafs_noise():
@@ -465,75 +367,6 @@ def test_the_paired_worst_row_refuses_a_row_far_off_on_some_examples_and_passes_
         off[::5] += math.log(10.0)
         assert _paired_rows(off, ROW_FACTOR) < LOWER_TAIL
     assert _paired_rows(np.asarray([3.0, 3.0, 0.0]), ROW_FACTOR) >= LOWER_TAIL
-
-
-def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whole(tmp_path, monkeypatch):
-    """armada's map and judge (`DRAWS`, `POOL`): a site whose seeds are sharded across map tasks, each writing
-    its draws and judging nothing, is judged over their pooled draws as it is when it draws them itself: a
-    product on par passes, and a bfloat16 one fails with the same findings; a pool that stops short of a
-    stage's seeds, or holds a gap, is refused, never judged."""
-    import map_judge
-    from map_judge import DRAWS, POOL, RECORDS, PoolRefused
-
-    def judged(dew, label, shards):
-        sharded_site(monkeypatch, tmp_path / label, shards,
-                     lambda: assert_as_exact(dew, jnp.matmul, a_product_draw, label, seeds=16))
-
-    def halved(x, w):
-        return (x.astype(jnp.bfloat16) @ w.astype(jnp.bfloat16)).astype(jnp.float32)
-
-    judged(jnp.matmul, "on par", [(0, 30), (30, 80)])
-    with pytest.raises(GateFailure) as whole:
-        assert_as_exact(halved, jnp.matmul, a_product_draw, "halved", seeds=16)
-    with pytest.raises(GateFailure) as pooled:
-        judged(halved, "halved", [(0, 40), (40, 80), (40, 80)])
-    assert sorted(found(pooled.value)) == sorted(found(whole.value))
-    with pytest.raises(PoolRefused) as short:
-        judged(halved, "halved, short", [(0, 16)])
-    with pytest.raises(PoolRefused) as gapped:
-        judged(halved, "halved, with a gap", [(0, 8), (16, 80)])
-    assert (short.value.held, gapped.value.held) == (16, 8)
-    # A judge that asks for its later seeds (LATER): over its first stage's seeds alone it passes where that
-    # stage passes, and where it finds something asks for the second stage's, writing its ask; over every
-    # seed it judges as a site that drew them all.
-    from map_judge import LATER, LaterUnits
-    asked = tmp_path / "later.json"
-    monkeypatch.setenv(LATER, str(asked))
-    judged(jnp.matmul, "on par, its first stage", [(0, 16)])
-    assert not asked.exists()
-    with pytest.raises(LaterUnits):
-        judged(halved, "halved, its first stage", [(0, 16)])
-    assert (json.loads(asked.read_text())["from"], json.loads(asked.read_text())["to"]) == (16, 80)
-    with pytest.raises(GateFailure) as both:
-        sharded_site(monkeypatch, tmp_path / "both stages", [(0, 16), (16, 56), (56, 80)],
-                     lambda: assert_as_exact(halved, jnp.matmul, a_product_draw, "halved", seeds=16))
-    assert sorted(found(both.value)) == sorted(found(whole.value))
-    monkeypatch.delenv(LATER)
-    # Two tests' sites of one label, their records under one pool: each judge pools its own test's alone.
-    def as_test(test, dew, *, records=None, pool=None):
-        monkeypatch.setenv("PYTEST_CURRENT_TEST", f"tests/test_{test}.py::test_{test} (call)")
-        for name, value in ((DRAWS, records and "0:80"), (RECORDS, records), (POOL, pool)):
-            if value:
-                monkeypatch.setenv(name, value)
-            else:
-                monkeypatch.delenv(name, raising=False)
-        assert_as_exact(dew, jnp.matmul, a_product_draw, "one label", seeds=16)
-
-    as_test("halved", halved, records=str(tmp_path / "shared" / "halved"))
-    as_test("on_par", jnp.matmul, records=str(tmp_path / "shared" / "on par"))
-    as_test("on_par", jnp.matmul, pool=str(tmp_path / "shared"))
-    with pytest.raises(GateFailure):
-        as_test("halved", halved, pool=str(tmp_path / "shared"))
-    # One site, its id, label and ranges alike, run on two Pythons into one pool: each Python's judge pools
-    # its own Python's draws alone.
-    for python, dew in (("3.12", jnp.matmul), ("3.14", halved)):
-        monkeypatch.setattr(map_judge, "python", lambda python=python: python)
-        as_test("one_site", dew, records=str(tmp_path / "pythons" / python))
-    monkeypatch.setattr(map_judge, "python", lambda: "3.12")
-    as_test("one_site", jnp.matmul, pool=str(tmp_path / "pythons"))
-    monkeypatch.setattr(map_judge, "python", lambda: "3.14")
-    with pytest.raises(GateFailure):
-        as_test("one_site", halved, pool=str(tmp_path / "pythons"))
 
 
 def test_check_1_refuses_a_draw_and_an_arm_that_turn_stateful_after_their_first_block():
@@ -1203,9 +1036,9 @@ def test_check_one_decides_at_its_second_stage_what_its_first_leaves_inconclusiv
     """Dew's squared error 2.6 on even seeds and 0.1 on odd ones, the reference's 1: over 8 seeds the
     pooled ratio's interval straddles PARITY and is wider than it; the second stage's 40 resolve it
     under PARITY, so the site passes, and its stage is logged, as every judgement's is."""
-    import json
 
-    from reference_error import STAGES_LOG, _interval, _pooled
+    from check1_judge import STAGES_LOG
+    from reference_error import _interval, _pooled
 
     from dew.parity import _status
 
