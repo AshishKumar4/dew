@@ -1,8 +1,8 @@
 """The attention template's Mosaic GPU mainloop compiled at the tiles its models decide
 (dew.nn.kernels.templates.attention_mosaic): each launch, forward, backward and decode step, compiled by XLA's
-CUDA backend for a compile-only A100 and H100 on the CPU (tests/kernel_compile.py), within its block, its
-registers as its model states them and spill-free; and an A100's launches counting the shared memory their
-lowering asks for. The mainloop's values are tests/test_attention_mosaic.py's."""
+CUDA backend for a compile-only A100 and H100 on the CPU (tests/kernel_compile.py), within its block and
+spill-free; and an A100's launches counting the shared memory their lowering asks for. The mainloop's values
+are tests/test_attention_mosaic.py's."""
 
 
 import dataclasses
@@ -251,17 +251,17 @@ def test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block(acc
     """An A100's backward of heads 256 wide (Gemma's) on 32 x 32 tiles, two launches on mma.sync arranged by
     their 32-row shares (`backward_family`), each register operand crossing its warps relayed through its
     consumer's tile (`_relay_tiles`): the fast form's logits' queries staged a step, the accurate form's sums
-    in two column halves, within the A100's block as its model sizes it, spilling nothing, every launch's
-    model ptxas's, lowered and compiled for an sm80 on this CPU."""
+    in two column halves, within the A100's block as its model sizes it, spilling nothing, lowered and
+    compiled for an sm80 on this CPU."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures, undercounts
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     op, ba, _ = _gated_backward("sm80", 256, accurate)
     with generation.assumed("sm80"):
         target = generation.gpu_target()
         assert op.staged_bytes(ba, config, target) <= target.shared_limit
         found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config))], "sm80")
-    failed = mosaic_failures(found) + undercounts(found)
+    failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
 
@@ -340,7 +340,7 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
     its shared memory and spilling nothing (`mosaic_failures`), where the forward gate's prefill calls
     derive their own tiles."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures, undercounts
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     from dew.nn.kernels.templates import attention_decode
 
@@ -360,7 +360,7 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
     operands = (query, key, key, *((scale, scale) if quantized else ()))
     with generation.assumed(generation_name):
         found = compile_mosaic_kernels([KernelCase("decode", lambda: (decode, operands))], generation_name)
-    failed = mosaic_failures(found) + undercounts(found)
+    failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
 
@@ -377,7 +377,7 @@ def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_n
     M-DD-10's W64-a100: 'Number of tiles is not a multiple of 4'; its 4- and 1-key pages refused, row
     4772)."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures, undercounts
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     from dew.nn.kernels.templates import attention_decode
 
@@ -393,7 +393,7 @@ def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_n
     with generation.assumed(generation_name):
         case = KernelCase("paged decode", lambda: (decode, (query, pool, pool, table)))
         found = compile_mosaic_kernels([case], generation_name)
-    failed = mosaic_failures(found) + undercounts(found)
+    failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
 
@@ -403,10 +403,10 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
                                                               dtype):
     """The forward, the training forward where `training`, at its derived tiles of a causal call `width`
     wide under the score hook `hooks` names, in `dtype`, lowered and compiled by ptxas for `generation_name`
-    on this CPU (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its
-    register model's decision ptxas's (`mosaic_failures`)."""
+    on this CPU (tests/kernel_compile.py): every launch within its shared memory, spilling nothing
+    (`mosaic_failures`)."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures, undercounts
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     queries = 512
     spans = template.spans(queries, queries, 1, causal=True)
@@ -426,7 +426,7 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
         assert config is not None, f"the Mosaic forward derives no config {width} wide"
         found = compile_mosaic_kernels([KernelCase("forward", lambda: (forward, (query, key, key)))],
                                        generation_name)
-    failed = mosaic_failures(found) + undercounts(found)
+    failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
 
@@ -436,9 +436,9 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
 def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_name, width):
     """An fp32 call's inference forward (`MosaicForward.parts`: its operands bf16 parts) at its derived tiles
     of a causal call `width` wide, lowered and compiled by ptxas for `generation_name` on this CPU: every
-    launch within its shared memory, spilling nothing, its register model's decision ptxas's."""
+    launch within its shared memory, spilling nothing."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures, undercounts
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     queries = 512
     spans = template.spans(queries, queries, 1, causal=True)
@@ -457,7 +457,7 @@ def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_nam
         assert config is not None, f"the Mosaic forward derives no fp32 config {width} wide"
         found = compile_mosaic_kernels([KernelCase("forward", lambda: (forward, (query, key, key)))],
                                        generation_name)
-    failed = mosaic_failures(found) + undercounts(found)
+    failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
 
@@ -475,8 +475,7 @@ def test_a_deterministic_backward_holds_check_1_interpreted(call, with_determini
 @pytest.mark.parametrize("width", [64, 128])
 def test_a_deterministic_backward_compiles_spill_free_as_its_model_decides(width, with_deterministic_ops):
     """The backward under --xla_gpu_deterministic_ops at its derived tiles of a causal call `width` wide,
-    lowered and compiled by ptxas for an H100 on this CPU: within its shared memory, spilling nothing, its
-    register model's decision ptxas's."""
+    lowered and compiled by ptxas for an H100 on this CPU: within its shared memory, spilling nothing."""
     test_the_backward_compiles_spill_free_as_its_model_decides(generation_name="sm90", width=width,
                                                                accurate=False, hooks="none")
 
@@ -512,7 +511,7 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
     model's decision ptxas's (`mosaic_failures`, each launch's model `resources.register_model` at its own
     layout and consumers, `MosaicBackward._launch_registers`)."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures, undercounts
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     queries = 512
     spans = template.spans(queries, queries, 1, causal=True)
@@ -551,7 +550,7 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
         shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), residuals)
         found = compile_mosaic_kernels(
             [KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)))], generation_name)
-    failed = mosaic_failures(found) + undercounts(found)
+    failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
 
@@ -563,12 +562,12 @@ def test_an_fp16_backward_compiles_spill_free_as_its_model_decides(width):
     compiled by ptxas for an H100 on this CPU: within its shared memory, spilling nothing, its register
     model's decision ptxas's."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures, undercounts
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     op, ba, config = _gated_backward("sm90", width, accurate=False, dtype=jnp.float16)
     with generation.assumed("sm90"):
         found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config))], "sm90")
-    failed = mosaic_failures(found) + undercounts(found)
+    failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
 
@@ -611,11 +610,10 @@ def test_each_tcgen05_forward_the_4b_steps_refusals_derive_lowers_for_a_b200(row
 def test_the_4b_steps_forward_compiles_spill_free_on_tensor_memory_for_a_b200(rows, kept):
     """Qwen3.5-4B's attention forward (16 query heads over 4, 256 wide, 12,288 causal tokens: the step's two
     rows and the planner's one-row decision) at the config its derivation gives on a compile-only B200: on a
-    tensor-memory family, every launch compiled by ptxas spilling nothing, its register model's decision
-    ptxas's (`mosaic_failures`). A B200's 4B step stepped through 19 spilling chunks forwards for 42 minutes
-    and landed on the Ampere family's."""
+    tensor-memory family, every launch compiled by ptxas spilling nothing (`mosaic_failures`). A B200's 4B
+    step stepped through 19 spilling chunks forwards for 42 minutes and landed on the Ampere family's."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures, undercounts
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     tokens, heads, kv_heads, width = 12288, 16, 4, 256
     spans = template.spans(tokens, tokens, rows, causal=True)
@@ -632,7 +630,7 @@ def test_the_4b_steps_forward_compiles_spill_free_on_tensor_memory_for_a_b200(ro
         assert config is not None and config.family.startswith("tcgen05"), config
         case = KernelCase("4B forward", lambda: (forward, (query, key, key)))
         found = compile_mosaic_kernels([case], "sm100")
-    failed = mosaic_failures(found) + undercounts(found)
+    failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
 

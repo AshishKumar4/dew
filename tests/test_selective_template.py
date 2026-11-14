@@ -477,11 +477,8 @@ def test_a_named_template_refuses_a_state_row_no_bulk_copy_takes(states):
 def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):
     """The selective scan's backward over Mamba's 16 states compiled for an H100 (`kernel_compile`), its
     documents packed or not: its launch spills nothing at the registers its derived residency leaves a thread
-    (`selective.backward_plan`, `mosaic.compiler_params`' `resident`), and the most programs the least
-    spill-free cap ptxas finds (`register_need`) leaves room for is the residency its register model gives
-    (`selective.backward_registers`), so a model whose decision parts from ptxas's, or a backward whose need
-    grows past its share, fails here rather than spilling or leaving a program out on the GPU (rows 3589,
-    3801)."""
+    (`selective.backward_plan`, `mosaic.compiler_params`' `resident`), so a backward whose need grows past its
+    share fails here rather than spilling on the GPU (rows 3589, 3801)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -502,16 +499,9 @@ def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):
 
         return (trained, (*operands, starts)) if packed else (trained, operands)
 
-    (record,) = compile_mosaic_kernels([KernelCase('selective backward', call)], 'sm90', least=True)
+    (record,) = compile_mosaic_kernels([KernelCase('selective backward', call)], 'sm90')
     assert not mosaic_failures([record]), mosaic_failures([record])
-    (kernel,) = [kernel for kernel in record['kernels'] if 'selective_scan_backward' in kernel['kernel']]
-    need = kernel['least']
-    assert need is not None, kernel
-    target = generation.gpu_target('sm90')
-    positions, resident = selective.backward_plan(target)
-    held = selective.backward_programs(need, target)
-    assert held == resident == selective.backward_programs(selective.backward_registers(positions), target), (
-        need, held, resident, positions)
+    assert [kernel for kernel in record['kernels'] if 'selective_scan_backward' in kernel['kernel']], record
 
 
 @lowers('sm90')

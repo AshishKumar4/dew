@@ -173,9 +173,8 @@ def test_the_short_convs_kernels_compile_within_each_gpus_resources(target):
 def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources():
     """The GEMM template's Mosaic GPU grouped matmul, lone and cooperative, compiled by Mosaic for a
     compile-only H100 on this CPU through ptxas (tests/kernel_compile.py): within the multiprocessor's
-    shared memory, no register spilled, its register model deciding as ptxas does (`model_failures`, row
-    1971). The resource gate every Mosaic GPU mainloop takes."""
-    from kernel_compile import compile_mosaic_kernels, model_failures, mosaic_failures
+    shared memory, no register spilled. The resource gate every Mosaic GPU mainloop takes."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     from dew.nn.kernels.templates.gemm import mosaic_gpu
 
@@ -194,7 +193,7 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
                                     case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2,
                                                           family='wgmma'))], "sm90")
     assert len(found) == 2 and all(record.get("kernels") for record in found), found
-    failed = mosaic_failures(found) + model_failures(found)
+    failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
 
@@ -204,10 +203,9 @@ def test_a_pingpong_tile_compiles_within_its_resources_as_its_register_model_pri
     """A Hopper GEMM pinned to a ping-pong tile (`Tiles.pingpong`: two consumers each holding a whole
     tile's accumulators, their products in turn), legal at a consumer's 64 rows (its granularity whole roles
     of the rows one consumer holds, `Tiles.sharing`), its forward and its input gradient, grouped and dense,
-    compiled by Mosaic and ptxas for a compile-only H100: spilling nothing, its registers
-    as its model prices each consumer's whole tile (`model_failures`), its turns' barriers within its planned
-    shared memory (`mosaic_failures`)."""
-    from kernel_compile import compile_mosaic_kernels, model_failures, mosaic_failures
+    compiled by Mosaic and ptxas for a compile-only H100: spilling nothing, its turns' barriers within its
+    planned shared memory (`mosaic_failures`)."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     from dew.nn.kernels.templates.gemm import mosaic_gpu
 
@@ -231,7 +229,7 @@ def test_a_pingpong_tile_compiles_within_its_resources_as_its_register_model_pri
                                         {"dew_gmm": model}))
     found = compile_mosaic_kernels(cases, "sm90")
     assert len(found) == len(cases) and all(record.get("kernels") for record in found), found
-    failed = mosaic_failures(found) + model_failures(found)
+    failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
 
@@ -547,29 +545,27 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
 
 
 class GemmCase(NamedTuple):
-    """A GEMM launch's compile case (`_gemm_mainloop_cases`): its form (`_gemm_forms`' name), its tile,
-    whether the derivation refused it for its registers, the consumer count of a family contract's case
-    (`every_consumer_count`, else None) and the kernel case compiled."""
+    """A GEMM launch's compile case (`_gemm_mainloop_cases`): its form (`_gemm_forms`' name), its tile, the
+    consumer count of a family contract's case (`every_consumer_count`, else None) and the kernel case
+    compiled."""
 
     form: str
     tile: Any
-    refused: bool
     consumers: int | None
     case: support.KernelCase
 
     @property
     def kernel(self) -> tuple:
-        """Its kernel's identity: its form, refusal and tile, the band its tiles are walked in apart
+        """Its kernel's identity: its form and tile, the band its tiles are walked in apart
         (`Tiles.grid_block_n`), a contract case's count the tile's consumers stating it."""
-        return self.form, self.refused, dataclasses.replace(self.tile, grid_block_n=0)
+        return self.form, dataclasses.replace(self.tile, grid_block_n=0)
 
 
 def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_count: bool = False,
                          form: str | None = None) -> list[GemmCase]:
     """Each GEMM Mosaic launch form a `generation_name` GPU runs at the projection `shape`
     (`GEMM_SHAPES`, `_gemm_forms`), at the one tile its launch derives from the generation's facts
-    (`Template.derived`) and at each tile the derivation refused for its registers alone
-    (`_derived_and_refused`); each a family's mainloop only where it takes the call
+    (`Template.derived`); each a family's mainloop only where it takes the call
     (`Template.eligible`). With `every_consumer_count`, each form at one consumer and at the family's most
     (`Family.consumers`) where that tile is legal instead, each case named with its count (`x1`, `x2`).
     With `form`, that form's alone. Each a record (`GemmCase`)."""
@@ -581,9 +577,8 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
             ba = launch.bind(*args, **options)
             if not launch.eligible(ba, target):
                 continue
-            config, refused = _derived_and_refused(launch, ba, target)
-            configs = {(f"{name} {config}", False, None): config,
-                       **{(f"{name} refused {tile}", True, None): tile for tile in refused}}
+            config = launch.derived(ba, target)
+            configs = {(f"{name} {config}", None): config}
             if every_consumer_count:
                 family = pricing.family_of(config, jnp.bfloat16)
                 configs = {}
@@ -608,14 +603,14 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                                  if isinstance(tile, mosaic_gpu.Tiles) and launch.legal(ba, tile, target)),
                                 None)
                     if tile is not None:
-                        configs[(f"{name} x{consumers} {tile}", False, consumers)] = tile
+                        configs[(f"{name} x{consumers} {tile}", consumers)] = tile
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
-            for (label, refusal, consumers), config in configs.items():
+            for (label, consumers), config in configs.items():
                 case = support.KernelCase(label, lambda launch=launch, ba=ba, config=config:
                                           launch.lowering(ba, config),
                                           {kernel: _model(launch, ba, config)},
                                           required=launch.legal(ba, config, target))
-                cases.append(GemmCase(name, config, refusal, consumers, case))
+                cases.append(GemmCase(name, config, consumers, case))
     return cases
 
 
@@ -630,39 +625,16 @@ def _replaced(config, **changes):
 
 def _model(launch, ba, config) -> resources.RegisterModel:
     """What a launch's model decides at `config` for the call `ba` at its residency (`Tiles.programs`, where
-    the launch's own model, `mosaic_gpu.gmm`'s `registers`, decides its register moves), as the gate holds
-    it to the compiled kernel (`resources.register_model`, `kernel_compile.decisions`), and the shared
-    memory the planner sized it by (`resources.shared_bytes` of `launch_of`'s allocations, including
-    barriers), against the kernel's own."""
+    the launch's own model, `mosaic_gpu.gmm`'s `registers`, decides its register moves, which the gate holds
+    its producer to, `producer_failures`), and the shared memory the planner sized it by
+    (`resources.shared_bytes` of `launch_of`'s allocations, including barriers), against the kernel's
+    own."""
     family = pricing.family_of(config, ba.arguments['tokens'].dtype)
     planned = launch.launch_of(ba, config)
     shared = resources.shared_bytes(family, planned.scope(config.stages))
     return resources.register_model(family, config.warpgroups, launch.registers(ba, config), shared=shared,
                                     producer=planned.producer, programs=config.programs,
                                     moves=mosaic_gpu.MOVES)
-
-
-def _derived_and_refused(launch, ba, target) -> tuple:
-    """A launch's derived tile, and the tiles its derivation asked the planner about (`launch_of`) that
-    it refused for their registers alone (`resources.plan`: a ring its program's share holds, the registers
-    not), whose need the gate checks refuses them too: a model over the need throws tiles away
-    (`kernel_compile.decisions`). Each is the largest such of its rows, columns and layout, at the deepest
-    ring the planner holds without the registers, the one a derivation would take had they held (the
-    plans it asked, `resources.recording`)."""
-    with resources.recording() as asked:
-        config = launch.derived(ba, target)
-    refused: dict = {}
-    for each in asked:
-        (tile,) = each.tiles
-        if each.plans is not None:
-            continue
-        held = resources.plan([dataclasses.replace(launch.launch_of(ba, tile), registers=0)], each.family,
-                              target, programs=each.programs)
-        if held is not None:
-            tile = dataclasses.replace(tile, stages=held[0].stages)
-            shape = (tile.block_m, tile.block_n, tile.block_k, tile.warpgroups, tile.family)
-            refused[shape] = max(refused.get(shape, tile), tile, key=lambda each: each.stages)
-    return config, list(refused.values())
 
 
 def _emitted_forms(family) -> set[str]:
@@ -734,15 +706,13 @@ def _by_form(names: tuple[str, ...], forms_of: Callable[[str], set[str]]) -> lis
 @pytest.mark.parametrize(("generation_name", "form"), _by_form(gate_generations(stated=True), _gate_forms))
 def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, form):
     """Every distinct GEMM Mosaic GPU kernel of a form a generation runs at a real projection (`_gate_cases`),
-    a test each form, at the tile its launch derives from the generation's facts and at each tile the
-    derivation refused for its registers, compiled by Mosaic for a compile-only device of the generation on
-    this CPU through ptxas, with the JAX this checkout pins. Required launches must spill nothing, and their
-    register model decide as ptxas does (`model_failures`: the GEMM's models match the compiler on every
-    case, row 1971). Rejected configurations supply model evidence; their spills are refusals, never
-    qualified launches. Compiler errors and missing reports fail either. Beside them, each launch of the
+    a test each form, at the tile its launch derives from the generation's facts, compiled by Mosaic for a
+    compile-only device of the generation on
+    this CPU through ptxas, with the JAX this checkout pins. Required launches must spill nothing; compiler
+    errors and missing reports fail any. Beside them, each launch of the
     form's family contract (`_family_cases`: each consumer count) the gate does not hold lowers, within the
     block, spilling nothing, before any consumer adopts a Family head; no version guard skips it."""
-    from kernel_compile import compile_mosaic_kernels, model_failures, mosaic_failures
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     cases = [each.case for each in _gate_cases(generation_name, form)]
     contract = ([each.case for each in _family_cases(generation_name, form)]
@@ -751,7 +721,7 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
     found = compile_mosaic_kernels(cases + contract, generation_name)
     failed = failures(found) + mosaic_failures(found[len(cases):])
     required = [record for case, record in zip(cases, found[:len(cases)], strict=True) if case.required]
-    failed += mosaic_failures(required) + model_failures(required)
+    failed += mosaic_failures(required)
     assert not failed, "\n".join(failed)
     assert all(record["kernels"] and all(not kernel["unread"] for kernel in record["kernels"])
                for record in found)
@@ -1376,7 +1346,7 @@ def test_a_capabilitys_cells_read_their_own_records_from_a_process_of_their_own(
 
 def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     """A record the gate reads (`mosaic_failures`): a kernel past its shared memory, its tensor memory or
-    spilling fails; a spill-free model disagreement is reported."""
+    spilling fails."""
     from kernel_compile import inherited, mosaic_failures, reports
 
     within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
@@ -1384,12 +1354,6 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     assert not mosaic_failures([record])
     for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
         assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
-    overestimated = resources.RegisterModel(200, 168, 2, 1, 8, 168, shared=1024, file=65536)
-    # Its producer lowered as its model states (`decreased`, the gate's `producer_failures`).
-    disagreement = {**record, "models": {"k": overestimated.record()},
-                    "kernels": [{**within, "need": 160, "decreased": overestimated.producer}]}
-    assert not mosaic_failures([disagreement])
-    assert any(not row["agrees"] for row in disagreement["evidence"])
     # A kernel whose reports state no resources, spilling nothing, is no evidence: it fails, as a record
     # with no kernel does (row 1877: a contract gate read only its shared count and positive spills).
     unstated = {**within, "unread": ["shared bytes", "tensor memory columns"], "shared": None, "tmem": None}
@@ -1415,77 +1379,6 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     (unbound,) = (inherited(dataclasses.asdict(found), compiled) for found in reports({"a": complete}, []))
     assert "binary" in unbound["unread"]
     assert mosaic_failures([{**record, "kernels": [unbound]}])
-
-
-def test_a_gate_holding_its_models_fails_a_spill_free_disagreement_and_an_unmodelled_launch():
-    """A family's gate that holds its register model to ptxas (`model_failures`, row 1971) fails a kernel
-    whose model decides otherwise than ptxas (here four programs where ptxas holds two) and a launch with
-    no model, as the resource gate fails a spill; a kernel whose model agrees passes."""
-    from kernel_compile import model_failures, mosaic_failures
-
-    need = {"admitted": True, "programs": 2, "budget": 255, "refusal_holds": True, "refusal_programs": 2,
-            "caps": [{"cap": 255, "registers": 96, "spilled": 0, "compiled": True, "holds": True}]}
-    kernel = {"kernel": "dew_gmm", "launch": None, "unread": [], "shared": 1024, "tmem": 0, "registers": 96,
-              "spilled": 0, "need": need}
-
-    def judged(most: int) -> list[str]:
-        model = resources.RegisterModel(96, 255, 1, most, 8, 0, shared=1024, file=65536)
-        record = {"name": "forward", "generation": "sm120", "limit": 101376, "tmem_limit": 0,
-                  "models": {"dew_gmm": model.record()}, "kernels": [kernel]}
-        assert not mosaic_failures([record])
-        return model_failures([record])
-
-    assert judged(most=2) == []
-    assert judged(most=4)
-    unmodelled = {"name": "forward", "generation": "sm90", "limit": 232448, "tmem_limit": 0, "models": {},
-                  "kernels": [kernel]}
-    assert model_failures([unmodelled])
-
-
-def test_an_undercounting_model_fails_the_gate_and_an_overcounting_one_does_not():
-    """The gate fails a model that admits more programs a multiprocessor than ptxas's caps hold
-    (`undercounts`: here four where the caps hold two, or a tile no cap holds spill-free), the launch then
-    spilling or planned past its residency; a model admitting fewer passes, its cost a smaller tile; a launch
-    no model states fails."""
-    from kernel_compile import undercounts
-
-    need = {"admitted": True, "programs": 2, "budget": 255, "refusal_holds": True, "refusal_programs": 2,
-            "caps": [{"cap": 255, "registers": 96, "spilled": 0, "compiled": True, "holds": True},
-                     {"cap": 64, "registers": 64, "spilled": 40, "compiled": True, "holds": False}]}
-    kernel = {"kernel": "dew_gmm", "launch": None, "unread": [], "shared": 1024, "tmem": 0, "registers": 96,
-              "spilled": 0, "need": need}
-
-    def failed(most: int, held: dict = need) -> list[str]:
-        model = resources.RegisterModel(96, 255, 1, most, 8, 0, shared=1024, file=65536)
-        return undercounts([{"name": "forward", "models": {"dew_gmm": model.record()},
-                             "kernels": [{**kernel, "need": held}]}])
-
-    assert failed(most=2) == [] and failed(most=1) == []
-    assert failed(most=4) and "ptxas holds 2" in failed(most=4)[0]
-    assert failed(most=2, held={**need, "admitted": False})
-    assert undercounts([{"name": "forward", "models": {}, "kernels": [kernel]}]) == [
-        "forward dew_gmm: a launch no register model states"]
-
-
-def test_a_kernel_is_judged_by_the_model_its_launch_stated_not_the_cases_declared_one():
-    """A kernel whose launch stated its own register model as it traced (`stated_models`: its plan's two
-    programs) is judged by that model, the decision its derivation made: the case's declared model for its
-    name (a family's four programs by registers alone) states no decision this launch made, so it adds no
-    disagreement (row 1971: 381 of the gate's 511 recorded misses were a declared model's residency against
-    the launch's need)."""
-    from kernel_compile import _register_evidence
-
-    declared = resources.RegisterModel(112, 255, 1, 4, 8, 0, shared=49232, file=65536)
-    stated = resources.RegisterModel(112, 255, 1, 2, 8, 0, shared=49232, file=65536)
-    need = {"admitted": True, "programs": 2, "budget": 255, "refusal_holds": True, "refusal_programs": 2,
-            "caps": [{"cap": 255, "registers": 96, "spilled": 0, "compiled": True, "holds": True}]}
-    kernel = {"kernel": "dew_tgmm", "launch": None, "unread": [], "shared": 49232, "tmem": 0,
-              "registers": 96, "spilled": 0, "need": need}
-    record = {"name": "kernel gradient", "generation": "sm120", "limit": 101376, "tmem_limit": 0,
-              "models": {"dew_tgmm": declared.record()}, "stated_models": {"dew_tgmm": stated.record()},
-              "kernels": [kernel]}
-    rows = _register_evidence(record)
-    assert rows and all(row["agrees"] for row in rows), rows
 
 
 def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():

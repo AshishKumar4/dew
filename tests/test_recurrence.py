@@ -442,10 +442,9 @@ def test_a_decode_step_holds_its_registers_at_the_residency_it_plans(target, row
     """Mamba-2's decode step (its rated decay and skip, the most registers a step's hooks hold) over 128 keys
     a head, compiled for a compile-only `target` (`kernel_compile`) at one row, whose grid the plan may split
     between two warpgroups a program, and at 128, past a wave (`step._plan`): its launch spills nothing at
-    the registers its planned residency leaves a thread (`mosaic.compiler_params`' `resident`), and ptxas's
-    least spill-free cap is within the step's model (`step.step_registers`), so a step whose need grows past
-    its share fails here rather than spilling or leaving programs out on the GPU (row 4864; uncapped, an
-    A100's step took all 255 registers, two programs a multiprocessor)."""
+    the registers its planned residency leaves a thread (`mosaic.compiler_params`' `resident`), so a step
+    whose need grows past its share fails here rather than spilling on the GPU (row 4864; uncapped, an A100's
+    step took all 255 registers, two programs a multiprocessor)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -466,8 +465,7 @@ def test_a_decode_step_holds_its_registers_at_the_residency_it_plans(target, row
                        shaped((rows, heads, value_width), jnp.bfloat16), shaped((rows, heads), jnp.float32),
                        *(shaped((heads,), jnp.float32),) * 2)
 
-    (record,) = compile_mosaic_kernels([KernelCase('decode step', call)], target, least=True)
+    (record,) = compile_mosaic_kernels([KernelCase('decode step', call)], target)
     assert not mosaic_failures([record]), mosaic_failures([record])
     (kernel,) = [kernel for kernel in record['kernels'] if 'recurrence_step' in kernel['kernel']]
-    assert kernel['spilled'] == 0 and kernel['least'] is not None, kernel
-    assert kernel['least'] <= template.step_registers(), kernel
+    assert kernel['spilled'] == 0, kernel

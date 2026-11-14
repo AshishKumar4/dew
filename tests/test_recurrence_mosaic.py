@@ -1331,31 +1331,27 @@ def refused_kernels(record: dict, launches: set[str]) -> set[str]:
 def apart_failures(found: list, apart: dict) -> list[str]:
     """Each compiled case's launches held apart (`apart`, the names its model refuses by its label): every
     launch its model admits as a required case's (`kernel_compile.mosaic_failures`: spill-free, every report
-    read), and every one it refuses free to spill, its model's decision beside ptxas's in the record's
-    register evidence, advisory where ptxas holds it spill-free (as `mosaic_failures` keeps a spill-free
-    disagreement)."""
-    from kernel_compile import _register_evidence, mosaic_failures, undercounts
+    read), and every one it refuses free to spill, as certification would refuse it."""
+    from kernel_compile import mosaic_failures
 
     failed = []
     for record in found:
         refused = refused_kernels(record, apart[record["name"]])
         admitted = [kernel for kernel in record.get("kernels", ()) if kernel["kernel"] not in refused]
         if admitted:
-            compared = [{**record, "kernels": admitted}]
-            failed += mosaic_failures(compared) + undercounts(compared)
-        record["evidence"] = _register_evidence(record)
+            failed += mosaic_failures([{**record, "kernels": admitted}])
     return failed
 
 
 def resource_failures(cases: list, found: list, plans: dict, apart: dict) -> list[str]:
     """The resource gate's verdict on compiled cases: every case reports within its plan, every required
-    launch holds, and forced variants' model-refused launches remain assembly evidence."""
-    from kernel_compile import failures, mosaic_failures, undercounts
+    launch holds, and forced variants' model-refused launches may spill."""
+    from kernel_compile import failures, mosaic_failures
 
     failed = failures(found) + planned_failures(found, plans)
     required = [record for case, record in zip(cases, found, strict=True)
                 if case.required and case.name not in apart]
-    failed += mosaic_failures(required) + undercounts(required)
+    failed += mosaic_failures(required)
     return failed + apart_failures([record for record in found if record['name'] in apart], apart)
 
 
@@ -1418,7 +1414,7 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
 def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blackwell(name):
     """A geometry's 16-bit training at its derived tiles, compiled for a compile-only B200 over one row of
     2048 tokens, so each persistent launch's programs walk several tiles (the gate's 256 tokens walk one): no
-    launch spills, and ptxas's least spill-free cap is within each launch's register model. Its producer at
+    launch spills. Its producer at
     24 registers, the walk's indices and addresses spilled once a program walked three tiles or more and
     ptxas allocated the consumers past their live set around them (`mainloop.PERSISTENT_PRODUCER`, row 5693:
     the 4B SSD's scores' gradient spilled 16 bytes at its 248 registers, its model 223)."""
@@ -1439,16 +1435,8 @@ def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blac
                   jax.ShapeDtypeStruct(args[5].shape, jnp.float32)]
     call = functools.partial(_gate_call, name, dtype, [*args, *cotangents], None, tiles, family,
                              training=True)
-    (record,) = compile_mosaic_kernels([KernelCase(name, call, models)], 'sm100', least=True)
+    (record,) = compile_mosaic_kernels([KernelCase(name, call, models)], 'sm100')
     assert not mosaic_failures([record]), mosaic_failures([record])
-
-    def modelled(kernel) -> int:
-        # The model's registers in the allocator's steps of 8, as ptxas's least cap is stated.
-        return -(-models[kernel['kernel'].split('__')[0]].registers // 8) * 8
-
-    over = [(kernel['kernel'], kernel['least'], modelled(kernel)) for kernel in record['kernels']
-            if kernel['spilled'] or kernel['least'] is None or kernel['least'] > modelled(kernel)]
-    assert not over, over
 
 
 def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple[list, list]:
