@@ -648,43 +648,47 @@ def gated_up(prefix: tuple, reference: tuple, index: jax.Array, place) -> jax.Ar
 
 def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, prefix: tuple,
                     at: Callable[[int], tuple], staged: Callable[[jax.Array, int, int | None], Tile], *,
-                    chunk: int, scales: Sequence[float], sub: int = SUB) -> list[list[tuple]]:
-    """A chunk's pairs under a decay a key dimension, one key block's, as the products whose sum they are: for
-    each of `rows` (each forming its row when called: the queries, the write-gated keys; fp32) a list of
-    `(name, lhs, rhs)` ('pairs'), summed into one accumulator a row set, its `[C, C]` pairs against the same
-    `keys` (fp32), `sum_k r_ik k_jk exp2(g_ik - g_jk)` for row `i` in sub-chunk `s` and key `j` in an earlier
-    sub-chunk `t < s`, zero for `t >= s` (a sub-chunk's own pairs are `key_diagonal_bands`', each its own
-    decay, as fla's token-parallel diagonal). `prefix` is the block's separated prefix (`separated`) and
-    `at(token)` it at the chunk's `token`, a column's vectors; each row set's gated rows are scaled by its of
-    `scales` (the scores' the attention scale), so the sums a mainloop holds are its pairs scaled. Each pair's
-    decay splits at `s`'s first token `G_s`, as fla_kda's inter-sub-chunk products split it: `exp2(g_i - G_s)
-    exp2(G_s - g_j)`, each exponent at most zero (`decay`). For each sub-chunk `s` past the first, one product
-    a row set: the rows of `s` gated down to `G_s`, zero on every other row, against every key before `s`
-    gated up to `G_s` (`gated_up`), zero from `s` on, a whole chunk of rows against a whole chunk of keys
-    (read transposed), each operand staged once where `staged(value, s, r)` puts it (the keys' `r` None, every
-    row set's products reading them). A row set's products sum into one accumulator, which a mainloop may hold
-    across its key blocks, read once. Factored instead at `t`'s last token, its middle factor laid over the
-    rows of `s` a product a key sub-chunk, each product awaited and read into a tile, the sums added up in
-    shared memory every key block, a B200's Kimi Linear intra walk spent 23% of its cycles waiting on its
-    products' commits and 20% staging (an emulated B200's line map at 37ef70629d7), and its intra launches
-    took 880 us on a GH200 and 1,858 on an A100 against fla's inter-sub-chunk launch's 159 and 355 (M-JS-24).
-    A sub-chunk's own pairs factored too, the queries and keys decay-scaled around its first token and taken
-    on the tensor cores, put a packed document's first token's output, a row of 2.5e-5 where `q . k` cancels,
-    at 0.83 of its size from float64 on an A100 against 7e-3 taken each its own decay (row 5194, M-JS-48w)."""
+                    chunk: int, scales: Sequence[float], sub: int = SUB) -> list[Callable[[], list[tuple]]]:
+    """A chunk's pairs under a decay a key dimension, one key block's, as the products whose sum they are, a
+    sub-chunk at a time: for each sub-chunk past the first a callable forming its products, one `(name, lhs,
+    rhs)` ('pairs') for each of `rows` (each forming its row when called: the queries, the write-gated keys;
+    fp32), summed into one accumulator a row set, its `[C, C]` pairs against the same `keys` (fp32), `sum_k
+    r_ik k_jk exp2(g_ik - g_jk)` for row `i` in sub-chunk `s` and key `j` in an earlier sub-chunk `t < s`,
+    zero for `t >= s` (a sub-chunk's own pairs are `key_diagonal_bands`', each its own decay, as fla's
+    token-parallel diagonal). `prefix` is the block's separated prefix (`separated`) and `at(token)` it at the
+    chunk's `token`, a column's vectors; each row set's gated rows are scaled by its of `scales` (the scores'
+    the attention scale), so the sums a mainloop holds are its pairs scaled. Each pair's decay splits at `s`'s
+    first token `G_s`, as fla_kda's inter-sub-chunk products split it: `exp2(g_i - G_s) exp2(G_s - g_j)`, each
+    exponent at most zero (`decay`). For each sub-chunk `s` past the first, one product a row set: the rows of
+    `s` gated down to `G_s`, zero on every other row, against every key before `s` gated up to `G_s`
+    (`gated_up`), zero from `s` on, a whole chunk of rows against a whole chunk of keys (read transposed),
+    each operand staged once where `staged(value, s, r)` puts it (the keys' `r` None, every row set's products
+    reading them). A row set's products sum into one accumulator, which a mainloop may hold across its key
+    blocks, read once; formed a sub-chunk at a time, a caller issues each sub-chunk's products once its
+    operands are staged, their MMAs running under the next sub-chunk's forming, where every operand staged
+    before any product was issued, a B200's intra walk's compute warps waited on their products' commit at its
+    end (11% of their stalls, an emulated B200 at b1a0fe4b98b). Factored instead at `t`'s last token, its
+    middle factor laid over the rows of `s` a product a key sub-chunk, each product awaited and read into a
+    tile, the sums added up in shared memory every key block, a B200's Kimi Linear intra walk spent 23% of its
+    cycles waiting on its products' commits and 20% staging (an emulated B200's line map at 37ef70629d7), and
+    its intra launches took 880 us on a GH200 and 1,858 on an A100 against fla's inter-sub-chunk launch's 159
+    and 355 (M-JS-24). A sub-chunk's own pairs factored too, the queries and keys decay-scaled around its
+    first token and taken on the tensor cores, put a packed document's first token's output, a row of 2.5e-5
+    where `q . k` cancels, at 0.83 of its size from float64 on an A100 against 7e-3 taken each its own decay
+    (row 5194, M-JS-48w)."""
     index, _ = _grid(prefix[0].shape)
     blocks = chunk // sub
     # Every row gated down to its own sub-chunk's first token.
     down = decay(prefix, _laid_references(lambda s: at(s * sub), index, chunk, sub))
-    raised = [staged(keys * gated_up(prefix, at(s * sub), index, s * sub), s, None).T
-              for s in range(1, blocks)]
-    products: list[list[tuple]] = []
-    for r, (row, scale) in enumerate(zip(rows, scales, strict=True)):
-        # Scaled once gated down, so a large row its decay attenuates stays finite.
-        gated = row() * down * scale
-        products.append([("pairs", staged(jnp.where((index >= s * sub) & (index < (s + 1) * sub), gated, 0.0),
-                                          s, r), raised[s - 1])
-                         for s in range(1, blocks)])
-    return products
+    # Scaled once gated down, so a large row its decay attenuates stays finite.
+    gated = [row() * down * scale for row, scale in zip(rows, scales, strict=True)]
+
+    def formed(s: int) -> list[tuple]:
+        raised = staged(keys * gated_up(prefix, at(s * sub), index, s * sub), s, None).T
+        mine = (index >= s * sub) & (index < (s + 1) * sub)
+        return [("pairs", staged(jnp.where(mine, value, 0.0), s, r), raised) for r, value in enumerate(gated)]
+
+    return [functools.partial(formed, s) for s in range(1, blocks)]
 
 
 Shifted = Callable[[int], Callable[[jax.Array], tuple]]

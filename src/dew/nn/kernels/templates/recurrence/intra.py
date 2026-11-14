@@ -273,15 +273,18 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                 set `r`'s rows gated down."""
                 return operands.staged(family, value, raised[s - 1] if r is None else lefts[r][s - 1])
 
-            # Every operand staged before any product, published once (`Family.staged_together`).
-            with family.staged_together():
-                pairs = algebra.key_block_pairs([functools.partial(rows, name) for name in products],
-                                                operand("keys"), whole, at_token, staged, chunk=chunk,
-                                                scales=[shrinking if name == "scores" else 1.0
-                                                        for name in products])
             issuer = Issuer(call)
-            return carry, tuple(issuer.summed(found, into=acc)
-                                for found, acc in zip(pairs, accumulators, strict=True))
+            for formed in algebra.key_block_pairs([functools.partial(rows, name) for name in products],
+                                                  operand("keys"), whole, at_token, staged, chunk=chunk,
+                                                  scales=[shrinking if name == "scores" else 1.0
+                                                          for name in products]):
+                # A sub-chunk's operands staged and published once (`Family.staged_together`), its products
+                # issued then, running under the next sub-chunk's forming.
+                with family.staged_together():
+                    found = formed()
+                accumulators = tuple(issuer.summed([product], into=acc)
+                                     for product, acc in zip(found, accumulators, strict=True))
+            return carry, accumulators
 
         def read(carry, totals):
             """The sums once the walk is done, the system masked once (a row whose write gate overflows
