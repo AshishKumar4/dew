@@ -226,25 +226,31 @@ def main() -> None:
                             log_every=1, **options)
         return state, {"losses": losses.losses[before:], "loss_steps": losses.steps[before:]}
 
-    def started() -> dict:
-        """What a draw's fit starts from: the run's own initial state, which the float64 run takes as the
-        float32 run draws it, widened exactly, so every launch's draws start from the same values."""
+    def started():
+        """What every draw's fit starts from, drawn once: the run's own initial state, which the float64 run
+        takes as the float32 run draws it, widened exactly, so every launch's draws start from the same
+        values."""
         if not args.float64:
-            return {}
-        with jax.enable_x64(new_val=False):
             # Its optimizer built over the run's length, as each fit builds the run's (`Trainer.scheduled`).
+            trainer.scheduled(args.steps)
+            return trainer.initial_state()
+        with jax.enable_x64(new_val=False):
             narrowed = trainer_of(None)
             narrowed.scheduled(args.steps)
             narrow = narrowed.initial_state()
-        return {"state": narrow.replace(variables=float64_held(narrow.variables),
-                                        opt_state=float64_held(narrow.opt_state),
-                                        ema=float64_held(narrow.ema))}
+        return narrow.replace(variables=float64_held(narrow.variables),
+                              opt_state=float64_held(narrow.opt_state), ema=float64_held(narrow.ema))
 
     if args.draws:
         # Every judged run is a draw: from the one initial state (`started`) on a packed batch of its own,
-        # the record's state the first draw's.
+        # the record's state the first draw's. Each fit is handed a copy, as it consumes the state it steps.
+        initial = started()
+
+        def copied():
+            return jax.tree.map(lambda leaf: jax.numpy.copy(leaf) if isinstance(leaf, jax.Array) else leaf, initial)
+
         seeds = range(args.first_draw, args.first_draw + args.draws)
-        runs = (run(drawn(seed), **started()) for seed in seeds)
+        runs = (run(drawn(seed), state=copied()) for seed in seeds)
         state, logged = next(runs)
         first, draws = {}, [logged["losses"], *(later["losses"] for _, later in runs)]
         computed = loss_dtype(trainer, state, packed_batch(args.first_draw))
