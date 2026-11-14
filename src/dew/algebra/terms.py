@@ -418,7 +418,8 @@ def parameter_key(value) -> Hashable:
         placement = (parameter_key(sharding.spec), parameter_key(mesh.axis_sizes),
                      parameter_key(mesh.axis_names), parameter_key(mesh.axis_types),
                      parameter_key(sharding.memory_kind))
-        return ("abstract", parameter_key(value.shape), parameter_key(value.dtype), value.weak_type,
+        # Its dtype by its name, a PRNG key's extended one's too (`key<fry>`).
+        return ("abstract", parameter_key(value.shape), ("dtype", value.dtype.name), value.weak_type,
                 placement, parameter_key(value.memory_space), parameter_key(value.layout),
                 parameter_key((manual.varying, manual.unreduced, manual.reduced, manual.unreduced_kind)))
     if value is Layout.AUTO:

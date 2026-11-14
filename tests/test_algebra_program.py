@@ -957,7 +957,8 @@ def _parameter_pairs():
              (jax.lax.Precision.HIGHEST, jax.lax.Precision("highest")),
              (jax.lax.DotAlgorithmPreset.BF16_BF16_F32, jax.lax.DotAlgorithmPreset.BF16_BF16_F32),
              (ShapedArray((4, 8), jnp.float32, sharding=NamedSharding(abstract, P("data", None))),
-              ShapedArray((4, 8), np.dtype("float32"), sharding=NamedSharding(abstract, P("data", None))))]
+              ShapedArray((4, 8), np.dtype("float32"), sharding=NamedSharding(abstract, P("data", None)))),
+             (jax.typeof(jax.random.key(0)), jax.typeof(jax.random.key(1)))]
     return equal, unequal
 
 
