@@ -361,15 +361,18 @@ def start(event: str, args: tuple, directory: str) -> str | None:
     if event == "subprocess.Popen":
         program, argv, environment = args[0], args[1], args[3]
         named = (os.environ if environment is None else environment).get(CHILDREN)
-        if named == directory and (_this_python(program) or _launched_here(argv)):
+        if named == directory and _this_python(program):
             return "followed"
+        if named == directory and _launched_here(argv):
+            return "launched"
     return "unfollowed"
 
 
 def _launched_here(argv) -> bool:
     """Whether `argv` is uv's run of this very interpreter (`uv run ... --python <this interpreter> ...`),
     which layers a requirement over this environment and runs its Python with it, the `.pth` among its paths,
-    so the child records itself as any other does (tests/release_support.py: a release's code under its own
+    so the child records itself as any other does, beside any Python uv starts to ask the interpreter what it
+    is (`gathered`: a launch is at least one child; tests/release_support.py: a release's code under its own
     transformers; train 812's review: counted as unfollowed, its files and every file after them in their
     process kept no key)."""
     if isinstance(argv, (str, bytes, os.PathLike)) or argv is None:
@@ -572,8 +575,8 @@ def follow() -> None:
                 recorded(taken)
         elif event in SPAWNS:
             kind = start(event, args, where)
-            if kind == "followed":
-                log.write("start\tfollowed\n")
+            if kind in ("followed", "launched"):
+                log.write(f"start\t{kind}\n")
             elif kind == "unfollowed":
                 write("unfollowed", 1)
 
@@ -616,7 +619,8 @@ def logged(path: Path) -> dict:
     """A child's log read back: whose it is, the files it executed and read and the modules it imported, its
     reads of the backend, how many children it followed in turn, whether it started one no event sees or
     was not followed itself, its life, its GPU pool, and whether it closed."""
-    record = {"file": "", "files": set(), "reads": set(), "expected": 0, "unfollowed": False, "began": 0.0,
+    record = {"file": "", "files": set(), "reads": set(), "expected": 0, "launched": 0, "unfollowed": False,
+              "began": 0.0,
               "ended": None, "pool": None, "peak": None, "inherited": False, "closed": False}
     for line in path.read_text().splitlines():
         kind, _, value = line.partition("\t")
@@ -627,7 +631,7 @@ def logged(path: Path) -> dict:
         elif kind == "read":
             record["reads"].add(value)
         elif kind == "start":
-            record["expected"] += 1
+            record["launched" if value == "launched" else "expected"] += 1
         elif kind == "unfollowed":
             record["unfollowed"] = True
         elif kind in ("began", "ended"):
@@ -641,7 +645,8 @@ def logged(path: Path) -> dict:
     return record
 
 
-def gathered(directory: Path, expected: dict[str, int]) -> dict[str, dict]:
+def gathered(directory: Path, expected: dict[str, int],
+             launched: dict[str, int] | None = None) -> dict[str, dict]:
     """What each test file's children logged in `directory`, by the file that started them (`""`, every
     file's, for those started outside a file's tests), given how many children each file's own process
     started (`expected`): their files and reads, whether every start was followed and every child's log
@@ -650,16 +655,21 @@ def gathered(directory: Path, expected: dict[str, int]) -> dict[str, dict]:
     bytes of those that named their own. Read once the process group has exited, so every log is whole."""
     records = [logged(path) for path in directory.glob("*.log")] if directory.is_dir() else []
     found: dict[str, dict] = {}
-    for name in {*expected, *(record["file"] for record in records)}:
+    launched = launched or {}
+    for name in {*expected, *launched, *(record["file"] for record in records)}:
         own = [record for record in records if record["file"] == name]
         starts = expected.get(name, 0) + sum(record["expected"] for record in own)
+        # A launch (uv's run of this interpreter) is one child at least: uv may start another to ask the
+        # interpreter what it is, which closes its own log too.
+        launches = launched.get(name, 0) + sum(record["launched"] for record in own)
+        counted = len(own) == starts if not launches else len(own) >= starts + launches
         whole = [record for record in own if record["closed"]]
         pooled = [record for record in whole if record["pool"]]
         inherited = [record for record in pooled if record["inherited"]]
         found[name] = {
             "files": {path for record in own for path in record["files"]},
             "reads": {site for record in own for site in record["reads"]},
-            "followed": len(whole) == len(own) == starts and not any(r["unfollowed"] for r in own),
+            "followed": len(whole) == len(own) and counted and not any(r["unfollowed"] for r in own),
             "peak": max((record["peak"] for record in inherited if record["peak"] is not None), default=None),
             "shares": _most_at_once(inherited, lambda record: 1),
             "pools": _most_at_once([r for r in pooled if not r["inherited"]], lambda record: record["pool"])}
@@ -700,7 +710,8 @@ def recorded(path: Path) -> dict[str, dict]:
     lines = log_events(path)
     closed = [SHARED, CLOSED] in lines
     starts = Counter(name for name, item in lines if item == f"{STARTED}followed")
-    children = gathered(path.with_name(f"{path.name}.children"), dict(starts))
+    launches = Counter(name for name, item in lines if item == f"{STARTED}launched")
+    children = gathered(path.with_name(f"{path.name}.children"), dict(starts), dict(launches))
     blank = {"files": set(), "reads": set(), "followed": True, "peak": None, "shares": 0, "pools": 0}
     shared_child = children.get(SHARED, blank)
     visits = [(index, name) for index, (name, item) in enumerate(lines) if item == VISIT]
