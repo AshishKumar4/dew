@@ -72,7 +72,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Bit-level synthesis in dew.algebra. [3733]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
-- No check 1 cell serves a prompt that reads an earlier request's quantized prefix pages. [6007]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 
 ## Tutorials and docs

@@ -14,7 +14,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - Layering: `dew.inference.projections` is `dew.nn.projections`; a run's score names, `Summary` and
   `recorded_name`, are `dew.scores`'s (were `dew.training.evaluation`'s); the token count a state holds is
   `dew.state.TokenCount`; the adapted-class mark a reader below the adapters asks is
-  `dew.nn.protocols.Adapted` (`dew.lora.AdaptedClass` its typed reading); a saved run's migration that
+  `dew.nn.protocols.Adapted`; a saved run's migration that
   reads its checkpoints is its run class's `earlier_checkpointed`. A state, an objective, the
   configuration and a checkpoint's metrics import no trainer, inference or front end through them.
 
@@ -51,6 +51,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   as named, where JAX's flattening of its state took them by their sorted names. A cosine's floor is formed
   from its solver's rate operands and an exponential's offset is always one, so a solver set to another end
   value or offset reaches it, where its program held the ones it was built at.
+
+- A run whose data phases change its passes frees the outgoing step's narrow copies before it plans the
+  next phase's step, and builds the next phase's window over the outgoing one's buffers, donated: they
+  stayed live beside the new step's own until it returned, and a phase that fits was refused.
+
+
+
 
 - A compile-only GPU states its memory once: `compile_only_gpus(generation, count, memory)` takes each GPU's
   memory, its total as the GPU states it, which XLA compiles for and every admission of a program compiled

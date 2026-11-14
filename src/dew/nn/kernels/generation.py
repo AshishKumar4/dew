@@ -139,6 +139,7 @@ class Choice(enum.StrEnum):
     DELTA_DECODE = 'delta_decode'
     DELTA_GATES = 'delta_gates'
     GATE_UP = 'gate_up'
+    GATED_MLP = 'gated_mlp'
     GATED_DELTA_RULE = 'gated_delta_rule'
     GEMM_EPILOGUE = 'gemm_epilogue'
     GEMM_PROLOGUE = 'gemm_prologue'

@@ -29,8 +29,8 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
 from dew.nn.kernels.options import owned_program, trace_context
 from dew.nn.kernels.templates import report
-from dew.nn.sharding import Link, Schedule
-from dew.state import TrainState, apart, together
+from dew.nn.sharding import Link, Schedule, spread_axes, spread_over
+from dew.state import Accumulation, TrainState, apart, taken, together
 from dew.training import staging
 from dew.training._lowering import KernelReport, Routed, kernel_report, routed
 from dew.training.diloco import group_of, windowed
@@ -142,7 +142,7 @@ class Stepping[LossT, EffectsT]:
     shape: RunShape
     validation: Callable[[TrainState], Validation]
     builds_window: Callable[[TrainState, Candidate, int], bool]
-    window_of: Callable[[TrainState, Candidate, int], TrainState]
+    window_of: Callable[[TrainState, Candidate, int, Accumulation | None], TrainState]
 
 
 KEPT_CANDIDATES = 4
@@ -206,6 +206,8 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
         with _KEEPING:
             if (kept := _CANDIDATES.get(key)) is not None:
                 _CANDIDATES.move_to_end(key)
+                # Its links decide as its trace decided them: the key holds their figures (`trace_context`).
+                spread_over(kept.spread)
                 sampled = _sampled(stepping, kept, batch, placement, replicated, split, platforms)
                 return dataclasses.replace(kept, sampled=sampled)
     candidate = _candidate(stepping, state, batch, schedule, placement, replicated, split, narrow,
@@ -218,7 +220,7 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
             # Its trace not kept (`lowers`, `traces`): a kept derivation traces its step again where it is
             # lowered, and a kept floor its gradient where the search asks.
             _CANDIDATES[key] = dataclasses.replace(candidate, micro=_shapes(candidate.micro), sampled=None,
-                                                   lowers=None, traces=None)
+                                                   lowers=None, traces=None, spread=spread_axes())
             while len(_CANDIDATES) > KEPT_CANDIDATES:
                 _CANDIDATES.popitem(last=False)
     return candidate
@@ -267,14 +269,13 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
     prepared = placed_shapes(prepared, shardings)
     # The check reads the state's arguments as already on the devices. The copies and accumulators
     # `run` builds on the first call are not yet, so they count with the prefetched batches beside
-    # the step, a ramp stage's window too, which `run` builds beside the last, already resident.
-    last = state.window
-    rebuilt = last is not None and not last.replays(prepared.window)
+    # the step: a window it builds over the one the state holds (a split's other than the state's, a ramp
+    # stage's of other shapes) donates that one's leaves of its shapes, and builds the rest (`taken`).
+    fresh = [] if prepared.window is None else taken(state.window, prepared.window)[0]
     # A step lowered for other devices is checked against none of this process's.
     # The copies the runner makes where the state holds another program's, or none (`holds_copies`).
     made = [] if prepared.compute is None or holds_copies(state.compute, copies) else [prepared.compute]
-    built = 0 if mesh is not None else placed_bytes(
-        [*made, *([prepared.window] if prepared.window is not None and (last is None or rebuilt) else [])])
+    built = 0 if mesh is not None else placed_bytes([*made, *fresh])
     held = 0 if mesh is not None else prefetched_bytes(batch, placement, stepping.shape.prefetch) + built
     jitted = step_program(stepping, shapes, copies, shardings, placement, replicated, split)
     part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
