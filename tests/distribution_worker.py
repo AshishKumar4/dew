@@ -234,7 +234,7 @@ def main() -> None:
         return state, {"losses": losses.losses[before:], "loss_steps": losses.steps[before:]}
 
     if args.draws:
-        # Every judged run is a draw: from the one initial state (`started`) on a packed batch of its own,
+        # Every judged run is a draw: from the one initial state on a packed batch of its own,
         # the record's state the first draw's. Each fit is handed a copy, as it consumes the state it steps.
         initial = None
         if args.float64:
