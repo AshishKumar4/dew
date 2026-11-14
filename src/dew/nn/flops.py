@@ -248,6 +248,17 @@ def ssd_flops(lengths: np.ndarray, heads: int, state: int, channels: int) -> flo
     return per_real_token(lengths, 4 * heads * state * channels)
 
 
+def log_linear_flops(lengths: np.ndarray, heads: int, state: int, channels: int, levels: int) -> float:
+    """Log-linear attention's recurrent function, 2*H*N*P*(1 + levels) per token, without chunk work.
+
+    SSD's write of each token's key-value product into its state, and a read
+    of each of its `levels` Fenwick states, each 2*H*N*P (Guo et al. 2025's
+    level-weighted readout, fla's log_linear_attn). Its level weights and
+    decays are pointwise work, excluded as SSD's are.
+    """
+    return per_real_token(lengths, 2 * heads * state * channels * (1 + levels))
+
+
 def traced_flops[**Arguments, Result](function: Callable[Arguments, Result], *arguments: Arguments.args,
                                       **keywords: Arguments.kwargs) -> float:
     """The forward work of `function` on `arguments` (arrays, or their `jax.ShapeDtypeStruct`s): two FLOPs a

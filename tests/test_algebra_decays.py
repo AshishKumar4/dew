@@ -74,14 +74,12 @@ def test_the_decay_gradient_is_on_par_with_the_pairs_spanning_each_position():
     with that sum of the pairs spanning `p` alone (each decay its span's own, `spans_decays`) from it in
     float64 (check 1). The prefix difference's gradient summed every pair after `p` into it with opposite
     signs, which cancelled."""
-    spanning = jnp.asarray((np.arange(TOKENS)[None, :] >= np.arange(TOKENS)[:, None])[:, :, None]
-                           & (np.arange(TOKENS)[:, None] > np.arange(TOKENS)[None, :])[:, None, :])
-
     def gradient(g, cotangent):
         return jax.vjp(between, g)[1](cotangent)[0]
 
     def pairs(g, cotangent):
-        return jnp.einsum("pij,ijk->pk", spanning.astype(g.dtype), cotangent * spans_decays(g))
+        # The pairs spanning `p` are those whose span holds it (`SPANNED[i, j, p]`).
+        return jnp.einsum("ijp,ijk->pk", SPANNED.astype(g.dtype), cotangent * spans_decays(g))
 
     assert_as_exact(gradient, pairs, drawing(0x585C, (TOKENS, TOKENS, KEYS)), "the decays' gradient",
                     seeds=GRADIENT_SEEDS)
@@ -126,3 +124,44 @@ def test_the_decays_take_their_second_tangent_from_each_spans_own_sums():
 
     assert_as_exact(second, spans, drawing(0x5859, (TOKENS, KEYS), (TOKENS, KEYS)),
                     "the decays' second tangent", seeds=SECOND_TANGENT_SEEDS)
+
+
+PAIRING_SEEDS = 8
+"""The decays' pairings' declared draws against the plain decays' (check 1), sized by `seeds_for` on
+armada."""
+
+
+def plain_between(g):
+    """`between` as its declaration states it, with no compensation: `exp(G_s - G_t)` of the plain prefix
+    sums `G` of a chunk's log decays `g` `[T, K]`, on and below the diagonal."""
+    prefix = jnp.cumsum(g, axis=0)
+    return jnp.where(BELOW, jnp.exp(jnp.where(BELOW, prefix[:, None] - prefix[None, :], 0.0)), 0.0)
+
+
+def test_the_decay_takes_the_same_tangent_forward_as_backward():
+    """Forward mode takes the decay gradient's tangent: a drawn tangent's forward-mode decays paired with a
+    drawn cotangent, and the cotangent's gradient paired with the tangent, each on par with JAX's own
+    derivatives of the plain decays (`plain_between`) from them in float64 (check 1), each batch row's and
+    key dimension's pairing a value of its own (each walks its own decays). The two pairings are not held
+    to each other: the forward one sums 64 x 64 products in float32 where the reverse one sums 64, and
+    measured 2.4 times its error for that alone; the tangent itself is on par with each span's own sums
+    (`test_the_decays_take_their_tangent_from_each_spans_own_sums`)."""
+    rows = 4
+
+    def draw(seed):
+        rng = np.random.default_rng([0x7A9E, seed])
+        return tuple(jnp.asarray(x, jnp.float32) for x in (
+            rng.uniform(-3, -1, (rows, TOKENS, KEYS)), rng.standard_normal((rows, TOKENS, KEYS)),
+            rng.standard_normal((rows, TOKENS, TOKENS, KEYS))))
+
+    def paired(decays):
+        decays = jax.vmap(decays)
+
+        def run(g, tangent, cotangent):
+            forward = jnp.sum(jax.jvp(decays, (g,), (tangent,))[1] * cotangent, axis=(1, 2))
+            backward = jnp.sum(tangent * jax.vjp(decays, g)[1](cotangent)[0], axis=1)
+            return {"forward": forward, "backward": backward}
+        return run
+
+    assert_as_exact(paired(between), paired(plain_between), draw, "the decays' tangent paired",
+                    seeds=PAIRING_SEEDS)
