@@ -66,14 +66,21 @@ _log = logging.getLogger(__name__)
 
 def freshly_held(state: TrainState) -> TrainState:
     """`state` as a fresh state holds it at an update's end (a phase of other passes planned afresh,
-    `dew.training.trainer.Trainer._compiled_for`): the narrow copies another program's step made
-    (`TrainState.compute`, made again from the variables, a pure function of them) released, their buffers
-    deleted, for the run holds the state it hands over until the new step returns: only dropped, they stayed
-    on the devices while the new step was planned (5.3 GiB of a Qwen3.5-4B's on a GH200, M-MC-3k). Its empty
-    window it keeps: the new step's window is built over it, its buffers donated (`laid_out`), so the plan
-    counts none of the window built beside the step but its leaves of other shapes (`taken`), where building
-    one afresh beside the old one's 16.7 GiB refused the run's third phase (M-MC-3q)."""
+    `dew.training.trainer.Trainer._compiled_for`), its narrow copies released, their buffers deleted, for
+    the run holds the state it hands over until the new step returns: only dropped, they stayed on the
+    devices while the new step was planned (5.3 GiB of a Qwen3.5-4B's on a GH200, M-MC-3k)."""
     released([state.compute])
+    return fresh(state)
+
+
+def fresh(state: TrainState) -> TrainState:
+    """`state` as a fresh state holds it at an update's end, its arrays or its shapes: without the narrow
+    copies another program's step made (`TrainState.compute`, made again from the variables, a pure
+    function of them), its empty window kept, which the new step's window is built over, its buffers
+    donated (`laid_out`), so a plan counts none of the window built beside the step but its leaves of
+    other shapes (`taken`), where building one afresh beside the old one's 16.7 GiB refused a run's third
+    phase (M-MC-3q). The boundary's state (`freshly_held`) and a later phase's planned off the loop
+    (`dew.training.ahead.LaterPlans`) alike."""
     return dataclasses.replace(state, compute=None)
 
 

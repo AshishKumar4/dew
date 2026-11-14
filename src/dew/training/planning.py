@@ -849,7 +849,6 @@ class FitSearch[LossT, EffectsT]:
         self.objective.substitute(list(modules))
         self.objective.restore_head(tile, fused=fused)
 
-
     def fitting(self, executable: jax.stages.Compiled | None,
                 candidate: Candidate) -> tuple[bool, int | None]:
         """`step_fits` of `executable`, `candidate`'s compiled step or its sampled twin, with the state's
@@ -948,8 +947,10 @@ class FitSearch[LossT, EffectsT]:
                 executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered,
                                                  first=firsts[0])
                 candidate = relowered.candidate(candidate)
-                if executable is not None and relowered.last is None:
-                    self.compiled[key] = executable
+                if executable is not None:
+                    # Under the program it compiled: the relowered one past a spill, which a plan after it
+                    # lowers directly, the spill's refusal held for the process.
+                    self.compiled[compiled_key(candidate.lowered, options)] = executable
             fit, headroom = self.fitting(executable, candidate)
             self.sampled = None
             if fit and candidate.sampled is not None:
@@ -1036,8 +1037,7 @@ class FitSearch[LossT, EffectsT]:
 
     def compiled_again(self) -> bool:
         """Climb the objective one rung, as `recompute_more` does, saying it compiles the step again
-        there: a run that states its remat climbs its head's rungs alone, as its derivation's walk does
-        (`headed_more`)."""
+        there: a run that states its remat climbs its head's rungs alone (`climbed` without its remat)."""
         moved = climbed(self.objective, self.base, remat=not self.remat_set)
         if moved is not None:
             _log.warning("the step does not fit the devices %s", moved)
