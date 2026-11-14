@@ -525,35 +525,50 @@ class Layout:
         the mesh lacks.
         """
         self._refuse_unknown(mesh)
-        sharded_devices = math.prod(mesh.shape[axis] for axis in parameter_axes(mesh.axis_names))
-        explicit = set(explicit_axes(mesh))
 
         def leaf_sharding(path, value):
-            axes = self._axes(path, value.ndim)
-            size = int(np.prod(value.shape, dtype=np.int64))
-            if axes is None:
-                spec = state_spec(lambda placed: parameter_spec(
-                    value.shape, placed.shape.get(FSDP_AXIS, 1), self.min_shard), mesh)
-            elif sharded_devices == 1 or size < self.min_shard:
-                spec = P()
-            else:
-                spec = state_spec(lambda placed: logical_spec(axes, value.shape, rules=self.axis_rules,
-                                                              mesh=placed), mesh)
-            if self._kept_whole(path):
-                spec = P(*map(_without_state_axes, spec))
-            placed = _spec_axes(spec)
-            if outside := sorted(placed & set(UNSPLIT_AXES)):
-                raise ValueError(
-                    f"the rules place {_variable_path(path)} on {outside}; the data axis "
-                    f"holds the batch's replicas, and the stage axis the pipeline")
-            if typed := sorted(placed & explicit):
-                raise ValueError(
-                    f"the rules place {_variable_path(path)} on the Explicit axes {typed}; the "
-                    f"partitioner places parameters, over Auto axes (jax.make_mesh's axis_types)")
-            return NamedSharding(mesh, spec)
+            return NamedSharding(mesh, self._leaf_spec(mesh, path, value))
 
         with self._declared(tree):
             return jax.tree_util.tree_map_with_path(leaf_sharding, unboxed(tree))
+
+    def leaf_spec(self, mesh: Mesh | AbstractMesh, path, value) -> P:
+        """Where `shardings` places the leaf at `path` (a variables tree's, `('params', ..., 'kernel')`) of
+        `value`'s shape on `mesh`, the axes its module declared read from the table in context (`boxed`, a
+        trainer's step traces under its own) as the rules place them: the one rule a parameter's placement
+        is read by, so a projection taking its weight per shard where the layout puts it
+        (`dew.nn.kernels.projections`) reads this layout's placement and no second statement of it."""
+        with self._declared({}):
+            return self._leaf_spec(mesh, path, value)
+
+    def _leaf_spec(self, mesh: Mesh | AbstractMesh, path, value) -> P:
+        """`leaf_spec` under the declared axes in context: the axes the leaf's module declared, or the
+        shape heuristic, a leaf below `min_shard` or on a mesh no parameter axis splits whole, what lands
+        on fsdp split over the sequence axis too where they divide it (`state_spec`), a frozen leaf whole
+        (`frozen_whole`); refused on the data or stage axis and on an Explicit axis."""
+        sharded_devices = math.prod(mesh.shape[axis] for axis in parameter_axes(mesh.axis_names))
+        axes = self._axes(path, value.ndim)
+        size = int(np.prod(value.shape, dtype=np.int64))
+        if axes is None:
+            spec = state_spec(lambda placed: parameter_spec(
+                value.shape, placed.shape.get(FSDP_AXIS, 1), self.min_shard), mesh)
+        elif sharded_devices == 1 or size < self.min_shard:
+            spec = P()
+        else:
+            spec = state_spec(lambda placed: logical_spec(axes, value.shape, rules=self.axis_rules,
+                                                          mesh=placed), mesh)
+        if self._kept_whole(path):
+            spec = P(*map(_without_state_axes, spec))
+        placed = _spec_axes(spec)
+        if outside := sorted(placed & set(UNSPLIT_AXES)):
+            raise ValueError(
+                f"the rules place {_variable_path(path)} on {outside}; the data axis "
+                f"holds the batch's replicas, and the stage axis the pipeline")
+        if typed := sorted(placed & set(explicit_axes(mesh))):
+            raise ValueError(
+                f"the rules place {_variable_path(path)} on the Explicit axes {typed}; the "
+                f"partitioner places parameters, over Auto axes (jax.make_mesh's axis_types)")
+        return spec
 
     def _declared(self, tree):
         """The context in which `declared_axes` reads the axes `tree`'s

@@ -12,6 +12,7 @@ import jax.numpy as jnp
 from flax.typing import PrecisionLike
 
 from dew import _cache
+from dew.mesh import mesh_axes
 from dew.nn.derivatives import Surrogate, contracted, declared_derivative
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.formats import MxFp8, NvFp4Block
@@ -24,7 +25,15 @@ from dew.nn.kernels.gemm import (
     nvfp4_block_product,
 )
 from dew.nn.kernels.templates.product import SCALE_DEPTH, declared
-from dew.nn.sharding import RESIDUAL, automatic_axes, explicit_spec, logical_spec, manual_map, seen_whole
+from dew.nn.sharding import (
+    RESIDUAL,
+    automatic_axes,
+    explicit_spec,
+    logical_spec,
+    on_shards,
+    placed_layout,
+    seen_whole,
+)
 
 
 def blockwise_fp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,
@@ -279,7 +288,7 @@ _nvfp4_projection = contracted("test_an_nvfp4_projection_holds_every_reverse_ord
     declared_derivative(Surrogate(), _nvfp4_value, _nvfp4_forward, _nvfp4_backward, nondiff_argnums=(3, 4)))
 
 
-def dot_general(xla):
+def dot_general(xla, path: tuple | None = None):
     """`xla`, a layer's product (a `jax.lax.dot_general`, as flax's `Dense` takes one), in the run's
     low-precision recipe where its role takes the matrix product (`recipe_projection`), else through the
     template's dense product (`gemm` of one group) where the call is a matrix product (`lhs`'s last axis
@@ -288,8 +297,9 @@ def dot_general(xla):
     program, differentiated by JAX, each of its products' routes reported with the reason no launch takes
     it (a declared cell's old route, a mesh axis splitting the operands, a CPU), so a layer runs as it ran
     before wherever the template declares XLA faster; every other product is `xla`'s. On a mesh whose
-    automatic axes split the rows alone (`rows_split`), each device's rows are its own call (`per_shard`):
-    a kernel launch per device on its own rows (bible §7, rows 1306 and 1923)."""
+    automatic axes split the rows alone, where a launch takes a device's rows' product, each device's rows
+    are its own call (`mapped_shards`), its matrix, the parameter at its variables `path`, placed by the
+    traced program's layout: a kernel launch per device on its own rows (bible §7, rows 1306 and 1923)."""
     def product(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, **kwargs):
         (contracted, against), batch = dimension_numbers
         out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
@@ -299,9 +309,12 @@ def dot_general(xla):
         plain = (not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
                  and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)
                  and tuple(map(tuple, batch)) == ((), ()))
-        if plain and rows_split(lhs) is not None:
-            return per_shard(lambda lhs, rhs: product(lhs, rhs, dimension_numbers, precision,
-                                                      preferred_element_type), lhs, (rhs,))
+        if plain and path is not None and (shards := mapped_shards(lhs, (rhs,), (path,), out_dtype,
+                                                                     precision)) is not None:
+            split, gathered = shards
+            return on_shards(lambda lhs, rhs: product(lhs, rhs, dimension_numbers, precision,
+                                                      preferred_element_type), split, (lhs, rhs),
+                             gathered=gathered)
         if plain:
             rows = lhs.reshape(-1, lhs.shape[-1])
             if launched(rows, rhs, out_dtype, precision):
@@ -332,43 +345,37 @@ def rows_split(lhs: jax.Array) -> jax.sharding.PartitionSpec | None:
     return jax.sharding.PartitionSpec(*rows) if named == automatic else None
 
 
-def per_shard(local, lhs: jax.Array, matrices: tuple) -> jax.Array:
-    """`local(lhs, *matrices)` on each device's rows (`manual_map`, the rows split as `rows_split`
-    states), as fully sharded data parallelism defines a projection: each matrix enters where the layout
-    places a declared projection kernel (`WEIGHT`, read by the layout's own rule, `placement.state_spec`:
-    fsdp, with sequence where it shares it, on its inputs where they divide) and is gathered whole in the
-    map, so its gradient leaves the map reduce-scattered back to that placement (the gather's transpose),
-    each device's share summed over the devices' rows, and a whole matrix's summed on every device. A
-    matrix its module places otherwise (`Layout.shardings`' declared axes) is resharded to it by the
-    partitioner, correct at a collective more. Entered whole instead, its gradient's sum over the devices
-    leaves as an all-reduce, the matrix's whole gradient on every device (tests/test_projection_shards.py).
-    A joined projection's kernels enter apart and are joined in the map, so each one's gradient is summed
-    at its own parameter's shape, its bias added past the map as a Dense adds its own
-    (`dew.nn.joined.joined_dense`)."""
-    from dew.distributed.placement import state_spec
-
-    split = rows_split(lhs)
-    assert split is not None, "a mesh's automatic axes split the rows alone"
+def mapped_shards(lhs: jax.Array, matrices: tuple[jax.Array, ...], paths: tuple, out_dtype,
+                  precision: PrecisionLike) -> tuple[jax.sharding.PartitionSpec, dict] | None:
+    """Where a projection of `lhs` by `matrices` (one, or a joined projection's kernels side by side, each
+    the parameter at its variables `path`) runs per shard, as fully sharded data parallelism defines one:
+    the rows as `rows_split` splits them and each matrix where the traced program's layout places it
+    (`placing`, `Layout.leaf_spec`), gathered whole in the map (`on_shards`' `gathered`), so its gradient
+    leaves the map reduce-scattered back to that placement; where a launch takes the product of a device's
+    own rows (`launched`'s decision, reported once inside the map). None elsewhere, the product the
+    partitioner's: no rows split alone, no layout traced under, or a product no launch takes per device
+    (an XLA-declared cell, a CPU or a TPU), which runs as it ran before (train 816 F3)."""
+    split, layout = rows_split(lhs), placed_layout()
+    if split is None or layout is None:
+        return None
     mesh = jax.sharding.get_abstract_mesh()
-    placed = tuple(state_spec(lambda on, shape=matrix.shape: logical_spec(WEIGHT, shape, mesh=on), mesh)
-                   for matrix in matrices)
-
-    def gathered(matrix, spec):
-        for axis, entry in enumerate(spec):
-            names = (entry,) if isinstance(entry, str) else tuple(entry or ())
-            if names:
-                matrix = jax.lax.all_gather(matrix, names, axis=axis, tiled=True)
-        return matrix
-
-    def shard(lhs, *parts):
-        return local(lhs, *(gathered(matrix, spec) for matrix, spec in zip(parts, placed, strict=True)))
-
-    return manual_map(shard, (split, *placed), split)(lhs, *matrices)
+    shards = math.prod(mesh.shape[axis] for entry in split for axis in mesh_axes(entry))
+    rows = jax.ShapeDtypeStruct((math.prod(lhs.shape[:-1]) // shards, lhs.shape[-1]), lhs.dtype)
+    matrix = jax.ShapeDtypeStruct((lhs.shape[-1], sum(each.shape[1] for each in matrices)), matrices[0].dtype)
+    product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
+    taken, _ = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole=True,
+                        target=generation.gpu_target(), choices=_cache.KERNEL_CHOICES.value,
+                        pins=_cache.KERNEL_PINS.value)
+    if not taken:
+        return None
+    return split, {1 + index: layout.leaf_spec(mesh, path, each)
+                   for index, (path, each) in enumerate(zip(paths, matrices, strict=True))}
 
 
-WEIGHT = ("embed", "mlp")
-"""A declared projection kernel's logical axes (its inputs, then its outputs), as Dew's Dense declares them
-(tests/test_mesh_axes.py), which the layout places (`dew.distributed.placement.Layout.shardings`)."""
+def kernel_path(layer) -> tuple:
+    """The variables path of `layer`'s kernel (`('params', *its scope, 'kernel')`), as the layout reads a
+    parameter's (`Layout.leaf_spec`)."""
+    return tuple(jax.tree_util.DictKey(name) for name in ('params', *layer.scope.path, 'kernel'))
 
 
 def _recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype) -> jax.Array | None:
