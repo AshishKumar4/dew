@@ -588,7 +588,10 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path
     assert judged[dense]["plans"]["base"][0]["remat"] is None
     # Each arm's planning by its parts beside the verdict, and which part moved said in its state (row 6108).
     assert len(judged[dense]["parts"]["head"]) == 6 and judged[dense]["parts"]["head"][0]["compiled"] == 30.0
-    assert "compiled 18.00/30.00" in judged[dense]["state"] and "traced 6.00/6.00" in judged[dense]["state"]
+    table = tmp_path / "table.md"
+    gate.report(SimpleNamespace(results=out, table=str(table), claim=False, verdicts=None))
+    [line] = [line for line in table.read_text().splitlines() if line.startswith(f"| {dense} ")]
+    assert "compiled 18.00/30.00" in line and "traced 6.00/6.00" in line
     a100 = SimpleNamespace(**{**vars(args), "kind": "a100", "rounds": 1, "only": ["finetune"],
                               "out": str(tmp_path / "a100.json")})
     assert gate.compile_battery(a100) == 0
