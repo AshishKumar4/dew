@@ -1129,7 +1129,7 @@ def _ran(tiles, *, training: bool):
     return tiles if training else tiles.forward or tiles
 
 
-def _two_roles(name: str, bound, derived, family, facts, *, packed: bool, training: bool) -> list:
+def _two_roles(bound, derived, facts, *, packed: bool, training: bool) -> list:
     """The walks at two consumer roles a program (`Tiles.walkers`) as a gate case's tiles, which the
     derivation gives a call whose walks fill more than a wave and `RESOURCE_SHAPES` never do (`Mosaic._walked`
     at two waves): a role's registers are its share of the program's; none where the family's walks take one
@@ -1216,8 +1216,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                 # do not hold (`template.backward_holds`).
                 refused.append(f"{name} {jnp.dtype(dtype).name} fast backward{' packed' if packed else ''}")
                 return []
-        walked = _two_roles(name, bound, _ran(derived, training=training), family, facts, packed=packed,
-                            training=training)
+        walked = _two_roles(bound, _ran(derived, training=training), facts, packed=packed, training=training)
         if variant == TWO_ROLES:
             return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
                     for tiles, kind in walked]
