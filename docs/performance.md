@@ -2313,7 +2313,7 @@ every call, so XLA updated its CUDA command buffer before it could replay,
 which took about 5 ms before 9 of a run's 16 admitting steps. Now an integer
 seed stays on the host until the admission's one key program makes and folds
 every row's key (`_row_keys`, the same bits as an eager key), and the
-admitting step compiles without command buffers (`ADMISSION_OPTIONS`); the
+admitting step compiles without command buffers (`UNGRAPHED_OPTIONS`); the
 decoding step keeps them. The benchmark submits integer seeds, as a client
 sends them. On the RTX 4080, the change against its parent, three
 alternating rounds, medians of five runs, in tokens a second:

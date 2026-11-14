@@ -732,8 +732,8 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   - XLA's fusion (`cost.fused`; a fact XLA holds is read from XLA, §4: today `fused` restates XLA's fusion
     rather than reading it, row 5897), for the compile-time pass over a program, error-aware extraction and the
     derived scan's carry split (`carry.split`, whose carry runs as a loop XLA lowers, a chunk an iteration, its
-    span priced at that loop's step; today the split's work states no span, so only its work is priced: the
-    loop's step latency is in no rate `Fused` reads, an open gap). A program's operands are read from device memory once, however many
+    work that reads the state spanning that loop's one iteration, priced at the loop's step,
+    `GpuTarget.step_seconds`). A program's operands are read from device memory once, however many
     reductions read them (XLA's fusion reads a sibling reduction's inputs once), and elementwise work fuses
     into its consumer. Each unit's work runs at the whole device's rate, in series with the memory traffic.
   - The template's tile walk (`cost.walk`, `templates.cost.walked`), for a form a template's algebra interface
@@ -943,9 +943,10 @@ The cheapest under the work-span model is the chunk's form, which `scan.py` eval
 splits. At a kernel's chunk on an A100 or an H100 (64 tokens, 128 keys and values) the extraction is the
 compact WY form with its inverse by doubling, the hand-written chunk's form. Both rule sets are proven
 sound over the reals from their declarations (tests/test_linear_scan.py). Today that proof is a symbolic
-check at finite shapes (three tokens, the test's shape inventory), and the doubling is checked against the
-solved inverse it must equal, not derived from `scan`'s own implementation of it: a proof at every chunk
-size is an open gap.
+check at finite shapes (three tokens, the test's shape inventory): a proof of the chunk identities at
+every chunk size is an open gap. The inverse by doubling is proven from the template's own
+implementation (`recurrence_algebra.doubled`, evaluated over SymPy at two, four and eight rows) and its
+level's join at every block size (the block inverse over symbolic sizes), so at every chunk size.
 
 A derived algebra's laws are proven before its forms ship, in the suite (tests/algebra_laws.py; today at the
 extents it walks, two and three keys a tile over every kernel tile shape, for the attention forward's and

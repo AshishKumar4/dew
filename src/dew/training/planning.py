@@ -49,7 +49,7 @@ from dew.training.ahead import handed
 from dew.training.distributed import batch_divisor
 from dew.training.interval import latest
 from dew.training.memory import (
-    Miss,
+    MemoryMiss,
     climbed,
     compiled_if_it_fits,
     head_fused_of,
@@ -307,20 +307,19 @@ def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
 
     `fits(split)`, a compile at the current rung, is asked of
     `candidates[first]` first (the batch whole, or a recorded plan, those
-    before it taken as missed); past a miss, of the split the compile that
+    before it taken as missed at the first rung alone); past a miss, of the split the compile that
     missed computes as the first that fits (`after`, an index into
-    `candidates`, from what it read: `Miss`), and so on from each compile
+    `candidates`, from what it read: `MemoryMiss`), and so on from each compile
     that misses, upward, until one fits; where `after` names none, the
-    objective climbs a rung and asks `candidates[first]` again. XLA fuses and
+    objective climbs a rung and asks the batch whole again. XLA fuses and
     schedules each split's program again, so its compile is the judge both
     ways: a miss there computes the next, and a split that fits past one not
     asked is asked of the split before it, down to one that misses, as a
     split coarser than one that misses misses too. A tight start is two
     compiles where the split computed is the next.
     """
-    index: int | None = first
+    index, missed = first, first - 1
     while True:
-        missed = first - 1
         while index is not None:
             if fits(candidates[index]):
                 while index - 1 > missed and fits(candidates[index - 1]):
@@ -329,7 +328,7 @@ def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
             missed, index = index, after(index)
         if not climb():
             return None
-        index = first
+        index, missed = 0, -1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -694,9 +693,9 @@ class FitSearch[LossT, EffectsT]:
     """The remat rungs (`recompute_record`) the search has asked as half rungs."""
     gather: Callable[[object], list] = from_every_process
     """How every process's figure is read (`from_every_process`), so each asks the same split."""
-    misses: dict[tuple[str, int], Miss] = dataclasses.field(default_factory=dict)
-    """What each compile that did not fit read, by its rung and split (`Miss`), which names the split the
-    search asks next (`after`)."""
+    misses: dict[tuple[str, int], MemoryMiss] = dataclasses.field(default_factory=dict)
+    """What each compile that did not fit read, by its rung and split (`MemoryMiss`), which names the split
+    the search asks next (`after`)."""
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled, jax.stages.CompilerOptions | None] | None = None
     """The plan the search last found to fit: its candidate, executable and the options it compiled under."""
@@ -827,18 +826,18 @@ class FitSearch[LossT, EffectsT]:
 
     def after(self, candidates: Sequence[int], index: int) -> int | None:
         """The index into `candidates` of the split asked after the compile of `candidates[index]` at the
-        objective's rung missed: the first above it that compile computes fits (`Miss.fits_at`), the
+        objective's rung missed: the first above it that compile computes fits (`MemoryMiss.fits_at`), the
         latest any process computes so every process asks the same; the next above it where the compile
-        read no memory (an executable XLA refused for memory as it compiled); the last where none is
-        computed to fit, XLA's compile the judge of the finest before the rung climbs; None past the
-        last, the rung's to climb."""
+        read no memory (an executable XLA refused for memory as it compiled, or one whose memory this
+        process states none of); the last where none is computed to fit, XLA's compile the judge of the
+        finest before the rung climbs; None past the last, the rung's to climb. Every process gathers at
+        every miss, whatever its own compile read, so their rounds stay in step."""
         if index + 1 >= len(candidates):
             return None
         miss = self.misses.get((self.rung(), candidates[index]))
-        if miss is None:
-            return index + 1
         above = range(index + 1, len(candidates))
-        computed = next((at for at in above if miss.fits_at(candidates[at])), len(candidates) - 1)
+        computed = index + 1 if miss is None else next(
+            (at for at in above if miss.fits_at(candidates[at])), len(candidates) - 1)
         return max(self.gather(computed))
 
     def current(self) -> dict[str, JSON]:
@@ -960,8 +959,8 @@ class FitSearch[LossT, EffectsT]:
         self.lowered[key] = candidate
         fit, headroom = probe.fits, probe.headroom
         self.probes.append(probe)
-        if not fit and headroom is not None:
-            self.misses[(self.rung(), split)] = missed(executable, split, headroom, self.factor)
+        if not fit and headroom is not None and probe.temp is not None:
+            self.misses[(self.rung(), split)] = missed(split, probe.temp, headroom, self.factor)
         if fit:
             assert executable is not None
             self.fitted, self.fitted_sampled = (candidate, executable, self.chosen), self.sampled

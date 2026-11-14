@@ -284,3 +284,43 @@ def test_every_chunk_identity_holds_over_the_reals(corrects, per_key, values_rea
                             right if isinstance(right, tuple) else (right,), strict=True):
         assert np.shape(mine) == np.shape(theirs)
         assert _equal(mine, theirs), f"chunk identity {index} differs"
+
+
+@pytest.mark.parametrize("size", [2, 4, 8])
+def test_the_templates_doubling_is_the_systems_inverse(size):
+    """The inverse by doubling as the template runs it (`recurrence_algebra.doubled`, which `scan._lowered`
+    and every recurrence mainloop take), its program traced and evaluated over the reals
+    (`algebra_laws.evaluate`): of a strictly lower `a` whose every entry is its own symbol, `(I - a)^-1`
+    exactly, its every level's join among them (sizes 2, 4 and 8: levels of two-, four- and eight-wide
+    blocks). With `test_a_doublings_join_is_the_block_inverse_at_every_size`, the doubling is the inverse at
+    every chunk size: each level joins blocks by the one identity."""
+    import jax
+    import jax.numpy as jnp
+    from algebra_laws import evaluate
+
+    from dew.nn.kernels import recurrence_algebra
+
+    def doubled(a):
+        return recurrence_algebra.doubled(a, lambda name, left, right: left @ right)
+
+    closed = jax.make_jaxpr(doubled)(jax.ShapeDtypeStruct((size, size), jnp.float32))
+    a = np.tril(_symbols("a", (size, size)), -1)
+    inverse, = evaluate(closed.jaxpr, closed.consts, [a])
+    assert _equal(inverse, _solved(-a, np.eye(size, dtype=int).astype(object)))
+
+
+def test_a_doublings_join_is_the_block_inverse_at_every_size():
+    """A doubling level's join, over blocks of any sizes `n` and `m`: where `X1` and `X2` are the inverses
+    of a lower block-triangular system's diagonal blocks, `[[X1, 0], [X2 A21 X1, X2]]` is the inverse of
+    `[[X1^-1, 0], [-A21, X2^-1]]`, the system `I - A` restricted to two blocks, whose lower block the
+    doubling adds as `(X A) X` masked to it (`recurrence_algebra.doubled`'s merge). From the two-wide
+    blocks, each level an inverse by this identity, at every size (its sizes symbols, not numbers)."""
+    n, m = sympy.symbols("n m", positive=True, integer=True)
+    first, second = sympy.MatrixSymbol("X1", n, n), sympy.MatrixSymbol("X2", m, m)
+    below = sympy.MatrixSymbol("A21", m, n)
+    joined = sympy.BlockMatrix([[first, sympy.ZeroMatrix(n, m)], [second * below * first, second]])
+    system = sympy.BlockMatrix([[sympy.Inverse(first), sympy.ZeroMatrix(n, m)],
+                                [-below, sympy.Inverse(second)]])
+    product = sympy.block_collapse(joined * system)
+    identity = (sympy.Identity(n), sympy.ZeroMatrix(n, m), sympy.ZeroMatrix(m, n), sympy.Identity(m))
+    assert [sympy.simplify(product.blocks[i, j]) for i in range(2) for j in range(2)] == list(identity)

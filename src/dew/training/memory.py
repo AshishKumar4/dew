@@ -553,35 +553,32 @@ def temporaries_factor(mesh: Mesh) -> int:
 
 
 @dataclasses.dataclass(frozen=True)
-class Miss:
+class MemoryMiss:
     """What a compile of the step at `split` microbatches that did not fit says of the splits above it,
-    every number its own: the temporaries live at its peak that no microbatch's rows scale (`fixed`) and
-    those they do (`scaled`), the bytes it was short (`shortfall`, its stranding counted, `factor`). A split
-    above it holds `fixed` and its share of `scaled`; the next program is XLA's to fuse and schedule
-    again, so the compile at the split this names is its judge."""
+    every number its own: its temporaries (`scaled`, every one taken as scaled by a microbatch's rows) and
+    the bytes it was short (`shortfall`, its stranding counted, `factor`). A split above it holds its share
+    of them; the next program is XLA's to fuse and schedule again, so the compile at the split this names
+    is its judge."""
 
     split: int
-    fixed: int
     scaled: int
     shortfall: int
     factor: int
 
     def fits_at(self, split: int) -> bool:
-        """Whether the temporaries this miss read leave room at `split` microbatches: those its rows scale
-        held at their share, `scaled * self.split / split`, the rest as they stand."""
+        """Whether the temporaries this miss read leave room at `split` microbatches, held at their share,
+        `scaled * self.split / split`."""
         saved = self.scaled - self.scaled * self.split // split
         return self.factor * saved >= self.shortfall
 
 
-def missed(executable: jax.stages.Compiled | None, split: int, headroom: int, factor: int) -> Miss:
-    """What the compile of the step at `split` that left `headroom` (negative: it did not fit) says of the
-    splits above it (`Miss`): its temporaries, every one taken as scaled by a microbatch's rows, which errs
-    toward a split too coarse, which its compile refuses, never one too fine, which every step would pay
-    for. XLA states no live set of a GPU compile to Python (the plugin's memory statistics carry sizes
-    alone), so none is read; a value it states fixed (a weight's, an optimizer state's) would count as
-    such where it did. None of its temporaries where it states none (no executable)."""
-    stats = None if executable is None else compiled_memory(executable)
-    return Miss(split, 0, 0 if stats is None else stats.temp, -headroom, factor)
+def missed(split: int, temporaries: int, headroom: int, factor: int) -> MemoryMiss:
+    """What the compile of the step at `split` that left `headroom` (negative: it did not fit) with
+    `temporaries` bytes of them says of the splits above it (`MemoryMiss`): every one taken as scaled by a
+    microbatch's rows, which errs toward a split too coarse, which its compile refuses, never one too fine,
+    which every step would pay for. XLA states no live set of a GPU compile to Python (the plugin's memory
+    statistics carry sizes alone), so none is read."""
+    return MemoryMiss(split, temporaries, -headroom, factor)
 
 
 def pooled_headroom(headroom: int | None) -> int | None:

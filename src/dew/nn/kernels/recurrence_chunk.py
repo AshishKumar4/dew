@@ -293,17 +293,23 @@ _VARYING = ("a shard_map that checks varying axes holds the operands, and a Pall
             "type for its results")
 
 
-def _port_precision(case) -> bool:
-    """Whether the run's declaration (`dew.nn.precision.effective_precision`) admits a port's products for a
-    call of `case.dtype`: a 16-bit call's, exact with fp32 sums, where the declaration takes those
-    (`exact_products`); an fp32 call's, TF32 (fla's and mamba_ssm's Triton dots), at no more than the
-    default. Off a GPU (not `triton_runs`) its kernels interpret, their products exact under any declaration
-    (`fla_gdn._dot`'s `exact`: an fp32 product summed in float64 and rounded once)."""
-    if not triton_runs():
-        return True
-    if case.dtype.itemsize == 2:
-        return exact_products(None, case.dtype)
+def upstream_precision(dtype) -> bool:
+    """Whether the run's declaration (`dew.nn.precision.effective_precision`) admits the upstream's products
+    (fla's and mamba_ssm's Triton dots, on a GPU) for a call in `dtype`: a 16-bit call's, exact with fp32
+    sums, where the declaration takes those (`exact_products`); an fp32 call's, TF32, at no more than the
+    default. Where it does not, no run of the upstream computes at the declared precision: the port hands the
+    call over (`_port_precision`), and a test's oracle is the recurrence a token at a time (testing.md)."""
+    dtype = jnp.dtype(dtype)
+    if dtype.itemsize == 2:
+        return exact_products(None, dtype)
     return asks_default_precision(None, configured=True)
+
+
+def _port_precision(case) -> bool:
+    """Whether the run's declaration admits a port's products for a call of `case.dtype`
+    (`upstream_precision`). Off a GPU (not `triton_runs`) its kernels interpret, their products exact under
+    any declaration (`fla_gdn._dot`'s `exact`: an fp32 product summed in float64 and rounded once)."""
+    return not triton_runs() or upstream_precision(case.dtype)
 
 
 _PORT_PRECISION = ("a product precision the run declares that the port's products do not compute: above "
@@ -344,7 +350,7 @@ itself; and keys wider than the port takes in their dtype. Packed documents take
 stores the memories by where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
 (`chunked_launch.Sequences`)."""
 
-FLA_PORT = Kernel[PortCase]('fla', PORT_SUPPORTS, upstream='fla')
+FLA_PORT = Kernel[PortCase]('fla', PORT_SUPPORTS)
 """Dew's port of fla's kernels (`fla_rule`)."""
 
 B200 = "on a B200, by device time"
@@ -1498,7 +1504,7 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
     return select(SCAN, case).kernel
 
 
-SSD_PORT = Kernel[ScanCase]('pallas', SSD_SUPPORTS, upstream='mamba_ssm')
+SSD_PORT = Kernel[ScanCase]('pallas', SSD_SUPPORTS)
 """Dew's port of mamba_ssm's SSD kernels (`mamba_ssd.ssd_scan`)."""
 
 SCAN_CELLS: dict[tuple[str | None, str], tuple[Kernel[ScanCase], str]] = {

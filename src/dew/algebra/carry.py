@@ -164,17 +164,20 @@ class Priced:
 
 def _carry_priced(region: terms.Region, schedule) -> DagCostModel[Priced]:
     """`Priced` per node: its work (`cost.work`) sequential where an operand reads the state (the e-classes
-    the extractor hands the callback, which alone it may look up), parallel otherwise."""
+    the extractor hands the callback, which alone it may look up), its span the carry's loop's one iteration
+    (spans on one path compose to their peak), parallel otherwise."""
     none = cost.Seconds(Work(), schedule)
 
     def marginal(graph: EGraph, node) -> Priced:
-        done = cost.Seconds(cost.work(graph, node, region), schedule)
+        work = cost.work(graph, node, region)
         operands = next((args for constructor in terms.LANGUAGE
                          if (args := get_callable_args(node, constructor)) is not None), ())
         if any(isinstance(operand, Term) and graph.lookup_function_value(reads(operand)) is not None
                for operand in operands):
-            return Priced(done, none)
-        return Priced(none, done)
+            # The carry is a loop XLA lowers, a chunk an iteration: its work that reads the state is a step
+            # of it, its span at least the loop's one iteration, priced at that loop's step (`Priced`).
+            return Priced(cost.Seconds(dataclasses.replace(work, span=max(work.span, 1.0)), schedule), none)
+        return Priced(none, cost.Seconds(work, schedule))
 
     return DagCostModel(marginal_cost=marginal, identity=Priced(none, none))
 

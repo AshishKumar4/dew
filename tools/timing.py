@@ -163,11 +163,22 @@ def timed(timer, call, args: tuple, evict: bool) -> dict:
             "wall_ms": wall}
 
 
+def worker_env(env: dict, clock: str) -> dict:
+    """An arm's `env` as its worker on `clock` runs: a worker reading device time runs no command buffers,
+    which CUPTI does not read whole (`benchmark.Ungraphed`), unless the arm's own env names them; the flag
+    goes after the XLA flags the worker would inherit, whose last occurrence holds."""
+    if clock != "device" or "--xla_gpu_enable_command_buffer" in env.get("XLA_FLAGS", ""):
+        return env
+    flags = env.get("XLA_FLAGS", os.environ.get("XLA_FLAGS", ""))
+    return {**env, "XLA_FLAGS": f"{flags} --xla_gpu_enable_command_buffer={instrument().UNGRAPHED}".strip()}
+
+
 class Process:
     """A worker (`worker`) in an arm's tree, its env and setup its own, and a compilation cache of its own."""
 
     def __init__(self, tree: Path, env: dict, setup: list[str], clock: str, cache: Path):
         cache.mkdir(parents=True, exist_ok=True)
+        env = worker_env(env, clock)
         # Several workers share one GPU: none preallocates it unless an arm's env says otherwise.
         variables = {**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false", **env,
                      "DEW_TIMING_INSTRUMENT": str(INSTRUMENT), "JAX_COMPILATION_CACHE_DIR": str(cache),
