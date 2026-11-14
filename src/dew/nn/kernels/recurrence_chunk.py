@@ -237,7 +237,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                 size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
                 out, final = xla_mainloop(Tiles(size), query, key, wide, g, beta, state, starts, firsts,
                                           scale=scale, delta=hooks.delta, dtype=work,
-                                          bound=hooks.inverse_bound, forked=carried)
+                                          bound=hooks.inverse_bound, forked=carried, reads=hooks.reads,
+                                          own=given['own'] if hooks.own_weight else None)
             return recurrence.skipped(hooks, out.astype(work), wide, {'skip': skip}, work), final
 
         out, final = _per_product(product_kernel, run, query, key, value, g, beta,
@@ -541,7 +542,7 @@ def _chunked(named: dict, starts, chunk_size: int, work) -> dict:
 
 def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=None, firsts=None, *,
                  scale: float, delta: bool, dtype=None, bound: float | None = None,
-                 forked: Forked | None = None):
+                 forked: Forked | None = None, reads: str = 'after', own=None):
     """The recurrence template's plain-JAX mainloop: the recurrence over `config.chunk`-token chunks by the
     forms derived from its token update (`dew.algebra.scan`, the compact
     WY form and its prefix derived, not written; each chunk's work that reads no memory at once, the memory's
@@ -557,7 +558,9 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     up each document's memory there from its table, `state` `[B, S', Hv, Dk, Dv]`'s given ones then those
     it stores at documents' last chunks (`_walk`), the final memory the row's last. `bound`,
     the layer's write gate's largest where its keys are of unit norm (`recurrence.Hooks.inverse_bound`), is
-    the declaration's range facts (`scan.Scan.ranges`)."""
+    the declaration's range facts (`scan.Scan.ranges`). The readout reads the memory entering its token where
+    `reads` is 'before' (`recurrence.Hooks.reads`), and `own` `[Hv, Dk]`, where given, weighs the token's
+    own write in it (`Hooks.own_weight`), each head's given every chunk."""
     dtype, work, query, key = _grouped(query, key, value, dtype)
     rows, length, heads, columns = value.shape
     aligned = None
@@ -568,10 +571,15 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     width = key.shape[-1]
     declared = (_delta_forms, (("delta", delta), ("scale", scale), ("per_key", g.ndim == 4),
                                 ("width", width), ("columns", columns), ("work", jnp.dtype(work)),
-                                ("reset", starts is not None), ("bound", bound)))
+                                ("reset", starts is not None), ("bound", bound), ("reads", reads),
+                                ("own", own is not None)))
     held = 0 if forked is None else forked.held
     given = dict(zip(("q", "k", "v", "g", "beta"), (query, key, value, g, beta), strict=True))
     operands = _chunked(given, starts, config.chunk, work)
+    if own is not None:
+        # Each head's weight every chunk, as the walk maps a row's and head's chunks.
+        chunks = operands["q"].shape[2]
+        operands["own"] = jnp.broadcast_to(own.astype(work)[None, :, None], (rows, heads, chunks, width))
     # The memory entering, and each carry below, typed as every operand varies (a checked `shard_map`'s
     # manual axes; an explicit axis's rows, as the portable math's): a step's outputs vary wherever its inputs
     # do, keys, gates or resets replicated or not.
@@ -603,34 +611,39 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
 
 @functools.lru_cache(maxsize=FORMS_HELD)
 def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, columns: int, work: jnp.dtype,
-                 reset: bool, bound: float | None):
+                 reset: bool, bound: float | None, reads: str = 'after', own: bool = False):
     """The delta rule's (or a plain linear recurrence's, without `delta`) chunk forms (`scan.derive_scan`) for
     these facts, every one its declaration reads: the update `h = D h - beta k (k^T D h) + beta k v^T` (`D h
     + beta k v^T` without the delta rule) of a `[width, columns]` state in `work`, `D = exp(g)` a head's or
-    each key's (`per_key`), read `scale q^T h`, packed documents' resets where `reset`, and the range facts
-    `bound` proves. Derived once for equal facts, the latest `FORMS_HELD` kept: built from a call's fresh
+    each key's (`per_key`), read `scale q^T h` (of the state entering the token where `reads` is 'before',
+    `scan.Scan.reads`; with the token's own write weighed a key, `scale ((q own) . (beta k)) v`, where
+    `own`), packed documents' resets where `reset`, and the range facts `bound` proves. Derived once for
+    equal facts, the latest `FORMS_HELD` kept: built from a call's fresh
     closures, every layer's call derived its own forms, their decomposition and carry splits (`derive_scan`'s
     caches a declaration's) again, 0.25 s a split (a 4B decoder's plan, row 5556)."""
     from dew.algebra import SATURATION, scan
 
-    def update(h, q, k, v, g, beta):
-        del q
+    def update(h, q, k, v, g, beta, own=None):
+        del q, own
         decayed = jnp.exp(g).reshape(-1, 1) * h
         written = v - k @ decayed if delta else v
         return decayed + beta * k[:, None] * written[None, :]
 
-    def readout(h, q, k, v, g, beta):
-        del k, v, g, beta
-        return scale * (q @ h)
+    def readout(h, q, k, v, g, beta, own=None):
+        del g
+        out = scale * (q @ h)
+        # The token's own write weighed a key (`recurrence.Hooks.own_weight`, no delta rule's correction).
+        return out if own is None else out + scale * jnp.sum(q * own * beta * k) * v
 
     axes = {"q": ("time", "key"), "k": ("time", "key"), "v": ("time", "value"),
-            "g": ("time", "key") if per_key else ("time",), "beta": ("time",)}
+            "g": ("time", "key") if per_key else ("time",), "beta": ("time",), **({"own": ("key",)} if own
+                                                                                 else {})}
     declared = {**axes, RESET: ("time",)} if reset else axes
     # A log decay at most 0 (its decay at most 1); with a bound, keys of unit norm and gates at most it, so
     # two tokens' corrections overlap by at most it (Cauchy-Schwarz).
     ranges = {"g": (-math.inf, 0.0), **({} if bound is None else {"k": 1.0, "beta": bound, "overlap": bound})}
     declaration = scan.Scan(update, readout, declared, walked="time", state=((width, columns), work),
-                            reset=RESET if reset else None, ranges=ranges)
+                            reset=RESET if reset else None, ranges=ranges, reads=reads)
     return scan.derive_scan(declaration, saturation=SATURATION)
 
 

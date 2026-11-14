@@ -136,6 +136,9 @@ class Hooks:
         if self.reads not in ('after', 'before'):
             raise ValueError(f"a readout reads the state 'after' its token's update or 'before' it, not "
                              f"{self.reads!r}")
+        if self.own_weight and self.delta:
+            raise ValueError("a readout weighs a token's own write without the delta rule: the delta rule's "
+                             "write is its corrected value, which reads the state its readout does not")
         if self.decay not in ('none', 'scalar', 'vector'):
             raise ValueError(f"a decay is 'none', 'scalar' or 'vector', not {self.decay!r}")
         if self.gates is not None and self.decay != 'scalar':

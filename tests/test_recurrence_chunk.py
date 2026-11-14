@@ -65,11 +65,15 @@ FORMED = [
     recurrence.Hooks(decay='vector', delta=False, write_gate=True, skip=True,
                      output=recurrence.OutputNorm(1e-6, 'sigmoid')),
     recurrence.Hooks(decay='scalar', delta=False),
+    recurrence.Hooks(decay='vector', delta=False, reads='before', own_weight=True),
+    recurrence.Hooks(decay='scalar', reads='before', scale=KEY_WIDTH ** -0.5, write_bound=1.0),
 ]
 """The prologue's and epilogue's hooks: the gated delta rule's gates and l2 norm, Mamba2's step gates
 clipped with the skip, the gated RMS norm after the l2 norm and after a plain scale, Mamba2's SSD as
 `chunk_ssd` hands it over (a rated decay, the step its write gate), with its gated norm, a rated decay
-under the delta rule and the l2 norm, the norm after the skip, and a decay without any write gate."""
+under the delta rule and the l2 norm, the norm after the skip, a decay without any write gate, and the
+readout of the memory entering its token (`Hooks.reads`): RWKV6's, a decay a key dimension with its own
+write weighed (`Hooks.own_weight`), and the delta rule's."""
 
 PACKED = (False, True)
 
@@ -138,7 +142,7 @@ def chunk_on(kernel: str, hooks, *args, **kwargs):
 
 SEEDS = dict(zip(((hooks, packed) for hooks in HOOKS + FORMED for packed in PACKED), (
     8, 8, 8, 8, 8, 8, 8, 8, 16, 16, 64, 64, 16, 16, 16, 16, 8, 8, 64, 64, 8, 8, 8, 8,
-    64, 64, 128, 128, 16, 8, 16, 16, 64, 64, 32, 32, 32, 32, 8, 8, 16, 16), strict=True))
+    64, 64, 128, 128, 16, 8, 16, 16, 64, 64, 32, 32, 32, 32, 8, 8, 16, 16, 16, 16, 16, 16), strict=True))
 """Each site's declared seeds (hooks in `HOOKS` then `FORMED` order, one sequence then packed), sized
 independently by `seeds_for` on armada (2026-10-21), on the draw with a memory entering and a
 document starting on a chunk's first token."""
@@ -233,11 +237,12 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
         epilogue = {'z': hosted(normal((ROWS, length, value_heads, width))[..., value_order]),
                     'weight': hosted((1.0 + 0.1 * normal((width,)))[value_order])}
     starts = jnp.asarray(marked(((0, 23, 40), (9, 48)), length)) if packed else None
+    own = {'own': hosted(0.5 * normal((value_heads, KEY_WIDTH))[..., key_order])} if hooks.own_weight else {}
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
     return (Chunk(hosted(query), hosted(key), hosted(value), log_decay=hosted(log_decay) if plain else None,
                   beta=hosted(beta) if reads_beta else None, skip=hosted(skip) if hooks.skip else None,
-                  state=hosted(state), starts=starts, **gates, **epilogue),)
+                  state=hosted(state), starts=starts, **gates, **epilogue, **own),)
 
 
 def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
@@ -262,7 +267,7 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
             state, query=query[:, t], key=key[:, t], value=operands.value[:, t],
             log_decay=at(operands.log_decay), gate=at(operands.gate), log_a=operands.log_a,
             bias=operands.bias, beta=at(operands.beta), skip=operands.skip, z=at(operands.z),
-            weight=operands.weight, rate=operands.rate)
+            weight=operands.weight, rate=operands.rate, own=operands.own)
         out, _, state = recurrence.step_reference(hooks, token)
         return state, out
 
