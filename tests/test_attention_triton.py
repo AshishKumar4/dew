@@ -314,11 +314,12 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
                 heads: int = 4):
     """The score hooks `names` asks for, as a score_mod and a draw of its parameters and the softmax's
     initial state for a seed (each a `[B, H, ...]` array or `Initial`, fp32, `rows` by `heads` query heads):
-    a softcap, ALiBi, a query's temperature, a per-key bias, a dense bias as one score_mod; sinks, or a
-    resumed partial (its maximum, a positive denominator and a numerator of any sign), as the initial
-    state."""
+    a softcap, ALiBi, a query's temperature, a per-query bias, a per-key bias, a dense bias as one score_mod;
+    sinks, or a resumed partial (its maximum, a positive denominator and a numerator of any sign), as the
+    initial state."""
     kinds = [kind for name, kind in (("alibi", template.Kind.HEAD), ("temperature", template.Kind.QUERY),
-                                     ("key", template.Kind.KEY), ("tile", template.Kind.TILE))
+                                     ("query", template.Kind.QUERY), ("key", template.Kind.KEY),
+                                     ("tile", template.Kind.TILE))
              if name in names]
 
     def score_mod(s, q_pos, k_pos, *values):
@@ -333,7 +334,7 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
             s = s + values.pop(0).astype(s.dtype) * k_pos.astype(s.dtype)
         if "temperature" in names:
             s = s / values.pop(0).astype(s.dtype)
-        for _ in range(("key" in names) + ("tile" in names)):
+        for _ in range(("query" in names) + ("key" in names) + ("tile" in names)):
             s = s + values.pop(0).astype(s.dtype)
         return s
 
@@ -344,6 +345,8 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
             params.append(jnp.asarray(alibi_slopes(heads)))
         if "temperature" in names:
             params.append(jax.random.uniform(streams[0], (rows, heads, queries), jnp.float32, 0.5, 1.5))
+        if "query" in names:
+            params.append(jax.random.normal(jax.random.fold_in(streams[0], 1), (rows, heads, queries)))
         if "key" in names:
             params.append(jax.random.normal(streams[1], (rows, heads, keys)))
         if "tile" in names:
@@ -357,7 +360,8 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
             initial = template.Initial(jax.random.normal(streams[5], (rows, heads, queries)), total, acc)
         return tuple(params), initial
 
-    scoring = bool({"softcap", "custom", "indexed", "alibi", "temperature", "key", "tile"} & set(names))
+    scored = {"softcap", "custom", "indexed", "alibi", "temperature", "query", "key", "tile"}
+    scoring = bool(scored & set(names))
     return (score_mod if scoring else None), tuple(kinds), draw
 
 

@@ -69,8 +69,7 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     contraction takes (`swizzling.swizzle_for`). The output and key gradients' stages, which no walk reads,
     are scoped after the walks where the family scopes them apart (`stages_after_walks`), in their slots. The
     score hook's parameters that ride the stream of queries (`params`, each its `Kind` and dtype:
-    `score_streams`: a tile's keys-first block of the program's keys, a query vector's) take one each, staged
-    plain."""
+    `score_streams`: a tile's keys-first block of the program's key block) take one each, staged plain."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     split = split_queries(family)
     holders, rows = (1, block_q // consumers) if split else (consumers, block_q)
@@ -111,7 +110,9 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     # stream's.
     transposed = transposed_swizzles(config, *(("logits",) if "logits" in blocks else ()), "douts")
     swizzles = transposed if swizzle is None else dict.fromkeys(blocks, swizzle)
-    hooked = score_streams(family, params, "queries", holders * block_k, block_q)
+    # A tile parameter's blocks of one key block's, the one holder a launch streaming them takes
+    # (`MosaicBackward.legal`).
+    hooked = score_streams(family, params, "queries", block_k, block_q)
     swizzles = {**swizzles, **dict.fromkeys(hooked, swizzling.UNSWIZZLED)}
     return scoped, family.streams({**blocks, **hooked}, stages, consumers, swizzles=swizzles), after
 
@@ -605,12 +606,12 @@ def _consumer_step(walk: _Backward, place: tuple, k_first, index: int, holder: i
     coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first, keys_first=True,
                                   draw=None if drop_of is None else drop_of.draw(row, head))
     # The key block's parameters held across the walk, read once (`held_params`), each query tile's of the
-    # queries' stream its step's, the consumer's keys and queries of the slot (`_score_params`).
+    # queries' stream its step's, the consumer's queries of the slot (`_score_params`).
     block_k = walk.program.tiles.block_k
     params_of = functools.partial(
         _score_params, family, score_refs, walk.kinds, row, head, k_first=k_first, keys_first=True,
         held=held_params(family, score_refs, walk.kinds, row, head, k_first, block_k, along="queries"),
-        streamed=riding(family, walk.kinds, "queries"), at=(holder * block_k, part[0]))
+        streamed=riding(family, walk.kinds, "queries"), at=(0, part[0]))
     adds = _fused_adds(walk, dq_ref, fused_stages, place, index, k_smem, holder)
     return functools.partial(_dkv_step, walk, (k_smem.at[holder], v_smem.at[holder]), statistics, coords_of,
                              params_of, store_tiles, shares, part, stage, adds)

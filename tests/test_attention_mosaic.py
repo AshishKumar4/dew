@@ -275,7 +275,7 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
                  form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
                  natural: bool = False, seeds: int | None = None, width: int = 64,
                  param_rows: int | None = None, pins: tuple | None = None,
-                 target: generation.GpuTarget | None = None):
+                 target: generation.GpuTarget | None = None, routed: bool = True):
     """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `_form_tiles`
     (64 wide) under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
@@ -283,7 +283,8 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
     `width` wide, the forward's logits `natural` or folded. The backward differentiates the queries, keys,
     values, the hook's parameters and the initial state, over `seeds` draws where given (the site's own,
     else the template site's); its launches at the forward's and backward's configs `pins` where given
-    (`_pinned`), interpreted for `target` where given (`_device`)."""
+    (`_pinned`), interpreted for `target` where given (`_device`), the backward the one the route takes
+    where `routed`, else this mainloop's (a TPU core's, which the route's CUDA facts do not read)."""
     rows, queries, heads, _ = shape
     # A hook's parameters drawn for `param_rows` batch rows where given (one every row shares).
     score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, width,
@@ -315,8 +316,9 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
                                                  residuals=template.Kept.SPLIT, interpret=interpret)[1:]
             # On the mainloop the route takes it to (`attention_route.backward`): this one's, else the
             # Pallas-Triton one's where this one's registers hold no tile of it.
-            grads = attention_route.backward(query, key, value, spans, hooks, dout, residuals=residuals,
-                                             accurate=accurate, interpret=interpret)
+            pulled = attention_route.backward if routed else attention_mosaic.backward
+            grads = pulled(query, key, value, spans, hooks, dout, residuals=residuals, accurate=accurate,
+                           interpret=interpret)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
     def reference(query, key, value, dout, params, initial):
@@ -355,19 +357,26 @@ def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
                  gate=gate, dtype=dtype, natural=natural)
 
 
+STREAMED_HOOKS = {"key-bias": ("key",), "tile-bias": ("tile",), "query-bias": ("query",)}
+"""Score hooks whose parameters ride a producer's streams (`attention_mosaic_program.riding`): a key's and a
+tile's the keys' in the forward and dQ, a tile's (keys first) and a query's the queries' in dK/dV; an additive
+query bias, whose dK/dV holds one varying tile where a temperature's holds two, the query's that fits one
+consumer's registers."""
+
+
 @INTERPRETS
-@pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
+@pytest.mark.parametrize("hooks", STREAMED_HOOKS)
 def test_a_hooks_streamed_parameters_hold_check_1_through_the_rings_rotations_interpreted(hooks):
     """The forward and the backward under a score hook whose parameters ride the producer's streams
-    (`attention_mosaic_program.riding`: a key's and a tile's the keys' in the forward and dQ, a tile's the
-    queries' in dK/dV, keys first, a key's held), over 256 causal tokens (four 64-token tiles a walk at most,
-    its two-stage rings each slot read twice), at wgmma's tiles, the forward on two consumers and the
-    backward on one (on two a tile bias's held 244 registers, past a thread's 240, at 64 x 64), dK/dV on the
-    producer's rings too (`BackwardTiles.dkv_family`): on par with the reference (check 1)."""
+    (`STREAMED_HOOKS`; a walk's held ones, a query's in the forward and dQ and a key's in dK/dV, beside them),
+    over 256 causal tokens (four 64-token tiles a walk at most, its two-stage rings each slot read twice), at
+    wgmma's tiles, the forward on two consumers and the backward on one (on two a tile bias's held 244
+    registers, past a thread's 240, at 64 x 64), dK/dV on the producer's rings too
+    (`BackwardTiles.dkv_family`): on par with the reference (check 1)."""
     spans = template.spans(256, 256, 1, causal=True)
     pins = (attention_mosaic.Tiles(64, 64, 2, 2, family=WGMMA),
             attention_mosaic.BackwardTiles(64, 64, 2, 1, family=WGMMA, dkv_family=WGMMA))
-    _check_spans("causal", spans, (1, 256, 2, 1), interpret=True, backward=True, score=SCORE_HOOKS[hooks],
+    _check_spans("causal", spans, (1, 256, 2, 1), interpret=True, backward=True, score=STREAMED_HOOKS[hooks],
                  pins=pins)
 
 
@@ -624,6 +633,21 @@ def test_a_tpu_cores_forward_is_on_par_interpreted(call, forward):
     par with the reference (check 1)."""
     _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], interpret=True,
                    target=generation.gpu_target("v5e"), **TPU_PASSES[forward])
+
+
+@INTERPRETS
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+@pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
+def test_a_tpu_cores_forward_and_backward_are_on_par_under_a_score_hooks_parameters_interpreted(hooks,
+                                                                                               backward):
+    """The forward, and the backward's every gradient, on a v5e's MXU under a score hook of a key's or a
+    tile's parameter, each step reading its block where the core's one role walks (no producer: `riding`
+    takes none), over 160 causal tokens at its derived configs, under Pallas TPU's interpreter: on par with
+    the reference (check 1)."""
+    spans = template.spans(160, 160, 1, causal=True)
+    _check_spans("causal", spans, (1, 160, 2, 1), interpret=True, backward=backward,
+                 score=SCORE_HOOKS[hooks], pins=(None, None), target=generation.gpu_target("v5e"),
+                 routed=False)
 
 
 @INTERPRETS

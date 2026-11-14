@@ -85,6 +85,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     few_rows,
     fewer_rows,
     fuses,
+    holders,
     hook_reduces,
     launch_scope,
     layouts,
@@ -97,6 +98,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     score_places,
     split_queries,
     stagings,
+    streams_operands,
     varying_slopes,
     walked_extents,
     whole_tiles,
@@ -1251,6 +1253,14 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # A family the device has no bundle of (a pin of an H100's wgmma on an A100) is not read here: the
         # mainloop's legality refuses it (`_Mainloop.legal`).
         if dkv_family is None or not whole_tiles(dkv_family, config.dkv):
+            return False
+        # A dK/dV launch whose producer streams a TILE parameter's keys-first blocks with its queries
+        # (`streams_operands`) stages one key block's (`_dkv_allocations`): a launch of more holders takes
+        # none, which no config of its family held either, a tile bias's two holders past a thread's
+        # registers at the family's one tile (`Family.registers`, `resources.role_registers`; et-a2-legal),
+        # until a capability holds them (row 5741).
+        if (not config.fused and streams_operands(dkv_family) and Kind.TILE in self.score_kinds
+                and holders(dkv_family, config.dkv.consumers) > 1):
             return False
         # The one launch's tiles a role's rows at least (`_role_rows`): no issuer specializes it below them
         # (`fewer_rows` the two launches' alone), its 32 x 32 tile on an sm120's fed mma.sync and an sm86's
