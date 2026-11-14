@@ -14,8 +14,10 @@ import contextvars
 import dataclasses
 import hashlib
 import importlib.util
+import itertools
 import json
 import logging
+import os
 import re
 import shutil
 import struct
@@ -347,12 +349,18 @@ class Certification:
     pulled: bool
     kernels: dict[str, tuple[str, "Binary"]]
     stored: bool
+    round: int
+    """The round of certification it was compiled or read in (`certified_together`): configs certified at once
+    share one."""
 
     @property
     def spilling(self) -> tuple["Binary", ...]:
         """Its kernels that spill as the GPU assembles them."""
         return tuple(binary for _, binary in self.kernels.values() if binary.frame)
 
+
+_ROUNDS = itertools.count()
+"""Each round of certification's number (`Certification.round`)."""
 
 _CERTIFIED: dict[tuple, Certification] = {}
 """Each launch certified (`certified`), by its identity, config, device and product."""
@@ -391,7 +399,8 @@ def certifying(device) -> Iterator[None]:
         _CERTIFYING.reset(token)
 
 
-def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple["Binary", ...]:
+def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round: int | None = None
+              ) -> tuple["Binary", ...]:
     """`op`'s kernels at `config` for `arguments` that spill as the GPU assembles them, each launch compiled
     alone before its program is: its kernels' binaries (`binaries`) as the plugin's own compiler makes them
     for the device the process compiles for (`_certifying_device`: its own GPU, or a compile-only one a
@@ -433,10 +442,32 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
             return ()
         if stored is not None:
             tuning.store_verdict(device.device_kind, stored, kernels)
-    found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None)
+    found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None,
+                          next(_ROUNDS) if round is None else round)
     with _GUARD:
         _CERTIFIED[key] = found
     return found.spilling
+
+
+def certified_together(op, arguments: tokamax.BoundArguments, configs: Sequence[Hashable]
+                       ) -> list[tuple["Binary", ...]]:
+    """Each of `configs` certified (`certified`) in one round, all at once on as many threads, each in a copy
+    of this context: a search's rungs, which the assembler answers only one yes or no each (`rung_round`
+    bounds a round by the host's cores)."""
+    round = next(_ROUNDS)
+    if len(configs) < 2:
+        return [certified(op, arguments, config, round=round) for config in configs]
+    with ThreadPoolExecutor(len(configs), thread_name_prefix="dew-certify") as pool:
+        submitted = [pool.submit(contextvars.copy_context().run, certified, op, arguments, config,
+                                 round=round) for config in configs]
+        return [each.result() for each in submitted]
+
+
+def rung_round() -> int:
+    """The most rungs a round of certification compiles at once (`certified_together`): the cores this
+    process may run on, so a small host takes fewer rungs a round rather than sharing its cores among more
+    compiles."""
+    return max(1, len(os.sched_getaffinity(0)))
 
 
 def _verdict_key(op, arguments: tokamax.BoundArguments, config: Hashable, reverse: bool) -> str | None:

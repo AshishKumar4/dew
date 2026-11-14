@@ -602,6 +602,17 @@ class Mosaic(base.Template[mainloop.Tiles]):
             tiles = _producing(tiles, raised)
         return tiles
 
+    def rungs(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> tuple[mainloop.Tiles, ...]:
+        """The tiles a refused `config`'s spilling launches' producers rise through, a setmaxnreg step a rung
+        (`_raised`), up to the most their consumers' least share allows: the ladder `_settled` climbs a
+        compile at a time, which certification asks a round at a time (`tuning.KernelOp._climbed`)."""
+        target, spilled = generation.gpu_target(), _spilled(self, ba, config)
+        ladder, rung = [], config
+        while spilled and (raised := self._raised(ba, rung, spilled, target)) is not None:
+            rung = _producing(rung, raised)
+            ladder.append(rung)
+        return tuple(ladder)
+
     def _raised(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                 target: generation.GpuTarget) -> resources.Producers | None:
         """`joined`'s producers with those of its `spilled` launches (each kernel's own, `_owners`) a

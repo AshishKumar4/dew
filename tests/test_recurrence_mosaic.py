@@ -1599,6 +1599,41 @@ def test_a_training_launchs_backward_kernels_carry_its_launch():
 
 
 
+@lowers('sm100')
+def test_a_launch_whose_producer_must_rise_climbs_its_ladder_a_round_at_a_time():
+    """A training call whose reverse walk spills at setmaxnreg's least producer on a compile-only B200
+    (Qwen3.5-4B's gated delta net over its 12,288-token row, certified as reverse mode runs it,
+    `report.pulled`) asks its producer's ladder (`Mosaic.rungs`, a setmaxnreg step a rung) a round at a time,
+    as many rungs a round as the host compiles at once (`report.rung_round`): the assembler answers only
+    whether a rung holds, so the least that holds is a search. A rung at a time, the walk's producer rose 24
+    to 80 over eight certification compiles, 95 s of the 4B's cold start."""
+    from dew.nn.kernels import recurrence_chunk
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    # Qwen3.5-4B's linear attention: 16 key heads and 32 value heads, each 128 wide.
+    operands = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
+        ((1, 12288, 16, 128), jnp.bfloat16), ((1, 12288, 16, 128), jnp.bfloat16),
+        ((1, 12288, 32, 128), jnp.bfloat16), ((1, 12288, 32), jnp.float32), ((1, 12288, 32), jnp.bfloat16))]
+    options = {'max_segments': None, 'scale': None, 'delta': True, 'wide': False, 'bound': 1.0,
+               'rounded': True}
+
+    def loss(*given):
+        out, final = recurrence_chunk.template_rule(*given, **options)
+        return out.astype(jnp.float32).sum() + final.sum()
+
+    before = {id(certified) for certified in report.certifications()}
+    with (report.refusals(), generation.assumed('sm100'), generation.chosen(gated_delta_rule='mosaic_gpu'),
+          report.certifying(compile_only_gpus('sm100')[0]), report.pulled()):
+        jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(*operands).lower(lowering_platforms=('cuda',))
+    certified = [each for each in report.certifications()
+                 if id(each) not in before and each.op == type(template.MOSAIC).__name__]
+    climbed = [each for each in certified if each.config.producers.raised_to]
+    assert climbed, certified
+    # The first config's round, then the ladder's: as many as its rungs fill at the host's round size.
+    rounds = {each.round for each in certified}
+    assert len(rounds) <= 1 + -(-len(climbed) // report.rung_round()), (rounds, len(climbed))
+
+
 def test_a_spilling_kernel_raises_only_the_launch_it_belongs_to():
     """A kernel spilling under a launch name another launch's extends (`recurrence_intra_solve` beside
     `recurrence_intra`) is that longer launch's alone (`template._owners`), so only its producer rises."""

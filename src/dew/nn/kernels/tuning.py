@@ -600,6 +600,7 @@ class KernelOp(tokamax.Op):
         while config not in seen and (spilling := report.certified(self, ba, config)):
             seen.add(config)
             report.refuse_launch(self, ba, config, {binary.kernel for binary in spilling})
+            self._climbed(ba, config, seen)
             try:
                 stepped = self._get_heuristics_config(ba)
             except report.Exhausted:
@@ -609,6 +610,30 @@ class KernelOp(tokamax.Op):
             report.missed_spilling(self, ba, config, spilling, stepped=stepped not in seen)
             config = stepped
         return config
+
+    def rungs(self, ba: tokamax.BoundArguments, config: Hashable) -> tuple[Hashable, ...]:
+        """The configs above a refused `config` its derivation steps through in turn, each the same launch
+        with one more of a resource the assembler alone decides (a recurrence's producer registers, a
+        setmaxnreg step a rung), up to the most the family allows: none unless the launch states them."""
+        del ba, config
+        return ()
+
+    def _climbed(self, ba: tokamax.BoundArguments, config: Hashable, seen: set) -> None:
+        """`config`'s rungs (`rungs`) certified a round at a time (`report.certified_together`,
+        `report.rung_round` a round), each one that spills refused and its misses recorded, until a rung
+        holds, which the derivation then takes. A search, not a step: the assembler reports whether a config
+        holds, never what it would need (its stack frame stays a word or two at every rung short of the
+        least that holds), so the least holding rung is found by asking several at once; one at a time, the
+        4B's reverse walk took eight compiles, 95 s of a cold B200 start."""
+        rungs, size = list(self.rungs(ba, config)), report.rung_round()
+        while rungs:
+            batch, rungs = rungs[:size], rungs[size:]
+            for rung, spilling in zip(batch, report.certified_together(self, ba, batch), strict=True):
+                if not spilling:
+                    return
+                seen.add(rung)
+                report.refuse_launch(self, ba, rung, {binary.kernel for binary in spilling})
+                report.missed_spilling(self, ba, rung, spilling, stepped=True)
 
     def variants(self, ba: tokamax.BoundArguments) -> tuple[Hashable, ...]:
         """The configs an opt-in tuning run (`tune`) times for `ba`: the launch's heuristic alone, or, where
