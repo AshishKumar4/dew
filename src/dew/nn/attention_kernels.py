@@ -543,43 +543,99 @@ the reference path, and refuses a call whose scores do not fit a device's memory
 
 
 def _dense_fits(case: AttentionCase) -> bool:
-    """Whether jax.nn's xla attention fits a device's memory for `case`: its training step's peak with its
-    operands, as Dew's footprint model derives it (`_dense_peak`), within the bytes a device holds
-    (`generation.device_memory`);
-    where the device states none (an assumed TPU), it fits. A training step's, as a call's kernel is chosen
-    before it is differentiated (`attention_route.attend`'s `custom_vjp`); the call's global shapes, a
-    device's share where no sharding splits them (a split call fits the more)."""
+    """Whether jax.nn's xla attention fits a device's memory for `case`: its training step's peak as XLA
+    analyses it (`_dense_peak`) within the bytes a device holds (`generation.device_memory`); where the
+    device states none (an assumed TPU), or its backend analyses no program's memory, it fits. A training
+    step's, as a call's kernel is chosen before it is differentiated (`attention_route.attend`'s
+    `custom_vjp`); the call's global shapes, a device's share where no sharding splits them (a split call
+    fits the more)."""
     memory = generation.device_memory()
-    return memory is None or _dense_peak(case) <= memory
+    if memory is None or _dense_bound(case) <= memory:
+        return True
+    peak = _dense_peak(case)
+    return peak is None or peak <= memory
 
 
-def _dense_peak(case: AttentionCase) -> int:
-    """The most bytes jax.nn's xla attention holds at once in a training step of `case`: its temporaries'
-    peak beside its operands (`footprint.gradient_peak`, on the platform the call is chosen for; 12 to 13 a
-    score in fp32, its logits, weights and their cotangents), and the operands, the query, keys and values."""
+def _dense_bound(case: AttentionCase) -> int:
+    """Bytes past any jax.nn's xla attention training step of `case` holds at once: every value its traced
+    step makes, its operands and gradients among them, held together (`_dense_bound_of`). A call within its
+    device's memory by it fits with no compile (a run's step compiles once: a planned run of a small dense
+    model); one past it is judged by the step XLA compiles (`_dense_peak`)."""
+    return _dense_bound_of(case.rows, case.queries, case.heads, case.keys, case.kv_heads, case.head_dim,
+                           jnp.dtype(case.dtype).name, case.causal)
+
+
+@functools.cache
+def _dense_bound_of(rows: int, queries: int, heads: int, keys: int, kv_heads: int, width: int, dtype: str,
+                    causal: bool) -> int:
+    """`_dense_bound` of a call of these shapes, traced once a shape (`jax.make_jaxpr`, which compiles
+    nothing)."""
+    import jax
+    from jax.core import ShapedArray
+
+    query = jax.ShapeDtypeStruct((rows, queries, heads, width), dtype)
+    key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), dtype)
+    program = jax.make_jaxpr(_dense_step(causal))(query, key, key, query).jaxpr
+    made = (var for equation in program.eqns for var in equation.outvars)
+    values = [var.aval for var in (*program.invars, *made)]
+    return sum(math.prod(aval.shape) * aval.dtype.itemsize for aval in values
+               if isinstance(aval, ShapedArray))
+
+
+def _dense_step(causal: bool):
+    """jax.nn's xla attention's training step of a call: its gradients of the query, keys and values given
+    the output's cotangent."""
+    import jax
+
+    def step(query, key, value, cotangent):
+        def attended(*operands):
+            with jax.softmax_custom_jvp(new_val=True):
+                return jax.nn.dot_product_attention(*operands, is_causal=causal, implementation='xla')
+
+        return jax.vjp(attended, query, key, value)[1](cotangent)
+
+    return step
+
+
+def _dense_peak(case: AttentionCase) -> int | None:
+    """The most bytes jax.nn's xla attention holds at once in a training step of `case`, as XLA's memory
+    analysis of that step, compiled as Dew compiles a program for the device the call is chosen for, states
+    them (`_dense_peak_of`): its operands and the output's cotangent, the gradients it returns and the
+    temporaries beside them (12 to 13 a score in fp32, its logits, weights and their cotangents); None where
+    the backend analyses none."""
+    import jax
+
+    found = generation.assumption()
+    mesh = jax.sharding.get_abstract_mesh()
+    if not mesh.empty:
+        # The context's mesh, over whose devices a program in it compiles, each holding the call whole.
+        placed = None
+    elif found is None or found.interpreted:
+        placed = jax.sharding.SingleDeviceSharding(generation.placed_devices()[0])
+    else:
+        multiprocessors = generation.gpu_target().multiprocessors
+        placed = jax.sharding.SingleDeviceSharding(
+            generation.compile_only_gpus(found.generation, 1, multiprocessors=multiprocessors)[0])
     return _dense_peak_of(case.rows, case.queries, case.heads, case.keys, case.kv_heads, case.head_dim,
-                          jnp.dtype(case.dtype).name, case.causal, generation.backend())
+                          jnp.dtype(case.dtype).name, case.causal, placed, mesh, found)
 
 
 @functools.cache
 def _dense_peak_of(rows: int, queries: int, heads: int, keys: int, kv_heads: int, width: int, dtype: str,
-                   causal: bool, platform: str) -> int:
-    """`_dense_peak` of a call of these shapes, derived once a shape: the program traced over shapes alone,
-    a matrix product's workspace (MiBs) none beside its scores."""
+                   causal: bool, placed, mesh, assumed) -> int | None:
+    """`_dense_peak` of a call of these shapes, each operand `placed` whole (on the context's `mesh` where
+    None), compiled once a shape, mesh and device `assumed` through Dew's compile point (`options.jit`): a
+    device's arguments, its outputs past those they alias, and its temporaries (`compiled_memory`)."""
+    del mesh, assumed
     import jax
 
-    from dew.training import footprint
+    from dew.nn.kernels import options
+    from dew.telemetry.instrumentation import compiled_memory
 
-    query = jax.ShapeDtypeStruct((rows, queries, heads, width), dtype)
-    key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), dtype)
-
-    def loss(params):
-        with jax.softmax_custom_jvp(new_val=True):
-            return jax.nn.dot_product_attention(*params, is_causal=causal, implementation='xla'), ()
-
-    operands = (query, key, key)
-    peak = footprint.gradient_peak(loss, operands, (), platform=platform, workspace=footprint.Workspace(0, 0))
-    return peak.bytes + sum(math.prod(operand.shape) * jnp.dtype(dtype).itemsize for operand in operands)
+    query = jax.ShapeDtypeStruct((rows, queries, heads, width), dtype, sharding=placed)
+    key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), dtype, sharding=placed)
+    memory = compiled_memory(options.jit(_dense_step(causal)).lower(query, key, key, query).compile())
+    return None if memory is None else memory.argument + memory.output - memory.alias + memory.temp
 
 
 TEMPLATE_SUPPORTS = (

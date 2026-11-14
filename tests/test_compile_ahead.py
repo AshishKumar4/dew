@@ -47,7 +47,8 @@ def this_gpus(count: int = 1) -> tuple:
     """`count` compile-only GPUs of this GPU's own target, its generation, its multiprocessors (an H100
     PCIe's 114, not the canonical H100's 132) and the memory whose allocator's limit is its own, whose
     programs this GPU's loader takes (`BuildTarget.held`)."""
-    from dew.training.ahead import BuildTarget, compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.training.ahead import BuildTarget
 
     own = BuildTarget.of(jax.devices()[:1])
     assert own.memory is not None
@@ -59,7 +60,7 @@ def gpus(generation: str, count: int = 1, limit: int = 2**36) -> tuple:
     """`count` compile-only GPUs of `generation` whose stated memory gives their allocator `limit` bytes
     (`memory_limited_to`), 64 GiB unless a test asks less: XLA's own scheduling reads the memory a target
     states, which a GPU's of that size leaves to the step's own needs."""
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     return compile_only_gpus(generation, count, memory_limited_to(limit))
 
@@ -613,7 +614,8 @@ def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_o
     from jax._src import cache_key, compiler
     from jax.experimental import topologies
 
-    from dew.training.ahead import compile_only_gpus, host_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.training.ahead import host_gpus
 
     host = compile_only_gpus("sm90", 2, 40 * 2**30)
     serialized = tmp_path / "topology.bin"
@@ -749,9 +751,9 @@ def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_
     candidates are cuBLASLt's on a GPU host. A run's own XLA_FLAGS setting, and devices that run, keep the
     options as given; the fit search compiles each rung under the step's own options, the target's left to
     the compile point."""
+    from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.kernels.options import compiler_options
     from dew.nn.kernels.templates.report import targeted
-    from dew.training.ahead import compile_only_gpus
     from dew.training.planning import FitSearch
 
     monkeypatch.setenv("XLA_FLAGS", without_flags(os.environ.get("XLA_FLAGS", ""),
@@ -788,7 +790,8 @@ def test_compiling_ahead_on_gpus_of_no_stated_memory_is_refused_before_anything_
     against, is refused before anything traces or compiles, its frontier or not (row 3107; PF03: it
     planned by compiling every rung, fourteen minutes of probes on a B200's step), naming the two ways to
     state it once: each GPU's memory, or a host's own serialized topology."""
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.training.ahead import compile_ahead
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
     trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)))
@@ -947,7 +950,8 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.ahead import compile_ahead, compile_only_gpus
+from dew.nn.kernels.generation import compile_only_gpus
+from dew.training.ahead import compile_ahead
 
 mixer = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=64,
                            linear_value_head_dim=64)
@@ -990,7 +994,8 @@ from dew.nn.kernels.generation import routes
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.ahead import compile_ahead, compile_only_gpus
+from dew.nn.kernels.generation import compile_only_gpus
+from dew.training.ahead import compile_ahead
 
 model = models.build(
     "causal_transformer", vocab_size=1024, emb_features=1024, num_layers=2, num_heads=8, num_kv_heads=2,
@@ -1044,8 +1049,7 @@ def test_tokamaxs_triton_attention_compiles_ahead_for_a_gpu_with_none_attached(g
     the kernel itself, not XLA's attention in its place; tokamax's check of the device a kernel runs on is
     the assumed GPU's (`generation.assumed`), where it read this host's ("Not supported on cpu")."""
     from dew.nn.attention import scaled_dot_product_attention
-    from dew.nn.kernels.generation import assumed, routes
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import assumed, compile_only_gpus, routes
 
     mesh = jax.sharding.Mesh(np.asarray(compile_only_gpus(generation, 1)), ("devices",))
     placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())

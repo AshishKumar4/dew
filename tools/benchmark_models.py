@@ -44,6 +44,7 @@ from dew.nn.backbones.wan import WanTransformer
 from dew.nn.backbones.z_image import ZImageTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import DenoisingCondition, ModelInputs
+from dew.nn.kernels.generation import compile_only_gpus
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
 from dew.nn.vision import ProjectorBase, TowerBase
 from dew.objectives.base import Objective
@@ -57,7 +58,7 @@ from dew.registry import models, projectors, read_arguments, resolve_dtype, towe
 from dew.state import TrainState
 from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus, step_batch
+from dew.training.ahead import AheadOfTime, compile_ahead, step_batch
 from dew.training.planning import Trials
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]

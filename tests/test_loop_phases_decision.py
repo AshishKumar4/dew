@@ -211,8 +211,9 @@ def test_a_phased_runs_later_phase_compiles_ahead_as_the_run_lowers_it_at_its_bo
     from run_kinds import decision
 
     from dew.config import RunConfig
+    from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.sharding import Link
-    from dew.training.ahead import AheadTarget, CompiledAhead, LaterPhases, compile_only_gpus
+    from dew.training.ahead import AheadTarget, CompiledAhead, LaterPhases
 
     topology = tmp_path / "topology.bin"
     host = compile_only_gpus("sm90", 8, 40 * 2**30)
