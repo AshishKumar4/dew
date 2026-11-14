@@ -199,7 +199,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         forked = Forked.of(operands, starts, firsts, work)
         firsts = forked.firsts
         max_segments = firsts.shape[1]
-    if hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
+    readout = hooks.reads == 'after' and not hooks.own_weight
+    if hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None and readout:
         # Each of its routes adds the skip, the port in its kernels.
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, firsts, chunk_size,
                                  work, dtype, max_segments=max_segments, forked=forked)
@@ -218,7 +219,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             return port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
                                scale=scale, wide=wide_out, bound=hooks.inverse_bound,
                                product=product, forked=forked, delta=hooks.delta,
-                               decayed=hooks.decay != 'none')
+                               decayed=hooks.decay != 'none', readout=readout)
 
         def run(kernel, query, key, value, g, beta, skip, state, starts, firsts, *walked):
             # Every kernel walks the packed rows, each document from its own memory, its values read once
@@ -258,7 +259,9 @@ class PortCase:
     form: whether it is the delta rule (`delta`) and decays (`decayed`), the largest entry of its chunk
     inverse the form proves (`bound`, `recurrence.Hooks.inverse_bound`; None where it proves none), whether
     its decay is a key dimension's
-    (`per_key`), and whether its documents enter earlier documents' finals (`forked`, `Chunk.loads`)."""
+    (`per_key`), whether its documents enter earlier documents' finals (`forked`, `Chunk.loads`), and
+    whether its readout reads the state after its token's update alone (`readout`: `Hooks.reads` 'after'
+    and no `Hooks.own_weight`)."""
 
     varying: bool
     dtype: np.dtype
@@ -272,6 +275,7 @@ class PortCase:
     bound: float | None = None
     per_key: bool = False
     forked: bool = False
+    readout: bool = True
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -317,6 +321,13 @@ _PORT_PRECISION = ("a product precision the run declares that the port's product
                    "narrows 16-bit ones")
 
 
+READOUT_HANDOFF = ("a readout of the state entering its token, or weighing its token's own write "
+                   "(`recurrence.Hooks.reads`, `Hooks.own_weight`: RWKV6's), which the portable math's "
+                   "forms derive (`scan.Scan.reads`) and neither the port's kernels nor the template's "
+                   "mainloop form")
+"""Why a kernel of the chunked op hands a call of another readout over to the portable math."""
+
+
 PORT_FORKED = Refusal('forked', "a forked call, whose documents enter earlier documents' finals of the same "
                       "call (`Chunk.loads`): the port runs a call's documents as sequences of their own in "
                       "parallel (fla's varlen), which no document's memory can wait on", row=INHERENT)
@@ -339,6 +350,7 @@ PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
                 "as the CPU suite runs them where a call names the port", row=INHERENT, kind='measured'),
     Requirement('precision', _port_precision, _PORT_PRECISION, row=INHERENT, kind='handoff'),
     Requirement('forked', lambda case: not case.forked, PORT_FORKED.detail, row=INHERENT),
+    Requirement('readout', lambda case: case.readout, READOUT_HANDOFF, row=INHERENT, kind='handoff'),
 )
 """What the port (`fla_rule`) needs of a rule's call: the gated delta rule, a decay with the delta rule (the
 other forms hand over to the portable math, the call's route reporting it); a GPU Dew's Triton kernels run on,
@@ -421,7 +433,8 @@ def _trains(call: base.Call | None) -> bool:
 class Templated(Protocol):
     """A case the recurrence template's requirements read (`TEMPLATE_SUPPORTS`): the template's
     implementations bound to the call (`call`), the instruction family of the device it runs on (`family`,
-    None off a GPU), the product it is selected for (`product`) and the operands' `dtype`."""
+    None off a GPU), the product it is selected for (`product`), the operands' `dtype`, and whether the
+    readout reads the state after its token's update alone (`readout`)."""
 
     @property
     def call(self) -> base.Call | None: ...
@@ -434,6 +447,9 @@ class Templated(Protocol):
 
     @property
     def dtype(self) -> np.dtype: ...
+
+    @property
+    def readout(self) -> bool: ...
 
 
 TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
@@ -455,6 +471,7 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
                 "an fp32 product), which the template's whole products (its accurate parts, or a 16-bit "
                 "operand's own) do not compute; it rounds an fp32 product at the default alone, under the "
                 "run's fast forms (`fast_rounding`)", row=INHERENT, kind='handoff'),
+    Requirement('readout', lambda case: case.readout, READOUT_HANDOFF, row='ledger 6128', kind='handoff'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
 call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Template.eligible`: dtypes,
@@ -913,14 +930,15 @@ def _walk(forms, width: int, recomputed: bool, held: int = 0):
 def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segments: int | None = None,
                 scale: float | None = None, wide: bool = False,
                 bound: float | None = None, product: str = 'forward', report: bool = True, delta: bool = True,
-                decayed: bool = True, forked: Forked | None = None) -> str:
+                decayed: bool = True, forked: Forked | None = None, readout: bool = True) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
     ('forward', 'training'), of the form `delta` and `decayed` state and the chunk inverse's `bound` its form
     proves (`recurrence.Hooks.inverse_bound`; `PortCase`), the template's
     implementations bound to it, on the target (`generation`'s, an assumed one's within `assumed`):
     reported as its route, or not where not `report` (`selected`). A kernel a call names
     (`generation.chosen`) insists on it (`selection.KernelRefused`: the port named over varying operands),
-    but for a form the rule's kernels do not run, which the portable math takes."""
+    but for a form the rule's kernels do not run, which the portable math takes; `readout` whether the
+    call's readout reads the state after its token's update alone (`PortCase.readout`)."""
     from .templates.recurrence import template
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
@@ -932,7 +950,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1],
                     heads=(key.shape[-2], value.shape[-2], value.shape[-1]), call=call, family=family,
                     product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4,
-                    forked=forked is not None)
+                    forked=forked is not None, readout=readout)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
 
 
@@ -1398,6 +1416,7 @@ class ScanCase:
     family: str | None = None
     product: str = 'forward'
     forked: bool = False
+    readout: bool = True
 
     @property
     def cell(self) -> tuple[str | None, str]:
