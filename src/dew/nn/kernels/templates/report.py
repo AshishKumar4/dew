@@ -507,14 +507,13 @@ def uncertified() -> dict[tuple, str]:
         return dict(_UNCERTIFIED)
 
 
-def refuse_spilling(op, arguments: tokamax.BoundArguments, config: Hashable,
-                    spilling: Sequence["Binary"]) -> None:
-    """`op`'s launch of `arguments` at `config` refused as certification found `spilling` (`certified`):
-    refused as a compile's spill refuses it (`refuse_launch`), each kernel's miss recorded, its launch
-    stepped down (`misses`), as `settled` records a compile's."""
-    refuse_launch(op, arguments, config, {binary.kernel for binary in spilling})
+def missed_spilling(op, arguments: tokamax.BoundArguments, config: Hashable, spilling: Sequence["Binary"],
+                    *, stepped: bool) -> None:
+    """Each of `spilling`'s kernels (`certified`'s, at `config`) recorded as a miss (`misses`), as `settled`
+    records a compile's: `stepped` where its launch's derivation took another config after its refusal
+    (`refuse_launch`), not where it had none left."""
     launch = Launch(_identity(op, arguments), type(op).__name__, config)
-    _recorded([(None, binary, launch) for binary in spilling], stepped=True)
+    _recorded([(None, binary, launch) for binary in spilling], stepped=stepped)
 
 
 def _certifying_device():
