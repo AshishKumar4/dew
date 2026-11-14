@@ -50,6 +50,7 @@ from dew._cache import ALGEBRA
 from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
 from dew.nn.derivatives import Protected, contracted
+from dew.nn.nested import nested
 from dew.nn.precision import at_least_fp32, compensated_add, vanishing
 from dew.nn.programs import read_by
 
@@ -801,12 +802,16 @@ def _lowered_rule() -> Callable:
         generation.linear_tangent(forward, backward, _doubled, kind=Protected()))
 
 
+@functools.partial(nested, static_argnames=("reverse",), inline=True)
 def _compensated(values, *, reverse: bool = False, restarts=None) -> tuple[jax.Array, jax.Array]:
     """`values`' inclusive prefix sums along their first axis (suffix sums where `reverse`), each a float and
     its rounding error (a compensated scan), each restarting where `restarts` holds (a segmented scan: an
     element of it the first of its segment's). Each pair joined renormalized (`compensated_add`), the hand
     math's sum: a pair left unrenormalized held a residual that a product XLA:CPU fused into its sum (a
-    rated decay's `rate * beta`, an FMA) had left wrong, 1.5e-5 off a 16-token prefix (row 1966)."""
+    rated decay's `rate * beta`, an FMA) had left wrong, 1.5e-5 off a 16-token prefix (row 1966).
+    A nested program (`dew.nn.nested`), traced once for its arguments' types within a trace: the associative
+    scan otherwise traces its protected additions afresh at every level on every call, each chunk's walked
+    sum among them."""
     def combine(left, right):
         summed = compensated_add(left[:2], right[:2])
         if restarts is None:
