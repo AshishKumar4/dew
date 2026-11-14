@@ -52,7 +52,7 @@ admission.
 
 This module is the host's scheduler. The device records and the programs it
 feeds live in `dew.inference.serving_kernel`, and the packing of the weights
-a decode step reads in `dew.inference.projections`.
+a decode step reads in `dew.nn.projections`.
 
 On a mesh the server runs one program over every device, its state placed
 by the weights' rule table (`dew.mesh.DEFAULT_RULES`). The slots split
@@ -99,7 +99,6 @@ from dew.batch import (
 )
 from dew.inference.engine import Timed, Waiting, normalized, reloaded, settled
 from dew.inference.pages import Pages, States, prefix_hashes
-from dew.inference.projections import pack_projections, packed_layout
 from dew.inference.serving_kernel import (
     Admission,
     Dense,
@@ -151,6 +150,7 @@ from dew.nn.kernels.options import Fetched, compiler_options, program as outer_p
 from dew.nn.kv_cache import GROUPS, POOLED, ROUNDING_KEYS, KVCache, is_paged, leaf_name, row_axis
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
+from dew.nn.projections import pack_projections, packed_layout
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import whole

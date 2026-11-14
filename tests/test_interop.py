@@ -421,8 +421,8 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     projections packed, as the run's own task holds them, at the task's."""
     from test_inference import make_lm_run
 
-    from dew.inference.projections import inference_projections
     from dew.interop import Pretrained
+    from dew.nn.projections import inference_projections
 
     run = tmp_path / "run"
     run.mkdir()

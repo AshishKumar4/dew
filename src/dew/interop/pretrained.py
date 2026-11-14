@@ -350,7 +350,7 @@ class Pretrained:
 
     def packed(self) -> Self:
         """A serving view with packed projections, preserving this bundle's arrays for reuse."""
-        from dew.inference.projections import inference_projections
+        from dew.nn.projections import inference_projections
 
         return replace(self, variables=inference_projections(self.model, self.variables))
 
@@ -780,12 +780,12 @@ class Pretrained:
         merged into their kernels, as PEFT's `merge_and_unload` does, from its
         variables or a trainer's split of them; `adapter.save` writes the factors
         alone. A loaded task's tree, its projections packed for serving, is written
-        as the source's own members (`dew.inference.projections.unpacked`). A model with DEX writes
+        as the source's own members (`dew.nn.projections.unpacked`). A model with DEX writes
         each layer's differential folded into its output projection (`dew.nn.dex.folded`).
         """
         from dew.batch import thaw
-        from dew.inference.projections import unpacked
         from dew.nn.backbones.layer_names import stored_layers
+        from dew.nn.projections import unpacked
         from dew.nn.protocols import CrossAttending, Differential
 
         if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:

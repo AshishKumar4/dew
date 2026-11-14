@@ -32,7 +32,7 @@ from dew.batch import FROZEN
 from dew.config import SourceOptions, TrainerConfig
 from dew.lora import LoRA
 from dew.registry import ModelConfig, objectives
-from dew.training.evaluation import Summary
+from dew.scores import Summary
 
 pytestmark = pytest.mark.mesh
 

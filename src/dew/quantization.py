@@ -218,7 +218,7 @@ class Quantization:
 class QuantizedClass(Protocol):
     """A model class Qwix made for a `Quantization` (`_quantized`), which `_dew_quantization` names for the
     programs that run it (`dew.nn.kernels.options.compiler_options` reads its dtypes,
-    `dew.inference.projections` its rules); a wrapper's class over it inherits it."""
+    `dew.nn.projections` its rules); a wrapper's class over it inherits it."""
 
     _dew_quantization: ClassVar[Quantization]
 
@@ -1564,7 +1564,7 @@ def _serving_provider() -> type:
         def _recorded(self, op: str, weight) -> bool:
             """Whether `weight` is a stored quantized kernel that reaches `op` with no rule matching
             it, as an unpacked task's member does under a rule that names its packed group
-            (`dew.inference.projections.unpacked`): it multiplies by the recipe it records, its
+            (`dew.nn.projections.unpacked`): it multiplies by the recipe it records, its
             activation unquantized, where every rule leaves activations so; a rule that quantizes
             them records no recipe a member could take, which refuses."""
             if not isinstance(weight, Annotated) or self._matched(op):
@@ -1667,7 +1667,7 @@ class Annotated(Protocol):
 
 def split_columns(leaf, widths: Sequence[int], *, axis: int = -1) -> list:
     """`leaf` split into one leaf a member along `axis` by `widths`, a packed projection's kernel
-    taken back into its members' (`dew.inference.projections.unpacked`): a plain array, host or
+    taken back into its members' (`dew.nn.projections.unpacked`): a plain array, host or
     device, as `np.split` or `jnp.split` would; a Qwix QArray with its values split and each scale
     and zero point split as its own axis is, shared (one entry) kept whole by every member, per
     channel split at the same columns, per tile at the tiles' (a member that would cut a tile is

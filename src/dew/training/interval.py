@@ -29,7 +29,7 @@ from dew.data.dataset import rows_of
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32
 from dew.optim_schedules import learning_rate
-from dew.state import TrainState
+from dew.state import TokenCount, TrainState
 from dew.telemetry.instrumentation import (
     NO_FLOPS,
     StepFlops,
@@ -39,7 +39,7 @@ from dew.telemetry.instrumentation import (
 from dew.training.diloco import rated
 from dew.training.display import EXAMPLES_CONSUMED_SCALAR, TrainingDisplay
 from dew.training.inspection import Summaries, logged
-from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
+from dew.training.model_flops import TOKENS, TRAINING_FLOPS
 from dew.training.transaction import Committed
 
 # Consecutive non-finite losses that stop a run.
@@ -139,8 +139,8 @@ def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committe
     if committed is not None:
         norms, commits = norms + committed.norm.astype(dtype), commits + committed.count
     return Book(book.loss + loss.astype(dtype), bad_run, jnp.maximum(book.worst_bad_run, bad_run),
-                book.training + training, _TokenCount.add(book.tokens, tokens), norms, commits,
-                _TokenCount.add(book.scored, scored))
+                book.training + training, TokenCount.add(book.tokens, tokens), norms, commits,
+                TokenCount.add(book.scored, scored))
 
 
 @dataclasses.dataclass
@@ -304,8 +304,8 @@ class Interval:
         counted = [tokens for tokens in (self.logged_tokens, self.book.tokens if self.tokens_counted and
                                          self.book is not None else None) if tokens is not None]
         read, held = jax.device_get((counted, pending))
-        return (self.tokens_before_log + sum(_TokenCount.host(tokens) for tokens in read),
-                0 if held is None else _TokenCount.host(held))
+        return (self.tokens_before_log + sum(TokenCount.host(tokens) for tokens in read),
+                0 if held is None else TokenCount.host(held))
 
     def take(self, step: int, loss: jax.Array, aux: Mapping[str, jax.Array], accepted: jax.Array,
              copies: tuple[jax.Array | None, jax.Array | None],
@@ -406,7 +406,7 @@ def latest(sampled: tuple[jax.Array, Summaries], kept: tuple[jax.Array, Summarie
 
 @program
 def added_tokens(left: jax.Array, right: jax.Array) -> jax.Array:
-    return _TokenCount.add(left, right)
+    return TokenCount.add(left, right)
 
 
 @functools.partial(program, static_argnames="grouped")
@@ -544,14 +544,14 @@ def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int
                             waited=counts.waited, compiling=counts.compiling, training_flops=work,
                             update_flops=None if update_flops is None or read.committed is None
                             else update_flops * float(read.committed[1]),
-                            tokens=None if read.scored is None else _TokenCount.host(read.scored)),
-               **real_token_share(None if read.scored is None else _TokenCount.host(read.scored),
+                            tokens=None if read.scored is None else TokenCount.host(read.scored)),
+               **real_token_share(None if read.scored is None else TokenCount.host(read.scored),
                                   counts.computed)}
     if read.tokens is not None:
         # The tokens the interval's committed updates trained on, a token budget's count: an interval that
         # cuts an accumulation window holds a share of its commits' tokens that its steps did not read
         # alone, so the steps' rates read the tokens they scored (`throughput`).
-        scalars["train/committed_tokens"] = float(_TokenCount.host(read.tokens))
+        scalars["train/committed_tokens"] = float(TokenCount.host(read.tokens))
     scalars["train/accepted"] = float(read.accepted)
     if read.committed is not None:
         norms, commits = read.committed

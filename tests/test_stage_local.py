@@ -925,7 +925,7 @@ def test_a_generation_from_a_stage_local_state_packs_its_projections():
     """A generation from the state a stage-local fit holds packs the projections the same state with every
     layer whole packs (ledger 3490), cutting its store onto its layers inside its call, where it packed
     none."""
-    from dew.inference.projections import pending
+    from dew.nn.projections import pending
 
     model = decoder()
     run = trainer(model, ADAM_FAST, STAGED, 8)
