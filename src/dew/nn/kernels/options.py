@@ -32,6 +32,7 @@ from dew import algebra
 from dew._devices import xla_flag
 from dew.nn.kernels.generation import backend, gpu_target, traced_fact
 from dew.nn.nested import staged
+from dew.telemetry.benchmark import UNGRAPHED_FLAG, options_of
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -691,11 +692,11 @@ def _signature(leaf) -> Hashable:
     return type(leaf), np.shape(leaf), np.result_type(leaf)
 
 
-UNGRAPHED_OPTIONS: Mapping[str, Option] = {"xla_gpu_enable_command_buffer": ""}
-"""The XLA options of a program compiled without CUDA command buffers (`program`'s `step`): a timed one's,
-whose command buffers CUPTI does not read whole (`dew.telemetry.benchmark.Ungraphed`), and a server's
-admitting step's, whose fresh inputs update a command buffer before it can replay
-(`dew.inference.serving_kernel.decode_programs`)."""
+UNGRAPHED_OPTIONS: Mapping[str, Option] = options_of(UNGRAPHED_FLAG)
+"""The XLA options of a program compiled without CUDA command buffers (`program`'s `step`), as a process
+given `dew.telemetry.benchmark.UNGRAPHED_FLAG` runs: a timed one's, whose command buffers CUPTI does not read
+whole (`dew.telemetry.benchmark.Ungraphed`), and a server's admitting step's, whose fresh inputs update a
+command buffer before it can replay (`dew.inference.serving_kernel.decode_programs`)."""
 
 
 def program[**P, R](function: Callable[P, R], *models: Held,

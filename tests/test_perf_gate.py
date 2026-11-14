@@ -440,7 +440,8 @@ def test_one_tree_against_itself_under_a_setting_sets_it_in_the_heads_processes_
     _, rows = standing_in_environments(gate, monkeypatch)
     tree = locked_tree(tmp_path / "main")
     out = tmp_path / "gate.json"
-    off = "--xla_gpu_enable_command_buffer="
+    from dew.telemetry.benchmark import UNGRAPHED_FLAG as off
+
     args = SimpleNamespace(base=f"main={tree}", head=f"buffers-off={tree}", rounds=2,
                            only=["serve", "lm-dense", "reference"], claim=False, model="unused",
                            flowers="unused", torch_python="", out=str(out),
