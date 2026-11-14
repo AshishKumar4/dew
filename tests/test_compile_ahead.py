@@ -1241,7 +1241,7 @@ def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tm
     step compiles ahead for), takes the file, then refuses its step before it trains, and again on its next
     fit, rather than compiling its own (row 1915)."""
     from dew.nn.kernels.generation import assumed
-    from dew.training.ahead import AheadOfTime, BuildTarget, compile_ahead
+    from dew.training.ahead import AheadOfTime, BuildTarget, NotTheStepCompiledAhead, compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
 
@@ -1258,7 +1258,7 @@ def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tm
     # On the GPU it was compiled for, which a CPU is not, its program is what refuses it (train 332's review).
     with assumed(own.target):
         for _ in range(2):
-            with pytest.raises(ValueError):
+            with pytest.raises(NotTheStepCompiledAhead):
                 run.fit(batch, steps=1, log_every=1)
 
 

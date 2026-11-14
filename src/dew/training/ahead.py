@@ -270,6 +270,12 @@ def _wheel_targets_registered() -> None:
         importlib.import_module("dew_flash_attn")._registered()
 
 
+class NotTheStepCompiledAhead(ValueError):
+    """A run handed a step compiled ahead (`AheadOfTime`) lowers its step, or its sampled step, to another
+    program than the one compiled: another config, data shape, rung or Dew, which the executable would not
+    run as the run's step (`AheadOfTime.taken`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class AheadProgram:
     """A program compiled ahead beside a step (`AheadOfTime.sampled`): its executable (`Executable`) and the
@@ -289,8 +295,9 @@ class AheadProgram:
         where that is another program than this one, and admitted as a compiled one is
         (`dew.communicators.admit`)."""
         if program_digest(lowered) != self.program:
-            raise ValueError("the sampled step compiled ahead is another program than the one this run "
-                             "compiles: compile it ahead from this run's config, with its inspection")
+            raise NotTheStepCompiledAhead(
+                "the sampled step compiled ahead is another program than the one this run compiles: compile "
+                "it ahead from this run's config, with its inspection")
         return self.executable.loaded(devices)
 
 
@@ -479,10 +486,10 @@ class AheadOfTime:
         that is another program than the one compiled ahead, a config, a data shape, a rung or a Dew
         that differs, which the executable would not run as the run's step."""
         if program_digest(lowered) != self.program:
-            raise ValueError("the step compiled ahead is another program than the one this run compiles "
-                             "first: compile it ahead from this run's config and data "
-                             "(--trainer.compile-ahead), with this Dew, and no plan recorded for another "
-                             "rung")
+            raise NotTheStepCompiledAhead(
+                "the step compiled ahead is another program than the one this run compiles first: compile it "
+                "ahead from this run's config and data (--trainer.compile-ahead), with this Dew, and no plan "
+                "recorded for another rung")
         return self.loaded()
 
 
