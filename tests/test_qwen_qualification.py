@@ -14,9 +14,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import parameter_loss
+from model_support import parameter_loss, stepped_outputs
+from reference_error import as_given
 
-from dew.batch import coordinates
+from dew.batch import coordinates, flat_field, prefix_sum, real_slots, token_positions
 from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -312,31 +313,126 @@ def test_shipped_prediction_weights_match_published_composition(source):
                         truth_fn=truth)
 
 
+MTP_CACHE_SEEDS = {"qwen38-dense-tiny": 64, "qwen38-moe-tiny": 64}
+"""Each family's cached prediction steps' declared check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def depth_draw(loaded):
+    """Check 1's draw for a source's prediction depth over Dew's own trunk: a draw of its encoding
+    (`encoded_draw`) and the depth's inputs as the trunk gives them in float32, its final states and the
+    embeddings it sows (media in place), which a prefill hands the depth; the tokens; which slots are real;
+    and each token's positions, its rotary positions where the source lays them out, else its rank among its
+    row's real tokens, as the trunk counts them."""
+    names = tuple(encoded_fields(loaded))
+    encoded = encoded_draw(loaded)
+
+    @jax.jit
+    def trunk(variables, inputs):
+        hidden, sown = loaded.model.apply(variables, inputs.tokens, method="hidden_states",
+                                          mutable=["embeddings"], **inputs.kwargs())
+        return hidden, jax.tree.leaves(sown["embeddings"])[0]
+
+    def draw(seed):
+        # The source's processor arranges the drawn encoding as the model's inputs, on the host.
+        inputs = loaded.processor.from_hf(dict(zip(names, encoded(seed), strict=True)))
+        hidden, embeddings = trunk(loaded.variables, inputs)
+        real = np.asarray(real_slots(inputs.token_fields, inputs.tokens.shape))
+        rotary = flat_field(inputs.token_fields, "rotary_positions")
+        given = token_positions(inputs.token_fields)
+        positions = (rotary if rotary is not None else given if given is not None
+                     else prefix_sum(jnp.asarray(real), dtype=jnp.int32) - 1)
+        return (np.asarray(hidden), np.asarray(inputs.tokens), np.asarray(embeddings), real,
+                np.asarray(positions))
+    return draw
+
+
+def laid(real, positions) -> dict:
+    """A depth call's layout of tokens `real` at `positions`, as a decode's draft lays a step out: rotary
+    positions (`[B, S, 3]`) under their own name, else one-axis positions in the tokens' coordinates."""
+    rotary = positions.ndim == 3
+    return {"coordinates": coordinates(real.shape, valid=real, positions=None if rotary else positions),
+            "rotary_positions": positions if rotary else None}
+
+
+def prepared_depths(module, hidden, tokens, **options):
+    """The first prediction depth's logits over its prepared inputs (`CausalTransformer.mtp_logits`'s
+    `input_embeddings`), through the decoder holding it, a wrapper's (`DecoderWrapper.wraps`), as a
+    wrapper's `mtp_step` hands them on."""
+    from dew.nn.wrapping import DecoderWrapper
+
+    decoder = getattr(module, module.wraps) if isinstance(module, DecoderWrapper) else module
+    return decoder.mtp_logits(hidden, tokens, **options)[0]
+
+
+def cached_steps(loaded, admitted: np.ndarray):
+    """The depth's cached steps over a draw (`depth_draw`), a token at a time over the depth's own cache
+    (`init_mtp_cache`, `mtp_step`), as a decode drafts: each a token's final state with the next token's
+    embedding at the next token's positions, valid where both tokens are real; their logits at the pairs
+    `admitted`."""
+    @jax.jit
+    def step(variables, cache, hidden, tokens, embeddings, valid, positions):
+        (logits, _), updated = loaded.model.apply(
+            {**variables, **cache}, hidden, tokens, input_embeddings=embeddings, decode=True,
+            method="mtp_step", mutable=["cache"], **laid(valid, positions))
+        return logits, updated
+
+    @as_given
+    def stepped(hidden, tokens, embeddings, real, positions):
+        cache = loaded.model.apply(loaded.variables, len(tokens), method="init_mtp_cache",
+                                   mutable=["cache"])[1]
+        pairs = real[:, :-1] & real[:, 1:]
+        found = []
+        for index in range(tokens.shape[1] - 1):
+            following = slice(index + 1, index + 2)
+            logits, cache = step(loaded.variables, cache, hidden[:, index:index + 1], tokens[:, following],
+                                 embeddings[:, following], pairs[:, index:index + 1], positions[:, following])
+            found.append(np.asarray(logits))
+        return np.concatenate(found, axis=1)[admitted]
+    return stepped
+
+
+def uncached_steps(loaded, admitted: np.ndarray):
+    """The depth's logits over a draw at the widths its cached steps compute them (`stepped_outputs`):
+    each step's from its uncached forward (`prepared_depths`) over the pairs up to it, at the pairs
+    `admitted`."""
+    @jax.jit
+    def depths(hidden, tokens, embeddings, real, positions):
+        return loaded.model.apply(loaded.variables, hidden, tokens, method=prepared_depths,
+                                  input_embeddings=embeddings, **laid(real, positions))
+
+    @as_given
+    def stepped(hidden, tokens, embeddings, real, positions):
+        def forward(pairs: int) -> jax.Array:
+            # The first `pairs` pairs' logits, a forward over one token more.
+            end = pairs + 1
+            return depths(hidden[:, :end], tokens[:, :end], embeddings[:, :end], real[:, :end],
+                          positions[:, :end])
+        return np.asarray(stepped_outputs(forward, tokens.shape[1] - 1, 1))[admitted]
+    return stepped
+
+
 def test_prediction_cache_matches_reference_candidate_steps(source):
-    """Independent cached MTP max errors 4.77e-7 dense / 4.18e-7 MoE."""
-    loaded, inputs, _ = source
-    reference = np.load(loaded.source / "mtp_reference.npz")
-    positions = reference["positions"][..., 1:]
-    rotary = np.moveaxis(positions, 0, -1) if positions.ndim == 3 else None
-    state = loaded.model.apply(loaded.variables, inputs.tokens.shape[0],
-                                method=loaded.model.init_mtp_cache, mutable=["cache"])[1]
-    chunks = []
-    for index in range(inputs.tokens.shape[1] - 1):
-        valid = jnp.asarray(reference["valid"][:, index:index + 1])
-        options = {"input_embeddings": jnp.asarray(reference["embeddings"][:, index + 1:index + 2])}
-        # The step's layout laid out once (`Coordinates`): its validity, and one-axis positions where given.
-        options["coordinates"] = coordinates(valid.shape, valid=valid, positions=None if rotary is not None
-                                             else jnp.asarray(positions[:, index:index + 1]))
-        if rotary is not None:
-            options["rotary_positions"] = jnp.asarray(rotary[:, index:index + 1])
-        (logits, _), state = loaded.model.apply(
-            {**loaded.variables, **state}, jnp.asarray(reference["hidden"][:, index:index + 1]),
-            inputs.tokens[:, index + 1:index + 2], decode=True,
-            method=loaded.model.mtp_step, mutable=["cache"], **options)
-        chunks.append(np.asarray(logits))
-    result = np.concatenate(chunks, axis=1)
-    valid = reference["valid"]
-    np.testing.assert_allclose(result[valid], reference["logits"][valid], atol=1e-4, rtol=0)
+    """The prediction depth's cached steps, a token at a time over its own cache (`cached_steps`), over
+    draws of its inputs from Dew's own trunk (`depth_draw`: drawn tokens and pixels in the source's
+    encoding, its padding and media slots as recorded) on par with its uncached forward at the widths each
+    step computes (`uncached_steps`), from its float64 twin's uncached forward (check 1, ledger 3912)."""
+    from arm_arithmetic import float64_held
+    from model_support import float64_twin
+    from reference_error import assert_as_exact
+
+    loaded, _, _ = source
+    real = encoded_fields(loaded)["attention_mask"] > 0
+    admitted = real[:, :-1] & real[:, 1:]
+    wide, held = float64_twin(loaded.model), float64_held(loaded.variables)
+
+    @jax.jit
+    def truth(hidden, tokens, embeddings, real, positions):
+        return jnp.asarray(wide.apply(held, hidden, tokens, method=prepared_depths,
+                                      input_embeddings=embeddings, **laid(real, positions)))[admitted]
+
+    assert_as_exact(cached_steps(loaded, admitted), uncached_steps(loaded, admitted), depth_draw(loaded),
+                    f"{loaded.source.name} cached prediction steps",
+                    seeds=MTP_CACHE_SEEDS[loaded.source.name], truth_fn=truth)
 
 
 def test_prediction_loss_respects_padding_and_exports_trained_depth(source, tmp_path):
