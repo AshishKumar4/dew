@@ -54,13 +54,14 @@ def quantized_codes(values, quantized: str) -> tuple[jax.Array, jax.Array]:
     would not be a normal float32."""
     # At the values' width, fp32 at least (a float64 truth's float64); the scale is the float32 a cache
     # stores (its quotient rounded once to fp32, as IEEE fp32 division rounds it, whatever the backend's own
-    # division does: `dew.nn.precision.divided`), each code its rounding.
+    # division does: `dew.nn.precision.divided`), each code the rounding of the value times the scale's
+    # reciprocal, that reciprocal IEEE division's too.
     width = jnp.promote_types(values.dtype, jnp.float32)
     wide = values.astype(width)
     limit = 127.0 if quantized == "int8" else float(jnp.finfo(jnp.float8_e4m3fn).max)
     scaled_amax = divided(jnp.max(jnp.abs(wide), axis=-1), jnp.asarray(limit, width)).astype(jnp.float32)
     scale = jnp.where(scaled_amax >= jnp.finfo(jnp.float32).tiny, scaled_amax, jnp.float32(1))
-    scaled = divided(wide, scale[..., None].astype(width))
+    scaled = wide * divided(jnp.ones((), width), scale.astype(width))[..., None]
     codes = (jnp.clip(jnp.rint(scaled), -127, 127).astype(jnp.int8) if quantized == "int8"
              else scaled.astype(jnp.float8_e4m3fn))
     return codes, scale

@@ -254,17 +254,21 @@ def quantize(values: jax.Array, dtype: KVDtype) -> tuple[jax.Array, jax.Array]:
     divides to codes no dequantize recovers, or flushes to zero where the
     device flushes subnormals.
 
-    The format's scale is a float32 and its codes round a float32 quotient: each computed at the values'
-    width (float32 for 16-bit ones, a float64 model's in float64) and rounded to float32 as the format
-    states, each quotient IEEE division's on every backend (`divided`): XLA takes a division by the
-    format's largest value as a product by its rounded reciprocal, a scale an ulp off the format's on a
-    CPU and an H100 alike, and a GPU's own division of the values by their scale is approximate.
+    The format's scale is a float32, the absmax over the format's largest value as IEEE division rounds it
+    on every backend (`divided`): XLA takes a division by that constant as a product by its rounded
+    reciprocal, a scale an ulp off the format's on a CPU and an H100 alike (row 6296). Each code is the
+    format's rounding of the value times the scale's reciprocal, itself IEEE division's: one rounded
+    product a value, the same on every backend and as cheap as the division XLA would make of it, where
+    an IEEE quotient a value cost a prefill's rounding four times its device time on an H100. Each is
+    computed at the values' width (float32 for 16-bit ones, a float64 model's in float64) and rounded to
+    float32, a float32 run's own bit for bit.
     """
     wide = values.astype(jnp.promote_types(values.dtype, jnp.float32))
     amax = jnp.max(jnp.abs(wide), axis=-1)
     scaled_amax = divided(amax, jnp.asarray(_LIMITS[dtype], amax.dtype)).astype(jnp.float32)
     scale = jnp.where(scaled_amax >= jnp.finfo(jnp.float32).tiny, scaled_amax, 1.0)
-    scaled = divided(wide, scale[..., None].astype(wide.dtype)).astype(jnp.float32)
+    inverse = divided(jnp.ones((), wide.dtype), scale.astype(wide.dtype))
+    scaled = (wide * inverse[..., None]).astype(jnp.float32)
     if dtype == "int8":
         return jnp.clip(jnp.rint(scaled), -127, 127).astype(jnp.int8), scale
     return scaled.astype(jnp.dtype(dtype)), scale

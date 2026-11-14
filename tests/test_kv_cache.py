@@ -277,16 +277,18 @@ def greedy(layout):
 def test_a_quantized_caches_scales_and_codes_are_its_formats_quotients(quantized):
     """A quantized cache's rounding of a token's vector, as a step compiles it: its scale the float32 the
     format states, the vector's absmax over the format's largest value correctly rounded, and each code the
-    format's rounding of the value over that scale, a quotient correctly rounded too: NumPy's IEEE quotients
-    of the same values, bit for bit, over a million vectors, where XLA's own division by the largest value,
-    a product by its rounded reciprocal, set an ulp-low scale on a 20th of them (a GH200's served cache held
-    such scales, row 6296)."""
+    format's rounding of the value times the scale's correctly rounded reciprocal, one rounded product:
+    NumPy's IEEE arithmetic on the same values, bit for bit, over a million vectors, where XLA's own
+    division by the largest value, a product by its rounded reciprocal, set an ulp-low scale on a 20th of
+    them (a GH200's served cache held such scales, row 6296)."""
     values = np.random.default_rng(6296).normal(0.0, 1.0, (1 << 20, 8)).astype(np.float32)
     codes, scales = jax.jit(lambda held: quantize(held, quantized))(values)
     limit = 127.0 if quantized == "int8" else 448.0
     expected = (np.max(np.abs(values.astype(np.float64)), axis=-1) / limit).astype(np.float32)
     np.testing.assert_array_equal(np.asarray(scales), expected)
-    quotients = (values.astype(np.float64) / expected[:, None].astype(np.float64)).astype(np.float32)
+    # A float32 product of two float32s is exact in float64, so its one rounding to float32 is IEEE's.
+    inverse = (1.0 / expected.astype(np.float64)).astype(np.float32)
+    quotients = (values.astype(np.float64) * inverse[:, None].astype(np.float64)).astype(np.float32)
     rounded = (np.clip(np.rint(quotients), -127, 127).astype(np.int8) if quantized == "int8"
                else quotients.astype(jnp.float8_e4m3fn))
     np.testing.assert_array_equal(np.asarray(codes).view(np.uint8), np.asarray(rounded).view(np.uint8))
