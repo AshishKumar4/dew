@@ -21,10 +21,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental import io_callback
-from quantized_basis import quantized_codes
 
 from dew.nn import kv_cache
 from dew.nn.kv_cache import KVStore
+
+ROUNDING = kv_cache.quantize
+"""The cache's rounding as the module defines it, held before any `traced` block patches the module's name."""
 
 _COLLECTING: list["Written"] = []
 """The `collected` blocks open on the host, innermost last, which a running rounding reports to."""
@@ -146,11 +148,12 @@ def traced(decided: dict | None = None):
         yield
 
 
-def rounds(quantized: str):
+def rounds(quantized: kv_cache.KVDtype):
     """A served quantized cache's `Followed.rounds`: each value its judged leaves `rounded/<name>` hold,
-    rounded as the `quantized` format rounds it (`quantized_basis.quantized_codes`), which the decisions an
-    arm's cache made (`<name>`, codes and scales) must equal."""
+    rounded as the `quantized` format rounds it (`ROUNDING`, the cache's own, which tests/test_kv_cache.py
+    holds to NumPy's IEEE arithmetic), which the decisions an arm's cache made (`<name>`, codes and scales)
+    must equal."""
     def rounded(judged: dict) -> dict:
-        return {name.removeprefix("rounded/"): quantized_codes(values, quantized)
+        return {name.removeprefix("rounded/"): ROUNDING(values, quantized)
                 for name, values in judged.items() if name.startswith("rounded/")}
     return rounded
