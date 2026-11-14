@@ -107,7 +107,7 @@ def test_a_settings_value_holds_its_mappings_in_order_and_none_for_a_function():
 
 
 @pytest.mark.mesh(devices=4)
-def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced(monkeypatch):
+def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
     """A trainer whose mesh splits the sequence fits again in the same process without tracing its step
     again: its key holds the links' measured figures (`dew.nn.sharding.trace_context`) and not the links
     its last compile decided, which keyed every refit on a tensor- or sequence-split mesh apart from the
@@ -119,14 +119,6 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced(mo
     from dew.optim import OptimConfig
     from dew.training import MeshSpec, Trainer
 
-    traced = []
-    original = candidates._candidate
-
-    def counted(*arguments, **options):
-        traced.append(1)
-        return original(*arguments, **options)
-
-    monkeypatch.setattr(candidates, "_candidate", counted)
     # The optimizer stated as a config, which keys the step.
     optimizer = OptimConfig(optimizer="adam", learning_rate=1e-2)
     trainer = Trainer(LMObjective(tiny(max_seq_len=16), 16), optimizer, key=jax.random.key(0),
@@ -139,8 +131,9 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced(mo
         return dict(trainer.links)
 
     first = fit()
-    once = len(traced)
+    # The steps this process keeps for a refit to read (`candidate_for`): the refit keeps none of its own.
+    kept = len(candidates._CANDIDATES)
     again = fit()
-    assert once and len(traced) == once
+    assert kept and len(candidates._CANDIDATES) == kept
     assert {axis: link.spread for axis, link in again.items()} == {
         axis: link.spread for axis, link in first.items()}
