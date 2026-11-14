@@ -207,6 +207,63 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     return state, losses, trainer
 
 
+def test_a_phase_planned_afresh_builds_its_window_over_the_outgoing_one():
+    """At an update's end, a phase of other passes planned afresh holds its state as a fresh one does
+    (`freshly_held`): the narrow copies the outgoing step made are released, their buffers deleted, so the
+    devices hold none of them while the new step is planned. Its empty window it keeps, and the step of
+    another split builds its own over it (`laid_out`, `Trainer._window_of`): each of its leaves of a new
+    leaf's shape donated, the new window's buffer the old one's, so none of them is allocated beside it. A
+    Qwen3.5-4B's third phase on a GH200, its window built afresh beside the old one's 16.7 GiB, was refused
+    8.26 GiB short of one block with 53.6 GiB free in all (M-MC-3q)."""
+    from dew.state import taken
+    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training.compiler import freshly_held
+
+    device = MeshSpec().build(jax.devices()[:1])
+    state, _, trainer = _trained(optax.sgd(0.5), copies=True, split=2, rows=16, mesh=device)
+    copies = jax.tree.leaves(state.compute)
+    assert copies and state.window is not None
+    fresh = freshly_held(state)
+    assert fresh.compute is None and all(leaf.is_deleted() for leaf in copies)
+    assert fresh.window is state.window
+    donor = jax.tree.leaves(fresh.window)
+    gradient = {(leaf.shape, leaf.dtype) for leaf in jax.tree.leaves(fresh.window.gradient)}
+    shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), fresh.window)
+    assert gradient
+    finer = Trainer(trainer.objective, optax.sgd(0.5), key=jax.random.key(0), mesh=device,
+                    layout=Layout(min_shard=1, tolerance=1.0), split=4)
+    batch = _decoder(rows=16)[1]
+    stepped, *_ = finer.compile(fresh, batch)(fresh, batch)
+    assert int(stepped.window_size) == 4
+    # Every leaf of the outgoing window went to the new one's build, donated, or was let go; the leaves the
+    # new window allocated afresh are its split-sized parts alone, none of the gradient's shapes.
+    assert all(leaf.is_deleted() for leaf in donor)
+    built, _ = taken(shapes, stepped.window)
+    assert not any((leaf.shape, leaf.dtype) in gradient for leaf in built)
+
+
+def test_a_phase_planned_afresh_is_planned_at_its_own_split_past_the_window_it_holds():
+    """The empty window a phase planned afresh holds binds no split (`StepCompiler.afresh`,
+    `resumed_stepping`): a run that leaves its split to the planner plans the new phase's step at its own,
+    one microbatch where the batch fits whole, and lets the outgoing split-2 window go, where the window
+    bound it to two (a Qwen3.5-4B's third phase on a GH200 searched 2 x 2 alone and was refused, M-MC-3u)."""
+    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training.compiler import freshly_held
+
+    device = MeshSpec().build(jax.devices()[:1])
+    state, _, trainer = _trained(optax.sgd(0.5), copies=True, split=2, rows=16, mesh=device)
+    assert int(state.window_size) == 2
+    fresh = freshly_held(state)
+    donor = jax.tree.leaves(fresh.window)
+    planner = Trainer(trainer.objective, optax.sgd(0.5), key=jax.random.key(0), mesh=device,
+                      layout=Layout(min_shard=1, tolerance=1.0))
+    planner._compiler.afresh = True  # as the boundary sets it (`Trainer._compiled_for`)
+    batch = _decoder(rows=16)[1]
+    stepped, *_ = planner.compile(fresh, batch)(fresh, batch)
+    assert planner.plan["split"] == 1 and stepped.window is None
+    assert all(leaf.is_deleted() for leaf in donor)
+
+
 def _on_par_with_the_plain_update(optimizer, label: str, **options):
     """`_trained`'s run through copies on par with the same run without them, its parameters, optimizer
     state (the last gradient, `_keeping_gradients`) and losses, over the starts and batches the seeds draw

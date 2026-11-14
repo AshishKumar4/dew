@@ -7,7 +7,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import logging
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
@@ -23,7 +23,7 @@ from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective
-from dew.state import TrainState, apart, occupied, together
+from dew.state import Accumulation, TrainState, apart, occupied, together
 from dew.telemetry.instrumentation import StepFlops
 from dew.training._candidates import Stepping, candidate_for, lowered_for
 from dew.training._lowering import Lowered, routed
@@ -64,16 +64,38 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 
-def laid_out(state: TrainState, window: int) -> TrainState:
-    """`state` laid out for a step of `window` microbatches an update: as it is where its window holds that
-    many, else, at an update's end, its empty window let go (a commit cleared it but for its gradient sum,
-    which the next window's first microbatch replaces unread) for the step to lay out its own
-    (`builds_window`), its count of accepted microbatches read in the new window's (`microstep`, whose
-    windows and steps the transaction counts by it: the same updates and steps). A state inside an update
-    is refused another window: its open window is laid out for the one it pools (`occupancy`)."""
+def freshly_held(state: TrainState) -> TrainState:
+    """`state` as a fresh state holds it at an update's end (a phase of other passes planned afresh,
+    `dew.training.trainer.Trainer._compiled_for`): the narrow copies another program's step made
+    (`TrainState.compute`, made again from the variables, a pure function of them) released, their buffers
+    deleted, for the run holds the state it hands over until the new step returns: only dropped, they stayed
+    on the devices while the new step was planned (5.3 GiB of a Qwen3.5-4B's on a GH200, M-MC-3k). Its empty
+    window it keeps: the new step's window is built over it, its buffers donated (`laid_out`), so the plan
+    counts none of the window built beside the step but its leaves of other shapes (`taken`), where building
+    one afresh beside the old one's 16.7 GiB refused the run's third phase (M-MC-3q)."""
+    released([state.compute])
+    return dataclasses.replace(state, compute=None)
+
+
+def released(trees: Sequence) -> None:
+    """Delete every buffer of `trees`, which nothing reads again: what a step lets go of before the next is
+    planned or built, so the devices hold none of it beside what replaces it."""
+    for leaf in jax.tree.leaves(trees):
+        leaf.delete()
+
+
+def laid_out(state: TrainState, window: int) -> tuple[TrainState, Accumulation | None]:
+    """`state` laid out for a step of `window` microbatches an update, and the window it let go: as it is
+    where its window holds that many, else, at an update's end, its empty window let go (a commit cleared
+    it but for its gradient sum, which the next window's first microbatch replaces unread) for the step to
+    lay out its own over it (`builds_window`, `window_of`: each leaf of its shape and dtype donated to the new
+    window's, `taken`, the rest released), its count of accepted microbatches read in the new window's
+    (`microstep`, whose windows and steps the transaction counts by it: the same updates and steps). A state
+    inside an update is refused another window: its open window is laid out for the one it pools
+    (`occupancy`)."""
     size = int(state.window_size)
     if size == window:
-        return state
+        return state, None
     if occupied(state.window):
         raise ValueError(f"the state pools an open window of {size} microbatches, and the step it is handed "
                          f"to reads {window} an update: a step of another split begins at an update's end")
@@ -83,7 +105,7 @@ def laid_out(state: TrainState, window: int) -> TrainState:
     return dataclasses.replace(
         state, accumulation=None,
         microstep=jax.device_put(np.asarray(microstep, state.microstep.dtype), state.microstep.sharding),
-        window_size=jax.device_put(np.int32(window), state.window_size.sharding))
+        window_size=jax.device_put(np.int32(window), state.window_size.sharding)), state.window
 
 
 def admitted_placed(planned: Planned, mesh: Mesh) -> tuple[bool, int | None]:
@@ -139,19 +161,20 @@ class Compiled:
 
 
 def resumed_stepping[L, E](stepping: Stepping[L, E], window_size: int, *, held: bool, pools: bool,
-                           replicas: bool) -> Stepping[L, E]:
+                           replicas: bool, afresh: bool = False) -> Stepping[L, E]:
     """`stepping` at the split a state of `window_size` microbatches an update steps at: a state that pools
     a window part filled (`pools`), or DiLoCo's `replicas` once they have stepped, each counting their
     microbatches in their split's windows, which no other split reads, bind it, a stated other refused; a
     state that holds an empty window (`held`), or was laid out at more than one microbatch, takes it unless
-    the run states another, the step it is handed then laying its own window out (`laid_out`). A run's
+    the run states another or its step is planned `afresh` (a phase of other passes at an update's end,
+    `StepCompiler.afresh`), the step it is handed then laying its own window out over it (`laid_out`). A run's
     compile and a resume's step compiled ahead (`dew.training.ahead.compile_ahead`) both read it."""
     accumulation = stepping.settings.accumulation
     split, unaligned = divmod(window_size, accumulation)
     if unaligned or ((pools or replicas) and stepping.shape.split not in (None, split)):
         raise ValueError(f"the state pools windows of {window_size} microbatches, and this run updates "
                          f"every {accumulation} steps of {stepping.shape.split} microbatches")
-    if pools or replicas or ((held or split > 1) and stepping.shape.split is None):
+    if pools or replicas or (not afresh and (held or split > 1) and stepping.shape.split is None):
         return dataclasses.replace(stepping, shape=dataclasses.replace(stepping.shape, split=split))
     return stepping
 
@@ -185,6 +208,10 @@ class StepCompiler[L, E]:
         # A fresh run's first step planned over its state's shapes before the state is placed
         # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.
         self._unplaced: Unplaced | None = None
+        # Whether the next compile plans a phase afresh at an update's end
+        # (`dew.training.trainer.Trainer._compiled_for`): the empty window its state holds binds no split
+        # (`resumed_stepping`), the new step's window built over it.
+        self.afresh = False
         # The executables a search before the state was placed compiled where it held no plan
         # (`planned_unplaced`), which the run's first compile's search takes in place of compiling them again.
         self._executables: dict | None = None
@@ -316,7 +343,7 @@ class StepCompiler[L, E]:
         transaction pooling `split` x `accumulation`. Batches split as the first plan or the pooling
         state's window holds, a state saved between updates at the split it was saved at unless the run
         states another; later shapes climb the ladder alone, but for a phase of other passes beginning at
-        an update's end, which its trainer plans afresh (`Trainer._unpooled`). No admitted plan compiles
+        an update's end, which its trainer plans afresh (`Trainer._planned_afresh`). No admitted plan compiles
         or times optional alternatives, even with `trials`: speed selection is offline. Where JAX's AutoPGLE
         is on (`jax_enable_pgle`), the plan admitted runs its first runs on a trial, `trials`' or, where
         none are given, a copy of the state beside it, refused where the devices hold no room for it
@@ -334,8 +361,10 @@ class StepCompiler[L, E]:
         # its split, binds it. Read on the host: a reduction on the devices compiles a program of the
         # occupancy's placement, a restored one's another than a fresh one's, which a resume compiles anew.
         pools = bool(occupied(state.window))
+        afresh, self.afresh = self.afresh, False
         stepping = resumed_stepping(stepping, int(state.window_size), held=state.window is not None,
-                                    pools=pools, replicas=state.inner is not None and int(state.step) > 0)
+                                    pools=pools, replicas=state.inner is not None and int(state.step) > 0,
+                                    afresh=afresh)
         if (state.scale is not None) != settings.dynamic_scale:
             raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")
         if settings.host_master:
@@ -450,30 +479,37 @@ class StepCompiler[L, E]:
             # A sampled step summarizes what the run inspects (`Planned.sampled`); every other, the plan's.
             executable = planned.sampled.executable if sampled and planned.sampled is not None else (
                 planned.executable)
+            donor = None
             if current.inner is None and current.window_size is not returned[0]:
-                current = laid_out(current, window)
+                current, donor = laid_out(current, window)
             with stepping.traced_on(mesh):
                 # Each program plans its copies (`at_base_rung`), and a step reads the state with its own: a
                 # state another program's step left holds that program's (a phase of other passes, row
                 # 5560), which are made again from its variables, a pure function of them.
                 if not candidate.copies:
+                    # Copies the step reads none of, let go with their buffers: the state the run holds
+                    # would keep them through the step's first call.
+                    released([current.compute])
                     current = dataclasses.replace(current, compute=None)
                 elif not holds_copies(current.compute, candidate.copies):
                     # The copies another program planned, which the step consumes with the state, are let go
                     # before its own are made: the plan's fit counts its own alone (`_candidates`).
-                    if current.compute is not None:
-                        jax.tree.map(lambda leaf: leaf.delete(), current.compute)
+                    released([current.compute])
                     # A run handed a step compiled ahead runs the program compiled with it: `fit` runs its
                     # steps within the hand (`Trainer._taking`).
                     copies = narrowing(candidate.copies, self.objective.towers(), candidate.shardings.compute)
                     current = dataclasses.replace(current, compute=copies(current.variables))
                 if stepping.builds_window(current, candidate, window):
-                    # The window, and with it the split, is the state's from here on.
-                    current = dataclasses.replace(stepping.window_of(current, candidate, window),
+                    # The window, and with it the split, is the state's from here on, built over the one it
+                    # replaces (a window laid out for another split, or a ramp's stage's of other shapes).
+                    current = dataclasses.replace(stepping.window_of(current, candidate, window, donor),
                                                   window_size=jax.device_put(np.int32(window)))
                     # The moving state alone: the frozen tree stays the arrays the run holds.
                     moving, frozen = apart(current)
                     current = together(jax.device_put(moving, apart(candidate.shardings)[0]), frozen)
+                elif donor is not None:
+                    # A step that keeps no window (one microbatch an update) lets the one it was handed go.
+                    released([donor])
                 outputs = []
                 moving, frozen = apart(current)
                 for part in parts:
@@ -525,8 +561,7 @@ class StepCompiler[L, E]:
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self.ahead,
             derive=None if recorded is not None else functools.partial(lower, lowering=False, floored=True),
-            split_stated=stepping.shape.split is not None, unplaced=unplaced,
-            compiled={} if executables is None else executables)
+            unplaced=unplaced, compiled={} if executables is None else executables)
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         above = search.above(candidates, planned.split) if frontier else None
