@@ -315,7 +315,22 @@ class Placing(Protocol):
     def __hash__(self) -> int: ...
 
 
-_PLACING: contextvars.ContextVar[Placing | None] = contextvars.ContextVar('placing', default=None)
+@dataclasses.dataclass(frozen=True)
+class Forward:
+    """The placement a forward-only trace's projections take their weights by (`Placing`): each whole,
+    gathered by the partitioner from wherever it lies as the map begins. A served or scored model
+    (`dew.inference`) traces under it (`FORWARD`): no gradient leaves its map, so where a weight came from
+    needs no reduce-scatter back to it, and no stored tree's path is read (a scanned stack's view, a
+    component applied to its own part, each sees other paths than the tree a loader placed)."""
+
+    def leaf_spec(self, mesh, path, value) -> jax.sharding.PartitionSpec:
+        """Every weight whole."""
+        del mesh, path, value
+        return jax.sharding.PartitionSpec()
+
+
+FORWARD = Forward()
+"""The one forward-only placement (`Forward`)."""
 
 
 @contextlib.contextmanager
@@ -325,17 +340,15 @@ def placing(layout: Placing | None) -> Iterator[None]:
     where the layout places it; None, as outside a trainer's trace, none: such a projection stays with the
     partitioner (a reference arm traced inside a step opts out so). The trainer's step and its evaluations
     trace under it (`Trainer._traced_on`, `Evaluator.scoring`); a program cached by what it traced under
-    keys on it (`trace_context`)."""
-    token = _PLACING.set(layout)
-    try:
+    keys on it (`trace_context`), and a call's identity states it (`dew._cache.PLACING`, a JAX user
+    context)."""
+    with _cache.PLACING(new_value=layout):
         yield
-    finally:
-        _PLACING.reset(token)
 
 
 def placed_layout() -> Placing | None:
     """The layout traced under (`placing`), None outside one."""
-    return _PLACING.get()
+    return _cache.PLACING.value
 
 
 def spread_axes() -> tuple[str, ...]:
@@ -360,7 +373,7 @@ def trace_context() -> tuple:
     schedule = _SCHEDULE.get()
     links = tuple(sorted((axis, link.bytes_per_second, link.flops_per_second)
                          for axis, link in _LINKS.get().items()))
-    return (None if schedule is None else schedule.count, axis_rules(), links, _PLACING.get())
+    return (None if schedule is None else schedule.count, axis_rules(), links, _cache.PLACING.value)
 
 
 def _spreads(axis: str, x: jax.Array, latent: int, tokens: float, *, padding: float = 0.0) -> bool:
