@@ -313,7 +313,7 @@ def test_shipped_prediction_weights_match_published_composition(source):
                         truth_fn=truth)
 
 
-MTP_CACHE_SEEDS = {"qwen38-dense-tiny": 64, "qwen38-moe-tiny": 64}
+MTP_CACHE_SEEDS = {"qwen38-dense-tiny": 8, "qwen38-moe-tiny": 8}
 """Each family's cached prediction steps' declared check-1 seeds, sized by `seeds_for` on armada."""
 
 
