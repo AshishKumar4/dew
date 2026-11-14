@@ -30,7 +30,7 @@ from dew.nn.kernels.generation import assumed, gpu_mesh
 from dew.nn.kernels.options import owned_program, trace_context
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link, Schedule
-from dew.state import TrainState, apart, together
+from dew.state import Accumulation, TrainState, apart, taken, together
 from dew.training import staging
 from dew.training._lowering import KernelReport, Routed, kernel_report, routed
 from dew.training.diloco import group_of, windowed
@@ -142,7 +142,7 @@ class Stepping[LossT, EffectsT]:
     shape: RunShape
     validation: Callable[[TrainState], Validation]
     builds_window: Callable[[TrainState, Candidate, int], bool]
-    window_of: Callable[[TrainState, Candidate, int], TrainState]
+    window_of: Callable[[TrainState, Candidate, int, Accumulation | None], TrainState]
 
 
 KEPT_CANDIDATES = 4
@@ -267,14 +267,13 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
     prepared = placed_shapes(prepared, shardings)
     # The check reads the state's arguments as already on the devices. The copies and accumulators
     # `run` builds on the first call are not yet, so they count with the prefetched batches beside
-    # the step, a ramp stage's window too, which `run` builds beside the last, already resident.
-    last = state.window
-    rebuilt = last is not None and not last.replays(prepared.window)
+    # the step: a window it builds over the one the state holds (a split's other than the state's, a ramp
+    # stage's of other shapes) donates that one's leaves of its shapes, and builds the rest (`taken`).
+    fresh = [] if prepared.window is None else taken(state.window, prepared.window)[0]
     # A step lowered for other devices is checked against none of this process's.
     # The copies the runner makes where the state holds another program's, or none (`holds_copies`).
     made = [] if prepared.compute is None or holds_copies(state.compute, copies) else [prepared.compute]
-    built = 0 if mesh is not None else placed_bytes(
-        [*made, *([prepared.window] if prepared.window is not None and (last is None or rebuilt) else [])])
+    built = 0 if mesh is not None else placed_bytes([*made, *fresh])
     held = 0 if mesh is not None else prefetched_bytes(batch, placement, stepping.shape.prefetch) + built
     jitted = step_program(stepping, shapes, copies, shardings, placement, replicated, split)
     part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)

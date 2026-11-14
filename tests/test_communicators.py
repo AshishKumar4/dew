@@ -177,14 +177,14 @@ def test_a_programs_code_is_held_to_what_is_free_beside_its_new_communicators():
     every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
     pair = Collectives(groups=frozenset({(0, 1)}))
     resident = communicators.Resident()
-    step = communicators.Loaded(b"step", (0, 1, 2, 3), GIB)
+    step = communicators.Loaded((0, 1, 2, 3), GIB)
     resident.admit(every, FOUR, room, lambda gpu: 3 * GIB, step)
     with pytest.raises(CommunicatorRoom) as again:
         resident.admit(every, FOUR, room, lambda gpu: GIB // 2, step)
     assert again.value.needed == dict.fromkeys(range(4), GIB)
     assert again.value.room == dict.fromkeys(range(4), GIB // 2)
     resident.admit(every, FOUR, room, lambda gpu: GIB, step)
-    evaluation = communicators.Loaded(b"eval", (0, 1), GIB // 2)
+    evaluation = communicators.Loaded((0, 1), GIB // 2)
     with pytest.raises(CommunicatorRoom):
         resident.admit(pair, FOUR, room, lambda gpu: GIB, evaluation)
     resident.admit(pair, FOUR, room, lambda gpu: GIB + GIB // 2, evaluation)

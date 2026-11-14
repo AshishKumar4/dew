@@ -94,7 +94,7 @@ class PhasePasses[L, E]:
     def begins(self, compiled: Collection[Hashable]) -> bool:
         """Whether the step being compiled (`current`) begins a phase whose count no step of `compiled`
         (keys of `key`) ran, past the run's first: a step planned afresh, at its own count's split, where
-        the run is at an update's end (`Trainer._unpooled`)."""
+        the run is at an update's end (`Trainer._planned_afresh`)."""
         if self.current is None or not compiled:
             return False
         return all(not isinstance(held, tuple) or len(held) != 2 or held[1] != self.current

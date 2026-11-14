@@ -1053,14 +1053,6 @@ def _positioned(stream: Iterator[Batch]) -> Checkpointable:
     return stream
 
 
-def admitted(loader: Loader, partition: DataPartition, position: bytes) -> None:
-    """Refuse `position` where `loader`'s training stream of `partition`'s share would not resume from it,
-    as it refuses it where the run opens its data (`_opened_at`), reading no record: a run checks it
-    before it writes anything a refusal would leave behind (`RunConfig.train`)."""
-    with _opened_at(loader, partition, position):
-        pass
-
-
 def _first_read(loader: Loader, partition: DataPartition, position: bytes | None = None, *,
                 kept: bool = False) -> Batch | None:
     """The first batch `loader`'s training stream gives `partition`'s share, from `position` where given,

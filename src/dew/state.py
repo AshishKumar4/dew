@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
@@ -72,6 +73,31 @@ class Accumulation:
         return jax.tree.structure(held) == jax.tree.structure(compiled) and all(
             (mine.shape, mine.dtype) == (theirs.shape, theirs.dtype)
             for mine, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(compiled), strict=True))
+
+
+def paired(donor: Accumulation | None, window) -> dict[int, int]:
+    """Each leaf of `window` (arrays or shapes, by its place among its leaves) a leaf of `donor`, the empty
+    window it replaces, of its shape and dtype takes the place of: that leaf's place among `donor`'s, each
+    of `donor`'s taken once, in order. None where there is no `donor`."""
+    free: dict[tuple, list[int]] = collections.defaultdict(list)
+    for index, leaf in enumerate(jax.tree.leaves(donor)):
+        free[(tuple(leaf.shape), jnp.dtype(leaf.dtype))].append(index)
+    pairs = {}
+    for index, leaf in enumerate(jax.tree.leaves(window)):
+        held = free.get((tuple(leaf.shape), jnp.dtype(leaf.dtype)))
+        if held:
+            pairs[index] = held.pop(0)
+    return pairs
+
+
+def taken(donor: Accumulation | None, window) -> tuple[list, list]:
+    """The leaves of `window` no leaf of `donor` takes the place of (`paired`), which a window built over
+    `donor` allocates afresh, the rest its buffers donated (`dew.training.compiler.laid_out`), and
+    `donor`'s leaves none takes, which it lets go."""
+    pairs = paired(donor, window)
+    used = set(pairs.values())
+    return ([leaf for index, leaf in enumerate(jax.tree.leaves(window)) if index not in pairs],
+            [leaf for index, leaf in enumerate(jax.tree.leaves(donor)) if index not in used])
 
 
 def occupancy(window: Accumulation | None) -> jax.Array:

@@ -92,7 +92,18 @@ from dew.optim_schedules import (
     with_rates,
 )
 from dew.registry import Unrecordable
-from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, occupied, together
+from dew.state import (
+    MODEL_STATE,
+    Accumulation,
+    TrainState,
+    apart,
+    drawn_in,
+    kept_window,
+    occupied,
+    paired,
+    taken,
+    together,
+)
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
@@ -140,7 +151,7 @@ from dew.training._fit import (
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau
 from dew.training.cadence import Counted
-from dew.training.compiler import Compiled, CompiledStep, StepCompiler, laid_out
+from dew.training.compiler import Compiled, CompiledStep, StepCompiler, freshly_held, released
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -796,12 +807,19 @@ class Trainer(Generic[Loss, Effects]):
         return jax.make_jaxpr(loss, return_shape=True)(variables, self._model_shapes(batch), *rest)
 
     def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, window: int,
-                                 split: int = 1, shape_only=False):
+                                 split: int = 1, shape_only=False, donor: Accumulation | None = None):
         """The state with the accumulation a `window` of microbatches of `batch`'s shapes pools in, empty;
-        unchanged under a window of one, a custom step or a held one that replays such batches
-        (`Accumulation.replays`): a ramp's stage begins with a window (`Ramp.stages`)."""
-        if window == 1 or self.step is not None:
+        unchanged under a custom step or a held one that replays such batches (`Accumulation.replays`): a
+        ramp's stage begins with a window (`Ramp.stages`). Under a window of one, the state holds none: an
+        empty one it holds of another split (a phase planned afresh, `StepCompiler.afresh`) is the one its
+        step lets go as it is handed the state (`laid_out`), so the step is planned over the state without
+        it. Built over `donor`, the empty window it replaces, where given: each of its leaves of a new
+        leaf's shape and dtype donated to it, its buffer the new one's, zeroed, the rest released
+        (`taken`)."""
+        if self.step is not None:
             return state
+        if window == 1:
+            return state if state.accumulation is None else dataclasses.replace(state, accumulation=None)
         stats, aux = shapes
         shared = pooled_by_mean(stats)
         mean_dtype = jnp.result_type(jnp.float32, *(x.dtype for x in jax.tree.leaves(stats)))
@@ -849,8 +867,26 @@ class Trainer(Generic[Loss, Effects]):
             return state
         if not shape_only:
             placement = self.shardings(dataclasses.replace(state, accumulation=pending)).accumulation
-            # Allocate on the final shards, without a replicated window-sized temporary.
-            pending = owned_program(allocate, out_shardings=placement)()
+            # Allocate on the final shards, without a replicated window-sized temporary, over the donor's
+            # buffers where the old window's leaves have the new ones' shapes: none allocated twice.
+            # The window it replaces: one laid out for another split (`donor`), or the state's own, a ramp's
+            # stage's of other shapes.
+            donor = state.accumulation if donor is None else donor
+            released(taken(donor, pending)[1])
+            pairs = paired(donor, pending)
+            given = jax.tree.leaves(donor)
+            donated = [given[index] for index in sorted(pairs.values())]
+            place = {index: sorted(pairs.values()).index(held) for index, held in pairs.items()}
+
+            def built(held):
+                # Each leaf a donated one takes the place of is written over it: the donated buffer is an
+                # operand, so XLA writes the new window's zeros into it.
+                leaves, structure = jax.tree.flatten(allocate())
+                for index, at in place.items():
+                    leaves[index] = held[at].at[...].set(leaves[index])
+                return jax.tree.unflatten(structure, leaves)
+
+            pending = owned_program(built, out_shardings=placement, donate_argnums=0)(donated)
         return dataclasses.replace(state, accumulation=pending)
 
     def _builds_window(self, state: TrainState, candidate: Candidate, window: int) -> bool:
@@ -860,13 +896,14 @@ class Trainer(Generic[Loss, Effects]):
         return window > 1 and self.step is None and (
             held is None or (bool(staged) and not held.replays(candidate.prepared.window)))
 
-    def _window_of(self, state: TrainState, candidate: Candidate, window: int) -> TrainState:
+    def _window_of(self, state: TrainState, candidate: Candidate, window: int,
+                   donor: Accumulation | None = None) -> TrainState:
         """`state` with the accumulation `window` microbatches of `candidate`'s pool in, empty, on its shards
-        (`windowed`): what a run's first step of a window builds, and a run compiled ahead compiles
-        (`dew.training.ahead.started`)."""
+        (`windowed`), built over `donor`, the empty window it replaces, where given: what a run's first step
+        of a window builds, and a run compiled ahead compiles (`dew.training.ahead.started`)."""
         return windowed(lambda state, rows, *, shape_only: self._initialize_accumulation(
             state, rows, candidate.shapes, window=window, split=window // self.accumulation,
-            shape_only=shape_only), state, candidate.micro, self.shardings)
+            shape_only=shape_only, donor=donor), state, candidate.micro, self.shardings)
 
     @contextlib.contextmanager
     def _traced_on(self, mesh: Mesh | AbstractMesh,
@@ -2044,7 +2081,9 @@ class Trainer(Generic[Loss, Effects]):
             # window is laid out for.
             self._planned_afresh()
             if state.inner is None:
-                state = laid_out(state, self.accumulation)
+                state = freshly_held(state)
+                # Its empty window binds no split: the new step's window is built over it.
+                self._compiler.afresh = True
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.
         trials = Trials(state, batch)
         if signature not in compiled:

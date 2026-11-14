@@ -812,8 +812,6 @@ class FitSearch[LossT, EffectsT]:
     none of them (`Candidate.held`), so one cached for a
     placed state serves an unplaced one."""
     derived: list[dict[str, JSON]] = dataclasses.field(default_factory=list)
-    split_stated: bool = False
-    """Whether the run states its split (`Trainer(split=...)`), which the search then reads alone."""
     """Each rung the derivation read before the first compile: its rung, terms, headroom and label."""
     judged_at: dict[tuple[str, int], int | None] = dataclasses.field(default_factory=dict)
     """The derived headroom of each candidate the derivation read, by its rung (`rung`) and split: what
