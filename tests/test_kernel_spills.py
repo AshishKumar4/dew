@@ -5,6 +5,7 @@ run keeps, its plan, its step compiled ahead and the executable it runs, is the 
 then. A program with no template launch compiles as jit compiles it."""
 
 import dataclasses
+import functools
 import gc
 import os
 import time
@@ -625,6 +626,70 @@ def test_a_program_whose_launch_spills_at_every_config_left_is_refused_not_kept(
             report.compiled(lowered(), relower=lowered)
         misses = report.misses()
     assert misses and not any(miss.stepped for miss in misses), misses
+
+
+class TwoKernels(grouped_matmul.MosaicGmm):
+    """The grouped forward launching its kernel again over half its rows: one launch of two Mosaic GPU
+    kernels of the one name its launch gives them (`report.named`)."""
+
+    @functools.wraps(grouped_matmul.MosaicGmm._fwd)  # its binding reads its forward's signature
+    def _fwd(self, tokens, kernel, sizes, *args, **kwargs):
+        whole, residuals = super()._fwd(tokens, kernel, sizes, *args, **kwargs)
+        half, _ = super()._fwd(tokens[: tokens.shape[0] // 2], kernel, sizes // 2, *args, **kwargs)
+        return whole.at[: half.shape[0]].add(half), residuals
+
+
+@lowers("sm90")
+def test_a_launch_of_two_kernels_of_one_name_is_refused_where_its_kernels_evidence_is_read():
+    """A launch of two kernels of one name and launch (a training call's keys-alone re-forming beside its
+    weighted launch, both `recurrence_weighted`, as one name given two forms of a launch makes) is refused
+    wherever its kernels' evidence is read by that name, never read as one kernel's: as a start certifies it
+    on a compile-only H100 (`report.certified`, whose read of one missed the other's 8-byte spill) and as a
+    step-down compiles its kernels alone (`report.compiled_alone`)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    devices, lowered = _paired_step(TwoKernels())
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90")):
+        with report.certifying(compile_only_gpus("sm90")[0]), pytest.raises(report.KernelsOfOneName):
+            lowered()
+        with pytest.raises(report.KernelsOfOneName):
+            report.compiled_alone(lowered(), None, lambda call: True)
+
+
+@lowers("sm90")
+def test_one_kernel_called_from_two_places_compiles_alone_once():
+    """A Mosaic GPU kernel and a Pallas-Triton kernel each called from two places under two name scopes, its
+    calls located apart, are each one kernel of its name: a step-down compiles each alone once
+    (`report.compiled_alone`), refusing neither."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as pltriton
+    from jax.sharding import NamedSharding, PartitionSpec
+    from kernel_compile import staged_copy
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    def added(x_ref, y_ref, o_ref):
+        o_ref[...] = x_ref[...] + y_ref[...]
+
+    shape = jax.ShapeDtypeStruct((128, 128), jnp.float32)
+    copy = staged_copy((128, 128), jnp.float32)
+
+    def summed(x, y):
+        return pl.pallas_call(added, out_shape=shape, grid=(1,), name="dew_added__l0123456789",
+                              compiler_params=pltriton.CompilerParams(num_warps=4, num_stages=1))(x, y)
+
+    def program(x, y):
+        with jax.named_scope("first"):
+            first = summed(x, y) + copy(x)
+        with jax.named_scope("second"):
+            return first + summed(y, x) + copy(y)
+
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    spec = jax.ShapeDtypeStruct((128, 128), jnp.float32, sharding=NamedSharding(devices, PartitionSpec()))
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90")):
+        lowered = jax.jit(program).trace(spec, spec).lower()
+        alone = report.compiled_alone(lowered, None, lambda call: True)
+    assert alone is not None and len(alone) == 2 and all(found.error is None for found in alone.values())
 
 
 @lowers("sm90")

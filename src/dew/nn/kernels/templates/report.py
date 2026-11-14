@@ -273,6 +273,40 @@ def launch_name(kernel: str, launch: str | None) -> str:
     return kernel if launch is None else f"{kernel}__l{launch}"
 
 
+class KernelsOfOneName(ValueError):
+    """Two kernels of one name and launch (`kernel_bodies`), whose evidence would be one's."""
+
+
+def kernel_bodies(calls: Iterable["KernelCall"]) -> dict[str, "KernelCall"]:
+    """Each kernel call by its kernel's name and launch (`launch_name`), the key every record of a kernel's
+    evidence reads (its module, binary, PTX and register model): two calls of one name and launch whose
+    kernels differ (`_kernel`) raise, as each record would hold one kernel's evidence for both.
+    Dew names a kernel where it launches it (`named`: the name it is given, its launch's digest beside), so
+    two forms of one launch given one name share it whatever their kernels: a training call's keys-alone
+    re-forming beside its weighted launch, both `recurrence_weighted`, whose certification read the one and
+    missed the other's 8-byte spill, and a Triton attention forward's rewalk beside its plain launch, both
+    `attention_forward`. Each form is named apart where Dew names it; this refuses one that is not."""
+    found: dict[str, KernelCall] = {}
+    for call in calls:
+        name = launch_name(call.name, call.launch)
+        if _kernel(found.setdefault(name, call)) != _kernel(call):
+            raise KernelsOfOneName(f"{name} names two kernels: its evidence would be one's")
+    return found
+
+
+def _kernel(call: "KernelCall") -> Hashable:
+    """A call's kernel as its compiler tells kernels apart: a Mosaic GPU kernel's hash (`KernelCall.config`,
+    which Mosaic takes of its module without debug information), any other's IR and config."""
+    return call.config if call.kind == "mosaic_gpu" else (call.ir, call.config)
+
+
+def kernel_modules(calls: Iterable["KernelCall"]) -> dict[str, str]:
+    """Each Mosaic GPU call's module (its kernel hash, `KernelCall.config`) by its kernel's name and launch,
+    one kernel a name and launch (`kernel_bodies`)."""
+    return {name: call.config
+            for name, call in kernel_bodies(call for call in calls if call.kind == "mosaic_gpu").items()}
+
+
 def launch_digest() -> str | None:
     """The digest of the launch tracing (`launching`), which its kernels' names carry (`named`), or None
     where none is."""
@@ -524,8 +558,7 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
         lowered = owned_program(pulled_back if reverse else launch).trace(*specs).lower()
     # A Mosaic GPU kernel compiled alone is the one its program loads (Mosaic compiles a module once a
     # process); a Triton kernel compiles again with each executable, so its program's compile reads it.
-    modules = {launch_name(call.name, call.launch): call.config
-               for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"}
+    modules = kernel_modules(kernel_calls(lowered, unrun=True))
     if not modules:
         return {}
     return {name: (modules[name], binary)
@@ -967,7 +1000,7 @@ def compiled_alone(lowered: jax.stages.Lowered, options: jax.stages.CompilerOpti
     from jax._src.interpreters import pxla
     from jax._src.lib.mlir.dialects import func
 
-    from dew.nn.kernels.lowered import kernel_call
+    from dew.nn.kernels.lowered import KernelCall, kernel_call
 
     # The compile's own backend, devices and options: a jit's lowering holds them (`pxla.MeshComputation`);
     # `Lowered` states none of them.
@@ -978,7 +1011,7 @@ def compiled_alone(lowered: jax.stages.Lowered, options: jax.stages.CompilerOpti
     backend, device = lowering.compile_args["backend"], next(iter(lowering._device_list))
     overrides = dict(lowering._compiler_options_kvs + tuple((options or {}).items()))
     module = lowering.stablehlo()
-    calls: dict[str, ir.Operation] = {}
+    operations: dict[KernelCall, ir.Operation] = {}
 
     def walk(operation) -> None:
         for region in operation.regions:
@@ -990,10 +1023,12 @@ def compiled_alone(lowered: jax.stages.Lowered, options: jax.stages.CompilerOpti
                     if target in (TRITON_TARGET, MOSAIC_CALL):
                         called = kernel_call(target, inner)
                         if called is not None and wanted(called):
-                            calls.setdefault(launch_name(called.name, called.launch), inner)
+                            operations.setdefault(called, inner)
                     walk(inner)
 
     walk(module.operation)
+    # Each kernel once, by its name and launch, as its program's evidence names it (`kernel_bodies`).
+    calls = {name: operations[call] for name, call in kernel_bodies(operations).items()}
     for call in calls.values():
         config = ir.DictAttr(call.attributes["mhlo.backend_config"])
         if "xla_replica_ids" in config or ("uses_xla_collective_metadata" in config

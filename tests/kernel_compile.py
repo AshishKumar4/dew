@@ -321,7 +321,7 @@ def _compiled(case, generation: str, record: dict,
                              if key not in uncertified]
     # Each kernel once, as JAX lowered it (a function's kernels however many calls reach them).
     calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]
-    modules = kernel_modules(calls)
+    modules = report.kernel_modules(calls)
     record["modules"] = modules
     # Each kernel certification compiled alone in this process, by name and launch: its module.
     record["certified"] = {name: module for found in report.certifications()
@@ -348,17 +348,6 @@ def _compiled(case, generation: str, record: dict,
     if expected is not None:
         record["route"] = _route(lowered, executable, _device(generation, expected.axes))
     return report.launched_kernels(executable), triton_kernels(lowered)
-
-
-def kernel_modules(calls: list) -> dict[str, str]:
-    """Each Mosaic GPU call's module (its kernel hash) by its kernel's name and launch (`report.launch_name`):
-    one name and launch of two modules raises, as its evidence would be one's."""
-    modules: dict[str, str] = {}
-    for call in calls:
-        name = report.launch_name(call.name, call.launch)
-        if modules.setdefault(name, call.config) != call.config:
-            raise ValueError(f"{name} names two kernels: its evidence would be one's")
-    return modules
 
 
 def _estimates(calls: list, printed: str) -> dict[str, str]:

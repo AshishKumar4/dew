@@ -1396,15 +1396,15 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
 
 def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
     """Evidence of one kernel's name and launch from two kernels is one kernel's at most: two modules
-    (`kernel_modules`), two binaries (`reports`) or two PTX modules (`write_modules`) of one raise."""
-    from kernel_compile import PTX_MODULE, kernel_modules, reports, write_modules
+    (`report.kernel_modules`), two binaries (`reports`) or two PTX modules (`write_modules`) of one raise."""
+    from kernel_compile import PTX_MODULE, reports, write_modules
 
     from dew.nn.kernels.lowered import KernelCall
 
     calls = [KernelCall("mosaic_gpu", "k", b"", module, None, "0123456789") for module in ("aa", "bb")]
-    assert kernel_modules(calls[:1]) == {"k__l0123456789": "aa"}
-    with pytest.raises(ValueError):
-        kernel_modules(calls)
+    assert report.kernel_modules(calls[:1]) == {"k__l0123456789": "aa"}
+    with pytest.raises(report.KernelsOfOneName):
+        report.kernel_modules(calls)
     binaries = [report.Binary("k", "0123456789", registers, 0) for registers in (168, 200)]
     assert len(reports({}, binaries[:1])) == 1
     with pytest.raises(ValueError):
