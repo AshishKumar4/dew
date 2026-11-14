@@ -28,7 +28,7 @@ What lands:
 - tests/fixtures/hf/qwen35-tiny/: a random-weight hybrid checkpoint in the
   HF layout (three linear-attention layers, one gated full-attention layer,
   a partial rotary of 0.25 with the interleaved mRoPE sections the released
-  configs carry), the 2 x 12 token ids it was run on and its fp32 logits.
+  configs carry) and 2 x 12 token ids.
 - tests/fixtures/hf/qwen35-0.8b/: no weights. config.json is the released
   config of Qwen/Qwen3.5-0.8B, the smallest checkpoint of the family, and
   its text decoder is what the translation is tested on. inv_freq.npy is
@@ -190,13 +190,8 @@ def write_tiny(model: Qwen3_5ForCausalLM) -> None:
     model.save_pretrained(directory, safe_serialization=True)
     ids = PROBE["probe_ids"](CONFIG["vocab_size"])
     np.save(directory / "input_ids.npy", ids)
-    model.set_attn_implementation("eager")
-    with torch.no_grad():
-        logits = model(input_ids=torch.from_numpy(ids), use_cache=False).logits
-    np.save(directory / "logits.npy", logits.to(torch.float32).numpy())
     size = sum(path.stat().st_size for path in directory.iterdir())
-    print(f"{directory}: {size / 1e3:.0f} kB, argmax[0, :8]="
-          f"{logits[0].argmax(-1)[:8].tolist()}")
+    print(f"{directory}: {size / 1e3:.0f} kB")
 
 
 def write_real(config: dict) -> None:

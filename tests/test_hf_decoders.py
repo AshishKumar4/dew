@@ -54,10 +54,9 @@ Tolerances and the differences actually observed, fp32 on CPU:
 - deepseek-v32-tiny: max |logit difference| 3.6e-06, tolerance 1e-4. The
   same over the sparse indexer; the dense mixer on the same weights differs
   from the fixture by 3.8, so the fixture is the sparse model.
-- qwen35-tiny : max |logit difference| 9.1e-05, tolerance 5e-4, on logits of
-  magnitude 6.8. Three gated delta net layers and one gated attention layer
-  with a sliced quarter-head rope; the delta net's own numbers are in
-  tests/test_linear_attention.py.
+- qwen35-tiny : check 1's against its source over drawn ids under a YaRN
+  record (tests/test_hf_family_sources.py). Three gated delta net layers and
+  one gated attention layer with a sliced quarter-head rope.
 - qwen3-next-tiny: max |logit difference| 2.3e-05 on the trunk, on logits of
   magnitude 6.6, tolerance 1e-4 scaled by that magnitude; its MTP layer is
   check 1's against the published composition live

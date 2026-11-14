@@ -173,20 +173,6 @@ def test_the_real_qwen35_rotary_rotates_the_dims_the_reference_rotates():
                            np.cos(positions[:, None] * inv_freq[None]), atol=1e-2)
 
 
-def test_qwen35_logits_match_the_reference_implementation():
-    """Full-model parity on the tiny hybrid: the delta net layers, the gated
-    attention with its sliced quarter-head rope (the reference applies its
-    interleaved mRoPE to text-only positions, which is this rope exactly),
-    the (1 + w) norms and the tied head. Largest observed max |logit
-    difference| 9.1e-05 on logits of magnitude 6.8, tolerance 5e-4, every
-    argmax equal. Translating the rope as Gemma 4's proportional convention
-    instead moves the logits by 7.8e-01."""
-    directory = FIXTURES / "qwen35-tiny"
-    model, variables = fp32_decoder(directory)
-    difference = recorded_logit_difference(model, variables, directory)
-    assert difference < 5e-4, f"max |logit difference| {difference:.3e}"
-
-
 @pytest.mark.parametrize("fixture", ["qwen35-tiny", "qwen35-moe-native-tiny", "qwen3-next-tiny"])
 @pytest.mark.parametrize("depth", [0, 1], ids=["trunk", "prediction-layer"])
 def test_a_hybrid_qwen_model_written_without_its_source_states_its_fields_and_reloads(fixture, depth,
