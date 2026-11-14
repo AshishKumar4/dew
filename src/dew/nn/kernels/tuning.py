@@ -53,6 +53,7 @@ import functools
 import hashlib
 import importlib
 import inspect
+import itertools
 import json
 import logging
 import os
@@ -600,40 +601,48 @@ class KernelOp(tokamax.Op):
         while config not in seen and (spilling := report.certified(self, ba, config)):
             seen.add(config)
             report.refuse_launch(self, ba, config, {binary.kernel for binary in spilling})
-            self._climbed(ba, config, seen)
+            # Each refused config stepped to the next refused one; the last, to what the derivation takes.
+            refused, stepped = [(config, spilling), *self._climbed(ba, config, seen)], None
             try:
                 stepped = self._get_heuristics_config(ba)
-            except report.Exhausted:
-                # No config left: its misses stepped nowhere.
-                report.missed_spilling(self, ba, config, spilling, stepped=False)
-                raise
-            report.missed_spilling(self, ba, config, spilling, stepped=stepped not in seen)
+            finally:  # a derivation left with no config raises: the last refused one stepped nowhere
+                for (refusal, its), later in zip(refused, [*refused[1:], None], strict=True):
+                    report.missed_spilling(self, ba, refusal, its, stepped=later is not None or (
+                        stepped is not None and stepped not in seen))
             config = stepped
         return config
 
-    def rungs(self, ba: tokamax.BoundArguments, config: Hashable) -> tuple[Hashable, ...]:
+    def rungs(self, ba: tokamax.BoundArguments, config: Hashable) -> Iterator[Hashable]:
         """The configs above a refused `config` its derivation steps through in turn, each the same launch
         with one more of a resource the assembler alone decides (a recurrence's producer registers, a
         setmaxnreg step a rung), up to the most the family allows: none unless the launch states them."""
         del ba, config
-        return ()
+        return iter(())
 
-    def _climbed(self, ba: tokamax.BoundArguments, config: Hashable, seen: set) -> None:
+    def _climbed(self, ba: tokamax.BoundArguments, config: Hashable, seen: set
+                 ) -> list[tuple[Hashable, tuple]]:
         """`config`'s rungs (`rungs`) certified a round at a time (`report.certified_together`,
-        `report.rung_round` a round), each one that spills refused and its misses recorded, until a rung
-        holds, which the derivation then takes. A search, not a step: the assembler reports whether a config
-        holds, never what it would need (its stack frame stays a word or two at every rung short of the
-        least that holds), so the least holding rung is found by asking several at once; one at a time, the
-        4B's reverse walk took eight compiles, 95 s of a cold B200 start."""
-        rungs, size = list(self.rungs(ba, config)), report.rung_round()
-        while rungs:
-            batch, rungs = rungs[:size], rungs[size:]
-            for rung, spilling in zip(batch, report.certified_together(self, ba, batch), strict=True):
-                if not spilling:
-                    return
+        `report.rung_round` a round) until a rung holds, which the derivation then takes: each rung below it
+        refused, returned with its spilling kernels for its misses (`_certified`'s); a rung of the same round
+        above it that spilled recorded as a miss stepped nowhere, neither refused nor taken. A search, not a
+        step: the assembler reports whether a config holds, never what it would need (its stack frame stays a
+        word or two at every rung short of the least that holds), so the least holding rung is found by
+        asking several at once; one at a time, the 4B's reverse walk took eight compiles, 95 s of a cold B200
+        start."""
+        rungs, size, refused = self.rungs(ba, config), report.rung_round(), []
+        while batch := list(itertools.islice(rungs, size)):
+            answers = list(zip(batch, report.certified_together(self, ba, batch), strict=True))
+            held = next((index for index, (_, spilling) in enumerate(answers) if not spilling), None)
+            for rung, spilling in answers[:held]:
                 seen.add(rung)
                 report.refuse_launch(self, ba, rung, {binary.kernel for binary in spilling})
-                report.missed_spilling(self, ba, rung, spilling, stepped=True)
+                refused.append((rung, spilling))
+            if held is not None:
+                for rung, spilling in answers[held + 1:]:
+                    if spilling:
+                        report.missed_spilling(self, ba, rung, spilling, stepped=False)
+                return refused
+        return refused
 
     def variants(self, ba: tokamax.BoundArguments) -> tuple[Hashable, ...]:
         """The configs an opt-in tuning run (`tune`) times for `ba`: the launch's heuristic alone, or, where

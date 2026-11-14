@@ -17,7 +17,7 @@ import dataclasses
 import functools
 import math
 import threading
-from collections.abc import Iterable, Set
+from collections.abc import Iterable, Iterator, Set
 from typing import ClassVar
 
 import jax
@@ -602,16 +602,15 @@ class Mosaic(base.Template[mainloop.Tiles]):
             tiles = _producing(tiles, raised)
         return tiles
 
-    def rungs(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> tuple[mainloop.Tiles, ...]:
+    def rungs(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> Iterator[mainloop.Tiles]:
         """The tiles a refused `config`'s spilling launches' producers rise through, a setmaxnreg step a rung
-        (`_raised`), up to the most their consumers' least share allows: the ladder `_settled` climbs a
-        compile at a time, which certification asks a round at a time (`tuning.KernelOp._climbed`)."""
-        target, spilled = generation.gpu_target(), _spilled(self, ba, config)
-        ladder, rung = [], config
+        (`_raised`), up to the most their consumers' least share allows, each planned as it is asked for: the
+        ladder `_settled` climbs a compile at a time, which certification asks a round at a time
+        (`tuning.KernelOp._climbed`)."""
+        target, spilled, rung = generation.gpu_target(), _spilled(self, ba, config), config
         while spilled and (raised := self._raised(ba, rung, spilled, target)) is not None:
             rung = _producing(rung, raised)
-            ladder.append(rung)
-        return tuple(ladder)
+            yield rung
 
     def _raised(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                 target: generation.GpuTarget) -> resources.Producers | None:
