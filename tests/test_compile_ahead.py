@@ -1682,8 +1682,12 @@ def test_a_run_takes_an_untuned_step_only_where_its_own_compile_tunes_nothing(tm
     assert len([entry for entry in caplog.records if entry.name == "dew.training.ahead"]) == 1
     tuned = dataclasses.replace(own, plan={**record(own.plan, "plan"), "autotuned": True})
     assert tuned.tuned and tuned.runnable(here) is tuned
+    # Built under the flags it runs under: XLA's flags are part of a step's target (`BuildTarget.flags`).
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
-    assert own.runnable(here) is own
+    level_zero = dataclasses.replace(handed, built=BuildTarget.of(here))
+    assert level_zero.runnable(here) is level_zero
+    with pytest.raises(ValueError):
+        own.runnable(here)
 
 
 def test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step():

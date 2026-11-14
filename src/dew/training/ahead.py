@@ -407,9 +407,9 @@ class AheadOfTime:
         are untuned (`tuned`) and the run's would be tuned, which the run then compiles on its devices as
         without a file, said once (`UNTUNED`). A step of another target is refused first, tuned or not
         (`held`): no run takes it."""
+        self.held(devices)
         if self.tuned or not report.autotuned(devices):
             return self
-        self.held(devices)
         _log.warning(UNTUNED, self.generation)
         return None
 
