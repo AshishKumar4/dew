@@ -58,9 +58,9 @@ jobs:
     - name: Build
       env:
         PYTHON: python3.12
-        # Four nvcc processes at once outgrow the arm runner's memory (killed, exit 137, on its first run);
-        # two fit it.
-        JOBS: ${{ matrix.machine == 'aarch64' && '2' || '4' }}
+        # Two nvcc processes at once: four outgrew the arm runner's memory (killed, exit 137, on its first run), and
+        # the x86_64 runner's on flash-attn 0.3.11's CUDA 12.9 wheel (killed at 75 min twice, run 43606377661).
+        JOBS: '2'
       run: |
         source /opt/rh/gcc-toolset-12/enable
         sh kernels/${{ inputs.package }}/build.sh
