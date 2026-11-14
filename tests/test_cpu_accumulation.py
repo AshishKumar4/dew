@@ -385,6 +385,33 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
         assert not choices(traced(divided, np.ones(3, np.float64), np.float64(3.0)))
 
 
+def test_a_users_process_spreads_a_bias_as_the_gate_measures_it(monkeypatch):
+    """A bias's gradient over 4,096 positions in a user's process, which sets no wide arithmetic, is the one
+    check 1 measures for it in the scope it runs a CPU arm in (`arm_arithmetic.summed_as_run`: the suite's
+    wide arithmetic under stated fp32 sums), bit for bit: every CPU process sums a spread's cotangent in
+    blocks (`precision.spread`), where a user's process summed the broadcast's transpose in XLA's order while
+    the gate judged the blocked sum (ledger 4882)."""
+    from arm_arithmetic import summed_as_run
+
+    rng = np.random.default_rng(4882)
+    inputs = jnp.asarray(rng.standard_normal((4096, 16)), jnp.float32)
+    cotangent = jnp.asarray(rng.standard_normal((4096, 8)), jnp.float32)
+    layer = Dense(8)
+    params = layer.init(jax.random.key(0), inputs)["params"]
+
+    def bias_gradient():
+        # Traced afresh, as a process with either setting traces it.
+        return jax.jit(jax.grad(lambda params: jnp.sum(layer.apply({"params": params}, inputs) * cotangent)))(
+            params)["bias"]
+
+    monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    users = bias_gradient()
+    monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    with summed_as_run():
+        measured = bias_gradient()
+    np.testing.assert_array_equal(np.asarray(users), np.asarray(measured))
+
+
 def test_a_narrow_bias_beside_a_wide_product_sums_its_wide_cotangent_before_it_rounds():
     """A bf16 bias added to fp32 products takes the fp32 cotangents' sum rounded once into its dtype
     (`biased`, `broadcast_summed`, review of ledger 3038): cotangents 1 + 1/256 and -1, which bf16 holds
