@@ -1002,15 +1002,15 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
         prefix = separated(*gates(c))
         index, _ = _grid(prefix[0].shape)
         down = decay(prefix, _laid_references(lambda s, c=c: separated(*reference(s, c)), index, chunk, sub))
-        key = keys(c)
         gated_rows = [staged(row(c) * down) for row in rows]
 
-        def turn(s, carried, c=c, prefix=prefix, index=index, key=key, gated_rows=gated_rows):
+        def turn(s, carried, c=c, prefix=prefix, index=index, gated_rows=gated_rows):
             d_rows, d_keys = carried
             place = s * sub
             up = gated_up(prefix, separated(*reference(s, c)), index, place)
-            # The keys gated up staged once, every pairs' product reading them.
-            keyed = raised(key * up)
+            # The keys read as the turn takes them, no tile of them live across the turns, and gated up
+            # staged once, every pairs' product reading them.
+            keyed = raised(keys(c) * up)
             *rowed, gated = together(
                 [[("pairs", d_pair, keyed)] for d_pair in d_pairs]
                 + [[("pairs", d_pair.rows(place, sub).T, down_rows.rows(place, sub))

@@ -413,8 +413,14 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
             # Each pairs' gradient's parts, staged once (`pairs_gradients`), read by every product as they are
             # and transposed.
             d_pairs = loaded
-            query = stream_tile(slots, "queries", given).value().astype(jnp.float32)
-            key = stream_tile(slots, "keys", given).value().astype(jnp.float32)
+
+            # The queries and keys read from their slots where each is taken, so neither tile lives across
+            # the sub-chunks' turns.
+            def query(c):
+                return stream_tile(slots, "queries", given).value().astype(jnp.float32)
+
+            def key(c):
+                return stream_tile(slots, "keys", given).value().astype(jnp.float32)
 
             def gated(c):
                 return stream_tile(slots, "gates", gates).value(), stream_tile(slots, "lows", gates).value()
@@ -435,13 +441,13 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
 
             found = {}
             algebra.key_decayed_pairs_back(
-                d_pairs, [lambda c: query, lambda c: algebra.write_gated(key, betas)], lambda c: key, 1,
+                d_pairs, [query, lambda c: algebra.write_gated(key(c), betas)], key, 1,
                 gated, reference, Issuer(call).summed_together, staged, raised, chunk=chunk,
                 emit=lambda kind, p, c, grad: found.__setitem__((kind, p), grad))
             d_query, d_keyed, d_key = found["rows", 0], found["rows", 1], found["keys", 0]
             d_betas = d_betas + own_pairs.pairs_back_stored(
                 call, (dq_ref, dk_ref, dg_ref), (row, h * width + index * keys), keys, landing["block"],
-                (query, key, betas), (d_query, d_keyed, d_key))
+                (query(0), key(0), betas), (d_query, d_keyed, d_key))
 
             @pl.when(index == steps - 1)
             def _():
@@ -494,13 +500,13 @@ def _key_pairs_staged(call: Call, keys: int) -> tuple:
 def _key_pairs_held(call: Call, keys: int) -> Held:
     """`_key_pairs_back`'s consumer thread at key block `keys`: the write gates' terms carried; across the
     rolled sub-chunks (`algebra.key_decayed_pairs_back`) a key block's prefix halves, its rows' decays to
-    their common points, its queries and keys, the rows' and keys' gradients carried and the rows' indices;
-    in a sub-chunk's turn its keys' gate up, the keys raised, a product's sum and the operand its product
+    their common points, the rows' and keys' gradients carried and the rows' indices; in a sub-chunk's turn
+    its keys read from their slot, their gate up, the keys raised, a product's sum and the operand its product
     forms, its parts (`product.formed`) and their remainder, their mask, beside a product's fragments. Before
     the walk, each pairs' gradient read whole and split into its parts and their remainder in turn."""
     chunk = call.chunk
     parted = _parted(call)
-    # As an sm100's lowered peak counts it (row 5298, jsf-sm100-backward): nine tiles a block, their masks,
+    # As an sm100's lowered peak counts it (row 5298, jsf-sm100-backward): eight tiles a block, their masks,
     # the rows' parts, and a product's fragments with mma.sync's right operand loaded ahead.
     # In turn: a pair's gradient against the keys raised; a sub-chunk's (read transposed) against its gated
     # rows (`algebra.key_decayed_pairs_back`); with the first's right operand loaded ahead.
@@ -509,7 +515,7 @@ def _key_pairs_held(call: Call, keys: int) -> Held:
                                         resources.OperandRead.of(parted))
     return Held(carried=[f32(chunk, 1)], phases=(
         [f32(chunk, chunk)] * 2 + held_tile(parted, chunk, chunk),
-        [f32(chunk, keys)] * 9 + masks(chunk, keys) * 2 + held_tile(parted, chunk, keys)
+        [f32(chunk, keys)] * 8 + masks(chunk, keys) * 2 + held_tile(parted, chunk, keys)
         + largest_live_set(
             product_fragments(call, (parted, chunk, chunk), (parted, chunk, keys)),
             product_fragments(call, (parted, chunk, algebra.SUB), (parted, algebra.SUB, keys)))
