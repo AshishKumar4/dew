@@ -189,57 +189,65 @@ def candidate_pool(scores, visible, blocks: int, block_size: int):
     return jnp.where((chosen >= 0) & (entries < total), entries, -1)
 
 
-def selected_runs(selected, chunks, *, slots=None, causal: bool = True, own: bool = True):
-    """Key runs `[B, Q, S + own, 2]` of a selection `selected` `[B, Q, S]`
-    (each query's chunks, -1 for none) over keys numbered into `chunks`
-    `[B, K]` or `[K]` (each key's, its chunk's keys consecutive, -1 for a
-    key in none: blocks of a row, `arange(K) // block`, or of each document
-    from its first place, `dew.nn.inputs.numbered_blocks`): each selected
-    chunk's keys, under causality up to the query's own key (`slots` `[B, Q]`,
-    each query's key, its index where None; -1 for a query with none), and
-    with `own` the query's own chunk up to it; sorted, duplicates and empty
-    chunks an empty run, as `scaled_dot_product_attention`'s `key_runs`
-    takes them. A selection takes no gradient."""
+SELECTING = "selecting"
+"""The scope a selection's scoring runs under (`jax.named_scope`): products that rank keys rather than
+weigh them, as MoBA's gate does in fp32 whatever the logits' arithmetic (`dew.nn.block_sparse.moba_gate`),
+which a program's logits are told apart from. A selection's scoring alone, never a product the attention
+weighs: a witness of the logits' arithmetic passes over all within it (tests/reference_error.py's
+`logits_operands`)."""
+
+
+def block_runs(keys: int, block: int) -> jax.Array:
+    """`[ceil(K / block), 2]`: each block of `block` keys of a sequence of `keys`, its first key and the key
+    past its last, the entries a selection of blocks names (`selected_runs`)."""
+    starts = jnp.arange(0, keys, block, dtype=jnp.int32)
+    return jnp.stack([starts, jnp.minimum(starts + block, keys)], axis=-1)
+
+
+def selected_runs(selected, bounds, *, own=None, slots=None, causal: bool = True):
+    """Key runs `[B, Q, S + 1, 2]` (`[B, Q, S, 2]` without `own`) of a selection `selected` `[B, Q, S]`, each
+    query's entries of `bounds` `[B, T, 2]` or `[T, 2]` (each entry's first key and the key past its last, an
+    empty run for none: a row's blocks, `block_runs`, or a document's windows), -1 for none, beside each
+    query's `own` run `[B, Q, 2]` where given; under causality each up to the query's own key (`slots`
+    `[B, Q]`, each query's key, its index where None; -1 for a query with none); sorted, repeats and empty
+    runs an empty run after the rest, as `scaled_dot_product_attention`'s `key_runs` takes them. A selection
+    takes no gradient."""
     rows, queries, _ = selected.shape
-    keys = chunks.shape[-1]
-    chunks = jnp.broadcast_to(chunks, (rows, keys))
+    bounds = jnp.broadcast_to(bounds, (rows, *bounds.shape[-2:]))
     slots = jnp.broadcast_to(jnp.arange(queries) if slots is None else slots, (rows, queries))
-    # Each chunk's first key and the key past its last, `[B, K]` (no chunk outnumbers its keys).
-    index, numbered = jnp.arange(keys), jnp.where(chunks >= 0, chunks, keys)
-    first = jax.vmap(lambda ids: jax.ops.segment_min(index, ids, num_segments=keys))(numbered)
-    past = jax.vmap(lambda ids: jax.ops.segment_max(index, ids, num_segments=keys))(numbered) + 1
     taken = selected.astype(jnp.int32)
-    if own:
-        mine = jnp.take_along_axis(chunks, jnp.maximum(slots, 0), axis=-1)
-        taken = jnp.concatenate([taken, jnp.where(slots >= 0, mine, -1)[..., None]], axis=-1)
-    taken = jnp.sort(jnp.where(taken < 0, jnp.iinfo(jnp.int32).max, taken), axis=-1)
-    repeated = jnp.concatenate([jnp.zeros_like(taken[..., :1], bool), taken[..., 1:] == taken[..., :-1]],
-                               axis=-1)
-    kept = (taken != jnp.iinfo(jnp.int32).max) & ~repeated
-    at = jnp.where(kept, taken, 0).reshape(rows, -1)
-    start, end = (jnp.take_along_axis(table, at, axis=-1).reshape(taken.shape) for table in (first, past))
+    at = jnp.maximum(taken, 0).reshape(rows, -1)
+    start, end = (jnp.where(taken >= 0, jnp.take_along_axis(bounds[..., side], at, axis=-1).reshape(
+        taken.shape), 0) for side in (0, 1))
+    if own is not None:
+        start, end = (jnp.concatenate([mine, theirs[..., None]], axis=-1)
+                      for mine, theirs in ((start, own[..., 0]), (end, own[..., 1])))
     if causal:
         end = jnp.minimum(end, slots[..., None] + 1)
-    held = kept & (end > start)
-    # The held runs first, in order, the empty after them.
-    order = jnp.argsort(jnp.where(held, start, jnp.iinfo(jnp.int32).max), axis=-1, stable=True)
+    held = end > start
+    # The held runs first, in order, a repeat of the run before it dropped, the empty after them.
+    order = jnp.lexsort((end, jnp.where(held, start, jnp.iinfo(jnp.int32).max)), axis=-1)
+    start, end, held = (jnp.take_along_axis(each, order, axis=-1) for each in (start, end, held))
+    repeated = jnp.concatenate([jnp.zeros_like(held[..., :1]), (start[..., 1:] == start[..., :-1])
+                                & (end[..., 1:] == end[..., :-1])], axis=-1)
+    held = held & ~repeated
+    order = jnp.argsort(~held, axis=-1, stable=True)
     start, end, held = (jnp.take_along_axis(each, order, axis=-1) for each in (start, end, held))
     runs = jnp.stack([jnp.where(held, start, 0), jnp.where(held, end, 0)], axis=-1)
     return jax.lax.stop_gradient(runs)
 
 
-def selected_attention(query, key, value, selected, chunks, *, slots=None, causal: bool = True,
-                       own: bool = True, implementation: AttentionImpl = 'auto', **options):
-    """Attention whose each query reads the chunks its selection names
-    (`selected` `[B, R, Q, S]`, a selection a GQA group's or a query head's,
-    `selected_runs` over `chunks`), each of the `R` selections a row of the
-    call's batch (the key runs are a row's): `query` `[B, Q, R * h, D]`,
-    `key` and `value` `[B, K, G, D]` with `R` a multiple of `G` (a head's
-    selection reads its group's keys), out `[B, Q, R * h, Dv]`, through the
-    template's indexed form (`scaled_dot_product_attention`'s `key_runs`).
-    `options` are the call's other arguments. A call whose queries are its
-    keys (`slots` None) states its causality to the kernel too; a cache
-    call's runs alone end each query's keys."""
+def selected_attention(query, key, value, selected, bounds, *, own=None, slots=None, key_valid=None,
+                       causal: bool = True, implementation: AttentionImpl = 'auto', **options):
+    """Attention whose each query reads the entries its selection names (`selected` `[B, R, Q, S]`, a
+    selection a GQA group's or a query head's, `selected_runs` over `bounds`) and its `own` run `[B, Q, 2]`
+    where given, each of the `R` selections a row of the call's batch (the key runs are a row's), the call's
+    real keys alone where `key_valid` `[B, K]` marks them (a run spans a hole the validity hides): `query`
+    `[B, Q, R * h, D]`, `key` and `value` `[B, K, G, D]` with `R` a multiple of `G` (a head's selection
+    reads its group's keys), out `[B, Q, R * h, Dv]`, through the template's indexed form
+    (`scaled_dot_product_attention`'s `key_runs`). `options` are the call's other arguments. A call whose
+    queries are its keys (`slots` None) states its causality to the kernel too; a cache call's runs alone
+    end each query's keys."""
     rows, queries, heads, _ = query.shape
     groups = selected.shape[1]
     per = heads // groups
@@ -252,14 +260,17 @@ def selected_attention(query, key, value, selected, chunks, *, slots=None, causa
             rows * groups, length, held, depth)
 
     def rowed(array):
-        return None if array is None else jnp.repeat(jnp.broadcast_to(array, (rows, array.shape[-1])),
+        # A row's `[B, ...]` (or one every row shares) at each of its selections' rows.
+        return None if array is None else jnp.repeat(jnp.broadcast_to(array, (rows, *array.shape[-1:])),
                                                      groups, axis=0)
 
-    runs = selected_runs(selected.reshape(rows * groups, queries, -1), rowed(chunks), slots=rowed(slots),
-                         causal=causal, own=own)
+    rowed_bounds = jnp.repeat(jnp.broadcast_to(bounds, (rows, *bounds.shape[-2:])), groups, axis=0)
+    rowed_own = None if own is None else jnp.repeat(own, groups, axis=0)
+    runs = selected_runs(selected.reshape(rows * groups, queries, -1), rowed_bounds, own=rowed_own,
+                         slots=rowed(slots), causal=causal)
     key, value = (jnp.repeat(each, shared, axis=2) for each in (key, value))
     out = scaled_dot_product_attention(batched(query, per), batched(key, 1), batched(value, 1),
                                        causal=causal and slots is None, key_runs=runs,
-                                       implementation=implementation, **options)
+                                       key_valid=rowed(key_valid), implementation=implementation, **options)
     out = out.reshape(rows, groups, queries, per, -1).transpose(0, 2, 1, 3, 4)
     return out.reshape(rows, queries, heads, -1)

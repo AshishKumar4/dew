@@ -41,6 +41,7 @@ from dew.batch import valid_order
 
 from .documents import document_windows
 from .inputs import MixerCall, PredictionPhase, coordinates_of
+from .kv_cache import Opened, cache_variables, kept
 from .mixer_base import MixerBase, MixerContext
 from .mla import INDEXER, IndexerFront, MultiHeadLatentAttention, latent_refusals
 from .norms import LayerNorm
@@ -65,6 +66,10 @@ def _real_slots(valid, count: int):
 # wq_b, wk, k_norm and weights_proj carry the V3.2 indexer's declarations
 # under the same names; the pool compression's two tables have no side worth
 # naming and take the shape heuristic.
+SELECTED, SELECTED_AT = "selection_indices", "selection_position"
+"""A k-pool layer's draft reuse leaves (`KPoolSparseAttention._selections`)."""
+
+
 class KPoolIndexer(IndexerFront, nn.Module):
     """The k-pool indexer: which keys each query attends, by pools
     (`Glm5NextTextIndexer`, modeling_glm5_next.py:736-1024).
@@ -210,7 +215,8 @@ class KPoolIndexer(IndexerFront, nn.Module):
         tokens = jnp.where(chosen[..., None] >= 0, chosen_indices, -1).reshape(batch, length, -1)
         if self.always_select_tail and self.kpool > 1:
             tokens = jnp.concatenate([tokens, self._tail(visible)], axis=-1)
-        return tokens
+        # Token indices are int32, as the cache keeps a draft's selection (`selection_indices`), x64 or not.
+        return tokens.astype(jnp.int32)
 
 
 # The latent projections and norms carry MLA's declarations under the same names.
@@ -289,11 +295,9 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
         return False
 
     def _selection(self, x, q_resid, index_keys, keep, freqs_cos, freqs_sin, call, row_valid, *,
-                    slots: jax.Array, allocated: bool = False, committed=None,
-                    prediction_phase: PredictionPhase = "ordinary"):
+                    slots: jax.Array, committed=None, prediction_phase: PredictionPhase = "ordinary"):
         """Select pools, retaining the complete token list for opted-in draft reuse."""
-        if not call.decode or (prediction_phase == "ordinary"
-                               and not self.has_variable("cache", "selection_position")):
+        if not call.decode:
             segments = coordinates_of(call.metadata, *x.shape[:2]).segments
             return self.indexer.select_indices(x, q_resid, index_keys, keep, segments), None
         # SGLang 97c6978 index_topk_share.py:22-28,48-64 carries the complete token list;
@@ -301,34 +305,52 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
         batch, length = x.shape[:2]
         if prediction_phase == "draft" and length != 1:
             raise ValueError("draft index reuse accepts one candidate per row")
-        pools = (self.index_topk or 0) // self.index_kpool
-        count = min(pools, -(-self.max_seq_len // self.index_kpool))
-        width = count * self.index_kpool + (
-            self.index_kpool - 1 if self.index_kpool_always_select_tail else 0
-        )
-        saved = self.variable("cache", "selection_indices", jnp.full, (batch, width), -1, jnp.int32)
-        origin = self.variable("cache", "selection_position", jnp.full, (batch,), -1, jnp.int32)
+        held = cache_variables(self, self._selections(batch))
+        saved, origin = held[SELECTED], held[SELECTED_AT]
         active = jnp.any(row_valid, axis=1)
         if committed is not None:
-            origin.value = jnp.where(active & (origin.value >= committed), -1, origin.value)
+            kept(origin, jnp.where(active & (origin.value >= committed), -1, origin.value), SELECTED_AT)
         hit = (origin.value >= 0) & active if prediction_phase == "draft" else jnp.zeros((batch,), bool)
+        width = saved.value.shape[-1]
         frozen = jnp.broadcast_to(saved.value[:, None], (batch, length, width))
-        if allocated and prediction_phase == "draft":
+        if prediction_phase == "draft":
             indices = nn.cond(
                 jnp.all(hit | ~active), lambda module: frozen,
                 lambda module: module.indexer.select_indices(x, q_resid, index_keys, keep), self)
             indices = jnp.where(hit[:, None, None], frozen, indices)
         else:
             indices = self.indexer.select_indices(x, q_resid, index_keys, keep)
-        if allocated:
-            if prediction_phase == "ordinary":
-                origin.value = jnp.where(active, -1, origin.value)
-            else:
-                last = jnp.max(jnp.where(row_valid, jnp.arange(length), 0), axis=1)
-                publish = active & ~hit
-                saved.value = jnp.where(publish[:, None], indices[jnp.arange(batch), last], saved.value)
-                origin.value = jnp.where(publish, slots[jnp.arange(batch), last], origin.value)
+        if prediction_phase == "ordinary":
+            kept(origin, jnp.where(active, -1, origin.value), SELECTED_AT)
+        else:
+            last = jnp.max(jnp.where(row_valid, jnp.arange(length), 0), axis=1)
+            publish = active & ~hit
+            kept(saved, jnp.where(publish[:, None], indices[jnp.arange(batch), last], saved.value), SELECTED)
+            kept(origin, jnp.where(publish, slots[jnp.arange(batch), last], origin.value), SELECTED_AT)
         return indices, None
+
+    @nn.nowrap
+    def _index_width(self) -> int:
+        """The packed indexer state a token: its keys, its pool gate scores and its validity
+        (`KPoolIndexer.packed`)."""
+        assert self.index_head_dim is not None
+        return 2 * self.index_head_dim + 1
+
+    @nn.nowrap
+    def _selections(self, rows: int) -> dict[str, Opened]:
+        """The draft reuse's leaves for `rows` rows: each row's complete token list a draft published,
+        `[rows, width]`, and the slot it published it at, -1 for none."""
+        pools = (self.index_topk or 0) // self.index_kpool
+        count = min(pools, -(-self.max_seq_len // self.index_kpool))
+        tail = self.index_kpool - 1 if self.index_kpool_always_select_tail else 0
+        width = count * self.index_kpool + tail
+        return {SELECTED: Opened((rows, width), jnp.int32, -1), SELECTED_AT: Opened((rows,), jnp.int32, -1)}
+
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """The latent attention's cache (`MultiHeadLatentAttention.cache_spec`) and the draft reuse's
+        leaves beside it (`_selections`)."""
+        return {**super().cache_spec(rows), **self._selections(rows)}
 
     def _empty_selection(self, selected, row_valid):
         # A valid query that selects no pool, one of the first tokens before
