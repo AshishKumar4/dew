@@ -1506,6 +1506,54 @@ def test_the_forward_on_tcgen05s_rows_over_narrow_value_blocks_holds_check_1_int
                    target=generation.gpu_target("sm100"))
 
 
+@INTERPRETS
+def test_a_refusal_of_the_rows_forwards_rewalk_alone_steps_its_rewalk_alone_interpreted():
+    """The forward pinned on a B200's tcgen05 rows (`ROWS_TILES`), causal and folded over 192 tokens, its
+    fold's rewalk on another family at the tiles that family's derivation gives it (`MosaicForward.completed`,
+    `Tiles.relaunch_family`): a compile's refusal of the rewalk's kernel alone (its spill,
+    `report.refuse_launch`) keeps the rows' own tiles and steps the rewalk to others
+    (`MosaicForward._rewalked_apart`), at which the launch lowers for a B200 and holds check 1 under the
+    interpreter. Refused as one config, the 4B forward's rows stepped down to a block of 16 value columns
+    where its rewalk had spilled (et-rows-spill)."""
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels.templates import report
+    from dew.nn.kernels.templates.attention_mosaic_forward import NATURAL_NAME
+
+    shape, width = (1, 192, 2, 1), 64
+    spans = template.spans(shape[1], shape[1], shape[0], **CALLS["causal"])
+    query, key, value, _ = _drawn(shape, jnp.bfloat16, width=width, value_width=width)(0)
+    target = generation.gpu_target("sm100")
+    fields = ("relaunch_family", "relaunch_q", "relaunch_k", "relaunch_consumers", "relaunch_columns")
+
+    def refused(interpret: bool) -> None:
+        # The pinned config as the launch of `forward` completes it, then its rewalk's launch refused: the
+        # rows' own tiles kept, the rewalk's stepped.
+        op, args = attention_mosaic._forward_call(query, key, value, spans, template.Hooks(), scale=None,
+                                                  natural=False, residuals=template.Kept.NONE)
+        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=interpret)
+        completed = op.completed(ba, ROWS_TILES)
+        assert completed.relaunch_family is not None, completed
+        columns = "" if completed.relaunch_columns is None else f"_columns{completed.relaunch_columns}"
+        report.refuse_launch(op, ba, completed, {f"attention_forward{NATURAL_NAME}{columns}"})
+        stepped = op.completed(ba, ROWS_TILES)
+        assert stepped.relaunch_family is not None, stepped
+        assert dataclasses.replace(stepped, **dict.fromkeys(fields)) == ROWS_TILES, stepped
+        assert [getattr(stepped, name) for name in fields] != [getattr(completed, name) for name in fields]
+
+    with report.refusals():
+        with _device(interpret=True, target=target):
+            refused(interpret=True)
+        with generation.assumed("sm100"):
+            refused(interpret=False)
+        abstract = tuple(jax.ShapeDtypeStruct(array.shape, array.dtype) for array in (query, key, value))
+        with _pinned(ROWS_TILES):
+            lowered_for(lambda q, k, v: attention_mosaic.forward(q, k, v, spans, None, natural=False),
+                        abstract, "sm100")
+        _check_forward("causal", jnp.bfloat16, shape, natural=False, interpret=True, width=width,
+                       value_width=width, tiles=ROWS_TILES, target=target)
+
+
 @pytest.mark.parametrize("count", [0, 1, 2, 3, 4, 5])
 def test_the_rows_issuer_issues_each_tiles_logits_before_the_tile_befores_weighted_values(count):
     """tcgen05's rows' issuer warp over a walk of `count` key tiles (`mosaic_sm100.issued`, its loops run

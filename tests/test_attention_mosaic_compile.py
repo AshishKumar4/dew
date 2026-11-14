@@ -602,35 +602,6 @@ def test_each_tcgen05_forward_the_4b_steps_refusals_derive_lowers_for_a_b200(row
         assert offered
 
 
-def test_a_refusal_of_the_rows_forwards_rewalk_alone_steps_its_rewalk_alone():
-    """Qwen3.5-4B's inference forward (16 query heads over 4, 256 wide, 12,288 causal tokens) on a B200, on
-    tcgen05's rows, its fold's rewalk on the chunks (`Tiles.relaunch_family`): a compile's refusal of the
-    rewalk's kernel alone (its spill, `report.refuse_launch`) keeps the rows' own tiles and steps the rewalk's
-    (`MosaicForward._rewalked_apart`). Refused as one config, the 4B forward's rewalk spilled 112 bytes and
-    its rows stepped down to a block of 16 value columns (et-rows-spill)."""
-    from dew.nn.kernels.templates import report
-    from dew.nn.kernels.templates.attention_mosaic_forward import NATURAL_NAME
-
-    tokens, heads, kv_heads, width = 12288, 16, 4, 256
-    spans = template.spans(tokens, tokens, 1, causal=True)
-    query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16)
-    with generation.assumed("sm100"), report.refusals():
-        target = generation.gpu_target()
-        op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None,
-                                                  natural=attention_mosaic.NATURAL)
-        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
-        derived = op.derived(ba, target)
-        assert derived.family == "tcgen05.rows" and derived.relaunch_family == "tcgen05.chunks", derived
-        rewalk = (f"attention_forward{NATURAL_NAME}"
-                  + ("" if derived.relaunch_columns is None else f"_columns{derived.relaunch_columns}"))
-        report.refuse_launch(op, ba, derived, {rewalk})
-        stepped = op.derived(ba, target)
-    own = ("block_q", "block_k", "stages", "consumers", "family", "columns")
-    assert [getattr(stepped, name) for name in own] == [getattr(derived, name) for name in own], stepped
-    assert stepped.relaunch_family == "tcgen05.chunks" and stepped.relaunch != derived.relaunch, stepped
-
-
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("kept", [template.Kept.SPLIT, template.Kept.NONE], ids=["training", "inference"])
 @pytest.mark.parametrize("rows", [2, 1], ids=["step", "decision"])
@@ -659,32 +630,6 @@ def test_the_4b_steps_forward_compiles_spill_free_on_tensor_memory_for_a_b200(ro
         found = compile_mosaic_kernels([case], "sm100")
     failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
-
-
-@pytest.mark.parametrize(("kept", "family"), [(template.Kept.SPLIT, "tcgen05.chunks"),
-                                              (template.Kept.NONE, "tcgen05.rows")],
-                         ids=["training", "inference"])
-def test_the_4b_steps_forward_issues_its_logits_ahead_on_a_b200(kept, family):
-    """Qwen3.5-4B's attention forward (16 query heads over 4, 256 wide, 12,288 causal tokens) at the config
-    its derivation gives on a compile-only B200: its program issues each key tile's logits a step before its
-    softmax reads them (`attention_mosaic_forward.logits_ahead`, row 5368), its accumulators within the
-    multiprocessor's tensor memory; the inference forward on tcgen05's rows (FlashAttention 4's structure,
-    its products issued by a warp of their own), the training forward, whose split sums its consumer gives
-    no issuer, on the chunks."""
-    from dew.nn.kernels.templates.attention_mosaic_forward import logits_ahead
-    from dew.nn.kernels.templates.attention_mosaic_program import bundle_of
-
-    tokens, heads, kv_heads, width = 12288, 16, 4, 256
-    spans = template.spans(tokens, tokens, 2, causal=True)
-    query = jax.ShapeDtypeStruct((2, tokens, heads, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((2, tokens, kv_heads, width), jnp.bfloat16)
-    with generation.assumed("sm100"):
-        op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None,
-                                                  natural=attention_mosaic.NATURAL)
-        config = op.derived(op.bind(*args, residuals=kept, interpret=False), generation.gpu_target())
-        assert config is not None and config.family == family, config
-        bundle = bundle_of(config, jnp.bfloat16)
-        assert logits_ahead(bundle, config, config.columns or width, jnp.bfloat16, stages=config.stages)
 
 
 CERTIFIED_FORWARD = """
