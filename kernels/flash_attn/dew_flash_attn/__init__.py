@@ -70,7 +70,8 @@ def registered() -> None:
 
 _registered = registered
 """The name Dew's releases through dewml 0.1.1, and its main until it loads this wheel through the
-`dew.kernel_wheels` group, call; this wheel's next release after Dew's lock takes 0.3.11 drops it."""
+`dew.kernel_wheels` group, call. Those releases take any 0.3 wheel (`~=0.3.9`), so every 0.3 release keeps it;
+0.4.0, which they exclude, drops it."""
 
 
 def _call(name: str, results):
