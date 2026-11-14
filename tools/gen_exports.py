@@ -39,6 +39,18 @@ def imports(package: str, exports: dict[str, str]) -> list[str]:
             *(f"    from {module} import {', '.join(names)}" for module, names in named.items())]
 
 
+def exported(tree: ast.Module) -> dict[str, str]:
+    """A lazy package's `_EXPORTS` read from its `__init__.py`'s tree, the literal dict of each name to the
+    absolute module that defines it (`dew._exports.lookup`), or to the package's own module of that name;
+    empty where it assigns none. The one reader of the declaration: this tool writes the package's blocks from
+    it, and tools/lint_layers.py follows the imports a lookup of each name runs."""
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "_EXPORTS"
+                                                for target in node.targets):
+            return ast.literal_eval(node.value)
+    return {}
+
+
 def written(path: Path, root: Path) -> str:
     """`path`, a package's `__init__.py` under the import root `root`, with its TYPE_CHECKING imports and
     `__all__` written from its `_EXPORTS`."""
@@ -46,7 +58,7 @@ def written(path: Path, root: Path) -> str:
     tree = ast.parse(text)
     assigned = {target.id: node for node in tree.body if isinstance(node, ast.Assign)
                 for target in node.targets if isinstance(target, ast.Name)}
-    exports = ast.literal_eval(assigned["_EXPORTS"].value)
+    exports = exported(tree)
     checking = next(node for node in tree.body if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
                     and node.test.id == "TYPE_CHECKING")
     lines = text.splitlines()
