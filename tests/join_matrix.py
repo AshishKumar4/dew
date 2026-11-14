@@ -12,8 +12,8 @@ The kernels under test are the joins', named `joined` where the cells run them (
 projections apart where the join measured no faster on the generation, `dew.nn.joined.JOINED_FASTER`): the
 cells' `CHOICES` are `gate_up` and `delta_gates`, a cell running its own. Every other choice a layer reports
 (the products' `grouped_matmul`, the gated product's `swiglu`, the delta net's `rms_norm`, `short_conv` and
-`gated_delta_rule`) runs at XLA, named in the cell (`XLA`), so the layer's other kernels leave the join's
-check as it is.
+`gated_delta_rule`) runs at XLA, and the fused MLP's `gated_mlp` apart, each named in the cell (`UNFUSED`), so
+the layer's other kernels leave the join's check as it is.
 
 What the route serves is read from the join's own selector: the layer traced for its shapes as the case's
 generation with the join named, the route its choice reports for the layer's projections
@@ -46,12 +46,14 @@ GATE_MULTIPLIER = 0.75
 """A scaled gate's multiplier (Falcon-H1's `mlp_multipliers`)."""
 CHOICES = frozenset({"gate_up", "delta_gates"})
 """The `generation.CHOICES` entries the cells run, a cell its case's join: each cell asserts that the routes
-it records run that join `joined` and that every choice outside `CHOICES` runs at XLA, which together reach
-them all."""
+it records run that join `joined` and that every choice outside `CHOICES` runs unfused (`UNFUSED`), which
+together reach them all."""
 KERNELS = {"gate_up": frozenset({"joined"}), "delta_gates": frozenset({"joined"})}
 """The kernels under test of each choice the cells run: the join's projections as one."""
-XLA = dict.fromkeys(("grouped_matmul", "swiglu", "rms_norm", "short_conv", "gated_delta_rule"), "xla")
-"""The layers' other choices, named XLA in every cell."""
+UNFUSED = {**dict.fromkeys(("grouped_matmul", "swiglu", "rms_norm", "short_conv", "gated_delta_rule"),
+                           "xla"), "gated_mlp": "apart"}
+"""The layers' other choices, each named unfused in every cell: XLA's, and the fused MLP's projections
+apart."""
 
 
 def _applies(case: dict[str, str]) -> bool:
@@ -81,14 +83,14 @@ def _input(case: dict[str, str]):
 def supported(case: dict[str, str]) -> bool:
     """Whether the route serves `case` (tests/kernel_matrix.py): its layer, which its join has (`_applies`),
     traced for its shapes as its generation within an abstract mesh of one of its devices, the join named and
-    the layer's other choices at XLA, reports the `joined` kernel for its join."""
+    the layer's other choices unfused (`UNFUSED`), reports the `joined` kernel for its join."""
     if not _applies(case):
         return False
     layer = _layer(case)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), case["generation"])
     params = jax.eval_shape(layer.init, jax.random.key(0), _input(case))
     with (generation.assumed(case["generation"]), jax.sharding.use_abstract_mesh(mesh),
-          generation.chosen(**XLA, **{case["join"]: "joined"}), generation.routes() as routes):
+          generation.chosen(**UNFUSED, **{case["join"]: "joined"}), generation.routes() as routes):
         jax.eval_shape(layer.apply, params, _input(case))
     return [route.kernel for route in routes if route.choice == case["join"]] == ["joined"]
 
@@ -117,7 +119,7 @@ def a_joined_layers_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The layer's training step of `case` on its GPU with its two projections joined on par with the
     projections apart (check 1): the output and the gradients of the input and every parameter, from the layer
     with them apart in float64. A gated MLP's biases are drawn too, which init leaves at zero. The routes it
-    records run its join `joined` and every other choice at XLA (`CHOICES`)."""
+    records run its join `joined` and every other choice unfused (`CHOICES`, `UNFUSED`)."""
     combination = dict(zip(AXES["join"], case, strict=True))
     layer = _layer(combination)
     dtype = jnp.dtype(combination["dtype"])
@@ -125,11 +127,12 @@ def a_joined_layers_training_step_is_on_par(case: tuple[str, ...]) -> None:
     if combination["join"] == "gate_up":
         params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(jax.random.key(6), leaf.shape),
                               params)
-    with generation.chosen(**XLA), generation.routes() as routes:
+    with generation.chosen(**UNFUSED), generation.routes() as routes:
         assert_joined_as_exact(combination["join"], with_gradients(layer.apply),
                                drawing(params, (*ROWS, FEATURES), dtype),
                                with_gradients(layer.clone(dtype=jnp.float64).apply), "-".join(case),
                                seeds=SEEDS)
     recorded = {(found.choice, found.kernel) for found in routes}
-    unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
+    unnamed = sorted(pair for pair in recorded
+                     if pair[0] not in CHOICES and pair[1] != UNFUSED.get(pair[0], "xla"))
     assert (combination["join"], "joined") in recorded and not unnamed, (sorted(recorded), unnamed)

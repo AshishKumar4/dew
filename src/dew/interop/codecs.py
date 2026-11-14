@@ -75,7 +75,7 @@ from dew.interop import unread
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.unread import Stored, Unread
 from dew.interop.weights import checkpoint_array, checkpoint_dtype
-from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, Block, block_sides, fp8_blocks_on_host
+from dew.nn.fake_quant import E2M1, E2M1_MAX, E2M1_MIDPOINTS, E4M3_MAX, Block, block_sides, fp8_blocks_on_host
 
 # --------------------------------------------------------------------------
 # E2M1 codes under E8M0 exponents, shared by every FP4 format
@@ -304,7 +304,7 @@ def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
     if values.ndim != 3:
         raise ValueError(f"MXFP4 takes an [expert, input, output] weight, got {values.shape}")
     groups = _float_groups(values.swapaxes(1, 2), "MXFP4", ml_dtypes.bfloat16).astype(np.float32)
-    bits = (np.abs(groups).max(-1) / np.float32(6)).view(np.uint32)
+    bits = (np.abs(groups).max(-1) / np.float32(E2M1_MAX)).view(np.uint32)
     exponents = ((bits + np.uint32(0x007fffff)) >> 23).astype(np.uint8)
     codes = encode_e2m1(groups / e8m0_scales(exponents)[..., None], ties='away')
     return codes.reshape(*exponents.shape, GROUP // 2), exponents
@@ -985,8 +985,8 @@ def quantize_deepseek_v4_fp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]
     nearest E2M1 value, ties to even. An all-zero group takes byte 1.
     """
     groups = _float_groups(weight, "DeepSeek-V4 FP4", ml_dtypes.bfloat16).astype(np.float32)
-    amax = np.maximum(np.abs(groups).max(-1), np.float32(6 * 2.0 ** -126))
-    exponents = _ceil_exponent(amax * np.float32(1 / 6)).astype(np.uint8)
+    amax = np.maximum(np.abs(groups).max(-1), np.float32(E2M1_MAX * 2.0 ** -126))
+    exponents = _ceil_exponent(amax * np.float32(1 / E2M1_MAX)).astype(np.uint8)
     codes = encode_e2m1(groups / e8m0_scales(exponents)[..., None], ties='even')
     return (codes.reshape(*groups.shape[:-2], groups.shape[-2] * GROUP // 2).view(np.int8),
             exponents.view(ml_dtypes.float8_e8m0fnu))
@@ -1380,7 +1380,7 @@ def _block_structure(weights: Mapping[str, object]) -> tuple[int, int] | None:
 
 
 def _code_range(scheme: _WeightScheme) -> tuple[float, float]:
-    return ((-448.0, 448.0) if scheme.kind == 'float'
+    return ((-E4M3_MAX, E4M3_MAX) if scheme.kind == 'float'
             else (-(1 << (scheme.bits - 1)), (1 << (scheme.bits - 1)) - 1))
 
 
@@ -1549,7 +1549,7 @@ def _ct_encode(name: str, weight: np.ndarray, *, scheme: _WeightScheme,
         quotients = weight.astype(np.float32) / _nvfp4_scales(
             scheme, scales, stored["global"], shape
         )
-        out[parts['packed']] = encode_e2m1(np.clip(quotients, -6.0, 6.0), ties='even')
+        out[parts['packed']] = encode_e2m1(np.clip(quotients, -E2M1_MAX, E2M1_MAX), ties='even')
         return out
     held = np.asarray(weight)
     # Two float dtypes that differ promote to float32 in torch.
@@ -1724,7 +1724,7 @@ def _modelopt_encode(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored
         raise ValueError(f"{name} has a zero ModelOpt weight scale and trained values outside its grid")
     quotients = np.divide(weight.astype(np.float32), effective, out=np.zeros_like(effective),
                           where=effective != 0)
-    packed = encode_e2m1(np.clip(quotients, -6, 6), ties='even')
+    packed = encode_e2m1(np.clip(quotients, -E2M1_MAX, E2M1_MAX), ties='even')
     low_zero = ((original & 15) == 8) & (weight[..., 0::2] == 0)
     high_zero = ((original >> 4) == 8) & (weight[..., 1::2] == 0)
     packed = np.where(low_zero, (packed & 0xf0) | 8, packed)

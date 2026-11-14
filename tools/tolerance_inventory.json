@@ -205,10 +205,6 @@
    "comparisons": 9,
    "lane": "Training"
   },
-  "tests/test_fla_gdn.py": {
-   "comparisons": 19,
-   "lane": "Recurrence & Dory"
-  },
   "tests/test_flaxdiff.py": {
    "comparisons": 6,
    "lane": "Models, Serving & RL"
@@ -262,7 +258,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoder_hybrids.py": {
-   "comparisons": 9,
+   "comparisons": 8,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoder_moe.py": {
@@ -498,7 +494,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_rae.py": {
-   "comparisons": 7,
+   "comparisons": 5,
    "lane": "Models, Serving & RL"
   },
   "tests/test_rcm.py": {
@@ -530,7 +526,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_sd3_source.py": {
-   "comparisons": 17,
+   "comparisons": 12,
    "lane": "Models, Serving & RL"
   },
   "tests/test_sequence_parallel.py": {
@@ -622,7 +618,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_wan_vae.py": {
-   "comparisons": 9,
+   "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
   "tests/test_whole_validation.py": {

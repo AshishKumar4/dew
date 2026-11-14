@@ -70,7 +70,7 @@ from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.options import Compiling, attempting, owned_program
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches
+from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches, placing
 from dew.objectives.base import (
     Aux,
     Initializer,
@@ -152,7 +152,7 @@ from dew.training._fit import (
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau
 from dew.training.cadence import Counted
-from dew.training.compiler import Compiled, CompiledStep, StepCompiler, freshly_held, released
+from dew.training.compiler import Compiled, CompiledStep, StepCompiler, freshly_held
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -177,7 +177,7 @@ from dew.training.memory import first_run, local_devices, recompute_record, refu
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, model_batch, prepare_counts, uncounted
 from dew.training.observe import Observe
 from dew.training.phase_passes import PhasePasses
-from dew.training.planning import Candidate, Planned, Trials, read_whole, splits
+from dew.training.planning import Candidate, Planned, Trials, read_whole, released, splits
 from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, waited_export
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process, signal_wake
@@ -914,11 +914,15 @@ class Trainer(Generic[Loss, Effects]):
         """What a traced step reads from context: the mesh, the pipeline's
         microbatch count, the layout's rules, which place the activations
         the model constrains (`dew.nn.sharding.constrain`) as they place the
-        parameters, and the links of the axes the step measured, none by
-        default. An abstract mesh is a GPU's this process lacks (`_candidates.lowered_for`)."""
+        parameters, the links of the axes the step measured, none by
+        default, and the layout itself with the axes the modules declared
+        (`placing`, `_declared`), where a projection mapped per shard reads
+        its weight's placement (`Layout.leaf_spec`). An abstract mesh is a
+        GPU's this process lacks (`_candidates.lowered_for`)."""
         on = jax.sharding.use_abstract_mesh(mesh) if isinstance(mesh, AbstractMesh) else jax.set_mesh(mesh)
-        with (on, pipeline_microbatches(self.microbatches) as schedule, self._staging.held(),
-              nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
+        with (on, pipeline_microbatches(self.microbatches) as schedule, self._declared(),
+              nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links),
+              placing(self.layout)):
             yield schedule
 
     def _step_body(self, shapes, copies, split: int, resting: Mapping[str, object] | None = None,
@@ -1852,8 +1856,7 @@ class Trainer(Generic[Loss, Effects]):
                 cooled=True)
         if checkpoints is not None and not cut:
             checkpoints.cooling(None)
-        for leaf in (leaf for leaf in jax.tree.leaves(apart(cooled)[0]) if not leaf.is_deleted()):
-            leaf.delete()
+        released(apart(cooled)[0])
         restored = together(restore(), frozen)
         if reading:
             run.train = self._prefetched(plan, run, plan.dataset.train(run.partition), position)

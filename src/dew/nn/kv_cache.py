@@ -48,6 +48,7 @@ from jax.sharding import PartitionSpec as P
 from dew.batch import prefix_sum
 from dew.mesh import LayoutRefused, logical_spec, mesh_axes
 from dew.nn.derivatives import KernelGlue, contracted
+from dew.nn.fake_quant import E4M3_MAX
 from dew.nn.host_memory import fetched, fetched_at, on_host, placed_like, stored_at
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, Choice, backend
@@ -102,7 +103,7 @@ decoding layer that rounds stochastically (a quantized memory's moving weights) 
 place and head, so a row's draws are its request's key's and its places' alone; a serving driver writes
 it from the request's key (`with_rounding_keys`), zeros where none does."""
 
-_LIMITS = {"int8": 127.0, "float8_e4m3fn": float(jnp.finfo(jnp.float8_e4m3fn).max)}
+_LIMITS = {"int8": 127.0, "float8_e4m3fn": E4M3_MAX}
 
 
 def leaf_name(path: tuple[jax.tree_util.KeyEntry, ...]) -> str | None:

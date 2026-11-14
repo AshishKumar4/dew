@@ -71,7 +71,7 @@ def _product(layer: nn.Dense | nn.DenseGeneral):
     product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
     plain = layer.dot_general in (None, float32_dot_general)
     if not intercepted():
-        return projections.dot_general(product) if plain else product
+        return projections.dot_general(product, projections.kernel_path(layer)) if plain else product
     refuse_recipe("a wrapper's product (an adapter's, a quantizer's)")
     return product
 

@@ -165,6 +165,77 @@ def torch_arms(reference, truth, *, widening=None):
     return arm(reference, contextlib.nullcontext), arm(truth, float64 if widening is None else widening)
 
 
+def dtype_arms(run):
+    """`run(dtype, *inputs)` in float32, and in float64 inside `float64` (`torch_arms`)."""
+    import torch
+
+    return torch_arms(lambda *inputs: run(torch.float32, *inputs),
+                      lambda *inputs: run(torch.float64, *inputs))
+
+
+def torch_coder_walk(model, call, dtype, inputs) -> dict:
+    """A source autoencoder's vector-Jacobian product, as check 1 compares it (`coder_walk`): `call(model,
+    operand)`'s outputs, a tuple, over a draw's channel-first `operand` at `dtype`, each dotted with its
+    probe among the draw's `probes`, differentiated for the operand and every parameter the source trains:
+    the outputs and the operand's gradient channels last, each parameter's gradient by its name, zero
+    where the outputs do not reach it."""
+    import torch
+
+    def tensor(value):
+        return torch.from_numpy(np.asarray(value)).to(dtype)
+
+    named = [(name, value) for name, value in model.named_parameters() if value.requires_grad]
+    with torch.enable_grad():
+        operand = tensor(inputs["operand"]).requires_grad_()
+        outputs = call(model, operand)
+        loss = torch.zeros((), dtype=dtype)
+        for output, probe in zip(outputs, inputs["probes"], strict=True):
+            loss = loss + (output * tensor(probe)).sum()
+        every = [operand, *(value for _, value in named)]
+        found = torch.autograd.grad(loss, every, allow_unused=True)
+    gradients = [torch.zeros_like(value) if gradient is None else gradient
+                 for gradient, value in zip(found, every, strict=True)]
+    return {"outputs": tuple(channels_last(output.detach().numpy()) for output in outputs),
+            "operand": channels_last(gradients[0].numpy()),
+            "parameters": {name: gradient.numpy()
+                           for (name, _), gradient in zip(named, gradients[1:], strict=True)}}
+
+
+def coder_walk(call, params, layouts):
+    """Dew's arm of a source autoencoder's vector-Jacobian product (`torch_coder_walk`), run as given:
+    `call(params, operand)`'s outputs, a tuple, over a draw's channel-first `operand` moved channels last,
+    each dotted with its probe, differentiated for the operand and the parameters, each of `layouts`'
+    parameters' gradient written into its source tensor's layout as an export writes it, by the source
+    tensor's name."""
+    @jax.jit
+    def pulled(params, operand, probes):
+        outputs, pull = jax.vjp(call, params, operand)
+        return outputs, pull(probes)
+
+    @as_given
+    def walked(inputs):
+        probes = tuple(channels_last(probe) for probe in inputs["probes"])
+        outputs, (grad_params, grad_operand) = pulled(params, channels_last(inputs["operand"]), probes)
+        exported = {"autoencoder": grad_params}
+        return {"outputs": tuple(np.asarray(output) for output in outputs),
+                "operand": np.asarray(grad_operand),
+                "parameters": {layout.name.removeprefix("vae/"): np.asarray(layout.export(exported))
+                               for layout in layouts}}
+    return walked
+
+
+def coder_draw(salt: int, operand: tuple[int, ...], outputs: tuple[tuple[int, ...], ...], *, uniform: bool):
+    """Check 1's draw of a coder walk (`coder_walk`): a channel-first operand of shape `operand`, pixels
+    uniform in [-1, 1] where `uniform` else a standard normal code, and a standard normal probe of each of
+    `outputs`' shapes, a stream of its own by `salt`."""
+    def draw(seed):
+        generator = np.random.default_rng([salt, seed])
+        given = (generator.uniform(-1, 1, operand) if uniform else generator.standard_normal(operand))
+        return ({"operand": given.astype(np.float32),
+                 "probes": tuple(generator.standard_normal(shape).astype(np.float32) for shape in outputs)},)
+    return draw
+
+
 def transformers_arms(model, run, *, source=None, twin=None):
     """Check 1's reference and truth over the transformers `model` (`torch_arms`): `run(model, *inputs)` on
     a draw's inputs as torch tensors (integers as int64), by `model` and by the float64 twin

@@ -27,10 +27,12 @@ from interop_support import (
     assert_autoencoder_vjp,
     assert_layout_tensors,
     channels_last,
+    dtype_arms,
     extract_fixture,
     fixture_arrays,
     scaled_gap,
 )
+from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from tool_support import load
 
 from dew.interop.autoencoders.rae import UNREAD, load_dinov2, load_rae
@@ -155,13 +157,21 @@ def test_the_published_rae_matches_the_source(name, monkeypatch):
     assert all(gaps[key] < bounds[key] for key in gaps), (gaps, bounds)
 
 
+PLAIN_SEEDS = 8
+"""The plain DINOv2's declared check-1 seeds, sized paired by `seeds_for` on armada (11-14)."""
+
+
 def test_the_plain_dinov2_matches_transformers(source, tmp_path):
-    """transformers' `Dinov2Model` (no registers, the final norm kept):
-    patch tokens of a normalized 112-pixel batch, the 37x37 table resized to
-    the grid without antialiasing, and the gradient of a probe against the
-    pixels."""
+    """transformers' `Dinov2Model` (no registers, the final norm kept), loaded from the fixture's files:
+    patch tokens of drawn 112-pixel batches, the 37x37 table resized to the grid without antialiasing,
+    and the gradient of a drawn probe against the pixels, on par (check 1) with Dew's, its float64 twin
+    the truth (ledger 705)."""
+    import torch
+    from transformers import Dinov2Model
+
+    from _dew_torch.precision import float64_twin
+
     module, params, layouts = load_dinov2(source / "dinov2_plain")
-    reference = dict(np.load(source / "dinov2_plain" / "reference.npz"))
     assert {layout.name for layout in layouts} == {
         f"dinov2/{name}"
         for name in component_tensors(source / "dinov2_plain", "")
@@ -173,17 +183,35 @@ def test_the_plain_dinov2_matches_transformers(source, tmp_path):
     rebound, supplied, supplied_layouts = load_dinov2(metadata, params=params)
     assert supplied is params and supplied_layouts == ()
     module = module.clone(input_size=112)
-    pixels = channels_last(reference["pixels"])
-    tokens = module.apply({"params": params}, pixels)
-    np.testing.assert_array_equal(
-        rebound.clone(input_size=112).apply({"params": supplied}, pixels), tokens)
-    assert tokens.shape == (1, 8, 8, 64)
-    probe = reference["probe"].reshape(1, 8, 8, 64)
-    grad = jax.grad(lambda pixels: jnp.sum(module.apply({"params": params}, pixels) * probe))(pixels)
-    gaps = {"tokens": scaled_gap(tokens.reshape(1, 64, 64), reference["tokens"]),
-            "gradient": scaled_gap(grad, channels_last(reference["grad_pixels"]))}
-    print(f"plain DINOv2 gaps {gaps}")
-    assert gaps["tokens"] < FORWARD and gaps["gradient"] < GRADIENT, gaps
+    narrow = Dinov2Model.from_pretrained(source / "dinov2_plain", local_files_only=True).eval()
+    models = {torch.float32: narrow, torch.float64: float64_twin(narrow)}
+
+    def draw(seed):
+        generator = np.random.default_rng([710, seed])
+        return (generator.standard_normal((1, 3, 112, 112)).astype(np.float32),
+                generator.standard_normal((1, 64, 64)).astype(np.float32))
+
+    def tokens(params, pixels):
+        return module.apply({"params": params}, pixels).reshape(1, 64, 64)
+
+    compiled = jax.jit(with_gradients(lambda pixels: tokens(params, pixels)))
+
+    @as_given
+    def native(pixels, probe):
+        out, grad = compiled(jnp.moveaxis(jnp.asarray(pixels), 1, -1), probe)
+        return np.asarray(out), np.moveaxis(np.asarray(grad), -1, 1)
+
+    def walk(dtype, pixels, probe):
+        # Its own graph: the arms run under `torch.no_grad` (`torch_arms`).
+        with torch.enable_grad():
+            return torch_with_gradients(lambda pixels: models[dtype](pixels).last_hidden_state[:, 1:])(
+                np.asarray(pixels, dtype=np.float64 if dtype == torch.float64 else np.float32), probe)
+
+    reference, truth = dtype_arms(walk)
+    assert_as_exact(native, reference, draw, "plain DINOv2", seeds=PLAIN_SEEDS, truth_fn=truth)
+    first = jnp.moveaxis(jnp.asarray(draw(0)[0]), 1, -1)
+    np.testing.assert_array_equal(rebound.clone(input_size=112).apply({"params": supplied}, first),
+                                  module.apply({"params": params}, first))
 
 
 @pytest.mark.network

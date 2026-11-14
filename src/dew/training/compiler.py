@@ -7,7 +7,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import logging
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
@@ -49,6 +49,7 @@ from dew.training.planning import (
     PlanRefused,
     Trials,
     held_objects,
+    released,
     settled,
     splits,
     whole_step_program,
@@ -75,13 +76,6 @@ def freshly_held(state: TrainState) -> TrainState:
     one afresh beside the old one's 16.7 GiB refused the run's third phase (M-MC-3q)."""
     released([state.compute])
     return dataclasses.replace(state, compute=None)
-
-
-def released(trees: Sequence) -> None:
-    """Delete every buffer of `trees`, which nothing reads again: what a step lets go of before the next is
-    planned or built, so the devices hold none of it beside what replaces it."""
-    for leaf in jax.tree.leaves(trees):
-        leaf.delete()
 
 
 def laid_out(state: TrainState, window: int) -> tuple[TrainState, Accumulation | None]:
