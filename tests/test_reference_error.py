@@ -1759,6 +1759,52 @@ def test_a_truths_recording_holds_a_float64_path_to_the_references_function_belo
             assert_truths_as_recorded(recorded, "site", off)
 
 
+def test_a_host_loops_float64_truth_is_held_by_the_programs_it_states():
+    """A float64 truth run as given, a host loop of compiled rows (each row's sums over its own valid length,
+    read from the draw on the host, as a decoder's rows run), states the programs a draw runs (`as_given`'s
+    `programs`), which the certifier traces to count the draw's roundings: it is held to a summarized
+    recording at every seed, and another function, a part in 2**30 off, is refused."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    def draw(seed):
+        rng = np.random.default_rng([5970, seed])
+        return {"x": rng.standard_normal((3, 48)).astype(np.float32), "lengths": rng.integers(16, 49, 3)}
+
+    def evaluate(inputs):
+        rows = [inputs["x"][row, :length] for row, length in enumerate(inputs["lengths"])]
+        return ({f"row{row}": np.cumsum(values, dtype=np.float32) for row, values in enumerate(rows)},
+                {f"row{row}": np.cumsum(values.astype(np.float64)) for row, values in enumerate(rows)})
+
+    summed = jax.jit(jnp.cumsum)
+
+    def rows_of(inputs, scale=1.0):
+        return [(summed, (jnp.asarray(inputs["x"][row, :length], jnp.float64) * scale,))
+                for row, length in enumerate(inputs["lengths"])]
+
+    def truth_of(scale):
+        def run(inputs):
+            with jax.enable_x64(new_val=True):
+                return {f"row{row}": np.asarray(program(*held))
+                        for row, (program, held) in enumerate(rows_of(inputs, scale))}
+        return as_given(run, programs=lambda inputs: rows_of(inputs, scale))
+
+    recorded = recorder.record_case("rows", draw, evaluate, store_inputs=False, summary=True)
+    seeds = int(recorded["rows.seeds"])
+    drawn, reference, truth = indexed_recording(recorded, "rows", seeds, inputs_of=draw,
+                                                truth_fn=truth_of(1.0))
+    def rows(index, inputs):
+        return {f"row{row}": np.asarray(summed(jnp.asarray(inputs["x"][row, :length])))
+                for row, length in enumerate(inputs["lengths"])}
+
+    dew = as_given(rows)
+    assert_as_exact(dew, reference, drawn, "rows", seeds=seeds, truth_fn=truth)
+    _, _, off = indexed_recording(recorded, "rows", seeds, inputs_of=draw, truth_fn=truth_of(1 + 2.0 ** -30))
+    with pytest.raises(UnrecordedTruth):
+        off(np.int32(0), draw(0))
+
+
 def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path):
     """tools/recorded_references.py records a reference over the seeds its own recording resolves, and
     their redraw; check 1 then judges Dew against the recording by its index."""

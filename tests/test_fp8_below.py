@@ -1,4 +1,4 @@
-"""The FP8 products' contract where no kernel reaches parity (`reference_error.assert_fp8_below`,
+"""The FP8 products' contract where no kernel reaches parity (`fp8_below.assert_fp8_below`,
 docs/design/testing.md): an error below a named arm's, judged as check 1 judges, its ratios recorded."""
 
 import json
@@ -8,11 +8,11 @@ import sys
 from pathlib import Path
 from xml.etree import ElementTree
 
+import fp8_below
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import reference_error
-from reference_error import assert_fp8_below
+from fp8_below import assert_fp8_below
 
 from dew.parity import PARITY, GateFailure, Inconclusive
 
@@ -72,7 +72,7 @@ def _judged(dew_fn, named_fn, draw=_codes, codes=lambda rows, matrix, scales: (r
 def holding() -> dict:
     """A form that misses parity and is below the named arm, judged: what the gate recorded of it."""
     _judged(_off(2.0 ** -14), _narrow)
-    return reference_error.BELOW[-1]
+    return fp8_below.BELOW[-1]
 
 
 def test_a_form_that_misses_parity_but_is_below_the_named_arm_holds_and_one_further_fails():
