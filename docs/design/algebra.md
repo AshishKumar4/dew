@@ -138,7 +138,9 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
   reads a link, and a rule set states its rounding class (§6.4). Error is measured per candidate, never held
   as a fact (§1.5).
 - **Rules,** in declared sets in one place, each set tagged with the modes it runs in:
-  - **linear algebra** (compile time and dev time): linearity of sums (`joined`), a laid factor hoisted out
+  - **linear algebra** (compile time and dev time): linearity of sums (`joined`: it changes no shipped
+    program today, and the pass runs 12% slower without it, the rule-set survey of 2026-11-14, which is its
+    receipt), a laid factor hoisted out
     of a sum, distributivity, a product's bilinearity (a shared operand out of two products, a power of two's
     scale on either operand), a row or column scale lifted out of a matrix product along the axis the product
     keeps (a dequant's: `(diag(s) X) Yᵀ ≡ diag(s) (X Yᵀ)`), and a positive scale out of a maximum or a minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign

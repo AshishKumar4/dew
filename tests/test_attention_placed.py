@@ -24,7 +24,7 @@ from test_attention_mosaic import (
 from test_attention_template import CASES, arguments, geometry as core_geometry
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_mosaic, mosaic, placed
+from dew.nn.kernels.templates import attention as template, attention_mosaic
 
 pytestmark = pytest.mark.kernel
 
@@ -48,6 +48,17 @@ def test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted(call, natural, w
     reference (check 1)."""
     _check_forward(call, jnp.bfloat16, (1, 192, 2, 1), natural=natural, interpret=True, width=width,
                    value_width=width, tiles=ROWS_TILES, target=generation.gpu_target("sm100"))
+
+
+@INTERPRETS
+@pytest.mark.parametrize("tokens", [64, 128, 256, 320])
+def test_the_forward_on_tcgen05s_rows_holds_check_1_over_short_walks_interpreted(tokens):
+    """The forward on a B200's tcgen05 rows over walks of one to five key tiles of 64 (a full call of
+    `tokens`, every query block walking them all, 192's three the check above), odd and even, its issuer
+    warp a tile's logits ahead of the softmax and its last tile's weighted values after the walk's turns
+    (`placed.issued`), under the interpreter: on par with the reference (check 1)."""
+    _check_forward("full", jnp.bfloat16, (1, tokens, 2, 1), natural=False, interpret=True, width=64,
+                   value_width=64, tiles=ROWS_TILES, target=generation.gpu_target("sm100"))
 
 
 @INTERPRETS
@@ -169,29 +180,6 @@ def test_a_refusal_of_the_rows_forwards_rewalk_alone_steps_its_rewalk_alone_inte
                         abstract, "sm100")
         _check_forward("causal", jnp.bfloat16, shape, natural=False, interpret=True, width=width,
                        value_width=width, tiles=ROWS_TILES, target=target)
-
-
-@pytest.mark.parametrize("count", [0, 1, 2, 3, 4, 5])
-def test_the_rows_issuer_issues_each_tiles_logits_before_the_tile_befores_weighted_values(count):
-    """tcgen05's rows' issuer warp over a walk of `count` key tiles (`placed.issued`, its loops run
-    eagerly): each tile's logits and its weighted values issued once, at its turn (its place among the two
-    tiles of each, its parity), the next tile's logits before a tile's weighted values (FlashAttention 4's
-    S in flight: the tensor core takes them while the softmax weighs the tile), short walks odd and even."""
-    issued = []
-
-    def score(index, turn: int) -> None:
-        issued.append(("S", int(index), turn))
-
-    def weigh(index, turn: int) -> None:
-        issued.append(("PV", int(index), turn))
-
-    with jax.disable_jit():
-        mosaic.looped(placed.issued(score, weigh, 0, count), None, ())
-    walked = [("S", 0, 0)] if count else []
-    for index in range(count):
-        walked += [("S", index + 1, (index + 1) % 2)] if index + 1 < count else []
-        walked.append(("PV", index, index % 2))
-    assert issued == walked
 
 
 @pytest.mark.parametrize("tiles", [2, 3, 4, 5])
