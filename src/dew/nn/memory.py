@@ -411,6 +411,8 @@ class InContextMemory(LinearProducts):
         places = counted_places(tokens.segments, tokens.valid)
         if places is None:
             places = rows_like(jnp.broadcast_to(jnp.arange(length)[None], (batch, length)), x)
+        # A place is an int32 count, as the cache counts a document's tokens (`COUNT`), x64 or not.
+        places = places.astype(jnp.int32)
         steps = _Steps(query.astype(wide), key.astype(wide), value.astype(wide), theta, mu, a, real, places,
                        self._keys(x))
         hooks, segments = self._route(), tokens.max_segments

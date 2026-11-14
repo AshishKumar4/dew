@@ -251,8 +251,9 @@ def compute_dtype(module: nn.Module, dtype: jax.typing.DTypeLike | None) -> jnp.
     with an input of theirs give."""
     if dtype is not None:
         return jnp.dtype(dtype)
+    # A quantized store's 8-bit codes are no dtype a product computes in.
     floats = [leaf.dtype for leaf in jax.tree.leaves(module.variables.get("params", {}))
-              if jnp.issubdtype(leaf.dtype, jnp.floating)]
+              if jnp.issubdtype(leaf.dtype, jnp.floating) and jnp.dtype(leaf.dtype).itemsize > 1]
     return jnp.dtype(jnp.result_type(*floats)) if floats else jnp.dtype(jnp.float32)
 
 

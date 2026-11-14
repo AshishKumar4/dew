@@ -1360,9 +1360,7 @@ class TorchCausalLM(nn.Module):
         given = {} if laid is None else {COORDINATES_FIELD: laid}
         if not decode:
             return self.logits(tokens, train=train, **given, **packing)
-        if self.graph.attention_impl is None:
-            raise Lacks("cache", "this model runs transformers' own attention, and a decode cache is the one "
-                                 "Dew's attention writes")
+        self._refuse_cache()
         laid = self._laid({**given, **packing})
         if laid is not None and laid.max_segments > 1:
             raise ValueError("a decoding row continues one document, and these rows hold several")
@@ -1391,6 +1389,7 @@ class TorchCausalLM(nn.Module):
         """Open the decode cache of `batch_size` rows (`Decoding`), every slot unfilled. Its leaves are an
         external graph's, which only a step's trace states (`_layer_caches`): the one decoder whose cache's
         opening traces its step, for its shapes alone, where Dew's own decoders' holders state theirs."""
+        self._refuse_cache()
         for layer, zeros in self._layer_caches(batch_size).items():
             self.put_variable("cache", f"layer_{layer}", zeros())
         put_opened(self, cursor(batch_size))
@@ -1489,6 +1488,13 @@ class TorchCausalLM(nn.Module):
         tokens = jnp.zeros(jnp.shape(hidden)[:2], jnp.int32)
         logits, _ = self._run(tokens, train=False, head_input=hidden)
         return logits.astype(at_least_fp32(logits.dtype))
+
+    def _refuse_cache(self) -> None:
+        """Refuse a decode cache to a model on transformers' own attention, which keeps none Dew's
+        attention writes, as the capability it lacks."""
+        if self.graph.attention_impl is None:
+            raise Lacks("cache", "this model runs transformers' own attention, and a decode cache is the one "
+                                 "Dew's attention writes")
 
     def _laid(self, packing: Mapping[str, object]) -> Coordinates | None:
         """The rows' `Coordinates`, their layout past `__call__` (ledger 1122), None for none: a model on

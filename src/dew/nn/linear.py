@@ -442,7 +442,8 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
                        parts=parts, dtype=dtype)
     if decode:
         assert conv_state is not None and held is not None
-        if token is not None:
+        # An initialization runs the general path, where the layer makes its parameters.
+        if token is not None and not module.is_initializing():
             out, history, final = token(mixed, conv_state.value, held.value)
             # The history and the state kept in the cache's dtypes, as they always were.
             kept(conv_state, history.astype(conv_state.value.dtype), 'conv_state')

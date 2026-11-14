@@ -215,7 +215,8 @@ class KPoolIndexer(IndexerFront, nn.Module):
         tokens = jnp.where(chosen[..., None] >= 0, chosen_indices, -1).reshape(batch, length, -1)
         if self.always_select_tail and self.kpool > 1:
             tokens = jnp.concatenate([tokens, self._tail(visible)], axis=-1)
-        return tokens
+        # Token indices are int32, as the cache keeps a draft's selection (`selection_indices`), x64 or not.
+        return tokens.astype(jnp.int32)
 
 
 # The latent projections and norms carry MLA's declarations under the same names.

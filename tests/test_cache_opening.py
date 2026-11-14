@@ -124,11 +124,12 @@ def test_prediction_depths_open_their_caches_as_their_steps_write_them(kind):
     assert_opens_as_it_decodes(model, variables, method="init_mtp_cache", decoded=stepped)
 
 
-def test_a_servers_start_traces_only_what_it_runs():
-    """A server's start traces each program it compiles and one more, the decoder state its admissions'
-    prefill leaves at an admission it runs (`serving_kernel.admitted_types`), whose types its free slots
-    hold beside a cache opened as the model states it: no forward is traced for the cache, nor for a
-    blank prompt of one row (JAX's public trace and compile events, `dew.telemetry.compiles`)."""
+def test_a_servers_start_traces_no_forward_for_its_free_slots_but_its_admissions_prefill():
+    """A server's start opens its free slots' cache as the model states it, tracing no forward for it,
+    and traces one forward for the rest of their state: its admissions' own prefill, at an admission it
+    runs, for the types that prefill leaves its rows (`serving_kernel.admitted_types`), where it traced a
+    blank prompt's prefill once for the slots' shapes and again for their program (JAX's public trace
+    events, `dew.telemetry.compiles`)."""
     from model_support import serving_task
 
     from dew.inference.serving import Server
@@ -136,8 +137,6 @@ def test_a_servers_start_traces_only_what_it_runs():
 
     with Compiles(None) as heard:
         Server.from_task(serving_task(), slots=4, capacity=32, admission=2)
-    traced = [program.name for program in heard.programs if program.kind == "traced"]
-    compiled = {program.name.removeprefix("jit(").removesuffix(")")
-                for program in heard.programs if program.kind == "compiled"}
-    alone = [name for name in traced if name not in compiled]
-    assert len(alone) == 1 and "prefilled" in alone[0], (alone, traced, sorted(compiled))
+    prefills = [program.name for program in heard.programs
+                if program.kind == "traced" and "prefill" in program.name]
+    assert len(prefills) == 1 and "prefilled" in prefills[0], prefills

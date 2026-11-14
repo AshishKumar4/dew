@@ -2165,7 +2165,11 @@ class CausalTransformer(LinearProducts):
 
     @nn.nowrap
     def cache_spec(self, rows: int) -> CacheSpec:
-        """The trunk's decode cache for `rows` rows as its holders state it (`decoder_cache.trunk_cache`)."""
+        """The trunk's decode cache for `rows` rows as its holders state it (`decoder_cache.trunk_cache`);
+        a bidirectional decoder, whose every token reads the whole sequence, keeps none."""
+        if not self.causal:
+            raise ValueError("a bidirectional decoder keeps no decode cache: its every token reads the whole "
+                             "sequence; prefill a canvas's prompt with its causal model")
         return trunk_cache(self, rows)
 
     # The serving and training hooks (`dew.nn.protocols`).
