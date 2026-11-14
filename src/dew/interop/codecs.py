@@ -985,8 +985,8 @@ def quantize_deepseek_v4_fp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]
     nearest E2M1 value, ties to even. An all-zero group takes byte 1.
     """
     groups = _float_groups(weight, "DeepSeek-V4 FP4", ml_dtypes.bfloat16).astype(np.float32)
-    amax = np.maximum(np.abs(groups).max(-1), np.float32(6 * 2.0 ** -126))
-    exponents = _ceil_exponent(amax * np.float32(1 / 6)).astype(np.uint8)
+    amax = np.maximum(np.abs(groups).max(-1), np.float32(E2M1_MAX * 2.0 ** -126))
+    exponents = _ceil_exponent(amax * np.float32(1 / E2M1_MAX)).astype(np.uint8)
     codes = encode_e2m1(groups / e8m0_scales(exponents)[..., None], ties='even')
     return (codes.reshape(*groups.shape[:-2], groups.shape[-2] * GROUP // 2).view(np.int8),
             exponents.view(ml_dtypes.float8_e8m0fnu))
@@ -1549,7 +1549,7 @@ def _ct_encode(name: str, weight: np.ndarray, *, scheme: _WeightScheme,
         quotients = weight.astype(np.float32) / _nvfp4_scales(
             scheme, scales, stored["global"], shape
         )
-        out[parts['packed']] = encode_e2m1(np.clip(quotients, -6.0, 6.0), ties='even')
+        out[parts['packed']] = encode_e2m1(np.clip(quotients, -E2M1_MAX, E2M1_MAX), ties='even')
         return out
     held = np.asarray(weight)
     # Two float dtypes that differ promote to float32 in torch.
@@ -1724,7 +1724,7 @@ def _modelopt_encode(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored
         raise ValueError(f"{name} has a zero ModelOpt weight scale and trained values outside its grid")
     quotients = np.divide(weight.astype(np.float32), effective, out=np.zeros_like(effective),
                           where=effective != 0)
-    packed = encode_e2m1(np.clip(quotients, -6, 6), ties='even')
+    packed = encode_e2m1(np.clip(quotients, -E2M1_MAX, E2M1_MAX), ties='even')
     low_zero = ((original & 15) == 8) & (weight[..., 0::2] == 0)
     high_zero = ((original >> 4) == 8) & (weight[..., 1::2] == 0)
     packed = np.where(low_zero, (packed & 0xf0) | 8, packed)
