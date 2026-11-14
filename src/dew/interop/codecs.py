@@ -75,7 +75,7 @@ from dew.interop import unread
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.unread import Stored, Unread
 from dew.interop.weights import checkpoint_array, checkpoint_dtype
-from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, E4M3_MAX, Block, block_sides, fp8_blocks_on_host
+from dew.nn.fake_quant import E2M1, E2M1_MAX, E2M1_MIDPOINTS, E4M3_MAX, Block, block_sides, fp8_blocks_on_host
 
 # --------------------------------------------------------------------------
 # E2M1 codes under E8M0 exponents, shared by every FP4 format
@@ -304,7 +304,7 @@ def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
     if values.ndim != 3:
         raise ValueError(f"MXFP4 takes an [expert, input, output] weight, got {values.shape}")
     groups = _float_groups(values.swapaxes(1, 2), "MXFP4", ml_dtypes.bfloat16).astype(np.float32)
-    bits = (np.abs(groups).max(-1) / np.float32(6)).view(np.uint32)
+    bits = (np.abs(groups).max(-1) / np.float32(E2M1_MAX)).view(np.uint32)
     exponents = ((bits + np.uint32(0x007fffff)) >> 23).astype(np.uint8)
     codes = encode_e2m1(groups / e8m0_scales(exponents)[..., None], ties='away')
     return codes.reshape(*exponents.shape, GROUP // 2), exponents

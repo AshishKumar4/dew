@@ -76,6 +76,7 @@ from dew.batch import Coordinates, unboxed
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.derivatives import contracted, surrogate
 from dew.nn.fake_quant import (
+    E2M1_MAX,
     E4M3_MAX,
     fp4_codes,
     fp8_block_cast,
@@ -784,7 +785,7 @@ def _cast(qwix: ModuleType, quotients: jax.Array, qtype: jax.typing.DTypeLike):
     if qtype == jnp.float8_e4m3fn:
         return qwix.quantize(fp8_codes(quotients), qtype, calibration_method=f"fixed,{E4M3_MAX:g}")
     return qwix.quantize(fp4_codes(quotients), qtype, tiled_axes={quotients.ndim - 1: 16},
-                         calibration_method="fixed,6")
+                         calibration_method=f"fixed,{E2M1_MAX:g}")
 
 
 def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
@@ -817,7 +818,7 @@ def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     if spec.format == 'modelopt':
         return _modelopt_input_qdq(x, spec, qwix)
     largest = jnp.max(jnp.abs(groups), -1)
-    divisor = jnp.full(largest.shape, 6, jnp.float32)
+    divisor = jnp.full(largest.shape, E2M1_MAX, jnp.float32)
     # CT's local division must round before global scaling, including its bf16 cast.
     scale = jnp.asarray(
         rounded_operand(correctly_rounded_divide(largest.astype(jnp.float32), divisor), x.dtype), jnp.float32)
@@ -858,7 +859,7 @@ def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qwix: ModuleType) ->
     # At g=0 every effective scale falls below the 1e-5 guard and becomes 1;
     # a tiny positive stand-in keeps that result while avoiding 0/0 NaNs.
     global_scale = jnp.where(spec.scale > 0, spec.scale, 1e-12).astype(jnp.float32)
-    denominator = jnp.full(largest.shape, 6, jnp.float32) * global_scale
+    denominator = jnp.full(largest.shape, E2M1_MAX, jnp.float32) * global_scale
     normalized = largest * correctly_rounded_divide(jnp.ones_like(largest), denominator)
     saturated = jnp.minimum(normalized, E4M3_MAX)
     scales = fp8_codes(saturated) * global_scale
