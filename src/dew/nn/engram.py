@@ -50,6 +50,7 @@ from dew.batch import Coordinates, Forks, document_ranks, prefix_sum, real_place
 from dew.nn.dense import Dense
 
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
+from .kv_cache import Opened, cache_variables, compute_dtype, kept, stated
 from .linear import DepthwiseConv1d, _stream_order, fork_histories, forked_conv, held_conv1d
 from .norms import RMSNorm
 from .precision import at_least_fp32, float32_dot_general, rms_statistics
@@ -329,6 +330,12 @@ class EngramHashes(nn.Module):
     spec: Engram
     vocab_size: int
 
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """The decode cache for `rows` rows: each row's last `max_ngram_size - 1` compressed tokens, none
+        at first."""
+        return {"history": Opened((rows, self.spec.max_ngram_size - 1), jnp.int32, _DEAD)}
+
     @nn.compact
     def __call__(self, tokens, coordinates: Coordinates | None, decode: bool, media=None):
         spec, vocab = self.spec, self.vocab_size
@@ -343,17 +350,14 @@ class EngramHashes(nn.Module):
         positions = laid.positions
         size = spec.max_ngram_size
         history = held = None
-        allocated = False
         stop = None if spec.stop_token_id is None else table[spec.stop_token_id]
+        if decode:
+            held = cache_variables(self, self.cache_spec(tokens.shape[0]))["history"]
+            history = held.value
         if laid.forks is not None:
-            cached = decode and self.has_variable('cache', 'history')
-            history = self.get_variable('cache', 'history') if cached else None
             ids, blocked = _forked_lookback(compressed, laid, laid.forks, size, history, stop)
             return spec.hash_ids(ids, blocked, table[spec.pad_token_id])
         if decode:
-            allocated = self.has_variable('cache', 'history')
-            held = self.variable('cache', 'history', jnp.full, (tokens.shape[0], size - 1), _DEAD, jnp.int32)
-            history = held.value
             if positions is None:
                 # The history knows where a row starts; a call's positions do not.
                 positions = jnp.full(tokens.shape, size, jnp.int32)
@@ -362,8 +366,8 @@ class EngramHashes(nn.Module):
             real = valid if laid.segments is None else valid & (jnp.asarray(laid.segments) != 0)
             positions = real_places(valid) if laid.starts is None else document_ranks(real, laid.starts)
         ids, blocked, history = _lookback(compressed, valid, jnp.asarray(positions), size, history, stop)
-        if held is not None and allocated:
-            held.value = history
+        if held is not None:
+            kept(held, history, "history")
         return spec.hash_ids(ids, blocked, table[spec.pad_token_id])
 
 
@@ -482,6 +486,14 @@ class PLELayer(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """The decode cache for `rows` rows: the dilated conv's history of the normed gated lookups, in
+        the layer's compute dtype."""
+        span = (self.kernel_size - 1) * self.dilation + 1
+        return {'conv_state': Opened((rows, span - 1, self.hc_mult * self.emb_features),
+                                     compute_dtype(self, self.dtype))}
+
     @nn.compact
     def __call__(self, streams, hash_ids, call: MixerCall = PLAIN_CALL):
         batch, length, hc, width = streams.shape
@@ -513,11 +525,9 @@ class PLELayer(nn.Module):
         dilated = jnp.zeros((hc * width, span), taps.dtype).at[:, ::self.dilation].set(taps)
         held = None
         if call.decode:
-            allocated = self.has_variable('cache', 'conv_state')
-            held = self.variable('cache', 'conv_state', jnp.zeros, (batch, span - 1, hc * width),
-                                 normed.dtype)
-            if not allocated:
-                return streams
+            spec = self.cache_spec(batch)
+            stated(spec, 'conv_state', (batch, span - 1, hc * width), normed.dtype)
+            held = cache_variables(self, spec)['conv_state']
         if tokens.forks is not None:
             # Each document after its chain's last inputs, a root after the held history; a cached call's
             # cache left as it was (`forked_conv`).
@@ -527,7 +537,8 @@ class PLELayer(nn.Module):
             convolved, history = held_conv1d(normed, dilated.astype(normed.dtype), token_mask,
                                              None if held is None else held.value, segments=segments)
             if held is not None:
-                held.value = history.astype(held.value.dtype)
+                # The history kept in the cache's dtype, as it always was.
+                kept(held, history.astype(held.value.dtype), 'conv_state')
         return streams + (gated + jnp.asarray(convolved)).reshape(streams.shape).astype(streams.dtype)
 
 

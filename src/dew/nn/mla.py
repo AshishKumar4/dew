@@ -41,7 +41,20 @@ from dew.nn.inputs import (
     document_reach,
 )
 from dew.nn.inspection import QK
-from dew.nn.kv_cache import KVCache, cached_validity, open_kv_cache, write_cache
+from dew.nn.kv_cache import (
+    CURSOR,
+    KVCache,
+    KVSpec,
+    Opened,
+    cache_variables,
+    cached_validity,
+    compute_dtype,
+    cursor,
+    kept,
+    open_kv_cache,
+    write_cache,
+    written_as,
+)
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.attention import call_visibility, dense_visibility, group_fields
 from dew.nn.norms import LayerNorm, RMSNorm
@@ -76,26 +89,26 @@ from dew.nn.sparse_selection import (
 )
 from dew.quantization import LinearProducts
 
+INDEX_KEYS = "cached_index"
+"""A sparse latent attention's cached indexer keys, one compact row a token beside its keys."""
 
-def open_latent_cache(module: nn.Module, key, value_dim: int, index_keys, max_seq_len: int, *, valid=None,
-                      layout: KVCache):
+
+def open_latent_cache(module: nn.Module, store: KVSpec, index: Opened | None, key, *, valid=None):
     """Open a sparse latent attention's decode cache: its expanded keys and values, as DeepSeek V3.2
-    stores them, through the attention cache (`open_kv_cache`) in `layout`, and the sparse indexer's
-    keys beside them where `index_keys` is given (None on a layer that owns no indexer and reads
+    stores them, through the attention cache (`open_kv_cache`) as `store` states it, and the sparse
+    indexer's keys beside them where `index` states them (None on a layer that owns no indexer and reads
     another layer's selection), one compact row each, which a paged server keeps as a row's state.
-    Returns the [B, S] slots, an `append` that writes the new rows and returns the whole cache, the
-    index keys last or None, and the attention cache's own append, whose `query` puts a query in the
-    basis the stored keys are in."""
-    positions, written = open_kv_cache(module, key, max_seq_len, valid=valid, value_dim=value_dim,
-                                       layout=layout)
-    cached_index = None if index_keys is None else module.variable(
-        "cache", "cached_index", jnp.zeros, (key.shape[0], max_seq_len, index_keys.shape[-1]),
-        index_keys.dtype)
+    Returns the [B, S] slots of `key`'s tokens, an `append` that writes the new rows and returns the
+    whole cache, the index keys last or None, and the attention cache's own append, whose `query` puts a
+    query in the basis the stored keys are in."""
+    positions, written = open_kv_cache(module, store, key, valid=valid)
+    cached_index = None if index is None else cache_variables(module, {INDEX_KEYS: index})[INDEX_KEYS]
 
     def append(new_key, new_value, new_index_keys):
         full_key, full_value = written(new_key, new_value)
-        if cached_index is not None and written.allocated:
-            cached_index.value = write_cache(cached_index.value, new_index_keys, written.positions)
+        if cached_index is not None:
+            written_as(INDEX_KEYS, cached_index.value.dtype, new_index_keys.dtype)
+            kept(cached_index, write_cache(cached_index.value, new_index_keys, written.positions), INDEX_KEYS)
         return full_key, full_value, None if cached_index is None else cached_index.value
 
     return positions, append, written
@@ -492,6 +505,45 @@ class MultiHeadLatentAttention(LinearProducts):
         """Whether the V3.2 indexer scores the keys beside the attention."""
         return self.index_n_heads is not None
 
+    @nn.nowrap
+    def _kv_spec(self, rows: int) -> KVSpec:
+        """The layer's attention cache for `rows` rows (`KVSpec`): under the sparse layout the expanded
+        keys and values, as DeepSeek V3.2 stores them, else the latent and its rotary part as one head's
+        keys and values, in the dtype its projections give them (`compute_dtype`)."""
+        latent = (self.kv_a_proj_with_mqa, self.kv_a_layernorm)
+        if self.sparse:
+            # The keys and values the latent expands into (`_expand`): the latent's modules' and the
+            # expansion's.
+            producers = (*latent, self.kv_b_proj)
+            expanded = jnp.result_type(*(compute_dtype(module, self.dtype) for module in producers))
+            return KVSpec(self.kv_cache, rows, self.max_seq_len, self.num_heads,
+                          self.qk_nope_head_dim + self.qk_rope_head_dim, expanded, value_dim=self.v_head_dim)
+        dtype = jnp.result_type(*(compute_dtype(module, self.dtype) for module in latent))
+        return KVSpec(self.kv_cache, rows, self.max_seq_len, 1, self.kv_lora_rank, dtype,
+                      value_dim=self.qk_rope_head_dim)
+
+    @nn.nowrap
+    def _index_width(self) -> int:
+        """The width of the indexer's cached key a token (`_index_keys`)."""
+        assert self.index_head_dim is not None
+        return self.index_head_dim
+
+    @nn.nowrap
+    def _index_spec(self, rows: int) -> Opened | None:
+        """The indexer's cached keys for `rows` rows beside the attention's, under the sparse layout of a
+        layer with an indexer of its own; None for one reading another layer's selection."""
+        if not (self.sparse and self.indexed):
+            return None
+        return Opened((rows, self.max_seq_len, self._index_width()), compute_dtype(self.indexer, self.dtype))
+
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """The layer's decode cache for `rows` rows: its attention cache with its cursor, and its
+        indexer's keys beside them (`_index_spec`)."""
+        index = self._index_spec(rows)
+        indexed = {} if index is None else {INDEX_KEYS: index}
+        return {**self._kv_spec(rows).leaves(), **cursor(rows), **indexed}
+
     @property
     def sparse(self) -> bool:
         """Whether each query attends a selection of the keys: this layer's
@@ -859,8 +911,7 @@ class MultiHeadLatentAttention(LinearProducts):
         return self.indexer.rotated_keys(keys, freqs_cos, freqs_sin)
 
     def _selection(self, x, q_resid, index_keys, keep, freqs_cos, freqs_sin, call, row_valid, *,
-                    slots: jax.Array, allocated: bool = False, committed=None,
-                    prediction_phase: PredictionPhase = "ordinary"):
+                    slots: jax.Array, committed=None, prediction_phase: PredictionPhase = "ordinary"):
         """Select candidates and retain the lightning scores for its optional training objective."""
         scores = (self.indexer.scores(x, q_resid, index_keys, freqs_cos, freqs_sin)
                   if self.indexed else None)
@@ -884,15 +935,15 @@ class MultiHeadLatentAttention(LinearProducts):
         # and the appended latents at theirs, while the cached ones keep
         # the angles of the slots they were written at.
         if self.sparse:
-            allocated = self.has_variable("cache", "cache_index")
-            committed = self.get_variable("cache", "cache_index")
+            # Each row's count before the call's tokens join it, none where the call opens the cache.
+            committed = self.get_variable("cache", CURSOR)
             row_valid = jnp.ones(x.shape[:2], bool) if valid is None else jnp.asarray(valid, bool)
-            # Allocate from the actual projection's dtype and retain its one interceptor/dropout
-            # draw. Only the decoupled rope channels change once the cache supplies their slots.
+            # The projection's one interceptor/dropout draw; only the decoupled rope channels change once
+            # the cache supplies their slots.
             key, value = self._expand(latent, rot)
             index_keys = self._index_keys(x, row_valid) if self.indexed else None
-            positions, append, basis = open_latent_cache(self, key, self.v_head_dim, index_keys,
-                                                         self.max_seq_len, valid=valid, layout=self.kv_cache)
+            positions, append, basis = open_latent_cache(self, self._kv_spec(x.shape[0]),
+                                                         self._index_spec(x.shape[0]), key, valid=valid)
             q_rot, rot, freqs_cos, freqs_sin = self._rotated(
                 q_rot, rot,
                 positions if logical_positions is None else logical_positions)
@@ -904,14 +955,14 @@ class MultiHeadLatentAttention(LinearProducts):
             keep = self._visible(positions, key.shape[1])[:, 0]
             selection, _ = self._selection(
                 x, q_resid, index_full, keep, freqs_cos, freqs_sin, call, row_valid, slots=positions,
-                allocated=allocated, committed=committed, prediction_phase=prediction_phase)
+                committed=committed, prediction_phase=prediction_phase)
             mask = selection_mask(selection, key.shape[1])[:, None]
             query_basis, own = basis.query, None
         else:
             # The latent and its rotary part, one head each, as the attention cache's keys and values,
             # the latents read back in their own basis, which the expansion reads.
-            positions, append = open_kv_cache(self, latent[:, :, None], self.max_seq_len, valid=valid,
-                                              value_dim=self.qk_rope_head_dim, layout=self.kv_cache)
+            positions, append = open_kv_cache(self, self._kv_spec(x.shape[0]), latent[:, :, None],
+                                              valid=valid)
             q_rot, rot, _, _ = self._rotated(
                 q_rot, rot,
                 positions if logical_positions is None else logical_positions)

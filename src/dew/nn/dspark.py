@@ -36,6 +36,7 @@ from dew.nn.dense import Dense
 from .deepseek_v4 import DRAFT_CONTEXT, DRAFT_VALID
 from .hyper_connections import Carried, HyperConnections, HyperHead, collapse_by, expand_streams, first_stream
 from .inputs import MixerCall
+from .kv_cache import CacheSpec
 from .norms import RMSNorm
 from .precision import at_least_fp32, float32_dot_general, float32_einsum
 from .protocols import ProjectionGroup
@@ -119,6 +120,12 @@ class DSparkStage(nn.Module):
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """The packed groups its block declares (`ProjectionSites`)."""
         return self.layer.projection_groups()
+
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> CacheSpec:
+        """The stage's window cache for `rows` rows: its block's, under the block's name."""
+        held = self.layer.cache_spec(rows)
+        return {'block': held} if held else {}
 
     def context(self, hidden):
         """The drafter's context off the concatenated target states (v41:1130)."""
