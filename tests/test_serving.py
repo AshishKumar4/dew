@@ -26,6 +26,7 @@ from serving_support import (
     assert_same_draws,
     assert_same_generation,
     assert_served_as_exact,
+    assert_served_through_its_cache_as_exact,
     assert_served_to_the_bit,
 )
 from sharded import assert_sharded
@@ -1164,10 +1165,9 @@ site), a prefix read or not (the hybrid sites), one decode step a call or severa
 sampled one (whose behavior likelihood is held too), a row of attention alone or with a layered or a
 parallel recurrent state, requests alone or mixed mid-flight, speculative blocks, and the meshes
 (`test_a_server_on_a_mesh_draws_what_each_request_draws_alone`, the prefill mesh's site below). The weights'
-form (packed, quantized, adapted, reloaded) is none of them: served and lone run the same weights. One
-dimension no site holds yet: a quantized cache (`KVCache.quantized`), which changes every step's attention
-operands and which no test serves through; its reference must apply the cache's rounding, which the served
-check's full forward does not (ledger 5681)."""
+form (packed, quantized, adapted, reloaded) is none of them: served and lone run the same weights. A
+quantized cache (`KVCache.quantized`), which rounds every step's attention operands, has cells of its own
+(`QUANTIZED_CACHES`)."""
 ARITHMETIC_SEEDS = {"sampled": 256, "several-steps-over-pages": 64, "a-parallel-hybrid": 128,
                     "speculative-blocks": 64}
 PREFILL_MESH_SEEDS = 64
@@ -1182,6 +1182,36 @@ def test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic(cell):
     bound, serving, requests, budget = ARITHMETIC[cell]
     assert_served_as_exact(bound(), requests, f"served arithmetic: {cell}", serving=serving, budget=budget,
                            seeds=(ARITHMETIC_SEEDS[cell],) * 2)
+
+
+QUANTIZED_CACHES = {
+    "int8": {"slots": 2, "capacity": 64, "kv_cache": KVCache(quantized="int8")},
+    "float8-over-pages": {"slots": 2, "capacity": 64, "decode_steps": 3, "prefix_cache": False,
+                          "kv_cache": KVCache(quantized="float8_e4m3fn", page_size=4, pages=12)},
+}
+"""The cells of a server over a quantized cache (`assert_served_through_its_cache_as_exact`), by name: its
+serving options. Each format's own arithmetic: int8 codes of keys in the Hadamard rotation, which every query
+takes, in a dense cache, a decode step a call; float8 codes of the keys as given, in pages of four whose
+scales a read gathers through each row's table, three decode steps a call. No cell reads a prefix's quantized
+pages: a later prompt would read codes an earlier request's round wrote, which its own round's roundings do
+not hold (`Written.started`; ledger 6007)."""
+QUANTIZED_CACHE_LENGTHS = (7, 5, 9)
+QUANTIZED_CACHE_BUDGET = 8
+"""Each quantized-cache cell's prompts, served one a round, and the tokens each draws."""
+QUANTIZED_CACHE_SEEDS = {"int8": 128, "float8-over-pages": 64}
+"""Each quantized-cache cell's declared seeds, sized paired by `seeds_for` on armada's CPUs (2026-11-14,
+kvq-size-1 at 021c8ff5a4c)."""
+
+
+@pytest.mark.parametrize("cell", list(QUANTIZED_CACHES))
+def test_a_server_scores_its_draws_over_a_quantized_cache_as_its_rounding_does(cell):
+    """Each cell of `QUANTIZED_CACHES`: the server's draws score on par with the decoder's own cached decode
+    of them through a cache of the same format, each held to the float64 forward that reads the codes and
+    scales its cache held (check 1, followed)."""
+    assert_served_through_its_cache_as_exact(measured_task(measured_decoder()), QUANTIZED_CACHE_LENGTHS,
+                                             f"served arithmetic: a quantized cache, {cell}",
+                                             serving=QUANTIZED_CACHES[cell], budget=QUANTIZED_CACHE_BUDGET,
+                                             seeds=QUANTIZED_CACHE_SEEDS[cell])
 
 
 @pytest.mark.distributed
