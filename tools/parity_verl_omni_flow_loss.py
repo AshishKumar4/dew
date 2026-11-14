@@ -25,8 +25,9 @@ REPO, COMMIT = "verl-project/verl-omni", "beab6b764b0b666c6de8468bf84b2e7762f434
 SOURCE = "verl_omni/trainer/diffusion/diffusion_algos.py"
 SHA256 = "0cd321e17f50fa624ff682048d9c7ef25ea9ad8d097acc6cf1d6cb938e3c0bee"
 RECORDED = Path(__file__).resolve().parents[1] / "tests/fixtures/rl/recorded_verl_omni_flow_loss.npz"
-ROWS = 64
-"""A transition's samples a draw holds."""
+ROWS = 1024
+"""A transition's samples a draw holds: enough that each seed's gradient, exactly zero wherever the clip holds
+a sample's ratio and one or two roundings elsewhere, resolves its error."""
 CLIP_RANGE = 1e-4
 """The ratio's clip, Flow-GRPO's (`FlowGRPOObjective.clip_range`'s default)."""
 ADV_CLIP_MAX = 5.0
