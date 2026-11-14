@@ -22,14 +22,17 @@ def costed(task: str, word: str) -> str:
     return f"{task}.{word}"
 
 
-SITE_TARGETS = 4
+SITE_TARGETS = 2
 """How many of the plan's targets (a row's seconds, .armada.json's) a site's map task of its declared cut may
 take before the plan cuts it finer (ci.py's `cut_draws`). Every map task pays its site's setup again, so cut
 down to one target, sites declared at 8 to 64 draws a task ran as 640 tasks of one or two draws: of the
 suite's 167 check-1 task-hours 56 were their setups (2026-11-12, the run at ac69e5e9ede; by the 115 sites'
-recorded costs, 11,436 map tasks and 483 h cut to one target, 4,647 and 327 h to four). A task of four
-targets, 480 s, stays under the run's longest (packed rows of 900 to 1,400 s), as row 4376's 966 s shard,
-eight targets, did not."""
+recorded costs, 11,436 map tasks and 483 h cut to one target, 4,647 and 327 h to four). A site's chain is its
+longest map task and then its judge, which a train waits for: at four targets, 480 s of draws and a judge of up
+to 320 s set the wall of every train past the owner's 15 minutes, whose bound for a row is 530 to 730 s
+(2026-11-14: test_narrow's 955 s chain, test_parallelism_matrix's 915 s; Main's target). Two targets, 240 s,
+hold a chain within it; the setups they add fall in a pool that is not the limit (300 to 460 containers of
+688)."""
 
 
 @dataclasses.dataclass(frozen=True)

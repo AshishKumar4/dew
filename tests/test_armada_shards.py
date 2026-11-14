@@ -174,13 +174,14 @@ def test_a_sites_unmeasured_map_tasks_weigh_its_measured_ones_rate_not_a_record_
     assert [weighed[name] for name in names] == [40.0, 80.0, 80.0]
 
 
-def test_a_sites_map_tasks_keep_their_declared_cut_within_four_targets_and_are_cut_finer_past_them(
+def test_a_sites_map_tasks_keep_their_declared_cut_within_two_targets_and_are_cut_finer_past_them(
         ci, tmp_path):
-    """A site's map tasks keep the cut its mark declares while a task of it takes at most four of the plan's
+    """A site's map tasks keep the cut its mark declares while a task of it takes at most two of the plan's
     targets by its measured rate (`costs.SITE_TARGETS`): every map task pays the site's setup again, so cut
     down to one target, sites declared at 8 to 64 draws a task ran as 640 tasks of one or two draws, and a
-    third of the suite's check-1 seconds were their setups (2026-11-12: 56 of 167 task-hours). One whose
-    declared task passes four targets is cut finer: as many units a task as four targets hold at that rate,
+    third of the suite's check-1 seconds were their setups (2026-11-12: 56 of 167 task-hours); and its chain,
+    its longest map task then its judge, holds within a train's wall bound (2026-11-14). One whose declared
+    task passes two targets is cut finer: as many units a task as two targets hold at that rate,
     each weighed at it, its later stage later still, and none is cut coarser than declared (row 4376: a
     64-seed shard of test_recurrence_template_stability ran 966 s, the train's critical path, where every
     other group took 256 s or less)."""
@@ -193,13 +194,13 @@ def test_a_sites_map_tasks_keep_their_declared_cut_within_four_targets_and_are_c
                 if entry["python"] == "3.12" and ".draws-" in entry["split"]]
 
     declared = ["test_site.draws-0-4", "test_site.draws-4-12", "test_site.draws-12-20"]
-    # 4 seeds in 40 s: 10 s a seed, so a task of the declared 8 takes 80 s: past the 30 s target, within four.
-    assert [split for split, _, _ in maps(30.0, 40.0)] == declared
-    # 4 seeds in 80 s: 20 s a seed, the declared 8 at 160 s past four targets: 6 a task within their 120 s.
+    # 4 seeds in 28 s: 7 s a seed, so a task of the declared 8 takes 56 s: past the 30 s target, within two.
+    assert [split for split, _, _ in maps(30.0, 28.0)] == declared
+    # 4 seeds in 80 s: 20 s a seed, the declared 8 at 160 s past two targets: 3 a task within their 60 s.
     assert maps(30.0, 80.0) == [
         ("test_site.draws-0-4", 80.0, False),
-        *((f"test_site.draws-{start}-{min(start + 6, 20)}", 20.0 * (min(start + 6, 20) - start), True)
-          for start in range(4, 20, 6))]
+        *((f"test_site.draws-{start}-{min(start + 3, 20)}", 20.0 * (min(start + 3, 20) - start), True)
+          for start in range(4, 20, 3))]
     # 4 seeds in 4 s fit a task of the declared 8 within the target, and of no more.
     assert [split for split, _, _ in maps(30.0, 4.0)] == declared
 
