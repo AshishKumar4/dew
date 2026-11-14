@@ -39,7 +39,7 @@ from google.protobuf.unknown_fields import UnknownFieldSet
 from jax._src.thunky import thunky
 from jax.extend.mlir import ir
 
-from dew import communicators
+from dew import _cache, communicators
 from dew._devices import deviceless, xla_flag
 from dew.nn.kernels import generation
 
@@ -451,15 +451,21 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
 
 def certified_together(op, arguments: tokamax.BoundArguments, configs: Sequence[Hashable]
                        ) -> list[tuple["Binary", ...]]:
-    """Each of `configs` certified (`certified`) in one round, all at once on as many threads, each in a copy
-    of this context: a search's rungs, which the assembler answers only one yes or no each (`rung_round`
-    bounds a round by the host's cores)."""
+    """Each of `configs` certified (`certified`) in one round, all at once on as many threads, each tracing
+    under this thread's states (`dew._cache.carried`: the assumed GPU, the kernel choices, JAX's per-thread
+    settings) in a copy of this context: a search's rungs, which the assembler answers only one yes or no each
+    (`rung_round` bounds a round by the host's cores)."""
     round = next(_ROUNDS)
     if len(configs) < 2:
         return [certified(op, arguments, config, round=round) for config in configs]
+    entered = _cache.carried()
+
+    def asked(config: Hashable) -> tuple["Binary", ...]:
+        with entered():
+            return certified(op, arguments, config, round=round)
+
     with ThreadPoolExecutor(len(configs), thread_name_prefix="dew-certify") as pool:
-        submitted = [pool.submit(contextvars.copy_context().run, certified, op, arguments, config,
-                                 round=round) for config in configs]
+        submitted = [pool.submit(contextvars.copy_context().run, asked, config) for config in configs]
         return [each.result() for each in submitted]
 
 
