@@ -16,7 +16,7 @@ from attention_oracle import attention_on_par, exact_attention, float64_weights
 from contract_support import normal_drawn
 from model_support import as_stepped
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_fp32_reduction_bound
-from sharded import assert_runs_per_shard, split_executable
+from sharded import assert_runs_per_shard
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_masks import with_key_lengths
@@ -631,14 +631,12 @@ def test_a_grouped_query_keeps_the_tensor_axis_split(kv_heads):
         return (analysis[0] if isinstance(analysis, list) else analysis)["flops"]
 
     mesh = MeshSpec(tensor=2).build(jax.devices()[:2])
-    specs = [PartitionSpec(None, None, "tensor") if shape[2] % 2 == 0 else PartitionSpec()
-             for shape in ((2, 1, 8, 32), (2, 32, kv_heads, 32), (2, 32, kv_heads, 32))]
-    split = split_executable(jax.jit(attend), draw(0), specs, mesh)
-    alone = jax.jit(attend).lower(*draw(0)).compile()
-    assert flops(split) <= 0.6 * flops(alone)
-    assert_runs_per_shard(attend, draw, specs, mesh,
-                          f"a lone query of 8 heads over {kv_heads} split over tensor",
-                          seeds=TENSOR_SPLIT_SEEDS[kv_heads], truth_fn=attend)
+    specs = [PartitionSpec(None, None, "tensor") if operand.shape[2] % 2 == 0 else PartitionSpec()
+             for operand in draw(0)]
+    split = assert_runs_per_shard(attend, draw, specs, mesh,
+                                  f"a lone query of 8 heads over {kv_heads} split over tensor",
+                                  seeds=TENSOR_SPLIT_SEEDS[kv_heads], truth_fn=attend)
+    assert flops(split) <= 0.6 * flops(jax.jit(attend).lower(*draw(0)).compile())
 
 
 @pytest.mark.mesh(devices=2)

@@ -25,7 +25,7 @@ import numpy as np
 import pytest
 from jax.sharding import PartitionSpec
 from model_support import two_documents
-from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
+from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
 from sharded import MOVES, assert_runs_per_shard
 from token_support import token_rows
 
@@ -141,7 +141,7 @@ def assert_exchanged_on_par(split, whole, mesh_spec, draw, label: str) -> None:
     the fewest (2026-11-14). The operands are placed whole, the exchange's own shard_map splitting them."""
     specs = [PartitionSpec()] * len(draw(0))
     assert_runs_per_shard(split, draw, specs, mesh_spec.build(), label, seeds=FEWEST_SEEDS, truth_fn=whole,
-                          moves=MOVES, arm=jax.jit(whole))
+                          moves=MOVES, arm=whole)
 
 
 # Heads split over tensor then sequence (2x2), and four sequence shards over
@@ -182,17 +182,11 @@ def test_row_arguments_split_as_the_query_rows_do_where_the_heads_contend_for_th
     def whole(query, key, value):
         return scaled_dot_product_attention(query, key, value, **call)
 
-    mesh = MeshSpec(tensor=2, expert=2, sequence=2).build()
-    exchanged = jax.jit(lambda q, k, v: through(exchange, q, k, v, **call))
-
-    @as_given
-    def split(query, key, value):
-        # The exchange under the mesh and the contending rules; the whole sequence outside them.
-        with jax.set_mesh(mesh), nn.logical_axis_rules((*HEADS_BEFORE_ROWS, *DEFAULT_RULES)):
-            return exchanged(query, key, value)
-
-    assert_as_exact(split, jax.jit(whole), draw, f"{exchange} exchange, {name}, under contending heads",
-                    seeds=FEWEST_SEEDS)
+    # The exchange compiled under the mesh and the contending rules; the whole sequence outside them.
+    with nn.logical_axis_rules((*HEADS_BEFORE_ROWS, *DEFAULT_RULES)):
+        assert_exchanged_on_par(lambda q, k, v: through(exchange, q, k, v, **call), whole,
+                                MeshSpec(tensor=2, expert=2, sequence=2), draw,
+                                f"{exchange} exchange, {name}, under contending heads")
 
 
 @pytest.mark.mesh
@@ -233,18 +227,10 @@ def test_a_dropping_call_drops_what_one_device_drops(name, exchange):
     too: its output and its query, key and value gradients are on par with the
     whole sequence's (row 1709: a split sequence refused dropout)."""
     call = dict(CALLS[name], dropout_rate=0.3, dropout_rng=jax.random.key(7))
-    mesh = SPLIT.build()
-    exchanged = jax.jit(with_gradients(lambda q, k, v: through(exchange, q, k, v, **call)))
-
-    @as_given
-    def split(*arrays):
-        with jax.set_mesh(mesh):
-            return exchanged(*arrays)
-
-    whole = jax.jit(with_gradients(
-        lambda q, k, v: scaled_dot_product_attention(q, k, v, deterministic=False, **call)))
-    assert_as_exact(split, whole, _dropping_draw, f"{exchange} exchange, {name}, dropping",
-                    seeds=FEWEST_SEEDS)
+    assert_exchanged_on_par(
+        with_gradients(lambda q, k, v: through(exchange, q, k, v, **call)),
+        with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, deterministic=False, **call)),
+        SPLIT, _dropping_draw, f"{exchange} exchange, {name}, dropping")
 
 
 @pytest.mark.mesh
@@ -267,16 +253,8 @@ def test_the_entry_drops_over_a_split_sequence():
     """`scaled_dot_product_attention` under a split sequence takes a dropping
     call (it refused one) and drops what the whole sequence does."""
     call = {"causal": True, "dropout_rate": 0.3, "dropout_rng": jax.random.key(7), "deterministic": False}
-    mesh = SPLIT.build()
-    entry = jax.jit(with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call)))
-
-    @as_given
-    def split(*arrays):
-        with jax.set_mesh(mesh):
-            return entry(*arrays)
-
-    assert_as_exact(split, entry, _dropping_draw, "the entry, dropping over a split sequence",
-                    seeds=FEWEST_SEEDS)
+    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+    assert_exchanged_on_par(entry, entry, SPLIT, _dropping_draw, "the entry, dropping over a split sequence")
 
 
 @pytest.mark.mesh
