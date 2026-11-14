@@ -1,6 +1,7 @@
 """A quantized KV cache's values dequantized in their own basis, computed apart from the cache.
 
-Plain jnp from the layout's rule (`dew.nn.kv_cache`'s module doc): a float32
+Plain jnp from the layout's rule (`dew.nn.kv_cache`'s module doc), its quotients IEEE division's
+(`dew.nn.precision.divided`): a float32
 scale per vector, its absmax over the format's largest value (one where that
 scale would not be a normal float32); int8 keys rotated by the orthonormal
 Hadamard basis before their rounding and back after it, values and float8
@@ -16,6 +17,8 @@ import math
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from dew.nn.precision import divided
 
 
 def hadamard_basis(size: int) -> np.ndarray:
@@ -50,13 +53,14 @@ def quantized_codes(values, quantized: str) -> tuple[jax.Array, jax.Array]:
     codes and its float32 scale `[...]`, the vector's absmax over the format's largest value, one where that
     would not be a normal float32."""
     # At the values' width, fp32 at least (a float64 truth's float64); the scale is the float32 a cache
-    # stores (its quotient rounded once to fp32, as fp32's division rounds it), each code its rounding.
+    # stores (its quotient rounded once to fp32, as IEEE fp32 division rounds it, whatever the backend's own
+    # division does: `dew.nn.precision.divided`), each code its rounding.
     width = jnp.promote_types(values.dtype, jnp.float32)
     wide = values.astype(width)
     limit = 127.0 if quantized == "int8" else float(jnp.finfo(jnp.float8_e4m3fn).max)
-    scaled_amax = (jnp.max(jnp.abs(wide), axis=-1) / limit).astype(jnp.float32)
+    scaled_amax = divided(jnp.max(jnp.abs(wide), axis=-1), jnp.asarray(limit, width)).astype(jnp.float32)
     scale = jnp.where(scaled_amax >= jnp.finfo(jnp.float32).tiny, scaled_amax, jnp.float32(1))
-    scaled = wide / scale[..., None].astype(width)
+    scaled = divided(wide, scale[..., None].astype(width))
     codes = (jnp.clip(jnp.rint(scaled), -127, 127).astype(jnp.int8) if quantized == "int8"
              else scaled.astype(jnp.float8_e4m3fn))
     return codes, scale

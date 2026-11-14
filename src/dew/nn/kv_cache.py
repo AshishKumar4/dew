@@ -53,7 +53,7 @@ from dew.nn.host_memory import fetched, fetched_at, on_host, placed_like, stored
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, Choice, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
-from dew.nn.precision import at_least_fp32, float32_einsum
+from dew.nn.precision import at_least_fp32, divided, float32_einsum
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import manual_map, sequence_shards
 
@@ -256,13 +256,15 @@ def quantize(values: jax.Array, dtype: KVDtype) -> tuple[jax.Array, jax.Array]:
 
     The format's scale is a float32 and its codes round a float32 quotient: each computed at the values'
     width (float32 for 16-bit ones, a float64 model's in float64) and rounded to float32 as the format
-    states, a float32 run's own quotient bit for bit.
+    states, each quotient IEEE division's on every backend (`divided`): XLA takes a division by the
+    format's largest value as a product by its rounded reciprocal, a scale an ulp off the format's on a
+    CPU and an H100 alike, and a GPU's own division of the values by their scale is approximate.
     """
     wide = values.astype(jnp.promote_types(values.dtype, jnp.float32))
     amax = jnp.max(jnp.abs(wide), axis=-1)
-    scaled_amax = (amax / _LIMITS[dtype]).astype(jnp.float32)
+    scaled_amax = divided(amax, jnp.asarray(_LIMITS[dtype], amax.dtype)).astype(jnp.float32)
     scale = jnp.where(scaled_amax >= jnp.finfo(jnp.float32).tiny, scaled_amax, 1.0)
-    scaled = (wide / scale[..., None]).astype(jnp.float32)
+    scaled = divided(wide, scale[..., None].astype(wide.dtype)).astype(jnp.float32)
     if dtype == "int8":
         return jnp.clip(jnp.rint(scaled), -127, 127).astype(jnp.int8), scale
     return scaled.astype(jnp.dtype(dtype)), scale
