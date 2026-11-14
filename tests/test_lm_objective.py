@@ -963,7 +963,10 @@ def test_a_loss_role_run_stepped_on_a_batch_without_roles_is_refused():
     would count every target as the assistant's (row 6120)."""
     trainer = Trainer(make_objective(loss_role=Role.ASSISTANT), optax.sgd(0.1), key=jax.random.key(0))
     state = trainer.initial_state()
-    batch = token_batch()
+    # The same rows with their roles step: only the column's absence is refused.
+    laid = assistant_batch(batch=BATCH)
+    trainer.compile(state, laid)(state, laid)
+    batch = {name: value for name, value in laid.items() if name != ROLES_KEY}
     with pytest.raises(ValueError):
         trainer.compile(state, batch)(state, batch)
 

@@ -648,8 +648,10 @@ def test_diffusion_nft_trains_from_the_run_config_on_a_registered_reward():
     assert isinstance(objective, DiffusionNFTObjective) and config.rollout is not None
     rollout = config.rollout.build(objective)
     assert isinstance(rollout, NFTRollout)
-    prepared, _, _ = grpo_step(objective, rollout)
+    prepared, started, state = grpo_step(objective, rollout)
     assert np.all(np.isfinite(prepared["rewards"]))
+    assert any(not np.array_equal(after, before) for after, before in zip(
+        jax.tree.leaves(state.variables["params"]), started, strict=True))
 
 
 def test_a_flow_grpo_runs_rollout_is_its_own_record_beside_the_objective():
