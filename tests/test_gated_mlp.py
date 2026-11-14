@@ -115,7 +115,7 @@ def test_a_gated_mlps_case_runs_at_the_dtype_its_products_run_and_asks_nothing_a
     for dtype, runs in ((None, jnp.float32), (jnp.bfloat16, jnp.bfloat16)):
         layer = GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, dtype=dtype)
         bound = layer.bind(layer.init(jax.random.key(0), x.astype(jnp.float32)))
-        case = gated_case(x, (bound.gate_proj, bound.up_proj, bound.down_proj))
+        case = gated_case(x, (bound.gate_proj, bound.up_proj, bound.down_proj), "swiglu")
         assert case.dtype == runs and case.cell[1] == runs, dtype
 
     def routes_of(layer):
@@ -126,3 +126,26 @@ def test_a_gated_mlps_case_runs_at_the_dtype_its_products_run_and_asks_nothing_a
 
     plain = GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, dtype=jnp.bfloat16)
     assert routes_of(plain) == routes_of(plain.clone(gate_multiplier=0.5))
+
+
+@pytest.mark.parametrize("generation_name", ["sm90", "sm100"])
+def test_a_gated_mlp_whose_hook_the_template_cannot_lower_runs_apart(generation_name):
+    """A gated MLP named fused (`generation.chosen(gated_mlp='fused')`) whose gated product's hook the
+    template's Mosaic launches do not lower (GeGLU's exact GELU, an erf behind an optimization barrier) runs
+    its products apart, the fused MLP reporting the hook's refusal, where it was fused and the paired
+    product's launch refused the call; GeGLU's tanh form fuses (train 813's F3)."""
+    from dew.nn.mlp import GatedMLP
+
+    x = jnp.zeros((2, 64, FEATURES), jnp.bfloat16)
+
+    def route(activation):
+        layer = GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, activation=activation,
+                         dtype=jnp.bfloat16)
+        params = jax.eval_shape(layer.init, jax.random.key(0), x)
+        named = generation.chosen(grouped_matmul="mosaic", gated_mlp="fused")
+        with generation.assumed(generation_name), named, generation.routes() as routes:
+            jax.eval_shape(layer.apply, params, x)
+        return [each.kernel for each in routes if each.choice == "gated_mlp"]
+
+    assert route("geglu") == ["fused"]
+    assert route("geglu_exact") == ["apart"]

@@ -244,7 +244,7 @@ class GatedMLP(nn.Module):
             up = checkpoint_name(self._placed(self.up_proj(x)), Residual.UP_PROJ)
             out = self._down(activation(up), train)
             return activation(out) if self.activation_after else out
-        if isinstance(activation, str) and self._fused(x):
+        if isinstance(activation, str) and self._fused(x, activation):
             fused = gated_mlp(x, (self.gate_proj, self.up_proj, self.down_proj), activation,
                               limit=self.swiglu_limit,
                               names=(Residual.GATE_PROJ, Residual.UP_PROJ, Residual.DOWN_PROJ))
@@ -278,14 +278,14 @@ class GatedMLP(nn.Module):
             gate = gaussian_topk(gate, self.activation_sparsity)
         return self._down(gated_product(activation, axes=axes)(gate, up), train)
 
-    def _fused(self, x) -> bool:
+    def _fused(self, x, activation: str) -> bool:
         """Whether the gated product and its three projections run fused (`dew.nn.gated_mlp`): a named
         activation's, optionally clamped, its projections held apart (not packed) and its hidden activation
         neither dropped, sparsified, rescaled nor nGPT's, where the fused MLP's selector takes them
         (`gated_mlp.fuses`)."""
         return (not self.activation_sparsity and self.ngpt is None and self.gate_multiplier == 1.0
                 and not self.dropout_rate and not self._packed()
-                and fuses(x, (self.gate_proj, self.up_proj, self.down_proj)))
+                and fuses(x, (self.gate_proj, self.up_proj, self.down_proj), activation, self.swiglu_limit))
 
     @staticmethod
     def _axes(hidden) -> LogicalAxes | None:

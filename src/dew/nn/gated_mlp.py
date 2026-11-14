@@ -16,7 +16,7 @@ otherwise, as `GatedMLP` ran them.
 """
 
 import dataclasses
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -28,8 +28,8 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn import activations
 from dew.nn.joined import Projections, projection_requirements, projections_of
-from dew.nn.kernels import gemm, projections
-from dew.nn.kernels.generation import INHERENT, Choice, device_generation
+from dew.nn.kernels import gemm, grouped_matmul, projections
+from dew.nn.kernels.generation import INHERENT, Choice, device_generation, gpu_target
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
 from dew.nn.precision import recipe_role
 from dew.nn.sharding import seen_whole
@@ -56,6 +56,9 @@ class GatedCase:
     kernels: tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct] | None
     whole: bool
     precision: PrecisionLike
+    hook: Callable[[jax.Array, jax.Array], jax.Array]
+    """The gated product's hook (`activations.gated_hook` of the activation and its limit), which the paired
+    product's epilogue and the down product's prologue trace."""
 
     @property
     def dtype(self) -> jnp.dtype:
@@ -76,8 +79,10 @@ class GatedCase:
             return False
         gate, down = self.kernels
         hidden = jax.ShapeDtypeStruct((self.rows.shape[0], gate.shape[1]), self.dtype)
-        return all(projections.launches(rows, kernel, self.dtype, self.precision, whole=self.whole)
-                   for rows, kernel in ((self.rows, gate), (hidden, down)))
+        tile = jax.ShapeDtypeStruct((128, 128), self.dtype)
+        return (all(projections.launches(rows, kernel, self.dtype, self.precision, whole=self.whole)
+                    for rows, kernel in ((self.rows, gate), (hidden, down)))
+                and grouped_matmul.hook_lowers(self.hook, (tile, tile), gpu_target()))
 
 
 FUSED_SUPPORTS: tuple[Requirement[GatedCase], ...] = (
@@ -92,7 +97,8 @@ FUSED_SUPPORTS: tuple[Requirement[GatedCase], ...] = (
                 "recipe_projection`), which the fused MLP's products do not", row=FUSION_ROW, kind='handoff'),
     Requirement('launched', lambda case: case.launched(),
                 "no launch of the GEMM template takes the up or the down product here (a mesh axis splitting "
-                "them, a CPU, a declared XLA cell)", row=FUSION_ROW, kind='handoff'),
+                "them, a CPU, a declared XLA cell), or its hooks the gated product's operations (an exact "
+                "GELU's erf behind an optimization barrier)", row=FUSION_ROW, kind='handoff'),
 )
 """What the fused MLP needs to stand in for the projections' own calls: each a handoff, so a call outside
 them runs its projections apart even where the fused MLP is named."""
@@ -111,8 +117,10 @@ GATED_MLP: Op[GatedCase] = Op(Choice.GATED_MLP, (FUSED, Kernel('apart', (), gene
 (`FUSED_CELLS`) or the block names it, and its requirements hold."""
 
 
-def gated_case(x: jax.Array, projections_: Sequence[nn.Module]) -> GatedCase:
-    """The `GatedCase` of a gated MLP's `projections_` (gate, up, down) over its input `x`."""
+def gated_case(x: jax.Array, projections_: Sequence[nn.Module], activation: str,
+               limit: float | None = None) -> GatedCase:
+    """The `GatedCase` of a gated MLP's `projections_` (gate, up, down) over its input `x`, its gated product
+    `activation`'s clamped at `limit`."""
     gate, _, down = projections_
     found = projections_of(projections_)
     kernels = ([meta.unbox(projection.get_variable('params', 'kernel')) for projection in (gate, down)]
@@ -128,16 +136,17 @@ def gated_case(x: jax.Array, projections_: Sequence[nn.Module]) -> GatedCase:
         kernels=None if kernels is None else (jax.ShapeDtypeStruct(kernels[0].shape, dtype),
                                               jax.ShapeDtypeStruct(kernels[1].shape, dtype)),
         whole=seen_whole(x) and all(seen_whole(kernel) for kernel in kernels or ()),
-        precision=gate.precision)
+        precision=gate.precision, hook=activations.gated_hook(activation, limit))
 
 
-def fuses(rows: jax.Array, projections_: Sequence[nn.Module]) -> bool:
-    """Whether a gated MLP's projections (gate, up, down) of `rows` run fused (`gated_mlp`), as the fused
-    MLP's selector reports it (`GATED_MLP`). Initialization creates each projection's parameters through its
-    own call."""
+def fuses(rows: jax.Array, projections_: Sequence[nn.Module], activation: str,
+          limit: float | None = None) -> bool:
+    """Whether a gated MLP's projections (gate, up, down) of `rows`, its gated product `activation`'s clamped
+    at `limit`, run fused (`gated_mlp`), as the fused MLP's selector reports it (`GATED_MLP`). Initialization
+    creates each projection's parameters through its own call."""
     if projections_[0].is_initializing():
         return False
-    return select(GATED_MLP, gated_case(rows, projections_)).kernel == 'fused'
+    return select(GATED_MLP, gated_case(rows, projections_, activation, limit)).kernel == 'fused'
 
 
 def gated_mlp(x: jax.Array, projections_: Sequence[nn.Module], activation: str, *,
