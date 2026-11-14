@@ -64,9 +64,10 @@ kernels (tests/test_deepseek_v41.py)."""
 
 def rounds(judged: dict) -> dict:
     """Each kind's rounding of the values an arm rounded, its judged leaves `rounded/<kind>`
-    (`Roundings.rounded`): a quantized computation's `Followed.rounds`, which the decisions an arm made
-    (`Roundings.decisions`) must equal."""
-    return {name.removeprefix("rounded/"): QUANTIZERS[name.removeprefix("rounded/")](blocks)
+    (`Roundings.rounded`), or `rounded/<call>/<kind>` where a run's several calls name theirs apart: a
+    quantized computation's `Followed.rounds`, which the decisions an arm made (`Roundings.decisions`,
+    named alike) must equal."""
+    return {name.removeprefix("rounded/"): QUANTIZERS[name.rsplit("/", 1)[1]](blocks)
             for name, blocks in judged.items() if name.startswith("rounded/")}
 
 

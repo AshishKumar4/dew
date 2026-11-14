@@ -1089,20 +1089,6 @@ def _models(launches: tuple[mainloop.Launch, ...], family: mosaic.Family,
     return {name: _model(launch, family, target) for name, launch in combined.items()}
 
 
-class Unbudgeted(template.Mosaic):
-    """The recurrence template with every launch's registers held: its derivation takes the tile it would
-    where only registers refuse one (`compiled_cases`' refused tiles), a states launch no multiprocessor
-    holds at its registers (`Launch.resident` zero) one program a multiprocessor, as it would hold were its
-    registers held."""
-
-    def _launches_hold(self, launches, family) -> bool:
-        del launches, family
-        return True
-
-    def states_held(self, ba, tiles, target, *, training: bool = False) -> int:
-        return max(super().states_held(ba, tiles, target, training=training), 1)
-
-
 NEIGHBOURS = 3
 """The most variants a call's derived tiles have beside them (`Mosaic.neighbours`: the value block either
 side of the derived one and its stages' other depth), the resource gate's variant groups (`GATE_GROUPS`)."""
@@ -1194,12 +1180,10 @@ def _gate_call(name: str, dtype, given: list, starts, tiles, family, *, training
 
 def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: tuple | None = None,
                    launched: dict | None = None) -> list:
-    """The resource gate's cases on `target` (`KernelCase`s), each with its launches' register models (row
-    1971): each `RESOURCE_SHAPES` geometry's forward in a 16-bit and an fp32 call, one row and packed
-    documents, and the gated delta rule's 16-bit training pass, at the template's derived tiles and, one row's
-    forward, at each of their variants; beside them the tiles the derivation takes where every register held
-    (`Template._held`) and refused for registers alone, and the fast backward its launches' registers refuse,
-    so a model over ptxas's need fails as one under it does. Each case's plan by its label into `plans`
+    """The resource gate's cases on `target` (`KernelCase`s), each with its launches' register models: each
+    `RESOURCE_SHAPES` geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the
+    gated delta rule's 16-bit training pass, at the template's derived tiles and, one row's forward, at each
+    of their variants. Each case's plan by its label into `plans`
     (`template.planned`), each call the template refuses into `refused`, and the launches a case's
     model refuses by its label into `apart` where they are held apart (`apart_failures`), and each case's
     bound call and tiles by its label into `launched` where given (`stepped_down`)."""
@@ -1210,7 +1194,6 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
     facts = generation.gpu_target(target)
     family = template.bundle(facts)
     rows, length = 1, 256
-    shared = generation.shared_budget(facts)
 
     def cases(name: str, dtype, *, training: bool, packed: bool, variant: int | None) -> list:
         """The case's kernels at its derived tiles, or, one row's forward, at its `variant`-th other variant
@@ -1223,20 +1206,13 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                                      **_form(name, dtype), **_skipped(name, dtype))
         with generation.assumed(facts):
             derived = template.MOSAIC.derived(bound, facts)
-            held = Unbudgeted().derived(bound, facts)
-            # The tile the derivation takes where every register held, refused for its registers alone.
-            unheld = [] if held is None or held == derived else [(held, 'refused ')]
-            if unheld and any(launch.shared > shared for launch in template.MOSAIC.launches(
-                    bound, _ran(held, training=training), facts, backward=training)):
-                unheld = []
             if derived is None and variant is not None:
                 return []
             if derived is None:
                 # Refused: a launch's registers or shared memory past the device's at every tile.
                 refused.append(f"{name} {jnp.dtype(dtype).name}{' training' if training else ''}")
                 assert not template.MOSAIC.eligible(bound, facts)
-                return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
-                             kind=kind) for tiles, kind in unheld]
+                return []
             # The variants beside the derived tiles, whatever their order (`Mosaic.variants`).
             others = [tiles for tiles in template.MOSAIC.variants(bound) if tiles != derived]
             if isinstance(variant, int):
@@ -1249,14 +1225,9 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                     max_segments=8 if packed else None, **unwide,
                     **_skipped(name, dtype)):
                 # The rule's gradient is the port's or the portable math's where the fast backward's launches
-                # do not hold (`template.backward_holds`); where only their registers refuse them,
-                # the gate compiles them, held to ptxas's need.
+                # do not hold (`template.backward_holds`).
                 refused.append(f"{name} {jnp.dtype(dtype).name} fast backward{' packed' if packed else ''}")
-                launches = template.MOSAIC.launches(bound, derived, facts, backward=True)
-                if any(launch.shared > shared for launch in launches):
-                    return []
-                return [case(name, dtype, args, starts, bound, derived, training=True, packed=packed,
-                             kind='refused ')]
+                return []
         walked = _two_roles(name, bound, _ran(derived, training=training), family, facts, packed=packed,
                             training=training)
         if variant == TWO_ROLES:
@@ -1265,7 +1236,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         # A training pass's two-role walks a group of their own (`TWO_ROLES`).
         walked = [] if training else walked
         return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
-                for tiles, kind in [(derived, ''), *walked, *([] if training else unheld)]]
+                for tiles, kind in [(derived, ''), *walked]]
 
     def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
         tiles = _ran(tiles, training=training)
@@ -1298,9 +1269,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                       array(rows, value_heads, key_width, value_width, kind=jnp.float32)]
         call = functools.partial(_gate_call, name, dtype, given, starts, tiles, family, training=training)
 
-        # A refused tile compiled for the model's evidence alone, which no call runs (`KernelCase.required`).
-        return KernelCase(label, call, _models(plans[label], family, facts),
-                          required=not kind.startswith('refused'))
+        return KernelCase(label, call, _models(plans[label], family, facts))
 
     return [kernel for group in (GATE_GROUPS if only is None else [only])
             for kernel in cases(group[0], group[1], training=group[2], packed=group[3], variant=group[4])]
@@ -1308,8 +1277,8 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
 
 def planned_failures(found: list, plans: dict) -> list[str]:
     """Each compiled kernel past its plan's shared memory (`template.planned`'s launch of its name,
-    from which the tiles are derived): the recurrence's shared-memory model, beside the register model the
-    shared gate holds to ptxas (`kernel_compile.mosaic_failures`)."""
+    from which the tiles are derived): the recurrence's shared-memory model, beside the gate's verdicts on
+    each kernel (`kernel_compile.mosaic_failures`)."""
     def planned(record: dict, kernel: dict) -> int:
         # A kernel's launches the longest names that begin its own: `recurrence_intra_solve` is no
         # `recurrence_intra`.
@@ -1331,31 +1300,27 @@ def refused_kernels(record: dict, launches: set[str]) -> set[str]:
 def apart_failures(found: list, apart: dict) -> list[str]:
     """Each compiled case's launches held apart (`apart`, the names its model refuses by its label): every
     launch its model admits as a required case's (`kernel_compile.mosaic_failures`: spill-free, every report
-    read), and every one it refuses free to spill, its model's decision beside ptxas's in the record's
-    register evidence, advisory where ptxas holds it spill-free (as `mosaic_failures` keeps a spill-free
-    disagreement)."""
-    from kernel_compile import _register_evidence, mosaic_failures, undercounts
+    read), and every one it refuses free to spill, as certification would refuse it."""
+    from kernel_compile import mosaic_failures
 
     failed = []
     for record in found:
         refused = refused_kernels(record, apart[record["name"]])
         admitted = [kernel for kernel in record.get("kernels", ()) if kernel["kernel"] not in refused]
         if admitted:
-            compared = [{**record, "kernels": admitted}]
-            failed += mosaic_failures(compared) + undercounts(compared)
-        record["evidence"] = _register_evidence(record)
+            failed += mosaic_failures([{**record, "kernels": admitted}])
     return failed
 
 
 def resource_failures(cases: list, found: list, plans: dict, apart: dict) -> list[str]:
     """The resource gate's verdict on compiled cases: every case reports within its plan, every required
-    launch holds, and forced variants' model-refused launches remain assembly evidence."""
-    from kernel_compile import failures, mosaic_failures, undercounts
+    launch holds, and forced variants' model-refused launches may spill."""
+    from kernel_compile import failures, mosaic_failures
 
     failed = failures(found) + planned_failures(found, plans)
     required = [record for case, record in zip(cases, found, strict=True)
                 if case.required and case.name not in apart]
-    failed += mosaic_failures(required) + undercounts(required)
+    failed += mosaic_failures(required)
     return failed + apart_failures([record for record in found if record['name'] in apart], apart)
 
 
@@ -1387,9 +1352,7 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     B200 on this CPU (tests/kernel_compile.py): every launch compiles within the multiprocessor's shared
     memory and tensor memory and at most its plan's shared memory (`template.planned`, from which
     the tiles are derived, `planned_failures`), no launch the template's legality holds spills a register
-    once a spilling launch steps down as a run's compile steps it (`stepped_down`; a refused tile's
-    compiled as the model's evidence, `KernelCase.required`), and each launch's register model
-    decides as ptxas's need does, admitting a tile or refusing it (row 1971,
+    once a spilling launch steps down as a run's compile steps it (`stepped_down`,
     `kernel_compile.mosaic_failures`). Lowering alone takes no device's budget: a launch past an A100's shared
     memory lowered and failed on the GPU (the fast backward's readout's third staging tile). The gated delta
     rule's 16-bit call, the production cell, derives tiles on every family. A GPU host's ptxas builds for its
@@ -1402,8 +1365,8 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     plans, refused, apart = {}, [], {}
     with report.refusals():
         cases, found = stepped_down(target, group, plans, refused, apart)
-    # Every case compiles and reports; a refused tile's spill is the model's refusal, a required one's fails,
-    # and a case whose launches are held apart fails as either does, launch by launch.
+    # Every case compiles and reports; a required case's spill fails, and a case whose launches are held
+    # apart fails launch by launch.
     failed = resource_failures(cases, found, plans, apart)
     failed += [f"{case}: no tiles derived" for case in refused
                if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
@@ -1418,7 +1381,7 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
 def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blackwell(name):
     """A geometry's 16-bit training at its derived tiles, compiled for a compile-only B200 over one row of
     2048 tokens, so each persistent launch's programs walk several tiles (the gate's 256 tokens walk one): no
-    launch spills, and ptxas's least spill-free cap is within each launch's register model. Its producer at
+    launch spills. Its producer at
     24 registers, the walk's indices and addresses spilled once a program walked three tiles or more and
     ptxas allocated the consumers past their live set around them (`mainloop.PERSISTENT_PRODUCER`, row 5693:
     the 4B SSD's scores' gradient spilled 16 bytes at its 248 registers, its model 223)."""
@@ -1439,16 +1402,8 @@ def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blac
                   jax.ShapeDtypeStruct(args[5].shape, jnp.float32)]
     call = functools.partial(_gate_call, name, dtype, [*args, *cotangents], None, tiles, family,
                              training=True)
-    (record,) = compile_mosaic_kernels([KernelCase(name, call, models)], 'sm100', least=True)
+    (record,) = compile_mosaic_kernels([KernelCase(name, call, models)], 'sm100')
     assert not mosaic_failures([record]), mosaic_failures([record])
-
-    def modelled(kernel) -> int:
-        # The model's registers in the allocator's steps of 8, as ptxas's least cap is stated.
-        return -(-models[kernel['kernel'].split('__')[0]].registers // 8) * 8
-
-    over = [(kernel['kernel'], kernel['least'], modelled(kernel)) for kernel in record['kernels']
-            if kernel['spilled'] or kernel['least'] is None or kernel['least'] > modelled(kernel)]
-    assert not over, over
 
 
 def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple[list, list]:

@@ -36,6 +36,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
 
@@ -80,10 +81,13 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
     other layer's zero. `paired`, a second matrix of `rhs`'s shape (a stack of them at the same `layer`), the
     rows multiply into a second accumulator the epilogue takes before its side operands (`epilogue(acc,
     paired_acc, *sides)`: a gate's and an up projection's SwiGLU), else an output. `gather`, int32 `[rows]` of
-    a grouped call with no prologue (a stack's layer's too), makes the product's rows `lhs[gather]`, read
-    where they lie: a mixture of experts' tokens in their own order, the router's sort fused into the rows'
-    loads where Mosaic GPU's launch takes the call (its producer's gather, row 1376), gathered by XLA
-    elsewhere; the rows' cotangent is summed back into each token's (`lhs`'s, a token every slot reads).
+    a grouped call (a stack's layer's too), makes the product's rows `lhs[gather]`, read where they lie: a
+    mixture of experts' tokens in their own order, the router's sort fused into the rows' loads where Mosaic
+    GPU's launch takes the call (its producer's gather, row 1376), gathered by XLA elsewhere; the rows'
+    cotangent is summed back into each token's (`lhs`'s, a token every slot reads). With a prologue, its
+    side operands along the rows are the product's rows' (`gather`'s order, a normalized stream's scale
+    gathered with it), and the rows are gathered first, the prologue's product taking them as an ungathered
+    call's (row 5391: an expert projection over a normalized or scaled token stream).
     `scatter`, int32 `[rows]` of a grouped call, a permutation, writes the product's row `i` at each output's
     row `scatter[i]`: the slots in token order, the un-permute fused into Mosaic GPU's stores
     (`mosaic.Scattered`), written by XLA elsewhere; the outputs' cotangents are read back through it, a
@@ -99,8 +103,12 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
                            interpret_on_cpu=interpret_on_cpu,
                            refused=(transpose_rhs, prologue, prologue_operands, paired, prologue_jvp,
                                     out_dtypes, applied))
-    _gemm_refused(group_sizes, prologue=prologue, gather=gather, scatter=scatter,
-                  compute=compute, applied=applied, lhs=lhs)
+    _gemm_refused(group_sizes, gather=gather, scatter=scatter, compute=compute, applied=applied,
+                  prologue=prologue, lhs=lhs)
+    if gather is not None and prologue is not None:
+        # The prologue's rows are the product's (its sides `gather`'s order): gathered first, its
+        # derivative summing each row's cotangent back into its token's.
+        lhs, gather = lhs[gather], None
     straight = compute is not None
     compute = jnp.dtype(lhs.dtype if compute is None else compute)
     dense = group_sizes is None and layer is None
@@ -236,12 +244,12 @@ def _scattered_cotangent(cotangent, scatter, *, epilogue, first) -> tuple:
 
 
 def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, lhs) -> None:
-    """`gemm`'s refusal of a call it does not take: gathered rows but a grouped call's with no prologue (a
-    prologue's side operands are each row's, which a gather would read at its tokens' rows, undefined),
-    scattered rows but a grouped call's, a prologue beside a named `compute`, and a formed operand
-    (`applied`) but a prologue's, of `lhs`'s shape and dtype."""
-    if gather is not None and (group_sizes is None or prologue is not None):
-        raise ValueError("gathered rows are a grouped call's, with no prologue")
+    """`gemm`'s refusal of a call it does not take: gathered rows but a grouped call's, or beside a formed
+    operand (`applied`, a producer's rows already in the product's order), scattered rows but a grouped
+    call's, a prologue beside a named `compute`, and a formed operand but a prologue's, of `lhs`'s shape and
+    dtype."""
+    if gather is not None and (group_sizes is None or applied is not None):
+        raise ValueError("gathered rows are a grouped call's, beside no formed operand")
     if scatter is not None and group_sizes is None:
         raise ValueError("scattered rows are a grouped call's")
     if compute is not None and prologue is not None:
@@ -267,6 +275,63 @@ def _nvfp4_gemm(lhs, matrix: "NvFp4", group_sizes, *, epilogue, epilogue_operand
         sizes = jnp.asarray([summed.shape[0]], jnp.int32) if group_sizes is None else group_sizes
         [summed] = _tupled(epilogue, summed, *_rows(arrays, axes, sizes, summed.shape[0]))
     return scattered(summed.astype(out_dtype), scatter)
+
+
+BATCHED_ROW = 'ledger 5972'
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchedCase:
+    """A batched product as its selector reads it (`BATCHED`): its operands' dtype, and whether its left
+    operand contracts its last axis (`rows`: the template's rows, unmoved)."""
+
+    dtype: jnp.dtype
+    rows: bool
+
+
+BATCHED: selection.Op[BatchedCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
+    selection.Kernel('mosaic', (
+        selection.Requirement(
+            'dtype', lambda case: case.dtype in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)),
+            lambda case: f"a batched product of {case.dtype} operands, where the template's grouped products "
+            "take 16-bit ones (a complex or wider one keeps XLA's dot, uncast)", BATCHED_ROW),
+        selection.Requirement(
+            'rows', lambda case: case.rows, "its left operand contracts an axis other than its last: the "
+            "template's rows would be a transposed copy", BATCHED_ROW),
+        selection.Requirement(
+            'measured', lambda case: False, "no receipt yet has the template's grouped product beat XLA's "
+            "batched dot (M-EM-47)", BATCHED_ROW, kind='measured'))),
+    selection.Kernel('xla', (), generic=True)))
+"""A batched product's selector (`batched_product`): the template's grouped product, its batches the groups,
+where a receipt names it; else XLA's dot as the caller wrote it."""
+
+
+def batched_product(a: jax.Array, b: jax.Array, contract: tuple[int, int], *,
+                    interpret_on_cpu: bool = False) -> jax.Array:
+    """`jax.lax.dot_general(a, b, ((contract[0],), (contract[1],)), (batch, batch))` over every leading axis
+    of `a` and `b` but their last two (`batch`, as many as there are, none for a plain product), contracting
+    `a`'s axis `contract[0]` with `b`'s `contract[1]`, each one of their last two: XLA's dot itself, or,
+    where the selector takes it (`BATCHED`), the template's grouped product of its batches, `a`'s rows
+    `[batches x m, k]` in equal groups by `b`'s matrices `[batches, k, n]` (`[batches, n, k]` read
+    transposed), in `a`'s dtype, summed in fp32 and rounded once. Muon's Newton-Schulz products' route
+    (dew/newton_schulz.py, row 5972)."""
+    last = a.ndim - 1
+    batch = tuple(range(a.ndim - 2))
+    if (b.ndim != a.ndim or a.shape[:-2] != b.shape[:-2] or {contract[0], contract[1]} - {last - 1, last}):
+        raise ValueError(f"a batched product of {a.shape} and {b.shape} over their leading axes contracts "
+                         f"one of each one's last two, not {contract}")
+    dimensions = (((contract[0],), (contract[1],)), (batch, batch))
+    taken = selection.select(BATCHED, BatchedCase(
+        jnp.dtype(a.dtype) if a.dtype == b.dtype else jnp.dtype(jnp.result_type(a, b)), contract[0] == last))
+    if taken.kernel != 'mosaic':
+        return jax.lax.dot_general(a, b, dimensions)
+    *batches, rows, depth = a.shape
+    count = int(np.prod(batches, dtype=np.int64))
+    matrices = b.reshape(count, *b.shape[-2:])
+    out = gemm(a.reshape(count * rows, depth), matrices if batches else matrices[0],
+               jnp.full((count,), rows, jnp.int32) if batches else None,
+               transpose_rhs=contract[1] == last, out_dtype=a.dtype, interpret_on_cpu=interpret_on_cpu)
+    return out.reshape(*batches, rows, out.shape[-1])
 
 
 def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, prologue=None,

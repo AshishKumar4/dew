@@ -1,8 +1,6 @@
 """A CI task's deadline (tools/armada/ci.py's `tested`): a task past it interrupts its pytest, names every row
 it holds red, and says where every thread of its pytest stood."""
 
-import base64
-import hashlib
 import json
 import os
 import re
@@ -10,7 +8,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import zipfile
 from pathlib import Path
 
 import pytest
@@ -71,42 +68,21 @@ STALLS = {
 """A stall at collection, by where its thread waits, and the function it waits in."""
 
 
-def wheel(root: Path) -> Path:
-    """A wheel of one empty package, a release check's requirement that uv installs from its file alone."""
-    path = root / "unused-1.0-py3-none-any.whl"
-    files = {"unused/__init__.py": b"",
-             "unused-1.0.dist-info/METADATA": b"Metadata-Version: 2.1\nName: unused\nVersion: 1.0\n",
-             "unused-1.0.dist-info/WHEEL": b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\n"
-                                           b"Tag: py3-none-any\n"}
-    hashed = {name: base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
-              for name, data in files.items()}
-    digests = [f"{name},sha256={hashed[name]},{len(data)}" for name, data in files.items()]
-    with zipfile.ZipFile(path, "w") as archive:
-        for name, data in files.items():
-            archive.writestr(name, data)
-        archive.writestr("unused-1.0.dist-info/RECORD",
-                         "\n".join([*digests, "unused-1.0.dist-info/RECORD,,"]) + "\n")
-    return path
-
-
-@pytest.mark.parametrize("launched", [False, True], ids=["pytest", "a release check's"])
 @pytest.mark.parametrize("stall", STALLS)
-def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, tmp_path, stall, launched):
+def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, tmp_path, stall):
     """A task interrupted at its deadline reports its pytest's every thread as it stood then, its Python
-    frames and the native ones under them, a stall before any test ran included, which pytest's own report
-    of an interrupt cannot give (2026-11-03: a group stalled 28 minutes in a read with no deadline during
-    collection, its row saying only that no tests ran): a thread stalled in the interpreter, or in native
-    code holding the GIL or not (an XLA compile, a wait on a device, a collective), read from outside the
-    process. A release check's pytest runs under `uv run`, which stands between the task and pytest: the
-    stacks are still pytest's own. The row names the stall's whole record among its evidence in the task's
-    artifacts (`stalls.kept`), its stacks and the host's cgroup quota beside them, the host read while the
-    stalled pytest still ran (rows 5452, 5454)."""
+    frames and the native ones under them, a stall before any test ran included, which pytest's own report of
+    an interrupt cannot give (2026-11-03: a group stalled 28 minutes in a read with no deadline during
+    collection, its row saying only that no tests ran): a thread stalled in the interpreter, or in native code
+    holding the GIL or not (an XLA compile, a wait on a device, a collective), read from outside the process.
+    The row names the stall's whole record among its evidence in the task's artifacts (`stalls.kept`), its
+    stacks and the host's cgroup quota beside them, the host read while the stalled pytest still ran (rows
+    5452, 5454)."""
     source, stalled = STALLS[stall]
     artifacts = tmp_path / "artifacts"
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_stalls.py": f"{source}\n\ndef test_never():\n    pass\n"})
-    ci.task("3.12", ["tests/test_stalls.py"], "", tmp_path / "rows.json", 10.0 if launched else 3.0,
-            cache="off", grace=5.0, release=str(wheel(tmp_path)) if launched else "")
+    ci.task("3.12", ["tests/test_stalls.py"], "", tmp_path / "rows.json", 3.0, cache="off", grace=5.0)
     [interrupted] = json.loads((tmp_path / "rows.json").read_text())["rows"]
     assert interrupted["kind"] == "deadline"
     # py-spy's frame of the stalled function, by its file and line.

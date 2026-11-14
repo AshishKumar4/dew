@@ -6,12 +6,10 @@ its live set (`live_registers`, `tile_registers`) and the budgets its roles run 
 the derivation's shared steps (`deepest`, `band`). Compiled kernels' own reports are the authority over these
 estimates (`report`)."""
 
-import contextlib
-import contextvars
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Hashable, Iterator, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
@@ -529,8 +527,6 @@ class Launch:
     registers: int | None
     floor: int = 2
     most: int = MOST_STAGES
-    tile: object = None
-    """The template's tile the launch is at, which a plan's evidence names (`recording`)."""
     producer: int | None = None
     """The registers its producer role is lowered to where its issue loop holds more than the family's
     least (`Family.roles`; None: `producer_floor`), as its schedule runs it."""
@@ -584,8 +580,8 @@ def register_programs(family: "Family", consumers: int, registers: int | None = 
 
 @dataclasses.dataclass(frozen=True)
 class RegisterModel:
-    """A launch's register decision as its template's model states it, which the compile gate holds the
-    GPU's compile to (tests/kernel_compile.py `decisions`): a consumer thread's registers (None where a case
+    """A launch's register decision as its template's model states it, which its derivation proposes and its
+    certification judges (`report.certified`): a consumer thread's registers (None where a case
     states only its budget), the family's budget for them at its consumers (`Family.registers`), its
     consumer warpgroups, the most programs its family runs a multiprocessor (`Family.programs`), the
     allocator's step (`Family.register_step`), a producer warpgroup's registers a thread (0 without one),
@@ -673,34 +669,6 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
                                 else moves))
 
 
-@dataclasses.dataclass(frozen=True)
-class Asked:
-    """A plan a derivation asked for (`plan`, `recording`), its static facts alone (no launch's scope, which
-    may close over a trace's values): each launch's tile (`Launch.tile`) and registers, the family it asked
-    on, the residency it fixed (None: the most that hold) and the plans, None where a launch held at none."""
-    tiles: tuple
-    registers: tuple[int | None, ...]
-    family: "Family"
-    programs: int | None
-    plans: tuple[LaunchPlan, ...] | None
-
-
-_ASKED: contextvars.ContextVar[list[Asked] | None] = contextvars.ContextVar("asked", default=None)
-
-
-@contextlib.contextmanager
-def recording() -> Iterator[list[Asked]]:
-    """Within the block, every plan asked (`plan`) appended to the list it gives, in order: the evidence a
-    derivation's choices rest on, which the compile gate holds to the GPU's compile (the tiles it refused
-    for their registers alone among them)."""
-    asked: list[Asked] = []
-    token = _ASKED.set(asked)
-    try:
-        yield asked
-    finally:
-        _ASKED.reset(token)
-
-
 def placed(launches_of: Callable, layouts: tuple["Family", ...], target, *,
            programs: int | None = None) -> tuple["Family", tuple[LaunchPlan, ...]] | None:
     """The layout a program runs on, and its launches' plans: the first of `layouts` (an instruction family's
@@ -723,16 +691,19 @@ def hidden(family: "Family", consumers: int) -> Callable[[int, int], tuple[int, 
 
     A family whose producer issues a program's loads and whose products run asynchronously to its consumers'
     warps (warpgroup MMA beside a TMA producer) hides its loads' latency by the bytes it holds in flight, its
-    programs times its stages (a stage's bytes are the launch's own at every plan), ties to fewer programs
-    (a larger raise each, its state held once): an H100 ran the 27B gated delta net's states launch one
-    program five deep (184 KiB in flight), where its most programs, two one deep (74 KiB), slowed the
-    forward 1.4 to 1.5 times (FS-RESIDENT-WINDOW1-h100, FS-INFLIGHT1); Nemotron-H 30B's SSD query/key launch,
-    one stage, two programs at 1.35 times one's rate (FS-SSD-RESIDENT1-h100). A family whose consumers issue
-    their own loads and synchronous products (mma.sync, no producer) hides their issue latency by its
-    resident warps, its programs first, then its ring: an A100 held its states launch at three programs
-    where its deepest ring alone held one (SE-family-a100-8c5b5b16a)."""
+    programs times its stages (a stage's bytes are the launch's own at every plan): an H100 ran the 27B gated
+    delta net's states launch one program five deep (184 KiB in flight), where its most programs, two one
+    deep (74 KiB), slowed the forward 1.4 to 1.5 times (FS-RESIDENT-WINDOW1-h100, FS-INFLIGHT1); Nemotron-H
+    30B's SSD query/key launch, one stage, two programs at 1.35 times one's rate (FS-SSD-RESIDENT1-h100). At
+    as many bytes in flight it takes more programs, whose warps hide the issue latency a deeper ring does not:
+    a B200's 27B gated delta training launches at two programs one deep against one two deep, 1.884 to 1.743
+    ms, its solve 211 to 135 us, Kimi delta attention's output 161 to 99 us, each launch latency-bound (12.5%
+    of its warps active, M-JS-112, row 5720). A family whose consumers issue their own loads and synchronous
+    products (mma.sync, no producer) hides their issue latency by its resident warps, its programs first, then
+    its ring: an A100 held its states launch at three programs where its deepest ring alone held one
+    (SE-family-a100-8c5b5b16a)."""
     if family.warpgroups(consumers) > consumers:
-        return lambda programs, stages: (programs * stages, -programs)
+        return lambda programs, stages: (programs * stages, programs)
     return lambda programs, stages: (programs, stages)
 
 
@@ -744,15 +715,6 @@ def plan(launches, family: "Family", target, *, programs: int | None = None) -> 
     (`program_shared`) holds the launch at its `floor`, each at the deepest ring that share holds, the one
     that hides the most latency (`hidden`). Each launch plans at its own residency and depth; a template's
     legality is that every launch holds."""
-    planned = _planned(launches, family, target, programs)
-    if (asked := _ASKED.get()) is not None:
-        asked.append(Asked(tuple(launch.tile for launch in launches),
-                           tuple(launch.registers for launch in launches), family, programs, planned))
-    return planned
-
-
-def _planned(launches, family: "Family", target, programs: int | None) -> tuple[LaunchPlan, ...] | None:
-    """`plan`'s plans."""
     block = generation.shared_budget(target)
     plans = []
     for launch in launches:

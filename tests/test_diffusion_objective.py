@@ -224,9 +224,9 @@ def test_a_sample_compiles_ahead_for_two_gpus_none_attached(preset, solver):
     they were evaluated on the mesh's devices, which run nothing (row 4752's class of reds)."""
     from jax.sharding import NamedSharding, PartitionSpec
 
+    from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.kernels.options import collecting
     from dew.training import MeshSpec
-    from dew.training.ahead import compile_only_gpus
 
     model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
     objective = DiffusionObjective(model, preset, InputSpec(Field("image", (RES, RES, 3))), steps=3,

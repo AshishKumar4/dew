@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from model_support import remote_code_site
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
+from release_support import under_release
 from remote_code_draws import SITES, draw
 
 from dew.interop import Pretrained
@@ -49,7 +50,7 @@ OPENED = {"lfm3-tiny": "transformers==5.18.0", "lfm3-biased-tiny": "transformers
           "lfm3-vl-tiny": "transformers==5.18.0", "mimo-v2-tiny": "transformers==5.1.0",
           "mimo-v2-sliding-tiny": "transformers==5.1.0"}
 """Each fixture whose export opens through its release's code, by the transformers that code runs under,
-which the whole suite's run overlays on the suite's own for its check alone (`release_env`): LFM3's
+which its check's own interpreter runs under (`release_support.under_release`): LFM3's
 native export carries it (`DecoderFamily.release_code`); MiMo-V2's and LFM3-VL's, which transformers
 holds no class for, are released sources Dew loads and saves, which keep the code their configs name
 (`Pretrained.code`)."""
@@ -63,12 +64,10 @@ SAVED_ONLY = ("lfm3-vl-tiny",)
 
 
 @pytest.mark.parametrize(("name", "saved"), [
-    pytest.param(name, saved, marks=pytest.mark.release_env(requirement),
-                 id=f"{name}-{'saved' if saved else 'native'}")
-    for name, requirement in OPENED.items()
+    pytest.param(name, saved, id=f"{name}-{'saved' if saved else 'native'}")
+    for name in OPENED
     for saved in ((True,) if name in SAVED_ONLY else (False, True) if name in SAVED else (False,))])
-def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name, saved, tmp_path,
-                                                                           monkeypatch):
+def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name, saved, tmp_path):
     """A Dew export of the fixture (`PretrainedDecoder.from_model(...).save`) opens offline through the
     release's own transformers loader, under the transformers its code needs, as the release itself opens:
     the same class, every weight matched, the same state tensor for tensor and the same logits bit for
@@ -76,7 +75,13 @@ def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name,
     fetched store; ledgers 2038, 2173). A native export reads its release's code from the hub's cache,
     seeded at the commit Dew holds it to from the same vendored files; a saved source keeps the code
     beside it (`SAVED`). A MiMo-V2 model exports natively as MiMo-V2, under its release's code
-    (ledger 2192)."""
+    (ledger 2192). Run in an interpreter of its own under that transformers (`under_release`)."""
+    under_release(OPENED[name], export_opens_as_the_release_does, name, saved, str(tmp_path))
+
+
+def export_opens_as_the_release_does(name: str, saved: bool, directory: str) -> None:
+    """`test_an_export_opens_through_its_releases_own_code_as_the_release_does`'s check, in the interpreter
+    its release's transformers runs (`under_release`), its scratch under `directory`."""
     import shutil
 
     import huggingface_hub.constants
@@ -84,6 +89,7 @@ def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name,
 
     from dew.interop import PretrainedDecoder
 
+    tmp_path = Path(directory)
     # The tool imports its siblings in tools/, as it does run as a script.
     with run_from("remote_code_reference", "tools") as reference:
         repo, revision, files, _ = reference.RELEASES[name]
@@ -91,7 +97,7 @@ def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name,
         snapshot.mkdir(parents=True)
         for file in files:
             shutil.copy(reference.release_file(name, file), snapshot / file)
-        monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
+        huggingface_hub.constants.HF_HUB_CACHE = str(tmp_path / "hub")
         if saved:
             # The fixture as its release ships: the code its config names beside it.
             source = tmp_path / "source"
@@ -108,39 +114,3 @@ def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name,
         (tmp_path / "scratch").mkdir()
         checks = reference.opens(name, tmp_path / "export", tmp_path / "scratch")
     assert all(checks.values()), checks
-
-
-@pytest.mark.parametrize("pinned", ["held", "other", "absent", "held wheel", "other wheel"])
-def test_a_release_test_outside_its_overlay_fails_naming_the_overlay(tmp_path, pinned):
-    """A release_env test run by an interpreter without the package its mark pins, a requirement or the
-    wheel's path CI's release task overlays (tools/armada/ci.py `pytest_command`), fails before it runs,
-    naming CI's release operation over its file, where the release's own loader failed opaquely in its
-    subprocess (row 3576); an interpreter that holds it runs the test. Run as pytest runs a marked test,
-    through the suite's own hooks (tests/conftest.py, loaded as the run's plugin) and its markers
-    (pyproject.toml)."""
-    import os
-    import subprocess
-    import sys
-    from importlib.metadata import version
-
-    held = version("packaging")
-    requirement = {"held": f"packaging=={held}", "other": "packaging==0.0.1", "absent": "dew-absent==1.0",
-                   "held wheel": str(tmp_path / f"packaging-{held}-py3-none-any.whl"),
-                   "other wheel": str(tmp_path / "packaging-0.0.1-py3-none-any.whl")}[pinned]
-    test = tmp_path / "test_marked.py"
-    test.write_text(f"import pytest\n\n\n@pytest.mark.release_env({requirement!r})\ndef test_marked():\n"
-                    "    pass\n")
-    tests = Path(__file__).resolve().parent
-    run = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "conftest",
-                          "-c", str(tests.parent / "pyproject.toml"), "--rootdir", str(tmp_path), str(test)],
-                         capture_output=True, text=True, cwd=tmp_path, check=False,
-                         env={**os.environ, "PYTHONPATH": os.pathsep.join(
-                             filter(None, (str(tests), os.environ.get("PYTHONPATH"))))})
-    from conftest import release_unheld
-
-    unheld = release_unheld(requirement, "test_marked.py::test_marked")
-    assert run.returncode == (0 if unheld is None else 1), run.stdout[-2000:]
-    assert (unheld is None) == pinned.startswith("held")
-    if unheld is not None:
-        assert unheld.command[:3] == ("python", "tools/armada/ci.py", "release")
-        assert {f"--requirement={requirement}", "--tests=test_marked.py"} <= set(unheld.command)

@@ -1,57 +1,38 @@
-"""DeepSeek-V4-Flash-0731 tiny fixture: the release's DSpark drafter over V4's trunk.
+"""DeepSeek-V4-Flash-0731 tiny fixture: the release's DSpark drafter over V4's trunk, and its recorded runs.
 
 V4-Flash-0731 ships V4's trunk with three DSpark stages under `mtp.*`; its
 config.json, inference/model.py and weight index are byte for byte
 DeepSeek-V4-Flash-DSpark's. transformers' DeepseekV4 builds the trunk and no
 drafter, so the drafter's reference is the release's inference/model.py at
-DEEPSEEK_V4_0731_REVISION. This tool downloads it, installs
+DEEPSEEK_V4_0731_REVISION alone. This tool downloads it, installs
 `tools/deepseek_v41_kernels.py` as its `kernel` module, as
 tools/deepseek_v41_reference.py does for V4.1 (the two releases' kernel.py
 export the same functions, and their sparse_attn differs only on a row with
-no valid key, which no row here has), and runs its `Transformer` in fp32 on
-CPU over dense weights. The trunk's logits come from transformers 5.16.1's
-DeepseekV4ForCausalLM over the same checkpoint. Run it in the project's
-environment:
+no valid key, which no row here has), and runs its `Transformer` on the CPU
+over dense weights. Run it in the project's environment:
 
-    PYTHONPATH=src:.:tools python tools/deepseek_v4_dspark_reference.py [--seed N] [--released]
+    PYTHONPATH=src:.:tests:tools python tools/deepseek_v4_dspark_reference.py [--seed N] \
+        [--record | --released]
 
 It writes tests/fixtures/hf/deepseek-v4-dspark-tiny: config.json in the
 release's spelling at toy width, model.safetensors under the release's
-tensor names, source.json, and
-
-    reference.npz      input_ids [2, 16]; logits, transformers' trunk over
-                       them; decode_prompt, the prefill length of the cached
-                       run; draft_ids, draft_logits, draft_confidence, the
-                       release's forward_spec after every teacher-forced step
-                       past the prefill
-    reference_f64.npz  the same outputs in float64: transformers with its
-                       weights widened, the release under
-                       tools/deepseek_v41_reference.py's `widened`
-
-The tool refuses a seed where either reference, in fp32, picks another
-expert, indexer entry or draft token than its float64 run does, or where
-the two references' float64 trunks part by more than float64 rounding. It
-counts the tied selections the release met, top-k rows whose k-th and next
-scores are equal, which the exact zeros of the indexer's ReLU make
-(model.py:427) and only the tie order decides; source.json records the
-count. SEED is the first seed tried, not one searched for.
-
-`--released` writes tests/fixtures/hf/deepseek-v4-flash-0731 instead: the
-release's config.json and tensor_names.json, its weight index with the
-`.scale` partners dropped and the expert index as K.
+tensor names and source.json. `--record` writes its recordings beside them
+(`write_recording`): recording.npz, the release's and transformers' outputs
+over drawn rows whose every selection clears the gate's margin
+(tests/selection_margins.py), summarized over seeds with their float64
+truth, for check 1 (tests/test_deepseek_v4_dspark.py), and recording_rows.npz,
+the rows each seed drew. `--released` writes tests/fixtures/hf/deepseek-v4-flash-0731
+instead: the release's config.json and tensor_names.json, its weight index
+with the `.scale` partners dropped and the expert index as K.
 
 Where the reference departs from the release it says so. The quantizers
-are off: act_quant and fp4_act_quant are the identity, since neither Dew's
-V4 mixer nor transformers' DeepseekV4 rounds the cache. With them off,
-rotate_activation, the indexer's Hadamard rotation of its queries and keys
-alike, leaves the scores it ranks unchanged in exact arithmetic, so it is
-the identity (model.py:253-257, :374-376, :420-422), and the head returns
-every position's logits (`_full_head`). Beyond the quantizers, the tie order
-is the one documented difference from the release: each indexer and router
-breaks equal scores toward the lower entry, as jax.lax.top_k does, where
-torch.topk leaves the order unspecified (`lower_index_ties` of
-tools/decoder_export_reference.py, on the release's Indexer and Gate and
-transformers' indexer and router alike).
+are off, act_quant and fp4_act_quant the identity, as Dew's V4 mixer runs.
+With them off, rotate_activation, the indexer's Hadamard rotation of its
+queries and keys alike, leaves the scores it ranks unchanged in exact
+arithmetic, so it is the identity (model.py:253-257, :374-376, :420-422):
+the release's runs only in bfloat16 on a GPU (`fast_hadamard_transform`).
+The head returns every position's logits, called with its own
+`full_logits=True` (model.py:731).
 """
 
 from __future__ import annotations
@@ -70,7 +51,6 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import deepseek_v41_reference as v41
-from decoder_export_reference import lower_index_ties
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -79,7 +59,8 @@ DEEPSEEK_V4_0731_REVISION = "7872f01b1d1fe23eabc4c98b48bffcef5a386062"
 FIXTURE = ROOT / "tests" / "fixtures" / "hf" / "deepseek-v4-dspark-tiny"
 RELEASED = ROOT / "tests" / "fixtures" / "hf" / "deepseek-v4-flash-0731"
 SEED = 0
-LENGTH = 16
+LENGTH = v41.LENGTH
+"""A row's tokens: V4.1's, which the shared draws take (`v41.clearing_rows`, `v41.clearing_cached_rows`)."""
 # Past the 4-token window, so the prefill wraps the trunk's and DSpark's
 # rings, and a multiple of neither compress ratio, so each compressor
 # carries an open group from the prefill into the decode.
@@ -148,7 +129,8 @@ def config_json() -> dict:
 
 def import_reference():
     """The pinned model.py over the torch kernels, its quantizers and
-    rotation the identity (the module doc)."""
+    rotation the identity (the module doc), its selections probed
+    (`v41.install_selection_probe`)."""
     from huggingface_hub import hf_hub_download
 
     sys.modules["kernel"] = importlib.import_module("tools.deepseek_v41_kernels")
@@ -158,6 +140,7 @@ def import_reference():
                     hf_hub_download(REPO, "inference/model.py", revision=DEEPSEEK_V4_0731_REVISION))
     v41.set_quantizers(module, enabled=False)
     module.rotate_activation = lambda x: x
+    v41.install_selection_probe()
     return module
 
 
@@ -208,51 +191,10 @@ def reset(net):
 
 
 def cached(net, ids) -> dict[str, np.ndarray]:
-    """The prefill of the first PROMPT tokens, which seeds DSpark's windows, then a
-    teacher-forced step and DSpark's draft after each (V4.1's driver, `v41.cached`,
-    under this release's reset, prompt and length)."""
-    outputs = v41.cached(net, ids, reset=reset, prompt=PROMPT, length=LENGTH)
-    return {name: outputs[name] for name in ("draft_ids", "draft_logits", "draft_confidence")}
-
-
-def inputs(seed: int) -> torch.Tensor:
-    """The fixture's token ids at `seed`, clear of the noise token."""
-    generator = torch.Generator().manual_seed(seed + 1)
-    return torch.randint(2, TINY["vocab_size"] - 1, (2, LENGTH), generator=generator)
-
-
-def tied(found: list) -> int:
-    """How many recorded selections the tie order decided: rows whose k-th
-    and next finite scores are equal."""
-    count = 0
-    for rows, picks in found:
-        k = picks.size(-1)
-        if k < rows.size(-1):
-            ordered = rows.sort(-1, descending=True).values
-            kth, after = ordered[:, k - 1], ordered[:, k]
-            count += int((torch.isfinite(kth) & (kth == after)).sum())
-    return count
-
-
-def differ(found: list, wide: list) -> int:
-    """How many picks an fp32 run made otherwise than its float64 run."""
-    if len(found) != len(wide):
-        return max(len(found), len(wide))
-    return sum(int((picks != other).sum()) for (_, picks), (_, other) in zip(found, wide, strict=True))
-
-
-def released_outputs(module, seed: int, ids: torch.Tensor, widen: bool = False):
-    """The release's full-forward logits and its cached run, the net, and
-    every top-k its indexers and routers made, each breaking ties toward the
-    lower index (`lower_index_ties`)."""
-    found: list = []
-    with torch.no_grad():
-        net = build(module, seed, widen)
-        with lower_index_ties(net, classes=(module.Indexer, module.Gate), found=found):
-            reset(net)
-            _, logits, _ = v41.forward(net, ids)
-            outputs = {"release_logits": logits.numpy(), **cached(net, ids)}
-    return net, outputs, found
+    """The release's driver (`v41.cached`) under this release's reset, prompt and length: the prefill of
+    the first PROMPT tokens, which seeds DSpark's windows, then a teacher-forced step and DSpark's draft
+    after each."""
+    return v41.cached(net, ids, reset=reset, prompt=PROMPT, length=LENGTH)
 
 
 @contextlib.contextmanager
@@ -268,17 +210,14 @@ def widened_transformers(module):
         yield
 
 
-def transformers_logits(directory: Path, ids: torch.Tensor, dtype: torch.dtype):
-    """transformers' logits over `ids` from the checkpoint in `directory`, and
-    every top-k its indexers and routers made under the lower-index tie order
-    (`lower_index_ties`); refused if it leaves a trunk tensor unread."""
+def transformers_model(directory: Path, dtype: torch.dtype):
+    """transformers' DeepseekV4 over the checkpoint in `directory` at `dtype`, its experts eager (torch's
+    grouped_mm takes no float64) and its attention eager; refused if it leaves a trunk tensor unread."""
     from transformers import DeepseekV4ForCausalLM
-    from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Indexer, DeepseekV4TopKRouter
 
-    # The eager experts, since torch's grouped_mm takes no float64.
-    loaded = DeepseekV4ForCausalLM.from_pretrained(str(directory), dtype=dtype, local_files_only=True,
-                                                   output_loading_info=True, experts_implementation="eager")
-    model, report = loaded
+    model, report = DeepseekV4ForCausalLM.from_pretrained(str(directory), dtype=dtype, local_files_only=True,
+                                                          output_loading_info=True,
+                                                          experts_implementation="eager")
     unread = {key: sorted(report[key]) for key in ("missing_keys", "mismatched_keys", "error_msgs")
               if report[key]}
     # transformers builds no drafter and ignores `mtp.*` on load
@@ -288,24 +227,47 @@ def transformers_logits(directory: Path, ids: torch.Tensor, dtype: torch.dtype):
         raise SystemExit(f"{directory}: transformers does not read the checkpoint: {unread} {stray}")
     model.eval()
     model.set_attn_implementation("eager")
-    found: list = []
-    selecting = (DeepseekV4Indexer, DeepseekV4TopKRouter)
-    with torch.no_grad(), lower_index_ties(model, classes=selecting, found=found):
-        logits = model(input_ids=ids, use_cache=False).logits.numpy()
-    return logits, found
+    return model
+
+
+def transformers_evaluated(module, directory: Path):
+    """A recorded trunk site's evaluation (`record_case`) by transformers over the checkpoint in `directory`:
+    its logits on a draw's rows in float32, refused where a selection it makes clears less than the gate's
+    `MARGIN` (the rows clear twice it in the release's forward, `write_recording`), and in float64 from the
+    same checkpoint widened (`widened_transformers`)."""
+    from selection_margins import MARGIN
+
+    narrow = transformers_model(directory, torch.float32)
+    with widened_transformers(module):
+        wide = transformers_model(directory, torch.float64)
+
+    def evaluate(inputs):
+        ids = torch.from_numpy(inputs["input_ids"].astype(np.int64))
+        recorded = v41.Record()
+        v41.RECORDS[:] = [recorded]
+        with torch.no_grad():
+            logits = narrow(input_ids=ids, use_cache=False).logits.numpy()
+        v41.RECORDS.clear()
+        smallest = min(float(call["margin"].min()) for call in recorded.calls["selection"])
+        if smallest <= MARGIN:
+            raise SystemExit(f"transformers' selections over {inputs['input_ids'].tolist()} clear "
+                             f"{smallest:.3g}, not MARGIN")
+        with torch.no_grad(), widened_transformers(module):
+            truth = wide(input_ids=ids, use_cache=False).logits.numpy()
+        return {"logits": logits.astype(np.float64)}, {"logits": truth}
+    return evaluate
 
 
 def write(seed: int):
+    """The fixture's checkpoint at `seed`: model.safetensors under the release's tensor names, refused
+    where a name is not one the release ships, config.json and source.json."""
     from reference_releases import require
 
     from dew.interop.safetensors_io import write_file
 
     pins = require("transformers")
-    module = import_reference()
-    ids = inputs(seed)
-    net, outputs, found = released_outputs(module, seed, ids)
-    with v41.widened(module):
-        _, wide, wide_found = released_outputs(module, seed, ids, widen=True)
+    with torch.no_grad():
+        net = build(import_reference(), seed)
     FIXTURE.mkdir(parents=True, exist_ok=True)
     # Each stage holds the trunk's embedding and head as attributes
     # (model.py:903-904), which the release's index does not repeat.
@@ -317,29 +279,51 @@ def write(seed: int):
         raise SystemExit(f"names the release does not ship: {unshipped}")
     write_file(tensors, FIXTURE / "model.safetensors", {"format": "pt"})
     (FIXTURE / "config.json").write_text(json.dumps(config_json(), indent=1) + "\n")
-    logits, picks = transformers_logits(FIXTURE, ids, torch.float32)
-    with widened_transformers(module):
-        truth, truth_picks = transformers_logits(FIXTURE, ids, torch.float64)
-
-    differing = {"release picks": differ(found, wide_found), "transformers picks": differ(picks, truth_picks),
-                 "draft_ids": int(np.sum(outputs["draft_ids"] != wide["draft_ids"]))}
-    trunks = float(np.max(np.abs(wide["release_logits"] - truth)))
-    ties = tied(found)
-    print(json.dumps({"seed": seed, "differing": differing, "float64 trunks apart": trunks,
-                      "tied selections": ties, "selections": sum(len(picks) for _, picks in found)}))
-    if any(differing.values()) or trunks > 1e-9:
-        raise SystemExit(f"seed {seed}: a reference decides otherwise than its float64 run, or the "
-                         "release's trunk is not transformers'")
-    names = ("draft_ids", "draft_logits", "draft_confidence")
-    np.savez(FIXTURE / "reference.npz", input_ids=ids.numpy().astype(np.int32), logits=logits,
-             decode_prompt=np.int32(PROMPT), **{name: outputs[name] for name in names})
-    np.savez(FIXTURE / "reference_f64.npz", logits=truth, draft_logits=wide["draft_logits"],
-             draft_confidence=wide["draft_confidence"])
     (FIXTURE / "source.json").write_text(json.dumps({
         "release": {"repo": REPO, "revision": DEEPSEEK_V4_0731_REVISION, "path": "inference/model.py"},
-        "transformers": {"version": pins["transformers"]}, "seed": seed, "tied_selections": ties},
-        indent=1) + "\n")
+        "transformers": {"version": pins["transformers"]}, "seed": seed}, indent=1) + "\n")
     print(f"{FIXTURE}: {len(tensors)} tensors, seed {seed}")
+
+
+def write_recording(seed: int):
+    """recording.npz beside the fixture (`recorded_references.record_case`, summarized over seeds): over
+    drawn rows whose every top-k clears twice the gate's `MARGIN` in the release's forward
+    (`v41.clearing_rows`), the release's trunk logits at every position (`deepseek v4 dspark trunk`) and
+    transformers' (`deepseek v4 dspark transformers trunk`, each of its selections clearing MARGIN); over
+    rows drawn apart whose cached run decides alike in a float32 port (`v41.clearing_cached_rows`), the
+    release's prefill, teacher-forced steps and DSpark's drafts after each (`deepseek v4 dspark cached`).
+    Each with its float64 run, the release's under `v41.widened`, transformers' under
+    `widened_transformers`. recording_rows.npz holds the rows each seed drew and the cached run's
+    prompt."""
+    from recorded_references import provenance, record_case, save
+    from reference_releases import require
+
+    pins = require("transformers")
+    module = import_reference()
+    with torch.no_grad():
+        net = build(module, seed)
+        with v41.widened(module):
+            wide = build(module, seed, widen=True)
+    vocabulary = TINY["vocab_size"]
+    draw, rows = v41.drawn_once(
+        lambda index: v41.clearing_rows(net, vocabulary, index, reset=reset, factor=2))
+    trunk = v41.twin_evaluated(module, net, wide, v41.logits_from(0, reset=reset))
+    arrays = {**record_case("deepseek v4 dspark trunk", draw, trunk, summary=True),
+              **record_case("deepseek v4 dspark transformers trunk", draw,
+                            transformers_evaluated(module, FIXTURE), summary=True)}
+    cached_draw, walking = v41.drawn_once(
+        lambda index: v41.clearing_cached_rows(net, vocabulary, index, run=cached))
+    leaves = functools.partial(v41.cached_leaves, run=cached)
+    arrays.update(record_case("deepseek v4 dspark cached", cached_draw,
+                              v41.twin_evaluated(module, net, wide, leaves), summary=True))
+    written = save(FIXTURE / "recording.npz", {**arrays, "provenance": provenance(
+        REPO, DEEPSEEK_V4_0731_REVISION, "cpu",
+        "PYTHONPATH=src:.:tests:tools <release python> tools/deepseek_v4_dspark_reference.py --record",
+        torch=torch.__version__, transformers=pins["transformers"])},
+        reference=f"{REPO}@{DEEPSEEK_V4_0731_REVISION}", license="mit")
+    np.savez(FIXTURE / "recording_rows.npz", rows=np.stack([rows[index] for index in range(len(rows))]),
+             cached_rows=np.stack([walking[index] for index in range(len(walking))]), prompt=np.int32(PROMPT))
+    print(f"{written}: {sorted(arrays)}; {len(rows)} rows, {len(walking)} cached rows")
 
 
 def family(name: str) -> str:
@@ -373,9 +357,12 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--released", action="store_true")
+    parser.add_argument("--record", action="store_true", help="write the fixture's recordings")
     args = parser.parse_args()
     if args.released:
         write_released()
+    elif args.record:
+        write_recording(args.seed)
     else:
         write(args.seed)
 

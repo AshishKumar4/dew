@@ -304,7 +304,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from dew import communicators
 from dew.communicators import Needs, Sizing
 from dew.nn.kernels import options
-from dew.training.ahead import compile_only_gpus
+from dew.nn.kernels.generation import compile_only_gpus
 
 mesh = Mesh(np.array(compile_only_gpus("sm90", 2)), ("pair",))
 summed = jax.shard_map(lambda part: jax.lax.psum(part, "pair"), mesh=mesh, in_specs=PartitionSpec("pair"),

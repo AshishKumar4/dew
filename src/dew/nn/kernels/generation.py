@@ -86,7 +86,7 @@ def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False,
     placed platform's) by the device's own bundles and facts, which Mosaic GPU's interpreter runs
     (`interpreted_target`): an interpreted check of that device's route on a CPU. `portable`, the program
     is compiled for any GPU of the generation (a canonical target's compile-only devices,
-    `dew.training.ahead.compile_only_gpus`), not one host's own: a kernel whose compiled plan holds to its
+    `compile_only_gpus`), not one host's own: a kernel whose compiled plan holds to its
     GPU's model alone (cuDNN's) does not lower in it. None assumes nothing. JAX keys its trace and compile
     caches on the device assumed (`dew._cache.KERNEL_ASSUMED`), so a function jitted for one traces again
     for another."""
@@ -229,7 +229,7 @@ SETMAXNREG = RegisterRaises(24, 256, 8)
 class Multiprocessor:
     """A CUDA multiprocessor's resources, which the templates' register and resource models read
     (`templates.resources`, `templates.cost`) and a compile ahead's target describes
-    (`dew.training.ahead.target_config`): the most threads and blocks resident at once
+    (`target_config`): the most threads and blocks resident at once
     (`resident_threads`, `resident_blocks`), its 32-bit `registers`, the most a thread holds
     (`thread_registers`), a block's limits (`block_registers`, `block_threads`, `block_shared`, the static
     shared memory a block declares without opting in), the threads of a warp (`warp_threads`), the
@@ -854,7 +854,7 @@ def built_target(generation: str, multiprocessors: int | None = None, memory: in
     `multiprocessors` its build states, where it states them (an H100 PCIe's 114 against the canonical H100's
     132), else the generation's own, and the `memory` a device holds where it states it (an A100 of 40 GB's
     bytes, a call's footprint held to them by `device_memory`), else the least of the target's parts
-    (`GpuTarget.memory`). What a build's XLA target (`dew.training.ahead.target_config`), its launches
+    (`GpuTarget.memory`). What a build's XLA target (`target_config`), its launches
     (`assumed`) and the target its loader holds it to (`dew.training.ahead.BuildTarget`) all read."""
     target = gpu_target(generation)
     if multiprocessors is not None and multiprocessors <= 0:
@@ -890,6 +890,94 @@ def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
 # cuDNN's fused attention refuses bf16 ("SDPA FP16/BF16 requires SM80"), and
 # Triton does not compile; measured on a T4 (sm75), 2026-09-22.
 BF16_GPU = 80
+
+
+def target_config(target: GpuTarget, memory: int | None = None) -> str:
+    """The `gpu_device_info` XLA compiles for, from the GPU `target` a build states (`built_target`: its
+    CUDA generation's, its multiprocessors its own where stated): its compute capability, the shared memory
+    a block may opt into, its multiprocessors, clock and bandwidth, its multiprocessor's and a block's
+    limits (`Multiprocessor`) and its fp32 lanes (`Architecture.tensor_rates`); CUDA's grid limits for the
+    rest. The fields past the capability and shared memory only steer XLA's own fusions, never a Triton
+    kernel's code. From Hopper on, its capability states the architecture-specific features (sm_90a,
+    sm_100a, sm_120a), which Mosaic GPU's PTX targets: left unspecified, an sm120's assembled for plain
+    sm_120 and refused its own PTX ('.target sm_120a cannot be compiled for architecture sm_120')."""
+    generation = target.generation
+    version = capability(generation)
+    shared, multiprocessors = target.shared_limit, target.multiprocessors
+    clock, bandwidth = target.clock_hz, target.memory_bandwidth
+    # Its fp32 lanes, two FLOPs a clock each (a fused multiply-add), as its architecture states them.
+    fp32 = target.tensor_rates.get("fp32")
+    if (version is None or shared is None or multiprocessors is None or clock is None or bandwidth is None
+            or fp32 is None):
+        raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
+    major, minor = version
+    multiprocessor = target.multiprocessor
+    return f"""gpu_device_info {{
+  threads_per_block_limit: {multiprocessor.block_threads}
+  threads_per_warp: {multiprocessor.warp_threads}
+  shared_memory_per_block: {multiprocessor.block_shared}
+  shared_memory_per_core: {shared + multiprocessor.reserved_shared}
+  threads_per_core_limit: {multiprocessor.resident_threads}
+  core_count: {multiprocessors}
+  fpus_per_core: {fp32 // 2}
+  block_dim_limit_x: 2147483647
+  block_dim_limit_y: 65535
+  block_dim_limit_z: 65535
+  memory_bandwidth: {int(bandwidth)}
+  device_memory_size: {0 if memory is None else memory}
+  clock_rate_ghz: {clock / 1e9}
+  shared_memory_per_block_optin: {shared}
+  cuda_compute_capability {{
+    major: {major}
+    minor: {minor}
+    feature_extension: {"ACCELERATED_FEATURES" if major >= 9 else "NONE"}
+  }}
+  registers_per_core_limit: {multiprocessor.registers}
+  registers_per_block_limit: {multiprocessor.block_registers}
+}}
+platform_name: "CUDA"
+device_description_str: "{target.device_kind}"
+"""
+
+
+def compile_only_gpus(generation: str, count: int = 1, memory: int | None = None,
+                      multiprocessors: int | None = None) -> tuple:
+    """`count` compile-only devices of the CUDA `generation`, none attached: XLA's CUDA backend compiles a
+    program over them, a mesh's collectives included, as for that many of the generation's GPUs, of the
+    `multiprocessors` a build states where it states them (`built_target`). `memory` states each GPU's
+    memory, its total bytes as the GPU states them (`nvidia-smi`'s total): XLA's scheduler and
+    rematerialization read it as the target's (`device_memory_size`), and every admission of a program
+    compiled for these devices reads the allocator's limit derived from it (`dew._devices.allocator_limit`,
+    `COMPILE_ONLY_MEMORY`), as the GPU's own allocator states it. Absent it, the devices state no memory: a
+    step is compiled ahead for them only where it is stated (`compile_ahead`)."""
+    from dew._devices import COMPILE_ONLY_MEMORY
+
+    if memory is not None:
+        positive_memory(memory)
+    stated = built_target(generation, multiprocessors).multiprocessors
+    devices = _compile_only_gpus(generation, count, memory, stated)
+    if memory is not None:
+        COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
+    return devices
+
+
+def positive_memory(memory: int) -> None:
+    """Refuse a GPU's stated memory that is not a positive count of bytes."""
+    if memory <= 0:
+        raise ValueError(f"a GPU states a positive count of bytes, not {memory}")
+
+
+@functools.cache
+def _compile_only_gpus(generation: str, count: int, memory: int | None,
+                       multiprocessors: int | None) -> tuple:
+    """`compile_only_gpus`, one topology for each GPU however a caller states it (the generation's own
+    multiprocessors as None or as their count)."""
+    import jax.experimental.topologies as topologies
+
+    config = target_config(built_target(generation, multiprocessors), memory)
+    topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=config,
+                                            topology=f"1x1x{count}")
+    return tuple(topology.devices[:count])
 
 
 def _compute_capability(device) -> str | None:

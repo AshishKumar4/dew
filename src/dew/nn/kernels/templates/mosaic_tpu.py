@@ -229,16 +229,15 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               ahead: Callable | None = None, settled: tuple[int, ...] = (),
                prefetched: Callable | None = None, registers: int | None = None,
                producer: int | None = None, shared: int | None = None,
                moves: bool | None = None) -> Callable:
         # A program a core, its operands and outputs left in HBM for its walks' copies; no cluster, and no
-        # program's roles launched ahead of the last's or prefetched (a GPU's dependent launch); its compiler
-        # holds its values, no register budget (`budgets_registers`).
+        # view prefetched ahead of a wait (a GPU's dependent launch); its compiler holds its values, no
+        # register budget (`budgets_registers`).
         del approx_math, reducing_warpgroups, resident, model_flops, registers, producer, shared, moves
-        if ahead is not None or settled or prefetched is not None:
-            raise NotImplementedError("a TPU program is launched after the last; none is ahead of it")
+        if prefetched is not None:
+            raise NotImplementedError("a TPU program is launched after the last; nothing is prefetched ahead")
         _one(consumers, clustered=cluster > 1)
 
         def named(*refs):
@@ -329,8 +328,10 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
-                unrolled: bool = False, accumulators: tuple = (), producer: int | None = None) -> None:
+                unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
+                pingpong: bool = False) -> None:
         del producer  # no producer role of its own
+        self.pingponged(pingpong)
         # A launch's tiles round-robin over its programs, each tile's outputs staged in VMEM and copied out
         # before the next tile's walk.
         del in_flight, unrolled, accumulators
@@ -381,9 +382,11 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
         # Each step's blocks awaited before it and the next step's copied while it multiplies; a segment
         # of no steps copies nothing. Its products are synchronous: no stage outlives its step.
+        if ahead:
+            raise NotImplementedError(f"{self.name}'s walk reads no stream ahead")
         del first, in_flight, unrolled, interpret
         names = tuple(streams.views)
         carry = (start, self.started(shapes, initial))

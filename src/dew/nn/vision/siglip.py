@@ -39,7 +39,7 @@ class SiglipVision(TowerBase):
             num_kv_heads=self.num_heads, head_dim=head_width(self.hidden_size, self.num_heads),
             intermediate_size=self.intermediate_size, activation=tower_activation(self.hidden_act),
             in_channels=self.num_channels, patch_size=self.patch_size, temporal_patch_size=1,
-            spatial_merge_size=1, norm_type="fast_layer", norm_eps=self.layer_norm_eps, norm_bias=True,
+            spatial_merge_size=1, norm_type="layer", norm_eps=self.layer_norm_eps, norm_bias=True,
             mlp_bias=True, packed=False, patch_bias=True, attention=("full",) * self.num_layers,
             order=("patches",) * self.num_layers, sinks=(False,) * self.num_layers,
             positions=LearnedPositions(self.image_size // self.patch_size, "fixed"),

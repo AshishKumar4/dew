@@ -1268,7 +1268,22 @@ class Objective(ABC, Generic[Loss, Effects]):
         if not held:
             # The draw `parameter_axes` reads, the names its boxes carry static under any trace.
             self.__dict__.setdefault("_drawn_axes", boxed_axes(tree))
+        # The draw's shapes, static under any trace (`drawn_shapes`).
+        self.__dict__.setdefault("_drawn_shapes", _shapes_of(tree))
         return tree
+
+    def drawn_shapes(self) -> Variables:
+        """The shapes of the tree `init` draws, plain (`dew.batch.unboxed`), its held parts among them:
+        those its first run recorded, under whatever trace it ran (a run's state traces it), else its draw
+        traced for them (`initializer` under `abstract`), which records them. One draw serves every reader
+        of its shapes (a stage-local run's layout, `dew.training.stages.StageLocal.of`; the trained modules a
+        config names; a traced update's work), where a Qwen3.5-4B's state traced its draw twice, 9.5 of the
+        16 s its start traced."""
+        found = self.__dict__.get("_drawn_shapes")
+        if found is None:
+            found = self.__dict__.setdefault("_drawn_shapes",
+                                             _shapes_of(abstract(self.initializer, jax.random.key(0))))
+        return found
 
     @functools.cached_property
     def parameter_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
@@ -2112,6 +2127,12 @@ and the batch's shapes, the `KEYED_FLOPS` latest: a refit's objective, built ane
 KEYED_FLOPS = 256
 
 
+def _shapes_of(tree) -> Variables:
+    """`tree`'s leaves' shapes and dtypes, unboxed (`dew.batch.unboxed`): arrays, tracers and abstract values
+    alike."""
+    return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype), unboxed(tree))
+
+
 def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tuple[float, float]:
     """The work of an update of `objective` on `batch` as its traced programs run it, for an objective whose
     work no closed form counts (`dew.nn.flops.traced_flops`): its loss's forward, and its loss's gradient's
@@ -2128,7 +2149,7 @@ def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tu
         if counted is not None:
             kept[signature] = counted
     if signature not in kept:
-        variables = unboxed(abstract(objective.init, jax.random.key(0)))
+        variables = objective.drawn_shapes()
         step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
         rest = {name: value for name, value in variables.items() if name != "params"}
 

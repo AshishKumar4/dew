@@ -604,6 +604,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
     consumers = 1
     gathers_rows = True  # its load warp's TMA four-row gathers (`gathered.Committed`, row 1376)
+    takes_pingpong = False  # its accumulators in tensor memory turn by tile (`persist`), one product warp
     # The expert down projection's gathered input gradient spilled 56 and 64 bytes at the floor's 24 on a B200
     # (128 x 128 at six stages, 128 x 64 at eight; the hybrid compile-ahead step, row 5358) and nothing at 40.
     gathering_producer = 40
@@ -691,7 +692,9 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
             "accumulators", Accumulators(self.turns, self.rows, width, self.topology, running=summed), "mma",
             ("epilogue",)),), floor=producer)
 
-    def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = ()) -> tuple[tuple, int]:
+    def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = (), *,
+                        pingpong: bool = False) -> tuple[tuple, int]:
+        self.pingponged(pingpong)
         # Its accumulator turns' barriers, filled and drained (`persist`), each rewritten ring's slots'
         # publish barriers (`prepared`), and its tensor memory's address.
         (accumulators,) = self.persist_schedule(consumers, 0).stated()
@@ -701,8 +704,10 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), summed: int = 0,
-                prepared: Callable | None = None, producer: int | None = None) -> None:
-        """`mosaic.Family.persist`. With `prepared`, `prepared(tile, index, slots)` rewrites each step's slots
+                prepared: Callable | None = None, producer: int | None = None,
+                pingpong: bool = False) -> None:
+        """`mosaic.Family.persist`, its tiles' accumulators turning in tensor memory, no ping-pong
+        (`takes_pingpong`). With `prepared`, `prepared(tile, index, slots)` rewrites each step's slots
         before its products read them (a kernel gradient's neighbouring groups' rows zeroed), run by a role
         of its own past the consumers (`warpgroups`: the launch's consumers one more): it waits for each
         step's loads, rewrites them, publishes them to the tensor cores and arrives at the step's `masked`
@@ -715,6 +720,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         sum back) once their commit arrives, freeing the turn for the window after next; the tile's store
         reads the running sums. Each window is a turn (`persistent.tiled`'s `turns`), so the products of a
         window run while the epilogue promotes the one before."""
+        self.pingponged(pingpong)
         if not accumulators:
             raise ValueError(f"{self._HOME}: a persistent launch states their shapes (`accumulators`)")
         if self.topology.paired and (summed or prepared is not None):
@@ -1009,14 +1015,22 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
                      if half % swizzling.swizzle_columns(dtype, swizzle) == 0),
                     swizzling.NARROWEST_SWIZZLE_BYTES)
 
-    def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = ()) -> dict:
+    def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
+                        ahead: tuple[int, ...] = ()) -> dict:
         # A role's accumulator of each product width: a half-lane tile's columns split between its two lane
         # groups, so a narrower product's is no column slice of a wider one's (Mosaic GPU's layout inference
         # refused one, jsf-tmem4). A 16-column product is issued 32 wide, its right operand padded
         # (`_padded`), its sum's first columns read (`summed`). A role's shared tile of each register left
         # operand's depth and dtype in `lefts` (`register_products` stages one there).
+        # A product of each width in `ahead` two accumulators a role, the one a step's read and the next
+        # step's issued, each its barrier (`issued_ahead`, `taken`).
         widths = tuple(sorted({max(width, PADDED) for width in widths}))
-        return {"tmem": {width: tuple(accumulator_columns(self.rows, width) for _ in range(consumers))
+        ahead = tuple(sorted({max(width, PADDED) for width in ahead}))
+        later = {"ahead": {width: tuple(tuple(accumulator_columns(self.rows, width) for _ in range(2))
+                                        for _ in range(consumers)) for width in ahead},
+                 "ahead_done": plgpu.Barrier(num_barriers=2 * consumers, orders_tensor_core=True)}
+        return {**(later if ahead else {}),
+                "tmem": {width: tuple(accumulator_columns(self.rows, width) for _ in range(consumers))
                          for width in widths},
                 "padded": tuple(plgpu.SMEM((self.rows, PADDED), jnp.bfloat16,
                                            transforms=swizzling.swizzle_transforms(jnp.bfloat16, PADDED))
@@ -1035,9 +1049,47 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
 
     def product_shared(self, scratch) -> tuple:
         # Its accumulators are tensor memory: its padded right operands, its staged left operands and its
-        # barrier are shared memory, as `product_scratch` allocates them.
+        # barriers are shared memory, as `product_scratch` allocates them.
         return (*scratch["padded"], *(tile for tiles in scratch["lefts"].values() for tile in tiles),
-                scratch["done"])
+                scratch["done"], *((scratch["ahead_done"],) if "ahead_done" in scratch else ()))
+
+    issues_ahead = True
+
+    def product_columns(self, products: tuple | None) -> int:
+        if products is None:
+            return 0
+        scratch = self.product_scratch(*products)
+        return resources.tensor_memory_columns(jax.tree.leaves((scratch["tmem"], scratch.get("ahead", {}))))
+
+    def _ahead(self, width: int, buffer):
+        """The building role's two accumulators `width` columns wide (`PADDED` at least) of a product it
+        issues ahead of its read, and accumulator `buffer`'s barrier (`product_scratch`'s `ahead`)."""
+        width = max(width, PADDED)
+        found = self._scoped()
+        if width not in found.get("ahead", {}):
+            raise ValueError(f"{self.name} has no {width}-column product issued ahead in its program's "
+                             "product scratch (`product_scratch`'s `ahead`)")
+        role = mosaic.ROLE.get()
+        tmems = tuple(_addressed_here(tmem, axis=1) for tmem in found["ahead"][width][role])
+        return tmems, found["ahead_done"].at[2 * role + buffer]
+
+    def issued_ahead(self, lhs, rhs, shape: tuple[int, int], buffer) -> None:
+        # Committed to the accumulator's own barrier, a product pending behind the commit (the commit of row
+        # 5671's wedge had none); the role's barrier of its awaited products (`done`) is not this one's.
+        tmems, done = self._ahead(shape[1], buffer)
+
+        def issue(tmem) -> None:
+            self._issued(Accumulator(tmem, (shape[0], max(shape[1], PADDED)), accumulate=False), lhs, rhs)
+
+        for index, tmem in enumerate(tmems):
+            pl.when(buffer == index)(functools.partial(issue, tmem))
+        plgpu.tcgen05_commit_arrive(done)
+
+    def taken(self, shape: tuple[int, int], buffer) -> jax.Array:
+        tmems, done = self._ahead(shape[1], buffer)
+        plgpu.barrier_wait(done)
+        found = lax.switch(buffer, [functools.partial(_read, tmem) for tmem in tmems])
+        return found if shape[1] >= PADDED else found[:, :shape[1]]
 
     @contextlib.contextmanager
     def products_in(self, refs):

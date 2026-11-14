@@ -949,16 +949,16 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
             (step, 0, 1), (functools.partial(step, scores=False), 1, group)))
 
     tiles, out_type = _query_key_launched(call, vq)
-    # Each value head of the group: three memory products (two without the delta rule's weights) and the
-    # scores' gradient's two, a key head's two without the delta rule.
-    scores = 2 * chunk * chunk * call.block
-    each = (2 + call.delta) * chunk * value_width * call.block + scores * call.delta
-    work = Work(flops=2 * (each * group + scores * (not call.delta)), span=group)
+    # Persistent under the delta rule, whose tile walks one step function (without it, the first step's
+    # scores products are a segment of their own, which a persistent tile walks none of): a program a tile
+    # paid each tile's setup, its chunk's table entries' dependent loads and its ring's and done barriers,
+    # most of a modelled B200's CTA (44.3k cycles for three tiles against a persistent one's 11.6k a tile).
     dq, dk, *weights, after, leaving, memory = launch_kernel(
         program, call, out_type=out_type,
         grid=(splits, width // call.block, call.chunks, call.heads // group),
         grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(10),
-        work=work, held=_query_key_held(call, vq), landing=_query_key_landing(call, splits))(
+        work=_query_key_work(call), held=_query_key_held(call, vq), landing=_query_key_landing(call, splits),
+        persistent=call.delta)(
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta)
     # The splits' own sums added (one split's, as they are, where a program takes every value column).
     if splits > 1:
@@ -966,6 +966,15 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
     after, leaving, memory = (x.reshape(splits, -1, *x.shape[1:]).sum(0) for x in (after, leaving, memory))
     dw = None if not weights else weights[0] if splits == 1 else held.split(weights[0])
     return dq, dk, dw, after, leaving, memory
+
+
+def _query_key_work(call: Call) -> Work:
+    """`_query_key`'s tile's work: each value head of its group three memory products (two without the delta
+    rule's weights) and the scores' gradient's two, a key head's two without the delta rule."""
+    chunk = call.chunk
+    scores = 2 * chunk * chunk * call.block
+    each = (2 + call.delta) * chunk * call.value_width * call.block + scores * call.delta
+    return Work(flops=2 * (each * call.group + scores * (not call.delta)), span=call.group)
 
 
 def _value_grads(call: Call) -> Operand:

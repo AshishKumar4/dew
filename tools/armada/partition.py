@@ -2,7 +2,7 @@
 as pytest lists them under CI's selection, against the tests its rows of one Python ran, a split file's
 groups, its sites' judges and a resumed task's recalled tests among them. A task of a split file refuses a
 cut that does not hold each collected test once (split.py), every task cutting alike; this reads the same of
-a run from outside its tasks, on a whole verdict (a train's or the daily run's: Main, 2026-11-12, after a
+a run from outside its tasks, on a whole verdict (a train's: Main, 2026-11-12, after a
 landing run's tails, read without their resumed attempts, seemed to leave a test unrun). The standard
 library alone."""
 

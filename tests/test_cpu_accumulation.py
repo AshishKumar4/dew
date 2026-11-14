@@ -339,9 +339,10 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     """Each site of the wide CPU arithmetic, a float32 product and a bias's spread and a row's logsumexp
     (`widened_reduction`), traces a platform choice in a process running Dew's test setting
     (`WIDE_CPU_ARITHMETIC`), and in a library process, which sets nothing, the plain computation:
-    no float64 beside a float32 computation, and no platform choice (ledger 3197: a bias's gradient
-    included; a CPU's float32 sums are XLA's own, row 5448). Each is traced afresh, as a process with
-    either setting traces it."""
+    no float64 beside a float32 computation, and no platform choice (ledger 3197; a CPU's float32 sums
+    are XLA's own, row 5448), but a bias's spread, whose blocked sum is every CPU process's (ledger 4882):
+    its platform choice, in no float64. Each is traced afresh, as a process with either setting traces
+    it."""
     from dew.nn.precision import divided
     from dew.nn.protocols import OutputTable
     from dew.objectives.lm.chunked import chunked_cross_entropy
@@ -375,7 +376,7 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
             states, OutputTable(table, vocab_major=True), targets, 1, tile=None)[0], states, table),
     }
     for name, found in sites.items():
-        if wide:
+        if wide or name == "bias":
             assert choices(found), name
         else:
             assert not choices(found), name
@@ -383,6 +384,49 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     # A float64 division is the plain division under either setting.
     with jax.enable_x64(new_val=True):
         assert not choices(traced(divided, np.ones(3, np.float64), np.float64(3.0)))
+
+
+def test_a_users_process_spreads_a_bias_as_the_gate_measures_it(monkeypatch):
+    """A bias's gradient over 4,096 positions in a user's process, which sets no wide arithmetic, is the one
+    check 1 measures for it in the scope it runs a CPU arm in (`arm_arithmetic.summed_as_run`: the suite's
+    wide arithmetic under stated fp32 sums), bit for bit: every CPU process sums a spread's cotangent in
+    blocks (`precision.spread`), where a user's process summed the broadcast's transpose in XLA's order while
+    the gate judged the blocked sum (ledger 4882)."""
+    from arm_arithmetic import summed_as_run
+
+    rng = np.random.default_rng(4882)
+    inputs = jnp.asarray(rng.standard_normal((4096, 16)), jnp.float32)
+    cotangent = jnp.asarray(rng.standard_normal((4096, 8)), jnp.float32)
+    layer = Dense(8)
+    params = layer.init(jax.random.key(0), inputs)["params"]
+
+    def bias_gradient():
+        # Traced afresh, as a process with either setting traces it.
+        return jax.jit(jax.grad(lambda params: jnp.sum(layer.apply({"params": params}, inputs) * cotangent)))(
+            params)["bias"]
+
+    monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    users = bias_gradient()
+    monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    with summed_as_run():
+        measured = bias_gradient()
+    np.testing.assert_array_equal(np.asarray(users), np.asarray(measured))
+
+
+def test_a_users_spread_keeps_its_float32_values_whatever_dot_algorithm_its_process_states(monkeypatch):
+    """A bias spread in a user's process (`precision.spread`'s blocked outer products of ones) keeps its
+    float32 values and their gradient's sum under a process's narrower dot algorithm (JAX's
+    F16_F16_F16, which casts a product's operands through float16): 1 + 2**-12 and 65536, which float16
+    rounds to 1 and overflows, spread as a broadcast spreads them, its products pinned to float32's."""
+    from dew.nn.precision import spread
+
+    monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    value = jnp.asarray([[1 + 2.0 ** -12, 65536.0, -3.0, 0.5]], jnp.float32)
+    with jax.default_matmul_precision("F16_F16_F16"):
+        spread_value = jax.jit(lambda value: spread(value, (6, 4)))(value)
+        gradient = jax.jit(jax.grad(lambda value: jnp.sum(spread(value, (6, 4)))))(value)
+    np.testing.assert_array_equal(np.asarray(spread_value), np.broadcast_to(np.asarray(value), (6, 4)))
+    np.testing.assert_array_equal(np.asarray(gradient), np.full((1, 4), 6.0, np.float32))
 
 
 def test_a_narrow_bias_beside_a_wide_product_sums_its_wide_cotangent_before_it_rounds():

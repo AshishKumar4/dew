@@ -68,7 +68,6 @@ from dew.distributed.placement import MeshSpec
 from dew.interop.weights import AUTO
 from dew.lora import LoRA
 from dew.nn.kernels import generation
-from dew.nn.sharding import abstract
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig, ParamGroup
 from dew.registry import (
@@ -295,10 +294,9 @@ def trained_modules(objective: Objective[Loss, Effects],
     gained, `Pretrained.with_model`): a tied readout is drawn with none."""
     if not modules:
         return (), ()
-    from dew.batch import unboxed
     from dew.optim import parameter_name
 
-    trained = unboxed(abstract(lambda: objective.init(jax.random.key(0))))["params"]
+    trained = objective.drawn_shapes()["params"]
     names = [parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(trained)]
     return (tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names)),
             tuple(module for module in modules if module in names))

@@ -218,7 +218,7 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, memory, dh, a, beta, taken
                 jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
     products = 2 * chunk * keys * value_width * 3 * steps + 2 * 2 * chunk * chunk * width
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                         grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(11),
+                         grid_names=("chunks", "heads"), blocks=tiles, stages=(1, 2), live=chunk_liveness(11),
                          work=Work(flops=products, span=steps), held=_key_memory_held(call, keys),
                          staging=staging,
                          landing=landing)(
@@ -383,7 +383,8 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
         pairs, squares, gated_rows, referenced = staging
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
-        views = own_pairs.pairs_back_views(call, row, h, q_ref, k_ref, hi_ref, lo_ref, ds_ref, da_ref)
+        views = own_pairs.pairs_back_views(call, row, h, q_ref, k_ref, hi_ref, lo_ref, ds_ref, da_ref,
+                                           columns=chunk)
 
         def step(index, slots, d_betas, accumulators):
             # Every slot acquired in the step's own trace: the rolled sub-chunks read them.
@@ -391,7 +392,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
             betas = family.rows_of(beta_ref.at[h, span])
             at = pl.ds(h * width + index * keys, keys)
             # The sub-chunks' first tokens' prefix halves read once a step into a plain tile, a row each, as
-            # the intra launch reads its own (`mainloop._intra`).
+            # the intra launch reads its own (`intra._intra`).
             for half, ref in enumerate((hi_ref, lo_ref)):
                 for sub in range(chunk // algebra.SUB):
                     referenced[half, sub, :] = family.columns_of(ref.at[row + sub * algebra.SUB, at])
@@ -444,7 +445,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
     out_type = (fp32_rows, fp32_rows, fp32_rows, jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
     products = 2 * 2 * 2 * chunk * chunk * keys * (chunk // algebra.SUB) * steps
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                         grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(7),
+                         grid_names=("chunks", "heads"), blocks=tiles, stages=(1, 2), live=chunk_liveness(7),
                          work=Work(flops=products, span=steps,
                                    exponentials=(chunk // algebra.SUB + 1) * chunk * width),
                          held=_key_pairs_held(call, keys), staging=staging, landing=landing)(
