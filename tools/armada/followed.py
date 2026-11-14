@@ -27,11 +27,14 @@ from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
-TOOLS = {"git", "nvidia-smi", "uname", "file", "ptxas"}
-"""The programs a test file may start and keep its key: git (a run's commit), nvidia-smi (the GPUs),
-uname and file (the `platform` module's answers) and ptxas (a GPU kernel's PTX compiled to machine
-code, on the host alone). Any other start, a shell's or a launcher's included, may run the
-checkout's code or hold the GPU."""
+TOOLS = {"git", "nvidia-smi", "uname", "file", "ptxas", "nvdisasm", "ffmpeg"}
+"""The programs a test file may start and keep its key: git (a run's commit), nvidia-smi (the GPUs), uname and
+file (the `platform` module's answers), ptxas and nvdisasm (a GPU kernel's PTX compiled to machine code and
+its cubin read back, on the host alone), and ffmpeg (a media file encoded or decoded), each reading only the
+files it is named and pinned by the lock that installs it. Any other start, a shell's or a launcher's
+included, may run the checkout's code or hold the GPU. A row whose test started nvdisasm or imageio-ffmpeg's
+ffmpeg kept no key and was never reused: 913 of the plan's lookups at main bebce1c53, the Mosaic GPU compile
+files' groups and the audio and video files' rows (2026-11-14)."""
 SPAWNS = {"subprocess.Popen", "_posixsubprocess.fork_exec", "os.posix_spawn", "os.spawn", "os.exec",
           "os.fork", "os.forkpty"}
 """Audit events of a process start; a multiprocessing child's is executed.py's `CHILD_START`'s."""
@@ -334,7 +337,15 @@ def native(names: list) -> bool:
     """Whether every one of `names`, and at least one, is a program of `TOOLS`. A start that names
     its program by a file descriptor (`os.execve`'s), or by nothing, is no tool's."""
     return bool(names) and all(isinstance(name, (str, bytes, os.PathLike))
-                               and os.path.basename(os.fsdecode(name)) in TOOLS for name in names)
+                               and tool(os.path.basename(os.fsdecode(name))) in TOOLS for name in names)
+
+
+def tool(base: str) -> str:
+    """The tool a program's file name `base` is: itself, or `ffmpeg` for imageio-ffmpeg's bundled build, named
+    by its platform and version (ffmpeg-linux-x86_64-v7.0.2)."""
+    platform, _, version = base.removeprefix("ffmpeg-").rpartition("-")
+    bundled = base.startswith("ffmpeg-") and "-" in platform and version.startswith("v")
+    return "ffmpeg" if bundled else base
 
 
 def start(event: str, args: tuple, directory: str) -> str | None:
