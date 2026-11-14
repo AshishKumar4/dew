@@ -73,14 +73,21 @@ def user_module(path: Path) -> types.ModuleType:
 def chain_of(named: str, branch: Literal["train", "validation"], trust: tuple[str, ...] = ()):
     """The chain `named` names as a `dew.data.compile` pipeline: a Python file's `data`, or with
     `branch="validation"` its `validation` (each a chain, or a function returning one); a chain's
-    record (a `.json` file `dew.data.records` reads); or a store's URL (`dew.data.sources.source`).
-    Raises ValueError for a file that holds no such chain, or a store asked for its validation."""
+    record (a local `.json` file `dew.data.records` reads, importing what `trust` names); or a store's URL
+    (`dew.data.sources.source`), a remote one whatever its suffix (an `s3://` JSON file is records the
+    store reads, not a chain's record on this disk). Raises ValueError for a file that holds no such chain,
+    or a store asked for its validation."""
+    from dew._files import is_uri
     from dew.data import records
     from dew.data.pipeline import Dataset
     from dew.data.sources import source
 
     path = Path(named)
-    if path.suffix == ".py":
+    if is_uri(named):
+        if branch == "validation":
+            raise ValueError(f"{named} is a store, which holds no validation chain; name a Python file's")
+        chain = source(named)
+    elif path.suffix == ".py":
         module = user_module(path)
         held = getattr(module, "data" if branch == "train" else "validation", None)
         chain = held() if callable(held) and not isinstance(held, Dataset) else held
@@ -112,6 +119,8 @@ class DataExport:
     provision: bool = False
     tokenizer: str | None = None
     eos: bool = False
+    trust: tuple[str, ...] = ()
+    """Packages outside Dew whose modules a chain's record may import (its own steps')."""
 
     def run_command(self) -> int:
         from dew.data.compile import iterate
@@ -120,7 +129,7 @@ class DataExport:
         format = self.format or ("array_record" if self.tokenizer is not None else "parquet")
         if self.tokenizer is not None and format != "array_record":
             raise ValueError("token exports must use --format array_record")
-        pipeline = chain_of(self.data, self.branch)
+        pipeline = chain_of(self.data, self.branch, self.trust)
         if self.tokenizer is not None:
             from dew.data.text import export_tokens
 
@@ -158,12 +167,14 @@ class DataPublish:
     branch: Literal["train", "validation"] = "train"
     read: Literal["memory", "indexed", "streamed"] = "streamed"
     provision: bool = False
+    trust: tuple[str, ...] = ()
+    """Packages outside Dew whose modules a chain's record may import (its own steps')."""
 
     def run_command(self) -> int:
         from dew.data.cache import Cache
         from dew.data.compile import publish
 
-        pipeline = chain_of(self.data, self.branch)
+        pipeline = chain_of(self.data, self.branch, self.trust)
         generation = publish(pipeline, Cache(self.destination), read=self.read, provision=self.provision)
         emit(f"published {generation.url}")
         return 0

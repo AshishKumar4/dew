@@ -333,6 +333,13 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             return False
         return crosses_alone(held.get("params", {}).get("backbone", {}))
 
+    traced = ("layout", "bounds", "loss_rule", "label_smoothing", "consistency", "input_lm", "pass_weights",
+              "exit_entropy")
+    """What its loss reads beside its modules and held tree: the layout its rows are laid out by (its
+    documents' forks among it) and the windows it packs (`bounds`: of its tokenizer, specials, segments and
+    context window), its scoring rule and smoothing, its terms' weights, its passes' weights and its exit's
+    entropy."""
+
     def __init__(self, backbone: nn.Module | Source | Adapter | Decide, *,
                  loss: ScoringRule | None = None, tokenizer: Tokenizer | None = None,
                  specials: Specials | None = None, layout: Layout | None = None,

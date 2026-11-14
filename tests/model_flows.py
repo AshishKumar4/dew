@@ -306,7 +306,7 @@ FLOWS = (
     Flow("lightning attention", "minimax-tiny", LIGHTNING, "bfloat16",
          {"train": {**TEMPLATE, "gated_delta_rule": NATIVE},
           "decode": {**TEMPLATE, "decode": NATIVE, "gated_delta_rule": NATIVE}},
-         families={"gated_delta_rule": ("wgmma",)}),
+         families={"gated_delta_rule": ("wgmma", "mma.sync")}),
 )
 """Every model flow, by the route it is for (docs/design/testing.md: a kernel's native run is a flow's
 cell): each family that takes a distinct default route on a GPU, its bf16 attention flows twice, under the
@@ -314,8 +314,9 @@ lane's deterministic ops (the template on a GPU's own mainloop) and as a user's 
 library's fused kernel where one takes the call, FlashAttention among them, which refuses the lane's), the
 dense fp32 flow on XLA's declared fp32 route, and the SSD port in fp32 too, as a user's process runs it (its
 products in TF32 at the default precision, which the lane's whole fp32 products refuse).
-Lightning attention's decay without the delta rule takes the recurrence template on a Hopper GPU alone: fla's
-port hands it to the portable math (`recurrence_chunk.PORT_SUPPORTS`). A latent attention flow's decode loop
+Lightning attention's decay without the delta rule takes the recurrence template on a Hopper or an Ampere GPU
+(an A100's once its output launch's phases were stated apart, row 6233): fla's port hands it to the portable
+math (`recurrence_chunk.PORT_SUPPORTS`). A latent attention flow's decode loop
 attends in XLA (the latent decode's own form), and a KDA flow's decode step's softmax layer too: no native
 attention route of theirs there."""
 

@@ -130,6 +130,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   memory. `AheadTarget.capacity_gib` is that memory, and `AheadOfTime.capacity` the limit the plan held to.
 
 
+- Dew requires its JAX build 0.12.0.1.post93 (Python alone; the CUDA and PJRT plugins stay post81's): the Pallas
+  lowering cache keys no caller's metadata of a kernel (`CompilerParams.metadata`), which no lowering reads, so
+  kernels that differ in it alone share one lowering, each call carrying its own.
+- Dew requires its JAX build 0.12.0.1.post92 (Python alone; the CUDA and PJRT plugins stay post81's): a compile for
+  compile-only GPUs that states no tuning (its options or XLA_FLAGS name neither autotune level 0 nor complete
+  stored autotune results) neither reads nor writes JAX's persistent cache, so a program XLA compiled untuned is
+  never stored under the key a device's tuned compile reads.
 - Dew requires its JAX build 0.12.0.1.post90 (Python alone; the CUDA and PJRT plugins stay post81's): Mosaic GPU
   issues tcgen05's products of fp32 shared-memory operands as TF32 (`.kind::tf32`), which Dew's Blackwell kernels
   do not select yet, and a compile ahead that requires its autotune results keys its programs as its device's

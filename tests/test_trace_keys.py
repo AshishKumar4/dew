@@ -6,6 +6,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from dew.data.text import ByteTokenizer
+from dew.decision import DecisionObjective, Specials, StateFirstLayout
 from dew.diffusion.discrete import MDLM
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.base import stated_trace
@@ -20,7 +22,19 @@ def tiny(**fields) -> CausalTransformer:
                                 "max_seq_len": 8, **fields})
 
 
+def deciding(**settings) -> DecisionObjective:
+    """A decision objective over a tiny backbone, its rows a state first, read by bytes."""
+    backbone = CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=2, max_seq_len=96)
+    specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
+    layout = StateFirstLayout(max_len=96, head_max_len=48, option_tokens=8)
+    tokenizer = ByteTokenizer()
+    return DecisionObjective(backbone, tokenizer=tokenizer, specials=specials, layout=layout, **settings)
+
+
 BUILT = {
+    # A decision objective's segments its loss reads as the windows it packs (`bounds`), never by name.
+    "decision": (deciding, {"label_smoothing": 0.1}),
+    "decision segments": (deciding, {"segments": 2}),
     "lm": (lambda **settings: LMObjective(tiny(), 8, **settings), {"z_loss": 1e-4}),
     "dpo": (lambda **settings: DPOObjective(tiny(), 8, **settings), {"beta": 0.5}),
     "dpo pairs": (lambda **settings: DPOObjective(tiny(), 8, **settings), {"pairs": 2}),

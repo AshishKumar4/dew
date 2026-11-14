@@ -19,6 +19,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The kernel challenge's lessons in the templates. [5271]
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353, 5288]
 - Convolution repairs above their owner. [5665]
+- Abstract values keyed by their printed form. [6287]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822, 5391]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -49,7 +50,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Training and parallelism
 
-- Time to first step: the compile path's re-derivations. [5556, 5558, 5669, 6082]
+- Time to first step: the compile path's re-derivations. [5556, 5558, 6082]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
 - Training & Data's tests on check 1. [708]
@@ -59,6 +60,7 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Data
 
 - Metamorphic run flows: a run equals its saved, reloaded and restarted self. [4511]
+- The diffusion kinds' starts keep no record and their refits trace again. [6297]
 
 ## RL and serving
 
@@ -67,6 +69,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Training and serving efficiency. [3330, 1880, 5292]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
 - A decoder computing in no dtype of its own. [6215]
+- Tests/test_serving.py::test_a_server_that_prefills_on_a_mesh_of_its_own_scores_its_draws_as_a_full_forward reads jax.devices()[1:3] under…. [6295]
 
 ## Algebra
 
@@ -77,6 +80,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Every MAINPERF measurement since 2026-11-09. [6045]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Bit-level synthesis in dew.algebra. [3733]
+- Greedy extraction prices dearer than the exact optimum when a saturation aid is absent. [6254]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 
@@ -87,4 +91,5 @@ This page is generated from the maintainers' findings ledger as each change land
 ## CI and tooling
 
 - Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
+- The perf gate accepts a timing from a step that went non-finite. [6279]
 - The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]

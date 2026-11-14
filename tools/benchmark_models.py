@@ -442,6 +442,21 @@ class CompiledStep:
     state: TrainState
     step: Step
     compile_seconds: float
+    # Each step's loss and finiteness as it ran, kept on the device (no wait inside a timed window), read by
+    # `nonfinite` after it.
+    taken: list = dataclasses.field(default_factory=list)
+
+    def nonfinite(self) -> int:
+        """How many of the steps run since the last read went non-finite (the step's own finiteness, or its
+        loss not finite): read once a window is over, so a timing is never kept from a window any of whose
+        steps was invalid, whichever step it was (audit, 2026-11-14: only the last step's was read)."""
+        taken = list(self.taken)
+        self.taken.clear()
+        if not taken:
+            return 0
+        losses, finite = zip(*taken, strict=True)
+        valid = jnp.logical_and(jnp.stack(finite), jnp.isfinite(jnp.stack(losses)))
+        return int(jnp.sum(~valid))
 
 
 @contextlib.contextmanager
@@ -468,9 +483,11 @@ def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) ->
 
         def step(state: TrainState) -> tuple[TrainState, jax.Array, jax.Array]:
             state, loss, _, finite, _, _ = compiled(state, first if fixed_batch else next(source))
+            found.taken.append((loss, finite))
             return state, loss, finite
 
-        yield CompiledStep(state, step, compile_seconds)
+        found = CompiledStep(state, step, compile_seconds)
+        yield found
 
 
 def timed_steps(step: Step, state: TrainState, steps: int

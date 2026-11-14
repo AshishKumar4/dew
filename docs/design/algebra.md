@@ -138,7 +138,9 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
   reads a link, and a rule set states its rounding class (§6.4). Error is measured per candidate, never held
   as a fact (§1.5).
 - **Rules,** in declared sets in one place, each set tagged with the modes it runs in:
-  - **linear algebra** (compile time and dev time): linearity of sums (`joined`), a laid factor hoisted out
+  - **linear algebra** (compile time and dev time): linearity of sums (`joined`: it changes no shipped
+    program today, and the pass runs 12% slower without it, the rule-set survey of 2026-11-14, which is its
+    receipt), a laid factor hoisted out
     of a sum, distributivity, a product's bilinearity (a shared operand out of two products, a power of two's
     scale on either operand), a row or column scale lifted out of a matrix product along the axis the product
     keeps (a dequant's: `(diag(s) X) Yᵀ ≡ diag(s) (X Yᵀ)`), and a positive scale out of a maximum or a minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign
@@ -641,6 +643,10 @@ class Rules:
 RULES: Mapping[str, Rules]                   # every registered set, by name
 def register(rules: Rules) -> None: ...
 def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]   # the sets numerics and a mode allow
+ARMS: Mapping[str, Rules]                    # a derivation's own sets a receipt's arm may leave out (carried)
+def armed(sets: Rules) -> Rules: ...         # registers one in ARMS
+def nameable() -> frozenset[str]: ...        # every registered non-dev set and each of ARMS
+def admits(sets: Rules) -> bool: ...         # whether the pass runs it: none an arm leaves out
 ```
 
 - A set's rules are egglog `rewrite`/`birewrite`/`rule` objects in its `ruleset`.
@@ -651,6 +657,13 @@ def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]   # the 
   numerics where it traces (`generation.numerics`, in JAX's trace context), so a program held across the two
   traces afresh.
 - At dev time every set is admitted, and the declared accuracy (§1.5) decides which forms extraction may take.
+- A set's measured receipt (§1.6) compares programs with the set and without it: a receipt's arm leaves sets
+  out (`passes(without=...)`, §6.7), any of `nameable()`: a registered set but a dev-time one, which runs at
+  dev time alone, and a derivation's own set where the derivation still makes a program without it
+  (`ARMS`: the carry split's, which then extracts its traced forms). A derivation's defining set (the
+  attention derivation's `decoupled`, a scan's own identities, `linear_scan`'s, which no `Rules` holds)
+  makes its program, which no arm has without it, so no arm names it. Every nameable set's saturation reads
+  `admits`, and every derivation keys on the sets left out (`derive.context`), so arms share no derivation.
 
 ### 6.5 Cost and extraction
 
@@ -851,11 +864,13 @@ class Passes:                         # dew._cache
     on: bool = True                   # the pass runs
     target: str | None = None         # the GpuTarget whose facts it prices for; None: the process's own
     checked: bool = False             # each derivation's greedy extraction held to the exact optimum
+    without: frozenset[str] = frozenset()   # the sets a receipt's arm leaves out (rules.nameable, §6.4)
 
 ALGEBRA = jax.make_user_context(default_value=Passes())   # dew._cache, in JAX's trace context
 
 @contextlib.contextmanager
-def passes(on: bool = True, target: str | None = None) -> Iterator[None]: ...   # sets ALGEBRA
+def passes(on: bool = True, target: str | None = None,
+           without: Collection[str] = ()) -> Iterator[None]: ...   # sets ALGEBRA; refuses a name not nameable
 
 @dataclass(frozen=True)
 class Rewrite:                        # one region's

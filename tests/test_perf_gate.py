@@ -1,15 +1,14 @@
 """The performance gate's verdict (tools/perf_gate.py), on samples written here."""
 
-import base64
 import hashlib
 import json
 import shutil
 import subprocess
 import sys
-import zipfile
 from pathlib import Path
 
 import pytest
+import wheels
 from tool_support import load
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -314,24 +313,6 @@ version = "0"
 """
 
 
-def wheel(directory: Path, version: str) -> Path:
-    """A wheel of the package `probe_wheel` at `version`: its module, metadata and record, zipped."""
-    info = f"probe_wheel-{version}.dist-info"
-    files = {"probe_wheel/__init__.py": f"__version__ = {version!r}\n",
-             f"{info}/METADATA": f"Metadata-Version: 2.1\nName: probe-wheel\nVersion: {version}\n",
-             f"{info}/WHEEL": ("Wheel-Version: 1.0\nGenerator: tests\nRoot-Is-Purelib: true\n"
-                               "Tag: py3-none-any\n")}
-
-    def digest(text: str) -> str:
-        return base64.urlsafe_b64encode(hashlib.sha256(text.encode()).digest()).rstrip(b"=").decode()
-    record = "".join(f"{name},sha256={digest(text)},{len(text.encode())}\n" for name, text in files.items())
-    path = directory / f"probe_wheel-{version}-py3-none-any.whl"
-    with zipfile.ZipFile(path, "w") as archive:
-        for name, text in {**files, f"{info}/RECORD": f"{record}{info}/RECORD,,\n"}.items():
-            archive.writestr(name, text)
-    return path
-
-
 def test_a_tree_imports_the_wheels_its_lock_names_and_dew_from_its_own_source(gate, tmp_path):
     """Built for real by each tree's own installer: a tree's process imports the wheel version its
     lock names and Dew from its own src, also where two trees whose locks agree share one
@@ -340,7 +321,7 @@ def test_a_tree_imports_the_wheels_its_lock_names_and_dew_from_its_own_source(ga
     for name, version in (("main", "1.0"), ("head", "2.0")):
         tree = trees[name] = tmp_path / name
         (tree / "locks").mkdir(parents=True)
-        built = wheel(tmp_path, version)
+        built = wheels.wheel(tmp_path, "probe-wheel", version)
         # As every lock holds it: each file's sha256, which Dew's installer requires.
         digest = hashlib.sha256(built.read_bytes()).hexdigest()
         (tree / "locks" / "cpu.txt").write_text(f"probe-wheel @ {built.as_uri()} --hash=sha256:{digest}\n")
@@ -556,7 +537,8 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path
         # remats by a structured policy.
         plan = {"split": 1, "rows": 4, "remat": {"policy": "dots_saveable"} if head else None,
                 "head_tile": [1024, 2] if head else None}
-        printed = json.dumps({"seconds": 48.0 if head else 32.0,
+        parts = {"traced": 6.0, "lowered": 2.0, "compiled": 30.0 if head else 18.0, "algebra": 4.0}
+        printed = json.dumps({"seconds": 48.0 if head else 32.0, "parts": parts,
                               "plan": {key: plan.get(key) for key in command[-1].split(",")}})
         return subprocess.CompletedProcess(command, 0, f"compiling\n{printed}\n", "")
 
@@ -588,6 +570,12 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path
              "head_fused": None, "xla_defaults": None, "narrow": None}
     assert judged[dense]["plans"]["head"] == [tiled] * 6
     assert judged[dense]["plans"]["base"][0]["remat"] is None
+    # Each arm's planning by its parts beside the verdict, and which part moved said in its state (row 6108).
+    assert len(judged[dense]["parts"]["head"]) == 6 and judged[dense]["parts"]["head"][0]["compiled"] == 30.0
+    table = tmp_path / "table.md"
+    gate.report(SimpleNamespace(results=out, table=str(table), claim=False, verdicts=None))
+    [line] = [line for line in table.read_text().splitlines() if line.startswith(f"| {dense} ")]
+    assert "compiled 18.00/30.00" in line and "traced 6.00/6.00" in line
     a100 = SimpleNamespace(**{**vars(args), "kind": "a100", "rounds": 1, "only": ["finetune"],
                               "out": str(tmp_path / "a100.json")})
     assert gate.compile_battery(a100) == 0
@@ -618,16 +606,18 @@ def test_a_step_compiled_ahead_for_an_absent_gpu_is_a_sample_of_its_planners_sec
     script = gate._script(tmp_path / "compiled.json", gate.COMPILED)
     environ = {**outside_suite(os.environ), "PYTHONPATH": f"{ROOT / 'src'}:{ROOT / 'tools'}"}
 
-    def compiled(attention: str) -> tuple[float, dict]:
+    def compiled(attention: str) -> tuple[float, dict, dict | None]:
         argv = [str(script), json.dumps(TINY), "sm90", str(1 << 30), attention, ",".join(gate.SELECTED)]
         done = subprocess.run([sys.executable, *argv], cwd=ROOT, env=environ, capture_output=True, text=True,
                               timeout=900, check=False)
         assert done.returncode == 0, done.stderr[-3000:]
         return gate.compiled_sample(done.stdout)
 
-    seconds, plan = compiled(gate.AHEAD_ATTENTION)
+    seconds, plan, parts = compiled(gate.AHEAD_ATTENTION)
     assert isinstance(seconds, float) and seconds > 0
     assert set(plan) == set(gate.SELECTED) and plan["split"] == 1
+    # Its seconds by their parts: JAX's traces, lowerings and compiles, and the algebra's passes.
+    assert set(parts) == {"traced", "lowered", "compiled", "algebra"} and parts["compiled"] > 0
 
 
 def paired(rates: dict[str, list[float]], session: str = "s") -> dict[str, list[dict]]:
@@ -850,3 +840,36 @@ def test_a_steps_compiled_ahead_on_a_host_with_no_gpu_are_named_for_their_cases(
     assert done.returncode == 0, done.stderr[-3000:]
     [case] = step.cases_from_json(json.dumps([TINY]))
     assert [path.name for path in (tmp_path / "ahead").iterdir()] == [step.ahead_name(case)]
+
+
+@pytest.mark.parametrize(("dispatched", "by"), [([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], "device"),
+                                                ([1.0, 1.0, 1.0, 55.0, 1.0, 1.0], "host")])
+def test_a_step_whose_window_stalled_in_one_part_keeps_its_elapsed_time_and_says_the_stall_beside_it(
+        gate, tmp_path, dispatched, by):
+    """A step's time is its window's whole elapsed time a step, a stall in it counted as a head's pause
+    would be; a part that took `STALL` times its parts' median is said beside it, with whose time it was:
+    the host's where its dispatch was as slow, the device's where only its readiness was (2026-11-14: a
+    round's first arm read 36.41 ms where one of six parts took 83.72 against 27)."""
+    out = tmp_path / "step.json"
+    series = [27.41, 26.92, 27.01, 83.72, 26.46, 26.95]
+    out.write_text(json.dumps([{"ms_per_step": 36.412, "window_ms_series": series,
+                                "window_dispatch_ms_series": dispatched}]))
+    assert gate._stepped(out)[0] == 36.412
+    assert gate.stalled(out) == {"part_ms": 83.72, "median_ms": 26.98, "by": by}
+    steady = [27.1, 26.9, 27.0, 27.2, 26.8, 27.0]
+    out.write_text(json.dumps([{"ms_per_step": 27.0, "window_ms_series": steady}]))
+    assert gate.stalled(out) is None
+
+
+@pytest.mark.parametrize("record", [{"finite": False, "nonfinite_steps": 3, "loss": 1.5},
+                                    {"finite": True, "loss": float("nan")}], ids=["flagged", "nan-loss"])
+def test_a_step_timing_from_a_window_that_went_non_finite_is_refused_not_a_sample(gate, tmp_path, record):
+    """A step record whose window went non-finite (its steps' count, or its loss) is refused by the gate's
+    reader, the probe's failure, never a timing sample: a head that makes a step NaN never reads as fast
+    (audit, 2026-11-14)."""
+    out = tmp_path / "step.json"
+    out.write_text(json.dumps([{"ms_per_step": 12.0, "mfu": 0.4, **record}]))
+    with pytest.raises(ValueError):
+        gate._stepped(out)
+    out.write_text(json.dumps([{"ms_per_step": 12.0, "mfu": 0.4, "finite": True, "loss": 1.5}]))
+    assert gate._stepped(out)[0] == 12.0
