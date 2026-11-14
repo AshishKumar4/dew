@@ -134,7 +134,8 @@ def judged_from_records(test: str) -> bool:
     task recorded (`_judged_pooled`), a site that stays undecided judging the weighed check it defers to
     (`_deferred`), the first failure the test's. A missing record, a stage's seeds short, or another commit's
     is refused, naming it (`map_judge.pooled_units`). False, the body to run, where no map task wrote a
-    manifest of `test` or a site it reached judges its own units (`map_judge.sharded`)."""
+    manifest of `test`, a site it reached judges its own units (`map_judge.sharded`), or its body decides a
+    site's verdict itself (`map_judge.judged_in_its_body`: a failure it expects)."""
     sites = manifests(test)
     if sites is None or any(verdict is None for _, verdict in sites):
         return False

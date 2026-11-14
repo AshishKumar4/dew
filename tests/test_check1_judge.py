@@ -123,8 +123,9 @@ def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whol
 def test_a_judge_judges_a_tests_sites_from_its_map_tasks_records_alone(tmp_path, monkeypatch):
     """A sharded test's judge (POOL) judges the sites its map tasks' manifests name from their records,
     none of its body run (`judged_from_records`): a product on par passes and a bfloat16 one fails with the
-    findings the body's own judge finds; a pool missing one map task's draws, short of the first stage's
-    seeds, or drawn at another commit is refused naming the record, never judged."""
+    findings the body's own judge finds; a test whose body expects its site's failure runs its body; a pool
+    missing one map task's draws, short of the first stage's seeds, or drawn at another commit is refused
+    naming the record, never judged."""
     import map_judge
     from check1_judge import judged_from_records
     from check1_wire import DRAWS, POOL, RECORDS
@@ -139,11 +140,14 @@ def test_a_judge_judges_a_tests_sites_from_its_map_tasks_records_alone(tmp_path,
     def body(dew):
         assert_as_exact(dew, jnp.matmul, a_product_draw, "a product", seeds=16)
 
-    def mapped(root, dew, shards):
-        """The test's body as each map task runs it, then its manifest written, as conftest writes it."""
+    def mapped(root, dew, shards, *, expecting: bool = False):
+        """The test's body as each map task runs it, then its manifest written, as conftest writes it; a body
+        `expecting` its site's failure says it decides the verdict itself (`judged_in_its_body`)."""
         for index, (start, stop) in enumerate(shards):
             monkeypatch.setenv(DRAWS, f"{start}:{stop}")
             monkeypatch.setenv(RECORDS, str(root / str(index)))
+            if expecting:
+                map_judge.judged_in_its_body("a product")
             body(dew)
             map_judge.manifested(test)
         monkeypatch.delenv(DRAWS)
@@ -164,8 +168,11 @@ def test_a_judge_judges_a_tests_sites_from_its_map_tasks_records_alone(tmp_path,
     with pytest.raises(GateFailure) as from_body:
         judged(tmp_path / "halved", lambda: body(halved))
     assert sorted(found(from_records.value)) == sorted(found(from_body.value))
-    # A test no map task wrote a manifest of runs its body.
+    # A test no map task wrote a manifest of runs its body, and so does one whose body decides its site's
+    # verdict itself, a failure it expects.
     assert not judged(tmp_path / "halved", lambda: judged_from_records("tests/test_judged.py::test_other"))
+    mapped(tmp_path / "expected", halved, [(0, 40), (40, 80)], expecting=True)
+    assert not judged(tmp_path / "expected", lambda: judged_from_records(test))
     # One map task's draws missing, or the first stage's seeds short: refused, naming what the pool holds.
     for path in (tmp_path / "halved" / "1").glob("*.pkl"):
         if ".manifest." not in path.name:

@@ -31,8 +31,9 @@ class PoolRefused(AssertionError):
 
 REACHED: list[tuple[str, object]] = []
 """The sites the running test has reached as a map task, in order: each its label and what its verdict reads
-(`check1_judge.Verdict`), None for a site whose test judges its own units (`sharded`). Written beside
-their records as the test's manifest once its call is done (`manifested`)."""
+(`check1_judge.Verdict`), None for a site whose test judges its own units (`sharded`) or decides its verdict
+itself (`judged_in_its_body`). Written beside their records as the test's manifest once its call is done
+(`manifested`)."""
 
 
 @functools.cache
@@ -174,6 +175,14 @@ def pooled_units(label: str, units: int | None = None) -> list[tuple[int, int, o
         raise PoolRefused(f"{label}: the map tasks' records under {root} hold units 0 to {held} of {units}",
                           held)
     return pieces
+
+
+def judged_in_its_body(label: str) -> None:
+    """In a map task, the running test's note that its body decides site `label`'s verdict itself (a site
+    it expects to fail, under `pytest.raises`): the site is noted in its manifest as one whose test judges
+    it (REACHED, no verdict), so its judge runs the body (`check1_judge.judged_from_records`)."""
+    if drawing():
+        REACHED.append((label, None))
 
 
 def manifested(test: str) -> None:
