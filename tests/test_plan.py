@@ -80,6 +80,8 @@ BATCH = {"text": jnp.asarray((np.arange(ROWS * (SEQ + 1)).reshape(ROWS, SEQ + 1)
     (lambda rung, split: rung >= 1 and split >= 2, 0, {(1, 1): 1}, (1, 2), [(0, 1), (1, 1), (1, 2)]),
     # A recorded plan is asked first and kept where it fits.
     (lambda rung, split: split >= 2, 2, {}, (0, 4), [(0, 4)]),
+    # One that misses at its rung: the next rung asks the batch whole, fewer microbatches than the plan's.
+    (lambda rung, split: rung >= 1, 2, {}, (1, 1), [(0, 4), (1, 1)]),
     # Nothing fits: each rung's batch whole, then no plan.
     (lambda rung, split: False, 0, {}, None, [(0, 1), (1, 1), (2, 1)]),
 ])
@@ -106,18 +108,45 @@ def test_the_plan_asks_what_each_miss_computes_then_climbs(fitting, first, compu
     assert compiled == asked
 
 
+def test_every_process_gathers_the_split_asked_after_each_miss():
+    """The split asked after a miss is the latest any process computes (`FitSearch.after`): every process
+    gathers at every miss, its own compile read or not (a compile XLA refused for memory, or one whose
+    memory this process states none of), so their rounds stay in step; past the last split none is asked
+    and none gathers."""
+    from types import SimpleNamespace
+
+    from dew.training.memory import MemoryMiss
+    from dew.training.planning import FitSearch
+
+    gathered = []
+
+    def gather(value):
+        gathered.append(value)
+        return [value, 2]
+
+    def search(misses):
+        return SimpleNamespace(misses=misses, rung=lambda: "rung", gather=gather)
+
+    candidates = [1, 2, 4, 8]
+    # This process read nothing of its miss and asks the next; another computes four, which all ask.
+    assert FitSearch.after(search({}), candidates, 0) == 2 and gathered == [1]
+    assert FitSearch.after(search({("rung", 1): MemoryMiss(1, 90, 50, 1)}), candidates, 0) == 2
+    assert gathered == [1, 2]
+    assert FitSearch.after(search({}), candidates, 3) is None and gathered == [1, 2]
+
+
 def test_a_miss_computes_the_split_its_temporaries_leave_room_at():
     """A compile that missed by its `shortfall`, its stranding counted: a split above it holds what its
-    rows scale at their share, the rest as they stand (`Miss.fits_at`)."""
-    from dew.training.memory import Miss
+    rows scale at their share (`MemoryMiss.fits_at`)."""
+    from dew.training.memory import MemoryMiss
 
     # The batch whole: 90 bytes of temporaries its rows scale, 50 short.
-    whole = Miss(1, 0, 90, 50, 1)
+    whole = MemoryMiss(1, 90, 50, 1)
     assert not whole.fits_at(2) and whole.fits_at(4)
-    # 60 of them fixed: only the 30 its rows scale fall, never by 50.
-    assert not any(Miss(1, 60, 30, 50, 1).fits_at(split) for split in (2, 4, 8, 64))
+    # 30 bytes of temporaries: they fall by no more than 30, never by 50.
+    assert not any(MemoryMiss(1, 30, 50, 1).fits_at(split) for split in (2, 4, 8, 64))
     # An allocator that strands its temporaries needs half the bytes back.
-    assert Miss(1, 0, 90, 50, 2).fits_at(2)
+    assert MemoryMiss(1, 90, 50, 2).fits_at(2)
 
 
 def test_the_fit_ladder_tiles_the_head_fused_then_unfused_before_it_recomputes_more():
@@ -1365,9 +1394,9 @@ def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, r
 def test_a_tight_start_compiles_twice_cold_and_once_warm(monkeypatch, tmp_path, width, between, cold):
     """What a run pays at its start where its batch does not fit whole (the owner's contract: "a single
     trace and compile most often"): cold, the batch whole compiles and misses, and that compile computes
-    the split asked next (`Miss`), XLA's compile the judge of it, until the fewest microbatches that fit,
-    those `between` missing at the first and fitting at the second; warm, the plan its cold start recorded
-    (`keep_rung`, beside the compilation cache) is the first candidate, one compile."""
+    the split asked next (`MemoryMiss`), XLA's compile the judge of it, until the fewest microbatches that
+    fit, those `between` missing at the first and fitting at the second; warm, the plan its cold start
+    recorded (`keep_rung`, beside the compilation cache) is the first candidate, one compile."""
     fewer, fewest = (needs(monkeypatch, lm(split=split, width=width)) for split in between)
     assert fewest < fewer, (fewest, fewer)
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))

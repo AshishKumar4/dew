@@ -62,6 +62,7 @@ from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import DecoderState, Speculative, block_step, row_step
 from dew.sampling.text import adapter_field, decode_ops, prediction_depths, prefill_state, rounding_keys
+from dew.telemetry.benchmark import UNGRAPHED_OPTIONS
 
 
 @struct.dataclass
@@ -905,14 +906,6 @@ def opened_in(formats: Formats) -> OuterProgram:
     return outer_program(opened, static_argnums=(0, 2, 3, 4, 5, 6), out_shardings=formats)
 
 
-ADMISSION_OPTIONS = {"xla_gpu_enable_command_buffer": ""}
-"""The admitting step's XLA options: no CUDA command buffers. Its inputs are
-fresh buffers every call, so a command buffer is updated before it can
-replay, and the device waited out the update: on an RTX 4080 serving
-Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting steps
-(docs/performance.md). Only a GPU backend is handed them."""
-
-
 def dispatched(program: OuterProgram) -> Step:
     """`program`, a server's step, as a `Step` that runs its executables (`OuterProgram.executable`), one
     for each size of admission its bucketing pads to and each trace context it runs in (`Fetched`'s), called
@@ -937,13 +930,18 @@ def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[
                     ) -> tuple[OuterProgram, OuterProgram]:
     """`_compiled` over `formats` and model `options`
     (`dew.nn.kernels.options.compiler_options`), for the decoding step and
-    the admitting one (`ADMISSION_OPTIONS`): one compile per (model,
+    the admitting one, compiled without CUDA command buffers on a GPU
+    (`dew.telemetry.benchmark.UNGRAPHED_OPTIONS`): its inputs are fresh
+    buffers every call, so a command buffer was updated before it could
+    replay, and the device waited out the update (on an RTX 4080 serving
+    Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting
+    steps, docs/performance.md). One compile per (model,
     admission shape) serves every server that keeps its state in the same
     layout (`dew.nn.kernels.options.program` keeps one program for every
     layout and options), and a server whose layout-choosing compile reads the
     state as it leaves it runs that compile as its decoding step instead
     (`resident_formats`)."""
     halves = split_donated(formats)
-    admission = ADMISSION_OPTIONS if jax.default_backend() == "gpu" else {}
+    admission = UNGRAPHED_OPTIONS if jax.default_backend() == "gpu" else {}
     return (_compiled(*halves, rows, options or None),
             _compiled(*halves, rows, {**admission, **options} or None))

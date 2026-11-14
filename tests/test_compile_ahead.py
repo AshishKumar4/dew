@@ -648,6 +648,56 @@ def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_o
     assert [device_memory(device)["bytes_limit"] for device in read] == [allocator_limit(40 * 2**30)] * 2
 
 
+def test_a_step_prepared_for_a_hosts_gpus_keys_the_cache_as_the_hosts_run_compiles_it():
+    """A program compiled for a host's GPUs within a prepare (`report.for_devices`), each tuned choice read
+    from the autotune cache and every one required, keys the persistent cache as the host's run's compile
+    of it does, under that run's own options (`report.targeted` on a GPU that runs: a CUB sort's choice
+    kept off its key), so the run reads the step the prepare compiled (row 6046)."""
+    from jax._src import cache_key, compiler
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.templates.report import CUB_NO_FALLBACK, for_devices, targeted
+
+    (device,) = compile_only_gpus("sm90", 1, 40 * 2**30)
+    lowered = jax.jit(lambda x: x @ x).trace(jax.ShapeDtypeStruct(
+        (64, 64), jnp.float32, sharding=jax.sharding.SingleDeviceSharding(device))).lower()
+
+    def key(overrides) -> str:
+        options = compiler.get_compile_options(num_replicas=1, num_partitions=1, device_assignment=[[device]],
+                                               backend=device.client, env_options_overrides=overrides)
+        return cache_key.get(lowered.compiler_ir("stablehlo"), np.array([device]), options, device.client)
+
+    with for_devices():
+        prepared = targeted(lowered, None)
+    assert key(prepared) == key({"xla_gpu_deviceless_cub_mode": CUB_NO_FALLBACK})
+
+
+def test_a_prepares_compiles_on_dews_compile_threads_take_its_target(monkeypatch):
+    """A program compiled on one of Dew's compile threads within a prepare (`report.for_devices`), a run's
+    start begun beside its planning (`options.compiling`) and a search's programs compiled together
+    (`report.attempts`), is compiled as one in the prepare's own thread, for a device to run, its tuned
+    choices required (`report.targeted`): on a host no H100's run left them beside, not preparable
+    (`report.Untuned`), where one read offline compiles untuned."""
+    from dew.nn.kernels import options
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.templates import report
+
+    monkeypatch.setenv("XLA_FLAGS", without_flags(os.environ.get("XLA_FLAGS", ""),
+                                                  "--xla_gpu_autotune_level"))
+    (device,) = compile_only_gpus("sm90", 1, 40 * 2**30)
+    program = jax.jit(lambda x, w: jnp.tanh(x @ w) @ w)
+    placed = jax.sharding.SingleDeviceSharding(device)
+    shapes = [jax.ShapeDtypeStruct((512, 512), jnp.bfloat16, sharding=placed)] * 2
+    lowered = program.trace(*shapes).lower()
+    assert report.attempts([(lowered, None), (lowered, None)])
+    with report.for_devices():
+        begun = options.compiling(program, *shapes)
+        with pytest.raises(report.Untuned):
+            report.attempts([(lowered, None), (lowered, None)])
+    with pytest.raises(report.Untuned):
+        begun.attempt.result()
+
+
 @pytest.mark.parametrize("host, memory", [("a100-sxm4-40gb", 42_406_903_808), ("gh200", 101_468_602_368)])
 def test_a_hosts_serialized_topology_states_its_gpus_memory_and_their_allocators_limit(monkeypatch, host,
                                                                                          memory):
@@ -677,7 +727,8 @@ def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admit
     """A step compiled ahead on GPUs whose memory its plan needs several microbatches for searches for its
     plan, the fewest microbatches that fit, which fits (`at_its_plan`), and saves it, the run left at its
     plan; the plan states the limit it was made against, its GPUs' stated memory at the share their loading
-    run takes (`pool_record`)."""
+    run takes (`pool_record`). Compiled on compile-only GPUs outside a prepare into the cache, it is XLA's
+    untuned program, which its record says (`AheadOfTime.tuned`, `report.autotuned`)."""
     from dew._devices import pool_share
     from dew.training.memory import recompute_record
 
@@ -690,6 +741,7 @@ def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admit
     pool = record(plan["pool"], "pool")
     assert pool["source"] == "compile_only" and pool["share"] == pool_share()
     assert pool["limit"] == NEEDING_MICROBATCHES
+    assert not ahead.tuned and plan["autotuned"] is False
 
 
 @pytest.mark.shared_setup("admitted")
@@ -1704,6 +1756,10 @@ def test_a_run_naming_its_input_alone_compiles_its_step_ahead(tmp_path):
                       mesh=MeshSpec().build(gpus("sm90")))
     ended = AheadTarget("sm90", 1, str(tmp_path / "step.dew-aot")).compiled(trainer, data, steps=1)
     assert ended.ahead.devices == 1 and trainer.objective.inputs is not None
+    # Into the cache, over canonical GPUs and not a host's own topology, its compiles key entries no run
+    # reads (`host_gpus`): refused, naming the two forms that are read.
+    with pytest.raises(ValueError):
+        AheadTarget("sm90", 1).compiled(trainer, data, steps=1)
 
 
 FAST = {"tensor": Link(1e18, 1e9)}
