@@ -20,6 +20,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   boundary, against the devices as they stand. The separate `dew train` process a configured run started
   for this is removed, and so is `dew.registry.trusted_packages`, which only it read.
 
+- `SourceOptions` and its keyword types live in `dew.interop.source_options`, and the release contract
+  (`Release`, `RELEASE_FILE`) in `dew.interop.release_record`, so a source's load imports no trainer;
+  `dew.config`, `dew.config.trainer` and `dew.config.release` keep exporting them, and a saved run's record
+  that names `dew.config.trainer:SourceOptions` reads as before.
 - The condition encoders that bind a released checkpoint are dew.interop's: `CLIPText`, `T5Text` and
   `HFAudio` in `dew.interop.encoders`, and `DiffusionConditioner`, `QwenImageConditioner`,
   `HiddenStatesConditioner` and `WanConditioner` in `dew.interop.conditioners`, each with its
