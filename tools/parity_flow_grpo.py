@@ -118,29 +118,14 @@ def dew_transition(inputs: dict) -> dict:
 
 
 def write_recording(command: str) -> None:
-    """RECORDED: the author code's transition recorded over check 1's seeds (`record_case`'s summary),
-    its float32 run's evidence from its float64 run."""
-    import jax
-    import torch
-    from fetched_fixtures import save
-    from recorded_references import provenance, record_case
-
-    from _dew_torch.precision import float64
+    """RECORDED: the author code's transition recorded over check 1's seeds (`record_torch_summary`)."""
+    from recorded_references import record_torch_summary
 
     reference = fetched_reference()
-
-    def evaluate(inputs):
-        found = author_transition(reference, inputs, torch.float32)
-        with float64():
-            truth = author_transition(reference, inputs, torch.float64)
-        return found, truth
-
-    with jax.enable_x64(new_val=True):
-        recorded = record_case("transition", transition_inputs, evaluate, store_inputs=False, summary=True)
-    recorded["transition.provenance"] = provenance("Flow-GRPO sde_step_with_logprob", COMMIT, "cpu", command,
-                                                   torch=torch.__version__)
-    written = save(RECORDED, recorded, reference=f"flow_grpo {COMMIT}", license="MIT")
-    print(f"{written}: {written.stat().st_size} bytes", flush=True)
+    record_torch_summary(RECORDED, "transition", transition_inputs,
+                         lambda inputs, dtype: author_transition(reference, inputs, dtype),
+                         name="Flow-GRPO sde_step_with_logprob", revision=COMMIT, command=command,
+                         reference=f"flow_grpo {COMMIT}", license="MIT")
 
 
 def main() -> None:

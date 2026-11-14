@@ -53,6 +53,22 @@ if TYPE_CHECKING:
     from dew.state import TrainState
 
 
+def flow_grpo_terms(current: jax.Array, previous: jax.Array, advantage: jax.Array, keep: jax.Array, *,
+                    clip_range: float, adv_clip_max: float) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """One transition's Flow-GRPO terms over its samples, `[B]` each: `current` and `previous` each sample's
+    mean log density over its coordinates under the policy and under the rollout's, `advantage` its advantage,
+    clipped to `adv_clip_max` either side, and `keep` the samples that count. Flow-GRPO's clip is PPO's
+    without the dual cap, one term a sample (flow_grpo's train_sd3, verl-omni's `FlowGRPOLoss`). Returns the
+    kept surrogates' sum and their count (`weighted_total`), whose ratio is the transition's loss, and how
+    many kept samples' ratios the clip moved."""
+    advantage = jnp.clip(advantage, -adv_clip_max, adv_clip_max)
+    surrogate, _ = clipped_surrogate_terms((current - previous)[:, None], advantage, keep[:, None],
+                                           epsilon_low=clip_range, epsilon_high=clip_range, dual_clip=None)
+    pg, mass = weighted_total(surrogate[:, 0], keep)
+    clipped = (keep & (jnp.abs(jnp.exp(current - previous) - 1) > clip_range)).sum()
+    return pg, mass, clipped
+
+
 def _source(inputs: InputSpec, batch: Batch) -> jax.Array:
     """Read the real row-bearing field used by rollout, scoring and preview."""
     conditions = inputs.conditions
@@ -211,7 +227,7 @@ class FlowGRPOObjective(DiffusionObjective):
         following = jnp.where(expanded, following, 0)
         mask = raw_mask & real
         old = jnp.where(mask, old, 0)
-        advantages = jnp.where(mask, jnp.clip(advantages, -self.adv_clip_max, self.adv_clip_max), 0)
+        advantages = jnp.where(mask, advantages, 0)
         # A watched step's policy calls return what they sow, through its guidance's own outputs
         # (`Guidance`), so the step summarizes the forward that trains.
         opened = (INSPECTED,) if step.watched is not None else ()
@@ -232,19 +248,15 @@ class FlowGRPOObjective(DiffusionObjective):
             keep = selected & (transition.variance != 0)
             current = jnp.where(keep, transition.log_prob(action), 0) / dimensions
             previous = jnp.where(keep, old_log_prob, 0) / dimensions
-            # Flow-GRPO's clip is PPO's without the dual cap, one term a sample.
-            surrogate, _ = clipped_surrogate_terms((current - previous)[:, None], advantage, keep[:, None],
-                                                   epsilon_low=self.clip_range, epsilon_high=self.clip_range,
-                                                   dual_clip=None)
-            pg, mass = weighted_total(surrogate[:, 0], keep)
-            ratio = jnp.exp(current - previous)
+            pg, mass, clipped_count = flow_grpo_terms(current, previous, advantage, keep,
+                                                      clip_range=self.clip_range,
+                                                      adv_clip_max=self.adv_clip_max)
             kl = jnp.asarray(0.0)
             if reference is not None:
                 # The released scripts/train_sd3.py that the module docstring
                 # compares this KL with is at 879042cf5707f8b90daa98d147d7deac2317c5da.
                 reference_mean = self._transition(pair_of(reference.at((), index)(x, t)), x, t, s).mean
                 kl, _ = weighted_total(transition.kl(reference_mean) / dimensions, keep)
-            clipped_count = (keep & (jnp.abs(ratio - 1) > self.clip_range)).sum()
             return None, ((pg, kl, mass, clipped_count), sown)
 
         _, (summed, sown) = jax.lax.scan(terms, None, (*(jnp.swapaxes(value, 0, 1) for value in (
