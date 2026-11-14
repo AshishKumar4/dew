@@ -83,8 +83,9 @@ def parser(pythons: Sequence[str], deadline: float) -> argparse.ArgumentParser:
     lane.add_argument("--processes", type=int, required=True, help="the most test files running at once")
     lane.add_argument("--deadline", type=float, default=3600.0, help="seconds a file may run")
     lane.add_argument("--owed", type=Path,
-                      help="the accuracy gate's owed sites (owed.json), handed to each file's pytest as "
-                           "--owed: a run that judges, or a prepare that draws, those sites' second stage alone")
+                      help="the accuracy gate's owed sites (owed.json), handed to each file's pytest "
+                           "as --owed: a run that judges, or a prepare that draws, those sites' second "
+                           "stage alone")
     operations.add_parser("gangs")
     versions = operations.add_parser("pythons")
     versions.add_argument("--check", action="store_true",
