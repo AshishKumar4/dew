@@ -18,8 +18,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh
-from reference_error import as_given, assert_as_exact, equations, with_gradients
+from jax.sharding import Mesh, PartitionSpec
+from reference_error import assert_as_exact, equations, with_gradients
+from sharded import assert_runs_per_shard, placed_on
 from tuned import each_config
 
 from dew.nn import attention, norms
@@ -763,7 +764,9 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
     assert sum(equation.primitive.name == "shard_map" for equation in graph) >= 2
     portable = run(stream_seam(jnp.float64, joined=True), gated_product("swiglu", implementation="xla"),
                    packed_gated_product("swiglu", implementation="xla"))
-    assert_meshed_on_par(fused, mesh, lambda *operands: operands, portable, f"per shard over {split}")
+    # The operands placed whole: the named axes split them inside.
+    assert_runs_per_shard(fused, _checked_shard_operands, [PartitionSpec()] * 8, mesh,
+                          f"per shard over {split}", seeds=SEEDS["per shard"], truth_fn=portable)
 
 
 @pytest.mark.mesh(devices=2)
@@ -771,44 +774,27 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
     """On an explicit mesh splitting the rows, no logical axes named: the operands' own types place the
     kernels per shard (`norm_swiglu._shard_spec`; row 822), the weight whole, its gradient summed over the
     shards, their outputs and gradients on par with one device's."""
-    from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+    from jax.sharding import AxisType
 
     mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
-
-    def placed(*operands):
-        return [jax.device_put(operand, NamedSharding(mesh, P() if index == 2 else P("data")))
-                for index, operand in enumerate(operands)]
-
+    # The rows split, the weight (the third operand) whole.
+    specs = [PartitionSpec() if index == 2 else PartitionSpec("data") for index in range(8)]
     with jax.set_mesh(mesh):
-        graph = traced(_checked_shard_run, *placed(*_checked_shard_operands()))
+        graph = traced(_checked_shard_run, *placed_on(_checked_shard_operands(), specs, mesh))
     assert sum(equation.primitive.name == "shard_map" for equation in graph) >= 2
 
     def portable(x, branch, scale, ds, dy, gate, up, dout):
         return (evaluated(stream_seam(jnp.float64, joined=True), (x, branch, scale), (ds, dy)),
                 evaluated(gated_product("swiglu", implementation="xla"), (gate, up), dout))
 
-    assert_meshed_on_par(_checked_shard_run, mesh, placed, portable, "per shard over an explicit mesh")
-
-
-def assert_meshed_on_par(run, mesh, placed, truth, label: str) -> None:
-    """`run`'s outputs and gradients compiled and run on `mesh`, its operands placed (`placed`), on par with
-    `run` on one device over the drawn operands (`_checked_shard_operands`; check 1): a shard's rows are its
-    own, and the weight's gradient sums the shards' partials in another order. `truth`, XLA's arithmetic,
-    run on the operands in float64."""
-    compiled = jax.jit(run)
-
-    @as_given
-    def meshed(*operands):
-        with jax.set_mesh(mesh):
-            return compiled(*placed(*operands))
-
-    assert_as_exact(meshed, jax.jit(run), _checked_shard_operands, label, seeds=SEEDS["per shard"],
-                    truth_fn=truth)
+    assert_runs_per_shard(_checked_shard_run, _checked_shard_operands, specs, mesh,
+                          "per shard over an explicit mesh", seeds=SEEDS["per shard"], truth_fn=portable)
 
 
 def _checked_shard_operands(draw: int = 0):
     """The per-shard tests' operands (`_checked_shard_run`'s): the seam's and SwiGLU's, and their
-    cotangents."""
+    cotangents. Held per shard as the gate holds a kernel (`sharded.assert_runs_per_shard`): a shard's rows
+    are its own, and the weight's gradient sums the shards' partials in another order."""
     (x, scale), dy = norm_operands((4, 8, 31), jnp.float32, jnp.float32, draw)
     branch, ds = (jax.random.normal(drawn_key(index, draw), x.shape) for index in (28, 29))
     gate, up, dout = (jax.random.normal(drawn_key(index, draw), (4, 8, 24)) for index in (30, 31, 32))
