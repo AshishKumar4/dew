@@ -1593,16 +1593,16 @@ def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_
 
 def a_run_handed_an_untuned_file_by_its_command_compiles_its_own(tmp_path, monkeypatch):
     """A GPU flow's cell (tests/test_gpu_training.py): a decision run compiled ahead through its command line
-    for its GPU kind's canonical GPU (`--trainer.compile-ahead.generation`, no topology: XLA's untuned
+    for this GPU's own target (its generation, multiprocessors and memory; no topology: XLA's untuned
     program) and then handed the file (`--trainer.ahead`), its XLA_FLAGS leaving the autotuner on as a user's
-    do, does not run the file's programs: it compiles its own step on the GPU and trains, said once
-    (`AheadOfTime.runnable`, UB-4792-AHEAD-TIME)."""
+    do, does not run the file's programs: it compiles its own step on the GPU and trains, said once as an
+    untuned file (`AheadOfTime.runnable`, `UNTUNED`, UB-4792-AHEAD-TIME)."""
     from lane_environment import without_flags
     from run_kinds import decision
 
     from dew._devices import xla_flag
     from dew.decision.config import DecisionRunConfig
-    from dew.training.ahead import BuildTarget, CompiledAhead
+    from dew.training.ahead import UNTUNED, BuildTarget, CompiledAhead
 
     runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
     default = decision(tmp_path, drawn=False)
@@ -1612,9 +1612,13 @@ def a_run_handed_an_untuned_file_by_its_command_compiles_its_own(tmp_path, monke
     flags = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level")
     monkeypatch.setenv("XLA_FLAGS", flags)
     assert xla_flag("xla_gpu_autotune_level") is None
+    # This GPU's own target, so the file differs from what the run compiles by its tuning alone.
     own = BuildTarget.of(jax.devices()[:1])
-    ahead = ["--trainer.compile-ahead.generation", own.generation, "--trainer.compile-ahead.devices", "1",
-             "--trainer.compile-ahead.path", str(path)]
+    assert own.memory is not None
+    ahead = ["--trainer.compile-ahead.generation", own.generation,
+             "--trainer.compile-ahead.multiprocessors", str(own.multiprocessors),
+             "--trainer.compile-ahead.capacity-gib", str(memory_limited_to(own.memory) / 2**30),
+             "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path)]
     with pytest.raises(CompiledAhead) as compiled:
         DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *ahead], default=default).run()
     assert not compiled.value.ahead.tuned
@@ -1629,7 +1633,8 @@ def a_run_handed_an_untuned_file_by_its_command_compiles_its_own(tmp_path, monke
             state = handed.run()
     finally:
         logging.getLogger("dew.training.ahead").removeHandler(heard)
-    assert compiles.count >= 1 and int(state.updates) > 0 and len(said) == 1
+    assert compiles.count >= 1 and int(state.updates) > 0
+    assert [record.msg for record in said] == [UNTUNED]
 
 
 ACCUMULATION_CELLS = [("sm80", "bfloat16"), ("sm90", "float32")]
