@@ -48,13 +48,14 @@ def _intra_held(call: Call, block: int, outputs: int = 1) -> Held:
     """`_intra_walk`'s consumer thread at key block `block` forming `outputs` pairs' sums, which its walk
     holds across the key blocks (`mosaic.Walk.sums`: in registers, but where its family keeps them in memory
     of its own, `Issuer.keeps_sums`): the block's prefix scan (its running pair, a shifted pair and the
-    decay); then the factors every output shares beside the block's tiles, staged before any product is issued
-    (`algebra.key_block_pairs`): its prefix halves and their separated pair, the rows' grid and their gate
-    down, the keys, a sub-chunk's keys gated up and an output's rows gated down as each is formed and staged
-    in its parts, their masks, and a product's operands (a row block against a chunk of keys, read
-    transposed). The pairs read their rows' grid alone (`algebra.key_block_pairs`), one int32 tile: its
-    columns' too stated 256 and 254 registers for an sm100's two intra launches, where ptxas held each at 248
-    spilling none, least 232 (armada recurrence-unused-grid-proof)."""
+    decay); then the factors every output shares beside the block's tiles across its sub-chunks, each
+    sub-chunk's operands staged and its products issued in turn (`algebra.key_block_pairs`): its prefix halves
+    and their separated pair, the rows' grid, each output's rows gated down, the keys, a sub-chunk's keys
+    gated up and an output's rows masked to it as each is formed and staged in its parts, their masks, and a
+    product's operands (a row block against a chunk of keys, read transposed). The pairs read their rows' grid
+    alone (`algebra.key_block_pairs`), one int32 tile: its columns' too stated 256 and 254 registers for an
+    sm100's two intra launches, where ptxas held each at 248 spilling none, least 232 (armada
+    recurrence-unused-grid-proof)."""
     chunk = call.chunk
     pairing = _pairing_operand(call)
     paired = product_fragments(call, (pairing, chunk, block), (pairing, block, chunk), rhs_transposed=True)
