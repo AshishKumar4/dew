@@ -23,8 +23,15 @@ LEARNING_RATE = 1e-4
 """The rate of the SGD step every family's references and Dew's runs take."""
 TEXT_DRAWN = frozenset({"qwen35"})
 """The families whose step over drawn token rows alone is a site of its own (`multimodal-<family>-text`),
-its leaves `TEXT_OUTPUTS` every one resolved: their decoder's step, apart from the towers and processors
-(the source draw's tests hold those)."""
+its leaves `TEXT_OUTPUTS`: their decoder's step, apart from the towers and processors (the source draw's
+tests hold those), held by its function, Dew's float64 run the reference's float64 truth at
+`TEXT_TRUTHS` draws (tests/recorded_truths.py): its float32 errors no count of draws resolves, Qwen3.5's
+step amplifying a GatedDeltaNet norm's rounding at a token unevenly, every arm's alike (ledger 5238: its
+forward displacement there reproduces the gradient's error whole, the norm's inverse root mean square 299
+to 982)."""
+TEXT_TRUTHS = 3
+"""The draws a text site's float64 truth is recorded at (tools/venv_reference.py's `truths`): a function
+another function computes differs on every draw, so a few hold it."""
 TEXT_OUTPUTS = ("logits", "loss", "updated_logits")
 """A text site's leaves: a family's numerics but the pixel gradient, which text alone has none of."""
 TEXT_LENGTHS = (32, 28, 24, 20)
@@ -34,13 +41,6 @@ shape for every draw, which a recording holds its leaves at."""
 TEXT_IDS = (4, 200)
 """The ids a text draw's tokens are drawn from, its checkpoints' word tokens (`token4` on), short of their
 vision tokens (Qwen3.5's image token is 200)."""
-
-WEIGHED = frozenset({"qwen35/text"})
-"""The drawn sites judged weighed where they stay undecided (`assert_as_exact`'s `conditioning`), recorded
-with each draw's rounding scale, the reference's own (tools/venv_reference.py's `weighed`): Qwen3.5's step
-amplifies a GatedDeltaNet norm's rounding at a token unevenly, every arm's alike (ledger 5238: its forward
-displacement there reproduces the gradient's error whole, the norm's inverse root mean square 299 to 982)."""
-
 
 def text_rows(ids):
     """A text draw's `input_ids` and `attention_mask`, `ids` `[rows, most]` each row its `TEXT_LENGTHS`
