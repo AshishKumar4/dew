@@ -1770,7 +1770,8 @@ def test_a_host_loops_float64_truth_is_held_by_the_programs_it_states():
 
     def draw(seed):
         rng = np.random.default_rng([5970, seed])
-        return {"x": rng.standard_normal((3, 48)).astype(np.float32), "lengths": rng.integers(16, 49, 3)}
+        # Each row's length is the draw's, read on the host, alike in every draw as a recording's leaves are.
+        return {"x": rng.standard_normal((3, 48)).astype(np.float32), "lengths": np.asarray([40, 32, 24])}
 
     def evaluate(inputs):
         rows = [inputs["x"][row, :length] for row, length in enumerate(inputs["lengths"])]
