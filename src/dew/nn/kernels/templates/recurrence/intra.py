@@ -199,7 +199,7 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
     programs of): each step the block's prefix halves from its decay (`algebra.scanned_prefix`, staged in a
     padded shared tile whose rows the sub-chunks' references read), stored for the later launches, and the
     block's pairs' products issued into the sums the walk holds (`mosaic.Walk.sums`), read and stored once
-    after it: the scores (the queries' pairs, scaled once gated) and, under the delta rule, the keys' system
+    after it: the scores (the queries' pairs, scaled) and, under the delta rule, the keys' system
     (the write-gated keys' pairs, strict), their factors formed once for both (`algebra.key_block_pairs`), and
     each sub-chunk's own pairs each their own decay (`algebra.key_diagonal_pairs`).
     Its prefix an XLA scan of its own, thirteen launches took 0.30 ms of Kimi Linear's 1.57 ms forward on an
@@ -214,6 +214,12 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                      functools.partial(_intra_staged, call, products=products),
                      functools.partial(_intra_streamed, call, queries=scored), contracted=True)
     steps = width // keys
+    # The scores' scale where each part stays in range: up to one on the gated rows, which shrinks every
+    # product and so every sum held across the key blocks (the pairs of two unscaled blocks near fp32's
+    # largest pass it); past one on the read sums, whose products a gated-up key may attenuate after a row's
+    # scale would have overflowed it (a query of 1e30 at a scale of 1e10).
+    shrinking = min(scale, 1.0)
+    growing = scale / shrinking
 
     def program(at, q_ref, k_ref, g_ref, beta_ref, taken_ref, *outs, streams, staging, landing):
         n, h = at["chunks"], at["heads"]
@@ -253,11 +259,10 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                 set `r`'s rows gated down."""
                 return operands.staged(family, value, raised[s - 1] if r is None else lefts[r][s - 1])
 
-            # The scores' rows scaled as their products take them: the sums held across the key blocks stay
-            # the scaled pairs', two unscaled blocks' near fp32's largest past it.
             pairs = algebra.key_block_pairs([functools.partial(rows, name) for name in products],
                                             operand("keys"), whole, at_token, staged, chunk=chunk,
-                                            scales=[scale if name == "scores" else 1.0 for name in products])
+                                            scales=[shrinking if name == "scores" else 1.0
+                                                    for name in products])
             issuer = Issuer(call)
             return carry, tuple(issuer.summed(found, into=acc)
                                 for found, acc in zip(pairs, accumulators, strict=True))
@@ -266,7 +271,7 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
             """The sums once the walk is done, the system masked once (a row whose write gate overflows
             times a zero factor is a NaN there, which its strict mask clears), and stored."""
             del carry
-            masked = tuple(algebra.strictly_lower(total) if name == "system" else total
+            masked = tuple(algebra.strictly_lower(total) if name == "system" else total * growing
                            for name, total in zip(products, totals, strict=True))
             intra_sums_stored(call, products, masked, sums, landing, row=row, head=h)
 

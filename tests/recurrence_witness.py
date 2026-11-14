@@ -447,9 +447,11 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
               np.broadcast_to(raised.hi[-1][:, None], step.carry.lo.shape))
     leaving = fp32(add(fused(mul(step.carry, held), lane), write), lane)
     factor = point(np.float32(scale))
-    # The pairs of sub-chunks the gated queries scaled (their sum held across the key blocks), each
-    # sub-chunk's own scaled once summed (`algebra.band_masked`).
-    crossed = key_pairs(point(step.q), step.k, exponents, lane, scale)
+    # The pairs of sub-chunks the gated queries scaled up to one (their sum held across the key blocks), a
+    # scale past one the read sums'; each sub-chunk's own scaled once summed (`algebra.band_masked`).
+    shrinking = min(scale, 1.0)
+    crossed = fp32(mul(key_pairs(point(step.q), step.k, exponents, lane, shrinking),
+                       point(np.float32(scale / shrinking))), lane)
     within = fp32(mul(key_diagonal(point(step.q), step.k, exponents, lane), factor), lane)
     scores = staged(where(_lags(size) >= 0, where(own, within, crossed), zeros), lane)
     queries = staged(fp32(mul(fp32(mul(point(step.q), raised), lane), factor), lane), lane)
