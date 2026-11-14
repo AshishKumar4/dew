@@ -228,8 +228,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cluster_columns: int = 1,
-               cost: pl.CostEstimate | Stated | None = None,
+               cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None,
@@ -241,7 +240,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         del approx_math, reducing_warpgroups, resident, model_flops, registers, producer, shared, moves
         if prefetched is not None:
             raise NotImplementedError("a TPU program is launched after the last; nothing is prefetched ahead")
-        _one(consumers, clustered=cluster * cluster_columns > 1)
+        _one(consumers, clustered=cluster > 1)
 
         def named(*refs):
             # The grid's axes by name while the entry traces (`program_index`): Pallas TPU numbers them.
@@ -297,8 +296,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         _one(consumers)
         return handoffs.Schedule((handoffs.Role("consumer"),), axis=None)
 
-    def streams(self, blocks: dict, stages: int, consumers: int,
-                multicast: dict[str, tuple[str, ...]] | None = None,
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
                 gathered: tuple[str, ...] = ()) -> dict:
         # Each stream's ring of `STAGES` slots, whatever the stages asked: a DMA a step ahead hides a step's.

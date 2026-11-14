@@ -1173,9 +1173,6 @@ class MosaicGmm(_Mosaic):
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
         family = pricing.family_of(config, dtype)
         columns = pricing.tile_columns(config, family)
-        if config.cluster_columns > 1:
-            # A product's cluster stacks its programs along the rows alone (`mosaic_gpu.gmm`).
-            return False
         runs = mosaic_gpu.partial_runs(config, dtype, ba.arguments['interpret'],
                                        transpose_rhs=ba.arguments['trans_rhs'],
                                        gathered=ba.arguments.get('gather') is not None,
@@ -1791,8 +1788,7 @@ class MosaicTgmm(_Mosaic):
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
         whole = (rows % pricing.tile_rows(config, family) == 0
                  or (self._ragged(ba, family) and config.cluster == 1))
-        # A cluster's column tiles side by side, whole (`pricing.walk_columns`).
-        return whole and width % pricing.walk_columns(config, family) == 0
+        return whole and width % pricing.tile_columns(config, family) == 0
 
     def _ragged(self, ba, family: mosaic.Family) -> bool:
         # A depth no cooperative tile's rows divide takes a partial last row tile where the family's loads
@@ -2282,6 +2278,9 @@ a cell of its own (`Kind.matrix`), which its receipt's winner holds; every other
 
 M_EM_36 = ("M-EM-36-gh200 (a GH200, base/kernels df82480cb5c, CUPTI medians of 5 rounds, cuBLASLt autotuned "
            "at run, 24,576 tokens)")
+M_EM_52 = ("M-EM-52-gh200 (a GH200 under its power cap, base/kernels 3bea6245b56's derivation: the kernel "
+           "gradient on a multicast pair, CUPTI medians of 5 rounds interleaved with cuBLASLt's, autotuned "
+           "in the same process, 24,576 tokens)")
 EM35D = ("em35d (a B200, base/kernels ce6eff7f0be, CUPTI medians of 5 rounds, cuBLASLt autotuned at run, "
          "24,576 tokens)")
 B200_GRID = ("lab-b200-20261113-grid (a B200, base/kernels 5ac163abbec, medians of 5 rounds' same-round "
@@ -2328,13 +2327,13 @@ DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str
     ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 64))): (
         MOSAIC, f"{M_EM_36}: the template 0.93x XLA's dot"),
     ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216))): (
-        XLA, f"{M_EM_36}: the template 1.095x XLA's dot"),
+        XLA, f"{M_EM_52}: the template 1.042x XLA's dot (1.559 against 1.496 ms)"),
     ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(9216, 2560))): (
-        MOSAIC, f"{M_EM_36}: the template 0.975x XLA's dot"),
+        MOSAIC, f"{M_EM_52}: the template 0.755x XLA's dot (1.493 against 1.977 ms)"),
     ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024))): (
-        MOSAIC, f"{M_EM_36}: the template 0.973x XLA's dot"),
+        MOSAIC, f"{M_EM_52}: the template 0.784x XLA's dot (0.189 against 0.241 ms)"),
     ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 64))): (
-        MOSAIC, f"{M_EM_36}: the template 0.376x XLA's dot"),
+        MOSAIC, f"{M_EM_52}: the template 0.39x XLA's dot (0.053 against 0.136 ms)"),
     ('tcgen05', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64))): (
         XLA, f"{B200_GRID}: the template 1.216x XLA's dot (em35d 1.225x)"),
     ('tcgen05', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 9216))): (
