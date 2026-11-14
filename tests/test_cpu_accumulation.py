@@ -339,9 +339,10 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     """Each site of the wide CPU arithmetic, a float32 product and a bias's spread and a row's logsumexp
     (`widened_reduction`), traces a platform choice in a process running Dew's test setting
     (`WIDE_CPU_ARITHMETIC`), and in a library process, which sets nothing, the plain computation:
-    no float64 beside a float32 computation, and no platform choice (ledger 3197: a bias's gradient
-    included; a CPU's float32 sums are XLA's own, row 5448). Each is traced afresh, as a process with
-    either setting traces it."""
+    no float64 beside a float32 computation, and no platform choice (ledger 3197; a CPU's float32 sums
+    are XLA's own, row 5448), but a bias's spread, whose blocked sum is every CPU process's (ledger 4882):
+    its platform choice, in no float64. Each is traced afresh, as a process with either setting traces
+    it."""
     from dew.nn.precision import divided
     from dew.nn.protocols import OutputTable
     from dew.objectives.lm.chunked import chunked_cross_entropy
@@ -375,7 +376,7 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
             states, OutputTable(table, vocab_major=True), targets, 1, tile=None)[0], states, table),
     }
     for name, found in sites.items():
-        if wide:
+        if wide or name == "bias":
             assert choices(found), name
         else:
             assert not choices(found), name

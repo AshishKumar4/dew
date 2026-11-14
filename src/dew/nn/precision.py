@@ -271,21 +271,24 @@ def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple
 
 def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     """`value` broadcast to `shape`, whose transpose, the sum of a cotangent over every position the
-    value spread over (a bias's gradient), a CPU running wide arithmetic (`WIDE_CPU_ARITHMETIC`, Dew's
-    tests) takes as it sums a float32 product (`accumulated`): there the broadcast is the outer product
-    of ones and the value, whose transpose is a product, summed in float64 and rounded once, or, in a
-    scope that states fp32 sums (`FP32_SUMS`), the product's own fp32 sum, so a gradient a program sums
-    whole and one it sums by shard are each a product's sum, not a reduction XLA's CPU fusions sum one
-    way in one program and another in the other (row 4520). Everywhere else, and in a quantized model's
-    trace, it is the broadcast, whose transpose JAX sums in the value's dtype, as a user's process sums
-    it on every platform (ledger 3197). A value an Explicit axis places along an axis it spreads
+    value spread over (a bias's gradient), every CPU process takes as products' sums: a float32 value's
+    broadcast is outer products of ones and the value (`_blocked_spread`), whose transpose sums the
+    positions in blocks, each block's and then the blocks', an error of about `N / B + B` float32
+    roundings where XLA:CPU's reduction of the broadcast's transpose sums the N positions in order, and
+    a program summing whole and one summing by shard each a product's sum, not a reduction XLA's CPU
+    fusions sum one way in one program and another in the other (row 4520); a user's process sums it
+    so, as check 1 measures it (ledger 4882, Main 11-14: the blocked sum every CPU process's, where it
+    was the suite's alone). A CPU running Dew's wide arithmetic (`WIDE_CPU_ARITHMETIC`, its tests) in no
+    scope that states fp32 sums (`FP32_SUMS`) takes the one outer product summed in float64 and rounded
+    once (`accumulated`). An accelerator, and a quantized model's trace, take the broadcast, whose
+    transpose JAX sums in the value's dtype. A value an Explicit axis places along an axis it spreads
     over (never a bias, whose leading axes `biased` adds) is broadcast: the outer product does not keep
     that placement on a dropped size-one axis."""
     axes = tuple(axis for axis, (size, total) in enumerate(zip(value.shape, shape, strict=True))
                  if size == 1 and total != 1)
     placed = explicit_spec(value)
     if (not axes or (placed is not None and any(placed.spec[axis] is not None for axis in axes))
-            or not _wide_cpu_products(value)):
+            or not _float32_products(value)):
         return jnp.broadcast_to(value, shape)
     kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
 
@@ -314,7 +317,7 @@ def _spread_block(count: int) -> int:
 def _blocked_spread(value: jax.Array, sizes: tuple[int, ...], outer_product) -> jax.Array:
     """`value` spread over `sizes` as two outer products of ones, whose transpose sums a cotangent's `N`
     positions in blocks of `_spread_block(N)` consecutive ones, each block's positions first and then the
-    blocks' sums, each an fp32 product sum (`accumulated` under `FP32_SUMS`): an error of about `(N / B + B)`
+    blocks' sums, each an fp32 product sum (`accumulated`): an error of about `(N / B + B)`
     units of float32's roundoff, where one sum of every position, which XLA:CPU accumulates in order, loses
     about `N` of them (a padded flow's bias, row 4520's review) and a reduction XLA's fusions block their own
     way sums the whole and a shard's otherwise (row 4520). Consecutive positions sum together first, as an
@@ -490,13 +493,17 @@ def wide_cpu_arithmetic() -> bool:
     return os.environ.get(WIDE_CPU_ARITHMETIC) == "1"
 
 
+def _float32_products(*operands) -> bool:
+    """Whether these operands multiply in float32 as Dew's own products: float32 arrays, outside a quantized
+    model's trace (`_intercepted`)."""
+    return (not _intercepted() and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
+            and products_dtype(*operands) == jnp.dtype(jnp.float32))
+
+
 def _wide_cpu_products(*operands) -> bool:
     """Whether these operands' products are the ones Dew's wide CPU arithmetic sums (`accumulated`): in a
-    process running it (`WIDE_CPU_ARITHMETIC`), float32 arrays, outside a quantized model's trace
-    (`_intercepted`)."""
-    return (wide_cpu_arithmetic() and not _intercepted()
-            and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
-            and products_dtype(*operands) == jnp.dtype(jnp.float32))
+    process running it (`WIDE_CPU_ARITHMETIC`), float32 products (`_float32_products`)."""
+    return wide_cpu_arithmetic() and _float32_products(*operands)
 
 
 def _sums_in_float64(*operands) -> bool:
