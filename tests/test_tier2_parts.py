@@ -311,23 +311,32 @@ def test_a_part_whose_code_differs_is_not_assembled(tmp_path):
 _LOADED = """
 import sys
 from dew.interop import Pretrained
-Pretrained.load(sys.argv[1], subfolder=sys.argv[2] or None, dtype="float32", attention_impl="reference",
-                trust_remote_code=True)
+try:
+    Pretrained.load(sys.argv[1], subfolder=sys.argv[2] or None, dtype="float32", attention_impl="reference",
+                    trust_remote_code=True)
+except ValueError:
+    print("refused")
+else:
+    print("loaded")
 """
-"""A load of the source `argv[1]` names, at the folder `argv[2]` selects, running its own code."""
+"""A load of the source `argv[1]` names, at the folder `argv[2]` selects, running its own code: its
+outcome printed, `loaded` or `refused` (the verification's refusal, a ValueError); any other failure
+fails the process."""
 
 
-def _offline_load(root, source, subfolder: str = ""):
+def _offline_load(root, source, subfolder: str = "") -> str:
     """A load of `source` (at `subfolder`) in a process of its own, offline over the Hub cache at
-    `root`/hub with Dew's cache at `root`/cache."""
+    `root`/hub with Dew's cache at `root`/cache: its outcome, `loaded` or `refused` (`_LOADED`)."""
     import os
     import subprocess
     import sys
 
     env = {**os.environ, "HF_HUB_CACHE": str(root / "hub"), "HF_HUB_OFFLINE": "1",
            "XDG_CACHE_HOME": str(root / "cache"), "JAX_PLATFORMS": "cpu"}
-    return subprocess.run([sys.executable, "-c", _LOADED, str(source), subfolder], capture_output=True,
-                          text=True, env=env)
+    run = subprocess.run([sys.executable, "-c", _LOADED, str(source), subfolder], capture_output=True,
+                         text=True, env=env)
+    assert run.returncode == 0, run.stderr[-2000:]
+    return run.stdout.split()[-1]
 
 
 def test_a_verification_of_remote_code_is_recorded_under_its_commit(tmp_path):
@@ -346,8 +355,7 @@ def test_a_verification_of_remote_code_is_recorded_under_its_commit(tmp_path):
     verified = tmp_path / "cache" / "dew" / "verified"
 
     def load(source) -> None:
-        run = _offline_load(tmp_path, source)
-        assert run.returncode == 0, run.stderr[-2000:]
+        assert _offline_load(tmp_path, source) == "loaded"
 
     load(tmp_path / "repo")
     assert not list(verified.glob("*/mapping.json"))
@@ -370,9 +378,8 @@ def test_each_code_folder_at_one_commit_is_verified_on_its_own(tmp_path):
                for folder in ("plain", "hooked")]
     assert configs[0] == configs[1]
     hub_cache(tmp_path / "hub", "dew/renamed", tmp_path / "repo")
-    plain = _offline_load(tmp_path, "dew/renamed", "plain")
-    assert plain.returncode == 0, plain.stderr[-2000:]
-    assert _offline_load(tmp_path, "dew/renamed", "hooked").returncode != 0
+    assert _offline_load(tmp_path, "dew/renamed", "plain") == "loaded"
+    assert _offline_load(tmp_path, "dew/renamed", "hooked") == "refused"
 
 
 @pytest.mark.parametrize("name", sorted(SOURCES))
