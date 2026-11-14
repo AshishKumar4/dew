@@ -2328,6 +2328,12 @@ def pythons(*, check: bool) -> int:
     smoked = tuple(re.findall(r"\.venv-(\d+\.\d+)/", smoke))
     if smoked != PYTHONS:
         problems.append(f".armada.json's smoke imports dew in {smoked}; the tested versions are {PYTHONS}")
+    gates = [line.split("\t", 1) for line in (REPO / "tools" / "check_gates").read_text().splitlines()
+             if line.startswith("collect-")]
+    collected = tuple(name.removeprefix("collect-") for name, command in gates
+                      if f".venv-{name.removeprefix('collect-')}/" in command)
+    if collected != PYTHONS or len(gates) != len(PYTHONS):
+        problems.append(f"tools/check_gates collects on {collected}; the tested versions are {PYTHONS}")
     for problem in problems:
         print(problem, file=sys.stderr)
     return 1 if problems else 0
