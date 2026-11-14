@@ -404,11 +404,12 @@ def test_a_rewrite_is_recorded_in_the_kernel_report():
 
 
 def test_a_pass_without_a_rule_set_leaves_its_rewrites_untaken():
-    """A pass that leaves registered sets out (`algebra.program.passes`' `without`, a rule set's receipt's
-    arm) admits them nowhere and takes none of their rewrites: the sums the `linear` set joins (as the test
-    above records) are rewritten without it by no `linear` match, and without it and `joined`, the other
-    set that joins them, by none at all, their program computing what the program with no pass computes; a
-    set no name registers is refused, as an arm without it would measure nothing."""
+    """A pass that leaves sets out (`algebra.program.passes`' `without`, a rule set's receipt's arm) admits
+    them nowhere and takes none of their rewrites: the sums the `linear` set joins (as the test above
+    records) are rewritten by no `linear` match without it, and without it and `joined`, the other set that
+    joins them, by none at all, their program computing what the program with no pass computes. A
+    derivation's own set an arm may name (`carry`'s) is taken; a dev-time set, a derivation's defining set
+    and a name no set registers are refused, as an arm without them would measure nothing."""
     from dew.algebra.program import passes
 
     def joined(x, y, a):
@@ -417,16 +418,18 @@ def test_a_pass_without_a_rule_set_leaves_its_rewrites_untaken():
     x, y, a = rows(3, (8, 64), (8, 64), (8, 64))
     with report.refusals(), passes(without=("linear",)):
         options.program(joined).compiled(x, y, a)
-        [made] = report.rewrites()
-    assert "linear" not in made.admitted and "linear" not in made.fired
+        assert not any("linear" in made.admitted or "linear" in made.fired for made in report.rewrites())
     with report.refusals(), passes(without=("linear", "joined")):
         computed = options.program(joined).compiled(x, y, a)(x, y, a)
         assert not report.rewrites()
     with passes(on=False):
         traced = options.program(joined).compiled(x, y, a)(x, y, a)
     np.testing.assert_array_equal(np.asarray(computed), np.asarray(traced))
-    with pytest.raises(ValueError), passes(without=("lineal",)):
+    with passes(without=("carried",)):
         pass
+    for unnamed in ("stable", "decoupled", "lineal"):
+        with pytest.raises(ValueError), passes(without=(unnamed,)):
+            pass
 
 
 def test_a_programs_whole_pass_is_recorded_by_either_entry():
