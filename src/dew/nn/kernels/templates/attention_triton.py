@@ -149,23 +149,21 @@ class Staging:
 
 def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
     """Whether a launch runs on `target`: a CUDA GPU, one dtype of `DTYPES` on the queries, keys and
-    values, and bf16 only from `generation.BF16_GPU` on, where Triton compiles its products; spans of one
-    interval a query (`refused`)."""
+    values, and bf16 only from `generation.BF16_GPU` on, where Triton compiles its products."""
     query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
     capability = generation.capability(target.generation)
     return (capability is not None and query.dtype == key.dtype == value.dtype and query.dtype in DTYPES
-            and (query.dtype != jnp.bfloat16 or 10 * capability[0] + capability[1] >= generation.BF16_GPU)
-            and ba.arguments["start"].ndim == 2)
+            and (query.dtype != jnp.bfloat16 or 10 * capability[0] + capability[1] >= generation.BF16_GPU))
 
 
 def refused(spans: KeySpans, hooks: Hooks | None = None) -> Refusal | None:
-    """Why this mainloop takes no call over `spans` under `hooks`, or None: a call's runs, several key
-    intervals a query (`KeySpans`), which this mainloop does not walk, the Mosaic and plain-JAX
-    mainloops do (ledger 956, `attention_route`); probability dropout (`Hooks.drop`), which it does not
-    draw, the plain-JAX mainloop does (ledger row 1521)."""
-    if spans.start.ndim == 3:
-        return Refusal('spans', "the Triton mainloop walks one key interval a query; a call's runs take the "
-                       "Mosaic or the plain-JAX mainloop")
+    """Why this mainloop takes no call over `spans` under `hooks`, or None: probability dropout
+    (`Hooks.drop`), which it does not draw, the plain-JAX mainloop does (ledger row 1521); and a quantized
+    call's rounding (`Hooks.rounds`). A call's runs, several key intervals a query (`KeySpans`), it walks
+    as their block map's envelope, each entry masked by its runs (`within`), the rows' runs a block's
+    whole (`_run_spec`; row 4862: an fp32 decision fine-tune's runs fell to the plain-JAX mainloop's
+    programs one at a time)."""
+    del spans
     if hooks is not None and hooks.drop is not None:
         return Refusal('dropout', "the Pallas-Triton mainloop takes no probability dropout (the route runs a "
                        "dropping call on the reference path, ledger row 1521)")
@@ -221,7 +219,7 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         # Only spans read their block map's bounds and their queries' intervals.
         bounds_ref = refs.pop(0)
         bounds = bounds_ref[0], bounds_ref[1]
-        spans = refs.pop(0)[...], refs.pop(0)[...]
+        spans = _intervals(refs.pop(0), refs.pop(0))
     if spec.ids:
         # The queries' ids, and the keys' ref a tile reads its own from.
         ids = refs.pop(0)[...], refs.pop(0)
@@ -244,7 +242,7 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         # calls for them, after the softmax, where jax's mha loads them.
         tile = pl.ds(index * block_k, block_k)
         coords = algebra.Coords(q_pos, index * block_k + jnp.arange(block_k)[None, :],
-                                None if spans is None else (spans,),
+                                spans,
                                 None if ids is None else (ids[0], ids[1][tile]))
         params = tuple(_tile_param(ref, kind, head, q_pos, tile)
                        for ref, kind in zip(score_refs, score_kinds, strict=True))
@@ -360,7 +358,8 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             blocks = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
             bounds = jnp.stack([blocks.lo, blocks.hi, blocks.full_lo, blocks.full_hi],
                                axis=-1).astype(jnp.int32)
-            in_specs += [pl.BlockSpec((None, None, 4), lambda i, b, h: (b, i, 0)), per_query, per_query]
+            bounded = per_query if start.ndim == 2 else _run_spec(per_query, start.shape[2])
+            in_specs += [pl.BlockSpec((None, None, 4), lambda i, b, h: (b, i, 0)), bounded, bounded]
             arrays += [bounds, start, end]
         if ids:
             in_specs += [per_query, whole_keys]
@@ -720,14 +719,13 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     product = functools.partial(_issued, interpret=interpret)
     # D's and the anchor's products with dO, summed as `product` sums dP (`gradient.off_anchor_delta`).
     row_products = interpreted_rows if interpret else gradient.summed_rows
-    start, end = start_ref[...], end_ref[...]
+    intervals = _intervals(start_ref, end_ref)
     query_ids = [ref[...] for ref in id_refs[:1]]
 
     def tile(index):
         keys = pl.ds(index * block_k, block_k)
         k_pos = index * block_k + jnp.arange(block_k)[None, :]
-        seen = within(k_pos, start[:, None], end[:, None],
-                      (query_ids[0][:, None], id_refs[1][keys][None, :]) if ids else None)
+        seen = _seen(k_pos, intervals, (query_ids[0][:, None], id_refs[1][keys][None, :]) if ids else None)
         params = [_tile_param(ref, kind, head, q_pos, keys)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
         return keys, k_pos, seen, params
@@ -821,8 +819,8 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
         rows = pl.ds(index * block_q, block_q)
         query, dout = query_ref[rows, :], dout_ref[rows, :]
         q_pos = index * block_q + jnp.arange(block_q)[:, None]
-        seen = within(k_pos, start_ref[rows][:, None], end_ref[rows][:, None],
-                      (id_refs[0][rows][:, None], key_ids[0][None, :]) if ids else None)
+        seen = _seen(k_pos, _intervals(start_ref, end_ref, rows),
+                     (id_refs[0][rows][:, None], key_ids[0][None, :]) if ids else None)
         params = [_key_param(ref, kind, head, rows)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
         # The logits from the queries taken by the power; dK at the call's whole scale against the call's
@@ -860,9 +858,34 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
             grad_refs[place][...] = grad
 
 
-def _spans_specs(per_rows, whole, ids: bool) -> list:
-    """The specs of the spans' starts and ends and, with documents, the queries' and keys' ids."""
-    return [per_rows, per_rows, *([per_rows, whole] if ids else [])]
+def _spans_specs(per_rows, whole, ids: bool, runs: int | None = None) -> list:
+    """The specs of the spans' starts and ends, each query's `runs` intervals a row where it has them
+    (`_run_spec`), and, with documents, the queries' and keys' ids."""
+    bounds = per_rows if runs is None else _run_spec(per_rows, runs)
+    return [bounds, bounds, *([per_rows, whole] if ids else [])]
+
+
+def _run_spec(per_rows, runs: int):
+    """`per_rows`' spec with an axis of `runs` more, taken whole: a call's runs' starts or ends, `[.., R]`,
+    which `within` reads run by run."""
+    return pl.BlockSpec((*per_rows.block_shape, runs), lambda *grid: (*per_rows.index_map(*grid), 0))
+
+
+def _intervals(start_ref, end_ref, rows: pl.Slice | None = None) -> tuple[tuple[jax.Array, jax.Array], ...]:
+    """The queries' intervals at `rows` (every one where None) as `Coords.spans` holds them
+    (`algebra.intervals`): their starts and ends `[rows]`, one interval, or each of a call's runs loaded from
+    its own column (`_run_spec`), as no Pallas Triton lowering slices a loaded value."""
+    taken = slice(None) if rows is None else rows
+    if len(start_ref.shape) == 1:
+        return ((start_ref[taken], end_ref[taken]),)
+    return tuple((start_ref[taken, run], end_ref[taken, run]) for run in range(start_ref.shape[-1]))
+
+
+def _seen(k_pos: jax.Array, intervals: tuple[tuple[jax.Array, jax.Array], ...], ids) -> jax.Array:
+    """Whether each query sees each key of `k_pos` `[1, bk]`: in an interval of its own (`within`), their
+    union where it has runs, of its document with `ids`."""
+    return functools.reduce(jnp.logical_or, (within(k_pos, start[:, None], end[:, None], ids)
+                                             for start, end in intervals))
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -1061,7 +1084,8 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
     per_query = pl.BlockSpec((None, block_q), lambda i, b, h: (b, i))
     per_head = pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))
     in_specs = [pl.BlockSpec((None, None, 2), lambda i, b, h: (b, i, 0)),
-                *_spans_specs(per_query, pl.BlockSpec((None, keys), lambda i, b, h: (b, 0)), ids),
+                *_spans_specs(per_query, pl.BlockSpec((None, keys), lambda i, b, h: (b, 0)), ids,
+                              start.shape[2] if start.ndim == 3 else None),
                 pl.BlockSpec((None, block_q, None, width), lambda i, b, h: (b, i, h, 0)),
                 pl.BlockSpec((None, keys, None, width), lambda i, b, h: (b, 0, h // group, 0)),
                 pl.BlockSpec((None, keys, None, value_width), lambda i, b, h: (b, 0, h // group, 0)),
@@ -1123,7 +1147,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     whole_queries = pl.BlockSpec((None, queries), lambda j, b, h: (b, 0))
     whole_head = pl.BlockSpec((None, None, queries), lambda j, b, h: (b, h, 0))
     in_specs = [pl.BlockSpec((None, None, 2), lambda j, b, h: (b, j, 0)),
-                *_spans_specs(whole_queries, pl.BlockSpec((None, block_k), lambda j, b, h: (b, j)), ids),
+                *_spans_specs(whole_queries, pl.BlockSpec((None, block_k), lambda j, b, h: (b, j)), ids,
+                              start.shape[2] if start.ndim == 3 else None),
                 pl.BlockSpec((None, queries, None, width), lambda j, b, h: (b, 0, h, 0)),
                 pl.BlockSpec((None, block_k, None, width), lambda j, b, h: (b, j, h // group, 0)),
                 pl.BlockSpec((None, block_k, None, value_width), lambda j, b, h: (b, j, h // group, 0)),

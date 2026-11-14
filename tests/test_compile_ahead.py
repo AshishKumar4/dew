@@ -344,6 +344,44 @@ def test_a_kept_program_that_is_not_its_calls_is_found_by_verifying(tmp_path):
         pass
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class Scales:
+    """A static argument whose field holds dictionaries through NumPy's storage of pointers."""
+    table: np.ndarray | np.void
+
+
+def scaled_by_table(held: Scales, values: jax.Array) -> jax.Array:
+    """`values` times the scale the static argument's first dictionary holds as the call traces."""
+    entry = held.table["entry"] if held.table.dtype.names else held.table[0]
+    return values * entry["scale"]
+
+
+@pytest.mark.parametrize("holder", ["array", "structured"])
+def test_a_program_over_numpys_pointers_runs_what_they_point_to_when_its_handed(tmp_path, holder):
+    """A static argument holding a dictionary through an array of objects, or a structured scalar with an
+    object field, states nothing of the dictionary (its storage is the pointer, the same after the
+    dictionary changes): its call is not kept, and a fresh program called where the file is handed after
+    the dictionary changed runs the scale it holds then, not the executable of the one it held before."""
+    from dew.nn.kernels.options import owned_program
+    from dew.training.ahead import keeping, kept
+
+    dictionary = {"scale": 2}
+    table = np.empty(1, dtype=object)
+    table[0] = dictionary
+    if holder == "structured":
+        table = np.array([(dictionary,)], dtype=[("entry", object)])[0]
+    values = jnp.ones(3)
+    path = tmp_path / "programs.dew-aot"
+    # A fresh program at each call, as a fresh process makes it.
+    fresh = functools.partial(owned_program, scaled_by_table, static_argnums=(0,))
+    with keeping() as programs:
+        assert fresh()(Scales(table), values).tolist() == [2.0] * 3
+    programs.save(path)
+    dictionary["scale"] = 3
+    with kept(path):
+        assert fresh()(Scales(table), values).tolist() == [3.0] * 3
+
+
 def test_a_program_called_over_shapes_while_collecting_compiles_there_and_runs_where_handed():
     """A program called within `collecting` over shapes compiles there, keyed by its program's digest, and
     answers with its results' shapes, running nothing; handed to a call of the program over arrays of those
