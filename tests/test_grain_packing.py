@@ -246,6 +246,27 @@ def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy, over
     assert memory and memory == windows("indexed")
 
 
+@pytest.mark.parametrize("read", ["indexed", "memory"])
+def test_a_planned_first_fit_places_an_empty_document_as_a_stream_does(read):
+    """An empty document is a document to first-fit, which counts it against a window's segments: two
+    tokens, none and two at width four and two documents a window are two windows, the empty one in the
+    first, whether planned from the documents' lengths (an indexed or memory read) or packed as they
+    stream (data.md's one layout, row 6277)."""
+    documents = [{"text": np.arange(length, dtype=np.int32) + 10 * index}
+                 for index, length in enumerate((2, 0, 2))]
+    pipeline = Pipeline(Memory(documents)).pack(4, bins=1, segments=2)
+
+    def windows(read):
+        reader = validation(pipeline, batch=1, read=read, loading=READ)(DataPartition())
+        try:
+            return [np.asarray(batch["text"]).tolist() for batch in reader]
+        finally:
+            reader.close()
+
+    streamed = windows("streamed")
+    assert len(streamed) == 2 and windows(read) == streamed
+
+
 def pairs(batch, field="text"):
     """The next-token pairs of `field` inside one segment of each real window of a packed batch,
     the repeats that fill a short last batch (`VALID_ROWS`, which a whole batch holds none of) left
