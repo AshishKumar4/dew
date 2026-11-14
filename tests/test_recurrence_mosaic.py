@@ -1131,18 +1131,18 @@ def _ran(tiles, *, training: bool):
 
 def _two_roles(name: str, bound, derived, family, facts, *, packed: bool, training: bool) -> list:
     """The walks at two consumer roles a program (`Tiles.walkers`) as a gate case's tiles, which the
-    derivation gives a call whose walks fill more than a wave and `RESOURCE_SHAPES` never do: a role's
-    registers are its share of the program's; none where the family's walks take one role
-    (`template.walk_roles`), packed documents', a value width of an odd number of blocks, or two roles' tiles
-    past the GPU's resources for the product, a training call's where `training` (`Mosaic._staged` None).
-    Their launches' producers are raised past a compile's spills as the derivation's are
+    derivation gives a call whose walks fill more than a wave and `RESOURCE_SHAPES` never do (`Mosaic._walked`
+    at two waves): a role's registers are its share of the program's; none where the family's walks take one
+    role (`template.walk_roles`), packed documents', a value width of an odd number of blocks, two roles'
+    tiles past the GPU's resources for the product, or a training call's whose fast backward holds at one role
+    and not at two. Their launches' producers are raised past a compile's spills as the derivation's are
     (`Mosaic._settled`), under the target whose capacities a refusal's identity reads."""
-    value_width = RESOURCE_SHAPES[name][3]
-    if template.walk_roles(family) < 2 or packed or value_width // derived.block_v % 2:
+    if packed:
         return []
-    two = template.MOSAIC._staged(bound, derived.block_v, facts, derived.chunk, walkers=2,
-                                  wide=derived.block_o or derived.block_v, training=training)
-    if two is None:
+    # As the derivation walks a call of two waves (`Mosaic._walked`): two roles only where they hold, and
+    # a training call's only where its fast backward holds as it does at one.
+    two = template.MOSAIC._walked(bound, derived, facts, 2, training=training)
+    if two.walkers != 2:
         return []
     with generation.assumed(facts):
         return [(template.MOSAIC._settled(bound, two, facts), 'two roles ')]
