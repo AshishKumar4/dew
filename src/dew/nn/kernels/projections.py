@@ -24,7 +24,7 @@ from dew.nn.kernels.gemm import (
     nvfp4_block_product,
 )
 from dew.nn.kernels.templates.product import SCALE_DEPTH, declared
-from dew.nn.sharding import explicit_spec, seen_whole
+from dew.nn.sharding import RESIDUAL, automatic_axes, explicit_spec, logical_spec, manual_map, seen_whole
 
 
 def blockwise_fp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,
@@ -287,7 +287,9 @@ def dot_general(xla):
     forward, the input gradient or the kernel gradient (`launched`). A call no launch takes is `xla`'s own
     program, differentiated by JAX, each of its products' routes reported with the reason no launch takes
     it (a declared cell's old route, a mesh axis splitting the operands, a CPU), so a layer runs as it ran
-    before wherever the template declares XLA faster; every other product is `xla`'s."""
+    before wherever the template declares XLA faster; every other product is `xla`'s. On a mesh whose
+    automatic axes split the rows alone (`rows_split`), each device's rows are its own call (`per_shard`):
+    a kernel launch per device on its own rows (bible §7, rows 1306 and 1923)."""
     def product(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, **kwargs):
         (contracted, against), batch = dimension_numbers
         out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
@@ -297,15 +299,76 @@ def dot_general(xla):
         plain = (not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
                  and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)
                  and tuple(map(tuple, batch)) == ((), ()))
+        if plain and rows_split(lhs) is not None:
+            return per_shard(lambda lhs, rhs: product(lhs, rhs, dimension_numbers, precision,
+                                                      preferred_element_type), lhs, (rhs,))
         if plain:
             rows = lhs.reshape(-1, lhs.shape[-1])
             if launched(rows, rhs, out_dtype, precision):
-                product = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
-                return product.reshape(*lhs.shape[:-1], rhs.shape[1])
+                out = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
+                return out.reshape(*lhs.shape[:-1], rhs.shape[1])
         return xla(lhs, rhs, dimension_numbers, precision=precision,
                    preferred_element_type=preferred_element_type, **kwargs)
 
     return product
+
+
+def rows_split(lhs: jax.Array) -> jax.sharding.PartitionSpec | None:
+    """How the context's mesh splits a projection's rows (`lhs`'s every axis but its last, an activation's
+    batch and length, `RESIDUAL`), where its automatic axes (`automatic_axes`) split those rows alone, each
+    axis a row axis's, the contracted axis whole; None where no automatic axis splits the call or one
+    splits more than its rows (a tensor axis's split of the depth or the outputs, which the partitioner
+    owns), or where an Explicit axis splits any operand (its placement the operands' types carry, which the
+    product's own sharding rules read: no rule table infers one here)."""
+    mesh = jax.sharding.get_abstract_mesh()
+    if any(mesh.shape[name] > 1 for name in mesh.explicit_axes):
+        return None
+    automatic = set(automatic_axes())
+    if not automatic or lhs.ndim < 2:
+        return None
+    lead = min(lhs.ndim - 1, 2)
+    rows = logical_spec(RESIDUAL[:lead], lhs.shape[:lead])
+    named = {axis for entry in rows for axis in ((entry,) if isinstance(entry, str) else entry or ())}
+    return jax.sharding.PartitionSpec(*rows) if named == automatic else None
+
+
+def per_shard(local, lhs: jax.Array, matrices: tuple) -> jax.Array:
+    """`local(lhs, *matrices)` on each device's rows (`manual_map`, the rows split as `rows_split`
+    states), as fully sharded data parallelism defines a projection: each matrix enters where the layout
+    places a declared projection kernel (`WEIGHT`, read by the layout's own rule, `placement.state_spec`:
+    fsdp, with sequence where it shares it, on its inputs where they divide) and is gathered whole in the
+    map, so its gradient leaves the map reduce-scattered back to that placement (the gather's transpose),
+    each device's share summed over the devices' rows, and a whole matrix's summed on every device. A
+    matrix its module places otherwise (`Layout.shardings`' declared axes) is resharded to it by the
+    partitioner, correct at a collective more. Entered whole instead, its gradient's sum over the devices
+    leaves as an all-reduce, the matrix's whole gradient on every device (tests/test_projection_shards.py).
+    A joined projection's kernels enter apart and are joined in the map, so each one's gradient is summed
+    at its own parameter's shape, its bias added past the map as a Dense adds its own
+    (`dew.nn.joined.joined_dense`)."""
+    from dew.distributed.placement import state_spec
+
+    split = rows_split(lhs)
+    assert split is not None, "a mesh's automatic axes split the rows alone"
+    mesh = jax.sharding.get_abstract_mesh()
+    placed = tuple(state_spec(lambda on, shape=matrix.shape: logical_spec(WEIGHT, shape, mesh=on), mesh)
+                   for matrix in matrices)
+
+    def gathered(matrix, spec):
+        for axis, entry in enumerate(spec):
+            names = (entry,) if isinstance(entry, str) else tuple(entry or ())
+            if names:
+                matrix = jax.lax.all_gather(matrix, names, axis=axis, tiled=True)
+        return matrix
+
+    def shard(lhs, *parts):
+        return local(lhs, *(gathered(matrix, spec) for matrix, spec in zip(parts, placed, strict=True)))
+
+    return manual_map(shard, (split, *placed), split)(lhs, *matrices)
+
+
+WEIGHT = ("embed", "mlp")
+"""A declared projection kernel's logical axes (its inputs, then its outputs), as Dew's Dense declares them
+(tests/test_mesh_axes.py), which the layout places (`dew.distributed.placement.Layout.shardings`)."""
 
 
 def _recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype) -> jax.Array | None:
