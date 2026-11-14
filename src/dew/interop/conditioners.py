@@ -81,6 +81,7 @@ def _row_guidance(record: Mapping[str, object], default: float | None) -> float:
     return float(value)
 
 
+@dataclass(frozen=True, eq=False)
 class T5Segment:
     """Holds the T5 tower a family reads beside its CLIP ones.
 

@@ -38,9 +38,6 @@ def latent_image_conditions(autoencoder, params, pixels, mask, key, noise=None):
 
 
 
-@dataclass(frozen=True, eq=False)
-
-
 @lru_cache(maxsize=32)
 def _cubic_weights(source: int, target: int) -> tuple[np.ndarray, np.ndarray]:
     """Compact Pillow bicubic taps, with its 22-bit integer coefficients."""

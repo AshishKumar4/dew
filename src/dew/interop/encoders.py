@@ -323,7 +323,7 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
 
         return sample_count(self.seconds, sampling_rate(self.extractor))
 
-    def waveform(self, row: AudioRow) -> np.ndarray:
+    def waveform(self, row: AudioRow | str) -> np.ndarray:
         """Return one row as a float32 waveform `samples` long.
 
         A constant fills the whole clip, and a mapping holds the waveform or

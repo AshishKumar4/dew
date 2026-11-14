@@ -11,8 +11,6 @@ from dew._exports import lookup as _lookup
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.inputs.condition import ConditionEncoder
     from dew.inputs.encoders import CharTable
-    from dew.interop.conditioners import DiffusionConditioner
-    from dew.interop.encoders import CLIPText, HFAudio, T5Text
     from dew.inputs.spec import (
         AudioCondition,
         Condition,
@@ -23,6 +21,8 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         encode_conditions,
         unit_range,
     )
+    from dew.interop.conditioners import DiffusionConditioner
+    from dew.interop.encoders import CLIPText, HFAudio, T5Text
 
 _EXPORTS = {
     "AudioCondition": "dew.inputs.spec", "CLIPText": "dew.interop.encoders",
