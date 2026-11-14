@@ -657,16 +657,19 @@ host (armada, 11-06); a replica layout sums its rows across processes as data do
 
 
 @pytest.mark.distributed
+@pytest.mark.parametrize("layout", POOLED_LAYOUTS)
 @pytest.mark.parametrize("model", ["dense", "moe"])
-def test_the_layouts_a_gang_crosses_hosts_with_match_one_device_across_four_processes(model, tmp_path):
+def test_the_layouts_a_gang_crosses_hosts_with_match_one_device_across_four_processes(model, layout,
+                                                                                         tmp_path):
     """The layout tool's dense decoder or mixture of experts over a pool of four processes of one device
     each, as the multi-host gang runs it over four hosts: each of POOLED_LAYOUTS, whose sums cross the
-    processes, on par with one device over POOLED_LAYOUT_SEEDS draws (check 1). A replica layout forms only
-    across processes or slices, so its draws are judged here, where a draw takes a fraction of its time
-    across hosts (dense 91 s, the mixture 150 s for both replica layouts, armada 11-06)."""
+    processes, on par with one device over POOLED_LAYOUT_SEEDS draws (check 1), each layout a pool of its
+    own, so the cells run apart (the four in one pool took 212 s dense and 269 s the mixture, CI 11-14). A
+    replica layout forms only across processes or slices, so its draws are judged here, where a draw takes a
+    fraction of its time across hosts."""
     rows = tmp_path / "rows.json"
     command = [sys.executable, "tools/layout_parity.py", "--models", model,
-               "--seeds", str(POOLED_LAYOUT_SEEDS), "--out", str(rows), "--layouts", *POOLED_LAYOUTS]
+               "--seeds", str(POOLED_LAYOUT_SEEDS), "--out", str(rows), "--layouts", layout]
     pool = {"DEW_PROCESS_COUNT": "4", "JAX_COORDINATOR_ADDRESS": f"127.0.0.1:{free_port()}"}
     with ProcessGroup() as group:
         group.running.extend(start_process(command, 1, environment={**pool, "DEW_PROCESS_ID": str(rank)})
@@ -676,8 +679,7 @@ def test_the_layouts_a_gang_crosses_hosts_with_match_one_device_across_four_proc
         for process in group.running[1:]:
             output(process, 120)
     assert [process.returncode for process in group.running] == [0] * 4
-    statuses = [(row["layout"], row["status"]) for row in judged]
-    assert statuses == [(layout, "works") for layout in POOLED_LAYOUTS], judged
+    assert [(row["layout"], row["status"]) for row in judged] == [(layout, "works")], judged
 
 
 @pytest.mark.distributed
