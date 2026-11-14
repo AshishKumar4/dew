@@ -264,8 +264,8 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_until_one_fi
     paired SwiGLU forward whose model counts no registers, compiled for a compile-only H100 on this CPU
     through ptxas; the refusals saved with the kept program derive it again. A derivation left no config
     refuses the program (test_kernel_spills)."""
+    from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.kernels.templates import report
-    from dew.training.ahead import compile_only_gpus
 
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
     traced = []
@@ -305,8 +305,8 @@ def test_programs_compiled_at_once_sharing_a_spilling_launch_keep_what_compiles_
     lowered before that refusal committed, is lowered again past it, so both keep the stepped tile and the
     refusals are those compiling them in turn leaves, the second neither refusing the first config again
     nor stepping its own past the kept one (review of the concurrent compiles)."""
+    from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.kernels.templates import report
-    from dew.training.ahead import compile_only_gpus
 
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
     mesh = generation.gpu_mesh(devices, "sm90")
@@ -335,8 +335,8 @@ def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kerne
     removed under the other thread's writes, and the other thread's kernels read as the compile's own."""
     from concurrent.futures import ThreadPoolExecutor
 
+    from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.kernels.templates import report
-    from dew.training.ahead import compile_only_gpus
 
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
     mesh = generation.gpu_mesh(devices, "sm90")

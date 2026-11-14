@@ -19,10 +19,11 @@ from token_support import token_rows
 
 from dew._records import listed, record
 from dew.data.dataset import Loader, replayed
+from dew.nn.kernels.generation import compile_only_gpus
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer, staging
-from dew.training.ahead import compile_ahead, compile_only_gpus
+from dew.training.ahead import compile_ahead
 from dew.training.compiled_program import compiled
 from dew.training.footprint import Footprint, Workspace, gradient_peak, peak_bytes, traced_loss
 from dew.training.inspection import Inspection

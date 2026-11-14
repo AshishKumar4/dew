@@ -486,8 +486,8 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
     """Admit a compiled or loaded program's communicators and code against the room the process's sizing left
     them and its GPUs have free outside XLA's pool now (`Resident`), refusing one that would not fit before it
     runs; a process that holds no sizing admits every program, and a program compiled for devices this process
-    has not (`dew.training.ahead.compile_only_gpus`) is never loaded here, so it takes none of this host's
-    room, as does a program on the host's CPU. Every program Dew compiles passes here
+    has not (`dew.nn.kernels.generation.compile_only_gpus`) is never loaded here, so it takes none of this
+    host's room, as does a program on the host's CPU. Every program Dew compiles passes here
     (`dew.nn.kernels.templates.report`), the RL rollouts' among them (`dew.nn.kernels.options.OuterProgram`),
     and every executable it loads compiled ahead (`dew.training.ahead`)."""
     runtime = executable.runtime_executable()

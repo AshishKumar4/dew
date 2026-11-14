@@ -571,8 +571,9 @@ class Trainer(Generic[Loss, Effects]):
         of the splits its plan may take whose devices hold it, the trainer's own where it fixes one
         (`splits`). It leaves out the narrow copies a step may read (`TrainState.compute`), which the plan
         drops first where the step does not fit with them. An `OptimConfig` is built over `steps`, as
-        `fit(steps=...)` builds it. A trainer on compile-only GPUs (`dew.training.ahead.compile_only_gpus`)
-        checks it against the memory stated for them, on a host that holds none.
+        `fit(steps=...)` builds it. A trainer on compile-only GPUs
+        (`dew.nn.kernels.generation.compile_only_gpus`) checks it against the memory stated for them, on a
+        host that holds none.
 
         Raises what `fit` raises before placing the state: `LayoutRefused` for a state over a device's memory
         or a layout that replicates too much of the model, and ValueError for rules that name an axis the

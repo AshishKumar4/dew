@@ -40,10 +40,9 @@ from sharded import collective_axes
 
 from dew._builds import generation_builds
 from dew.nn.kernels import grouped_matmul
-from dew.nn.kernels.generation import assumed, capability, gpu_target
+from dew.nn.kernels.generation import assumed, capability, compile_only_gpus, gpu_target
 from dew.nn.kernels.lowered import kernel_calls, triton_kernels
 from dew.nn.kernels.templates import report, resources
-from dew.training.ahead import compile_only_gpus
 
 MOSAIC_REFUSED = re.compile(r"smem_bytes=(\d+) > max_smem_bytes=\d+")
 """Mosaic GPU's refusal, as it lowers, of a kernel whose shared memory a block of the GPU does not hold."""

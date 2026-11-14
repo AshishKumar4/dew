@@ -74,8 +74,10 @@ from dew.nn.kernels.generation import (
     assumed,
     built_target,
     capability,
+    compile_only_gpus,
     device_target,
     gpu_target,
+    positive_memory,
     tpu,
 )
 from dew.nn.kernels.options import OuterProgram, collecting, owned_program, program_digest, shapes_of, taking
@@ -100,79 +102,12 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-def target_config(target: GpuTarget, memory: int | None = None) -> str:
-    """The `gpu_device_info` XLA compiles for, from the GPU `target` a build states (`built_target`: its
-    CUDA generation's, its multiprocessors its own where stated): its compute capability, the shared memory
-    a block may opt into, its multiprocessors, clock and bandwidth, its multiprocessor's and a block's
-    limits (`Multiprocessor`) and its fp32 lanes (`Architecture.tensor_rates`); CUDA's grid limits for the
-    rest. The fields past the capability and shared memory only steer XLA's own fusions, never a Triton
-    kernel's code. From Hopper on, its capability states the architecture-specific features (sm_90a,
-    sm_100a, sm_120a), which Mosaic GPU's PTX targets: left unspecified, an sm120's assembled for plain
-    sm_120 and refused its own PTX ('.target sm_120a cannot be compiled for architecture sm_120')."""
-    generation = target.generation
-    version = capability(generation)
-    shared, multiprocessors = target.shared_limit, target.multiprocessors
-    clock, bandwidth = target.clock_hz, target.memory_bandwidth
-    # Its fp32 lanes, two FLOPs a clock each (a fused multiply-add), as its architecture states them.
-    fp32 = target.tensor_rates.get("fp32")
-    if (version is None or shared is None or multiprocessors is None or clock is None or bandwidth is None
-            or fp32 is None):
-        raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
-    major, minor = version
-    multiprocessor = target.multiprocessor
-    return f"""gpu_device_info {{
-  threads_per_block_limit: {multiprocessor.block_threads}
-  threads_per_warp: {multiprocessor.warp_threads}
-  shared_memory_per_block: {multiprocessor.block_shared}
-  shared_memory_per_core: {shared + multiprocessor.reserved_shared}
-  threads_per_core_limit: {multiprocessor.resident_threads}
-  core_count: {multiprocessors}
-  fpus_per_core: {fp32 // 2}
-  block_dim_limit_x: 2147483647
-  block_dim_limit_y: 65535
-  block_dim_limit_z: 65535
-  memory_bandwidth: {int(bandwidth)}
-  device_memory_size: {0 if memory is None else memory}
-  clock_rate_ghz: {clock / 1e9}
-  shared_memory_per_block_optin: {shared}
-  cuda_compute_capability {{
-    major: {major}
-    minor: {minor}
-    feature_extension: {"ACCELERATED_FEATURES" if major >= 9 else "NONE"}
-  }}
-  registers_per_core_limit: {multiprocessor.registers}
-  registers_per_block_limit: {multiprocessor.block_registers}
-}}
-platform_name: "CUDA"
-device_description_str: "{target.device_kind}"
-"""
-
-
 @functools.cache
 def compile_only_tpus(topology: str) -> tuple:
     """The devices of the TPU `topology` ('v5e:4x4', as `jax.experimental.topologies` names one), none
     attached: libtpu compiles a program over them on any host that holds it, as MaxText's train_compile
     does, a mesh's collectives included, as for that topology's TPUs."""
     return tuple(topologies.get_topology_desc(topology, "tpu").devices)
-
-
-def compile_only_gpus(generation: str, count: int = 1, memory: int | None = None,
-                      multiprocessors: int | None = None) -> tuple:
-    """`count` compile-only devices of the CUDA `generation`, none attached: XLA's CUDA backend compiles a
-    program over them, a mesh's collectives included, as for that many of the generation's GPUs, of the
-    `multiprocessors` a build states where it states them (`built_target`). `memory` states each GPU's
-    memory, its total bytes as the GPU states them (`nvidia-smi`'s total): XLA's scheduler and
-    rematerialization read it as the target's (`device_memory_size`), and every admission of a program
-    compiled for these devices reads the allocator's limit derived from it (`dew._devices.allocator_limit`,
-    `COMPILE_ONLY_MEMORY`), as the GPU's own allocator states it. Absent it, the devices state no memory: a
-    step is compiled ahead for them only where it is stated (`compile_ahead`)."""
-    if memory is not None:
-        _positive(memory)
-    stated = built_target(generation, multiprocessors).multiprocessors
-    devices = _compile_only_gpus(generation, count, memory, stated)
-    if memory is not None:
-        COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
-    return devices
 
 
 @contextlib.contextmanager
@@ -182,7 +117,7 @@ def stand_in_gpus(devices: Sequence, memory: int) -> Iterator[tuple]:
     the allocator's limit derived from it (`dew._devices.allocator_limit`, `COMPILE_ONLY_MEMORY`), as
     `compile_only_gpus`' do, where JAX's CUDA plugin, which those need, does not install. `Trainer.validate`
     checks a run's layout on them against the GPUs' limits; a program compiles for the CPU."""
-    _positive(memory)
+    positive_memory(memory)
     devices = tuple(devices)
     COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
     try:
@@ -190,23 +125,6 @@ def stand_in_gpus(devices: Sequence, memory: int) -> Iterator[tuple]:
     finally:
         for device in devices:
             del COMPILE_ONLY_MEMORY[device]
-
-
-def _positive(memory: int) -> None:
-    """Refuse a GPU's stated memory that is not a positive count of bytes."""
-    if memory <= 0:
-        raise ValueError(f"a GPU states a positive count of bytes, not {memory}")
-
-
-@functools.cache
-def _compile_only_gpus(generation: str, count: int, memory: int | None,
-                       multiprocessors: int | None) -> tuple:
-    """`compile_only_gpus`, one topology for each GPU however a caller states it (the generation's own
-    multiprocessors as None or as their count)."""
-    config = target_config(built_target(generation, multiprocessors), memory)
-    topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=config,
-                                            topology=f"1x1x{count}")
-    return tuple(topology.devices[:count])
 
 
 _HOSTS_GPUS: set = set()
