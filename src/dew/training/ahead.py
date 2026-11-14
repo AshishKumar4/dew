@@ -365,8 +365,7 @@ class AheadOfTime:
         def load(executable: Executable) -> Callable[[], jax.stages.Compiled]:
             def loaded() -> jax.stages.Compiled:
                 found = jax.devices()
-                if self.built is not None:
-                    self.built.held(found)
+                self.held(found)
                 return executable.loaded(found)
             return loaded
 

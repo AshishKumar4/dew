@@ -44,13 +44,14 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
     (`gpu_flow.isolated`), each one's failure kept and all raised together."""
     in_own = isolated(tmp_path_factory)
 
-    saved, handed, links, split, clocked, watched = (
+    saved, handed, links, split, clocked, watched, untuned = (
         compile_ahead.a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place,
         compile_ahead.a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu,
         compile_ahead.a_run_handed_a_step_compiled_ahead_traces_with_the_links_it_was_compiled_with,
         compile_ahead.a_run_takes_the_saved_offline_split_before_loading_its_executable,
         compile_ahead.a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_no_other,
-        compile_ahead.a_watched_run_handed_its_steps_compiled_ahead_compiles_neither)
+        compile_ahead.a_watched_run_handed_its_steps_compiled_ahead_compiles_neither,
+        compile_ahead.a_run_handed_an_untuned_file_by_its_command_compiles_its_own)
     settled, guided, half, failed = (
         plan.a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_them,
         plan.a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly,
@@ -88,6 +89,7 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
              in_own(run_option_matrix.an_lm_run_whose_launches_are_tokamaxs_refuses_to_tune, "untunable")),
         Cell("a clocked run with a cooldown trains from its step compiled ahead, compiling no other",
              in_own(clocked, "clocked")),
+        Cell("a run handed an untuned file by its command compiles its own", in_own(untuned, "untuned")),
         Cell("a program on this GPU is admitted against the room its pool left",
              in_own(admitted, "admitted")),
         Cell("a program loaded from the compilation cache is admitted from its kept communicators",
