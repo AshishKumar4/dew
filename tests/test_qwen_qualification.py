@@ -346,7 +346,7 @@ def depth_draw(loaded):
     return draw
 
 
-def laid(real, positions) -> dict:
+def depth_layout(real, positions) -> dict:
     """A depth call's layout of tokens `real` at `positions`, as a decode's draft lays a step out: rotary
     positions (`[B, S, 3]`) under their own name, else one-axis positions in the tokens' coordinates."""
     rotary = positions.ndim == 3
@@ -373,7 +373,7 @@ def cached_steps(loaded, admitted: np.ndarray):
     def step(variables, cache, hidden, tokens, embeddings, valid, positions):
         (logits, _), updated = loaded.model.apply(
             {**variables, **cache}, hidden, tokens, input_embeddings=embeddings, decode=True,
-            method="mtp_step", mutable=["cache"], **laid(valid, positions))
+            method="mtp_step", mutable=["cache"], **depth_layout(valid, positions))
         return logits, updated
 
     @as_given
@@ -398,7 +398,7 @@ def uncached_steps(loaded, admitted: np.ndarray):
     @jax.jit
     def depths(hidden, tokens, embeddings, real, positions):
         return loaded.model.apply(loaded.variables, hidden, tokens, method=prepared_depths,
-                                  input_embeddings=embeddings, **laid(real, positions))
+                                  input_embeddings=embeddings, **depth_layout(real, positions))
 
     @as_given
     def stepped(hidden, tokens, embeddings, real, positions):
@@ -428,7 +428,7 @@ def test_prediction_cache_matches_reference_candidate_steps(source):
     @jax.jit
     def truth(hidden, tokens, embeddings, real, positions):
         return jnp.asarray(wide.apply(held, hidden, tokens, method=prepared_depths,
-                                      input_embeddings=embeddings, **laid(real, positions)))[admitted]
+                                      input_embeddings=embeddings, **depth_layout(real, positions)))[admitted]
 
     assert_as_exact(cached_steps(loaded, admitted), uncached_steps(loaded, admitted), depth_draw(loaded),
                     f"{loaded.source.name} cached prediction steps",

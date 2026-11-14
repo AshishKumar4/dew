@@ -502,7 +502,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_qualification.py": {
-   "comparisons": 11,
+   "comparisons": 10,
    "lane": "Models, Serving & RL"
   },
   "tests/test_rae.py": {
