@@ -51,6 +51,7 @@ from dew.sampling.flow import FlowSDE, flow_transition
 from dew.telemetry.records import RECORD_TYPES
 from dew.training import Trainer
 from tools.parity_flow_grpo import RECORDED, dew_transition, transition_inputs
+from tools.parity_verl_omni_flow_loss import RECORDED as VERL_OMNI, dew_loss, loss_inputs
 
 SEEDS = {'guided walk': 8, 'converted': 8, 'rescored walk': 16, 'clipping': 32, 'kl': 8, 'rollout': 64,
          'inpainting': 32, 'inpainting update': 512, 'live policy': 64, 'mixed precision': 32,
@@ -736,6 +737,22 @@ def test_transition_matches_released_sampler_and_torch_distribution():
     assert_certified(dew_transition, lambda seed: (transition_inputs(seed),), "released transition",
                      seeds=seeds)
 
+
+
+def test_a_transitions_loss_is_verl_omnis_flow_grpo_loss():
+    """A transition's Flow-GRPO loss over its samples, from their mean log densities under the policy and
+    the rollout's and their advantages, the ratio's clip and the advantages' each moving some
+    (`flow_grpo_terms`), and that loss's gradient in the policy's densities, on par with verl-omni's
+    `FlowGRPOLoss` (pinned) from its float64 run over the recorded seeds (check 1,
+    tools/parity_verl_omni_flow_loss.py), the truth Dew's own loss in float64, held at every seed to the
+    recording's sketch: the shared algorithm's loss diffusion RL's interchange with verl-omni starts from
+    (docs/design/post-training.md §13)."""
+    seeds = declared_seeds(VERL_OMNI)["loss"]
+    draw, recorded, truth = indexed_recording(recording(VERL_OMNI), "loss", seeds, inputs_of=loss_inputs,
+                                              truth_fn=jax.jit(dew_loss))
+    dew = jax.jit(dew_loss)
+    assert_as_exact(lambda index, inputs: dew(inputs), recorded, draw, "verl-omni loss", seeds=seeds,
+                    truth_fn=truth)
 
 
 @pytest.mark.mesh
