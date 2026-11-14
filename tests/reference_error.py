@@ -1279,9 +1279,10 @@ def _cancelling_terms(draw, truth, program=None):
     rounding's residue Dew's and the reference's alike). None where no row is zero, or where the site
     states a truth no program's terms are traced from (run as given, recorded, a window loop's; ledger
     3198): every other truth traces, and a failure to is the site's. `program`, the truth as the draws
-    run it (`_truth_program`), evaluates the first draw's truth, so its first call's run and trace serve
-    the draws too, once a process (a map task's draws, DRAWS); a reference standing for it runs
-    compiled, not eagerly (ledger 3774)."""
+    run it (`_truth_program`: a Truth, or a truth compiled already, a jit or Dew's own programs), evaluates
+    the first draw's truth, so its first call's run and compiles serve the draws too, once a process (a
+    map task's draws, DRAWS): a truth compiled apart here compiled the float64 truth twice a site
+    (pass_weights' 10 s). None, a reference standing for it, runs compiled, not eagerly (ledger 3774)."""
     if truth is None or isinstance(truth, _Windowed) or _given(truth) or getattr(truth, "recorded", False):
         return None
     # The truth on the site's first draw, and its terms only where it holds a zero row: only a zero row whose
@@ -1620,8 +1621,7 @@ def _site_terms(terms_fn, terms, draw, truth, truth_program):
     found (`map_judge.judging`): no truth runs there. A program traced for its terms is traced once a
     signature, its static runs compiled once for the site's every draw (`float64_terms`)."""
     if terms is not False and not judging() and terms_fn is None:
-        program = truth_program if isinstance(truth_program, Truth) else None
-        terms_fn = _cancelling_terms(draw, truth, program)
+        terms_fn = _cancelling_terms(draw, truth, truth_program)
     return terms_fn if terms_fn is None or isinstance(terms_fn, _SiteTerms) else functools.partial(
         float64_terms, terms_fn)
 

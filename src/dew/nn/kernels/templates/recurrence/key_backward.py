@@ -368,8 +368,9 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
     """`(dq, dk, dg [R, HV * Dk], dbeta [HV, R])` fp32: each chunk and value head's gradients through its
     pairs, the scores' `scale (q . k) exp2(g_q - g_k)` and the keys' system's `beta (k . k) exp2(..)`
     (`algebra.key_decayed_pairs_back` a key block a step, the write gates' terms carried; fla_kda's intra),
-    given their gradients `d_scores` (`_key_scores_back`'s) and `d_system` (`_key_memory_back`'s), staged
-    once a step in `_parted`'s form. The queries' and keys' each value head's, which `gradients` sums."""
+    given their gradients `d_scores` (`_key_scores_back`'s) and `d_system` (`_key_memory_back`'s), read and
+    staged once a program in `_parted`'s form (`pairs_gradients`). The queries' and keys' each value head's,
+    which `gradients` sums."""
     chunk = call.chunk
     width, family = call.width, call.family
     given, gates, square = call.given, call.gates, fp32_operand(call)

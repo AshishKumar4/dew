@@ -1160,11 +1160,13 @@ class Trainer(Generic[Loss, Effects]):
                 if plan.restore_best and run.preempted is None:
                     trained = self._best_model(trained, run)
             finally:
+                primary = sys.exception()
+                error = self._closed(run, primary, profiler)
+                # After the run's log, tracker and outcome closed: a plan still running off the loop is
+                # waited for, which a run that failed or stopped need not wait on to close.
                 if self._later is not None:
                     self._later.stopped()
                     self._later = None
-                primary = sys.exception()
-                error = self._closed(run, primary, profiler)
                 if primary is None and error is not None:
                     raise error
         if run.preempted is not None:

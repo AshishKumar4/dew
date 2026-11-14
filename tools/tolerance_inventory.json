@@ -309,10 +309,6 @@
    "comparisons": 18,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_linear_attention.py": {
-   "comparisons": 2,
-   "lane": "Kernels"
-  },
   "tests/test_llama4.py": {
    "comparisons": 6,
    "lane": "Models, Serving & RL"
@@ -394,7 +390,7 @@
    "lane": "Training"
   },
   "tests/test_multimodal_model.py": {
-   "comparisons": 17,
+   "comparisons": 13,
    "lane": "Kernels"
   },
   "tests/test_multiprocess.py": {
