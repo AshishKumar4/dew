@@ -1860,7 +1860,15 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
 def recording(path) -> dict[str, np.ndarray]:
     """A recording of a reference over seeds (`indexed_recording`'s `stored`), read whole: where a pin
     holds it, from the fetched store's local copy, checked against the pin; else from the file at
-    `path`, as git holds one of at most 1 MiB (tools/fetched_fixtures.py)."""
+    `path`, as git holds one of at most 1 MiB (tools/fetched_fixtures.py). Read, decompressed and
+    checked once a process (`_read_recording`), each call its own copy of the arrays: a site reads its
+    recording at each of its calls (`declared_seeds`, `indexed_recording`), the fla template's 41 MB 24
+    times in one map task (16.4 s)."""
+    return {name: value.copy() for name, value in _read_recording(str(path)).items()}
+
+
+@functools.cache
+def _read_recording(path: str) -> dict[str, np.ndarray]:
     from tool_support import load
 
     with np.load(load("fetched_fixtures").local(path), allow_pickle=False) as stored:
