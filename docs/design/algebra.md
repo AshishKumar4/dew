@@ -229,7 +229,8 @@ Each form is priced in time from the device facts Dew already owns, never from f
 
 A region's seconds are computed once, from its composed terms over the chosen DAG (§6.5): bytes over bandwidth,
 FLOPs over the dtype's rate, each kernel XLA's fusion makes of it (a reduction's
-and a product's, each a fusion's root, as `cost.fused` restates XLA's fusion today: §6.5, row 5897) at the part's measured fixed latency (its launch and first byte; a part no measurement holds pays none, and
+and a product's, each a fusion's root, as `cost.fused` restates XLA's fusion, which XLA states nothing of before a
+compile: §6.5, whose table measures where the restatement over-counts) at the part's measured fixed latency (its launch and first byte; a part no measurement holds pays none, and
 its kernels are counted as work no rate prices, §6.5), so a
 chain of dependent reductions pays a kernel's latency a link, and the span of a loop XLA lowers at its
 iteration's latency (§6.5), combined as `templates.cost` combines a launch's. Row
@@ -729,13 +730,33 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   takes fewer seconds and no more of that work (`cost.cheaper`), so it is cheaper whatever the rate. A process
   of no accelerator prices as the interpreted templates' H100 (or the device an interpreted check assumes), a GPU no row names by its family's and its
   runtime's facts (`cost.target`):
-  - XLA's fusion (`cost.fused`; a fact XLA holds is read from XLA, §4: today `fused` restates XLA's fusion
-    rather than reading it, row 5897), for the compile-time pass over a program, error-aware extraction and the
+  - XLA's fusion (`cost.fused`), for the compile-time pass over a program, error-aware extraction and the
     derived scan's carry split (`carry.split`, whose carry runs as a loop XLA lowers, a chunk an iteration, its
     span priced at that loop's step; today the split's work states no span, so only its work is priced: the
     loop's step latency is in no rate `Fused` reads, an open gap). A program's operands are read from device memory once, however many
     reductions read them (XLA's fusion reads a sibling reduction's inputs once), and elementwise work fuses
     into its consumer. Each unit's work runs at the whole device's rate, in series with the memory traffic.
+    Each reduction and each product is a kernel of its own, a fusion's root.
+  - `fused` restates XLA's fusion, since XLA states nothing of it before a compile (§4's rule, that a fact XLA
+    holds is read from XLA, has no reading to take here; row 5897, measured on compile-only GPUs, jax
+    0.11.2.post3). Its HloCostAnalysis of an unoptimized module is refused on a compile-only client ("implemented
+    for a PjRt-compatible backend only"). `Lowered.cost_analysis()` and a compile-only
+    `Compiled.cost_analysis()` are None. A program's fusion is read only from its optimized module, after a
+    compile of 111 to 401 ms for a small program: a compile a candidate. The restatement over-counts a chain of
+    reductions over one row's values, which XLA makes one kernel, and once it under-counts. The table measures
+    rows 1 to 5 on sm80, sm90 and sm100 at 4096 rows of 128, 1024 and 16384 float32 columns, and rows 6 to 8 on
+    sm90 at 1024 and 16384. A price that counts such a chain once needs the chosen DAG's reductions, which no
+    node's own price holds: fusion-aware extraction, row 6009 (Main, 2026-11-14).
+
+    | program | its reductions and products: `fused`'s kernels | XLA's kernels |
+    |---|---|---|
+    | a row's sum; its exp-sum; a sum, then the row scaled by it | 1 | 1 (kInput; kInput; kCustom) |
+    | two sums of one row | 2 | 1 (kInput) |
+    | softmax; a two-pass logsumexp | 2 | 1 (kCustom) |
+    | rms norm; layer norm | 1; 2 | 1 (kCustom) |
+    | a row's sum, then a column sum of it; a row's sum and x's column sum; a row's max, then a column sum of x less it | 2 | 2 |
+    | a row's sum, a product by it, a row sum of that | 3 | 3 |
+    | the row means of x and of x·x, both outputs | 2 | 3 (kInput, kLoop, kLoop) |
   - The template's tile walk (`cost.walk`, `templates.cost.walked`), for a form a template's algebra interface
     takes (`derive`). A tile's work runs on its program with its units overlapped, the longest
     unit's time. Its operands are staged by the walk, so its device bytes are the launch's.
