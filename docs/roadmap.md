@@ -41,7 +41,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [1506, 1437]
 - Stacks, scans and looped models. [1568]
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
-- Every nn and interop primitive, seam, contract and derivative has one owner. [3270, 5450, 5625]
+- Every nn and interop primitive, seam, contract and derivative has one owner. [5450, 5625]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
 
 ## Training and parallelism
@@ -64,14 +64,13 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Algebra
 
-- One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 1551, 705, 5234, 5235, 5239, 5381]
+- One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 1551, 705, 5234, 5235, 5239]
 - Qwix's quantized convolution from its fork alone. [783]
 - Released checkpoints judged on GPUs. [1703, 1549]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Bit-level synthesis in dew.algebra. [3733]
 - RL batch-fill and microbatch-split invariants, rollout start/evaluation compilation and RL suite cost cuts. [5681]
-- algebra.md and the engine agree. [5780]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 

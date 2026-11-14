@@ -100,13 +100,13 @@ def test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_
     assert_as_exact(leaves(headed), leaves(plain), draw, f"{objective.__name__} head",
                     seeds=HEAD_SEEDS[objective], truth_fn=truth)
     variables, reference, batch = draw(0)
-    assert trained(plain)(variables, reference, batch)[1] is None
-    _, qk = trained(headed, qk_stats=True)(variables, reference, batch)
+    assert jax.jit(trained(plain))(variables, reference, batch)[1] is None
+    _, qk = jax.jit(trained(headed, qk_stats=True))(variables, reference, batch)
     held, rows = scored_batch(objective)
     laid = ({} if objective is not DPOObjective
             else {"coordinates": window_coordinates(held, plain.finals, plain.pairs)})
-    own, frozen = (plain.token_scores(tree, rows, qk_stats=True, **laid).qk
-                   for tree in (variables, reference))
+    scores = jax.jit(lambda tree: plain.token_scores(tree, rows, qk_stats=True, **laid).qk)
+    own, frozen = (scores(tree) for tree in (variables, reference))
     jax.tree.map(np.testing.assert_array_equal, qk, own)
     assert not all(np.array_equal(found, other) for found, other in zip(
         jax.tree.leaves(qk), jax.tree.leaves(frozen), strict=True))

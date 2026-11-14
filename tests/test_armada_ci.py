@@ -189,6 +189,26 @@ def test_a_task_states_the_same_key_in_every_plan_that_cuts_it_whatever_its_name
     assert set(cold) == set(before) and all(cold[rows][0] != before[rows][0] for rows in before)
 
 
+def test_the_tested_pythons_are_named_once_and_a_collection_gate_for_another_set_is_refused(
+        ci, tmp_path, monkeypatch):
+    """`pythons --check` holds every file that names the tested Pythons to PYTHONS, the collection gates of
+    tools/check_gates among them: a gate for a Python no environment is built for fails every pull request,
+    and one missing collects nowhere (train 805's review, F1)."""
+    (tmp_path / "tools").mkdir()
+    (tmp_path / ".python-version").write_text(f"{ci.PYTHONS[0]}\n")
+    (tmp_path / ".armada.json").write_text(json.dumps({"environment": {"smoke": " && ".join(
+        f".venv-{version}/bin/python -c 'import dew'" for version in ci.PYTHONS)}}))
+    monkeypatch.setattr(ci, "REPO", tmp_path)
+
+    def gates(*versions: str) -> int:
+        (tmp_path / "tools/check_gates").write_text("".join(
+            f"collect-{version}\t.venv-{version}/bin/python -m pytest --co tests\n" for version in versions))
+        return ci.pythons(check=True)
+
+    assert gates(*ci.PYTHONS) == 0
+    assert gates(ci.PYTHONS[0]) == 1 and gates(*ci.PYTHONS, "3.15") == 1
+
+
 def test_the_newest_pythons_collection_is_planned_within_the_target_at_the_slowest_rate_it_ran_at(
         ci, tmp_path, monkeypatch):
     """Each collect task holds at most the target's seconds of files at the slowest per-file rate armada
@@ -401,10 +421,12 @@ def test_a_file_pytest_reports_nothing_of_is_red_unless_its_collection_shows_eve
 
 
 def install_compiler(directory: Path) -> None:
-    """A kernel's compiler under `directory`, named as the CUDA toolkit installs it (ptxas)."""
+    """A kernel's compiler and disassembler under `directory`, named as the CUDA toolkit installs them (ptxas,
+    nvdisasm), and imageio-ffmpeg's bundled ffmpeg."""
     directory.mkdir()
-    (directory / "ptxas").write_text("#!/bin/sh\necho 'ptxas: NVIDIA (R) Ptx assembler'\n")
-    (directory / "ptxas").chmod(0o755)
+    for name in ("ptxas", "nvdisasm", "ffmpeg-linux-x86_64-v7.0.2"):
+        (directory / name).write_text(f"#!/bin/sh\necho '{name}'\n")
+        (directory / name).chmod(0o755)
 
 
 def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_for_a_gpu(
@@ -420,8 +442,9 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     (test_a_python_child_joins_its_files_record), a shell's or any
     multiprocessing context's, has no key, so it is in, and no task reuses
     its row, whatever names its program (a descriptor, for `os.execve`); one
-    that asked a native tool about the host or compiled a kernel with ptxas
-    (`followed.TOOLS`) keeps its key. The command line
+    that asked a native tool about the host, compiled a kernel with ptxas and
+    read it back with nvdisasm, or ran imageio-ffmpeg's ffmpeg (`followed.TOOLS`)
+    keeps its key. The command line
     spreads the tier over its shards, each file once, and per batch names
     the files the checkout marks for a GPU."""
     url, stored, _ = cache_worker
@@ -453,6 +476,9 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
                         "def test_tool():\n"
                         "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n"
                         "    subprocess.run(['tests/compiler/ptxas', '--version'], check=True)\n"
+                        "    subprocess.run(['tests/compiler/nvdisasm', '-c', 'k.cubin'], check=True)\n"
+                        "    subprocess.run(['tests/compiler/ffmpeg-linux-x86_64-v7.0.2', '-i', 'a.wav'],\n"
+                        "                   check=True)\n"
                         "    assert platform.platform()\n",
         "test_shell.py": "import os, subprocess, sys\n"
                          "def test_shell(): subprocess.run('git --version', shell=True, check=True)\n"

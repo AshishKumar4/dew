@@ -73,8 +73,10 @@ def forward(model, variables, ids):
     return jax.jit(lambda held, tokens: model.apply(held, tokens))(variables, ids)
 
 
-def loss_and_gradient(model, variables, ids):
-    """The next-token loss LMObjective reports and its gradient in the parameters."""
+def next_token_loss(model, variables, ids):
+    """The next-token loss LMObjective reports over `ids`, a function of the parameters: the one loss every
+    V4.1 step takes (`loss_and_gradient`, tests/deepseek_v41_support.py `training_step`,
+    tests/test_deepseek_v41.py's quantization-aware step)."""
     objective = LMObjective(model, ids.shape[1] - 1, variables=variables, ema_decay=None)
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
@@ -82,7 +84,12 @@ def loss_and_gradient(model, variables, ids):
         statistics, _ = objective.loss({**variables, "params": params}, {"text": ModelInputs(ids)}, step)
         return objective.reduce_loss(statistics)[0]
 
-    return jax.jit(jax.value_and_grad(loss))(variables["params"])
+    return loss
+
+
+def loss_and_gradient(model, variables, ids):
+    """The next-token loss LMObjective reports and its gradient in the parameters."""
+    return jax.jit(jax.value_and_grad(next_token_loss(model, variables, ids)))(variables["params"])
 
 
 def stepped(variables, gradient, rate):

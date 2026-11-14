@@ -21,7 +21,6 @@ from reference_error import (
     REDRAW,
     GateFailure,
     Inconclusive,
-    UnrecordedTruth,
     as_given,
     assert_as_exact,
     assert_moves,
@@ -267,6 +266,24 @@ def test_check_1_sizes_a_cancelling_row_by_its_terms_and_admits_nothing_else():
     with pytest.raises(ValueError):
         assert_as_exact(cancelling(split=True), reference, cancelling_draw, "untraceable", seeds=16,
                         terms=True, truth_fn=as_given(lambda x, w: {"rows": np.zeros((64, 4))}))
+
+
+@pytest.mark.parametrize("cancels", [False, True])
+def test_a_sites_terms_decide_by_its_zero_leaves_beside_others(cancels):
+    """A truth whose zero rows sit in one leaf beside a leaf of none (`_cancelling_terms`, which traces the
+    terms of the leaves holding zero rows alone): a zero row that cancels sizes the site by its terms, and
+    an empty sum leaves it the reference's residue rule, whatever the other leaves hold."""
+    from reference_error import _cancelling_terms
+
+    def truth(x):
+        total = jnp.sum(x, axis=-1, keepdims=True)
+        zero = total - total if cancels else jnp.sum(jnp.zeros_like(x), axis=-1, keepdims=True)
+        return {"nonzero": total + 100, "zero": jnp.concatenate([zero, total + 100])}
+
+    def draw(seed):
+        return (jnp.arange(32, dtype=jnp.float32).reshape(4, 8),)
+
+    assert (_cancelling_terms(draw, truth) is truth) == cancels
 
 
 def found(failure: GateFailure) -> list[tuple[str, str, float]]:
@@ -1408,28 +1425,6 @@ def test_a_recording_judged_is_held_to_dews_own_run_of_the_same_weights(tmp_path
             "site.reference.y"] * np.float32(1 + 1e-4)}, judged=True)
 
 
-def test_a_recording_asked_ahead_is_the_recording_asked_in_turn():
-    """A reference asked several seeds at a time on threads of their own (`record_case`'s `ahead`, an
-    `evaluate` that holds its own arithmetic) records what it records asked one seed at a time: the same
-    declared count, evidence and sketches, its sizing's pilots included."""
-    from tool_support import load
-
-    recorder = load("recorded_references")
-    _, live = _tiny_row(4)
-    draw, evaluate = _tiny_row_recording(live)
-
-    def own(inputs):
-        with jax.enable_x64(new_val=True):
-            return evaluate(inputs)
-
-    with jax.enable_x64(new_val=True):
-        in_turn = recorder.record_case("site", draw, own, summary=True)
-        ahead = recorder.record_case("site", draw, own, summary=True, ahead=4)
-    assert ahead.keys() == in_turn.keys()
-    for key, value in in_turn.items():
-        np.testing.assert_array_equal(ahead[key], value, err_msg=key)
-
-
 def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
     """A summarized recording made in shards of seeds (`record_shard`), each drawn as one run draws it,
     and joined (`merge_shards`) is the recording `record_case`'s summary makes of the same reference:
@@ -1755,30 +1750,6 @@ def _squared_case(first: int):
         return {"y": x * x - np.float32(1)}, {"y": x.astype(np.float64) ** 2 - 1}
 
     return draw, evaluate
-
-
-def test_a_truths_recording_holds_a_float64_path_to_the_references_function_below_float32_noise():
-    """A truths recording (`record_truths`) keeps the reference's float64 truth alone at a few draws: the
-    reference's function computed in float64 is held to it at every draw (`assert_truths_as_recorded`), and
-    another function is refused, one a part in 2**40 off, far below any float32 run's rounding, among
-    them."""
-    from recorded_truths import assert_truths_as_recorded
-    from tool_support import load
-
-    recorder = load("recorded_references")
-    draw, evaluate = _squared_case(700)
-    recorded = recorder.record_truths("site", draw, evaluate, 4)
-
-    def squared(inputs):
-        return {"y": jnp.asarray(inputs["x"], jnp.float64) ** 2 - 1}
-
-    def off(inputs):
-        return {"y": (jnp.asarray(inputs["x"], jnp.float64) ** 2 - 1) * (1 + 2.0 ** -40)}
-
-    with jax.enable_x64(new_val=True):
-        assert_truths_as_recorded(recorded, "site", squared)
-        with pytest.raises(UnrecordedTruth):
-            assert_truths_as_recorded(recorded, "site", off)
 
 
 def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path):

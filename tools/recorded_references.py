@@ -16,7 +16,6 @@ summary writes. A reference whose recorder keeps each row's distance from its tr
 too large to keep over the seeds, is summarized from those by `record_distances`.
 """
 
-import concurrent.futures
 import dataclasses
 import sys
 import urllib.parse
@@ -145,18 +144,14 @@ class _Records:
     it is drawn and never again (`_drawn` reads each draw through before the next), so only the one being read
     is held. With `reduced`, a verdict seed is held the same way, and of each the row `reduced(seed, record)`
     alone is kept (`rows`): a summarized recording's evidence, where its outputs over (1 + REDRAW) times the
-    seeds are gigabytes. With `ahead` above one, `evaluate` is asked that many seeds at a time on threads of
-    its own, which the caller says it may run on: a caller's context (x64, a matmul precision) is its
-    thread's. With `followed`, an evaluation's third value is the reference's decisions, which its truth
-    followed, each verdict seed's kept (`decisions`) whatever else is dropped."""
+    seeds are gigabytes. With `followed`, an evaluation's third value is the reference's decisions, which its
+    truth followed, each verdict seed's kept (`decisions`) whatever else is dropped."""
 
-    def __init__(self, draw, evaluate, ahead: int, reduced=None, kept: _Kept | None = None,
-                 followed: bool = False):
-        self.draw, self.evaluate, self.ahead, self.reduced = draw, evaluate, ahead, reduced
+    def __init__(self, draw, evaluate, reduced=None, kept: _Kept | None = None, followed: bool = False):
+        self.draw, self.evaluate, self.reduced = draw, evaluate, reduced
         self.kept = _Kept(None, None, "") if kept is None else kept
-        self.records, self.reading, self.rows, self.replayed, self.pending = {}, {}, {}, set(), {}
+        self.records, self.reading, self.rows, self.replayed = {}, {}, {}, set()
         self.followed, self.decisions = followed, {}
-        self.asking = concurrent.futures.ThreadPoolExecutor(ahead) if ahead > 1 else None
 
     def evaluated(self, seed: int):
         inputs = self.draw(seed)
@@ -168,13 +163,7 @@ class _Records:
         held = self.records if verdict and self.reduced is None else self.reading
         if seed not in held:
             self.reading.clear()
-            if self.asking is None:
-                inputs, (reference, truth, *made) = self.evaluated(seed)
-            else:
-                for further in range(seed, seed + self.ahead):
-                    if further not in self.pending and further not in held:
-                        self.pending[further] = self.asking.submit(self.evaluated, further)
-                inputs, (reference, truth, *made) = self.pending.pop(seed).result()
+            inputs, (reference, truth, *made) = self.evaluated(seed)
             if self.followed:
                 (decisions,), made = made[:1], made[1:]
                 if verdict:
@@ -193,18 +182,10 @@ class _Records:
             if seed not in self.rows:
                 self.record(seed)
 
-    def __enter__(self) -> "_Records":
-        return self
-
-    def __exit__(self, *_) -> None:
-        """Every draw asked ahead and not yet begun dropped, every one begun finished."""
-        if self.asking is not None:
-            self.asking.shutdown(cancel_futures=True)
-
 
 def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
                 summary: bool = False, dew=None, start: int = FEWEST_SEEDS,
-                examples: bool = False, scale=None, ahead: int = 1, judged: bool = False,
+                examples: bool = False, scale=None, judged: bool = False,
                 kept_in: Path | None = None, resumed_from: Path | None = None,
                 followed: bool = False) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
@@ -243,14 +224,11 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
     (`<label>.heavy.<leaf>`) and the reference's weighed evidence a draw, a recording of its own under
     `<label>.weighed` whose leaves are the classes' (`dew.parity.Conditioning.recorded_evidence`). Its
     unweighted sizing that never resolves declares the cap, MOST_SEEDS (docs/design/testing.md).
-    With `ahead`, an `evaluate` that may run on several threads at once
-    is asked that many seeds at a time, the next ones a draw's read reaches beside its own: every reading here
-    walks its seeds in order. With `kept_in`, a directory, each seed's evaluation and scale is saved there as
+    With `kept_in`, a directory, each seed's evaluation and scale is saved there as
     it is made, and with `resumed_from`, an interrupted run's `kept_in`, found there in place of being made
     again (`_Kept`): the recording a run resumed makes is the one an uninterrupted run makes. With `followed`,
     a quantized computation's summary keeps the reference's decisions too (`_decided`)."""
     _followed_case(label, followed, dew, scale, summary)
-    # The evaluations asked ahead are cancelled or finished on every exit, before the caller's workers close.
     # A summary that weighs nothing keeps each draw's evidence as it is drawn and drops its outputs; a weighed
     # one reads each of its check's draws whole, twice (its sizing, then its heavy elements over them all).
     streamed = summary and scale is None
@@ -259,53 +237,53 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
         return _row(seed, _summarized(record, examples))
 
     keeping = _Kept(kept_in, resumed_from, label)
-    with _Records(draw, evaluate, ahead, row if streamed else None, keeping, followed) as held:
-        record, ensure = held.record, held.ensure
-        records, replayed = held.records, held.replayed
+    held = _Records(draw, evaluate, row if streamed else None, keeping, followed)
+    record, ensure = held.record, held.ensure
+    records, replayed = held.records, held.replayed
 
-        def recorded_draw(seed):
-            return np.int32(seed), record(int(seed))[0]
+    def recorded_draw(seed):
+        return np.int32(seed), record(int(seed))[0]
 
-        recorded, live = _arms_of(label, record, dew, judged=judged, weighed=scale is not None)
-        reference, arm = (live, recorded) if judged else (recorded, live)
-        try:
-            confirmed = seeds_for(reference, recorded_draw, label, start=start,
-                                  truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
-                                  dew_fn=arm, examples=examples)
-        except Inconclusive:
-            # A weighed site whose unweighted sizing never resolves declares the cap (docs/design/testing.md).
-            if scale is None:
-                raise
-            confirmed = MOST_SEEDS
-        # The recording is the confirmed count's draws and their redraw, no more.
-        kept = staged_units(confirmed)
-        weighed, scales = 0, {}
+    recorded, live = _arms_of(label, record, dew, judged=judged, weighed=scale is not None)
+    reference, arm = (live, recorded) if judged else (recorded, live)
+    try:
+        confirmed = seeds_for(reference, recorded_draw, label, start=start,
+                              truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
+                              dew_fn=arm, examples=examples)
+    except Inconclusive:
+        # A weighed site whose unweighted sizing never resolves declares the cap (docs/design/testing.md).
+        if scale is None:
+            raise
+        confirmed = MOST_SEEDS
+    # The recording is the confirmed count's draws and their redraw, no more.
+    kept = staged_units(confirmed)
+    weighed, scales = 0, {}
 
-        def scaled(seed: int):
-            if seed not in scales:
-                inputs = record(seed)[0]
-                (made,) = held.kept.made("scale", seed, inputs, lambda: (scale(inputs, seed),))
-                # As the recording holds it, float32, for the sizing, the reference's weighed evidence and
-                # the test's weighing of Dew's arm alike: one denominator for both arms.
-                scales[seed] = {name: np.asarray(value, np.float32) for name, value in made.items()}
-            return scales[seed]
+    def scaled(seed: int):
+        if seed not in scales:
+            inputs = record(seed)[0]
+            (made,) = held.kept.made("scale", seed, inputs, lambda: (scale(inputs, seed),))
+            # As the recording holds it, float32, for the sizing, the reference's weighed evidence and
+            # the test's weighing of Dew's arm alike: one denominator for both arms.
+            scales[seed] = {name: np.asarray(value, np.float32) for name, value in made.items()}
+        return scales[seed]
 
-        if scale is not None:
-            weighed = seeds_for(recorded, recorded_draw, label, start=start,
-                                truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
-                                dew_fn=live, conditioning=True,
-                                conditioning_scale=lambda inputs, seed: scaled(int(inputs[0])))
-            # The weighed check draws its own stages' seeds from the first, as the unweighted check does.
-            kept = max(kept, staged_units(weighed))
-        ensure(kept)
-        kept_records = [] if streamed else [records[seed] for seed in range(kept)]
-        decided = _decided(label, held.decisions, kept) if followed else {}
-        # The weighed check's own entries, the same whether the outputs are kept or summarized.
-        weighing = {} if scale is None else {
-            f"{label}.conditioning": np.int32(weighed),
-            **{f"{label}.scale.{name}": np.stack([scaled(seed)[name]
-                                                 for seed in range(staged_units(weighed))])
-               for name in scaled(0)}}
+    if scale is not None:
+        weighed = seeds_for(recorded, recorded_draw, label, start=start,
+                            truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
+                            dew_fn=live, conditioning=True,
+                            conditioning_scale=lambda inputs, seed: scaled(int(inputs[0])))
+        # The weighed check draws its own stages' seeds from the first, as the unweighted check does.
+        kept = max(kept, staged_units(weighed))
+    ensure(kept)
+    kept_records = [] if streamed else [records[seed] for seed in range(kept)]
+    decided = _decided(label, held.decisions, kept) if followed else {}
+    # The weighed check's own entries, the same whether the outputs are kept or summarized.
+    weighing = {} if scale is None else {
+        f"{label}.conditioning": np.int32(weighed),
+        **{f"{label}.scale.{name}": np.stack([scaled(seed)[name]
+                                             for seed in range(staged_units(weighed))])
+           for name in scaled(0)}}
     if summary:
         # A weighed check that draws past the unweighted one's stages reads the reference and its truth's
         # sketch at every draw of its own, so the evidence covers the further of the two.

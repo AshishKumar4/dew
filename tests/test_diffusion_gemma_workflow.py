@@ -206,8 +206,11 @@ def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
     assert again.model.canvas_length == exported.model.canvas_length
 
     def logits(bundle):
-        cache = prefill(bundle.model, bundle.variables, reference["prompt"])
-        return np.asarray(bundle.model.apply({**bundle.variables, "cache": cache}, reference["canvas"]))
+        # Compiled, as a run's reads are: the same program over each bundle's values.
+        def read(variables, prompt, canvas):
+            cache = prefill(bundle.model, variables, prompt)
+            return bundle.model.apply({**variables, "cache": cache}, canvas)
+        return np.asarray(jax.jit(read)(bundle.variables, reference["prompt"], reference["canvas"]))
 
     np.testing.assert_array_equal(logits(again), logits(exported))
     # Loaded stating no dtype, it computes in the run's own, its decoder's (row 4314).

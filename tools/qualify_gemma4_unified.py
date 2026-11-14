@@ -152,7 +152,11 @@ def record_site(site, output, device, *, shards=()):
                     exact = truth(*widened(arguments))
                 return observed, exact
 
-            stored = record_case(site, drawn, evaluate, store_inputs=False)
+            # Its evidence alone (`summary`): the test holds Dew's own float64 run to the recorded truth's
+            # sketch at each draw (test_gemma4_unified.py's `rows_forward`, `cached_run`), where the whole
+            # outputs took 94 MB of the fetched store over seven sites. The bfloat16 source's outputs stay
+            # whole: Dew's float64 forward of its bfloat16 load is not the reference's float64 run.
+            stored = record_case(site, drawn, evaluate, store_inputs=False, summary=site != "bfloat16")
         if not (site == "backward" and shards):
             made = environment(device)
         stored["precision"] = "ieee"
