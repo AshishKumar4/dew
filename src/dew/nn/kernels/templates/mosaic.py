@@ -173,6 +173,15 @@ def stacked_views(refs, groups: tuple[tuple[int, ...], ...]) -> list:
     return views
 
 
+def added_copies(ref) -> jax.Array:
+    """A ref every role adds into (`Family.added`) after the launch, from its leading axis of copies: one on a
+    device, every role's adds atomic into it, read as it is; each role's own interpreted, summed. A sum over
+    one copy is a second buffer of the ref's size, which XLA writes beside it (a Qwen3.5-4B training step's
+    fp32 dQ on an H100, 805 MB more at its peak)."""
+    added = jax.freeze(ref)
+    return added[0] if added.shape[0] == 1 else added.sum(axis=0)
+
+
 def stacked_read(refs, groups: tuple[tuple[int, ...], ...]) -> list[jax.Array]:
     """Each stacked ref's member (`stacked_zeros`) after the launch, an array, in its shapes' order."""
     found: list = [None] * sum(map(len, groups))

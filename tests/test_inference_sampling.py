@@ -367,25 +367,27 @@ def test_prompts_inside_one_bucket_trace_once_and_draw_what_their_own_width_draw
     """
     exact = {width: generate(roomy.model, roomy.variables, ramp(width), 8, key=0,
                              sampling=roomy.sampling) for width in (100, 120)}
-    with Compiles("_checked") as compiled:
-        for width, reference in exact.items():
-            drawn = roomy(ramp(width), 8, key=0)
-            assert drawn.tokens.shape == (1, width + 8)
-            np.testing.assert_array_equal(drawn.tokens, reference.tokens)
-            tokens = np.asarray(reference.tokens)
-            logits = roomy.model.apply(roomy.variables, jnp.asarray(tokens))
-            bound = 16 * np.finfo(np.float32).eps * float(jnp.max(jnp.abs(logits)))
-            for field in ("raw_log_probs", "behavior_log_probs"):
-                np.testing.assert_allclose(getattr(drawn, field), getattr(reference, field),
-                                           rtol=0, atol=bound, err_msg=field)
-            attended = jnp.concatenate([jnp.zeros((1, 128 - width), jnp.int32), jnp.asarray(tokens)], axis=1)
-            unmasked = roomy.model.apply(roomy.variables, attended)[:, 128 - width:]
-            drawn_ids = jnp.asarray(tokens[:, width:, None])
-            moved = jnp.max(jnp.abs(
-                jnp.take_along_axis(jax.nn.log_softmax(logits[:, width - 1:-1]), drawn_ids, axis=-1)
-                - jnp.take_along_axis(jax.nn.log_softmax(unmasked[:, width - 1:-1]), drawn_ids, axis=-1)))
-            assert float(moved) > 1e3 * bound, (float(moved), bound)
-    assert compiled.count == 1
+    drawn = {100: roomy(ramp(100), 8, key=0)}
+    # The bucket's second prompt runs the executable its first compiled (`dew.inference.tasks._checked`).
+    with Compiles("_checked") as again:
+        drawn[120] = roomy(ramp(120), 8, key=0)
+    assert again.count == 0
+    for width, reference in exact.items():
+        assert drawn[width].tokens.shape == (1, width + 8)
+        np.testing.assert_array_equal(drawn[width].tokens, reference.tokens)
+        tokens = np.asarray(reference.tokens)
+        logits = roomy.model.apply(roomy.variables, jnp.asarray(tokens))
+        bound = 16 * np.finfo(np.float32).eps * float(jnp.max(jnp.abs(logits)))
+        for field in ("raw_log_probs", "behavior_log_probs"):
+            np.testing.assert_allclose(getattr(drawn[width], field), getattr(reference, field),
+                                       rtol=0, atol=bound, err_msg=field)
+        attended = jnp.concatenate([jnp.zeros((1, 128 - width), jnp.int32), jnp.asarray(tokens)], axis=1)
+        unmasked = roomy.model.apply(roomy.variables, attended)[:, 128 - width:]
+        drawn_ids = jnp.asarray(tokens[:, width:, None])
+        moved = jnp.max(jnp.abs(
+            jnp.take_along_axis(jax.nn.log_softmax(logits[:, width - 1:-1]), drawn_ids, axis=-1)
+            - jnp.take_along_axis(jax.nn.log_softmax(unmasked[:, width - 1:-1]), drawn_ids, axis=-1)))
+        assert float(moved) > 1e3 * bound, (float(moved), bound)
 
 
 def processor_rows(width):
@@ -403,22 +405,22 @@ def test_a_processor_prompt_is_bucketed_like_bare_ids(roomy):
     ids of its width draw at the exact width: the same tokens, and the same
     likelihoods to the bound the bare-id test above justifies.
     """
-    # The references draw bare ids at their exact widths, an executable each, and
-    # whether an earlier test in this process already compiled them is no concern
-    # of this test's: the count starts after them.
+    # The references draw bare ids at their exact widths, an executable each; the count is the bucket's
+    # second prompt's alone.
     references = {width: generate(roomy.model, roomy.variables, ramp(width), 8, key=0,
                                   sampling=roomy.sampling) for width in (100, 120)}
-    with Compiles("_checked") as compiled:
-        for width, reference in references.items():
-            drawn = roomy(processor_rows(width), 8, key=0)
-            assert drawn.tokens.shape == (1, width + 8)
-            np.testing.assert_array_equal(drawn.tokens, reference.tokens)
-            logits = roomy.model.apply(roomy.variables, jnp.asarray(reference.tokens))
-            bound = 16 * np.finfo(np.float32).eps * float(jnp.max(jnp.abs(logits)))
-            for field in ("raw_log_probs", "behavior_log_probs"):
-                np.testing.assert_allclose(getattr(drawn, field), getattr(reference, field),
-                                           rtol=0, atol=bound, err_msg=field)
-    assert compiled.count == 1
+    drawn = {100: roomy(processor_rows(100), 8, key=0)}
+    with Compiles("_checked") as again:
+        drawn[120] = roomy(processor_rows(120), 8, key=0)
+    assert again.count == 0
+    for width, reference in references.items():
+        assert drawn[width].tokens.shape == (1, width + 8)
+        np.testing.assert_array_equal(drawn[width].tokens, reference.tokens)
+        logits = roomy.model.apply(roomy.variables, jnp.asarray(reference.tokens))
+        bound = 16 * np.finfo(np.float32).eps * float(jnp.max(jnp.abs(logits)))
+        for field in ("raw_log_probs", "behavior_log_probs"):
+            np.testing.assert_allclose(getattr(drawn[width], field), getattr(reference, field),
+                                       rtol=0, atol=bound, err_msg=field)
 
 
 def test_a_budget_inside_a_bucket_returns_the_budget_and_what_the_budget_draws(roomy):
@@ -431,14 +433,13 @@ def test_a_budget_inside_a_bucket_returns_the_budget_and_what_the_budget_draws(r
     assert (shaped.tokens.shape[1], trips, capacity) == (64, 128, 256)
     exact = generate(tasks.cache_sized(roomy.model, capacity), roomy.variables, shaped, budget,
                      key=3, sampling=roomy.sampling)
-    with Compiles("_checked") as compiled:
-        drawn = roomy(prompt, budget, key=3)
+    drawn = roomy(prompt, budget, key=3)
     assert drawn.tokens.shape == (1, 40 + budget) and drawn.behavior_log_probs.shape == (1, budget)
     np.testing.assert_array_equal(drawn.tokens[:, -budget:], exact.tokens[:, -budget:])
     np.testing.assert_array_equal(drawn.lengths, exact.lengths)
     np.testing.assert_array_equal(drawn.terminated, exact.terminated)
     np.testing.assert_array_equal(drawn.raw_log_probs, exact.raw_log_probs)
-    assert compiled.count == 1
+    # The bucket's whole budget runs the executable the smaller one compiled.
     with Compiles("_checked") as again:
         roomy(prompt, 128, key=3)
     assert again.count == 0

@@ -49,7 +49,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Training and parallelism
 
-- Time to first step: the compile path's re-derivations. [5556, 5558, 5669, 6082]
+- Time to first step: the compile path's re-derivations. [5556, 5558, 6082]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
 - Training & Data's tests on check 1. [708]
@@ -77,6 +77,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Every MAINPERF measurement since 2026-11-09. [6045]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Bit-level synthesis in dew.algebra. [3733]
+- Greedy extraction prices dearer than the exact optimum when a saturation aid is absent. [6254]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 
