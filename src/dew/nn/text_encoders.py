@@ -86,7 +86,7 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
                rotary_pairs: Literal["half", "adjacent"] = "half", rotary_interleaved: bool = False,
                rope_theta: float = 10000.0, packed: bool = False, kv_heads: int | None = None,
                head_dim: int | None = None,
-               norm_type: Literal["rms", "layer", "fast_layer"] = "fast_layer", norm_bias: bool = True,
+               norm_type: Literal["rms", "layer", "fast_layer"] = "layer", norm_bias: bool = True,
                mlp_bias: bool = True, mlp_packed: bool = False, window: int | None = None,
                branch_scale: float | None = None, attention_bias: bool = True, qk_norm: bool = False,
                wide_logits: bool = False, scale_after_cast: bool = False,
@@ -97,9 +97,9 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
     Llama 4's, and every `dew.nn.vision.vit` layout's (`vit_block`): a norm before the attention
     and before the feed-forward, both residual.
 
-    By default CLIP's: layer norms with their bias, taking flax's one-pass variance
-    (`decoder_norm`'s 'fast_layer'), as Dew's towers always ran (torch's exact one reduces twice);
-    attention with a bias on all four maps, `positions` the longest sequence it reads; and two
+    By default CLIP's: layer norms with their bias, taking torch's centered variance
+    (`decoder_norm`'s 'layer'), as every tower's torch reference does; attention with a bias on
+    all four maps, `positions` the longest sequence it reads; and two
     biased maps around `activation` (a feed-forward activation; `tower_activation` reads a
     checkpoint's `hidden_act`). The attention is causal in CLIP's text tower and full elsewhere,
     over `window` places either side where given; the vision towers rotate it by their patch grid
@@ -250,7 +250,7 @@ class CLIPVisionTransformer(nn.Module):
             num_kv_heads=self.num_heads, head_dim=self.hidden_size // self.num_heads,
             intermediate_size=self.intermediate_size, activation=tower_activation(self.activation),
             in_channels=self.num_channels, patch_size=self.patch_size, temporal_patch_size=1,
-            spatial_merge_size=1, norm_type="fast_layer", norm_eps=self.layer_norm_eps, norm_bias=True,
+            spatial_merge_size=1, norm_type="layer", norm_eps=self.layer_norm_eps, norm_bias=True,
             mlp_bias=True, packed=False, patch_bias=False, attention=("full",) * self.num_layers,
             order=("patches",) * self.num_layers, sinks=(False,) * self.num_layers,
             positions=LearnedPositions(self.image_size // self.patch_size, "fixed"),

@@ -73,6 +73,8 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     spilling. Its streams run through `persist`, or a plain walk over a `Feed` (`fed`) every consumer walks
     whole (no `passed`: a consumer's steps are every consumer's); it takes no cluster (a multicast ring's
     loads are each program's producer's)."""
+
+    takes_pingpong = False  # its first consumer issues every ring's loads, its partner's tiles' too
     cluster = 1
     feeds_itself = True
     gathers_rows = True  # the loading consumer, a whole warpgroup, gathers a step's rows (`gathered.Ring`)
@@ -110,7 +112,9 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
+        if ahead:
+            raise NotImplementedError(f"{self.name}'s consumers feed their own rings: none is read ahead")
         if not isinstance(streams, Feed):
             raise NotImplementedError(f"{self.name}'s consumers feed their own rings (`fed`)")
         # The walk reads each step at the ring counter its feed loads it at, both from the feed's `lo`.

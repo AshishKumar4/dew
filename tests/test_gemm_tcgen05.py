@@ -393,3 +393,39 @@ def test_an_exactly_summed_tile_holds_the_registers_its_promotes_hold():
         ba = launch.bind(bf16((512, 128)), bf16((4, 128, 128)), jax.ShapeDtypeStruct((4,), jnp.int32),
                          out_dtype="float32", trans_rhs=False, interpret=False, exact_sums=True)
         assert launch.legal(ba, mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=1, family="tcgen05"), target)
+
+
+PARTIALS = ((1024, 488, 512, False), (1024, 488, 512, True), (1000, 488, 488, True))
+"""Dense products (rows, depth, width, the matrix lying `[width, depth]`) no pair's tile divides: a depth
+past whole steps, and rows and a width past whole tiles, each row whole 16 bytes, so they run partial."""
+
+
+def _paired(transposed: bool):
+    """A dense bf16 product at the pinned pair's tile (`PAIRED`)."""
+    def product(x, w):
+        with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: PAIRED}):
+            return gemm.gemm(x, w, None, transpose_rhs=transposed, out_dtype=jnp.bfloat16)
+    return product
+
+
+def a_pairs_partial_extents_hold_check_1_on_blackwell(rows, depth, width, transposed):
+    """A dense product at the pair's tile on extents no tile divides (`PARTIALS`), run on a B200 or a B300:
+    as exact as the plain product from float64 truth, its loads past the call zero-filled and its stores past
+    it dropped (tests/test_gpu_gemm.py's cells)."""
+    matrix = (width, depth) if transposed else (depth, width)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=matrix) / np.sqrt(depth), jnp.bfloat16))
+
+    def plain(*, truth: bool = False):
+        def run(x, w):
+            wide = jnp.promote_types(x.dtype, jnp.float32)
+            out = jnp.dot(x, w.T if transposed else w, preferred_element_type=wide)
+            return out.astype(jnp.float64 if truth else jnp.bfloat16)
+        return run
+
+    assert_as_exact(jax.jit(_paired(transposed)), jax.jit(plain()), draw,
+                    f"a pair's partial extents {rows}x{depth}x{width}{' transposed' if transposed else ''}",
+                    seeds=SEEDS, truth_fn=plain(truth=True))

@@ -49,10 +49,11 @@ SEGMENT_CASES = [
 
 @functools.cache
 def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: bool,
-           streams: tuple = ("a",)):
+           streams: tuple = ("a",), pingpong: bool = False, empty_active: bool = False):
     """The ring family's persistent walk at the configuration over a ring of each of `streams`, each step
-    reading its slot of each: each warpgroup's program and the barriers' arrivals
-    (`ring_protocol.programs`)."""
+    reading its slot of each, its two consumers taking alternate tiles whole where `pingpong` (each slot
+    released by its tile's owner alone), a tile of no steps active where `empty_active` (its turn taken, its
+    walk none): each warpgroup's program and the barriers' arrivals (`ring_protocol.programs`)."""
     family = mosaic_sm90.WGMMA
     starts = [sum(tiles[:index]) for index in range(len(tiles))]
 
@@ -67,7 +68,7 @@ def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: 
                 tile = index[0]
                 steps = at(tile, tiles)
                 views = {name: (x_gmem, lambda step: (at(tile, starts) + step, 0)) for name in streams}
-                return steps > 0, steps, views, tile
+                return (steps > 0) | empty_active, steps, views, tile
 
             def issue(wg, tile, walk, *, active):
                 def step(index, slots, carry, accumulators):
@@ -82,10 +83,10 @@ def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: 
 
             family.persist(streams, (len(tiles),), schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=(), interpret=False, in_flight=in_flight,
-                           unrolled=unrolled)
+                           unrolled=unrolled, pingpong=pingpong)
 
         family.scoped(scope, streams=family.streams(dict.fromkeys(streams, (BLOCK, jnp.bfloat16)), stages,
-                                                    consumers))
+                                                    1 if pingpong else consumers))
 
     kernel = family.kernel(body, out_type=jax.ShapeDtypeStruct((8, 8), jnp.float32), grid=(1,),
                            grid_names=("programs",), consumers=consumers, interpret=False, name="ring_model")
@@ -162,6 +163,75 @@ def test_segments_of_one_walk_release_their_slots_before_the_producer_reuses_the
         assert sum(event.kind == "read" for event in consumer) == total
         assert sum(event.kind == "arrive" for event in consumer) == total
     assert explore(threads, arrivals) > 0
+
+
+PINGPONG_CASES = [case for case in ring_protocol.configurations(
+    stages=(2, 3), consumers=(2,), tiles=((3,), (2, 0, 3), (1, 4), (2, 0, 1, 3), (0, 2), (0,)),
+    in_flight=(0, 1), unrolled=BOUNDS["unrolled"], empty_active=(False, True))
+    if case["in_flight"] < case["stages"]]
+"""Ping-pong's walks: one active tile, an inactive one between two, an odd and an even count of active
+tiles, a first tile inactive, so either consumer may take none or the last, and a walk of no steps at all;
+each with its tiles of no steps inactive, or active (a turn taken, no step walked)."""
+
+
+def _owned(tiles: tuple, empty_active: bool = False) -> list[int]:
+    """Each consumer's steps under ping-pong: the active tiles' in turn, the first consumer's first."""
+    steps = [0, 0]
+    for turn, count in enumerate(count for count in tiles if count or empty_active):
+        steps[turn % 2] += count
+    return steps
+
+
+@pytest.mark.parametrize("case", PINGPONG_CASES, ids=[
+    f"stages{c['stages']}-tiles{c['tiles']}-inflight{c['in_flight']}"
+    f"-{'unrolled' if c['unrolled'] else 'stepped'}{'-empty-active' if c['empty_active'] else ''}"
+    for c in PINGPONG_CASES])
+def test_a_pingpong_walk_alternates_whole_tiles_and_holds_every_property(case):
+    """The ring family's walk with its two consumers taking alternate tiles whole (`persist`'s `pingpong`):
+    each consumer reads and releases its own tiles' steps alone, the active tiles in turn from the first
+    consumer, each slot one release a generation, and every interleaving holds each property (no deadlock,
+    no aliased parity, no early arrival, no read before its write lands, no overwrite before its read)."""
+    threads, arrivals = walked(**case, pingpong=True)
+    owned = _owned(case["tiles"], case["empty_active"])
+    released = _released(threads)
+    assert [sum(event.kind == "read" for event in consumer) for consumer in threads[:-1]] == owned
+    assert [sum(event.kind == "arrive" and event.at[0] in released for event in consumer)
+            for consumer in threads[:-1]] == owned
+    assert explore(threads, arrivals) > 0
+
+
+def _released(threads) -> set:
+    """The barriers a ring's slots are released at: those the producer waits on before it refills one."""
+    return {event.at[0] for event in threads[-1] if event.kind == "wait"}
+
+
+def _turns(threads) -> set:
+    """The barriers the consumers arrive at past the rings' releases (the turns of `Family.meeting`)."""
+    released = _released(threads)
+    return {event.at[0] for consumer in threads[:-1] for event in consumer
+            if event.kind == "arrive" and event.at[0] not in released}
+
+
+def test_a_pingpong_walk_missing_its_turn_is_caught():
+    """The first consumer's first turn arrival dropped: its partner never takes its turn, a deadlock."""
+    threads, arrivals = walked(2, 2, (2, 3), 0, unrolled=False, pingpong=True)
+    turns = _turns(threads)
+    index = next(index for index, event in enumerate(threads[0])
+                 if event.kind == "arrive" and event.at[0] in turns)
+    with pytest.raises(Violation) as found:
+        explore(_mutated(threads, 0, index, []), arrivals)
+    assert found.value.kind in ("deadlock", "unfinished")
+
+
+def test_a_pingpong_ring_awaiting_both_consumers_releases_is_caught():
+    """The rings' slots awaiting both consumers' releases, as a cooperative tile's do: under ping-pong the
+    tile's partner releases none of its steps, so the producer never refills them, a deadlock."""
+    threads, arrivals = walked(2, 2, (2, 3), 0, unrolled=False, pingpong=True)
+    released = _released(threads)
+    both = {name: 2 if name in released else count for name, count in arrivals.items()}
+    with pytest.raises(Violation) as found:
+        explore(threads, both)
+    assert found.value.kind in ("deadlock", "unfinished")
 
 
 def _mutated(threads, thread: int, index: int, replaced) -> list:

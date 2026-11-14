@@ -136,7 +136,7 @@ def test_a_parts_prepare_compiles_a_flows_programs_for_its_nodes_gpu_and_writes_
     and its truths written to the tier's store, and what it took reported."""
     from jax.experimental import topologies
 
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     topology = store / "topology.bin"
     topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())

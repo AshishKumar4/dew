@@ -1251,29 +1251,67 @@ def test_stochastic_rounding_draws_from_its_own_stream():
                                         jax.tree.leaves(other), strict=True)) > 0.0
 
 
-def test_a_convolutions_quantized_gradients_run_on_every_backend():
-    """A convolution trained under quantized gradients (`bwd_qtype`) runs Qwix's own quantized backward
-    on every backend, a GPU's among them, whose integer convolutions Qwix runs exactly in float32 chunks
-    (0.1.8.post4; row 783): Dew refused it on a GPU before. Its gradients are finite and move with the
-    input."""
-    pytest.importorskip("qwix")
+GPU_CONVOLUTION_SEEDS = 8
+"""The quantized convolution's GPU cell's declared seeds for check 1, sized by `seeds_for` on armada."""
+
+
+def a_quantized_convolution_trains_and_serves_on_this_gpu_as_qwix_computes_it_on_the_cpu():
+    """A convolution trained under quantized gradients (`bwd_qtype`), its value and the gradients of its
+    input and kernel, and the convolution served quantized (`quantize_for_serving`), each run on the
+    default device, a GPU's in the GPU flow (tests/test_gpu_training.py), whose integer convolutions Qwix
+    takes in float32 chunks (0.1.8.post4), on par (check 1) with Qwix's own quantized training of the same
+    convolution computed on the CPU, which convolves its integers into int32, from the float convolution in
+    float64 (ledger 4635: the CUDA path ran on no GPU, and on a CPU it passes at base too)."""
+    qwix = pytest.importorskip("qwix")
     from dew.nn.conv import Conv
 
-    conv = Conv(features=8, kernel_size=(3, 3), padding="SAME", use_bias=False)
-    x = jax.random.normal(jax.random.key(4), (2, 12, 12, 4))
-    variables = nn.unbox(conv.init(jax.random.key(5), x))
-    quantized = Quantization(bwd_qtype="int8").apply(conv)
+    settings = {"features": 8, "kernel_size": (3, 3), "padding": "SAME", "use_bias": False}
+    conv, shape = Conv(**settings), (2, 12, 12, 4)
+    own = quantize_with(Conv(**settings), qwix.QtProvider([qwix.QtRule(
+        module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8, bwd_qtype=jnp.int8)]))
+    cpu = jax.devices("cpu")[0]
 
-    @jax.jit
-    def gradients(params, x):
-        return jax.grad(lambda params, x: jnp.sum(quantized.apply({"params": params}, x) ** 2),
-                        argnums=(0, 1))(params, x)
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 3)
+        x = jax.random.normal(keys[0], shape)
+        kernel = nn.unbox(conv.init(keys[1], x))["params"]["kernel"]
+        return (np.asarray(x), np.asarray(kernel),
+                np.asarray(jax.random.normal(keys[2], (*shape[:-1], settings["features"]))))
 
-    kernel, inputs = gradients(variables["params"], x)
-    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves((kernel, inputs)))
-    moved, _ = gradients(variables["params"], 2.0 * x)
-    assert not all(np.array_equal(first, second) for first, second in zip(
-        jax.tree.leaves(kernel), jax.tree.leaves(moved), strict=True))
+    def through(module):
+        # Its value and the gradients of its input and kernel under the cotangent.
+        return with_gradients(lambda x, kernel: module.apply({"params": {"kernel": kernel}}, x))
+
+    own_run = jax.jit(through(own))
+
+    @as_given
+    def on_cpu(x, kernel, cotangent):
+        return own_run(*jax.device_put((x, kernel, cotangent), cpu))
+
+    assert_as_exact(jax.jit(through(Quantization(bwd_qtype="int8").apply(conv))), on_cpu, draw,
+                    "quantized-gradient convolution", seeds=GPU_CONVOLUTION_SEEDS, truth_fn=through(conv))
+
+    # Served: a kernel quantized once as a load stores it, over drawn inputs.
+    kernel = nn.unbox(conv.init(jax.random.key(0), jnp.zeros(shape)))["params"]["kernel"]
+    module, variables = quantize_for_serving(conv, {"params": {"kernel": kernel}}, Quantization(),
+                                             jnp.zeros(shape))
+    own_forward = jax.jit(lambda x, kernel: own.apply({"params": {"kernel": kernel}}, x))
+    wide = np.asarray(kernel, np.float64)
+
+    @as_given
+    def own_served(x):
+        return own_forward(*jax.device_put((x, kernel), cpu))
+
+    assert_as_exact(jax.jit(lambda x: module.apply(variables, x)), own_served,
+                    lambda seed: (np.asarray(jax.random.normal(jax.random.key(seed), shape)),),
+                    "served quantized convolution", seeds=GPU_CONVOLUTION_SEEDS,
+                    truth_fn=lambda x: conv.apply({"params": {"kernel": wide}}, x))
+
+
+def test_a_quantized_convolution_trains_and_serves_as_qwix_computes_it_on_the_cpu():
+    """The GPU flow's quantized convolution cell on this process's default device: a quantized-gradient
+    convolution and a served one on par with Qwix's own computed on the CPU."""
+    a_quantized_convolution_trains_and_serves_on_this_gpu_as_qwix_computes_it_on_the_cpu()
 
 
 def test_an_objective_rounds_its_gradients_from_the_step_key():

@@ -91,7 +91,7 @@ class RepresentationEncoder(nn.Module):
             num_kv_heads=heads, head_dim=self.width // heads,
             intermediate_size=spec.intermediate or 4 * self.width, activation=activation(spec.activation),
             in_channels=3, patch_size=self.patch, temporal_patch_size=1, spatial_merge_size=1,
-            norm_type="fast_layer", norm_eps=spec.epsilon, norm_bias=True, mlp_bias=True,
+            norm_type="layer", norm_eps=spec.epsilon, norm_bias=True, mlp_bias=True,
             packed=False, patch_bias=True, attention=("full",) * self.layers,
             order=("patches",) * self.layers, sinks=(False,) * self.layers,
             positions=LearnedPositions(spec.table_size // self.patch, "bicubic",

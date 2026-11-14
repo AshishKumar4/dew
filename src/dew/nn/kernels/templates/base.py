@@ -214,14 +214,6 @@ class Template[Config: Hashable](tuning.KernelOp):
                                              if self.legal(ba, config, target)))))
 
 
-def dividing[C](configs: Sequence[C], extents: tuple[int, ...],
-                blocks: Callable[[C], tuple[int, ...]]) -> tuple[C, ...]:
-    """The configs of `configs` whose blocks (`blocks(config)`) divide the launch's `extents`, place by
-    place, in `configs`' order: a launch's space at its padded shapes."""
-    return tuple(config for config in configs
-                 if all(extent % block == 0 for extent, block in zip(extents, blocks(config), strict=True)))
-
-
 class Unfitted(report.Exhausted):
     """A call no config of a launch holds: its programs stage at least `least` bytes of shared memory,
     past the `budget` a block of `generation` holds, or (`least` None) no config's threads hold their

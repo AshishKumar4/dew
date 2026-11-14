@@ -47,7 +47,6 @@ every registered model built tiny by tests/tiny_models.py's `build_model`
 and `tiny_inputs`, which that file's registry-wide parametrization needs.
 """
 
-import contextlib
 import dataclasses
 import functools
 import json
@@ -58,12 +57,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import quantized_arms
 from architecture_cases import CASES as ARCHITECTURES
 from checkpoint_cases import CHECKPOINTS, DECODERS, FIXTURES, LENGTH, OWN, PATHS, ROWS, loaded, reads, tokens
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jepa_cases import MASK
 from model_support import float64_twin, floating_gradient, moved
-from reference_error import as_given, assert_as_exact, summed_as_run, widened
+from reference_error import Followed, Rounded, as_given, assert_as_exact, summed_as_run, widened
 from tiny_models import build_model, tiny_inputs
 
 from dew.batch import coordinates
@@ -384,10 +384,17 @@ class _Served(NamedTuple):
 
 
 def _served(model, call: dict) -> _Served:
+    """`_Served`: the call returns its logits, the cache it leaves and the roundings its fake quantizers met
+    (`quantized_arms.rounding`: their inputs and decisions, none for a model with no quantizer), taking
+    `decided`'s where given, as a following run rounds where an arm rounded."""
+    def applied(variables, cache, tokens, decided=None):
+        with quantized_arms.rounding(decided) as roundings:
+            logits, held = model.apply({**variables, "cache": cache}, tokens, mutable=["cache"], **call)
+        return logits, held, (roundings.rounded(), roundings.decisions())
+
     return _Served(jax.jit(lambda variables: model.apply(variables, ROWS, method="init_cache",
                                                          mutable=["cache"])[1]["cache"]),
-                   jax.jit(lambda variables, cache, tokens: model.apply(
-                       {**variables, "cache": cache}, tokens, mutable=["cache"], **call)))
+                   jax.jit(applied))
 
 
 @functools.cache
@@ -400,19 +407,28 @@ def _programs(name: str, kind: str, call: tuple) -> _Served:
     return _served(model, dict(call))
 
 
-def _greedy(programs: _Served, variables, tokens, forced=None):
-    """The cache the programs allocate, the `STEPS` greedy draws after `tokens` (or the `forced` ones)
-    and the logits of every call, through their call (the decode mode, or DiffusionGemma's `encode`, the
-    clean commits a canvas reads)."""
+def _greedy(programs: _Served, variables, tokens, forced=None, decided=None):
+    """The cache the programs allocate, the `STEPS` greedy draws after `tokens` (or the `forced` ones),
+    the logits of every call, through their call (the decode mode, or DiffusionGemma's `encode`, the
+    clean commits a canvas reads), and each call's roundings (`_served`), each call following its own of
+    `decided` (`_by_call`) where given."""
+    calls = [None] * (STEPS + 1) if decided is None else _by_call(decided)
     cache = programs.allocated(variables)
-    logits, held = programs.applied(variables, cache, jnp.asarray(tokens))
-    drawn, scores = [], [logits]
+    logits, held, met = programs.applied(variables, cache, jnp.asarray(tokens), calls[0])
+    drawn, scores, roundings = [], [logits], [met]
     for step in range(STEPS):
         drawn.append(jnp.argmax(logits[:, -1], axis=-1).astype(jnp.int32) if forced is None
                      else jnp.asarray(forced)[:, step])
-        logits, held = programs.applied(variables, held["cache"], drawn[-1][:, None])
+        logits, held, met = programs.applied(variables, held["cache"], drawn[-1][:, None], calls[step + 1])
         scores.append(logits)
-    return cache, jnp.stack(drawn, axis=1), scores
+        roundings.append(met)
+    return cache, jnp.stack(drawn, axis=1), scores, roundings
+
+
+def _by_call(decisions: dict) -> list[dict]:
+    """A run's decisions (`_scored`'s, `<call>/<kind>`) as each of its `STEPS + 1` calls takes them."""
+    return [{name.split("/", 1)[1]: value for name, value in decisions.items()
+             if name.split("/", 1)[0] == str(call)} for call in range(STEPS + 1)]
 
 
 def _decoding(name: str) -> dict:
@@ -435,37 +451,53 @@ def _continued(model):
 
 
 def _scored(programs: _Served, variables, *, wide: bool = False):
-    """A drawn prompt's logits and each forced step's through the cache, as `_greedy` takes them: a host
-    loop over the programs, which the gate runs as given; with `wide`, under x64, the float64 twin's
-    truth."""
+    """A drawn prompt's logits and each forced step's through the cache, as `_greedy` takes them, beside
+    each call's values its fake quantizers rounded (`rounded/<call>/<kind>`), and its decisions
+    (`Rounded`): a host loop over the programs, which the gate runs as given. With `wide`, under x64, the
+    float64 twin's truth, following an arm's decisions (`Followed`): a float32 rounding a value within its
+    noise of a decision boundary decides it either way, so no truth that rounds for itself holds every arm
+    (docs/design/testing.md, a quantized computation's truth; row 1551). A model with no quantizer rounds
+    nothing and decides nothing, its check as before."""
+    def judged(scores, roundings) -> dict:
+        rounded = {f"rounded/{call}/{name.removeprefix('rounded/')}": np.asarray(value)
+                   for call, (inputs, _) in enumerate(roundings) for name, value in inputs.items()}
+        return {"scores": [np.asarray(score, np.float64 if wide else score.dtype) for score in scores],
+                **rounded}
+
+    if wide:
+        def truth(decisions, tokens, forced):
+            with jax.enable_x64(new_val=True):
+                _, _, scores, roundings = _greedy(programs, variables, tokens, forced, decisions)
+                return judged(scores, roundings)
+        return as_given(truth)
+
     @as_given
     def run(tokens, forced):
-        with jax.enable_x64(new_val=True) if wide else contextlib.nullcontext():
-            _, _, scores = _greedy(programs, variables, tokens, forced)
-            return [np.asarray(score, np.float64 if wide else score.dtype) for score in scores]
+        _, _, scores, roundings = _greedy(programs, variables, tokens, forced)
+        decisions = {f"{call}/{kind}": np.asarray(value)
+                     for call, (_, decided) in enumerate(roundings) for kind, value in decided.items()}
+        return Rounded(judged(scores, roundings), decisions)
     return run
 
 
 @functools.cache
 def _reference(name: str, call: tuple) -> tuple[Callable, Callable]:
-    """`name`'s reference arm and its float64 truth over `_continued` draws (`_scored`), each draw's
-    scores kept once a process: the cache-capacity and packed-projection tests judge their programs
-    against the same two."""
+    """`name`'s reference arm over `_continued` draws (`_scored`), each draw's scores kept once a process,
+    and its float64 truth following an arm's roundings (`Followed`): the cache-capacity and
+    packed-projection tests judge their programs against the same two."""
     variables = loaded(name).variables
 
-    def kept(run):
-        results: dict[tuple[bytes, bytes], object] = {}
+    results: dict[bytes, object] = {}
 
-        @as_given
-        def held(tokens, forced):
-            key = (np.asarray(tokens).tobytes(), np.asarray(forced).tobytes())
-            if key not in results:
-                results[key] = run(tokens, forced)
-            return results[key]
-        return held
+    @as_given
+    def reference(tokens, forced):
+        key = np.asarray(tokens).tobytes() + np.asarray(forced).tobytes()
+        if key not in results:
+            results[key] = _scored(_programs(name, "model", call), variables)(tokens, forced)
+        return results[key]
 
-    return (kept(_scored(_programs(name, "model", call), variables)),
-            kept(_scored(_programs(name, "wide", call), widened(variables), wide=True)))
+    return reference, Followed(_scored(_programs(name, "wide", call), widened(variables), wide=True),
+                               quantized_arms.rounds)
 
 
 @pytest.mark.parametrize("name", PATHS)
@@ -486,15 +518,15 @@ def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name)
     call = tuple(_decoding(name).items())
     own, at_capacity = _programs(name, "model", call), _programs(name, "sized", call)
     with summed_as_run():
-        cache, drawn, _ = _greedy(own, variables, rows)
-        sized_cache, sized_drawn, _ = _greedy(at_capacity, variables, rows)
+        cache, drawn, _, _ = _greedy(own, variables, rows)
+        sized_cache, sized_drawn, _, _ = _greedy(at_capacity, variables, rows)
     assert jax.tree.structure(sized_cache) == jax.tree.structure(cache)
     assert (any(CAPACITY in leaf.shape for leaf in jax.tree.leaves(sized_cache))
             == any(model.max_seq_len in leaf.shape for leaf in jax.tree.leaves(cache)))
     np.testing.assert_array_equal(np.asarray(sized_drawn), np.asarray(drawn))
-    reference, truth = _reference(name, call)
+    reference, followed = _reference(name, call)
     assert_as_exact(_scored(at_capacity, variables), reference, _continued(model),
-                    f"{name} cached logits at a capacity", seeds=CACHED_SEEDS, truth_fn=truth)
+                    f"{name} cached logits at a capacity", seeds=CACHED_SEEDS, followed=followed)
 
 
 def _packed(variables, groups) -> dict:
@@ -536,12 +568,12 @@ def test_packed_projections_score_as_the_model_does(name):
     call = (("decode", True),)
     own = _programs(name, "model", call)
     with summed_as_run():
-        _, drawn, _ = _greedy(own, variables, rows)
-        _, packed_drawn, _ = _greedy(own, packed, rows)
+        _, drawn, _, _ = _greedy(own, variables, rows)
+        _, packed_drawn, _, _ = _greedy(own, packed, rows)
     same(packed_drawn, drawn)
-    reference, truth = _reference(name, call)
+    reference, followed = _reference(name, call)
     assert_as_exact(_scored(own, packed), reference, _continued(model), label,
-                    seeds=CACHED_SEEDS, truth_fn=truth)
+                    seeds=CACHED_SEEDS, followed=followed)
 
 
 def _request() -> ModelInputs:

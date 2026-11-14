@@ -1949,6 +1949,18 @@ class Checkpoints:
             arrays["fill"] = jax.ShapeDtypeStruct(clock.shape, jnp.int32)
         return Accumulation(**arrays)
 
+    def window_size(self, step: int) -> int:
+        """The microbatches an update of the state at `step` pools (`TrainState.window_size`), read alone on
+        the host: the split a resume of it steps at, which a step compiled ahead for it compiles at
+        (`dew.training.compiler.resumed_stepping`)."""
+        from_local = step == self._local_latest()
+        snapshot = self._step_metadata(step, local=from_local)
+        _refuse_cut_resume(step, snapshot, 'window size')
+        stored = _item_metadata(snapshot)['window_size']
+        wanted = {'window_size': jax.ShapeDtypeStruct(stored.shape, stored.dtype)}
+        restored = self._restored(step, wanted, {'window_size': _read(None, stored.dtype)}, local=from_local)
+        return int(np.asarray(restored['window_size']))
+
     def position(self, step: int, share: DataPartition) -> bytes | None:
         """The data position the reader of `share` resumes from at `step` (`read_position`), read
         alone, before any state is restored: a run opens its data there and reads its first batch

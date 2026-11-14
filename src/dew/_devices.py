@@ -253,7 +253,7 @@ def pool_share() -> float:
 
 COMPILE_ONLY_MEMORY: dict = {}
 """Each compile-only GPU's memory, its total bytes, as its topology states it to XLA (`device_memory_size`,
-written by `dew.training.ahead.compile_only_gpus`, read from a host's own by `host_gpus`), and each CPU
+written by `dew.nn.kernels.generation.compile_only_gpus`, read from a host's own by `host_gpus`), and each CPU
 device's standing in for a GPU (`dew.training.ahead.stand_in_gpus`): the one statement every admission
 and layout check on the device reads (`device_memory`, `allocator_limit`)."""
 

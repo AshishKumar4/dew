@@ -391,8 +391,7 @@ def opens(name: str, export: Path, scratch: Path) -> dict[str, bool]:
           "/tmp/lfm3-export")'
       <the release's Python> tools/remote_code_reference.py lfm3-tiny --opens /tmp/lfm3-export
     The release's files are its vendored copies where they are pinned (`release_file`). Returns each
-    check by name; tests/test_remote_code_releases.py runs it under the release's transformers
-    (`release_env`)."""
+    check by name; tests/test_remote_code_releases.py runs it under the release's transformers."""
     import os
 
     _, _, files, auto = RELEASES[name]

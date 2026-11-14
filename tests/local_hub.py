@@ -6,6 +6,7 @@ asks, a repo's discussions and a revision's commits), and keeps every request it
 or file's too (`LocalHub.served`), so a test counts what a load fetched. A process reaches it through
 `HF_ENDPOINT` (`LocalHub.endpoint`), which `huggingface_hub` reads when it is imported."""
 
+import functools
 import hashlib
 import json
 import os
@@ -69,7 +70,7 @@ class LocalHub:
         return f"http://{host}:{port}"
 
     def commit(self, repo: str) -> str:
-        """`repo`'s commit: a hash of its files' names and bytes."""
+        """`repo`'s commit: a hash of its files' names and bytes (`_hashed`)."""
         return _hashed(self.repos[repo])
 
     def pull_commit(self, repo: str, num: int) -> str:
@@ -120,18 +121,26 @@ def _chunks(path: Path, start: int = 0, stop: int | None = None):
 
 
 def _sha1(path: Path) -> str:
-    """A file's SHA-1, read a chunk at a time: its oid and ETag as the Hub states them."""
+    """A file's SHA-1: its oid and ETag as the Hub states them, read once while the file stays as it is
+    (`_digest`), where every request read every byte of it again."""
+    stat = path.stat()
+    return _digest(path, (stat.st_ino, stat.st_size, stat.st_mtime_ns))
+
+
+@functools.cache
+def _digest(path: Path, stamp: tuple[int, int, int]) -> str:
+    """`path`'s SHA-1 as its file stood at `stamp` (its inode, size and modification time), read a chunk at
+    a time."""
+    del stamp
     with path.open("rb") as file:
         return hashlib.file_digest(file, "sha1").hexdigest()
 
 
 def _hashed(files: Mapping[str, Path], parent: str = "") -> str:
-    """A commit's hash: its files' names and bytes, after its parent's."""
+    """A commit's hash: its files' names and bytes (each file's SHA-1, `_sha1`), after its parent's."""
     digest = hashlib.sha1(parent.encode())
     for name, path in sorted(files.items()):
-        digest.update(name.encode() + b"\0")
-        for chunk in _chunks(path):
-            digest.update(chunk)
+        digest.update(name.encode() + b"\0" + _sha1(path).encode())
     return digest.hexdigest()
 
 

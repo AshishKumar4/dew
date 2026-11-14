@@ -119,10 +119,12 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float 
     `norm_gated` says: a layer's on the layers it names, the `routed` layer's
     among them or not, and a norm outside the layers (`routed` None) wherever
     it runs, its gate's maps at the model's `precision`. 'layer' keeps torch's
-    exact variance, the reference decoders' formula (`dew.nn.norms.LayerNorm`'s);
+    exact variance, every torch LayerNorm's (`dew.nn.norms.LayerNorm`'s);
     'fast_layer' is flax's E[x^2] - E[x]^2 (`use_fast_variance`), whose mean
-    and square reduce in one pass, which the vision towers run. An `epsilon` of None is an RMS
-    norm's input dtype's (`RMSNorm.epsilon`); a layer norm states its own."""
+    and square reduce in one pass, for a model that states it: it cancels in
+    fp32 wherever a row's mean dwarfs its spread, so no port of a torch norm
+    takes it. An `epsilon` of None is an RMS norm's input dtype's
+    (`RMSNorm.epsilon`); a layer norm states its own."""
 
     def build(*, name: str) -> nn.Module:
         # A site's own name, a plain string (`NormSite`'s value): the module's path holds no enum.
@@ -319,6 +321,12 @@ class Mixture:
                     "counts otherwise")
         return None
 
+    def dispatch_over(self, shards: int) -> str:
+        """The dispatch its layers run over `shards` expert shards (`moe.resolved_dispatch`): `'auto'` the
+        exchange where the shards divide the experts, the global dispatch anywhere else, either other as
+        named."""
+        return resolved_dispatch(self.dispatch, self.experts, shards)
+
     def generation_refusal(self) -> str | None:
         """Why a generation loop cannot run the layers this mixture builds, or None.
 
@@ -334,8 +342,7 @@ class Mixture:
                     "decode step, holding one token of its block, cannot: the step's routing would differ "
                     "from the full forward's. Generate by refining whole sequences (dew.diffusion.discrete) "
                     "or route without blocks")
-        shards = jax.sharding.get_abstract_mesh().shape.get(EXPERT_AXIS, 1)
-        if resolved_dispatch(self.dispatch, self.experts, shards) != 'exchange':
+        if self.dispatch_over(jax.sharding.get_abstract_mesh().shape.get(EXPERT_AXIS, 1)) != 'exchange':
             return None
         return ("generation cannot run dispatch='exchange' until jax fixes jax-ml/jax#40907: checkify, "
                 "which carries each draw's device checks into the next step's model call, fails on a "

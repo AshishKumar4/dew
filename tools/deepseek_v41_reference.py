@@ -489,24 +489,27 @@ def followed_quantizers(model_module, decided: dict[str, np.ndarray]):
 
 
 def install_selection_probe():
-    """Wrap torch.Tensor.topk to record every selection: its scored rows, its
-    sorted picks and their margins."""
-    topk = torch.Tensor.topk
-    if getattr(topk, "probed", False):
+    """Wrap torch.Tensor.topk and torch.topk to record every selection: its scored rows, its sorted picks
+    and their margins. The releases select through the method, transformers' DeepSeek-V4 router through
+    the function (modeling_deepseek_v4.py:1039)."""
+    if getattr(torch.topk, "probed", False):
         return
 
-    def probe_topk(self, k, dim=-1, largest=True, sorted=True):
-        result = topk(self, k, dim=dim, largest=largest, sorted=sorted)
-        if RECORDS:
-            rows = self.detach().float().movedim(dim, -1)
-            rows = rows.reshape(-1, rows.size(-1)).clone()
-            picks = result.indices.movedim(dim, -1).reshape(-1, k).sort(dim=-1).values.int()
-            for record in RECORDS:
-                record.add("selection", rows=rows, picks=picks, **selection_margins(rows, k))
-        return result
+    def probed(topk):
+        def probe_topk(self, k, dim=-1, largest=True, sorted=True):
+            result = topk(self, k, dim=dim, largest=largest, sorted=sorted)
+            if RECORDS:
+                rows = self.detach().float().movedim(dim, -1)
+                rows = rows.reshape(-1, rows.size(-1)).clone()
+                picks = result.indices.movedim(dim, -1).reshape(-1, k).sort(dim=-1).values.int()
+                for record in RECORDS:
+                    record.add("selection", rows=rows, picks=picks, **selection_margins(rows, k))
+            return result
 
-    probe_topk.probed = True
-    torch.Tensor.topk = probe_topk
+        probe_topk.probed = True
+        return probe_topk
+
+    torch.Tensor.topk, torch.topk = probed(torch.Tensor.topk), probed(torch.topk)
 
 
 def cross_entropy(logits, ids):
@@ -649,18 +652,27 @@ def search(first: int, count: int):
 def widened(model_module):
     """The reference in fp64: the default dtype, and every fp32 pin of
     model.py and the stand-ins widened, which are their `.float()` casts, the
-    MoE accumulator's and the first pre-mix's float32 (model.py:893, :1161)
-    and the rotary tables' float32 frequencies (:376, :384), rebuilt."""
+    MoE accumulator's and the first pre-mix's float32 (model.py:893, :1161),
+    and every cached table rebuilt in it, on entry and on exit: the rotary
+    tables' float32 frequencies (:376, :384) and, where the release's model
+    reads a vision tower (V4.1's, model.py:21), its cos and sin (vision.py
+    `get_vision_cos_sin`), which a float32 run left cached for a float64 one
+    to read (an fp64 span 1e-8 off the fp64 truth)."""
     from _dew_torch.precision import default_dtype, dtype_widened, float_as, replaced
 
-    model_module.precompute_freqs_cis.cache_clear()
+    tables = [model_module.precompute_freqs_cis]
+    if hasattr(model_module, "ViT"):
+        tables.append(sys.modules[model_module.ViT.__module__].get_vision_cos_sin)
+    for table in tables:
+        table.cache_clear()
     try:
         with replaced(float_as(torch.float64), (torch, "zeros_like", dtype_widened(torch.zeros_like)),
                       (torch.Tensor, "new_zeros", dtype_widened(torch.Tensor.new_zeros)),
                       (torch, "arange", dtype_widened(torch.arange))), default_dtype(torch.float64):
             yield
     finally:
-        model_module.precompute_freqs_cis.cache_clear()
+        for table in tables:
+            table.cache_clear()
 
 
 def widened_outputs(seed: int) -> dict[str, np.ndarray]:
@@ -924,31 +936,56 @@ def vision_config_json(args) -> dict:
             "max_wh_ratio": args.vision_max_wh_ratio}
 
 
-def vision_outputs(model_module, engram_module, seed: int, widen: bool = False):
-    """One image prompt through Transformer.forward (model.py:1241-1272), the
-    quantizers off: the toy model with its vision half, its arguments, and its pixels, ids
-    and token types, the span the image fills (merge_image_embeddings), the
-    prefill's logits and three teacher-forced text steps after it; in fp64
-    when `widen`, inside `widened`."""
-    processor = importlib.import_module("image_processor")
+def vision_net(model_module, engram_module, seed: int, widen: bool = False):
+    """The toy model with its vision half (`VISION`), the quantizers off, and its arguments; in fp64 when
+    `widen`, inside `widened`."""
     set_quantizers(model_module, enabled=False)
     args = model_args(model_module, engram_module)
     for field, value in VISION.items():
         setattr(args, field, value)
-    net = build(model_module, engram_module, args, seed, widen=widen)
-    generator = torch.Generator().manual_seed(seed + 3)
-    patch = args.vision_patch_size
-    pixels = torch.randn(3, GRID[0] * patch, GRID[1] * patch, generator=generator, dtype=torch.float32)
-    patches = (pixels.reshape(3, GRID[0], patch, GRID[1], patch).permute(1, 3, 0, 2, 4)
-               .reshape(-1, 3, patch, patch))
+    return build(model_module, engram_module, args, seed, widen=widen), args
+
+
+def vision_layout(args) -> tuple[np.ndarray, int]:
+    """An image prompt's token types `[1, LENGTH]` (the span the image fills from `IMAGE_START_AT`, text
+    around it) and the prompt's length, the text after it the teacher-forced steps': the site's shape,
+    alike for every prompt drawn (`vision_draw`)."""
+    processor = importlib.import_module("image_processor")
     ratio = args.vision_downsample_ratio
     types = processor.image_token_types(-(-GRID[0] // ratio), -(-GRID[1] // ratio))
-    text = torch.randint(3, IMAGE_TOKEN_ID, (1, LENGTH - types.numel()), generator=generator)
+    token_types = torch.full((1, LENGTH), processor.TEXT)
+    token_types[0, IMAGE_START_AT:IMAGE_START_AT + types.numel()] = types
+    return token_types.numpy().astype(np.int32), IMAGE_START_AT + types.numel() + 1
+
+
+def vision_draw(args, key: int) -> dict[str, np.ndarray]:
+    """An image prompt drawn at `key` in the site's shape (`vision_layout`): its pixels, and its ids, the
+    text around the image's span and the image token over it."""
+    token_types, _ = vision_layout(args)
+    span = int(np.sum(token_types >= 0))
+    generator = torch.Generator().manual_seed(key)
+    patch = args.vision_patch_size
+    pixels = torch.randn(3, GRID[0] * patch, GRID[1] * patch, generator=generator, dtype=torch.float32)
+    text = torch.randint(3, IMAGE_TOKEN_ID, (1, LENGTH - span), generator=generator)
     start = IMAGE_START_AT
-    ids = torch.cat([text[:, :start], torch.full((1, types.numel()), IMAGE_TOKEN_ID), text[:, start:]], 1)
-    token_types = torch.full(ids.shape, processor.TEXT)
-    token_types[0, start:start + types.numel()] = types
-    prompt = start + types.numel() + 1
+    ids = torch.cat([text[:, :start], torch.full((1, span), IMAGE_TOKEN_ID), text[:, start:]], 1)
+    return {"pixels": pixels.numpy(), "input_ids": ids.numpy().astype(np.int32)}
+
+
+def vision_leaves(net, args, inputs: dict, widen: bool = False) -> dict[str, np.ndarray]:
+    """An image prompt (`vision_draw`) through Transformer.forward (model.py:1241-1272), the quantizers
+    off: the span the image fills (merge_image_embeddings), the prefill's logits and each teacher-forced
+    text step's after it; in fp64 when `widen`, inside `widened`."""
+    processor = importlib.import_module("image_processor")
+    patch, ratio = args.vision_patch_size, args.vision_downsample_ratio
+    pixels = torch.from_numpy(inputs["pixels"])
+    patches = (pixels.reshape(3, GRID[0], patch, GRID[1], patch).permute(1, 3, 0, 2, 4)
+               .reshape(-1, 3, patch, patch))
+    types = processor.image_token_types(-(-GRID[0] // ratio), -(-GRID[1] // ratio))
+    layout, prompt = vision_layout(args)
+    ids = torch.from_numpy(inputs["input_ids"].astype(np.int64))
+    token_types = torch.from_numpy(layout.astype(np.int64))
+    start = IMAGE_START_AT
     image = processor.ImageInput(start, patches.double() if widen else patches, GRID[0], GRID[1], types)
     with torch.no_grad():
         reset(net)
@@ -957,12 +994,76 @@ def vision_outputs(model_module, engram_module, seed: int, widen: bool = False):
         _, prompt_logits, _ = type(net).forward.__wrapped__(
             net, ids[:, :prompt], 0, [[image]], token_types[:, :prompt])
         steps = [forward(net, ids[:, position:position + 1], position)[1][:, 0]
-                 for position in range(prompt, LENGTH)]
-    return net, args, {"pixels": pixels.numpy(), "input_ids": ids.numpy().astype(np.int32),
-                 "token_types": token_types.numpy().astype(np.int32), "decode_prompt": np.int32(prompt),
-                 "vision_span": embedded[0, start:start + types.numel()].numpy(),
-                 "vision_prompt_logits": prompt_logits.numpy(),
-                 "vision_decode_logits": torch.stack(steps, 1).numpy()}
+                 for position in range(prompt, ids.shape[1])]
+    return {"vision_span": embedded[0, start:start + types.numel()].numpy(),
+            "vision_prompt_logits": prompt_logits.numpy(),
+            "vision_decode_logits": torch.stack(steps, 1).numpy()}
+
+
+def vision_outputs(model_module, engram_module, seed: int, widen: bool = False):
+    """One image prompt (`vision_draw`, the seed's) through the release's forward (`vision_leaves`): the
+    toy model with its vision half, its arguments, and the prompt's inputs and leaves; in fp64 when
+    `widen`, inside `widened`."""
+    net, args = vision_net(model_module, engram_module, seed, widen)
+    inputs = vision_draw(args, seed + 3)
+    token_types, prompt = vision_layout(args)
+    return net, args, {**inputs, "token_types": token_types, "decode_prompt": np.int32(prompt),
+                       **vision_leaves(net, args, inputs, widen)}
+
+
+def clearing_vision(net, args, index: int) -> dict[str, np.ndarray]:
+    """The `index`-th drawn image prompt (`vision_draw`, its keys apart from every other index's, redrawn
+    until it does) whose every top-k of the release's forward, its prefill's and each step's, clears the
+    gate's `MARGIN` (tests/selection_margins.py): prompts a float32 port selects over as the release does."""
+    from selection_margins import MARGIN
+
+    for attempt in range(64):
+        inputs = vision_draw(args, 0x5649_0000 + index + 1_000_003 * attempt)
+        recorded = Record()
+        RECORDS[:] = [recorded]
+        try:
+            vision_leaves(net, args, inputs)
+        finally:
+            RECORDS.clear()
+        if all(bool((call["margin"] > MARGIN).all()) for call in recorded.calls.get("selection", [])):
+            return inputs
+    raise AssertionError(f"no image prompt of index {index} clears the selection margin")
+
+
+def write_vision_recording(seed: int):
+    """vision_recording.npz beside the fixture: the vision half's forward over drawn image prompts its
+    selections clear (`clearing_vision`), the span, the prefill's logits and each teacher-forced step's
+    (`vision_leaves`), in fp32 and fp64, summarized over seeds for check 1 (`record_case`), and the
+    prompts each seed drew, their pixels and ids (vision_rows.npz), in the site's shape (`vision_layout`,
+    vision.npz's)."""
+    from recorded_references import provenance, record_case, save
+
+    model_module, engram_module = import_reference()
+    install_selection_probe()
+    net, args = vision_net(model_module, engram_module, seed)
+    with widened(model_module):
+        wide, _ = vision_net(model_module, engram_module, seed, widen=True)
+    prompts: dict[int, dict[str, np.ndarray]] = {}
+
+    def draw(index: int) -> dict[str, np.ndarray]:
+        if index not in prompts:
+            prompts[index] = clearing_vision(net, args, index)
+        return prompts[index]
+
+    def evaluate(inputs):
+        narrow = vision_leaves(net, args, inputs)
+        with widened(model_module):
+            truth = vision_leaves(wide, args, inputs, widen=True)
+        return {name: value.astype(np.float64) for name, value in narrow.items()}, truth
+
+    arrays = record_case("deepseek v41 vision", draw, evaluate, summary=True, store_inputs=False)
+    command = "PYTHONPATH=src:.:tests:tools <release python> tools/deepseek_v41_reference.py --record-vision"
+    written = save(FIXTURE / "vision_recording.npz", {**arrays, "provenance": provenance(
+        "deepseek-ai/DeepSeek-V4.1-Flash", DEEPSEEK_V41_REVISION, "cpu", command, torch=torch.__version__)},
+        reference=f"deepseek-ai/DeepSeek-V4.1-Flash@{DEEPSEEK_V41_REVISION}", license="mit")
+    np.savez(FIXTURE / "vision_rows.npz", **{
+        name: np.stack([prompts[index][name] for index in range(len(prompts))]) for name in prompts[0]})
+    print(f"{written}: {written.stat().st_size} bytes, {len(prompts)} prompts", flush=True)
 
 
 def write_vision(seed: int):
@@ -1022,10 +1123,11 @@ def write_padding() -> None:
                    json.loads((FIXTURE / "config.json").read_text()), FIXTURE)
 
 
-def clearing_rows(net, vocabulary: int, seed: int) -> np.ndarray:
+def clearing_rows(net, vocabulary: int, seed: int, *, reset=reset, factor: int = 1) -> np.ndarray:
     """The `seed`-th drawn rows `[2, LENGTH]` (from the seed's stream, redrawn until it does) whose every
-    top-k of the release's plain forward clears the gate's `MARGIN` (tests/selection_margins.py): rows a
-    float32 port selects over as the release does."""
+    top-k of the release's plain forward, its caches cleared by the release's `reset`, clears `factor` times
+    the gate's `MARGIN` (tests/selection_margins.py): rows a float32 port selects over as the release does;
+    twice, so a port's run held to them clears MARGIN as its own recording or test holds it to."""
     from selection_margins import MARGIN
 
     generator = torch.Generator().manual_seed(0x4241 + seed)
@@ -1038,7 +1140,7 @@ def clearing_rows(net, vocabulary: int, seed: int) -> np.ndarray:
             forward(net, ids)
         RECORDS.clear()
         margins = [call["margin"] for call in recorded.calls.get("selection", [])]
-        if all(bool((margin > MARGIN).all()) for margin in margins):
+        if all(bool((margin > factor * MARGIN).all()) for margin in margins):
             return ids.numpy().astype(np.int32)
 
 
@@ -1072,10 +1174,11 @@ CACHED_LEAVES = ("prompt_logits", "decode_logits", "draft_logits", "draft_confid
 rows' margins hold apart (`clearing_cached_rows`)."""
 
 
-def clearing_cached_rows(net, vocabulary: int, seed: int) -> np.ndarray:
+def clearing_cached_rows(net, vocabulary: int, seed: int, *, run=cached) -> np.ndarray:
     """The `seed`-th drawn rows `[2, LENGTH]` (a stream of their own, redrawn until it does) whose cached run
-    (`cached`) decides alike in a float32 port: every top-k clears twice the gate's `MARGIN`
-    (tests/selection_margins.py), and so does every argmax the run feeds on, its top two apart by that of
+    (`run`, the release's driver, `cached`) decides alike in a float32 port: every top-k clears twice the
+    gate's `MARGIN` (tests/selection_margins.py), and so does every argmax the run feeds on, its top two
+    apart by that of
     the row's largest finite logit: the main model's at the prompt's last position and at each step, which
     DSpark drafts from, and each draft's at every position but its last, whose token the next position's
     logits read (model.py:1149-1153). Twice, so a port's own run, whose decisions' inputs sit within
@@ -1089,7 +1192,7 @@ def clearing_cached_rows(net, vocabulary: int, seed: int) -> np.ndarray:
         recorded = Record()
         RECORDS[:] = [recorded]
         with torch.no_grad():
-            outputs = cached(net, ids)
+            outputs = run(net, ids)
         RECORDS.clear()
         fed = [outputs["prompt_logits"][:, -1], outputs["decode_logits"], outputs["draft_logits"][:, :, :-1]]
         margins = [call["margin"] for call in recorded.calls.get("selection", [])] + [
@@ -1111,8 +1214,9 @@ def twin_evaluated(model_module, net, wide, leaves):
     return evaluate
 
 
-def logits_from(start: int):
-    """A forward's leaves (`twin_evaluated`): each row's logits from position `start` on."""
+def logits_from(start: int, *, reset=reset):
+    """A forward's leaves (`twin_evaluated`): each row's logits from position `start` on, its caches cleared
+    by the release's `reset` first."""
     def leaves(net, ids):
         with torch.no_grad():
             reset(net)
@@ -1120,12 +1224,13 @@ def logits_from(start: int):
     return leaves
 
 
-def cached_leaves(net, ids):
+def cached_leaves(net, ids, *, run=cached):
     """A cached run's leaves (`twin_evaluated`): the release's prefill, teacher-forced steps and DSpark's
-    drafts after each (`cached`), their logits and confidence (`CACHED_LEAVES`)."""
+    drafts after each (`run`, the release's driver, `cached`), their logits and confidence
+    (`CACHED_LEAVES`)."""
     with torch.no_grad():
-        run = cached(net, ids)
-    return {name: run[name] for name in CACHED_LEAVES}
+        outputs = run(net, ids)
+    return {name: outputs[name] for name in CACHED_LEAVES}
 
 
 def step_leaves(net, ids):
@@ -1292,6 +1397,8 @@ def main():
                         help="write the tilelang kernels' outputs (kernels.npz) on CUDA")
     parser.add_argument("--fp64", action="store_true", help="write the fixture's float64 truth")
     parser.add_argument("--vision", action="store_true", help="write the vision half beside the fixture")
+    parser.add_argument("--record-vision", action="store_true",
+                        help="record the vision half's forward over drawn image prompts, over seeds")
     parser.add_argument("--padding", action="store_true", help="record the rows the lookup leaves untrained")
     parser.add_argument("--record", action="store_true",
                         help="record the plain logits over drawn rows its selections clear, over seeds")
@@ -1312,6 +1419,8 @@ def main():
         write_truth(options.seed)
     elif options.vision:
         write_vision(options.seed)
+    elif options.record_vision:
+        write_vision_recording(options.seed)
     elif options.padding:
         write_padding()
     elif options.record:

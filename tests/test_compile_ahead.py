@@ -47,7 +47,8 @@ def this_gpus(count: int = 1) -> tuple:
     """`count` compile-only GPUs of this GPU's own target, its generation, its multiprocessors (an H100
     PCIe's 114, not the canonical H100's 132) and the memory whose allocator's limit is its own, whose
     programs this GPU's loader takes (`BuildTarget.held`)."""
-    from dew.training.ahead import BuildTarget, compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.training.ahead import BuildTarget
 
     own = BuildTarget.of(jax.devices()[:1])
     assert own.memory is not None
@@ -59,7 +60,7 @@ def gpus(generation: str, count: int = 1, limit: int = 2**36) -> tuple:
     """`count` compile-only GPUs of `generation` whose stated memory gives their allocator `limit` bytes
     (`memory_limited_to`), 64 GiB unless a test asks less: XLA's own scheduling reads the memory a target
     states, which a GPU's of that size leaves to the step's own needs."""
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     return compile_only_gpus(generation, count, memory_limited_to(limit))
 
@@ -480,6 +481,43 @@ def test_a_run_resumed_mid_window_compiles_its_step_ahead_building_no_window_of_
     assert ahead.starts
 
 
+def test_a_fresh_runs_start_compiles_once_beside_its_steps_planning():
+    """A fresh run's start (`start_compiling`) compiles in a thread of its own while its step is planned,
+    and the start compiled ahead with the step is that compile: its program compiled once, its executable
+    among the run's starts, where it compiled after the step, in turn (a Qwen3.5-4B's 97 s after its
+    step's 110 s for an H100)."""
+    from dew.training.ahead import compile_ahead
+
+    trainer = fine_tune(MeshSpec().build(gpus("sm90")))
+    with Compiles("joined") as compiles:
+        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
+    assert compiles.count == 1 and ahead.starts
+
+
+def test_a_resume_compiled_ahead_steps_at_the_split_its_checkpoint_was_saved_at(tmp_path):
+    """A run saved at an update's end after updates of two microbatches, its window empty and so not kept
+    (`dew.state.without_empty_window`), resumes at that split, which a run stating none takes from its
+    state (`dew.training.compiler.resumed_stepping`): its step compiled ahead plans split 2, the program
+    the resume compiles, where it planned a split of its own (docs/design/training.md: a resumed run's at
+    its checkpoint's rung)."""
+    from dew.checkpoints import Checkpoints
+    from dew.training.ahead import compile_ahead
+
+    def run(**options):
+        model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
+        return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
+                       layout=Layout(min_shard=TINY_SHARD), checkpoints=Checkpoints(str(tmp_path / "run")),
+                       **options)
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    saved = run(split=2, mesh=MeshSpec().build(jax.devices()[:1]))
+    saved.fit(batch, steps=1, checkpoint_every=1)
+    saved.checkpoints.wait()
+    assert saved.checkpoints.window_size(1) == 2 and saved.checkpoints.accumulation_template(1) is None
+    ahead = compile_ahead(run(mesh=MeshSpec().build(gpus("sm90"))), batch)
+    assert record(ahead.plan, "plan")["split"] == 2
+
+
 def test_a_bfloat16_decoders_step_compiles_ahead_for_an_a100():
     """A bfloat16 decoder's training step compiles ahead for an A100 (`compile_only_gpus("sm80")`): its
     compile point keys each body's recognition by its equations' parameters, the custom VJP's rules its
@@ -576,7 +614,8 @@ def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_o
     from jax._src import cache_key, compiler
     from jax.experimental import topologies
 
-    from dew.training.ahead import compile_only_gpus, host_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.training.ahead import host_gpus
 
     host = compile_only_gpus("sm90", 2, 40 * 2**30)
     serialized = tmp_path / "topology.bin"
@@ -712,9 +751,9 @@ def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_
     candidates are cuBLASLt's on a GPU host. A run's own XLA_FLAGS setting, and devices that run, keep the
     options as given; the fit search compiles each rung under the step's own options, the target's left to
     the compile point."""
+    from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.kernels.options import compiler_options
     from dew.nn.kernels.templates.report import targeted
-    from dew.training.ahead import compile_only_gpus
     from dew.training.planning import FitSearch
 
     monkeypatch.setenv("XLA_FLAGS", without_flags(os.environ.get("XLA_FLAGS", ""),
@@ -751,7 +790,8 @@ def test_compiling_ahead_on_gpus_of_no_stated_memory_is_refused_before_anything_
     against, is refused before anything traces or compiles, its frontier or not (row 3107; PF03: it
     planned by compiling every rung, fourteen minutes of probes on a B200's step), naming the two ways to
     state it once: each GPU's memory, or a host's own serialized topology."""
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.training.ahead import compile_ahead
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
     trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)))
@@ -910,7 +950,8 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.ahead import compile_ahead, compile_only_gpus
+from dew.nn.kernels.generation import compile_only_gpus
+from dew.training.ahead import compile_ahead
 
 mixer = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=64,
                            linear_value_head_dim=64)
@@ -953,7 +994,8 @@ from dew.nn.kernels.generation import routes
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.ahead import compile_ahead, compile_only_gpus
+from dew.nn.kernels.generation import compile_only_gpus
+from dew.training.ahead import compile_ahead
 
 model = models.build(
     "causal_transformer", vocab_size=1024, emb_features=1024, num_layers=2, num_heads=8, num_kv_heads=2,
@@ -1007,8 +1049,7 @@ def test_tokamaxs_triton_attention_compiles_ahead_for_a_gpu_with_none_attached(g
     the kernel itself, not XLA's attention in its place; tokamax's check of the device a kernel runs on is
     the assumed GPU's (`generation.assumed`), where it read this host's ("Not supported on cpu")."""
     from dew.nn.attention import scaled_dot_product_attention
-    from dew.nn.kernels.generation import assumed, routes
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import assumed, compile_only_gpus, routes
 
     mesh = jax.sharding.Mesh(np.asarray(compile_only_gpus(generation, 1)), ("devices",))
     placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
@@ -1839,3 +1880,23 @@ def test_a_flag_given_twice_is_read_by_its_order():
     assert computation_flags(first) != computation_flags(second)
     excess = "--xla_allow_excess_precision"
     assert computation_flags(first) == (f"{excess}=false", f"{excess}=true")
+
+
+@pytest.mark.parametrize(("generation", "capability"),
+                         [("sm100", (10, 0)), ("sm90", (9, 0)), ("sm80", (8, 0))])
+def test_cudnn_attentions_gates_read_the_capability_of_the_gpus_a_program_is_traced_for(generation,
+                                                                                         capability):
+    """The gates of cuDNN's attention (its head dims past 128, packed and latent forms and score functions
+    from Hopper on, a 10.3's cuDNN version) read the capability of the GPUs a program is traced for: in this
+    GPU-free process, those of compile-only GPUs (`compile_only_gpus`) whose mesh it is traced under
+    (`jax.set_mesh`), as a step compiled ahead is, and none outside it, its backend the CPU. JAX read the
+    process's backend alone, so a step compiled ahead for a B200 refused its d256 attention (row 5894)."""
+    from jax._src.cudnn import fused_attention_stablehlo as cudnn
+
+    from dew.training.ahead import compile_only_gpus
+
+    mesh = jax.sharding.Mesh(np.asarray(compile_only_gpus(generation, 1)), ("data",))
+    with jax.set_mesh(mesh):
+        assert cudnn.check_compute_capability("9.0") == (capability >= (9, 0))
+        assert cudnn.is_cuda_compute_capability_equal("10.0") == (capability == (10, 0))
+    assert not cudnn.check_compute_capability("8.0")

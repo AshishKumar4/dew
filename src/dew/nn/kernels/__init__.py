@@ -15,6 +15,7 @@ from .generation import (
     backend,
     bf16_dot_runs,
     chosen_kernel,
+    compile_only_gpus,
     device_generation,
     gpu_mesh,
     gpu_target,
@@ -23,5 +24,5 @@ from .generation import (
 from .ssd import ssd_kernel_platform, ssd_kernel_runs
 
 __all__ = ["PALLAS_CHOICES", "TARGETS", "GpuTarget", "assumed", "backend", "bf16_dot_runs", "chosen_kernel",
-           "device_generation", "gpu_mesh", "gpu_target", "ssd_kernel_platform",
+           "compile_only_gpus", "device_generation", "gpu_mesh", "gpu_target", "ssd_kernel_platform",
            "ssd_kernel_runs", "triton_runs"]
