@@ -177,11 +177,10 @@ RECORD_TRIES = 4
 """How many times a record's write is tried, two, four and eight seconds apart."""
 
 
-def written(key: str, token: str, body: bytes) -> bool:
-    """Whether `body` was PUT at `key`, tried `RECORD_TRIES` times while the Worker is unavailable: a
-    record not written leaves the one before it, such as an older green row a red run should have
-    replaced."""
-    for attempt in range(RECORD_TRIES):
+def written(key: str, token: str, body: bytes, tries: int = RECORD_TRIES) -> bool:
+    """Whether `body` was PUT at `key`, tried `tries` times while the Worker is unavailable: a record not
+    written leaves the one before it, such as an older green row a red run should have replaced."""
+    for attempt in range(tries):
         if attempt:
             time.sleep(2 ** attempt)
         try:

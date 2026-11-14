@@ -499,9 +499,11 @@ def mainline() -> str | None:
 
 
 def named_at_commit(python: str, place: str, held: str, key: str, token: str) -> None:
-    """Row `place`'s green run of `key` on class `held` named this commit's own (`main_key`)."""
+    """Row `place`'s green run of `key` on class `held` named this commit's own (`main_key`), tried once: a
+    name lost costs a later lookup that row's rerun, never this task its deadline (review: a kept task of 120
+    rows retrying each write against an unavailable Worker would wait past its 1,800 s)."""
     if (commit := head_commit()) is not None:
-        written(main_key(commit, python, place, held), token, json.dumps({"key": key}).encode())
+        written(main_key(commit, python, place, held), token, json.dumps({"key": key}).encode(), tries=1)
 
 
 READ_TOKEN = "DEW_XLA_CACHE_READ_TOKEN"
