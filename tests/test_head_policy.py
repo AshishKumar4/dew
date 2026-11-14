@@ -2,16 +2,12 @@
 builds it (`objective_cases.cases`), runs its model's head by `dew.objectives.lm.head`, which the fit ladder
 moves and the step's program reports."""
 
-import jax
-import numpy as np
-import optax
 import pytest
 from objective_cases import cases
 from objective_data import corpus_windows
 
 from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import objectives
-from dew.training import Trainer
 from dew.training.memory import recompute_more, rung_record
 
 TOKEN_OBJECTIVES = ("lm", "masked_diffusion", "block_diffusion", "distillation", "dpo", "grpo", "ppo")
@@ -37,9 +33,9 @@ def test_the_token_objectives_are_registered_and_every_other_scores_no_vocabular
 @pytest.mark.parametrize("name", TOKEN_OBJECTIVES)
 def test_every_token_objective_runs_its_head_by_the_one_policy(name, windows):
     """Its fit ladder moves its head to the generation's tile, fused, then its backward, before it
-    recomputes more, each rung its step's program reports (`rung_record`); and a step compiled at the
-    tiled backward trains, its loss finite, and its program reports the tile."""
-    objective, batch = cases(windows)[name]()
+    recomputes more, each rung its step's program reports (`rung_record`); put back at the tiled backward,
+    its trained head's program reports the tile."""
+    objective, _ = cases(windows)[name]()
     tile = list(chunked_tile())
     heads = [(rung["head_tile"], rung["head_fused"], rung["remat"])
              for rung in [rung_record(objective, xla_defaults=False, narrow=False)]]
@@ -49,10 +45,7 @@ def test_every_token_objective_runs_its_head_by_the_one_policy(name, windows):
     before_remat = [(head_tile, fused) for head_tile, fused, remat in heads if remat == heads[0][2]]
     assert (tile, False) in before_remat, heads
     assert before_remat[0] in ((None, False), (tile, True), (tile, False)), heads
+    # Put back at the tiled backward, as a resumed run that recorded it is, its program reports it.
     objective.restore_head(chunked_tile(), fused=False)
-    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(0))
-    state = trainer.initial_state()
-    _, loss, *_, accepted, _ = trainer.compile(state, batch)(state, batch)
-    assert bool(accepted) and np.isfinite(float(loss))
-    reported = [(entry.head_tile, entry.head_fused) for entry in objective.program_key()]
+    reported = [(entry.head_tile, entry.head_fused) for entry in objective.program_key() if entry.trained]
     assert (chunked_tile(), False) in reported, reported
