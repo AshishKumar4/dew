@@ -1057,30 +1057,32 @@ def test_a_stored_cut_a_group_of_which_has_outgrown_its_bound_is_cut_afresh(
         "3.12:tests/test_steady.py#1/2": nodes[:1], "3.12:tests/test_steady.py#2/2": nodes[1:]}
 
 
-def test_a_group_past_its_bound_is_cut_again_with_its_nearest_groups_alone_and_the_rest_keep_their_tests(
-        ci):
-    """The fold cuts a group main's CI ran past `session.KEPT` of the target again with its nearest groups
-    alone, as few as bring each within it, a test heavier than the bound standing alone: the file's other
-    groups keep their tests and so their records and compiled programs (2026-11-14: one group past its bound
-    re-cut test_recurrence_stability.py whole, 9 of 11 bounds moved, every group run cold). Where no
-    neighbourhood short of the whole file fits, the file is cut anew whole."""
-    nodes = [f"tests/test_steady.py::test_{index:02d}" for index in range(12)]
-    own = dict.fromkeys(nodes, 50.0) | {nodes[3]: 200.0}
-    bounds = [nodes[2], nodes[4], nodes[6], nodes[8], nodes[10]]
-    groups = ci.session.cut_by(nodes, bounds)
-    ran = [sum(own[node] for node in group) + 10.0 for group in groups]
+def test_a_group_past_its_bound_is_cut_again_with_its_nearest_groups_alone_and_the_next_plan_keeps_it(
+        ci, tmp_path):
+    """The fold cuts a group main's CI ran past `session.KEPT` of the target, or whose recorded tests now
+    weigh past it with its setup (a test added since sorts into it), again with its nearest groups alone, as
+    few as bring each within it, a test heavier than the bound standing alone; the file's other groups keep
+    their tests, and the next plan runs the cut as stored, so their records and compiled programs are found
+    again (2026-11-14: one group past its bound re-cut test_recurrence_stability.py whole, 9 of 11 bounds
+    moved, every group run cold). A group that holds no recorded test, or no neighbourhood short of the whole
+    file that fits, leaves the file to be cut anew whole."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 120}))
     name = "tests/test_steady.py"
+    nodes = [f"{name}::test_{index:02d}" for index in range(12)]
+    added = f"{name}::test_11b"
+    bounds = [nodes[2], nodes[4], nodes[6], nodes[8], nodes[10]]
+    # The second group's test_03 took 200 s; test_11b, added since, ran in another group and took 100 s.
+    own = dict.fromkeys(nodes, 50.0) | {nodes[3]: 200.0, added: 100.0}
+    ran = [110.0, 260.0, 110.0, 110.0, 110.0, 110.0]
     folded = ci.cuts.refolded(ci.session, {name: bounds}, {name: ran}, 120.0, {name: own}, {name: own})
-    after = ci.session.cut_by(nodes, folded[name])
-    # The outgrown second group's neighbourhood alone moved: its heavy test stands alone, the last four
-    # groups are as they were.
-    assert after[1] == [nodes[3]] and after[2:] == groups[2:]
-    assert all(sum(own[node] for node in group) + 10.0 <= 180.0 for group in after if len(group) > 1)
-    # Every group past the bound, its tests too many to fit short of the whole file: cut anew whole.
-    crowded = dict.fromkeys(nodes, 100.0)
-    folded = ci.cuts.refolded(ci.session, {name: bounds}, {name: [210.0] * 6}, 120.0, {name: crowded},
-                              {name: crowded})
-    assert len(folded[name]) > len(bounds)
+    after = [nodes[0:3], [nodes[3]], nodes[4:6], nodes[6:8], nodes[8:11], [nodes[11], added]]
+    assert ci.session.cut_by(sorted(own), folded[name]) == after
+    assert ci.session.planned(name, sorted(own), [own[node] for node in sorted(own)], 6, folded) == after
+    # A group that holds no recorded test (its tests removed), or tests too many to fit short of the whole
+    # file, is no local cut.
+    removed = {node: seconds for node, seconds in own.items() if node not in nodes[6:8]}
+    assert ci.cuts.rebalanced(ci.session, removed, bounds, ran, 180.0) is None
+    assert ci.cuts.rebalanced(ci.session, dict.fromkeys(nodes, 100.0), bounds, [210.0] * 6, 180.0) is None
 
 
 def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cuts_them(

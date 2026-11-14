@@ -73,14 +73,14 @@ def weighed(session, tests: list[float], seconds: float, target: float,
     left to scale by, every other file weighed 1.6 times its record and the 0.6 was its setup, so
     tests/test_model_protocols.py's 10,537 s of tests were planned as 195 groups of 6,500 s, 354 task-hours;
     armada sized the run by its longest tasks, gave the sites' 874 map tasks 20 of its 688 containers, and
-    train 772's CI ran out its deadline). A file with a stored cut (`stored`: each of its groups' recorded
-    seconds, session.CUTS) runs as that cut, each group its tests plus the setup each paid, while every
-    group's tests stay within `session.held_seconds` (`session.planned`'s test, whatever target a plan is
-    asked for, so its tasks cut it alike: review): the durations fold alone keeps or replaces a cut
-    (`refolded`), so a group's name means the same tests from run to run and its record is found again (Main,
-    2026-11-13); one outgrown is cut afresh, so a group past its deadline, which no green run would fold away,
-    is not run as it is again (train 793's review)."""
-    if stored and max(stored) <= session.held_seconds():
+    train 772's CI ran out its deadline). A file with a stored cut that holds (`stored`: each of its groups'
+    recorded seconds, session.CUTS, where ci.py's `stored_weights` finds `session.holds` as `session.planned`
+    does, whatever target a plan is asked for, so its tasks cut it alike: review) runs as that cut, each
+    group its tests plus the setup each paid: the durations fold alone keeps or replaces a cut (`refolded`),
+    so a group's name means the same tests from run to run and its record is found again (Main, 2026-11-13);
+    one outgrown is cut afresh, so a group past its deadline, which no green run would fold away, is not run
+    as it is again (train 793's review)."""
+    if stored:
         setup = max((measured[0] if measured is not None else seconds) - sum(stored), 0.0) / len(stored)
         return [weight + setup for weight in stored]
     if measured is not None:
@@ -148,31 +148,38 @@ def refolded(session, stored: Mapping[str, list[str]], runs: Mapping[str, list[f
 def rebalanced(session, own: Mapping[str, float], bounds: list[str], measured: list[float],
                limit: float) -> list[str] | None:
     """Stored cut `bounds` of a file whose groups ran as `measured` (seconds, setup included), its record
-    `own` (node id to seconds), with each group past `limit` cut again together with its nearest groups alone,
-    as few as bring every group of them within it, its tests' seconds and their groups' setup shared: the
+    `own` (node id to seconds), with each group past `limit`, as it ran or as its recorded tests weigh with
+    the setup it paid (a test added since falls in the group it sorts into), cut again together with its
+    nearest groups alone, as few as bring every group of them within it, their setup shared alike: the
     other groups keep their tests and so their names' records and compiled programs (2026-11-14: one group
     past its bound re-cut test_recurrence_stability.py whole, 9 of 11 bounds moved, every group run cold).
-    None where no neighbourhood short of the whole file fits, which is then cut anew whole."""
-    nodes = sorted(own)
-    groups = session.cut_by(nodes, bounds)
-    weight = {node: own[node] for node in nodes}
-    setup = [max(ran - sum(weight[node] for node in group), 0.0)
+    A group that is one unit (a test heavier than the bound) runs alone however the file is cut, as the plan
+    keeps it (`session.holds`). None where a group holds no recorded test or no neighbourhood short of the
+    whole file fits, which is then cut anew whole."""
+    groups = session.cut_by(list(own), bounds)
+    if not all(groups):
+        return None
+    setup = [max(ran - sum(own[node] for node in group), 0.0)
              for ran, group in zip(measured, groups, strict=True)]
-    for outgrown in [index for index, ran in enumerate(measured) if ran > limit]:
-        if (sum(weight[node] for node in groups[outgrown]) + setup[outgrown] <= limit
-                or len(session.units(groups[outgrown])) == 1):
-            continue  # an earlier neighbourhood's cut took it within its bound
+    weighs = [max(ran, sum(own[node] for node in group) + paid)
+              for ran, group, paid in zip(measured, groups, setup, strict=True)]
+
+    def outgrown() -> int | None:
+        return next((index for index, group in enumerate(groups)
+                     if weighs[index] > limit and len(session.units(group)) > 1), None)
+
+    # Each pass brings one more group within the bound and moves none outside its window: it ends.
+    while (index := outgrown()) is not None:
         for reach in range(1, len(groups)):
-            low, high = max(0, outgrown - reach), min(len(groups), outgrown + reach + 1)
+            low, high = max(0, index - reach), min(len(groups), index + reach + 1)
             if (low, high) == (0, len(groups)):
                 return None
             tests = [node for group in groups[low:high] for node in group]
-            cut = session.cut(tests, [weight[node] for node in tests], high - low)
+            cut = session.cut(tests, [own[node] for node in tests], high - low)
             shared = sum(setup[low:high]) / (high - low)
-            # A group of one unit past the bound (a test heavier than it) runs alone however it is cut.
-            if all(cut) and all(sum(weight[node] for node in group) + shared <= limit
-                                or len(session.units(group)) == 1 for group in cut):
+            if all(cut) and session.holds(cut, own, limit - shared):
                 groups[low:high], setup[low:high] = cut, [shared] * (high - low)
+                weighs[low:high] = [sum(own[node] for node in group) + shared for group in cut]
                 break
         else:
             return None
