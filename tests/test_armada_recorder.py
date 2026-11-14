@@ -3,6 +3,7 @@ record keys the file's row in the test cache (tools/armada/ci.py's `cache_key`):
 read, imported and started, for the process's whole life, and its children's."""
 
 import json
+import zipfile
 
 import pytest
 from armada_support import ON_SRC, PASSING, cached, interpreter, lifetime_task, loaded, reusable_now, written
@@ -61,6 +62,36 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     assert ci.gpu_tier("3.12") == {"tests/test_child.py": ["tests/devices.py:placed"],
                                    "tests/test_killed.py": ["changed"],
                                    "tests/test_own_environment.py": ["changed"]}
+
+
+def test_a_python_child_uv_runs_over_this_environment_joins_its_files_record(ci, tmp_path, monkeypatch,
+                                                                            cache_worker):
+    """uv's run of this very interpreter with a requirement layered over its environment (`uv run --python
+    <this interpreter> --with ...`, a release's code under its own transformers) starts a Python child that
+    records itself as any other does: its file keeps its key, which holds until a file it executed changes
+    (train 812's review: counted as unfollowed, its file and every one after it in their process kept none)."""
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    wheel = tmp_path / "layered-1.0-py3-none-any.whl"
+    info = "layered-1.0.dist-info"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("layered/__init__.py", "")
+        archive.writestr(f"{info}/METADATA", "Metadata-Version: 2.1\nName: layered\nVersion: 1.0\n")
+        archive.writestr(f"{info}/WHEEL", "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\n"
+                                          "Tag: py3-none-any\n")
+        archive.writestr(f"{info}/RECORD", "")
+    launched = ["uv", "run", "--offline", "--no-project", "--python", "{python}", "--with", str(wheel),
+                "python", "-c", "import layered, plain"]
+    written(tmp_path, {
+        "plain.py": "def helper(): return 1\n",
+        "test_layered.py": "import subprocess, sys\ndef test_layered():\n"
+                           f"    words = [sys.executable if word == '{{python}}' else word for word in {launched!r}]\n"
+                           "    subprocess.run(words, check=True, cwd='tests')\n"})
+    interpreter(tmp_path, "3.12")
+    ci.task("3.12", ["tests/test_layered.py"], "", tmp_path / "verdict.json", 600.0)
+    assert reusable_now(ci, ["tests/test_layered.py"]) == [True]
+    (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
+    assert reusable_now(ci, ["tests/test_layered.py"]) == [False]
 
 
 def test_new_tests_spread_across_a_split_files_groups_and_their_groups_run_until_the_record_names_them(

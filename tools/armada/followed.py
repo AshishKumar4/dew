@@ -359,11 +359,24 @@ def start(event: str, args: tuple, directory: str) -> str | None:
     if native(programs(event, args)):
         return None
     if event == "subprocess.Popen":
-        program, environment = args[0], args[3]
+        program, argv, environment = args[0], args[1], args[3]
         named = (os.environ if environment is None else environment).get(CHILDREN)
-        if named == directory and _this_python(program):
+        if named == directory and (_this_python(program) or _launched_here(argv)):
             return "followed"
     return "unfollowed"
+
+
+def _launched_here(argv) -> bool:
+    """Whether `argv` is uv's run of this very interpreter (`uv run ... --python <this interpreter> ...`), which layers a
+    requirement over this environment and runs its Python with it, the `.pth` among its paths, so the child records
+    itself as any other does (tests/release_support.py: a release's code under its own transformers; train 812's
+    review: counted as unfollowed, its files and every file after them in their process kept no key)."""
+    if isinstance(argv, (str, bytes, os.PathLike)) or argv is None:
+        return False
+    words = [os.fsdecode(word) for word in argv if isinstance(word, (str, bytes, os.PathLike))]
+    if len(words) < 4 or os.path.basename(words[0]) != "uv" or words[1] != "run" or "--python" not in words:
+        return False
+    return _this_python(words[words.index("--python") + 1]) if words.index("--python") + 1 < len(words) else False
 
 
 def _beneath_popen() -> bool:
