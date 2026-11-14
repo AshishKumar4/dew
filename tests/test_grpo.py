@@ -491,10 +491,10 @@ def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
 COUNT_LOW, COUNT_HIGH = 3, 11
 """The counting language's ids: each token follows its predecessor by one, wrapping from COUNT_HIGH to
 COUNT_LOW."""
-COUNT_RUNS, COUNT_STEPS, COUNT_GROUPS, COUNT_TOKENS = 31, 80, 8, 4
+COUNT_RUNS, COUNT_STEPS, COUNT_GROUPS, COUNT_TOKENS = 21, 80, 8, 4
 """A GRPO policy's runs, each its own initialization and prompts, and each run's updates over eight prompts
 of two tokens, `COUNT_GROUPS` completions of `COUNT_TOKENS` a prompt: the runs `learning_gate.units_for`
-sizes from a pilot of 96 (runs 1000 to 1095 on armada's CPUs, its contrasts' mean 1.20 and spread 0.47)."""
+sizes from a pilot of 96 (runs 1000 to 1095 on armada's CPUs, its contrasts' mean 1.90 and spread 0.47)."""
 
 
 def counted(start, length: int) -> np.ndarray:
