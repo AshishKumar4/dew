@@ -1046,30 +1046,29 @@ def key_diagonal_pairs_back(strips: list, own: list, behind: Callable[[jax.Array
                             *, sub: int = SUB) -> tuple:
     """`key_diagonal_bands`' transpose on one key block, added onto its gradients so far `d_rows` (one a
     pairs' gradient) and `d_keys`: for each offset `e` the band `dP[i, i - e]` of each pairs' gradient
-    `strips[p](e)` within `i`'s sub-chunk, a row's vector `[C]` (a row of the pairs' gradients' own bands laid
-    an offset a row, `own_bands`, read once a launch: read from each chunk's `[C, C]` square at every offset
-    and key block, an sm100's own pairs' backward took 0.844 ms of Kimi Linear's training, M-JS-119), and each
-    pair's own decay, the product of its tokens' own formed across the offsets as the forward forms it
-    (`behind(e)`: the keys and each token's own decay, each row holding the token `e` before its own's, as
-    `key_diagonal_bands` reads them); the rows' `dP[i, i - e] k_{i - e}` decayed, and the keys' `sum_p dP[i, i
-    - e] r_i` decayed (`own[p]()` the rows, read where weighed), formed on the rows `i` and moved up to the
-    keys `i - e` (`lower(e, x)`: row `i` of `x` at row `i - e`, any value past the tile's end, masked). Every
-    factor at most one (fla_kda's token-parallel diagonal's gradient, chunk_kda_bwd_intra's diagonal blocks).
-    A row before its offset is masked on its strips, its terms a zero strip's: its keys and decays read below
-    its sub-chunk finite (`behind`'s, the staged rows below the chunk zeroed), where the gradients' every term
-    held to its mask was a quarter of a B200's own pairs' backward's issues."""
+    `strips[p](e)` within `i`'s sub-chunk, a row's vector `[C]` (a row of the pairs' gradients' own bands
+    laid an offset a row, `own_bands`, read once a launch: read from each chunk's `[C, C]` square at every
+    offset and key block, an sm100's own pairs' backward took 0.844 ms of Kimi Linear's training,
+    M-JS-119), and each pair's own decay, the product of its tokens' own formed across the offsets as the
+    forward forms it (`behind(e)`: the keys and each token's own decay, each row holding the token `e`
+    before its own's, as `key_diagonal_bands` reads them); the rows' `dP[i, i - e] k_{i - e}` decayed, and
+    the keys' `sum_p dP[i, i - e] r_i` decayed (`own[p]()` the rows, read where weighed), formed on the
+    rows `i` and moved up to the keys `i - e` (`lower(e, x)`: row `i` of `x` at row `i - e`, any value
+    past the tile's end, masked). Every factor at most one (fla_kda's token-parallel diagonal's gradient,
+    chunk_kda_bwd_intra's diagonal blocks). A row before its offset is zero on its strips (`own_bands`
+    lays them so), its terms a zero strip's: its keys and decays read below its sub-chunk finite
+    (`behind`'s, the staged rows below the chunk zeroed), where the gradients' every term held to its mask
+    was a quarter of a B200's own pairs' backward's issues."""
     index, _ = _grid(d_keys.shape)
-    token = jax.lax.broadcasted_iota(jnp.int32, (index.shape[0],), 0)
 
     def offset(e, carried):
         d_rows, d_keys, pair, following = carried
         keys, decays = behind(e)
         pair = pair * following
         # A row before its offset reads below its sub-chunk, finite values (the staged rows below the chunk
-        # zeroed), its strip's mask its terms'. The keys' terms are moved up from the rows `e` below, each
-        # within its sub-chunk where selected.
-        within = token % sub >= e
-        bands = [jnp.where(within, strip(e), 0.0)[:, None] for strip in strips]
+        # zeroed), its strip zero there (`own_bands`) its terms'. The keys' terms are moved up from the rows
+        # `e` below, each within its sub-chunk where selected.
+        bands = [strip(e)[:, None] for strip in strips]
         d_rows = tuple(total + strip * keys * pair for total, strip in zip(d_rows, bands, strict=True))
         # The rows read where they are weighed, not held across the offsets: held, an sm100's own pairs'
         # backward needed all of its 248 registers, read here 232 (row 5298).

@@ -219,10 +219,11 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
     """`(dq, dk, dg [R, HV * Dk], dbeta [HV, R])` fp32: each chunk and value head's gradients through its
     sub-chunks' own pairs, each its own decay (`algebra.key_diagonal_pairs_back`), given the pairs'
     gradients `d_scores` and `d_system` `[R, HV * C]`: a launch of their own, no products on the tensor
-    cores, as the forward's (`intra_own`), each key block's offsets reading the pairs' gradients' own bands
-    (`algebra.own_bands`, taken once from the squares, a column an offset, `algebra.band_strip`) and the keys
-    and the tokens' own decays shifted (`shifted_keys`). In `_key_pairs_back`'s walk, they held an H100's Kimi
-    Linear launch at 248 registers, 2268 us against 672 (M-JS-50d)."""
+    cores, as the forward's (`intra_own`), each key block's offsets reading the pairs' gradients' own
+    bands (`algebra.own_bands`, taken once from the squares, laid an offset a row `[HV * SUB, R]`: each
+    offset's strip a row read as a row's vector) and the keys and the tokens' own decays shifted
+    (`shifted_keys`). In `_key_pairs_back`'s walk, they held an H100's Kimi Linear launch at 248
+    registers, 2268 us against 672 (M-JS-50d)."""
     chunk, width, family = call.chunk, call.width, call.family
     given, gates, square = call.given, call.gates, fp32_operand(call)
     # The block a multiprocessor holds most programs of, at its registers and its shared memory: by its
