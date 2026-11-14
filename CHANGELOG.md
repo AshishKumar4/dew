@@ -8,7 +8,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 ## Unreleased
 
 - A run's plan search, past a candidate whose compile misses, asks for the split computed from the
-  compile that missed (`dew.training.memory.Miss`): the first at which its temporaries, taken as scaled
+  compile that missed (`dew.training.memory.MemoryMiss`): the first at which its temporaries, taken as scaled
   by a microbatch's rows, leave room for its shortfall. This replaces the forecast (`Forecast`) and the
   halving. A split that fits past one not asked is followed by the split before it until one misses, so
   the plan is still the fewest microbatches that fit; where none is computed to fit, the finest is asked
