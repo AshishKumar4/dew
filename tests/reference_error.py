@@ -628,23 +628,26 @@ def _platform_branch(equation, platform: str | None):
     return None if chosen is None else programs.branches(equation)[programs.platform_branch(chosen, platform)]
 
 
-def equations(graph, *, platform: str | None = None):
+def equations(graph, *, platform: str | None = None, skip=None):
     """Every equation of a jaxpr, its sub-jaxprs' (scan, cond, custom rules) in turn. With `platform`
     (a lowering platform's name: 'cpu', 'cuda', 'tpu'), a platform-dependent cond
-    (`jax.lax.platform_dependent`) gives only the branch that platform runs, as lowering keeps it."""
+    (`jax.lax.platform_dependent`) gives only the branch that platform runs, as lowering keeps it. With
+    `skip`, an equation it holds and every equation within it are passed over."""
     if hasattr(graph, "eqns"):
         for equation in graph.eqns:
+            if skip is not None and skip(equation):
+                continue
             yield equation
             kept = _platform_branch(equation, platform)
-            yield from equations(equation.params if kept is None else kept, platform=platform)
+            yield from equations(equation.params if kept is None else kept, platform=platform, skip=skip)
     elif hasattr(graph, "jaxpr"):
-        yield from equations(graph.jaxpr, platform=platform)
+        yield from equations(graph.jaxpr, platform=platform, skip=skip)
     elif isinstance(graph, dict):
         for value in graph.values():
-            yield from equations(value, platform=platform)
+            yield from equations(value, platform=platform, skip=skip)
     elif isinstance(graph, (tuple, list)):
         for value in graph:
-            yield from equations(value, platform=platform)
+            yield from equations(value, platform=platform, skip=skip)
 
 
 def dot_precisions(function, *arguments) -> list:
@@ -670,10 +673,11 @@ def logits_operands(function, *arguments, width: int) -> set:
     them: the witness of a policy that widens the query and keys before their product (`wide_logits`), which
     no output shows on a CPU, whose compiler may keep a bf16 result wider than bf16 (rows 5429 and 5439).
     jax.nn's 16-bit logits are fp32 sums of 16-bit operands, which this tells apart. A float64 sum Dew's wide
-    CPU arithmetic takes (`dew.nn.precision.float64_sum`) multiplies float64."""
+    CPU arithmetic takes (`dew.nn.precision.float64_sum`) multiplies float64. A selection's scoring, which
+    ranks keys rather than weighing them (`dew.nn.sparse_selection.SELECTING`), is no logits' product."""
     graph = jax.make_jaxpr(function)(*arguments)
     found = set()
-    for equation in equations(graph):
+    for equation in equations(graph, skip=_selecting):
         if equation.primitive is not jax.lax.dot_general_p:
             continue
         # Its contracted axes' lengths, which its two operands share.
@@ -681,6 +685,13 @@ def logits_operands(function, *arguments, width: int) -> set:
         if [equation.invars[0].aval.shape[axis] for axis in contracted] == [width]:
             found.add(jnp.promote_types(*(variable.aval.dtype for variable in equation.invars)))
     return found
+
+
+def _selecting(equation) -> bool:
+    """Whether `equation` runs within a selection's scoring scope (`dew.nn.sparse_selection.SELECTING`)."""
+    from dew.nn.sparse_selection import SELECTING
+
+    return any(getattr(scope, "name", None) == SELECTING for scope in equation.source_info.name_stack.stack)
 
 
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
