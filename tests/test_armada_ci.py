@@ -1890,10 +1890,10 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
                ("src/other/optional.py", "VALUE = 1\n", [1, 2]), ("src/other/optional.py", None, [1, 3]),
                ("src/other/lone/__init__.py", "def value(): return 5\n", [1, 4]),
                ("src/other/lone/__init__.py", None, [1, 5]), ("tests/test_added.py", None, [1, 5]),
-               # test_lone ran in one process with test_uses, so its record holds the package lookups that
-               # process made: they changed, it runs too, as a key reads what its run read.
-               ("src/pkg/space/__init__.py", "", [2, 6]), ("src/pkg/space/__init__.py", None, [3, 7]),
-               ("src/top/__init__.py", "", [4, 8])]
+               # test_lone's last run was alone in its process, so its record holds none of test_uses'
+               # package lookups: only test_uses runs.
+               ("src/pkg/space/__init__.py", "", [2, 5]), ("src/pkg/space/__init__.py", None, [3, 5]),
+               ("src/top/__init__.py", "", [4, 6])]
     for path, source, runs in changes:
         if path and source is None:
             (tmp_path / path).unlink()
