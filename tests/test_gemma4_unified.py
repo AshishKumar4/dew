@@ -107,14 +107,15 @@ def rows_forward(native, wide: bool = False):
     return as_given(run, programs=rows if wide else None)
 
 
-def assert_forward(source, draw, label, site):
-    """Check 1 of Dew's forward against the recorded transformers' over the site's draws (`<site>.npz`, its
-    evidence alone), Dew's own float64 forward held to the recorded truth at each (`rows_forward`)."""
+def assert_forward(source, draw, label, site, summary: bool = True):
+    """Check 1 of Dew's forward against the recorded transformers' over the site's draws (`<site>.npz`): its
+    evidence alone, Dew's own float64 forward held to the recorded truth at each (`rows_forward`), or with
+    `summary` false its outputs whole, the recorded truth the reference's."""
     ours = rows_forward(source[0])
     stored = recording(FIXTURE / f"{site}.npz")
     seeds = int(stored[f"{site}.seeds"])
-    drawn, reference, truth = indexed_recording(stored, site, seeds, inputs_of=draw,
-                                                truth_fn=rows_forward(source[0], wide=True))
+    wide = rows_forward(source[0], wide=True) if summary else None
+    drawn, reference, truth = indexed_recording(stored, site, seeds, inputs_of=draw, truth_fn=wide)
     assert_as_exact(as_given(lambda index, inputs: ours(inputs)), reference, drawn,
                     label, seeds=seeds, truth_fn=truth)
 
@@ -131,8 +132,10 @@ def test_vision_blocks_longer_than_the_window_keep_their_whole_block(source):
 
 def test_a_bfloat16_unified_source_uses_the_same_media_and_decoder_policy():
     source = source_pair(FIXTURE, "bfloat16")
+    # Its outputs whole: Dew's float64 forward of its bfloat16 load is not the reference's float64 run of
+    # transformers' bfloat16 one (its sketch 6e-2 away at seed 0), whose weights the two load otherwise.
     assert_forward(source, lambda seed: unified_draw(source[1].config, seed),
-                    "Gemma4 Unified bfloat16 source forward", "bfloat16")
+                    "Gemma4 Unified bfloat16 source forward", "bfloat16", summary=False)
 
 
 AUDIO_FRAMES = 16
