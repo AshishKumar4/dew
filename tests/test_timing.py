@@ -236,3 +236,19 @@ def test_a_cases_profiles_run_inside_one_more_window(tmp_path):
     assert [state for _, state in profiled] == ["open", "open"]
     assert all(session.granted[1] <= float(at) <= session.released[1] for at, _ in profiled)
 
+
+
+def test_a_device_worker_runs_no_command_buffers_unless_its_arm_names_them(monkeypatch):
+    """A worker reading device time runs no command buffers, its flag after those it inherits (a harness's
+    `FUSION` among them), so the last occurrence, its own, holds; an arm naming them keeps its own, and a
+    wall-clock worker runs as it would."""
+    from dew.telemetry.benchmark import UNGRAPHED
+
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_enable_command_buffer=FUSION")
+    named = {"XLA_FLAGS": "--xla_gpu_enable_command_buffer=CUBLAS"}
+    with run_from("timing", "tools") as timing:
+        device = timing.worker_env({}, "device")["XLA_FLAGS"].split()
+        assert device[-1] == f"--xla_gpu_enable_command_buffer={UNGRAPHED}"
+        assert device[0] == "--xla_gpu_enable_command_buffer=FUSION"
+        assert timing.worker_env(named, "device") == named
+        assert timing.worker_env({}, "wall") == {}
