@@ -24,8 +24,8 @@ its map tasks."""
 
 CENSUS = "DEW_GATE_CENSUS"
 """The environment variable whose being set runs check 1's arms with YNNPACK's fusions on (no WITHOUT_YNN,
-`reference_error.switched_off`), as CPU users compile them: the census the whole suite runs every fifth
-publish (the plan's `--census`), each red it finds filed and judged Dew's or XLA:CPU's (row 4471;
+`reference_error.switched_off`), as CPU users compile them: the census (the plan's `--census`, the land
+queue's census run), each red it finds filed and judged Dew's or XLA:CPU's (row 4471;
 docs/design/testing.md, "the YNNPACK switch")."""
 
 STAGES = "DEW_CHECK1_STAGES"
@@ -37,5 +37,4 @@ QUALIFY = "DEW_CHECK1_QUALIFY"
 (`reference_error._qualified`) and fail where the count it sizes is above the count it declares: a file,
 to which each site appends what it sized, a line of JSON. A declared count is a fact of the site, of the
 arithmetic at the commit that sized it and of the host level, so a head that changes how an arm rounds runs
-the sites its diff reaches so, and main's daily whole run does (docs/design/testing.md, "a declared
-count")."""
+the sites its diff reaches so (docs/design/testing.md, "a declared count")."""

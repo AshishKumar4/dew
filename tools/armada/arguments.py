@@ -29,24 +29,12 @@ def task_arguments(running: argparse.ArgumentParser, pythons: Sequence[str], dea
     running.add_argument(
         "--cache", required=True,
         help="the plan's DEW_TEST_CACHE (`policy`): on, cold (looked up, run cold), or off")
-    running.add_argument("--whole", choices=("0", "1"), default="0",
-                         help="the plan's DEW_WHOLE_SUITE: 1 on the whole suite's run, which runs its cells")
     running.add_argument("--census", choices=("0", "1"), default="0",
                          help="the plan's census: 1 runs the tests under check 1's CENSUS, recording no row")
     running.add_argument("--deadline", type=float, default=deadline,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     running.add_argument("--coverage", type=Path, default=None,
                          help="run the files under coverage.py, its data file in this directory")
-
-
-def release_arguments(planning: argparse.ArgumentParser, checking: argparse.ArgumentParser,
-                      pythons: Sequence[str]) -> None:
-    """The `release-plan` and `release` operations' arguments: a whole suite's second job (`release_plan`)."""
-    planning.add_argument("verdict", type=Path, help="armada verdict <sha> --json")
-    checking.add_argument("--python", choices=pythons, required=True)
-    checking.add_argument("--tests", required=True)
-    checking.add_argument("--requirement", required=True)
-    checking.add_argument("--out", type=Path, required=True)
 
 
 def tier_arguments(choosing: argparse.ArgumentParser) -> None:
@@ -73,8 +61,6 @@ def parser(pythons: Sequence[str], deadline: float) -> argparse.ArgumentParser:
     selecting.add_argument("--tests", default="", help="the files --split's group is of, space-separated")
     selecting.add_argument("--split", default="",
                            help="--tests' group as CI names it: 1/3, a check-1 site's test or its draws")
-    selecting.add_argument("--whole", action="store_true",
-                           help="select as main's whole run does, its whole_suite cells too (a bisect)")
     selecting.add_argument("arguments", nargs=argparse.REMAINDER,
                            help="after --, pytest's own: files, node ids and options")
     measuring = operations.add_parser("coverage")
@@ -105,10 +91,6 @@ def parser(pythons: Sequence[str], deadline: float) -> argparse.ArgumentParser:
     flagging.add_argument("verdict", type=Path, help="armada verdict <sha> --json")
     flagging.add_argument("--new", type=Path, default=None,
                           help="the durations record the change is measured against: only the tests it lacks")
-    release_arguments(
-        operations.add_parser("release-plan", help="a whole suite verdict's release checks, a task each"),
-        operations.add_parser("release", help="one requirement's release checks; exit 1 on a red row"),
-        pythons)
     whole = operations.add_parser(
         "partition", help="whether a whole verdict's rows ran each collected test once; exit 1 where not")
     whole.add_argument("verdict", type=Path, help="armada verdict <sha> --json")

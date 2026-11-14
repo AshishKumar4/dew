@@ -11,23 +11,11 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
-import zipfile
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from armada_support import (
-    apart,
-    armada_task,
-    cached,
-    cached_checkout,
-    commit,
-    fetcher,
-    gpu_lane_at,
-    interpreter,
-    loaded,
-    written,
-)
+from armada_support import apart, armada_task, cached, cached_checkout, commit, interpreter, loaded, written
 from tool_support import git, load
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,9 +82,8 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     heavier than the target splits into groups of itself. On a pushed run
     3.14 runs its own files (NEWEST_FILES) the same way and imports every
     other one in a few collect-only tasks, its cache's policy on or off (a
-    policy-off train ran every file on both Pythons, doubling its suite); the
-    daily run (DEW_WHOLE_SUITE) runs every file on both, with nothing only
-    collected. Every row is named once, test_gen_api never."""
+    policy-off train ran every file on both Pythons, doubling its suite).
+    Every row is named once, test_gen_api never."""
     for name in ("test_heavy", "test_light", "test_new", "test_measured", "test_gen_api", "test_config"):
         (tmp_path / "tests" / f"{name}.py").write_text(
             "".join(f"def test_{each}(): pass\n" for each in "abcde"))
@@ -128,14 +115,6 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
         ("tests/test_config.py tests/test_light.py", "")]
     assert sorted(name for entry in off if entry["python"] == "3.14" and entry["split"] == ci.COLLECT
                   for name in entry["tests"].split()) == collected
-    monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
-    daily = ci.plan(120.0, {"files": {"3.12:tests/test_measured.py": 40.0, "3.12:tests/test_light.py": 30.0}})
-    for python in ("3.12", "3.14"):
-        ran = [(entry["tests"], entry["split"]) for entry in daily if entry["python"] == python]
-        assert {name for tests, _ in ran for name in tests.split()} == {
-            "tests/test_config.py", "tests/test_light.py", "tests/test_measured.py", "tests/test_heavy.py",
-            "tests/test_new.py"}
-    assert all(entry["split"] != ci.COLLECT and entry["cache"] == "off" for entry in daily)
 
 
 def test_a_split_groups_weight_covers_its_recorded_nodes_when_collection_has_new_tests(ci, tmp_path):
@@ -230,16 +209,14 @@ def test_the_newest_pythons_collection_is_planned_within_the_target_at_the_slowe
 
 
 def test_a_python_no_run_has_timed_weighs_a_file_by_another_pythons_time(ci, tmp_path, monkeypatch):
-    """A file 3.14 has no measured time for (3.14 runs every file only on the daily run) weighs, and
+    """A file 3.14 has no measured time for (3.14 runs every file only on the census) weighs, and
     splits, by 3.12's measured time of it, not by its tests' least recorded times, so armada's
     longest-first dispatch does not start it last (train 143: 3.14 tasks of 500-800 s, weighed near
     the target, started 550-760 s into the run)."""
     (tmp_path / "tests/test_heavy.py").write_text("")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {"tests/test_heavy.py::test_a": 150.0, "tests/test_heavy.py::test_b": 100.0}))
-    monkeypatch.setenv("DEW_TEST_CACHE", "off")
-    monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
-    entries = ci.plan(240.0, {"files": {"3.12:tests/test_heavy.py": 800.0}})
+    entries = ci.plan(240.0, {"files": {"3.12:tests/test_heavy.py": 800.0}}, census=True)
     weighed = {python: sum(entry["weight"] for entry in entries if entry["python"] == python)
                for python in ("3.12", "3.14")}
     assert weighed["3.14"] == weighed["3.12"] >= 800.0, weighed
@@ -276,21 +253,18 @@ def test_a_collect_task_rows_each_file_red_where_it_would_not_import(ci, tmp_pat
 
 def test_a_targeted_pytest_selects_the_tests_a_task_would_and_its_own_arguments_override(ci, tmp_path):
     """`ci.py pytest`, which a lane's targeted run uses (tmp/run_tests.py), runs the tests a CI task would,
-    with the task's own marker selection: a network test and a whole_suite cell are deselected; a `-m` of the
-    caller's own, after the selection, chooses instead; with `whole`, as main's whole run selects, its
-    whole_suite cells run, as a bisect of its red runs them (row 4230). Its exit status is pytest's."""
+    with the task's own marker selection: a network test is deselected; a `-m` of the caller's own, after the
+    selection, chooses instead. Its exit status is pytest's."""
     written(tmp_path, {"test_marked.py": "import pytest\n\ndef test_offline():\n    pass\n\n\n"
-                                         "@pytest.mark.network\ndef test_online():\n    pass\n\n\n"
-                                         "@pytest.mark.whole_suite\ndef test_cell():\n    pass\n"})
+                                         "@pytest.mark.network\ndef test_online():\n    pass\n"})
     interpreter(tmp_path, "3.12")
 
-    def ran(*arguments: str, whole: bool = False) -> tuple[int, list[str]]:
+    def ran(*arguments: str) -> tuple[int, list[str]]:
         report = tmp_path / "report.xml"
-        status = ci.targeted("3.12", ["tests/test_marked.py", *arguments], report, whole=whole)
+        status = ci.targeted("3.12", ["tests/test_marked.py", *arguments], report)
         return status, [case.get("name") for case in ET.parse(report).iter("testcase")]
 
     assert ran() == (0, ["test_offline"])
-    assert ran(whole=True) == (0, ["test_offline", "test_cell"])
     assert ran("-m", "network") == (0, ["test_online"])
     assert ran("-k", "nothing_matches")[0] == 5
 
@@ -654,13 +628,12 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
 def test_the_census_plans_the_whole_suite_cold_whatever_its_environment_says(ci, tmp_path, monkeypatch,
                                                                             capsys):
     """`plan --census`, as armada's run passes it after `--`: every file on both Pythons, nothing only
-    collected, every entry with the cache off and the whole suite's cells, though DEW_TEST_CACHE says on and
-    DEW_WHOLE_SUITE is unset, and each carrying the census to its task; a plan without it carries none."""
+    collected, every entry with the cache off, though DEW_TEST_CACHE says on, and each carrying the census to
+    its task; a plan without it carries none."""
     for name in ("test_light", "test_config", "test_other"):
         (tmp_path / "tests" / f"{name}.py").write_text("def test_ok(): pass\n")
     monkeypatch.setattr(ci, "NEWEST_FILES", ("tests/test_config.py",))
     monkeypatch.setenv("DEW_TEST_CACHE", "on")
-    monkeypatch.delenv("DEW_WHOLE_SUITE", raising=False)
     timings = tmp_path / "timings.json"
     timings.write_text("{}")
 
@@ -670,7 +643,7 @@ def test_the_census_plans_the_whole_suite_cold_whatever_its_environment_says(ci,
         return json.loads(capsys.readouterr().out)["include"]
 
     census = planned("--census")
-    assert {(entry["cache"], entry["whole"], entry["census"]) for entry in census} == {("off", "1", "1")}
+    assert {(entry["cache"], entry["census"]) for entry in census} == {("off", "1")}
     for python in ("3.12", "3.14"):
         assert {name for entry in census if entry["python"] == python for name in entry["tests"].split()} == {
             "tests/test_config.py", "tests/test_light.py", "tests/test_other.py"}
@@ -881,7 +854,6 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     assert run("GenuineIntel-6-143") == 11
     shared.write_text("")
     assert run("GenuineIntel-6-143") == 12
-
 
 
 def test_every_row_carries_its_cases_reports_and_a_reused_row_keeps_them(ci, tmp_path, monkeypatch,
@@ -1973,33 +1945,6 @@ def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):
         "not (layouts and dense) and not (layouts and moe) and not (layouts and hybrid)"]
 
 
-def test_whole_suite_tests_run_on_a_whole_suite_run_alone(ci, tmp_path, monkeypatch):
-    """A test marked whole_suite runs on the whole suite alone (DEW_WHOLE_SUITE, the daily run), and is set
-    aside on every other run, a train's whatever the cache's policy: a
-    policy-off train runs every file, but not a whole-suite cell (the maintainer, 2026-10-28, via Models:
-    train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline)."""
-    interpreter(tmp_path, "3.12")
-    written(tmp_path, {"test_matrix.py": "import pytest\nfrom pathlib import Path\n"
-                       "@pytest.mark.whole_suite\ndef test_cell():\n"
-                       "    with Path('runs-cell').open('a') as runs: runs.write('x')\n"
-                       "def test_contract():\n"
-                       "    with Path('runs-contract').open('a') as runs: runs.write('x')\n"})
-    (tmp_path / ".verdict").mkdir()
-    out = tmp_path / ".verdict/verdict.json"
-
-    def ran(policy: str, whole: str = "") -> list[int]:
-        monkeypatch.setenv("DEW_WHOLE_SUITE", whole)
-        rows = armada_task(ci, monkeypatch, out, policy)
-        assert [row["exitCode"] for row in rows] == [0]
-        return [len(path.read_text()) if path.exists() else 0
-                for path in (tmp_path / "runs-cell", tmp_path / "runs-contract")]
-
-    assert ran("on") == [0, 1]
-    assert ran("off") == [0, 2]
-    assert ran("off", "1") == [1, 3]
-
-
-
 def proven_step(tmp_path: Path, ref: str, runs: str, statuses: str) -> str:
     """The run .github/actions/proven's step gives, its own script run in bash for a push of `ref`, with a
     GitHub CLI that answers the successful-runs query with `runs` and the commit's statuses query with
@@ -2038,12 +1983,10 @@ def test_a_tip_the_land_queue_graded_green_is_proven_for_mains_push_alone(tmp_pa
     assert proven_step(tmp_path / "run", "refs/heads/fix/lane", "77\n", "") == "77"
 
 
-def suite_step(tmp_path: Path, ref: str, proven: str, policy: str, verdict: int,
-               whole: bool = False) -> list[list[str]]:
+def suite_step(tmp_path: Path, ref: str, proven: str, policy: str, verdict: int) -> list[list[str]]:
     """The armada commands ci.yml's suite step gives, its own script run in bash for a push of `ref` with
     the proven job's output `proven` and the cache's `policy`, beside an armada whose stored verdict at the
-    commit exits `verdict` (0 green, 1 red, 2 none), as main's whole run where `whole`: each call's words, a
-    call a list."""
+    commit exits `verdict` (0 green, 1 red, 2 none): each call's words, a call a list."""
     import yaml
 
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
@@ -2058,10 +2001,8 @@ def suite_step(tmp_path: Path, ref: str, proven: str, policy: str, verdict: int,
     (bin_dir / "armada").chmod(0o755)
     subprocess.run(["bash", "-c", script], cwd=ROOT, capture_output=True, text=True, timeout=120,
                    env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "PROVEN": proven,
-                        "DEW_TEST_CACHE": policy, "GITHUB_REF_NAME": ref,
-                        # As ci.yml's expressions give them: the whole run's bounded share and its mode.
-                        "BACKGROUND_POOL": "48" if whole else "", "DEW_WHOLE_SUITE": "1" if whole else "",
-                        "RUNNER_TEMP": str(tmp_path), "ARMADA_URL": "http://127.0.0.1:9", "ARMADA_TOKEN": ""})
+                        "DEW_TEST_CACHE": policy, "GITHUB_REF_NAME": ref, "RUNNER_TEMP": str(tmp_path),
+                        "ARMADA_URL": "http://127.0.0.1:9", "ARMADA_TOKEN": ""})
     return [line.split() for line in calls.read_text().splitlines()] if calls.exists() else []
 
 
@@ -2073,16 +2014,15 @@ def commands(calls: list[list[str]]) -> list[str]:
 def test_a_proven_push_runs_no_suite_though_its_stored_verdict_is_red(tmp_path):
     """Main's push of a tip the land queue graded green, its own CI run red on a row the regrade passed,
     carries the queue's proof: the suite step submits no suite, whatever the stored verdict or the cache's
-    policy (a train that changed what every test reads runs main's push with the cache off); the daily run,
-    which reads no proof, runs it as ever on main's tip, and an unproven push with a red verdict too (train
-    237's review, P1: the proof skipped the gangs alone)."""
+    policy (a train that changed what every test reads runs main's push with the cache off); an unproven push
+    with a red verdict, or with the cache off, runs it (train 237's review, P1: the proof skipped the gangs
+    alone)."""
     def ran(ref: str, proven: str, policy: str, verdict: int) -> bool:
         place = tmp_path / ref.replace("/", "-") / policy / (proven or "unproven")
         calls = suite_step(place, ref, proven, policy, verdict)
         return "run" in commands(calls)
 
     assert not ran("main", "4242", "on", 1) and not ran("main", "4242", "off", 1)
-    # The daily run reads no proof (the proven job runs on a push alone): main's tip, run anew.
     assert ran("main", "", "off", 0) and ran("fix/lane", "", "on", 1)
 
 
@@ -2116,12 +2056,9 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
     bin_dir.mkdir()
     (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n')
     (bin_dir / "armada").chmod(0o755)
-    # Main's whole run's gates start after every lane's run at a head, as its suite does.
-    for ref, whole, priority in (("fix/lane", "", []), ("main", "", ["--priority=5"]),
-                                 ("main", "1", ["--priority=-15"])):
+    for ref, priority in (("fix/lane", []), ("main", ["--priority=5"])):
         script = step["run"].replace("${{ github.sha }}", "a" * 40).replace("${{ github.ref_name }}", ref)
-        environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref,
-                       "WHOLE": whole}
+        environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref}
         ran = subprocess.run(["bash", "-c", script], cwd=checkout, capture_output=True, text=True, timeout=60,
                              env=environment)
         assert ran.returncode == 0, ran.stderr
@@ -2157,16 +2094,14 @@ def test_a_cold_suite_is_planned_with_its_cold_cost_and_given_a_long_deadline(ci
     assert deadline("off") == ["--deadline=5400"] and deadline("on") == ["--deadline=2700"]
 
 
-def run_options(tmp_path: Path, ref: str, policy: str, option: str, whole: bool = False) -> list[str]:
-    """The armada run's `option` words CI's suite step gives a push of `ref` under `policy`, main's whole
-    run's where `whole` (`suite_step`)."""
-    where = tmp_path / (ref.replace("/", "-") + ("-whole" if whole else ""))
-    calls = suite_step(where, ref, "", policy, 2, whole)
+def run_options(tmp_path: Path, ref: str, policy: str, option: str) -> list[str]:
+    """The armada run's `option` words CI's suite step gives a push of `ref` under `policy` (`suite_step`)."""
+    calls = suite_step(tmp_path / ref.replace("/", "-"), ref, "", policy, 2)
     [run] = [call for call in calls if call[0] == "run"]
     return [word for word in run if word.startswith(option)]
 
 
-def test_a_base_push_runs_at_a_targeted_runs_priority_and_the_background_suite_below_every_lanes(tmp_path):
+def test_a_base_push_runs_at_a_targeted_runs_priority_and_main_above_every_lanes(tmp_path):
     """A push to base/kernels runs its suite at a targeted run's priority, 0, with the suite's ordinary
     deadline, so it is graded: at a lane's whole-suite priority (-10) with the background deadline it waited
     behind every train, precheck and lane run and ran out its 6,000 s ungraded, every one of the eleven runs
@@ -2179,171 +2114,41 @@ def test_a_base_push_runs_at_a_targeted_runs_priority_and_the_background_suite_b
 
     assert priority("base/kernels") == ["--priority=0"]
     assert priority("fix/lane") == []
-    # Main's whole run (the schedule's, the queue's whole dispatch) is background work, below every lane's run
-    # at a head (verdict.sh's -10), so no head waits behind it (Main, 2026-11-06); a push to main stays its
-    # tip's test.
-    assert run_options(tmp_path, "main", "off", "--priority", whole=True) == ["--priority=-15"]
+    # A push to main the queue did not grade is its tip's only test.
     assert priority("main") == ["--priority=5"]
-    # Below every lane's, it waits for capacity within its deadlines: the suite's and its gangs' a background
-    # run's (train 663's review), on its bounded share.
-    calls = suite_step(tmp_path / "whole-deadlines", "main", "", "off", 2, whole=True)
-    assert {word for call in calls for word in call if word.startswith(("--deadline", "--pool=48"))} == {
-        "--deadline=6000", "--pool=48"}
-    # A base push, no background run now, on the pool armada gives it, has the suite's ordinary deadline.
+    # A base push, on the pool armada gives it, has the suite's ordinary deadline.
     assert run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline") == ["--deadline=2700"]
     assert run_options(tmp_path / "base-pool", "base/kernels", "on", "--pool") == []
 
 
 def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_path, monkeypatch, capsys):
     """A test whose own seconds in a task's run pass the group target (.armada.json's `target`) is flagged
-    from the verdict's rows, as no cut can bring its group within the target; a whole_suite cell is flagged
-    too, marked as running on the whole suite alone, however pytest comes to mark it (its own mark, its
-    class's, a parameter set's, a mark held in a name), which the run records in its row (bible §7: every
-    test past the target is reported); and with main's durations record, a test it lacks fails the check, a
-    cell newly marked whole_suite too, while one main holds already passes (owner, 2026-10-28: a new slow test
-    fails its lane's check; row 2073's cell ran 1,540 s)."""
+    from the verdict's rows, as no cut can bring its group within the target (bible §7: every test past the
+    target is reported); and with main's durations record, a test it lacks fails the check, while one main
+    holds already passes (owner, 2026-10-28: a new slow test fails its lane's check)."""
     interpreter(tmp_path, "3.12")
-    written(tmp_path, {"test_slow.py": "import time\nimport pytest\ncell = pytest.mark.whole_suite\n"
+    written(tmp_path, {"test_slow.py": "import time\nimport pytest\n"
                        "def test_old(): time.sleep(0.4)\n"
                        "def test_new(): time.sleep(0.6)\n"
                        "def test_quick(): pass\n"
-                       "@pytest.mark.whole_suite\ndef test_cell(): time.sleep(0.4)\n"
-                       "@cell\ndef test_named(): time.sleep(0.4)\n"
-                       "class TestHeld:\n    pytestmark = cell\n    def test_inside(self): time.sleep(0.4)\n"
-                       "@pytest.mark.parametrize('n', [1, pytest.param(2, marks=cell, id='big')])\n"
+                       "@pytest.mark.parametrize('n', [1, pytest.param(2, id='big')])\n"
                        "def test_sized(n): time.sleep(0.3 * n)\n"})
     (tmp_path / ".verdict").mkdir()
     out = tmp_path / ".verdict/verdict.json"
-    # The whole suite's run, which runs the cells too.
-    monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
     verdict = tmp_path / "verdict.json"
     verdict.write_text(json.dumps({"rows": armada_task(ci, monkeypatch, out, "off")}))
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 0.2}))
     base = tmp_path / "base.json"
-    held = ("test_old", "test_sized[1]", "test_cell", "test_named", "TestHeld::test_inside")
-    base.write_text(json.dumps({f"tests/test_slow.py::{name}": 0.4 for name in held}))
+    base.write_text(json.dumps({f"tests/test_slow.py::{name}": 0.4 for name in ("test_old",
+                                                                                 "test_sized[1]")}))
 
-    def slow(*options: str) -> tuple[int, dict[str, bool]]:
+    def slow(*options: str) -> tuple[int, list[str]]:
         monkeypatch.setattr(sys, "argv", ["ci.py", "slow", str(verdict), *options])
         code = ci.main()
         printed = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
-        return code, {item["test"].partition("::")[2]: item.get("whole_suite", False) for item in printed}
+        return code, sorted(item["test"].partition("::")[2] for item in printed)
 
-    assert slow() == (0, {"test_new": False, "test_old": False, "test_sized[1]": False, "test_cell": True,
-                          "test_named": True, "TestHeld::test_inside": True, "test_sized[big]": True})
-    assert slow("--new", str(base)) == (1, {"test_new": False, "test_sized[big]": True})
-
-
-def test_a_train_runs_row_names_the_whole_suite_cells_it_set_aside(ci, tmp_path, monkeypatch):
-    """A train's run sets a file's whole_suite cells aside, yet its row names them, as pytest marks them: main
-    then holds them though its train CI never times one, so a lane's whole-suite run of a cell main has is no
-    new slow test (verdict.sh), while one main has not stays new (2026-10-30: row 2116's two cells failed
-    every whole-suite run)."""
-    interpreter(tmp_path, "3.12")
-    written(tmp_path, {"test_cells.py": "import pytest\ncell = pytest.mark.whole_suite\n"
-                       "def test_plain(): pass\n"
-                       "@cell\ndef test_cell(): pass\n"
-                       "@pytest.mark.parametrize('n', [1, pytest.param(2, marks=cell, id='big')])\n"
-                       "def test_sized(n): pass\n"})
-    (tmp_path / ".verdict").mkdir()
-    rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", "off")
-    assert [(sorted(row["tests"]), row.get("whole_suite")) for row in rows] == [
-        (["tests/test_cells.py::test_plain", "tests/test_cells.py::test_sized[1]"],
-         ["tests/test_cells.py::test_cell", "tests/test_cells.py::test_sized[big]"])]
+    assert slow() == (0, ["test_new", "test_old", "test_sized[1]", "test_sized[big]"])
+    assert slow("--new", str(base)) == (1, ["test_new", "test_sized[big]"])
 
 
-def a_wheel(root: Path, name: str, version: str) -> Path:
-    """A pure-Python wheel of `name` at `version` whose module says its version, as an index serves one."""
-    wheel = root / f"{name}-{version}-py3-none-any.whl"
-    info = f"{name}-{version}.dist-info"
-    files = {f"{name}/__init__.py": f"VERSION = {version!r}\n",
-             f"{info}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
-             f"{info}/WHEEL": "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\n"
-                              "Tag: py3-none-any\n"}
-    with zipfile.ZipFile(wheel, "w") as archive:
-        for path, text in files.items():
-            archive.writestr(path, text)
-        recorded = [*files, f"{info}/RECORD"]
-        archive.writestr(f"{info}/RECORD", "".join(f"{path},,\n" for path in recorded))
-    return wheel
-
-
-def test_a_release_check_marked_whole_suite_or_network_too_runs_in_its_release_task_alone(
-        ci, tmp_path, monkeypatch, cache_worker):
-    """A release_env test marked whole_suite or network too runs in its release task, never set aside there
-    as the whole suite's or the network lane's cells, and the network lane, which lacks its requirement,
-    never runs it (the bundle's review: such a check was planned, deselected by its own task, and reported
-    green)."""
-    url, _, _ = cache_worker
-    gpu_lane_at(tmp_path, monkeypatch, url, 0)
-    interpreter(tmp_path, "3.12")
-    fetcher(tmp_path)
-    pinned = a_wheel(tmp_path, "pinned", "2.0")
-    written(tmp_path, {"test_release.py": "import pytest\nfrom pathlib import Path\n" + "".join(
-        f"@pytest.mark.release_env({str(pinned)!r})\n@pytest.mark.{also}\n"
-        f"def test_{also}_too():\n    import pinned\n    Path('ran-{also}').write_text(pinned.VERSION)\n"
-        for also in ("whole_suite", "network"))})
-    monkeypatch.setenv("UV_OFFLINE", "1")
-    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
-    out = tmp_path / "verdict.json"
-    assert ci.gpu_lane("3.12", ["tests/test_release.py"], out, cache="off", processes=1, deadline=600.0,
-                       network=True) == 0
-    assert not (tmp_path / "ran-network").exists(), "the network lane ran a release check"
-    monkeypatch.setattr(sys, "argv", ["ci.py", "release", "--python=3.12", "--tests=tests/test_release.py",
-                                      f"--requirement={pinned}", f"--out={tmp_path / 'release.json'}"])
-    assert ci.main() == 0
-    assert [(tmp_path / f"ran-{also}").read_text() for also in ("whole_suite", "network")] == ["2.0", "2.0"]
-
-
-@pytest.mark.parametrize("mark", ["release_env()", "release_env(requirement='pinned==2.0')",
-                                  "release_env('pinned==2.0', 'other==1.0')", "release_env(2)"])
-def test_a_release_mark_without_one_requirement_fails_its_files_collection(ci, tmp_path, monkeypatch, mark):
-    """A release_env mark that names no one requirement string (none, a keyword's, two, or not a string)
-    fails its file's collection, naming its test: every suite task sets a marked test aside, and no release
-    task would plan it, so it would run nowhere (the maintainer's read of 6b48c32ee)."""
-    interpreter(tmp_path, "3.12")
-    written(tmp_path, {"test_release.py": f"import pytest\n@pytest.mark.{mark}\n"
-                       "def test_under_the_release():\n    pass\n"
-                       "def test_plain():\n    pass\n"})
-    (tmp_path / ".verdict").mkdir()
-    [row] = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", "off")
-    assert row["exitCode"] != 0, row["output"]
-    assert "tests/test_release.py::test_under_the_release" in row["output"] and "release_env" in row["output"]
-
-
-def test_a_release_check_runs_in_the_whole_suites_second_job_under_its_requirement(ci, tmp_path, monkeypatch,
-                                                                                   capsys):
-    """A test marked release_env(<requirement>) checks a release's own code under a package pinned apart from
-    the suite's (2173: LFM3's needs transformers>=5.18.0, MiMo-V2's <=5.1.0): every suite task sets it aside,
-    as the suite's environment lacks its requirement, and its file's row names it as pytest resolved its mark;
-    from a whole suite's rows, its second job plans a task each requirement, whose pytest runs with the
-    requirement over the suite's environment (uv's overlay, torch and jax the suite's), under a row of its
-    own beside its file's, and exits 1 on a red one."""
-    interpreter(tmp_path, "3.12")
-    pinned = a_wheel(tmp_path, "pinned", "2.0")
-    written(tmp_path, {"test_release.py": "import pytest\n"
-                       "@pytest.mark.release_env(" + repr(str(pinned)) + ")\n"
-                       "def test_under_the_release():\n    import pinned\n"
-                       "    assert pinned.VERSION == '2.0'\n"
-                       "def test_plain():\n    pass\n"})
-    monkeypatch.setenv("UV_OFFLINE", "1")
-    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
-    monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
-    (tmp_path / ".verdict").mkdir()
-    rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", "off")
-    assert [(found["name"], found["exitCode"], found.get("release_env")) for found in rows] == [
-        ("3.12:tests/test_release.py", 0, {str(pinned): ["tests/test_release.py::test_under_the_release"]})]
-    verdict = tmp_path / "verdict.json"
-    verdict.write_text(json.dumps({"rows": rows}))
-    capsys.readouterr()
-    monkeypatch.setattr(sys, "argv", ["ci.py", "release-plan", str(verdict)])
-    assert ci.main() == 0
-    [item] = json.loads(capsys.readouterr().out)
-    assert item == {"release": str(pinned), "python": "3.12", "tests": "tests/test_release.py"}
-    out = tmp_path / ".verdict/release.json"
-    monkeypatch.setattr(sys, "argv", ["ci.py", "release", f"--python={item['python']}",
-                                      f"--tests={item['tests']}", f"--requirement={item['release']}",
-                                      f"--out={out}"])
-    assert ci.main() == 0
-    assert [(found["name"], found["exitCode"]) for found in json.loads(out.read_text())["rows"]] == [
-        (f"3.12:tests/test_release.py#release:{pinned}", 0)]

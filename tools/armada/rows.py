@@ -72,16 +72,3 @@ def place_variant(group: str) -> str:
     """The process variant a record's group (`key_parts`) is of (`row_place`: `whole-as-<variant>`,
     `<index>-of-<count>-as-<variant>`); none, the lane's own process's."""
     return group.partition("-as-")[2]
-
-
-def release_plan(verdict: dict, python: str) -> list[dict]:
-    """The release checks of a whole suite's `verdict` (`armada verdict <sha> --json`), a task each
-    requirement: the files whose rows name checks under it (`release_env`, as pytest resolved each test's
-    mark before any selection: executed.py), which the run's own tasks set aside, as the suite's environment
-    lacks it (ci.py's `selected`), each run on `python` (the oldest tested). ci.py's `release` runs them."""
-    checks: dict[str, set[str]] = {}
-    for found in verdict["rows"]:
-        for requirement in found.get("release_env", {}):
-            checks.setdefault(requirement, set()).add(parsed_row(found["name"])[1])
-    return [{"release": requirement, "python": python, "tests": " ".join(sorted(names))}
-            for requirement, names in sorted(checks.items())]
