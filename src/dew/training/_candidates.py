@@ -29,7 +29,7 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
 from dew.nn.kernels.options import owned_program, trace_context
 from dew.nn.kernels.templates import report
-from dew.nn.sharding import Link, Schedule
+from dew.nn.sharding import Link, Schedule, spread_axes, spread_over
 from dew.state import Accumulation, TrainState, apart, taken, together
 from dew.training import staging
 from dew.training._lowering import KernelReport, Routed, kernel_report, routed
@@ -206,6 +206,8 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
         with _KEEPING:
             if (kept := _CANDIDATES.get(key)) is not None:
                 _CANDIDATES.move_to_end(key)
+                # Its links decide as its trace decided them: the key holds their figures (`trace_context`).
+                spread_over(kept.spread)
                 sampled = _sampled(stepping, kept, batch, placement, replicated, split, platforms)
                 return dataclasses.replace(kept, sampled=sampled)
     candidate = _candidate(stepping, state, batch, schedule, placement, replicated, split, narrow,
@@ -218,7 +220,7 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
             # Its trace not kept (`lowers`, `traces`): a kept derivation traces its step again where it is
             # lowered, and a kept floor its gradient where the search asks.
             _CANDIDATES[key] = dataclasses.replace(candidate, micro=_shapes(candidate.micro), sampled=None,
-                                                   lowers=None, traces=None)
+                                                   lowers=None, traces=None, spread=spread_axes())
             while len(_CANDIDATES) > KEPT_CANDIDATES:
                 _CANDIDATES.popitem(last=False)
     return candidate

@@ -475,18 +475,20 @@ class Trainer(Generic[Loss, Effects]):
     def _step_key(self) -> Hashable | None:
         """A value of everything this trainer's step traces from beside its arguments, equal for two trainers
         whose steps trace alike, so a refit or a resume in the same process that builds its trainer and
-        objective anew reads the step its equal traced (`dew.training._candidates.candidate_for`; row
-        3873): the objective's own (`Objective.trace_key`, its EMA among it) at its current rung, the
-        optimizer's config and the updates or examples it was built for, the reader's device steps, and
-        every setting the step reads. None where a value states none of it: an objective that states no
-        trace, an optimizer given built, a custom step, a device step or a setting compared by identity
-        (`frozen_value`), a loss scale given built, links, or a run that measures its kernels' configs as
-        it lowers."""
+        objective anew reads the step its equal traced (`dew.training._candidates.candidate_for`; row 3873):
+        the objective's own (`Objective.trace_key`, its EMA among it) at its current rung, the optimizer's
+        config and the updates or examples it was built for, the reader's device steps, and every setting the
+        step reads. The links it traces under are the candidate's key's (`trace_context`, their measured
+        figures), its spreads replayed where it is kept (`Candidate.spread`), so the links the last compile
+        decided key nothing (row 6022: every refit on a tensor- or sequence-split mesh traced its step again).
+        None where a value states none of it: an objective that states no trace, an optimizer given built, a
+        custom step, a device step or a setting compared by identity (`frozen_value`), a loss scale given
+        built, stated links, or a run that measures its kernels' configs as it lowers."""
         from dew.objectives.base import UNKEYED, frozen_value, stated_trace
 
         objective = stated_trace(self.objective)
         if (objective is None or self._config is None or self.step is not None or self._scaled is None
-                or self.links or self._compiler.stated_links or self.tune_kernels):
+                or self._compiler.stated_links or self.tune_kernels):
             return None
         settings = frozen_value((self._config, self._shape.device, self.mesh, self.layout, self.inspection,
                                  self.param_dtype, self.diloco))

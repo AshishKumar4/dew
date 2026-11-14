@@ -165,6 +165,10 @@ class Candidate:
     """Whether its footprint is its whole logits' floor alone (`dew.training.footprint.logits_floor`), its
     gradient untraced: a derivation's candidate, which the search judges by the floor first
     (`FitSearch.judged`), and traces where the floor leaves room (`unfloored`)."""
+    spread: tuple[str, ...] = ()
+    """The mesh axes a projection of its step spread over as it traced (`dew.nn.sharding.Link.spread`), which
+    a step kept apart from its trace (`dew.training._candidates.candidate_for`) sets again on the links of
+    the trace that reads it."""
     traces: Callable[[], Candidate] | None = None
     """For a candidate `floored`, the step at its rung with its gradient traced, from the forward its floor
     read (`unfloored`); None where it was kept apart from the trace that made it

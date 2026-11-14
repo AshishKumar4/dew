@@ -104,3 +104,43 @@ def test_a_settings_value_holds_its_mappings_in_order_and_none_for_a_function():
     assert frozen_value(one) != frozen_value(OptimConfig(optimizer_opts={"b1": 0.8, "b2": 0.95}))
     assert hash(frozen_value(one)) is not None
     assert frozen_value((one, lambda batch: batch)) is UNKEYED
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced(monkeypatch):
+    """A trainer whose mesh splits the sequence fits again in the same process without tracing its step
+    again: its key holds the links' measured figures (`dew.nn.sharding.trace_context`) and not the links
+    its last compile decided, which keyed every refit on a tensor- or sequence-split mesh apart from the
+    fit before it (row 6022); the kept step's spreads are its trace's (`Candidate.spread`)."""
+    import numpy as np
+
+    import dew.training._candidates as candidates
+    from dew.data.dataset import Loader
+    from dew.optim import OptimConfig
+    from dew.training import MeshSpec, Trainer
+
+    traced = []
+    original = candidates._candidate
+
+    def counted(*arguments, **options):
+        traced.append(1)
+        return original(*arguments, **options)
+
+    monkeypatch.setattr(candidates, "_candidate", counted)
+    # The optimizer stated as a config, which keys the step.
+    optimizer = OptimConfig(optimizer="adam", learning_rate=1e-2)
+    trainer = Trainer(LMObjective(tiny(max_seq_len=16), 16), optimizer, key=jax.random.key(0),
+                      mesh=MeshSpec(fsdp=2, sequence=2))
+    rows = {"text": np.random.default_rng(0).integers(0, 8, size=(4, 17)).astype(np.int32)}
+
+    def fit():
+        data = Loader(train=lambda partition: iter([rows] * 4), val=None, records=None, batch=4)
+        trainer.fit(data, steps=2)
+        return dict(trainer.links)
+
+    first = fit()
+    once = len(traced)
+    again = fit()
+    assert once and len(traced) == once
+    assert {axis: link.spread for axis, link in again.items()} == {
+        axis: link.spread for axis, link in first.items()}
