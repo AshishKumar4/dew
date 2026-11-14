@@ -7,13 +7,16 @@ run running, and a checkpoint on disk is never the copy that gets removed.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import jax
 from etils import epath
 
 from dew.checkpoints import frozen_entries, is_uri, step_artifact
 from dew.interop.saved_sources import step_records
-from dew.training.tracker import WandbTracker
+
+if TYPE_CHECKING:
+    from dew.training.tracker import WandbTracker
 
 REGISTRY = "wandb-registry-model"
 

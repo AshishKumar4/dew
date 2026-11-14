@@ -15,8 +15,8 @@ import tyro
 from dew._records import JSON, is_share, recorded_duration, share
 from dew.data.dataset import Loader
 from dew.objectives.base import Metric, TrainingScalar
+from dew.scores import Summary
 from dew.training.cadence import Cadence, Counted
-from dew.training.evaluation import Summary
 
 
 def run_length(steps: int | None, epochs: int | None, tokens: int | None, examples: int | None = None, *,

@@ -150,6 +150,30 @@ class Losses:
         pass
 
 
+def widened_start(trainer_of, steps: int):
+    """What every draw of the float64 run starts from, drawn once: the run's own initial state as the float32
+    run draws it, widened exactly, so every launch's draws start from the same values. A pool's fits draw
+    their own instead: a state handed to a fit is placed from the host, which a pool's arrays across
+    processes are not."""
+    import jax
+    from arm_arithmetic import float64_held
+
+    with jax.enable_x64(new_val=False):
+        # Its optimizer built over the run's length, as each fit builds the run's (`Trainer.scheduled`).
+        narrowed = trainer_of(None)
+        narrowed.scheduled(steps)
+        narrow = narrowed.initial_state()
+    return narrow.replace(variables=float64_held(narrow.variables), opt_state=float64_held(narrow.opt_state),
+                          ema=float64_held(narrow.ema))
+
+
+def copied(state):
+    """`state` copied, for a fit that consumes the state it steps."""
+    import jax
+
+    return jax.tree.map(lambda leaf: jax.numpy.copy(leaf) if isinstance(leaf, jax.Array) else leaf, state)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
@@ -177,8 +201,6 @@ def main() -> None:
     prepare_process()
 
     import jax
-    import optax
-    from arm_arithmetic import float64_held
     from sharded import split_axes
 
     if args.float64:
@@ -187,6 +209,7 @@ def main() -> None:
     from dew.checkpoints import Checkpoints
     from dew.data.dataset import DataPartition, Loader
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
     from dew.registry import models
     from dew.training import Layout, MeshSpec, Trainer
 
@@ -207,7 +230,10 @@ def main() -> None:
         """The run's trainer over the model computing in `dtype` (None: the model's own, float32)."""
         model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=2,
                              num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN, dtype=dtype)
-        return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-2), key=jax.random.key(0),
+        # The optimizer as a config, which keys the step (`Trainer._step_key`): each draw's fit reads the step
+        # the first traced and lowered (`candidate_for`), where a built optimizer had each trace its own.
+        return Trainer(LMObjective(model, SEQ_LEN), OptimConfig(optimizer="adam", learning_rate=1e-2),
+                       key=jax.random.key(0),
                        mesh=MeshSpec(**json.loads(args.mesh)), layout=Layout(min_shard=TINY_SHARD), **options)
 
     losses = Losses()
@@ -223,22 +249,12 @@ def main() -> None:
                             log_every=1, **options)
         return state, {"losses": losses.losses[before:], "loss_steps": losses.steps[before:]}
 
-    def started() -> dict:
-        """What a draw's fit starts from: the run's own initial state, which the float64 run takes as the
-        float32 run draws it, widened exactly, so every launch's draws start from the same values."""
-        if not args.float64:
-            return {}
-        with jax.enable_x64(new_val=False):
-            narrow = trainer_of(None).initial_state()
-        return {"state": narrow.replace(variables=float64_held(narrow.variables),
-                                        opt_state=float64_held(narrow.opt_state),
-                                        ema=float64_held(narrow.ema))}
-
     if args.draws:
         # Every judged run is a draw: from the one initial state (`started`) on a packed batch of its own,
-        # the record's state the first draw's.
+        # the record's state the first draw's. Each fit is handed a copy, as it consumes the state it steps.
+        initial = widened_start(trainer_of, args.steps) if args.float64 else None
         seeds = range(args.first_draw, args.first_draw + args.draws)
-        runs = (run(drawn(seed), **started()) for seed in seeds)
+        runs = (run(drawn(seed), **({} if initial is None else {"state": copied(initial)})) for seed in seeds)
         state, logged = next(runs)
         first, draws = {}, [logged["losses"], *(later["losses"] for _, later in runs)]
         computed = loss_dtype(trainer, state, packed_batch(args.first_draw))

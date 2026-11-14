@@ -586,7 +586,7 @@ def test_a_saved_distillation_loads_as_its_student_and_reads_the_students_data(t
     # The load restores the student alone, onto a mesh as on the host, its projections packed as a
     # loaded task holds them: the teacher and the distillation's projections stay unread.
     from dew.inference import TextGeneration
-    from dew.inference.projections import inference_projections
+    from dew.nn.projections import inference_projections
 
     student = jax.tree.structure(own.bind(inference_projections(own.model, own.variables)).variables)
     for loaded in (task, TextGeneration.from_run(str(tmp_path / "run"), mesh=MeshSpec())):

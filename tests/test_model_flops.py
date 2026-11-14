@@ -70,10 +70,11 @@ from dew.nn.ssm import BidirectionalS5Layer, S5Layer, _scanned_directions
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.objective import batch_text
+from dew.state import TokenCount
 from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
 from dew.training.interval import Interval
-from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount, prepare_counts, step_counts
+from dew.training.model_flops import TOKENS, TRAINING_FLOPS, prepare_counts, step_counts
 
 LENGTHS = np.asarray([2, 5], np.int64)
 
@@ -231,11 +232,11 @@ def test_a_world_model_run_reports_its_updates_gradient_programs_work():
 def test_integer_token_counts_carry_across_words_on_a_partitioned_batch():
     from jax.sharding import NamedSharding, PartitionSpec
 
-    rows = _TokenCount.words([2**32 - 1, 2, 2**40, 0])
+    rows = TokenCount.words([2**32 - 1, 2, 2**40, 0])
     mesh = MeshSpec().build(jax.devices()[:2])
     placed = jax.device_put(rows, NamedSharding(mesh, PartitionSpec("data")))
-    total = jax.jit(_TokenCount.sum)(placed)
-    assert _TokenCount.host(total) == 2**40 + 2**32 + 1
+    total = jax.jit(TokenCount.sum)(placed)
+    assert TokenCount.host(total) == 2**40 + 2**32 + 1
     assert total.dtype == jnp.uint32
 
 
@@ -430,7 +431,7 @@ def test_host_row_counts_add_to_objectives_total_without_padding():
     objective = LMObjective(decoder(), seq_len=6, pad_id=0)
     batch = packed_batch()
     counted = prepare_counts(objective, batch, count_model=True)
-    np.testing.assert_array_equal(counted[TOKENS], _TokenCount.words([2, 2]))
+    np.testing.assert_array_equal(counted[TOKENS], TokenCount.words([2, 2]))
     assert counted[TRAINING_FLOPS].sum() == objective.training_flops(None, batch)
     assert counted["text"] is batch["text"]
     with pytest.raises(ValueError):
@@ -453,8 +454,8 @@ def test_a_batchs_repeats_count_no_tokens_and_no_model_work():
     alone = prepare_counts(objective, take_batch(batch, np.flatnonzero(real)), count_model=True)
     assert counted[TRAINING_FLOPS].sum() == alone[TRAINING_FLOPS].sum() > 0
     assert not np.any(counted[TRAINING_FLOPS][~real])
-    np.testing.assert_array_equal(_TokenCount.host(_TokenCount.sum(jnp.asarray(counted[TOKENS]))),
-                                  _TokenCount.host(_TokenCount.sum(jnp.asarray(alone[TOKENS]))))
+    np.testing.assert_array_equal(TokenCount.host(TokenCount.sum(jnp.asarray(counted[TOKENS]))),
+                                  TokenCount.host(TokenCount.sum(jnp.asarray(alone[TOKENS]))))
     repeats = prepare_counts(objective, {**batch, VALID_ROWS: np.zeros(rows, bool)}, count_model=True)
     assert not np.any(repeats[TRAINING_FLOPS]) and not np.any(repeats[TOKENS])
 
@@ -605,7 +606,7 @@ def test_prefetch_counts_on_worker_then_step_reduces_global_rows():
     with DevicePrefetchIterator(iter([batch]), mesh, prepare=prepare) as source:
         placed = next(source)
         measured = jax.jit(step_counts)(placed)
-        assert _TokenCount.host(measured[TOKENS]) == 4
+        assert TokenCount.host(measured[TOKENS]) == 4
         assert float(measured[TRAINING_FLOPS]) == objective.training_flops(None, batch)
     assert threads == ["dew-prefetch"]
 
@@ -620,15 +621,15 @@ def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
         for forward, tokens in steps:
             interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
                            jnp.asarray(a=True), None, {TRAINING_FLOPS: jnp.asarray(3 * forward),
-                                                      TOKENS: jnp.asarray(_TokenCount.words(tokens))})
+                                                      TOKENS: jnp.asarray(TokenCount.words(tokens))})
 
     counted(((100, 4), (200, 3)))
-    assert float(interval.book.training) == 900 and _TokenCount.host(interval.book.tokens) == 7
+    assert float(interval.book.training) == 900 and TokenCount.host(interval.book.tokens) == 7
     interval.saved(2)
-    assert float(interval.book.training) == 900 and _TokenCount.host(interval.book.tokens) == 7
+    assert float(interval.book.training) == 900 and TokenCount.host(interval.book.tokens) == 7
     taken = interval.take(3, loss, {}, jnp.asarray(a=True), (None, None), {}, {})
-    assert float(taken.reading.training) == 900 and _TokenCount.host(taken.reading.tokens) == 7
-    assert float(interval.book.training) == 0 and _TokenCount.host(interval.book.tokens) == 0
+    assert float(taken.reading.training) == 900 and TokenCount.host(taken.reading.tokens) == 7
+    assert float(interval.book.training) == 0 and TokenCount.host(interval.book.tokens) == 0
     assert not interval.model_counted and not interval.tokens_counted
     assert interval.real_tokens == 12
     counted(((50, 2),))

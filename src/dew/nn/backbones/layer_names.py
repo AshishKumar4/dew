@@ -110,7 +110,7 @@ class StoredRow:
 
     def split(self, widths: Sequence[int]) -> list[Deferred]:
         """The row's last axis in runs of `widths` (a packed projection's members,
-        `dew.inference.projections.unpacked`), each read from the row as it is read."""
+        `dew.nn.projections.unpacked`), each read from the row as it is read."""
         starts = np.cumsum([0, *widths[:-1]])
         # Each member sliced where the bank lies before it is read home, so a row's members read it home
         # once between them, a member's share each.

@@ -179,8 +179,8 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
                  dtype: str | None, param_dtype: str | None,
                  revision: str | None, options: SourceOptions, precision: Numerics | str | None) -> SavedTask:
     from dew.distributed.placement import MeshSpec as DefaultMesh
-    from dew.inference.projections import packed_owned
     from dew.interop import Pretrained, PretrainedPipeline
+    from dew.nn.projections import packed_owned
 
     storage = "auto" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh

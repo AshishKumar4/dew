@@ -17,8 +17,9 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
 
 ROWS, TOKENS, HEADS, KV_HEADS = 1, 128, 2, 1
-"""A call's rows, tokens and heads, its draws each case's `SEEDS`: check 1's fewest (test_attention_mosaic's,
-`reference_error.seeds_for`)."""
+"""A call's rows, tokens and heads, its draws each case's `SEEDS` (8, test_attention_mosaic's): the count
+`reference_error.seeds_for` sizes, paired with Dew's arm, at the route's call in fp32 and bf16 and the Mosaic
+forward's fused prologue alike (armada, 2026-11-14, et-prologue-seeds)."""
 EPSILON = 1e-6
 
 

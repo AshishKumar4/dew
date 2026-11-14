@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     from dew.quantization import InputQuantizer
 
 __all__ = [
+    "Adapted",
     "AffineHead",
     "BlockDenoiser",
     "BlockDrafting",
@@ -1032,7 +1033,7 @@ class Serving(Protocol):
     autoregressively names none). It reads which parameters the tree holds and
     their shapes, never their values or placement, and the model is an unbound,
     hashable module, so its answer is kept per model and tree shape
-    (`dew.inference.projections`) and is called over `jax.ShapeDtypeStruct`
+    (`dew.nn.projections`) and is called over `jax.ShapeDtypeStruct`
     leaves. `cache_rebuild_position` is where cached
     keys go stale and the prefix is recomputed (LongRoPE's long factors,
     Phi-3), or None. `mixed_admission_refusal` says why its layers would not
@@ -1334,3 +1335,18 @@ class TimeScaled(Protocol):
 
     @property
     def time_scale(self) -> float: ...
+
+
+@runtime_checkable
+class Adapted(Protocol):
+    """Marks a module class an adapter already wrapped, at any depth of its wrappers (`dew.lora.AdaptedClass`
+    states what its marks hold).
+
+    The wrapper subclass declares the interceptor its `apply` and `init` run
+    under, which is the whole record that a class was adapted: a second
+    adapter over it would run one branch inside the other. Declared here, below
+    the adapters, so a reader of a model's tree asks it without importing them.
+    """
+
+    _dew_lora_interceptor: ClassVar[object]
+    _dew_lora_bound: ClassVar[object]

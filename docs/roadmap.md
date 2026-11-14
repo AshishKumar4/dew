@@ -49,6 +49,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Time to first step: the compile path's re-derivations. [5556, 5558, 5669]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
+- The saved data plan as recorded rules, one last version, and the resume modes. [6022]
 - Training & Data's tests on check 1. [708]
 - XLA:CPU edges. [1591]
 
@@ -70,7 +71,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Every model comparison on check 1. [2300, 3722, 5212]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Bit-level synthesis in dew.algebra. [3733]
-- algebra.md and the engine agree. [6009]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
 - No check 1 cell serves a prompt that reads an earlier request's quantized prefix pages. [6007]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]

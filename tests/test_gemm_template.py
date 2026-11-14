@@ -2146,25 +2146,37 @@ def test_a_cooperative_tiles_exact_sums_add_as_its_plain_sum_does():
 
 def test_a_tile_states_a_schedule_the_kernels_run():
     """A pair of multiprocessors needs two warpgroups, which stream at least two stages; a warpgroup count
-    or cluster outside one or two is refused where the tile is made; the kernel gradient's schedule is one
-    multiprocessor's, so the tile it derives is no pair and a direct kernel gradient refuses one."""
+    or cluster outside one or two is refused where the tile is made."""
     for fields in ({"warpgroups": 1, "cluster": 2}, {"warpgroups": 3}, {"warpgroups": 2, "cluster": 4},
                    {"warpgroups": 2, "stages": 1}):
         with pytest.raises(ValueError):
             mosaic_gpu.Tiles(**{"block_m": 128, "block_n": 128, "block_k": 64, "stages": 3, "grid_block_n": 1,
                                 "family": "wgmma"} | fields)
-    launch = grouped_matmul.MosaicTgmm()
-    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    with generation.assumed("sm90"):
-        space = launch.space(launch.bind(bf16((ROWS, 512)), bf16((ROWS, WIDTH)),
-                                         jax.ShapeDtypeStruct((3,), jnp.int32), out_dtype="float32",
-                                         interpret=False))
-    assert space and all(tile.cluster == 1 for tile in space)
-    x = jnp.zeros((ROWS, 512), jnp.bfloat16)
-    with pytest.raises(ValueError):
-        mosaic_gpu.tgmm(x, jnp.zeros((ROWS, WIDTH), jnp.bfloat16), jnp.asarray(SIZES),
-                        tiles=mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, cluster=2, family='wgmma'),
-                        out_dtype=jnp.float32, multiprocessors=2)
+
+
+@runs("sm90")
+@pytest.mark.parametrize("sizes", [None, (0, 70, 1, 129, 100, 0)], ids=["dense", "grouped"])
+def test_a_kernel_gradient_on_a_multicast_cluster_holds_check_1(sizes):
+    """The kernel gradient on a pair of Hopper multiprocessors a cluster (`PAIRED`), each its own depth tile
+    of the pair's 256 rows, the cotangent's blocks they read alike loaded once between them (multicast, as
+    the forward's matrix and cuBLAS's 2 x 1 cluster on the 4B's up dW), interpreted: on par with the plain
+    kernel gradient from float64 truth (check 1), where the kernel gradient refused a cluster."""
+    def draw(seed):
+        rng = np.random.default_rng(seed + 4)
+        return (jnp.asarray(rng.normal(size=(ROWS, 256)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(ROWS, WIDTH)), jnp.bfloat16))
+
+    def dew(x, dy):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
+                {grouped_matmul.MosaicTgmm: PAIRED}):
+            return gemm.gemm_t(x, dy, None if sizes is None else jnp.asarray(sizes), out_dtype=jnp.float32,
+                               interpret_on_cpu=True)
+
+    def plain(x, dy, wide=jnp.float32):
+        return _kernel_gradient(x.astype(wide), dy.astype(wide), sizes)
+
+    assert_as_exact(dew, jax.jit(plain), draw, "a kernel gradient on a multicast cluster", seeds=SEEDS,
+                    truth_fn=functools.partial(plain, wide=jnp.float64))
 
 
 def test_a_pin_names_only_a_config_the_launchs_kernel_takes():
