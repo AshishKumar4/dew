@@ -42,11 +42,13 @@ def compiled_in(passed, run) -> tuple[list[str], int]:
 
 
 def test_a_host_master_step_compiles_its_phases_through_the_pass_and_an_evaluation_its_program(passed):
-    """A step whose optimizer state and average live in host memory compiles its phases at the compile
-    point, its local reduction, its attempt's preparation and its finish among them, each recording its
-    pass; an evaluation of the run's weights its own program, with its pass."""
+    """A host-master step, its variables in host memory (`Layout.host`, which runs the transaction's
+    phases on the host, `Transaction.step(host=True)`), compiles its phases at the compile point, its local
+    reduction, its attempt's preparation and its finish among them, each recording its pass; an evaluation
+    of the run's weights its own program, with its pass. (A layout keeping only the optimizer state on the
+    host steps on the devices, one program, which shows no phase.)"""
     trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0, host=("opt_state", "ema")))
+                      layout=Layout(min_shard=1, tolerance=1.0, host=("variables",)))
     state = trainer.initial_state()
     batch = next(iter(Counting()))
     names, passes = compiled_in(passed, lambda: trainer.compile(state, batch)(state, batch))
