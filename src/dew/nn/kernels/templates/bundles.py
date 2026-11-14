@@ -91,13 +91,17 @@ COMPOSITIONS: dict[str, tuple[Composition, ...]] = {
     # tcgen05 on TMA rings, its accumulators in tensor memory: persisted a tile in full-lane tensor memory
     # and read out in chunks for a launch that states its tiles' accumulators; scoped a product in half-lane
     # tensor memory and read back into registers in the WGMMA layout (row 4747) for a launch holding its
-    # 64-row tiles in registers between products whose program scopes the issuer's product scratch. A
+    # 64-row tiles in registers between products whose program scopes the issuer's product scratch, or
+    # issued by a warp of their own for a consumer holding a row a thread in tensor memory's own layout
+    # (`mosaic_sm100.ROWS`, a walk that places its declared products on a role, row 5368). A
     # launch stating neither takes the next issuer. A launch stating its accumulators takes the pair too
     # (`mosaic_sm100.PAIR`, CUTLASS's 2-SM UMMA, a cluster of two each product spans), by its tile's config,
     # after the one CTA's.
     mosaic_sm100.RINGS.name: (Composition(lambda dtype: mosaic_sm100.RINGS, lambda launch: launch.stated),
                               Composition(lambda dtype: mosaic_sm100.PAIR, lambda launch: launch.stated),
                               Composition(lambda dtype: mosaic_sm100.CHUNKS,
+                                          lambda launch: launch.scoped and not launch.stated),
+                              Composition(lambda dtype: mosaic_sm100.ROWS,
                                           lambda launch: launch.scoped and not launch.stated)),
     # wgmma: TMA rings a producer fills, then rings its consumers fill.
     mosaic_sm90.WGMMA.name: (Composition(lambda dtype: mosaic_sm90.WGMMA),

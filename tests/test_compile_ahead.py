@@ -664,12 +664,19 @@ def test_a_hosts_serialized_topology_states_its_gpus_memory_and_their_allocators
 @pytest.mark.shared_setup("admitted")
 def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admitted):
     """A step compiled ahead on GPUs whose memory its plan needs several microbatches for searches for its
-    plan, at several microbatches, and saves it, the run left at its plan, its rung its last probe's."""
+    plan, at several microbatches, and saves it, the run left at its plan, its rung its last probe's; the
+    plan states the limit it was made against, its GPUs' stated memory at the share their loading run takes
+    (`pool_record`)."""
+    from dew._devices import pool_share
+
     _, trainer, ahead = admitted
     plan = record(ahead.plan, "plan")
     probes = listed(plan["probes"], "probes", read=record, what="probes")
     assert plan["split"] > 1 and len(probes) > 1 and probes[-1]["fits"] is True
     assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
+    pool = record(plan["pool"], "pool")
+    assert pool["source"] == "compile_only" and pool["share"] == pool_share()
+    assert pool["limit"] == NEEDING_MICROBATCHES
 
 
 @pytest.mark.shared_setup("admitted")
@@ -855,6 +862,8 @@ def test_an_ahead_plan_that_fits_no_device_reports_every_refused_program(tmp_pat
     # The allocator its closest's headroom read, stated beside it: the GPU's limit.
     (allocator,) = refused.value.allocators
     assert allocator["bytes_limit"] == held
+    # What each probe placed beside its temporaries, which its headroom read.
+    assert all(probe.beside is not None and probe.beside >= 0 for probe in probes)
 
 
 def test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once(tmp_path, monkeypatch):

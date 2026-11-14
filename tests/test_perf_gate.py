@@ -467,7 +467,8 @@ def test_a_gate_keeps_each_arms_compiles_apart_and_places_its_arms_at_random_eac
     """A run measures three arms, the base, the head and the base again (its A/A), each with a compile cache
     and a peak cache of its own beside its results (made where absent) that it keeps across its rounds and
     removes at its end; each round's arms in an order drawn at random and kept, every arm in every round,
-    every row each round; the first round's seconds and the later rounds' apart."""
+    every row each round, each beside its probe's seconds; the first round's seconds and the later rounds'
+    apart."""
     from types import SimpleNamespace
 
     _, rows = standing_in_environments(gate, monkeypatch)
@@ -493,6 +494,8 @@ def test_a_gate_keeps_each_arms_compiles_apart_and_places_its_arms_at_random_eac
     assert len(results["orders"]) == 6
     for arm, taken in results["samples"].items():
         assert all("step lm-dense 4x1024" in sample for sample in taken) and len(taken) == 6, arm
+        # Each probe's process timed beside its rows: where a run's minutes went, probe by probe.
+        assert all(sample["seconds step lm-dense 4x1024"] >= 0 for sample in taken), arm
     assert set(results["seconds"]) == {"first round", "later rounds"}
     assert gate.report(SimpleNamespace(results=out, table=None, claim=False)) == 0
 

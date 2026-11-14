@@ -29,7 +29,7 @@ queue's census run), each red it finds filed and judged Dew's or XLA:CPU's (row 
 docs/design/testing.md, "the YNNPACK switch")."""
 
 STAGES = "DEW_CHECK1_STAGES"
-"""The file check 1 appends each judgement it completes to, its stage among it (`reference_error._logged`),
+"""The file check 1 appends each judgement it completes to, its stage among it (`check1_judge._logged`),
 which the plan reads to draw a site's later map tasks in its first wave."""
 
 QUALIFY = "DEW_CHECK1_QUALIFY"

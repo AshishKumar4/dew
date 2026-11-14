@@ -13,6 +13,7 @@ cells to its supported pairs (`covered`). A TPU tier runs `TPU_FLOWS`. Nothing h
 import functools
 import importlib
 import itertools
+from collections.abc import Callable
 
 import gpu_flow
 import jax.numpy as jnp
@@ -358,12 +359,13 @@ def covering(family: str) -> list[tuple[str, ...]]:
     return [tuple(combination.values()) for combination in pairwise(served, seeded)]
 
 
-def pairwise(served: list[dict], seeded: list[dict]) -> list[dict]:
+def pairwise(served: list[dict], seeded: list[dict],
+             cost: Callable[[dict], float] | None = None) -> list[dict]:
     """Combinations of `served` (each an axis's value by its name) in which every pair of axis values some
     served combination holds occurs: `seeded` first, then the fewest others holding the pairs left, chosen
-    as `gpu_flow.greedy` chooses."""
+    as `gpu_flow.greedy` chooses (by `cost` where given)."""
     def pairs(group: list[dict]) -> set:
         return set().union(*(gpu_flow.held(combination, values=False) for combination in group))
 
     left = pairs(served) - pairs(seeded)
-    return [*seeded, *(served[index] for index in gpu_flow.greedy(served, left, values=False))]
+    return [*seeded, *(served[index] for index in gpu_flow.greedy(served, left, values=False, cost=cost))]

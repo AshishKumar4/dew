@@ -7,6 +7,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- The condition encoders that bind a released checkpoint are dew.interop's: `CLIPText`, `T5Text` and
+  `HFAudio` in `dew.interop.encoders`, and `DiffusionConditioner`, `QwenImageConditioner`,
+  `HiddenStatesConditioner` and `WanConditioner` in `dew.interop.conditioners`, each with its
+  `from_pretrained`. `dew.inputs` still exports them by name, and its registry aliases (`clip_text`, `t5`,
+  `hf_audio`, `diffusion_text`, …) are unchanged; a record that named their earlier import paths under
+  `dew.inputs` reads as their new ones (`dew.registry.MOVED`). `dew.inputs` itself imports no interop.
+
 - On a CPU every process sums a bias's gradient, a broadcast's transpose (`dew.nn.precision.spread`), in
   blocks of about the square root of its positions, each an fp32 product sum: about N / B + B roundings
   where XLA:CPU's reduction took N in order, and what check 1 measures; it was the suite's alone.
@@ -26,7 +33,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   beside it, which it ignored.
 - A plan the devices refuse (`PlanRefused`) states what each local device's allocator read as it refused
   (`PlanRefused.allocators`, the tightest in its message: its limit, its bytes in use, its largest free
-  block and its pool), so a refusal at a phase's boundary names what holds the device.
+  block and its pool), so a refusal at a phase's boundary names what holds the device; each refused
+  candidate states what it placed beside its temporaries (`Probe.beside`: its outputs no donated argument
+  holds, and what the loop keeps outside the step), which its shortfall read.
 
 - A run's start reaches its first step sooner and keeps what it states: a fresh state's init is traced once,
   its shapes, its layout (`Objective.drawn_shapes`, the shapes the objective's first draw recorded, which a
@@ -55,6 +64,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - A run whose data phases change its passes frees the outgoing step's narrow copies before it plans the
   next phase's step, and builds the next phase's window over the outgoing one's buffers, donated: they
   stayed live beside the new step's own until it returned, and a phase that fits was refused.
+
+- `import dew` holds XLA's GPU pool to 95% of each GPU where you name no fraction, a notebook's first JAX
+  computation after it included; a run that names its preallocation or allocator but no fraction is held
+  to it too, where JAX held it to 75% (a GH200's plans were made against 70.88 GiB of its 94.5), a pool that
+  grows sized for its communicators as a preallocated one is. A `Trainer` run in a process `prepare_process`
+  did not set up sizes its pool as `prepare_process` does, before the backend opens; one whose backend
+  opened before `import dew` keeps JAX's 75% and says once how to get Dew's. Every plan records its
+  allocator's limit, the pool's share and its source (`pool`: named, dew, sized, jax, compile_only).
 
 - A compile-only GPU states its memory once: `compile_only_gpus(generation, count, memory)` takes each GPU's
   memory, its total as the GPU states it, which XLA compiles for and every admission of a program compiled

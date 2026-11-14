@@ -120,18 +120,51 @@ def test_an_unknown_branch_between_walks_steps_the_costliest():
     assert _emitted(either, _ROW, index, _TRIPS).roles[0].step(_exponentials) == 3 * 128
 
 
-def test_a_peeled_walks_step_is_its_parts_mean():
-    """A walk reading ahead, its first and last steps peeled from its loop (`RingFamily._walked`): its first
-    step two exponentials a row, its loop's one, its last none, counts one a step, under a guard its data
-    decides too (a program's active tile's)."""
+def test_a_split_walks_step_is_its_parts_mean():
+    """A walk split into parts, its first step's issuing one ahead and its last none (a pipelined walk's
+    opening, steady and closing loops): its first step two exponentials a row, its loop's one, its last none,
+    counts one a step, under a guard its data decides too (a program's active tile's)."""
     first, loop, last = _walked(lambda row: jnp.exp(jnp.exp(row))), _walked(jnp.exp), _walked(lambda row: row)
 
-    def peeled(row, trips):
+    def split(row, trips):
         return last(loop(first(row, trips), trips), trips)
 
     def guarded(row, trips, active):
-        return lax.cond(active, peeled, lambda row, trips: row, row, trips)
+        return lax.cond(active, split, lambda row, trips: row, row, trips)
 
     active = jax.ShapeDtypeStruct((), jnp.bool_)
-    assert [role.step(_exponentials) for role in _emitted(peeled, _ROW, _TRIPS).roles] == [128, 128]
+    assert [role.step(_exponentials) for role in _emitted(split, _ROW, _TRIPS).roles] == [128, 128]
     assert [role.step(_exponentials) for role in _emitted(guarded, _ROW, _TRIPS, active).roles] == [128, 128]
+
+
+def test_a_walks_guards_on_its_steps_place_count_at_their_trips():
+    """A walk over a range whose first step takes its own exponential and every step but its last the next
+    one's (`index == lo`, `index + 1 < hi`, as a walk reading ahead guards them) counts one a row a step and
+    none apart: each guard read at the trips it decides, not taken every step."""
+    def walk(row, lo, hi):
+        def step(index, row):
+            _STEP(index)
+            row = lax.cond(index == lo, jnp.exp, lambda row: row, row)
+            return lax.cond(index + 1 < hi, jnp.exp, lambda row: row, row)
+
+        return lax.fori_loop(lo, hi, step, row)
+
+    bound = jax.ShapeDtypeStruct((), jnp.int32)
+    counted = _emitted(walk, _ROW, bound, bound)
+    assert [(role.step(_exponentials), role.fixed.exponentials) for role in counted.roles] == [(128, 0)] * 2
+
+
+def test_a_walks_guards_on_its_steps_parity_count_one_branch_a_step():
+    """A walk whose step takes one of two exponentials by its parity (`index % 2`, the accumulator of two a
+    walk reading ahead issues into) counts one a row a step, not both guards' each step."""
+    def walk(row, lo, hi):
+        def step(index, row):
+            _STEP(index)
+            row = lax.cond(index % 2 == 0, jnp.exp, lambda row: row, row)
+            return lax.cond(index % 2 == 1, jnp.exp, lambda row: row, row)
+
+        return lax.fori_loop(lo, hi, step, row)
+
+    bound = jax.ShapeDtypeStruct((), jnp.int32)
+    counted = _emitted(walk, _ROW, bound, bound)
+    assert [(role.step(_exponentials), role.fixed.exponentials) for role in counted.roles] == [(128, 0)] * 2

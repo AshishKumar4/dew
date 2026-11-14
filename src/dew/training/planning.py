@@ -31,7 +31,7 @@ from jax.experimental.profiler import get_profiled_instructions_proto
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
-from dew._devices import device_memory
+from dew._devices import device_memory, pool_share, pool_statement
 from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
@@ -60,6 +60,7 @@ from dew.training.memory import (
     local_devices,
     offloads,
     placeable,
+    placed_beside,
     pooled_headroom,
     recompute_more,
     recompute_record,
@@ -397,8 +398,8 @@ class Probe:
     """One compile of a plan's search (`planned`): the split, the rows of
     its microbatch and the rung (`rung_record`) it compiled at, what
     the fit check read, this process's tightest headroom and XLA's
-    temporaries and arguments, None where none were read, and what the
-    candidate's shapes derived it would take (`Footprint`)."""
+    temporaries and arguments and what the step places beside its temporaries (`beside`), None where none
+    were read, and what the candidate's shapes derived it would take (`Footprint`)."""
     split: int
     rows: int
     rung: Mapping[str, JSON]
@@ -417,22 +418,28 @@ class Probe:
     derived_headroom: int | None = None
     """The headroom the derivation judged the candidate would leave (`derived_headroom`), None where it
     judged none: beside `headroom`, which the compile measured, its error."""
+    beside: int | None = None
+    """The bytes the fit check placed beside the step's temporaries (`placed_beside`): its outputs that
+    write over no donated argument and what the loop holds outside the step (copies, accumulators, a state
+    not placed yet). None where none were read."""
 
     @classmethod
     def read(cls, split: int, candidate: Candidate, rung: Mapping[str, JSON], fit: bool,
-             headroom: int | None, executable: jax.stages.Compiled | None) -> Probe:
-        """The compile of `candidate` at `rung`, its memory as XLA reads it where it compiled."""
+             headroom: int | None, executable: jax.stages.Compiled | None, held: int) -> Probe:
+        """The compile of `candidate` at `rung`, its memory as XLA reads it where it compiled, `held` the
+        bytes its fit check held beside it (`FitSearch.fitting`)."""
         stats = None if executable is None else compiled_memory(executable)
+        beside = None if stats is None else placed_beside(stats, held)
         return cls(split, rows_of(candidate.micro), rung, fit, headroom,
                    None if stats is None else stats.temp, None if stats is None else stats.argument,
-                   candidate.footprint)
+                   candidate.footprint, beside=beside)
 
     def record(self) -> dict[str, JSON]:
         return {"split": self.split, "rows": self.rows, **self.rung, "fits": self.fits,
                 "headroom": self.headroom, "temp": self.temp, "argument": self.argument,
                 "derived": None if self.derived is None else self.derived.record(), "ahead": self.ahead,
                 "compile_seconds": self.compile_seconds, "derived_headroom": self.derived_headroom,
-                "spent": dict(self.spent)}
+                "beside": self.beside, "spent": dict(self.spent)}
 
     def named(self) -> str:
         tile = ("" if self.rung["head_tile"] is None else ", the head tiled" if self.rung["head_fused"]
@@ -451,9 +458,12 @@ def unplanned(probes: Sequence[Probe]) -> str:
     if closest.headroom is None or closest.temp is None or closest.argument is None:
         said = f"the last, {closest.named()}, XLA refused for memory"
     else:
-        said = (f"the closest, {closest.named()}, needs {closest.temp / gib:.2f} GiB of temporaries beside "
-                f"{closest.argument / gib:.2f} GiB of arguments, {-closest.headroom / gib:.2f} GiB more than "
-                "its tightest device has")
+        placed = "" if closest.beside is None else (
+            f" and {closest.beside / gib:.2f} GiB more beside them (outputs no donated argument holds, and "
+            "what the loop keeps outside the step)")
+        said = (f"the closest, {closest.named()}, needs {closest.temp / gib:.2f} GiB of temporaries"
+                f"{placed}, with {closest.argument / gib:.2f} GiB of arguments in use, "
+                f"{-closest.headroom / gib:.2f} GiB more than its tightest device has")
     return (f"the training step fits no plan of its batch: {said}. Tried "
             f"{'; '.join(probe.named() for probe in probes)}. Shard the state over more devices "
             "(fsdp), train fewer parameters or shorter rows, or use a device with more memory")
@@ -687,7 +697,19 @@ def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch,
     above: dict[str, JSON] = {} if frontier is None else {"frontier": [probe.record() for probe in frontier]}
     return {**planned.record(), "kernels": planned.candidate.kernels.record(),
             "probes": [probe.record() for probe in probes], "derived": list(search.derived), **search.kernels,
-            **above}
+            "pool": pool_record(local_devices(search.mesh)), **above}
+
+
+def pool_record(devices: Sequence) -> dict[str, JSON]:
+    """The allocator's limit a plan was made against, its tightest device's (`device_memory`), with the pool's
+    share and its source (`dew._devices.pool_statement`): a plan held to JAX's 75% of the device, its
+    backend opened before Dew sized the pool, is visible as such. Devices this process does not attach
+    plan against the memory stated for them (`compile_only`), at the share their loading run takes."""
+    limits = [limit for device in devices if (limit := device_memory(device).get("bytes_limit")) is not None]
+    attached = set(jax.local_devices())
+    stated = {"share": pool_share(), "source": "compile_only"} if not attached.issuperset(devices) else (
+        pool_statement())
+    return {"limit": min(limits, default=None), **stated}
 
 
 def refusal_record(identity: str, config: Hashable, names: frozenset[str]) -> dict[str, JSON]:
@@ -1120,8 +1142,13 @@ class FitSearch[LossT, EffectsT]:
         """`step_fits` of `executable`, `candidate`'s compiled step or its sampled twin, with the state's
         `unplaced` bytes beside it where the devices hold none of it yet."""
         unplaced = self.unplaced or 0
-        return step_fits(executable, self.mesh, candidate.held + unplaced, candidate.built + unplaced,
+        return step_fits(executable, self.mesh, self.held(candidate), candidate.built + unplaced,
                          placed=self.unplaced is None)
+
+    def held(self, candidate: Candidate) -> int:
+        """The bytes the fit check holds beside `candidate`'s step: its own (`Candidate.held`), and the
+        state's `unplaced` bytes where the devices hold none of it yet."""
+        return candidate.held + (self.unplaced or 0)
 
     def lowering(self, split: int) -> Candidate:
         """The step at `split` at the objective's rung and the search's `narrow`, lowered: from the
@@ -1366,7 +1393,7 @@ class FitSearch[LossT, EffectsT]:
                 fit, headroom = self.fitting(None if self.sampled is None else self.sampled.executable,
                                              candidate)
         seconds = time.perf_counter() - began
-        probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
+        probe = Probe.read(split, candidate, self.current(), fit, headroom, executable, self.held(candidate))
         foreseen = _judged_headroom(self.headroom_bounds(candidate))
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen,
                                     spent=spent)

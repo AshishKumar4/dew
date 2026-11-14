@@ -5,17 +5,15 @@ ratio's rule changed (`assert_fp8_below`), and what each site measured (`BELOW`)
 import functools
 
 import jax.numpy as jnp
+from check1_judge import _logged, _narrow, _with_mode
 from reference_error import (
     _arms_with,
     _drawn,
     _enough_seeds,
-    _logged,
     _mode_of,
-    _narrow,
     _refuse_numpy_arms,
     _site_terms,
     _truth_program,
-    _with_mode,
 )
 
 from dew.parity import GateFailure, Inconclusive, _below_one, _Draws, _judged, _pooled, _staged, _verdict
@@ -87,6 +85,6 @@ def assert_fp8_below(dew_fn, named_fn, draw, label: str, *, seeds: int, named: s
                       "reference_ratio": _pooled(parity.mine[:, index], parity.theirs[:, index])})
     _logged(held, stage, _verdict(over, unresolved), _narrow(against), _mode_of(arms))
     if over:
-        raise GateFailure(_with_mode(over + unresolved, arms))
+        raise GateFailure(_with_mode(over + unresolved, _mode_of(arms)))
     if unresolved:
-        raise Inconclusive(_with_mode(unresolved, arms))
+        raise Inconclusive(_with_mode(unresolved, _mode_of(arms)))
