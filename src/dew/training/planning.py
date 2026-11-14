@@ -543,6 +543,14 @@ class Planned:
         return dataclasses.replace(self, candidate=dataclasses.replace(self.candidate, program=None))
 
 
+def released(trees) -> None:
+    """Delete every buffer of `trees`, which nothing reads again: what a step lets go of before the next is
+    planned or built, so the devices hold none of it beside what replaces it. An array already deleted
+    stays so (`Array.delete` returns at once)."""
+    for leaf in jax.tree.leaves(trees):
+        leaf.delete()
+
+
 @dataclasses.dataclass
 class Trials:
     """Trial runs of a plan's steps on `batch` from `state`, each on a copy of the state as it stood
@@ -569,9 +577,7 @@ class Trials:
         outcome = trial(together(stepped, frozen))
         # What the trial did not donate of the state it stepped is freed too, so nothing holds a
         # reference to a state handed to a trial, on any backend.
-        for leaf in jax.tree.leaves(stepped):
-            if not leaf.is_deleted():
-                leaf.delete()
+        released(stepped)
         if self.owned:
             self.state = together(self.restored(), frozen)
         return outcome

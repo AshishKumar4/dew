@@ -56,9 +56,6 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   next phase's step, and builds the next phase's window over the outgoing one's buffers, donated: they
   stayed live beside the new step's own until it returned, and a phase that fits was refused.
 
-
-
-
 - A compile-only GPU states its memory once: `compile_only_gpus(generation, count, memory)` takes each GPU's
   memory, its total as the GPU states it, which XLA compiles for and every admission of a program compiled
   for it reads as the allocator's limit derived from it (`dew._devices.allocator_limit`, the run's pool
