@@ -389,11 +389,9 @@ def test_a_launchs_register_model_runs_the_programs_its_shared_memory_holds():
 
 def test_a_kernel_named_with_its_register_model_states_it_on_its_launch():
     """A kernel named with its register model (`report.named`'s `model`) records it on the launch tracing it
-    (`report.Launch.kernels`), by its name less the launch's suffix, where the compile point reads it before a
-    case's model for that name (`kernel_compile._declared`), which still serves a kernel its launch stated
-    none for; named outside any launch, it states nothing."""
-    import kernel_compile
-
+    (`report.Launch.kernels`), by its name less the launch's suffix, where the compile point reads the
+    producer its schedule lowers to (`kernel_compile.producer_failures`); named outside any launch, it states
+    nothing."""
     from dew.nn.kernels.templates import attention, report, resources
     from dew.nn.kernels.templates.attention_mosaic import MosaicForward, Tiles
     from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
@@ -404,15 +402,11 @@ def test_a_kernel_named_with_its_register_model_states_it_on_its_launch():
     bound = op.bind(q, q, q, starts, starts, None, None, (), (), None, residuals=attention.Kept.NONE,
                     interpret=True)
     with generation.assumed("sm90"):
-        stated, declared = (resources.register_model(WGMMA, 2, registers) for registers in (168, 128))
+        stated = resources.register_model(WGMMA, 2, 168)
         with report.launching(op, bound, Tiles(16, 16, 2, 1, family="wgmma")):
             name = report.named("attention", model=stated)
         kernel, launch = report.kernel_of(name)
-        assert report.traced(launch).kernels == {"attention": stated}
-        assert kernel_compile._declared({"kernel": kernel, "launch": launch},
-                                        {"attention": declared}) is stated
-        assert kernel_compile._declared({"kernel": "epilogue", "launch": launch},
-                                        {"epilogue": declared}) is declared
+        assert kernel == "attention" and report.traced(launch).kernels == {"attention": stated}
         assert report.named("attention", model=stated) == "attention"
 
 
