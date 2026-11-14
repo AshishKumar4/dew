@@ -458,7 +458,7 @@ def test_representation_health_is_the_float64_statistics():
                     "representation health", seeds=HEALTH_SEEDS)
     (z,) = redundant_embeddings(0)
     collapsed = representation_health(jnp.tile(jnp.asarray(z[:1]), (32, 1)))
-    assert collapsed["repr_std"].held() < 1e-6 and collapsed["repr_cov_offdiag"].held() < 1e-6
+    assert all(float(collapsed[name].mean()[0]) < 1e-6 for name in ("repr_std", "repr_cov_offdiag"))
 
 
 # --- EMA target encoder ----------------------------------------------------

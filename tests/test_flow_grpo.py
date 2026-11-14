@@ -918,6 +918,37 @@ def test_mixed_precision_transition_keeps_density_arithmetic_in_float32():
 
 
 
+def test_a_step_read_in_two_microbatches_trains_and_logs_its_reward_and_policy_terms():
+    """A step of collected trajectories the trainer reads in two microbatches trains, and logs the reward it
+    shows and its policy gradient, KL and clipped share, each pooled over its rows or transitions, which a
+    split step once refused (train 800's F2); a run whose rollout writes its batches steps it whole."""
+    from recording import RecordingTracker
+
+    from dew.data.dataset import Loader
+    from dew.nn.backbones.dit import SimpleDiT
+
+    count = jax.device_count()
+    model = SimpleDiT(output_channels=1, patch_size=2, emb_features=8, num_layers=1, num_heads=2, mlp_ratio=2)
+    objective = FlowGRPOObjective(model, Process(FlowMatchingScheduler(), FlowMatchPredictionTransform()),
+                                  InputSpec(Field("image", (4, 4, 1))), guidance=None, beta=0.1)
+    rollout = FlowRollout(objective, lambda images, context: np.arange(len(images), dtype=np.float64),
+                          groups=2, steps=3)
+    initial = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(93), rollout=rollout).place()[0]
+    collected = rollout(initial, {"image": np.zeros((count, 4, 4, 1), np.uint8)}, jax.random.key(94),
+                        objective=objective)
+    tracker = RecordingTracker()
+    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(93), split=2, tracker=tracker)
+    rows = len(collected["rewards"])
+    # The images the objective's inputs declare, which a step of collected trajectories reads none of.
+    collected = {**collected, "image": np.zeros((rows, 4, 4, 1), np.uint8)}
+    data = Loader(train=lambda partition: itertools.repeat(collected), val=None, records=rows, batch=rows)
+    final = trainer.fit(data, steps=1, log_every=1)
+    assert int(final.updates) == 1
+    (logged,) = [scalars for _, scalars in tracker.scalars if "train/reward" in scalars]
+    for name in ("train/reward", "train/pg", "train/transition_kl", "train/actor/clipfrac"):
+        assert np.isfinite(logged[name]), name
+
+
 def test_float64_callback_distinctions_reach_a_real_policy_update():
     from dew.data.dataset import Loader
     from dew.nn.backbones.dit import SimpleDiT

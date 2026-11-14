@@ -1813,18 +1813,26 @@ def test_a_causal_windows_last_target_is_consumed_by_the_window_that_holds_it():
 
 
 @dataclasses.dataclass(frozen=True)
-class Lengthened:
-    """A random step that appends up to `most` tokens to a record's `text`, the fewest it makes of a
-    record its own length (`Shortest`)."""
+class Encoded:
+    """A random step that encodes a record's `size` as that many tokens of `text` and up to `most` more, the
+    fewest it makes of a record its size (`Shortest`): its records hold no `text` before it, as a decision
+    row holds no tokens before its layout's encoding."""
 
     most: int = 3
 
     def __call__(self, row, rng):
-        extra = int(rng.integers(0, self.most + 1))
-        return {**row, "text": np.concatenate([row["text"], np.zeros(extra, np.int32)])}
+        return {"text": np.zeros(int(row["size"]) + int(rng.integers(0, self.most + 1)), np.int32)}
 
     def shortest(self, row, field):
-        return len(row[field])
+        return int(row["size"])
+
+
+@dataclasses.dataclass(frozen=True)
+class Unstated:
+    """`Encoded`'s draw, stating no floor."""
+
+    def __call__(self, row, rng):
+        return Encoded()(row, rng)
 
 
 @pytest.mark.parametrize("stated", [True, False], ids=["stated", "unstated"])
@@ -1832,10 +1840,11 @@ def test_a_memory_read_packing_after_a_draw_declares_the_windows_its_shortest_re
     """A memory read cannot pack ahead of a random step, so it declares no measured count: where the step
     states the fewest tokens it makes of each held record (`Shortest`), a fitting pack's window holds at
     most `seq_len` over the shortest documents, 16 over 6 here, and its windows hold no more; a step that
-    states none leaves the window's length declared (the decision objective's encoding, row 5916)."""
-    documents = Memory(tuple({"text": np.arange(6 + index % 2, dtype=np.int32)} for index in range(12)))
-    step = Lengthened() if stated else Unstated()
-    packed = Pipeline(documents).repeat().random_map(step, identity="lengthened@1").pack(16).batch(2)
+    states none leaves the window's length declared. The records hold no tokens before the step, as a
+    decision read's rows before their layout's encoding (row 5916)."""
+    documents = Memory(tuple({"size": np.int32(6 + index % 2)} for index in range(12)))
+    step = Encoded() if stated else Unstated()
+    packed = Pipeline(documents).repeat().random_map(step, identity="encoded@1").pack(16).batch(2)
     opened = compile(packed, read="memory", loading=Loading(workers=0)).train(DataPartition())
     try:
         laid = [batch["text_coordinates"] for batch in itertools.islice(opened, 6)]
@@ -1843,11 +1852,3 @@ def test_a_memory_read_packing_after_a_draw_declares_the_windows_its_shortest_re
         opened.close()
     assert {coordinates.max_segments for coordinates in laid} == {2 if stated else 16}
     assert max(int(coordinates.segments.max()) for coordinates in laid) <= 2
-
-
-@dataclasses.dataclass(frozen=True)
-class Unstated:
-    """`Lengthened`'s draw, stating no floor."""
-
-    def __call__(self, row, rng):
-        return Lengthened()(row, rng)
