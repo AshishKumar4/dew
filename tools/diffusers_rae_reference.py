@@ -213,10 +213,9 @@ PLAIN = {"hidden_size": 64, "num_hidden_layers": 1, "num_attention_heads": 1, "i
 PLAIN_INPUT = 112
 
 
-def build_plain(root: Path) -> dict[str, np.ndarray]:
-    """A tiny transformers `Dinov2Model`, REPA's encoder, saved, and its
-    patch tokens for a normalized 112-pixel batch (the table resized to the
-    8x8 grid) with the gradient of a probe against the pixels."""
+def build_plain(root: Path) -> None:
+    """A tiny transformers `Dinov2Model`, REPA's encoder, saved: tests/test_rae.py runs it live, at float32
+    and as its float64 twin, as check 1's reference and truth."""
     from transformers import Dinov2Config, Dinov2Model
 
     torch.manual_seed(SEED)
@@ -228,12 +227,6 @@ def build_plain(root: Path) -> dict[str, np.ndarray]:
                 parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
     on_bfloat16_grid(model)
     model.save_pretrained(root, safe_serialization=True)
-    pixels = torch.randn((1, 3, PLAIN_INPUT, PLAIN_INPUT), generator=generator).requires_grad_()
-    tokens = model(pixels).last_hidden_state[:, 1:]
-    probe = torch.randn(tokens.shape, generator=generator)
-    (grad,) = torch.autograd.grad((tokens * probe).sum(), [pixels])
-    return {"pixels": pixels.detach().numpy(), "tokens": tokens.detach().numpy(), "probe": probe.numpy(),
-            "grad_pixels": grad.numpy()}
 
 
 def main(destination: str) -> None:
@@ -245,7 +238,7 @@ def main(destination: str) -> None:
         (root / name).mkdir(parents=True, exist_ok=True)
         np.savez_compressed(root / name / "reference.npz", **build(name, root / name))
     (root / "dinov2_plain").mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(root / "dinov2_plain" / "reference.npz", **build_plain(root / "dinov2_plain"))
+    build_plain(root / "dinov2_plain")
     record = {"diffusers": DIFFUSERS, "transformers": TRANSFORMERS, "configs": CONFIGS, "statistics": STATISTICS,
               "batch": BATCH, "plain": PLAIN, "plain_input": PLAIN_INPUT, "seed": SEED}
     (root / "rae.json").write_text(json.dumps(record, indent=1) + "\n")
