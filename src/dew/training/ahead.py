@@ -111,9 +111,13 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-_UNTUNED = ("this step was compiled ahead into a file for %s GPUs without their tuned choices, XLA's "
-            "untuned program; a run's compile on such a GPU tunes it, and a job's prepare into the "
-            "persistent cache takes the choices such runs wrote")
+UNTUNED = ("this step was compiled ahead into a file for %s GPUs without their tuned choices, XLA's "
+           "untuned program, whose products ran up to 48 times slower on a GH200 (UB-4792-AHEAD-TIME): a run "
+           "handed it compiles its step on its GPUs as a run without a file does, and keeps their tuned "
+           "choices beside its compilation cache. To train from a file, compile it ahead on a host whose "
+           "autotune cache holds that GPU kind's choices, within `report.for_devices`")
+"""What a step file compiled without its GPU kind's tuned choices (`AheadOfTime.tuned`) is said as, where it
+is saved and where a run is handed it (`dew.training.trainer.Trainer`)."""
 
 @functools.cache
 def compile_only_tpus(topology: str) -> tuple:
@@ -322,7 +326,8 @@ class AheadOfTime:
     tuned: bool
     """Whether its compile took the GPU kind's tuned choices, as the device's own compile makes them
     (`report.autotuned`): a step compiled on compile-only GPUs outside a prepare into the cache is XLA's
-    untuned program there, which its save and its load say; a TPU's is the device's own."""
+    untuned program there, which its save says, and a run handed it compiles its step on its devices in its
+    place (`UNTUNED`); a TPU's is the device's own."""
     target: GpuTarget | None = None
     """The facts of the GPU its kernels' launches were derived for (`gpu_target` within `assumed`), which a
     run handed the step reproduces it under (`handed`, `derived_for`): another SKU of the generation, its
@@ -391,10 +396,19 @@ class AheadOfTime:
                          "traces with the step's", differ, {axis: self.links[axis] for axis in differ})
         return self.links
 
+    def runnable(self) -> AheadOfTime | None:
+        """The step a run handed it runs: this one where it is tuned; None where its XLA products are
+        untuned (`tuned`), which the run then compiles on its own devices as without a file, said once
+        (`UNTUNED`)."""
+        if self.tuned:
+            return self
+        _log.warning(UNTUNED, self.generation)
+        return None
+
     def save(self, path: str | Path) -> None:
         """Write the step to `path`, for `load` on a host of its topology."""
         if not self.tuned:
-            _log.warning(_UNTUNED, self.generation)
+            _log.warning(UNTUNED, self.generation)
         Path(path).write_bytes(filed(self))
 
     @staticmethod
@@ -407,8 +421,6 @@ class AheadOfTime:
                              "ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
         _current(path, "step", [step.executable, *sampled])
-        if not step.tuned:
-            _log.warning(_UNTUNED, step.generation)
         return step
 
     def loaded(self) -> jax.stages.Compiled:

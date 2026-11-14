@@ -82,6 +82,7 @@ sys.exit("the step loaded in a process whose XLA computes otherwise")
 must refuse as it loads it: a trainer handed a step loads it at its first step's compile, not as it is
 made."""
 QUIET_BUILD = """
+import dataclasses
 import sys
 
 from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune
@@ -98,7 +99,9 @@ trainer = fine_tune(target, xla=True, split=2, inspection=Inspection(every=2))
 batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
 validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).batch(BATCH)}
 fit = {"steps": 6, "log_every": 5, "eval_every": 3, "validation": validation}
-compile_ahead(trainer, batch, fit=fit).save(path)
+# Stated tuned, as a prepare's file is (`report.for_devices`): an untuned one no run takes at all
+# (`dew.training.ahead.UNTUNED`), and these cells read how a run takes a file.
+dataclasses.replace(compile_ahead(trainer, batch, fit=fit), tuned=True).save(path)
 """
 """A step of two microbatches, sampled every second step, compiled ahead for the GPU argv[1] names, with
 argv[3] multiprocessors and argv[4] bytes of memory, with the programs of its fit's evaluations, and saved

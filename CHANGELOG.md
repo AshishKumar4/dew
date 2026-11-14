@@ -7,6 +7,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A run handed a step file compiled without its GPU kind's tuned choices (`AheadOfTime.tuned` false: one
+  compiled on compile-only GPUs outside a prepare) no longer runs it: it compiles its step on its own
+  devices as a run without a file does, keeps their tuned choices beside its compilation cache, and says
+  once why (`dew.training.ahead.UNTUNED`). On a GH200 such a file's 4096x4096 bf16 product ran at 8.32 ms
+  a call against 0.174 ms compiled on the device (UB-4792-AHEAD-TIME). Such a file still writes, for its
+  plan and its kernels; a tuned file loads as before.
+
 - A compile-ahead target with no path (`--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY`, its generation
   and devices) compiles the run's first step and every later data phase's step into the run's persistent
   compilation cache and exits 0, as a job's prepare compiles its node's run, where it refused for want of a

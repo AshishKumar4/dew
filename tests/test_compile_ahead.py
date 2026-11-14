@@ -1245,7 +1245,8 @@ def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tm
 
     first, again, wide = ahead(), ahead(), ahead(width=48)
     assert first.program == again.program != wide.program
-    wide.save(tmp_path / "wide.dew-aot")
+    # Stated tuned, as a prepare's file is (`report.for_devices`): an untuned one no run takes at all.
+    dataclasses.replace(wide, tuned=True).save(tmp_path / "wide.dew-aot")
     run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(tmp_path / "wide.dew-aot"))
     # On the GPU it was compiled for, which a CPU is not, its program is what refuses it (train 332's review).
     with assumed(wide.target):
@@ -1642,10 +1643,11 @@ def a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path)
 
 def a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
     """A step compiled ahead for one compile-only GPU of this GPU's own target (`this_gpus`), saved and
-    handed to the run (`Trainer(ahead=...)`), is the program the run lowers its first step to, and the run
-    trains from it, its plan's first compile the step compiled ahead: its steps advance and its
-    parameters move (row 1915). A wider model's step for this GPU is another program, refused. The
-    model's attention takes XLA's path, which a step compiled with no GPU attached traces too."""
+    handed to the run (`Trainer(ahead=...)`), is XLA's untuned program there (`AheadOfTime.tuned`), whose
+    products ran up to 48 times slower on a GH200 (UB-4792-AHEAD-TIME): the run compiles its step on its GPU
+    as a run without a file does, its plan's first compile its own, and trains, its steps advancing and its
+    parameters moving (row 1915). A wider model's step is dropped alike. The model's attention takes XLA's
+    path, which a step compiled with no GPU attached traces too."""
     from dew.nn.kernels.generation import chosen
     from dew.training.ahead import AheadOfTime, compile_ahead
 
@@ -1659,12 +1661,33 @@ def a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
         initial = jax.tree.leaves(run.initial_state().variables["params"])
         state = run.fit(batch, steps=2, log_every=1)
         other = fine_tune(here, ahead=AheadOfTime.load(tmp_path / "wide.dew-aot"), xla=True)
-        with pytest.raises(ValueError):
-            other.fit(batch, steps=1, log_every=1)
+        assert int(other.fit(batch, steps=1, log_every=1).step) == 1
     first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
-    assert int(state.step) == 2 and first["ahead"] is True
+    assert int(state.step) == 2 and first["ahead"] is False
     assert any(not np.array_equal(np.asarray(new), np.asarray(old))
                for new, old in zip(jax.tree.leaves(state.variables["params"]), initial, strict=True))
+
+
+def test_a_run_handed_an_untuned_step_compiles_its_own(tmp_path, caplog):
+    """A run handed a step compiled ahead without its GPU kind's tuned choices (`AheadOfTime.tuned`: compiled
+    on compile-only GPUs outside a prepare) does not run that file's programs, whose XLA products ran up to
+    48 times slower on a GH200 (UB-4792-AHEAD-TIME): it compiles its step on its own devices as a run
+    without a file does, its first compile its own, and says so once (`AheadOfTime.runnable`); here a
+    CPU, handed an H100's file, trains."""
+    from dew.training.ahead import AheadOfTime, compile_ahead
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    compile_ahead(fine_tune(MeshSpec().build(gpus("sm90"))), batch).save(tmp_path / "step.dew-aot")
+    handed = AheadOfTime.load(tmp_path / "step.dew-aot")
+    assert not handed.tuned
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="dew.training.ahead"):
+        run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=handed)
+        with Compiles("step") as compiles:
+            state = run.fit(batch, steps=1, log_every=1)
+    first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
+    assert int(state.step) == 1 and first["ahead"] is False and compiles.count >= 1
+    assert len([entry for entry in caplog.records if entry.name == "dew.training.ahead"]) == 1
 
 
 def test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step():
@@ -1684,9 +1707,8 @@ def test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step():
 
 def a_watched_run_handed_its_steps_compiled_ahead_compiles_neither(tmp_path):
     """A GPU flow's cell (tests/test_gpu_training.py): a run that inspects, handed its step and sampled step
-    compiled ahead for this host's own GPU, takes both (`taken`) and compiles no step program on its GPU
-    (`Compiles`): its first plan's compile is the step compiled ahead, and it trains from it (train 332's
-    review)."""
+    compiled ahead for this host's own GPU, untuned there (`AheadOfTime.tuned`), runs neither: it compiles
+    both on its GPU (`Compiles`), as a run without a file does, and trains (train 332's review; UB-4792)."""
     from dew.nn.kernels.generation import chosen
     from dew.telemetry.compiles import Compiles
     from dew.training import Inspection
@@ -1701,7 +1723,7 @@ def a_watched_run_handed_its_steps_compiled_ahead_compiles_neither(tmp_path):
         with Compiles("step") as compiles:
             state = run.fit(batch, steps=1, log_every=1)
     first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
-    assert int(state.step) == 1 and first["ahead"] is True and compiles.count == 0
+    assert int(state.step) == 1 and first["ahead"] is False and compiles.count >= 2
 
 
 @pytest.mark.tpu(reason="runs a step compiled ahead for this host's TPU topology as a run's first step")
@@ -1812,7 +1834,8 @@ def a_run_handed_a_step_compiled_ahead_traces_with_the_links_it_was_compiled_wit
     here = spec.build(jax.devices()[:2])
     with chosen(narrow_copies="off"):
         target = spec.build(this_gpus(2))
-        compile_ahead(latent(target), batch).save(path)
+        # Stated tuned, as a prepare's file is (`report.for_devices`): an untuned one no run takes at all.
+        dataclasses.replace(compile_ahead(latent(target), batch), tuned=True).save(path)
         saved = str(tmp_path / "run")
         run = latent(here, ahead=AheadOfTime.load(path), links=FAST, checkpoints=Checkpoints(saved))
         state = run.fit(batch, steps=2, log_every=1)
@@ -1833,7 +1856,8 @@ def a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     with chosen(narrow_copies="off"):
         target = MeshSpec().build(this_gpus())
-        saved = compile_ahead(fine_tune(target, xla=True, split=2), batch)
+        # Stated tuned, as a prepare's file is (`report.for_devices`): an untuned one no run takes at all.
+        saved = dataclasses.replace(compile_ahead(fine_tune(target, xla=True, split=2), batch), tuned=True)
         path = tmp_path / "split.dew-aot"
         saved.save(path)
         here = MeshSpec().build(jax.devices()[:1])
