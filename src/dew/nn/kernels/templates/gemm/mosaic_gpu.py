@@ -217,10 +217,12 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       ahead, `Family.loads_ahead`, beside the one consumed and those whose products the family keeps in
       flight, `Family.in_flight`); a tile that cannot stage that deep gives way to the next
       narrower or shorter one, or a shallower step.
-    - Cluster: where grouped and a group's rows span at least as many row tiles as the family's cluster
-      takes (`Family.cluster`: a pair on warpgroup MMA), that many multiprocessors a cluster, running row
-      tiles of one group that load its matrix block once between them (multicast), CUTLASS's and
-      cuBLASLt's pair on an H100; each multiprocessor's tile, stages and staged bytes as alone, its
+    - Cluster: where the call's rows (a group's on average, or a kernel gradient's output rows, the inputs'
+      width) hold a tile's on a family whose cluster takes a pair (`Family.cluster`: warpgroup MMA's), that
+      many multiprocessors a cluster, running row tiles that load the block they share once between them
+      (multicast: a product's matrix, a kernel gradient's cotangent), CUTLASS's and cuBLASLt's pair on an
+      H100 (cuBLASLt's 2 x 4 cluster on the 4B's up kernel gradient read 35% less from device memory than the
+      template's one-multiprocessor tile, its tensor pipe 98.7% busy against 82.4%, M-EM-48-gh200); each multiprocessor's tile, stages and staged bytes as alone, its
       legality unchanged. On layouts whose products span a pair (tcgen05's 2-SM MMA, which the caller
       tries first where the rows hold its two row tiles, `paired_first`), every tile the pair's.
     - Band: the planar snake's column tiles a band (`resources.band`), the rows' and the columns' blocks
@@ -371,11 +373,12 @@ def _balanced_side(layouts: tuple, consumers: int, role: int, most_rows: int) ->
 def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, programs: int, rows: int,
             width: int, multiprocessors: int, grouped: bool) -> Tiles:
     """`derived`'s tile of a shape and step on `layout`: a pair of multiprocessors a cluster runs two row
-    tiles of one group where its layout's loads multicast and a group averages a tile's rows, which then
-    read its matrix's blocks once; a pair is two consumers' (`Tiles`), so a one-consumer tile, the
+    tiles of one group where its layout's loads multicast and the call's rows (a group's on average, a
+    kernel gradient's output rows) hold a tile's, which then read the block they share once (a product's
+    matrix, a kernel gradient's cotangent); a pair is two consumers' (`Tiles`), so a one-consumer tile, the
     fallback, runs alone; a layout whose products span a pair (`mosaic.Transport.pairs_product`, tcgen05's
     2-SM MMA) runs every tile on its pair."""
-    multicast = grouped and consumers > 1 and rows >= block_m
+    multicast = consumers > 1 and rows >= block_m
     cluster = layout.cluster if layout.pairs_product or multicast else 1
     band = resources.band(multiprocessors * programs, block_m, block_n, width // block_n,
                           -(-rows // (block_m * cluster)) if grouped else None, cluster=cluster)
