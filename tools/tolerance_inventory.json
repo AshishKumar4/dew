@@ -498,7 +498,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_rae.py": {
-   "comparisons": 7,
+   "comparisons": 5,
    "lane": "Models, Serving & RL"
   },
   "tests/test_rcm.py": {
@@ -530,7 +530,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_sd3_source.py": {
-   "comparisons": 17,
+   "comparisons": 12,
    "lane": "Models, Serving & RL"
   },
   "tests/test_sequence_parallel.py": {
@@ -622,7 +622,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_wan_vae.py": {
-   "comparisons": 9,
+   "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
   "tests/test_whole_validation.py": {
