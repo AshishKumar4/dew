@@ -100,47 +100,33 @@ PARAM_ID = re.compile(r"[\w-]+")
 digits, `_` and `-`, so its node id, its rows' names and its tasks' split hold it whole."""
 
 
-def selected(command: list[str], network: bool, whole: bool = False, release: bool = False,
-             site: bool = False) -> list[str]:
+def selected(command: list[str], network: bool, site: bool = False) -> list[str]:
     """CI's pytest `command` (`pytest_run`), or with `network` the same selecting the network-marked tests
-    alone, every one the rest of CI sets aside. It sets aside the tests marked whole_suite too, but on the
-    whole suite's run (`whole`: DEW_WHOLE_SUITE, CI's schedule and its whole dispatch), whatever the cache's
-    policy: a policy-off train runs every file, never a whole-suite cell (the maintainer, 2026-10-28: train
-    250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The release checks run in
-    their own tasks alone (`release`), every one whatever else marks it, under a requirement the suite's
-    environment lacks (rows.py's `release_plan`), and on no other run, the network lane's among them. A site
-    marked one of `SHARDS` runs in its own tasks alone (`site`: its map tasks and its judge, ci.py's
-    `site_entries`), and every other run sets it aside. This module is every row's key's (ci.py's `SHARED`),
-    so a change to what a run selects re-keys every row (row 2558)."""
+    alone, every one the rest of CI sets aside. A site marked one of `SHARDS` runs in its own tasks alone
+    (`site`: its map tasks and its judge, ci.py's `site_entries`), and every other run sets it aside. This
+    module is every row's key's (ci.py's `SHARED`), so a change to what a run selects re-keys every row (row
+    2558)."""
     at = command.index(SELECTION[1])
-    if release:
-        chosen = "release_env"
-    elif network:
-        chosen = "network and not release_env"
+    if network:
+        chosen = "network"
     else:
-        chosen = (SELECTION[1] + " and not release_env" + ("" if whole else " and not whole_suite")
-                  + ("" if site else "".join(f" and not {kind}" for kind in SHARDS)))
+        chosen = SELECTION[1] + ("" if site else "".join(f" and not {kind}" for kind in SHARDS))
     return [*command[:at], chosen, *command[at + 1:]]
 
 
-def selection(tests: list[str], split: str, release: str = "") -> list[str]:
+def selection(tests: list[str], split: str) -> list[str]:
     """pytest's arguments that select `tests` as a CI task does: one group of a split file (`split`,
-    split.py), a release check's tests (`release`, release.py), or a check-1 site's test alone (`split` its
-    group, `SITE`)."""
+    split.py), or a check-1 site's test alone (`split` its group, `SITE`)."""
     site = SITE.fullmatch(split)
-    grouping = (["-p", "split", f"--ci-group={split}"] if split and not site else []) + (
-        ["-p", "release", f"--ci-release={release}"] if release else [])
+    grouping = ["-p", "split", f"--ci-group={split}"] if split and not site else []
     named = [f"{name}::{site['test'].replace('.', '::')}" for name in tests] if site else tests
     return [*named, *grouping]
 
 
-def pytest_command(run: list[str], tests: list[str], split: str, release: str) -> list[str]:
+def pytest_command(run: list[str], tests: list[str], split: str) -> list[str]:
     """CI's pytest `run` over `tests`, with the plugin that records what ran (executed.py), as `selection`
-    selects them. A release check's pytest runs with its requirement over the suite's environment, whose
-    torch and jax it keeps: uv's overlay."""
-    command = [*run, "-p", "executed", *selection(tests, split, release)]
-    return ["uv", "run", "--no-project", "--python", command[0], "--with", release, "--", "python",
-            *command[1:]] if release else command
+    selects them."""
+    return [*run, "-p", "executed", *selection(tests, split)]
 
 
 MARKS = ("gpu",)
