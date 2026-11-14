@@ -1910,11 +1910,11 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
 def test_a_tools_init_added_or_a_helper_of_a_shadowing_name_reruns_the_rows_whose_imports_it_changes(
         ci, tmp_path, monkeypatch, cache_worker):
     """tools/ is a namespace package, which a test imports from (`from tools import x`): an __init__.py added
-    to it, which runs on every such import and makes it a regular package, reruns each row that imported from
-    it (train 672's review: no row's key held tools' own lookup), and its removal returns the row to inputs it
-    ran green on, whose run is reused (keyed by its last run's set, those inputs are its first run's, which
-    its green key holds); a helper under tests/ of a module's name, which shadows it as tests/ leads sys.path,
-    reruns each row that imported that name, and one of another name reruns none."""
+    to it, which runs on every such import and makes it a regular package, reruns each row that imported
+    from it (train 672's review: no row's key held tools' own lookup), and so does its removal, as the row's
+    last run executed it and no main of this checkout names the run before (`green_record`); a helper under
+    tests/ of a module's name, which shadows it as tests/ leads sys.path, reruns each row that imported that
+    name, and one of another name reruns none."""
     (tmp_path / "tools").mkdir(exist_ok=True)
     (tmp_path / "tools/helper.py").write_text("def value(): return 1\n")
     written(tmp_path, {
@@ -1935,9 +1935,9 @@ def test_a_tools_init_added_or_a_helper_of_a_shadowing_name_reruns_the_rows_whos
         return len((tmp_path / "runs").read_text())
 
     assert run() == 1
-    for path, source, runs in (("tools/__init__.py", "", 2), ("tools/__init__.py", None, 2),
-                               ("tests/unrelated_helper.py", "VALUE = 1\n", 2),
-                               ("tests/json.py", "def dumps(value): return str(value)\n", 3)):
+    for path, source, runs in (("tools/__init__.py", "", 2), ("tools/__init__.py", None, 3),
+                               ("tests/unrelated_helper.py", "VALUE = 1\n", 3),
+                               ("tests/json.py", "def dumps(value): return str(value)\n", 4)):
         if source is None:
             (tmp_path / path).unlink()
         else:
