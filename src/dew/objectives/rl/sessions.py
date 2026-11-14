@@ -143,7 +143,8 @@ def pooled(shares: Sequence[Moments]) -> tuple[float, float]:
     count, mean, m2 = 0.0, 0.0, 0.0
     for share in shares:
         if share.count:
-            count, mean, m2, _, _ = joined_moments(count, mean, m2, share.count, share.mean, share.m2)
+            count, mean, delta, weight = joined_moments(count, mean, share.count, share.mean)
+            m2 += share.m2 + weight * delta ** 2
     return mean, float(np.sqrt(m2 / count)) if count else 0.0
 CREDITS = ("session", "turn")
 """What an advantage is computed over: `session`, one per session from its

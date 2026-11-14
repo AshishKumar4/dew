@@ -177,17 +177,15 @@ class Exponentiated(Ratio):
         return jnp.where(active, jnp.exp(value), 0), active
 
 
-def joined_moments[M: (jax.Array, float)](count: M, center: M, squares: M, later_count: M, later_center: M,
-                                          later_squares: M) -> tuple[M, M, M, M, M]:
-    """Two parts' row counts, means and summed squared deviations from them (by feature, arrays or floats)
-    as the whole's, by Chan, Golub and LeVeque's pairwise update, which no part's sum of squares cancels
-    against its mean in; and the means' difference and the weight their outer product joins the parts'
-    co-moments by (`Moments`). The whole holds a row."""
+def joined_moments[M: (jax.Array, np.ndarray, float)](count: M, center: M, later_count: M, later_center: M
+                                                      ) -> tuple[M, M, M, M]:
+    """Two parts' row counts and means (by feature, arrays or floats) as the whole's, by Chan, Golub and
+    LeVeque's pairwise update, which no part's sum of squares cancels against its mean in; and the means'
+    difference and the weight the parts' summed squared deviations, or co-moments, join by: theirs added,
+    and `weight` times the difference's square, or its outer product. The whole holds a row."""
     whole = count + later_count
     delta = later_center - center
-    weight = count * later_count / whole
-    joined = squares + later_squares + weight * delta ** 2
-    return whole, center + delta * later_count / whole, joined, delta, weight
+    return whole, center + delta * later_count / whole, delta, count * later_count / whole
 
 
 @struct.dataclass
@@ -230,8 +228,8 @@ class Moments(Pooled):
     def joined(self, later: Pooled) -> Moments:
         if not isinstance(later, Moments):
             raise TypeError(f"moments join moments, not a {type(later).__name__}")
-        count, center, squares, delta, weight = joined_moments(self.count, self.center, self.squares,
-                                                               later.count, later.center, later.squares)
+        count, center, delta, weight = joined_moments(self.count, self.center, later.count, later.center)
+        squares = self.squares + later.squares + weight * delta ** 2
         products = None if self.products is None or later.products is None else (
             self.products + later.products + weight * jnp.outer(delta, delta))
         return Moments(count, center, squares, products, self.statistic)

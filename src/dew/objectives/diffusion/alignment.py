@@ -169,11 +169,6 @@ class Alignment:
         """Return the projector's variables for `count` hidden tokens of `width`."""
         return self.module(features).init(key, jnp.zeros((1, count, width)))
 
-    def loss(self, projector: Variables, hidden: jax.Array, targets: jax.Array, batch: Batch) -> jax.Array:
-        """Return REPA's projection loss, the mean of -cos(target, projection) over tokens and examples
-        (`statistics`'s)."""
-        return self.statistics(projector, hidden, targets, batch).mean()[0]
-
     def statistics(self, projector: Variables, hidden: jax.Array, targets: jax.Array, batch: Batch) -> Ratio:
         """REPA's projection loss as the ratio its mean is, -cos(target, projection) summed over `batch`'s
         rows (`Objective.row_mean`) and their mass, which a step read in several microbatches pools.
