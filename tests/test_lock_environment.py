@@ -160,12 +160,12 @@ def wheel_of(directory: Path, name: str) -> Path:
     return directory / namespace["_wheel"](str(directory), name)
 
 
-@pytest.mark.parametrize("altered", [False, True], ids=["as-locked", "bytes-changed"])
-def test_dews_installer_installs_a_locked_file_only_where_its_bytes_hash_to_the_lock(tmp_path, altered):
+@pytest.mark.parametrize("case", ["as-locked", "bytes-changed", "unhashed"])
+def test_dews_installer_installs_a_locked_file_only_where_its_bytes_hash_to_the_lock(tmp_path, case):
     """tools/install_environment.sh, the path armada, the GPU nodes and Colab take, installs a lock's file
     where its bytes hash to the lock's sha256, and refuses it, by name, before Dew's checkout is installed,
-    where they changed under its name and version (ledger 6204's audit: the locks pinned no hash, so a
-    replaced wheel installed)."""
+    where they changed under its name and version, or where the lock gives it no hash at all (ledger 6204's
+    audit: the locks pinned no hash, so a replaced wheel installed)."""
     if shutil.which("uv") is None:
         raise AssertionError("uv, which Dew's installer runs, is not on PATH")
     tree, store = tmp_path / "tree", tmp_path / "store"
@@ -178,8 +178,9 @@ def test_dews_installer_installs_a_locked_file_only_where_its_bytes_hash_to_the_
                                          'requires = []\nbuild-backend = "backend"\nbackend-path = ["."]\n')
     wheel = wheel_of(store, "locked")
     digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
-    (tree / "locks" / "t.txt").write_text(f"locked @ {wheel.as_uri()} \\\n    --hash=sha256:{digest}\n")
-    if altered:
+    hashed = "" if case == "unhashed" else f" \\\n    --hash=sha256:{digest}"
+    (tree / "locks" / "t.txt").write_text(f"locked @ {wheel.as_uri()}{hashed}\n")
+    if case == "bytes-changed":
         with zipfile.ZipFile(wheel, "a") as changed:
             changed.writestr("locked_extra.py", b"")
     venv = tmp_path / "venv"
@@ -188,7 +189,7 @@ def test_dews_installer_installs_a_locked_file_only_where_its_bytes_hash_to_the_
     done = subprocess.run(["sh", "tools/install_environment.sh", "t", "-q", "--offline", "--python",
                            str(python)], cwd=tree, capture_output=True, text=True)
     installed = subprocess.run([str(python), "-c", "import locked, checkout"], capture_output=True)
-    if altered:
+    if case != "as-locked":
         assert done.returncode != 0 and "locked" in done.stderr and "hash" in done.stderr.lower(), done.stderr
         assert installed.returncode != 0
     else:
