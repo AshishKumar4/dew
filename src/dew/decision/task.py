@@ -827,10 +827,16 @@ class Decide(SavedRunTask, InItsForm):
                        bins=shape.rows)
 
     @functools.cached_property
+    def _weightless(self) -> "Decide":
+        """This task holding no weights, which every scoring of it holds (`RowScoring`, `scoring`), so its
+        plan (its passes' shapes, window bounds and packs) and its compiled programs are built once for
+        them all."""
+        return replace(self, variables={})
+
+    @functools.cached_property
     def _row_scoring(self) -> "RowScoring":
-        """The task's rows as a scoring task over no weights, held once so its passes' plans and
-        compiled programs are built once (`logits`)."""
-        return RowScoring(replace(self, variables={}))
+        """The task's rows as a scoring task over no weights (`logits`), held once."""
+        return RowScoring(self._weightless)
 
     @functools.cached_property
     def _bounds(self) -> dict[int, Bounds]:
@@ -1323,7 +1329,7 @@ class Decide(SavedRunTask, InItsForm):
         task's calibration with the weights it was fitted to."""
         if strict and details:
             raise ValueError("strict answers hold Jev's fields alone, so they carry no details")
-        held = WireScoring(replace(self, variables={}), details=details, strict=strict, whole=whole)
+        held = WireScoring(self._weightless, details=details, strict=strict, whole=whole)
         return held, self.variables
 
     def _read_wire(self, request: Mapping[str, object], *, strict: bool

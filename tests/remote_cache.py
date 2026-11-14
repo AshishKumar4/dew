@@ -645,7 +645,7 @@ def main(arguments: list[str]) -> int:
     from jax.experimental import topologies
 
     from dew._cache import default_compilation_cache_dir
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     # The CUDA plugin, which a serialized topology deserializes through, initialized with no GPU and no
     # client, as a compile-only target initializes it (`dew.training.ahead.host_gpus`).

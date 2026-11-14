@@ -28,7 +28,7 @@ from dew.data.compile import compile, iterate, validation
 from dew.data.dataset import DataPartition, Loading
 from dew.data.mixing import TokenDeficit, token_weights
 from dew.data.pipeline import Configured, Pack, Pipeline, Rejected, mix
-from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
+from dew.data.plan import Environment, Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources import Files, Memory
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
@@ -1264,11 +1264,12 @@ def test_authoritative_zero_target_count_is_refused_before_division():
 
 
 def test_dependency_change_preserves_global_resume_only_when_derived_order_matches():
-    manifest = Manifest({"name": "test"}, revision="before")
+    manifest = Manifest({"name": "test"}, environment=Environment(revision="before"))
     plan = Plan("global", manifest, {"seed": 0}, {"accepted_ids": fingerprint([1, 3, 5])})
     # Dew's revision is the checkpoint step's, not the position's (row 5862): nothing the position holds
     # changed.
-    changed = dataclasses.replace(plan, manifest=dataclasses.replace(manifest, revision="after"))
+    changed = dataclasses.replace(plan, manifest=dataclasses.replace(
+        manifest, environment=Environment(revision="after")))
     assert changed.check(plan.record()) == ()
     changed = dataclasses.replace(changed, derived={"accepted_ids": fingerprint([1, 3, 7])})
     with pytest.raises(ValueError):
@@ -1832,11 +1833,12 @@ def test_a_plan_identity_is_its_rows_on_any_host_and_share():
     """A pool agrees on the plan's identity: processes that read other shares
     of the same rows with other code agree, and processes whose source holds
     other rows do not."""
-    manifest = Manifest({"rows": "one"}, revision="before")
+    manifest = Manifest({"rows": "one"}, environment=Environment(revision="before"))
     plan = Plan("per-share", manifest, {"seed": 0}, topology={"shares": 2, "share": 0})
     elsewhere = dataclasses.replace(
         plan,
-        manifest=dataclasses.replace(manifest, revision="after", platform="another host"),
+        manifest=dataclasses.replace(manifest, environment=dataclasses.replace(
+            manifest.environment, revision="after", platform="another host")),
         topology={"shares": 2, "share": 1},
     )
     other = dataclasses.replace(plan, manifest=dataclasses.replace(manifest, source={"rows": "two"}))

@@ -660,7 +660,7 @@ import jax
 import jax.numpy as jnp
 from kernel_compile import lowered_for
 from dew.nn.kernels.templates import attention as template, attention_mosaic, report
-from dew.training.ahead import compile_only_gpus
+from dew.nn.kernels.generation import compile_only_gpus
 
 tokens, heads, kv_heads, width = 640, 4, 2, 128
 spans = template.spans(tokens, tokens, 1, causal=True)

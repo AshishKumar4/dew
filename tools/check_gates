@@ -9,6 +9,12 @@ ruff	"$PYTHON" -m ruff check $ruff_inputs
 slop	JAX_PLATFORMS=cpu "$PYTHON" tools/lint_slop.py
 # Dew's layering contracts, read from the source's imports (docs/design/architecture.md).
 layers	"$PYTHON" tools/lint_layers.py
+# Every test file collects on each tested Python, one gate a Python (`ci.py pythons --check` holds these to PYTHONS):
+# a name a package's __all__ lists that it does not bind, or any import error, stops a file at collection, which a head
+# whose train runs it learns only from that train (Main, 2026-11-13: a head's reach runs no whole suite; a head's
+# dew.objectives.__all__ named what it did not import). About 210 s each.
+collect-3.12	( l=$(mktemp); trap 'rm -f "$l"' EXIT; JAX_PLATFORMS=cpu .venv-3.12/bin/python -m pytest --co -qq tests > "$l" 2>&1 || { tail -60 "$l"; exit 1; } )
+collect-3.14	( l=$(mktemp); trap 'rm -f "$l"' EXIT; JAX_PLATFORMS=cpu .venv-3.14/bin/python -m pytest --co -qq tests > "$l" 2>&1 || { tail -60 "$l"; exit 1; } )
 # A released version keeps the notes it shipped, and new entries go under ## Unreleased (row 3050).
 changelog	"$PYTHON" tools/changelog_released.py check
 # The ratchet reads the inventory's whole history, which a shallow checkout fetches first.

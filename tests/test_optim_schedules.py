@@ -18,7 +18,17 @@ import optax
 import pytest
 from reference_error import assert_computes_the_oracle, chain_roundings
 
-from dew.optim import Cosine, Exponential, Linear, OneCycle, OptimConfig, ParamGroup, Power, stepped
+from dew.optim import (
+    Cosine,
+    Exponential,
+    Linear,
+    OneCycle,
+    OptimConfig,
+    ParamGroup,
+    Power,
+    post_step_order,
+    stepped,
+)
 
 TORCH = np.load(Path(__file__).resolve().parent / "fixtures" / "torch_optim" / "reference.npz")
 EPOCHS, PER_EPOCH = 6, 2
@@ -102,7 +112,7 @@ def run(solver: optax.GradientTransformation, initial, grads) -> dict[str, list[
     for step in range(len(grads["kernel"])):
         updates, after = update({name: grads[name][step] for name in params}, state, params)
         # A bounded group's clamp acts on the stepped weights (`stepped`).
-        params, state = stepped(params, updates, state, after), after
+        params, state = stepped(params, updates, state, after, post_step_order(solver, params)), after
         for name, value in params.items():
             trace[name].append(value)
     return trace
@@ -128,6 +138,35 @@ def test_grouped_adam_is_torchs_adam_with_param_groups_a_momentum_cycle_and_a_cl
         assert_computes_the_oracle(np.stack(trace[name]), TORCH[f"params/{name}"], name, roundings=roundings)
 
 
+def test_post_step_effects_act_in_the_order_a_named_chain_declares():
+    """A named chain's post-step effects act on the stepped weights in the order it declares them
+    (docs/design/training.md: in the chain's order), its state a dict by name, which JAX flattens by sorted
+    names: QK-Clip's rescale by 0.5 named `z_clip`, then a clamp into [0, 2] named `a_bound`, take a
+    stepped 3 to 1.5, where the clamp first gave 1.0. Each effect is judged by its own counter where the
+    step's argument holds the chain sorted by name, as a step's argument comes in: the clamp into [0, 1]
+    the update deferred leaves the rescaled 1.5. The order is the chain's own (`post_step_order`), read from
+    its init however a wrapper's state comes back sorted: `optax.MultiSteps`' `lax.cond` sorts it too."""
+    from dew.optim import BoundsState, QKClipState, _keep_within, scale_by_qk_clip
+
+    params, path = {"q_proj": {"kernel": jnp.asarray([[3.0]])}}, "['q_proj']['kernel']"
+    unmoved = jax.tree.map(jnp.zeros_like, params)
+
+    def state(clipped: int, bounded: int, rescale: float, upper: float, order=("z_clip", "a_bound")) -> dict:
+        held = {"z_clip": QKClipState(jnp.asarray(clipped), {path: jnp.asarray([rescale])}),
+                "a_bound": BoundsState(jnp.asarray(bounded), {path: jnp.asarray([0.0, upper])})}
+        return {name: held[name] for name in order}
+
+    chain = optax.named_chain(("z_clip", scale_by_qk_clip(1.0)), ("a_bound", _keep_within(0.0, 2.0)))
+    declared = post_step_order(chain, params)
+    assert [path[-1] for path in post_step_order(optax.MultiSteps(chain, 2), params)] == ["z_clip", "a_bound"]
+    moved = stepped(params, unmoved, state(0, 0, 1.0, 2.0, order=("a_bound", "z_clip")),
+                    state(1, 1, 0.5, 2.0, order=("a_bound", "z_clip")), declared)
+    np.testing.assert_array_equal(moved["q_proj"]["kernel"], [[1.5]])
+    deferred = stepped(params, unmoved, state(5, 2, 1.0, 1.0, order=("a_bound", "z_clip")),
+                       state(6, 2, 0.5, 1.0), declared)
+    np.testing.assert_array_equal(deferred["q_proj"]["kernel"], [[1.5]])
+
+
 def test_a_bounded_group_clamps_its_parameters_and_no_others():
     params = {"delay": jnp.asarray([0.05, 2.95]), "kernel": jnp.asarray([0.05, 2.95])}
     config = OptimConfig(optimizer="adam", learning_rate=0.5, param_groups=(
@@ -136,7 +175,7 @@ def test_a_bounded_group_clamps_its_parameters_and_no_others():
     grads = {"delay": jnp.asarray([1.0, -1.0]), "kernel": jnp.asarray([1.0, -1.0])}
     initial = solver.init(params)
     updates, state = solver.update(grads, initial, params)
-    moved = stepped(params, updates, initial, state)
+    moved = stepped(params, updates, initial, state, post_step_order(solver, params))
     # The clamp is exact: the bounds themselves, where the step overshot them; no other group's
     # parameters are clamped, the step applied as it is.
     np.testing.assert_array_equal(moved["delay"], [0.0, 3.0])
@@ -151,7 +190,7 @@ def test_a_bounded_group_clamps_its_parameters_and_no_others():
         def step(params, grads):
             first = read.init(params)
             updates, state = read.update(grads, first, params)
-            return stepped(params, updates, first, state)
+            return stepped(params, updates, first, state, post_step_order(read, params))
         kernel = np.asarray(step(wide, widened)["kernel"])
         roundings = chain_roundings(jax.make_jaxpr(step)(wide, widened))
     # From the float32 parameters and gradients the step read, widened.

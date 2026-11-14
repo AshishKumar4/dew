@@ -410,8 +410,6 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
 
     issues_in_consumers = False
 
-    takes_pairs = False
-
     takes_register_left = False
 
     block_formats = (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.float8_e5m2), jnp.dtype(jnp.float4_e2m1fn))

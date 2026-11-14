@@ -34,7 +34,6 @@ import tokamax
 from google.protobuf import empty_pb2
 from google.protobuf.message import DecodeError
 from google.protobuf.unknown_fields import UnknownFieldSet
-from jax._src import config as jax_config, core as jax_core, mesh as mesh_lib
 from jax._src.thunky import thunky
 from jax.extend.mlir import ir
 
@@ -508,12 +507,13 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
 
     from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.kernels.options import owned_program
+    from dew.nn.programs import meshless
 
     mesh = Mesh([device], ("launch",))
     placed = NamedSharding(mesh, PartitionSpec())
-    # A program of its own on one device (`_standalone`): none of the enclosing trace's mesh nor its axes (a
+    # A program of its own on one device (`meshless`): none of the enclosing trace's mesh nor its axes (a
     # checked shard_map's body, whose abstract values the launch's own must not vary over), its operands' too.
-    with _standalone(), jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+    with meshless(), jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
         launch, shapes = op.lowering(arguments, config)
         specs = [jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=placed) for shape in shapes]
 
@@ -531,24 +531,6 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
     return {name: (modules[name], binary)
             for binary in binaries(lowered.compile(targeted(lowered, None)))
             if (name := launch_name(binary.kernel, binary.launch)) in modules}
-
-
-@contextlib.contextmanager
-def _standalone() -> Iterator[None]:
-    """A program of its own, traced within another's trace (a launch certified as a shard_map's body traces):
-    no mesh in context, abstract or concrete, nor its axes bound or checked (a checked shard_map's manual axes
-    bound, and its values asked to state their variance over them, `check_vma`), as outside every trace.
-    `jax.set_mesh(None)` does the mesh's swaps but refuses to run under a trace."""
-    abstract = mesh_lib.abstract_mesh_context_manager.swap_local(mesh_lib.empty_abstract_mesh)
-    concrete = mesh_lib.device_context.swap_local(mesh_lib.empty_concrete_mesh)
-    axes = jax_core.axis_env_state.swap_local(jax_core.top_axis_env)
-    try:
-        with jax_config._check_vma(new_val=False):
-            yield
-    finally:
-        jax_core.axis_env_state.set_local(axes)
-        mesh_lib.device_context.set_local(concrete)
-        mesh_lib.abstract_mesh_context_manager.set_local(abstract)
 
 
 def _unit_cotangent(out: jax.Array) -> jax.Array | np.ndarray:

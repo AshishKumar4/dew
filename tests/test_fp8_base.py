@@ -31,8 +31,9 @@ from reference_error import as_given, assert_as_exact, widened, with_gradients
 
 from dew.batch import FROZEN
 from dew.data.dataset import Loader
-from dew.interop.codecs import fp8_block_cast, quantize_fp8_blocks
+from dew.interop.codecs import quantize_fp8_blocks
 from dew.lora import LoRA, unadapted
+from dew.nn.fake_quant import fp8_block_cast
 from dew.nn.kernels.generation import assumed, device_generation, fp8_tensor_cores
 from dew.objectives.lm import LMObjective
 from dew.quantization import (

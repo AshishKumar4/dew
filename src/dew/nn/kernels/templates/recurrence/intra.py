@@ -195,17 +195,9 @@ def _rows_of(ref, keys: int) -> jax.Array:
     return plgpu.load(ref, layout=layout, optimized=False)
 
 
-def intra_masked(found: jax.Array, *, strict: bool, scale: float) -> jax.Array:
-    """An output's pairs `found` (a key block's factored pairs) as its sum takes them: below the diagonal
-    where `strict` (the system), else on and below it and scaled (the scores); the sub-chunks' own pairs'
-    bands alike, in their form (`algebra.band_masked`)."""
-    lag = algebra._lags(found.shape)
-    return jnp.where(lag > 0, found, 0.0) if strict else jnp.where(lag >= 0, found, 0.0) * scale
-
-
 def _intra_summed(call: Call, found: jax.Array, at, *, first) -> None:
-    """A key block's masked pairs `found` of an output (`intra_masked`) added to its sum in shared memory
-    `at` (written at the first block), before the next output's are formed (a merged walk's)."""
+    """A key block's masked pairs `found` of an output (`algebra.pairs_masked`) added to its sum in shared
+    memory `at` (written at the first block), before the next output's are formed (a merged walk's)."""
     mosaic.synced(call.interpret)
 
     # The first block's written, the rest added, in branches: a scalar condition laid over a tile
@@ -294,7 +286,7 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                                             _placed(call, placing), chunk=chunk, right=_pairs_right(call))
             masked = []
             for name, found in zip(products, pairs, strict=True):
-                masked.append(intra_masked(found, strict=name == "system", scale=scale))
+                masked.append(algebra.pairs_masked(found, strict=name == "system", scale=scale))
                 if summed_at is not None:
                     _intra_summed(call, masked[-1], summed_at.at[len(masked) - 1], first=index == 0)
             if summed_at is None:

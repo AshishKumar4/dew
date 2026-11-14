@@ -11,7 +11,6 @@ import threading
 import urllib.parse
 from datetime import timedelta
 from pathlib import Path
-from typing import NamedTuple
 
 import lane_environment
 import apart_records
@@ -178,11 +177,12 @@ def pytest_runtest_makereport(item, call):
         gate.SWITCHED.clear()
         outcome.get_result().user_properties.append(switched)
         item.user_properties.append(switched)
-    # What the FP8 sites this test judged below a named arm measured (`reference_error.BELOW`), the JUnit
+    # What the FP8 sites this test judged below a named arm measured (`fp8_below.BELOW`), the JUnit
     # property `fp8_below`: each form's ratio to that arm and to the dequantized reference, of a pass too.
-    if call.when == "call" and gate is not None and gate.BELOW:
-        below = ("fp8_below", json.dumps(gate.BELOW))
-        gate.BELOW.clear()
+    fp8 = sys.modules.get("fp8_below")
+    if call.when == "call" and fp8 is not None and fp8.BELOW:
+        below = ("fp8_below", json.dumps(fp8.BELOW))
+        fp8.BELOW.clear()
         outcome.get_result().user_properties.append(below)
         item.user_properties.append(below)
     # A test of a process that computes as a user's does (`lane_environment.USERS_ARITHMETIC`, set for
@@ -210,55 +210,7 @@ def pytest_terminal_summary(terminalreporter):
         terminalreporter.write_line(_remote.summary())
 
 
-class Unheld(NamedTuple):
-    """A release test this interpreter cannot run (`release_unheld`): the package its mark pins, the one it
-    holds (None where it holds none), and the command that runs the test as CI's release task does."""
-
-    requirement: str
-    package: str
-    held: str | None
-    command: tuple[str, ...]
-
-    def __str__(self) -> str:
-        return (f"this release's own code runs under {self.requirement}, and this interpreter holds "
-                f"{self.package} {self.held or 'not at all'}: run it as CI's release task does, under "
-                f"that overlay: {' '.join(self.command)}")
-
-
-def release_unheld(requirement: str, test: str) -> Unheld | None:
-    """Why this interpreter cannot run `test`, marked release_env(`requirement`): a release's own code under
-    the package it pins apart from the suite's, a requirement or a wheel's path as CI's release task hands
-    it to its overlay (tools/armada/session.py's `pytest_command`); or None where it holds that package. The
-    reason names CI's own release operation, which runs the test's file under that overlay, where the
-    release's own loader would fail opaquely in its subprocess (row 3576)."""
-    from importlib.metadata import PackageNotFoundError, version
-
-    from packaging.requirements import Requirement
-    from packaging.utils import canonicalize_version, parse_wheel_filename
-
-    if requirement.endswith(".whl"):
-        name, wheel, _, _ = parse_wheel_filename(Path(requirement).name)
-        pinned, wanted = str(name), canonicalize_version(wheel)
-    else:
-        parsed = Requirement(requirement)
-        pinned, wanted = parsed.name, parsed.specifier
-    try:
-        held = version(pinned)
-    except PackageNotFoundError:
-        held = None
-    if held is not None and (canonicalize_version(held) == wanted if isinstance(wanted, str)
-                             else wanted.contains(held, prereleases=True)):
-        return None
-    python = ".".join(map(str, sys.version_info[:2]))
-    return Unheld(requirement, pinned, held, (
-        "python", "tools/armada/ci.py", "release", f"--python={python}", f"--requirement={requirement}",
-        f"--tests={test.split('::', 1)[0]}", "--out=<rows.json>"))
-
-
 def pytest_runtest_setup(item):
-    released = item.get_closest_marker("release_env")
-    if released is not None and (unheld := release_unheld(released.args[0], item.nodeid)) is not None:
-        pytest.fail(str(unheld), pytrace=False)
     marker = item.get_closest_marker("mesh")
     needed = marker.kwargs.get("devices", lane_environment.MESH_DEVICES) if marker else 0
     if jax.device_count() < needed:

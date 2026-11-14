@@ -390,15 +390,38 @@ class GatedRMSNorm(nn.Module):
         return stream, (normed.astype(wide) * jax.nn.sigmoid(gate.astype(wide))).astype(normed.dtype)
 
 
-class LayerNorm(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_saveable)):
+class _Shifted(nn.LayerNorm):
+    """flax's `nn.LayerNorm` over its input less each row's mean, which a layer norm does not change: its
+    statistics read rows centered near zero, a corrected two-pass mean, so a row whose mean dwarfs its
+    spread rounds as a row near zero does (half torch's distance from float64 at rows a hundred from zero,
+    where flax's one centering sat 1.6 times it at a width of 64). The shift is a constant to the
+    gradient, whose own term a layer norm's invariance makes zero; one shift over every shard its
+    statistics read (`axis_name`), and taken in float32 at least, as flax's statistics read a narrower
+    input, its output in the dtype flax gives that input."""
+
+    @nn.compact
+    def __call__(self, x, *, mask=None):
+        axes = (self.reduction_axes,) if isinstance(self.reduction_axes, int) else tuple(self.reduction_axes)
+        wide = jnp.promote_types(x.dtype, jnp.float32)
+        shift = jnp.mean(x, axis=axes, keepdims=True, dtype=wide, where=mask)
+        if self.axis_name is not None:
+            shift = jax.lax.pmean(shift, self.axis_name, axis_index_groups=self.axis_index_groups)
+        normed = super().__call__(x.astype(wide) - jax.lax.stop_gradient(shift), mask=mask)
+        # The parameters' values, out of the partitioning box a norm declaring its axes stores them in.
+        held = [nn.unbox(self.get_variable("params", name)) for name in ("scale", "bias")
+                if self.has_variable("params", name)]
+        return normed.astype(canonicalize_dtype(x, *held, dtype=self.dtype))
+
+
+class LayerNorm(nn.remat(_Shifted, policy=jax.checkpoint_policies.nothing_saveable)):
     """flax's `nn.LayerNorm`, rematerialized saving nothing: its backward pass keeps the input as
     it arrived and its parameters, not the two fp32 copies flax's own differentiation keeps
-    (2.35 GiB of them on one SimpleDiT step). The parameter tree, the arithmetic
-    and the module's name are flax's, so checkpoints and scopes move both ways, but its variance:
-    the centered mean square, E[(x - E[x])^2], as torch's LayerNorm takes it, where flax's default
-    E[x^2] - E[x]^2 cancels in fp32 wherever a row's mean dwarfs its spread (row 5907: Gemma 4's
-    audio subsampling, whose norm reads a ReLU's output, sat 1.58 times Transformers' distance from
-    float64 on a GH200). A caller that takes the one-pass form states it (`use_fast_variance`)."""
+    (2.35 GiB of them on one SimpleDiT step). The parameter tree and the module's name are flax's, so
+    checkpoints and scopes move both ways; its statistics read each row less its mean (`_Shifted`), and
+    its variance is the centered mean square, E[(x - E[x])^2], as torch's LayerNorm takes it, where
+    flax's default E[x^2] - E[x]^2 cancels in fp32 wherever a row's mean dwarfs its spread (row 5907:
+    Gemma 4's audio subsampling, whose norm reads a ReLU's output, sat 1.58 times Transformers' distance
+    from float64 on a GH200). A caller that takes the one-pass form states it (`use_fast_variance`)."""
 
     use_fast_variance: bool = False
 

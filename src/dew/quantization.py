@@ -75,7 +75,7 @@ from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.fake_quant import fp4_codes, fp8_codes, straight_through
+from dew.nn.fake_quant import fp4_codes, fp8_block_cast, fp8_blocks_on_host, fp8_codes, straight_through
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import accumulated, at_least_fp32, correctly_rounded_divide, float32_einsum
@@ -482,7 +482,7 @@ codes for the forward product, `[out, in]`, and for the input gradient,
 def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, jax.Array | np.ndarray]:
     """A frozen `[in, out]` kernel packed once for both products it takes part
     in, each direction's rows scaled on their own by the one FP8 block cast
-    (`dew.interop.codecs.fp8_block_cast` over `(1, width)` blocks), on the
+    (`dew.nn.fake_quant.fp8_block_cast` over `(1, width)` blocks), on the
     kernel's resident devices without a host gather; a host input stays on the host: the
     forward's `[out, in]` rows contract the input, the input gradient's
     `[in, out]` rows the output's cotangent. A forward row's scale is a
@@ -492,13 +492,11 @@ def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, jax.Array | np.
     kernel's, so the gain over a bf16 base is the products' rate."""
     from jax import core
 
-    from dew.interop.codecs import fp8_block_cast, quantize_fp8_blocks
-
     resident = isinstance(kernel, (jax.Array, core.Tracer))
     kernel = jnp.asarray(kernel, jnp.float32) if resident else np.asarray(kernel, np.float32)
     if kernel.ndim != 2:
         raise ValueError(f"a frozen FP8 site packs a two-axis [in, out] kernel, got shape {kernel.shape}")
-    cast = fp8_block_cast if resident else quantize_fp8_blocks
+    cast = fp8_block_cast if resident else fp8_blocks_on_host
     forward, forward_scale = cast(kernel.T, (1, kernel.shape[0]))
     dgrad, dgrad_scale = cast(kernel, (1, kernel.shape[1]))
     return dict(zip(FROZEN_FP8, (forward, forward_scale, dgrad, dgrad_scale), strict=True))
@@ -616,7 +614,6 @@ def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.
     times its time at a training shape, row 3620); elsewhere the codes as exact bfloat16 values summed in
     fp32, held apart from XLA's FP8 GEMM, whose sum is narrower (ledger 1625). Both rows' scales apply
     after (`_scaled`)."""
-    from dew.interop.codecs import fp8_block_cast
     from dew.nn.kernels import gemm
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))

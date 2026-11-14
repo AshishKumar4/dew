@@ -1160,19 +1160,21 @@ TIMED = [
     ("sm90", "forward", (2560, 1024), "mosaic"), ("sm90", "forward", (2560, 64), "xla"),
     ("sm90", "input_gradient", (2560, 9216), "mosaic"), ("sm90", "input_gradient", (9216, 2560), "mosaic"),
     ("sm90", "input_gradient", (2560, 1024), "mosaic"), ("sm90", "input_gradient", (2560, 64), "mosaic"),
-    ("sm90", "kernel_gradient", (2560, 9216), "xla"), ("sm90", "kernel_gradient", (9216, 2560), "mosaic"),
+    ("sm90", "kernel_gradient", (2560, 9216), "mosaic"), ("sm90", "kernel_gradient", (9216, 2560), "mosaic"),
     ("sm90", "kernel_gradient", (2560, 1024), "mosaic"), ("sm90", "kernel_gradient", (2560, 64), "mosaic"),
-    ("sm90", "forward", (2560, 3072), "xla"), ("sm90", "kernel_gradient", (3072, 2560), "xla"),
+    ("sm90", "forward", (2560, 3072), "xla"), ("sm90", "kernel_gradient", (3072, 2560), "mosaic"),
     ("sm100", "forward", (2560, 64), "xla"), ("sm100", "forward", (2560, 9216), "mosaic"),
     ("sm100", "input_gradient", (2560, 9216), "xla"), ("sm100", "input_gradient", (2560, 64), "mosaic"),
-    ("sm100", "kernel_gradient", (2560, 9216), "xla"), ("sm100", "kernel_gradient", (9216, 2560), "mosaic"),
-    ("sm100", "kernel_gradient", (2560, 1024), "xla"), ("sm100", "kernel_gradient", (2560, 64), "mosaic"),
+    ("sm100", "kernel_gradient", (2560, 9216), "mosaic"),
+    ("sm100", "kernel_gradient", (9216, 2560), "mosaic"),
+    ("sm100", "kernel_gradient", (2560, 1024), "mosaic"), ("sm100", "kernel_gradient", (2560, 64), "mosaic"),
     ("sm100", "kernel_gradient", (3072, 2560), "mosaic"),
 ]
 """Each dense product the receipts timed (M-EM-36-gh200 on Hopper, em35d and lab-b200-20261113-grid on a
 B200: Qwen3.5-4B's up, down, key and gates matrices `[in, out]` at 24,576 tokens) beside the route its receipt
 timed fastest, and an untimed matrix (`[2560, 3072]`, `[3072, 2560]`), which keeps its kind's default
-(Hopper's XLA cells, the B200's template)."""
+(Hopper's XLA cells, the B200's template); a kernel gradient takes the template on both, whatever its time
+(`grouped_matmul.MEASURED`: XLA's dot of one holds every layer's cotangents to the backward's end)."""
 
 
 def _named(value) -> str:

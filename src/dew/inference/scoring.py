@@ -140,7 +140,10 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         it, and a reload replaces both at once, so an answer never pairs one task with another's
         weights."""
         self.mesh = mesh_of(placed)
-        self._source_shapes = jax.tree_util.tree_flatten_with_path(jax.eval_shape(lambda: placed))[0]
+        # Read off the leaves, which a call's server is built over: no program traced, and no reference
+        # held to the weights a reload replaces.
+        self._source_shapes = jax.tree_util.tree_flatten_with_path(jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), placed))[0]
         self._waiting: Waiting[_Request[Row, Payload, Output, Answer]] = Waiting(
             "the server stopped after a step failed")
         """The requests waiting for a pass, or for the rest of their rows."""

@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 from interop_support import extract_fixture
-from whole_suite import timed
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -17,16 +16,17 @@ def edges(tmp_path_factory):
                            tmp_path_factory.mktemp("native-diffusion-edges"))
 
 
-PAST_TARGET = {"parity": {"dpm-karras": 171}}
-"""The cases past a group's 120 s (`timed`), each its seconds in train 270's CI (66a222273, ledger 2133):
-DPM-Karras's schedule; every train walks the same native-source path under DDIM, DDIM-clip, Euler and
-PNDM, row 647's proof."""
-
-
-@pytest.mark.parametrize("case", timed(PAST_TARGET, "parity", ["ddim-linspace", "ddim-clip", "euler-zero-snr",
-                                                                "dpm-karras", "norm", "odd", "dropped"]))
+@pytest.mark.parametrize("case", ["ddim-linspace", "ddim-clip", "euler-zero-snr", "norm", "odd", "dropped"])
 def test_native_source_control_and_gradient_parity(edges, case):
     checked(edges, case)
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=32)
+def test_native_source_control_and_gradient_parity_under_dpm_karras(edges):
+    """`checked` over DPM-Karras's walk, whose 128 draws, each its own table's walk compiled again, took
+    171 s in one task (train 270's CI, ledger 2133), past a group's 120 s: CI draws them in map tasks of 32,
+    as PNDM's below (`map_judge`)."""
+    checked(edges, "dpm-karras")
 
 
 @pytest.mark.check1_shards(seeds=128, per_task=32)

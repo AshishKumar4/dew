@@ -10,8 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.interop import Pretrained
-from dew.nn.inputs import ModelInputs
-from tools.deepseek_v41_numerics import unquantized
+from tools.deepseek_v41_numerics import next_token_loss, unquantized
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "deepseek-v41-tiny"
@@ -32,33 +31,26 @@ def source():
 
 def training_step(loaded, model, quantized: bool = False):
     """Dew's training step on a draw's rows as its trainer takes one: LMObjective's reduced next-token loss
-    and its gradient in the params, every other collection (which trains nothing) a zero gradient, each
-    tensor's gradient by the release's name for it: its layout's source array (`WeightLayout.source_array`,
-    the tensor `Pretrained.export` writes, in the program that computes it, at the gradient's own
-    precision), as the release's recording takes its step (tools/deepseek_v41_reference.py `step_leaves`).
-    `quantized`, its roundings met (`quantized_arms.rounding`, following `decided` where it is given), their
-    inputs and decisions returned beside."""
+    (tools/deepseek_v41_numerics.py `next_token_loss`) and its gradient in the params, every other
+    collection (which trains nothing) a zero gradient, each tensor's gradient by the release's name for it:
+    its layout's source array (`WeightLayout.source_array`, the tensor `Pretrained.export` writes, in the
+    program that computes it, at the gradient's own precision), as the release's recording takes its step
+    (tools/deepseek_v41_reference.py `step_leaves`). `quantized`, its roundings met
+    (`quantized_arms.rounding`, following `decided` where it is given), their inputs and decisions returned
+    beside."""
     import quantized_arms
-
-    from dew.objectives.base import Step
-    from dew.objectives.lm import LMObjective
 
     layouts = {layout.name: layout for layout in loaded.weight_layouts}
 
     @jax.jit
     def stepped(variables, ids, decided=None):
-        objective = LMObjective(model, ids.shape[1] - 1, variables=variables, ema_decay=None)
-        at = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
+        reduced = next_token_loss(model, variables, ids)
 
         def loss(params):
-            def reduced():
-                trained = {**variables, "params": params}
-                statistics, _ = objective.loss(trained, {"text": ModelInputs(ids)}, at)
-                return objective.reduce_loss(statistics)[0]
             if not quantized:
-                return reduced(), None
+                return reduced(params), None
             with quantized_arms.rounding(decided) as roundings:
-                value = reduced()
+                value = reduced(params)
             return value, (roundings.rounded(), roundings.decisions())
 
         (value, met), gradients = jax.value_and_grad(loss, has_aux=True)(variables["params"])

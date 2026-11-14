@@ -972,11 +972,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def _pair_refuses(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> bool:
         """Whether a pair's product refuses the call at `config` (`mosaic_gpu.pair_refuses`, the statement
-        `gmm`, `tgmm` refuse by): its prologue, second matrix, scales, gathered rows, exact sums, rewrite."""
+        `gmm`, `tgmm` refuse by): its prologue, scales, gathered rows, exact sums, rewritten stage."""
         return mosaic_gpu.pair_refuses(config, family, transpose_lhs=False,
                                        exact_sums=bool(ba.arguments.get('exact_sums')), scaled=self._scaled,
-                                       parts=(ba.arguments['hooks'].prologue, ba.arguments.get('paired'),
-                                              ba.arguments.get('gather')),
+                                       parts=(ba.arguments['hooks'].prologue, ba.arguments.get('gather')),
                                        rewritten=self.rewritten(ba, family))
 
     def _ran(self, ba, config: mosaic_gpu.Tiles) -> tuple:
@@ -2247,9 +2246,13 @@ gated delta net's gates, which M-EM-36-gh200 and em35d timed at 24,576 tokens, e
 
 MEASURED: dict[tuple[str | None, Made], frozenset[tuple[int, int]]] = {
     (family, made): frozenset(FOUR_B) for family in ('wgmma', 'tcgen05')
-    for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT)}
+    for made in (Made.FORWARD, Made.INPUT_GRADIENT)}
 """The dense matrices each instruction family's receipts timed, by what the product makes: a product of one is
-a cell of its own (`Kind.matrix`), which its receipt's winner holds; every other product its kind's."""
+a cell of its own (`Kind.matrix`), which its receipt's winner holds; every other product its kind's. A kernel
+gradient has none: XLA's dot of one is deferred to the backward's end, holding every layer's cotangents
+live (the 4B's up, gate, key and value on a B200: 22.25 GB of the step's temporaries against 11.06 GB on
+the template, compile-only, so a four-row step needed 148 GiB against 95), which no per-call time
+prices."""
 
 M_EM_36 = ("M-EM-36-gh200 (a GH200, base/kernels df82480cb5c, CUPTI medians of 5 rounds, cuBLASLt autotuned "
            "at run, 24,576 tokens)")
@@ -2280,8 +2283,6 @@ DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str
              "10 projections at 8192 tokens"),
     ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT)):
         (XLA, "DENSE1 (H100): Mosaic 1.048x, Triton 1.738x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT)):
-        (XLA, "DENSE1 (H100): Mosaic 1.049x, Triton 1.149x XLA's dot"),
     ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 9216))): (
         MOSAIC, f"{M_EM_36}: the template 0.866x XLA's dot"),
     ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(9216, 2560))): (
@@ -2298,22 +2299,10 @@ DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str
         MOSAIC, f"{M_EM_36}: the template 0.949x XLA's dot"),
     ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 64))): (
         MOSAIC, f"{M_EM_36}: the template 0.93x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216))): (
-        XLA, f"{M_EM_36}: the template 1.095x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(9216, 2560))): (
-        MOSAIC, f"{M_EM_36}: the template 0.975x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024))): (
-        MOSAIC, f"{M_EM_36}: the template 0.973x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 64))): (
-        MOSAIC, f"{M_EM_36}: the template 0.376x XLA's dot"),
     ('tcgen05', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64))): (
         XLA, f"{B200_GRID}: the template 1.216x XLA's dot (em35d 1.225x)"),
     ('tcgen05', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 9216))): (
         XLA, f"{EM35D}: the template 1.009x XLA's dot"),
-    ('tcgen05', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216))): (
-        XLA, f"{B200_GRID}: the template 1.355x XLA's dot (em35d 1.303x)"),
-    ('tcgen05', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024))): (
-        XLA, f"{B200_GRID}: the template 1.148x XLA's dot (em35d 1.326x)"),
 }
 """The grouped GEMM's declared cells (`selection.Op.declared`), where a route measured faster than the
 template's default on a generation, each with its receipt (owner, bible da64ae5; "whatever is the
@@ -2322,9 +2311,22 @@ call) to (that route's kernel, the receipt). A product of a matrix a receipt tim
 its own, which that receipt's winner holds: the template's where it won (on Hopper, over its kind's XLA
 cell), XLA's where it lost (on Blackwell, where the template is the kind's default); one timed whose cell is
 undeclared takes the template. A cell leaves the list once the template measures at least as fast on it.
+Its price includes the step memory its route holds (`HELD`), which no per-call time sees.
 Nothing is ranked at runtime. A
 call the template cannot run (its legality) takes the next route in `GROUPED`'s order, which is no cell of
 this list."""
+
+HELD: dict[tuple[str | None, Kind], tuple[int, str]] = {
+    ('mma.sync', Kind(dense=True, made=Made.KERNEL_GRADIENT)): (
+        1, "XLA's dot of each layer's kernel gradient deferred to the backward's end, each layer's cotangent "
+           "held to it: Llama-3-8B's MLP at 8192 tokens 32 x 2 x 8192 x 14336 bf16, 15 GiB"),
+}
+"""The step memory a declared cell's route holds beyond the template's, which its receipt states beside its
+time (row 5972's P0: the B200's and GH200's kernel-gradient cells held the 4B's every layer's dgate and dup to
+the backward's end, a four-row step's temporaries 22.25 GB against 11.06 on the template): (instruction
+family, kind of call) to (the outputs of its call each layer holds, the receipt's statement). A cell absent
+holds none (tests/test_declared_cells_memory.py)."""
+
 
 GROUPED: selection.Op[GroupedCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
     MOSAIC, TRITON, CUTLASS,

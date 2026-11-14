@@ -936,8 +936,8 @@ class Issuer[Accumulator](abc.ABC):
 
     takes_pairs: bool = True
     """Whether a launch on it takes a paired product whole, its model pricing the second accumulator beside
-    the first in a consumer's registers (`column_registers`); where not (tcgen05's, whose accumulators stay
-    in tensor memory, read out in chunks), its two products run apart."""
+    the first (`column_registers`: in a consumer's registers, or tcgen05's, whose accumulators stay in tensor
+    memory side by side, read out a chunk of each at once); where not, its two products run apart."""
 
     rewrites_in_persist: bool = False
     """Whether its persistent walk rewrites a step's slots in a role of its own before the products read them

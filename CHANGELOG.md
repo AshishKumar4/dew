@@ -7,6 +7,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- On a CPU every process sums a bias's gradient, a broadcast's transpose (`dew.nn.precision.spread`), in
+  blocks of about the square root of its positions, each an fp32 product sum: about N / B + B roundings
+  where XLA:CPU's reduction took N in order, and what check 1 measures; it was the suite's alone.
+  Accelerators keep the broadcast.
 - A host's CPU devices stand in for the GPUs a run is checked for where JAX's CUDA plugin does not install
   (`dew.training.ahead.stand_in_gpus`, a block): `validate` holds the run's state to the allocator limits
   their stated GPU memory gives, as over compile-only GPUs. `dew.newton_schulz.spread_matrices` is removed:
@@ -16,6 +20,30 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - A plan the devices refuse (`PlanRefused`) states what each local device's allocator read as it refused
   (`PlanRefused.allocators`, the tightest in its message: its limit, its bytes in use, its largest free
   block and its pool), so a refusal at a phase's boundary names what holds the device.
+
+- A run's start reaches its first step sooner and keeps what it states: a fresh state's init is traced once,
+  its shapes, its layout (`Objective.drawn_shapes`, the shapes the objective's first draw recorded, which a
+  config's trained modules and a traced update's work read too) and the program that builds it on the
+  devices from that one trace; a fresh run's start compiled ahead compiles beside its step's planning, in a
+  thread of its own (`dew.nn.kernels.options.compiling`), and a fresh run's first step is planned and
+  compiled over its state's shapes before the state is placed, its start's program compiling beside it:
+  judged on the devices' free bytes in all, not on a pool's largest free block, which placing the state
+  reshapes, and on their allocators once the state is on them. A run that sets its remat keeps it where a
+  compile misses: the plan climbs its head's rungs alone, as its derivation does, and refuses where none
+  fits, where it compiled again under a remat the run did not ask for. A state given to `fit(state=)` is
+  checked against its first batch, its accumulator among it, before it is placed, as a fresh or resumed one
+  is. A run's sampled step compiled ahead is admitted by the plan as one compiled on its devices is.
+
+- A post-step effect acts in the order its optimizer's chain declares, read from the chain itself
+  (`dew.optim.post_step_order`), which `stepped` now takes: under `optax.MultiSteps` the chain's state came
+  back sorted by name, and a clamp acted before the rescale it follows. A fresh run's first step, planned
+  before its state is placed, counts the state as the layout places it, a field kept in host memory not
+  among a device's bytes, and records its rung only once the devices hold it placed.
+
+- A run's post-step effects act on its stepped weights in the order its chain declares them, a named chain's
+  as named, where JAX's flattening of its state took them by their sorted names. A cosine's floor is formed
+  from its solver's rate operands and an exponential's offset is always one, so a solver set to another end
+  value or offset reaches it, where its program held the ones it was built at.
 
 - A compile-only GPU states its memory once: `compile_only_gpus(generation, count, memory)` takes each GPU's
   memory, its total as the GPU states it, which XLA compiles for and every admission of a program compiled
@@ -27,6 +55,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   memory. `AheadTarget.capacity_gib` is that memory, and `AheadOfTime.capacity` the limit the plan held to.
 
 
+- Dew requires its JAX build 0.12.0.1.post87 (Python alone; the CUDA and PJRT plugins stay post81's): a run under
+  a profiler or dumping XLA's programs reads the Mosaic GPU lowerings and kernel certifications an unprofiled run
+  stored, where it lowered and certified them afresh.
+- Dew requires its JAX build 0.12.0.1.post86 (Python alone; the CUDA and PJRT plugins stay post81's): a Mosaic
+  GPU kernel's identity reads its operations, not its source locations, so a kernel traced alone and again in a
+  step's gradient compiles once; cuDNN's attention gates read the capability of the GPU a program is traced
+  for, so compiling ahead for a compile-only GPU takes head dims past 128; the Mosaic GPU pipeline takes a
+  prefetch of a step's first values under the step before's last products; the TPU pipeline carries a value
+  across its steps.
 - Dew requires its JAX build 0.12.0.1.post85 (Python alone; the CUDA and PJRT plugins stay post81's): the
   GPU interpreter checks a barrier wait that names its phase at its waits alone, so consumers that take
   alternate tiles of one ring over several rotations, warps among them, are checked rather than refused.
@@ -69,8 +106,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   its own, and refuses 8 to 13, naming both ways on: resume with the Dew that wrote it, or go on from its
   weights as a new run that reads its data afresh; a relaxed resume of one starts its data again.
   `Objective.bind_plan`, `dew.data.pipeline.earlier`, `Pipeline.at` and `ObjectiveData.earlier` are gone,
-  `Source.manifest` takes no version, and a run handed a compiled loader records the version the run it
-  resumes saved, or this Dew's.
+  `Source.manifest` takes no version, and the data layer reads by this Dew's alone: `compile`, `iterate`,
+  `validation`, `publish`, `fitted`, `held` and `text.export_tokens` take no `plan_version`, nor `dew data
+  export` and `dew data publish` a `--plan-version`. A run resolves its version once
+  (`RunConfig.data_plan_version`): one it reads it reads as its own and records as this Dew's, the version
+  its positions are saved under; one it reads none of is refused resumed exactly and started again relaxed.
 
 - A schedule's step horizons (its warmup's and decay's lengths in steps) are operands of its solver's state
   (`RateState.horizons`) where a run builds it stated (`OptimConfig.build(stated=True)`), so a rehearsed run

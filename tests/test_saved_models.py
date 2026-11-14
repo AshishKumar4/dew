@@ -3,7 +3,6 @@ control policy and a DreamerV3 agent, objectives with no inference task of their
 their run's record states and load back as the model and weights the run trained, where their checkpoints
 recorded no declaration and `SavedRun.at` refused them."""
 
-import json
 from pathlib import Path
 
 import jax
@@ -15,7 +14,7 @@ from run_kinds import jepa, trained
 from test_env_runs import TEACHER, student, teacher_run
 
 from dew.checkpoints import Checkpoints
-from dew.config.release import RELEASE_FILE, Release
+from dew.config.release import Release
 from dew.inference.loading import pipeline
 from dew.inference.tasks import SavedRun
 from dew.interop.saved_sources import export_run
@@ -141,28 +140,41 @@ def test_a_native_release_loads_in_the_dtype_asked_and_refuses_a_source_it_is_no
 
 
 
-def test_a_model_release_written_before_it_stated_its_run_loads_as_it_did(tmp_path):
-    """A native model release written before the release stated its run (`task` holding the objective, the
-    model's record, its settings and numerics) loads as the release of today writes it: the same model and
-    weights, the same settings (review of the run release)."""
-    from dew.inference.models import SavedModel
+def test_a_native_release_is_cast_a_leaf_at_a_time_as_it_is_placed(tmp_path):
+    """A native release loaded in another `param_dtype` is read memory-mapped and cast a leaf at a time as
+    it is placed, never whole in host memory (ledger 4789): a policy of ten 512-wide matrices loaded in
+    bfloat16 holds less than half its parameters' bfloat16 bytes in host arrays beyond what its load in the
+    stored dtype holds, its largest leaf a tenth of them; the leaves are the stored ones, cast."""
+    import tracemalloc
+    from dataclasses import replace
 
-    teacher_run(tmp_path).prepare().train("teacher")
-    run = SavedRun.pinned(str(tmp_path / "teacher"))
-    export_run(run, tmp_path / "policy", ema=False)
-    today = pipeline(str(tmp_path / "policy"))
-    release = Release.load(tmp_path / "policy")
-    assert release is not None and release.task is not None
-    record = dict(release.task["run"])
-    settings = {name: record.pop(name) for name in list(record)
-                if name not in ("objective", "model", "precision")}
-    earlier = {"objective": record["objective"], "model": record["model"], "settings": settings,
-               "numerics": record.get("precision"), "dtypes": {}}
-    (tmp_path / "policy" / RELEASE_FILE).write_text(json.dumps({"task": earlier}))
-    before = pipeline(str(tmp_path / "policy"))
-    assert isinstance(before, SavedModel) and before.model == today.model
-    assert before.settings == today.settings
-    assert_same(before.variables, today.variables)
+    from test_env_runs import ACTOR_CRITIC
+
+    from dew.registry import ModelConfig
+
+    wide = {"policy_layers": [512] * 6, "value_layers": [512] * 6}
+    run = replace(teacher_run(tmp_path), model=ModelConfig(ACTOR_CRITIC, wide))
+    run.prepare().train("teacher")
+    export_run(SavedRun.pinned(str(tmp_path / "teacher")), tmp_path / "policy", ema=False)
+
+    def peak(**options):
+        tracemalloc.start()
+        try:
+            loaded = pipeline(str(tmp_path / "policy"), **options)
+            return tracemalloc.get_traced_memory()[1], loaded
+        finally:
+            tracemalloc.stop()
+
+    plain, stored_ = peak()
+    cast, half = peak(param_dtype="bfloat16")
+    halves = jax.tree.leaves(half.variables["params"])
+    assert {leaf.dtype for leaf in halves} == {jnp.dtype(jnp.bfloat16)}
+    total = sum(leaf.size * 2 for leaf in halves)
+    assert max(leaf.size * 2 for leaf in halves) < total / 8
+    assert cast - plain < total / 2, (cast - plain, total)
+    for one, other in zip(jax.tree.leaves(half.variables["params"]),
+                          jax.tree.leaves(stored_.variables["params"]), strict=True):
+        np.testing.assert_array_equal(np.asarray(one), np.asarray(other).astype(jnp.bfloat16))
 
 
 def test_a_run_whose_average_is_its_reference_never_reads_as_averaged():

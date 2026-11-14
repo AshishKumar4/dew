@@ -9,6 +9,7 @@ facts with the run's own XLA flags.
 from __future__ import annotations
 
 import collections
+import concurrent.futures
 import contextlib
 import contextvars
 import dataclasses
@@ -234,6 +235,45 @@ def keeping(kept: Kept) -> Iterator[None]:
         yield
     finally:
         _KEEPING.reset(token)
+
+
+@dataclasses.dataclass(frozen=True)
+class Compiling:
+    """A program's first compile running in a thread of its own (`compiling`), by its lowering's digest
+    (`program_digest`): what the program's compile through Dew's compile point takes in its place where it
+    lowers the same program (`attempting`)."""
+
+    digest: str
+    attempt: Future
+
+
+def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
+    """`program` over these arguments (arrays or shapes) lowered here and its first compile begun in a
+    thread of its own (`report.attempted`: XLA's compile alone, which releases the GIL), so it compiles
+    while this thread runs on: a run's start beside its step's planning, which does not read it."""
+    from dew.nn.kernels.templates import report
+
+    lowered = program.lower(*args, **kwargs)
+    pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dew-compile-ahead")
+    try:
+        return Compiling(program_digest(lowered), pool.submit(report.attempted, lowered, None))
+    finally:
+        pool.shutdown(wait=False)
+
+
+_ATTEMPTING: contextvars.ContextVar[Compiling | None] = contextvars.ContextVar("dew_attempting", default=None)
+
+
+@contextlib.contextmanager
+def attempting(begun: Compiling | None) -> Iterator[None]:
+    """Within the block, a program compiled through Dew's compile point whose lowering is `begun`'s takes
+    its first compile from that thread (`compiling`), waiting for it there, and keeps it as one it compiled
+    itself (`report.compiled`'s `first`); any other compiles as it would. None begins nothing."""
+    token = _ATTEMPTING.set(begun)
+    try:
+        yield
+    finally:
+        _ATTEMPTING.reset(token)
 
 
 _COLLECTED: contextvars.ContextVar[dict[str, jax.stages.Compiled] | None] = contextvars.ContextVar(
@@ -583,8 +623,13 @@ class OuterProgram:
         # A program compiled ahead for this target runs as it was compiled (`taking`).
         if (taken := _TAKEN.get()) and (ahead := taken.get(program_digest(lowered))) is not None:
             return ahead()
+        # Its first compile begun in a thread of its own where it was (`compiling`).
+        begun, first = _ATTEMPTING.get(), None
+        if begun is not None and begun.digest == program_digest(lowered):
+            first = begun.attempt.result()
         executable = report.compiled(lowered,
-                                     relower=functools.partial(self._relowered, args, kwargs, relowered))
+                                     relower=functools.partial(self._relowered, args, kwargs, relowered),
+                                     first=first)
         # Later calls trace as the relowering did, past the trace its refused config is in.
         if relowered:
             self.jitted, lowered = relowered[-1]

@@ -442,6 +442,26 @@ def source():
     return Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
 
 
+def test_a_bundle_of_a_cross_attending_model_is_its_sources_carrying_it(source):
+    """A bundle of a model that reads a context through cross-attention (`PretrainedDecoder.carrying`,
+    which a run's load and a decision's release both build it through) is its source's, laid out as the
+    model without its blocks, carrying the model: its config is the source's, its model the attached one,
+    and its export, which no family's format holds, is refused (ledger 4799); `from_model`, which writes
+    the layout the model's own family states, refuses the model at once."""
+    from dew.interop.decoder_parts import ExportRefused
+    from dew.interop.pretrained import PretrainedDecoder
+
+    attached = source.with_cross_attention(CrossAttention(layer_ids=(1,), context_length=3,
+                                                          context_features=8), key=0)
+    bundle = PretrainedDecoder.carrying(attached.model, attached.variables)
+    assert bundle.model == attached.model
+    assert bundle.config == PretrainedDecoder.from_model(source.model, source.variables).config
+    with pytest.raises(ValueError):
+        bundle.export()
+    with pytest.raises(ExportRefused):
+        PretrainedDecoder.from_model(attached.model, attached.variables)
+
+
 def test_the_blocks_train_beside_an_adapter_with_the_source_frozen(source, tmp_path):
     """Attached to a loaded source, the blocks train and the source stays frozen; attached beside a
     LoRA adapter in either order, the blocks and the factors train together. An objective over the
@@ -601,6 +621,12 @@ def test_a_served_request_reads_its_own_context(options):
     assert (hits, server.prefix_hits) == ((4, 4) if shares else (0, 0))
 
 
+SERVED_CONTEXT_SEEDS = {"dense": 512, "kv_cache": 512, "kv_cache, chunk": 256,
+                        "kv_cache, chunk, prefix_cache": 256}
+"""Check 1's declared seeds for each served-contexts site, by its serving options, sized paired by `seeds_for`
+on armada (main f57250bb2)."""
+
+
 @pytest.mark.parametrize("options", [
     {},
     {"kv_cache": KVCache(page_size=4, pages=40)},
@@ -622,10 +648,10 @@ def test_served_requests_score_their_draws_from_their_own_contexts(options):
     repeated = [Served(len(PROMPTS[2]), conditioning=functools.partial(drawn_context, 2)),
                 Served(len(PROMPTS[2]), conditioning=lambda row: {
                     **drawn_context(2, row), CONTEXT_LENGTHS: np.asarray([1], np.int32)})]
-    label = f"served contexts {', '.join(options) or 'dense'}"
-    assert_served_as_exact(served_task(eos_token_ids=None), [*requests, *repeated], label,
+    site = ", ".join(options) or "dense"
+    assert_served_as_exact(served_task(eos_token_ids=None), [*requests, *repeated], f"served contexts {site}",
                            serving={"slots": 4, "capacity": 128, "admission": 2, **options},
-                           rounds=(len(requests), 1, 1))
+                           rounds=(len(requests), 1, 1), seeds=(SERVED_CONTEXT_SEEDS[site],) * 2)
 
 
 def test_a_server_refuses_a_context_its_layers_cannot_read():

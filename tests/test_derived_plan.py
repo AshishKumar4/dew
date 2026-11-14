@@ -3,6 +3,7 @@ derivation walks the ladder from the base rung before anything compiles, and the
 climbs on as a correction. A run that starts from a plan, recorded or resumed, tries that plan first."""
 
 import cProfile
+import json
 import logging
 import pstats
 
@@ -201,7 +202,7 @@ def bare_search(objective):
 
     from model_support import memory_limited_to
 
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     # A GPU whose stated memory limits its allocator to `LIMIT`, so the search judges its derivations.
     mesh = MeshSpec().build(compile_only_gpus("sm90", 1, memory_limited_to(LIMIT)))
@@ -531,6 +532,26 @@ def test_a_run_that_sets_its_remat_derives_its_own_rung_alone_and_compiles_there
         assert trainer.plan["derived"] and {entry["remat"] for entry in trainer.plan["derived"]} == {remat}
 
 
+def test_a_run_that_sets_its_remat_keeps_it_through_a_compile_that_misses(monkeypatch, tmp_path):
+    """A run that sets its remat keeps it where its compile misses (docs/design/training.md: every choice
+    the plan makes can be overridden): with room for the step under full recomputation and an eighth of
+    what 'minimal' needs past it, the run that sets 'minimal' is refused, every compile at 'minimal' (its
+    head's rungs among them), where a miss climbed it to recompute more than it asked."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    stated, recomputed = deep(REMAT_POLICIES["minimal"]), deep(REMAT_POLICIES["full"])
+    own = needs(monkeypatch, stated, lambda: compiled(stated))
+    full = needs(monkeypatch, recomputed, lambda: compiled(recomputed))
+    assert full < own, (full, own)
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, full + (own - full) // 8)
+    trainer = deep(REMAT_POLICIES["minimal"])
+    with pytest.raises(PlanRefused) as refused:
+        compiled(trainer)
+    assert refused.value.probes
+    assert {json.dumps(probe.rung["remat"]) for probe in refused.value.probes} == {
+        json.dumps(stated.plan["remat"])}
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_run_over_two_devices_that_sets_its_remat_derives_its_share_and_compiles_once(
         monkeypatch, tmp_path):
@@ -637,8 +658,9 @@ def gated(layers: str, generation: str, remat: str, capacity: int, records, prec
     refused or not."""
     from model_support import memory_limited_to
 
+    from dew.nn.kernels.generation import compile_only_gpus
     from dew.registry import models
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead
 
     model = models.build("causal_transformer", vocab_size=128, emb_features=64, num_layers=2, num_heads=4,
                          num_kv_heads=2, mlp_features=128, max_seq_len=128,

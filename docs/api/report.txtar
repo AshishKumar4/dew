@@ -43,6 +43,7 @@ class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str 
   .stored(self, step: int | str | None = None) -> Variables
   .variables(self, *, step: int | str | None = None, ema: bool | None = None, mesh=None, layout=None, param_dtype: jax.typing.DTypeLike | None = None, parameter_roots: tuple[tuple[str, ...], ...] = (('params',), ('frozen',)), unread: tuple[tuple[str, ...], ...] = (), on_host: bool = False) -> Variables
   .wait(self) -> None
+  .window_size(self, step: int) -> int
   .would_keep(self, ranking: Ranking | Sequence[Ranking]) -> bool
 class Condition(encoder: ConditionEncoder, field: str = 'text', unconditional: str | float | Mapping[str, object] = '') -> None  [dew.inputs.spec]
   .bound(record: Mapping[str, object], *, params: Variables | None = None) -> Condition  [staticmethod]
@@ -144,6 +145,7 @@ class Objective()  [dew.objectives.base]
   .complete_variables(self, key: jax.Array, tree: Variables) -> Variables
   .data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData
   .defines_validation_loss: property -> bool
+  .drawn_shapes(self) -> Variables
   .evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None
   .evaluation_variables(self, variables: Variables, step: Step) -> Variables
   .fresh_modules(self) -> tuple[str, ...]
@@ -245,6 +247,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .complete_variables(self, key: jax.Array, tree: Variables) -> Variables
   .data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData
   .defines_validation_loss: property -> bool
+  .drawn_shapes(self) -> Variables
   .evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None
   .evaluation_variables(self, variables: Variables, step: Step) -> Variables
   .fresh_modules(self) -> tuple[str, ...]
@@ -1124,7 +1127,6 @@ dew data export  [dew._cli.main.DataExport]
   provision: bool = False
   tokenizer: str | None = None
   eos: bool = False
-  plan_version: int | None = None
 dew data provision  [dew._cli.main.DataProvision]
   source: str  [Positional]
 dew data publish  [dew._cli.main.DataPublish]
@@ -1133,7 +1135,6 @@ dew data publish  [dew._cli.main.DataPublish]
   branch: Literal['train', 'validation'] = 'train'
   read: Literal['memory', 'indexed', 'streamed'] = 'streamed'
   provision: bool = False
-  plan_version: int | None = None
 dew tpu  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
 dew tpu attach-disk  [dew._cli.tpu.AttachDisk]
   zone: str | None = None  [metavar='ZONE']

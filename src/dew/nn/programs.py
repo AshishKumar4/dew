@@ -18,7 +18,7 @@ from typing import NamedTuple, TypeGuard
 import jax
 import jax.extend.core as jcore
 import jax.numpy as jnp
-from jax._src import mesh as mesh_lib
+from jax._src import config as jax_config, core as jax_core, mesh as mesh_lib
 from jax._src.pallas.mpmd import mpmd_map_p
 from jax.core import ShapedArray
 from jax.experimental.pallas import pallas_call_p
@@ -444,19 +444,32 @@ def _extended(value) -> bool:
 
 
 @contextlib.contextmanager
-def on_host() -> Iterator[None]:
-    """Compile-time evaluation on this host, no mesh in context, abstract or concrete: a step
-    traced under its devices' mesh (`jax.set_mesh`, a compile-only TPU topology's, a multi-process one's)
-    would place an eager primitive's operands on devices that run nothing here. `jax.set_mesh(None)` does
-    the same swaps but refuses to run under a trace, which a program's rewrite may be."""
+def meshless() -> Iterator[None]:
+    """No mesh in context, abstract or concrete, nor its axes bound or checked, under a trace too: a program
+    begun within another's trace (a shard_map's body, whose mesh JAX refuses to resize,
+    `jax.sharding.use_abstract_mesh`, and whose manual axes a checked shard_map binds and asks its values to
+    state their variance over, `check_vma`) takes none of its mesh. `jax.set_mesh(None)` does the mesh's
+    swaps but refuses to run under a trace."""
     abstract = mesh_lib.abstract_mesh_context_manager.swap_local(mesh_lib.empty_abstract_mesh)
     concrete = mesh_lib.device_context.swap_local(mesh_lib.empty_concrete_mesh)
+    axes = jax_core.axis_env_state.swap_local(jax_core.top_axis_env)
     try:
+        with jax_config._check_vma(new_val=False):
+            yield
+    finally:
+        jax_core.axis_env_state.set_local(axes)
+        mesh_lib.device_context.set_local(concrete)
+        mesh_lib.abstract_mesh_context_manager.set_local(abstract)
+
+
+@contextlib.contextmanager
+def on_host() -> Iterator[None]:
+    """Compile-time evaluation on this host, no mesh in context (`meshless`): a step traced under its
+    devices' mesh (`jax.set_mesh`, a compile-only TPU topology's, a multi-process one's) would place an eager
+    primitive's operands on devices that run nothing here."""
+    with meshless():
         # This process's own device: its CPU, or, where it runs no CPU backend (`JAX_PLATFORMS=cuda`), its
         # first. Its own: the pool's first device may be another process's, which this one cannot read back.
         host = jax.local_devices(backend="cpu" if "cpu" in backends() else None)[0]
         with jax.ensure_compile_time_eval(), jax.default_device(host):
             yield
-    finally:
-        mesh_lib.device_context.set_local(concrete)
-        mesh_lib.abstract_mesh_context_manager.set_local(abstract)

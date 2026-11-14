@@ -777,8 +777,16 @@ def band_strip(band: jax.Array, offset) -> jax.Array:
     return jnp.sum(jnp.where(lane == offset, band, 0.0), axis=1)[:, None]
 
 
+def pairs_masked(found: jax.Array, *, strict: bool, scale: float) -> jax.Array:
+    """An output's pairs `found` `[C, C]` (a key block's factored pairs) as its sum takes them: below the
+    diagonal where `strict` (the system), else on and below it and scaled (the scores); the sub-chunks' own
+    pairs' bands alike, in their form (`band_masked`)."""
+    lag = _lags(found.shape)
+    return jnp.where(lag > 0, found, 0.0) if strict else jnp.where(lag >= 0, found, 0.0) * scale
+
+
 def band_masked(band: jax.Array, *, strict: bool, scale: float) -> jax.Array:
-    """A band of own pairs as its output's sum takes it (`intra_masked`'s rule in the band's form): its
+    """A band of own pairs as its output's sum takes it (`pairs_masked`'s rule in the band's form): its
     column 0, a token's pair with itself, dropped where `strict` (the system), else kept and `scale`d."""
     lane = jax.lax.broadcasted_iota(jnp.int32, band.shape, 1)
     return jnp.where(lane > 0, band, 0.0) if strict else band * scale

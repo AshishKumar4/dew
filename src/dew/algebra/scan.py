@@ -534,7 +534,7 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
         value = _paired(of(args[0]), of(args[1]), of(args[3]), issue, "gram" if strict else "scores",
                         strict=strict)
     elif (args := get_callable_args(node, Chunk.spread)) is not None:
-        value = _spread(of(args[0]), of(args[1]), of(args[2]), of(args[3]), issue)
+        value = spread(of(args[0]), of(args[1]), of(args[2]), of(args[3]), issue=issue)
     elif (args := get_callable_args(node, Chunk.applied)) is not None:
         value = issue("apply", of(args[1]), of(args[0]).T)
     elif (args := get_callable_args(node, Chunk.rows)) is not None:
@@ -684,18 +684,23 @@ def _factored(left, right, between, joined, issue: Callable, role: str):
     return jnp.concatenate(rows, axis=0)
 
 
-def _spread(readers, values, keys, between, issue: Callable):
+def spread(readers, values, keys, between, *, weights=None, issue: Callable | None = None):
     """Each token's earlier writes read along the state's values and decayed to it along its keys, `sum_{j <=
     i} (readers_i . values_j) keys_jk between_ijk` `[C, K]` (`linear_scan.Chunk.spread`): the reads a
-    product `issue` makes (`scores`), a pair no decay joins (a token's future) selected out. A scalar decay's
-    pairs decay the reads, then a product applies them; a decay a key dimension's factor around each
-    sub-chunk's reference as `_factored`'s (`recurrence_algebra.SUB`): an earlier sub-chunk's keys decayed to
-    the reference `p` before the row's sub-chunk and applied, the row's decay from it after, each factor at
-    most 1; a sub-chunk's own pairs elementwise over its keys."""
+    product `issue` makes (`scores`; the portable product where None, `_issued`), a pair no decay joins (a
+    token's future, or one through a vanished decay) selected out. `weights` `[C, C]`, each pair's read
+    multiplied before it is applied (log-linear's level weights, kernel-templates.md Appendix B), none where
+    None. A scalar decay's pairs decay the reads, then a product applies them; a decay a key dimension's
+    factor around each sub-chunk's reference as `_factored`'s (`recurrence_algebra.SUB`): an earlier
+    sub-chunk's keys decayed to the reference `p` before the row's sub-chunk and applied, the row's decay
+    from it after, each factor at most 1; a sub-chunk's own pairs elementwise over its keys."""
     from dew.nn.kernels import recurrence_algebra
 
+    issue = issue or _issued
     active = jnp.any(between != 0, axis=-1)
     reads = jnp.where(active, issue("scores", readers, values.T), 0.0)
+    if weights is not None:
+        reads = reads * weights
     if between.shape[-1] == 1:
         return issue("apply", reads * between[..., 0], keys)
     count = keys.shape[0]
@@ -846,6 +851,13 @@ def _decays(exponents, base2: bool) -> _Decays:
     factoring around a reference prefix is the faster equal form, the extraction's choice under a kernel
     cost)."""
     return _decays_of(exponents, base2)
+
+
+def between(exponents, *, base2: bool = False) -> jax.Array:
+    """`exponents` `[T, K]`'s decays of the spans after token `j` through token `i`, `[T, T, K]`, zero above
+    the diagonal (`_decays`' `between`): compensated within each segment, a vanished token ending one, so no
+    span's sum holds a -2**70 or two -2**127 (`_decays_value`)."""
+    return _decays(exponents, base2).between
 
 
 def _walked(exponents, base2: bool) -> jax.Array:

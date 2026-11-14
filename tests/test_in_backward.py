@@ -12,11 +12,12 @@ from reference_error import assert_as_exact, widened
 from token_support import token_rows
 
 from dew.distributed.batches import shard_batch
+from dew.nn.kernels.generation import compile_only_gpus
 from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig, ParamGroup
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.ahead import compile_ahead, compile_only_gpus
+from dew.training.ahead import compile_ahead
 
 VOCAB, SEQ, BATCH = 128, 8, 8
 """The decoder's vocabulary, each row's length and the step's rows."""

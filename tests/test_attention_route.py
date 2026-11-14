@@ -1079,7 +1079,7 @@ def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
 
 def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_linear_in_its_tokens():
     """On a CPU 'auto' routes a call by time, jax.nn's xla attention where its training step's peak, as
-    Dew's footprint model derives it, fits the device's share of the process's memory
+    XLA's memory analysis of it states it, fits the device's share of the process's memory
     (`attention_kernels._dense_fits`, `generation.host_memory_share`): a causal fp32 training step of 8 heads
     64 wide, the first of 1024 tokens doubled whose xla attention does not fit, takes the template, its
     compiled temporaries below a byte a score, the template's plain-JAX mainloop's, which grow with the
