@@ -1455,18 +1455,22 @@ def test_the_forward_on_three_consumers_holds_check_1_interpreted(call, training
 
 
 @INTERPRETS
-@pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
+@pytest.mark.parametrize(("width", "training"), [(64, template.Kept.NONE), (64, template.Kept.SPLIT),
+                                                 (256, template.Kept.SPLIT)],
+                         ids=["plain", "training", "training-256"])
 @pytest.mark.parametrize("call", ["full", "causal"])
-def test_the_forward_on_tcgen05s_chunks_holds_check_1_interpreted(call, training):
+def test_the_forward_on_tcgen05s_chunks_holds_check_1_interpreted(call, training, width):
     """The forward and the training forward on a B200's tcgen05 chunks (`mosaic_sm100.CHUNKS`: consumers of
     64 rows, three a program for the forward and two for the training forward, whose registers three do
-    not hold, each product into its scoped tensor memory and read back into registers, the weights staged
-    into the issuer's tile for the values' product), under the interpreter, which models tensor memory: on
-    par with the reference (check 1)."""
+    not hold; each product into its scoped tensor memory, the logits read back into registers, the weights
+    staged into the issuer's tile for the values' product; the forward's sums carried in registers, the
+    training forward's split sums kept in tensor memory across its walk), under the interpreter, which models
+    tensor memory, at width 256 too the 4B call's one training launch over every value column: on par with
+    the reference (check 1)."""
     consumers = 3 if training == template.Kept.NONE else 2
     tiles = attention_mosaic.Tiles(64, 64, 2, consumers, family="tcgen05.chunks")
-    _check_forward(call, jnp.bfloat16, (1, 192, 2, 1), natural=False, interpret=True, width=64,
-                   value_width=64, tiles=tiles, training=training, target=generation.gpu_target("sm100"))
+    _check_forward(call, jnp.bfloat16, (1, 192, 2, 1), natural=False, interpret=True, width=width,
+                   value_width=width, tiles=tiles, training=training, target=generation.gpu_target("sm100"))
 
 
 @pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])

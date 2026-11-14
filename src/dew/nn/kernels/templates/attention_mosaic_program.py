@@ -1567,33 +1567,11 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     # inference walk's logits and weights and its masks' places; a training walk's spilled 224 to 248 bytes
     # at 238 of 240 priced so, et-scaledneed5); an fp32 call's parts walk its logits alone, its weights'
     # parts formed after the exponential (`_parted_products`).
-    scaled_terms = []
     core = (list(step) if residuals else [logits, weights, *masks]) if parts == 1 else [logits]
+    scaled_terms = []
     if scaled:
-        # Its small weights raised from their exponents, fp32, and a part's product's own accumulator beside
-        # the walk's while it issues (`operands.Issuer.summed`), and its weights at the scale fp32 beside
-        # them; an fp32 call's parts walk forms the small ones' parts in turn as it forms theirs
-        # (`_parted_products`; its weights at the scale held as the step's fp32 weights, an H100's fp32 decode
-        # step at 64 x 64 priced 212 where ptxas needed 240, et-parity-w); a 16-bit call's holds the small
-        # ones' three parts (`algebra.small_parts`), a family whose products read registers its values'
-        # block's fragments whole beside them, which the weights' product and each part's read.
-        accumulator = (block_q, value_width, jnp.float32)
-        # tcgen05's fp32 parts walk reads each part's product back beside them (priced below), its weights at
-        # the scale held no apart (a B200's at 64 x 64 over 16 columns needed 224).
-        scaled_terms = [logits] if parts > 1 and scopes_products(family) else [logits, logits]
-        step += [*scaled_terms, accumulator]
-        if parts == 1:
-            step += [weights] * (3 if jnp.dtype(dtype).itemsize == 2 else 1)
-            if family.operands_in_registers and not residuals:
-                step.append((block_k, value_width * family.rhs_copies, dtype))
-        if scopes_products(family) and parts > 1:
-            # An fp32 call's small part's product read back from tensor memory in its layout, converted to the
-            # walk's and taken back by its power (`algebra.restored`) beside its parts' step (tcgen05's
-            # chunks, `Tcgen05ChunksIssuer.summed`): unpriced, a B200's scaled fp32 forward at width 128
-            # priced 220 at 64 x 64 over 32 columns and spilled 176 bytes at 248, and 204 over 16 where it
-            # needed 224 (et-sneedfp32c). A 16-bit call's step holds no such tile beside its own (its scaled
-            # forward at width 64 needed 208 at 64 x 64 on one consumer, et-sneedbf16).
-            step += [accumulator] * 3
+        step, scaled_terms = _scaled_step(family, step, logits, weights, (block_q, value_width, jnp.float32),
+                                          block_k=block_k, parts=parts, dtype=dtype, residuals=residuals)
     phases = [step]
     if family.operands_in_registers:
         # Its weights relaid as the values' product's left operand (`MmaIssuer._left`), a copy in each warp
@@ -1608,16 +1586,20 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
         phases.append([logits] * 2 + [bits] + ([*core, *scaled_terms] if scaled else []))
         if residuals:
             phases.append([logits, weights, weights, bits, bits])
+    kept = residuals and family.keeps_sums(value_width)
     if scopes_products(family):
-        phases = _scoped_phases(phases, logits, (block_q, value_width, jnp.float32),
-                                parted=parts > 1 and not scaled, merged=merged)
+        phases = _scoped_phases(phases, logits, weights, (block_q, value_width, jnp.float32), kept=kept,
+                                rescaled=scaled, parted=parts > 1 and not scaled,
+                                added=scaled or jnp.dtype(dtype) == jnp.dtype(jnp.float16), merged=merged)
     depth = value_width if width is None else width
     products = _products(
         family, dtype,
         resources.Product(block_q, depth, block_k, beside=[logits], transposed=True),
         resources.Product(block_q, block_k, value_width, beside=[weights], held=True),
         narrow=tiles.narrow, lhs_swizzle=query_swizzle(family))
-    carried = [(block_q, value_width, jnp.float32)]
+    # Its weighted values' sums carried across the walk, but where its family keeps them in its own memory
+    # (`Issuer.keeps_sums`, `_scoped_phases`).
+    carried = [] if kept else [(block_q, value_width, jnp.float32)]
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
     if codes:
         phases += _converted(block_k, value_width if width is None else width, value_width)
@@ -1625,6 +1607,37 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
               + _held_registers(family, block_q, params, residuals=residuals)
               + (_started_rows(family, block_q) if started else 0))
     return max(walked, _reach_registers(family, block_q, positions, per_span)) if positions else walked
+
+
+def _scaled_step(family: mosaic.Family, step: list, logits: tuple, weights: tuple, accumulator: tuple, *,
+                 block_k: int, parts: int, dtype, residuals: bool) -> tuple[list, list]:
+    """A scaled walk's `step` (`forward_registers`' `scaled`) with what it holds beside the unscaled one's,
+    and its scaled terms, which its natural form's exponential holds too."""
+    value_width = accumulator[1]
+    # Its small weights raised from their exponents, fp32, and a part's product's own accumulator beside
+    # the walk's while it issues (`operands.Issuer.summed`), and its weights at the scale fp32 beside
+    # them; an fp32 call's parts walk forms the small ones' parts in turn as it forms theirs
+    # (`_parted_products`; its weights at the scale held as the step's fp32 weights, an H100's fp32 decode
+    # step at 64 x 64 priced 212 where ptxas needed 240, et-parity-w); a 16-bit call's holds the small
+    # ones' three parts (`algebra.small_parts`), a family whose products read registers its values'
+    # block's fragments whole beside them, which the weights' product and each part's read.
+    # tcgen05's fp32 parts walk reads each part's product back beside them (priced below), its weights at
+    # the scale held no apart (a B200's at 64 x 64 over 16 columns needed 224).
+    scaled_terms = [logits] if parts > 1 and scopes_products(family) else [logits, logits]
+    step += [*scaled_terms, accumulator]
+    if parts == 1:
+        step += [weights] * (3 if jnp.dtype(dtype).itemsize == 2 else 1)
+        if family.operands_in_registers and not residuals:
+            step.append((block_k, value_width * family.rhs_copies, dtype))
+    if scopes_products(family) and parts > 1:
+        # An fp32 call's small part's product read back from tensor memory in its layout, converted to the
+        # walk's and taken back by its power (`algebra.restored`) beside its parts' step (tcgen05's
+        # chunks, `Tcgen05ChunksIssuer.summed`): unpriced, a B200's scaled fp32 forward at width 128
+        # priced 220 at 64 x 64 over 32 columns and spilled 176 bytes at 248, and 204 over 16 where it
+        # needed 224 (et-sneedfp32c). A 16-bit call's step holds no such tile beside its own (its scaled
+        # forward at width 64 needed 208 at 64 x 64 on one consumer, et-sneedbf16).
+        step += [accumulator] * 3
+    return step, scaled_terms
 
 
 def _started_rows(family: mosaic.Family, block_q: int) -> int:
@@ -1635,31 +1648,36 @@ def _started_rows(family: mosaic.Family, block_q: int) -> int:
     return 2 * family.row_registers(block_q, jnp.float32)
 
 
-def _scoped_phases(phases: list[list[tuple]], logits: tuple, sums: tuple, *, parted: bool,
-                   merged: bool) -> list[list[tuple]]:
+def _scoped_phases(phases: list[list[tuple]], logits: tuple, weights: tuple, sums: tuple, *, kept: bool,
+                   rescaled: bool, parted: bool, added: bool, merged: bool) -> list[list[tuple]]:
     """A forward's `phases` on a family that scopes its products in tensor memory (`scopes_products`): its
-    products read back beside them (`_read_back`), and where an initial state is `merged` past the walk
-    (`attention_mosaic_forward._started`), its sums and the merged sums beside the walk's (`algebra.merge`;
-    priced as the walk's alone, a B200's 64 x 64 forward on three consumers, width 128, under sinks priced
-    156 and spilled 16 bytes at 160). A register family's merge takes the walk's sums in place."""
-    phases = _read_back(phases, logits, sums, parted=parted)
-    return [*phases, [sums] * 2] if merged else phases
-
-
-def _read_back(phases: list[list[tuple]], logits: tuple, sums: tuple, *, parted: bool) -> list[list[tuple]]:
-    """A forward's `phases` where its products are read back from tensor memory in their layout and converted
-    to the walk's, both live at once (tcgen05's chunks, `Tcgen05ChunksIssuer.summed`): the `logits` a second
-    time in each phase holding them (a B200's 64 x 64 forward on three consumers, width 64, priced 126 of 160
-    and spilled 20 bytes; 64 x 128 132 and 184, et-h1need), and the weighted values' product beside the sums
-    it adds into, read in the sums' own layout (`mosaic_sm100._read`'s WGMMA layout), so once (priced twice, a
-    B200's 64 x 64 forward on two consumers over 128 of 256 columns 204, where ptxas held it in 154 with no
-    register moved). An unscaled fp32 call's (`parted`) parts each read back from a fresh accumulator into
-    the walk's registers beside its step: an sm103's 64 x 64 decode priced 188 spilled 60 bytes at 248, so
-    252 (bounded-removal)."""
+    logits read back from there in their layout and converted to the walk's, both live at once
+    (`Tcgen05ChunksIssuer.taken`, `summed`), a second time in each phase holding them (a B200's 64 x 64
+    forward on three consumers, width 64, priced 126 of 160 and spilled 20 bytes; 64 x 128 132 and 184,
+    et-h1need). Its weighted values' sums, each read in their own layout (`mosaic_sm100._read`'s WGMMA
+    layout): where it keeps them there across the walk (`kept`: a training walk's, `Issuer.keeps_sums`), in
+    no register but where a phase reads them: once after the walk; a `rescaled` walk's (a scaled one's, its
+    rows' change of scale) within each step, beside the step's narrowed weights
+    (`Tcgen05ChunksIssuer.rescaled_products`);
+    beside a product of their own accumulator added into them (`added`: a scaled walk's small weights', an
+    fp16 call's, `Tcgen05ChunksIssuer.added_into`). Where it carries them in registers, the weighted values'
+    product read back beside them, once (priced twice, a B200's 64 x 64 forward on two consumers over 128 of
+    256 columns 204, where ptxas held it in 154 with no register moved), an unscaled fp32 call's (`parted`)
+    parts each from a fresh accumulator beside its step (an sm103's 64 x 64 decode priced 188 spilled 60
+    bytes at 248, so 252, bounded-removal). Where an initial state is `merged` past the walk
+    (`attention_mosaic_forward._started`), its sums beside the merged sums (`algebra.merge`; priced as the
+    walk's alone, a B200's 64 x 64 forward on three consumers, width 128, under sinks priced 156 and spilled
+    16 bytes at 160). A register family's merge takes the walk's sums in place."""
     phases = [[*phase, logits] for phase in phases]
-    if parted:
+    if kept:
+        if rescaled:
+            phases.append([sums, weights])
+        if added:
+            phases.append([sums] * 2)
+    elif parted:
         phases[0] += [sums] * 2
-    return [*phases, [sums]]
+    phases.append([sums])
+    return [*phases, [sums] * 2] if merged else phases
 
 
 def _reach_registers(family: mosaic.Family, block_q: int, positions: int, per_span: int) -> int:

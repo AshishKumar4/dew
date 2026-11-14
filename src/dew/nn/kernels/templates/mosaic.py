@@ -1021,16 +1021,24 @@ class Issuer[Accumulator](abc.ABC):
         return resources.widest_swizzle(dtype, columns)
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
-                        ahead: tuple[int, ...] = ()) -> tuple | dict:
+                        ahead: tuple[int, ...] = (), sums: tuple[int, ...] = ()) -> tuple | dict:
         """The memory a program's products take where the issuer keeps each product's accumulator itself
         (tcgen05's chunks: tensor memory of each product width in `widths` and a tensor-core barrier, a
         consumer role each), and stages a register left operand of each `(depth, dtype)` in `lefts` where
         it takes none in registers (`takes_register_left`: a shared tile a role), allocated at the program's
         scope: a role's own scope may not allocate (Mosaic GPU's thread-collective allocations wait for
         every warpgroup); none where its products need none. A product of each width in `ahead` a role
-        issues a step before it reads it (`issued_ahead`) takes two accumulators and a barrier each."""
-        del consumers, widths, lefts, ahead
+        issues a step before it reads it (`issued_ahead`) takes two accumulators and a barrier each. A walk's
+        sums of each width in `sums` stay in an accumulator of the issuer's across the walk (`accumulated`),
+        where it keeps them so, a role each."""
+        del consumers, widths, lefts, ahead, sums
         return ()
+
+    def keeps_sums(self, width: int) -> bool:
+        """Whether a walk's sums `width` columns wide stay in the issuer's own memory across the walk
+        (`product_scratch`'s `sums`, `accumulated`), carried in no register: none of a register home's."""
+        del width
+        return False
 
     issues_ahead: bool = False
     """Whether a role issues a product into memory of the issuer's own a step before it reads it

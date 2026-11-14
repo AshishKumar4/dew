@@ -1496,6 +1496,62 @@ def _chunks_products(x, w, *, interpret):
                          interpret=interpret, name="chunks_left")(x, w)
 
 
+def _kept_sums(x, w, *, interpret):
+    """`3 + sum_j x_j @ w_j` and `5 + sum_j 2 x_j @ w_j` over a walk of `x`'s and `w`'s depth blocks on
+    tcgen05's chunks, two sums of one width each kept in its own accumulator of the issuer's tensor memory
+    across the walk (`product_scratch`'s `sums`, `accumulated`) from its initial value, each step's register
+    left operand's product added onto it in place."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.CHUNKS
+    rows, columns = family.rows, w.shape[1]
+    steps = x.shape[1] // CHUNK_DEPTH
+
+    def body(x_gmem, w_gmem, out_gmem, twice_gmem):
+        allocated = family.streams({'x': ((rows, CHUNK_DEPTH), jnp.bfloat16),
+                                    'w': ((CHUNK_DEPTH, columns), jnp.bfloat16)}, 2, 1)
+
+        def scope(*, streams):
+            rings = family.opened(streams)
+            views = {'x': (x_gmem, lambda j: (0, j)), 'w': (w_gmem, lambda j: (j, 0))}
+
+            def step(index, slots, carry, accumulators):
+                del index
+                held = family.tile_of(slots['x'])
+                return carry, (family.register_products(accumulators[0], (held,), slots['w']),
+                               family.register_products(accumulators[1], (held * 2,), slots['w']))
+
+            def walked(wg):
+                del wg
+                _, (sums, twice) = family.walk(rings, ((step, 0, steps),), None, ((rows, columns),) * 2,
+                                               interpret, initial=(family.zeros((rows, columns)) + 3.0,
+                                                                   family.zeros((rows, columns)) + 5.0))
+                out_gmem[...] = sums
+                twice_gmem[...] = twice
+
+            family.scheduled(1, walked, lambda: family.stream(rings, views, 0, steps))
+
+        family.scoped(scope, streams=allocated,
+                      products=(1, (), ((CHUNK_DEPTH, jnp.bfloat16),), (), (columns, columns)))
+
+    out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
+    return family.kernel(body, out_type=(out, out), grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="chunks_kept")(x, w)
+
+
+@INTERPRETS
+def test_a_walks_sums_kept_in_tcgen05s_tensor_memory_are_its_products_onto_its_initial_value():
+    """Interpreted: on tcgen05's chunks, a walk's two sums of one width kept in tensor memory across three
+    steps (`Issuer.accumulated`), each in its own accumulator, each step's register product added onto it in
+    place and none read before the walk's end, are exactly each one's initial value plus its products."""
+    keys = jax.random.split(jax.random.key(4))
+    x = jax.random.randint(keys[0], (64, 3 * CHUNK_DEPTH), -4, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (3 * CHUNK_DEPTH, 128), -4, 4).astype(jnp.bfloat16)
+    sums, twice = (np.asarray(out) for out in _kept_sums(x, w, interpret=INTERPRETED))
+    product_ = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+    np.testing.assert_array_equal(sums, 3 + product_)
+    np.testing.assert_array_equal(twice, 5 + 2 * product_)
+
+
 @INTERPRETS
 def test_a_register_left_product_on_tcgen05s_chunks_is_its_shared_memory_product():
     """Interpreted: on tcgen05's chunks, whose product takes no register left operand

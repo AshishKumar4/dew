@@ -125,21 +125,35 @@ def _stores_through_query(family: mosaic.Family, width: int, value_width: int, d
 
 
 def forward_products(tiles: Tiles, value_width: int, dtype, *, peaks: bool = False, parts: int = 1,
-                     ahead: bool = False) -> tuple:
+                     ahead: bool = False, scaled: bool = False, training: bool = False) -> tuple:
     """A forward program's products as its scope takes its issuer's scratch (`Family.scoped`'s `products`):
     each consumer's logits, a key tile wide, and, but a peak walk's, its weighted values, the values' width,
     whose left operand, the weights a key tile deep in the values' dtype (an fp32 call's bf16 parts), is a
     register value (`Issuer.register_products`); the logits issued a step ahead of their read where `ahead`
-    (`logits_ahead`), in the two accumulators of those alone."""
+    (`logits_ahead`), in the two accumulators of those alone. A `training` walk's split sums take no
+    maximum's factor (`algebra.anchored_step`), so they stay where the issuer keeps them across the walk
+    (`Issuer.accumulated`'s `sums`: tcgen05's chunks, in tensor memory, no step reading them back), its
+    product of the weights added onto them in place; beside them, an accumulator of the values' width a
+    product that takes its own and is added into them after it: a `scaled` walk's small weights'
+    (`algebra.at_scale`) and an fp16 call's (`product.Scaled`, `operands.Issuer.summed`). An inference
+    walk's sums, which each step takes by its maximum's factor, a fresh accumulator a step's product, read
+    back onto the sums its registers carry (kept in tensor memory and taken by its factor there, the 4B
+    call's inference forward over all 256 value columns priced 156 of 240 registers and spilled 48 bytes
+    at 4,096 tokens, et-kept-regs; a column block of the kept sums a half-lane tile is no Mosaic GPU
+    layout, et-tmem-b)."""
     logits, ahead_logits = ((), (tiles.block_k,)) if ahead else ((tiles.block_k,), ())
     if peaks:
         return (tiles.consumers, logits, (), ahead_logits)
-    return (tiles.consumers, (*logits, value_width),
-            ((tiles.block_k, jnp.bfloat16 if parts > 1 else dtype),), ahead_logits)
+    lefts = ((tiles.block_k, jnp.bfloat16 if parts > 1 else dtype),)
+    if not training:
+        return (tiles.consumers, (*logits, value_width), lefts, ahead_logits)
+    fresh = (value_width,) if scaled or jnp.dtype(dtype) == jnp.dtype(jnp.float16) else ()
+    return (tiles.consumers, (*logits, *fresh), lefts, ahead_logits, (value_width,))
 
 
 def logits_ahead(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, *, stages: int,
-                 peaks: bool = False, parts: int = 1, coded: bool = False) -> bool:
+                 peaks: bool = False, parts: int = 1, coded: bool = False, scaled: bool = False,
+                 training: bool = False) -> bool:
     """Whether a forward program issues each key tile's logits a step before its softmax reads them, the next
     tile's product running under this one's softmax (FlashAttention 4's S in flight, row 5368: at the 4B
     decision call a tile's wait for its logits, 1.2k to 1.4k cycles, and its softmax, 2.5k, ran in series
@@ -151,7 +165,8 @@ def logits_ahead(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, *
     columns fill 512)."""
     if not family.issues_ahead or parts > 1 or coded or stages < mosaic.ahead_stages(("keys",)):
         return False
-    columns = family.product_columns(forward_products(tiles, value_width, dtype, peaks=peaks, ahead=True))
+    columns = family.product_columns(forward_products(tiles, value_width, dtype, peaks=peaks, ahead=True,
+                                                      scaled=scaled, training=training))
     return columns <= (generation.gpu_target().tmem_columns or 0)
 
 
@@ -181,7 +196,12 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     # family that scopes them apart, in their slots (`stages_after_walks`).
     stage = None
     if residuals:
-        stage = family.staged_memory((consumers, block_q, value_width), jnp.float32)
+        # Read out of tensor memory a chunk of their columns at a time where the family keeps its sums there
+        # (`scopes_products`), through a stage of one chunk (`mosaic.staged_columns`, CUTLASS's sub-tiled
+        # epilogue): the 4B call's training program at width 256 on two consumers stages 231,564 bytes so,
+        # of the block's 232,448, where the whole split sums' 131,072 refused it.
+        chunk = mosaic.staged_columns(value_width, (jnp.float32,)) if scopes_products(family) else value_width
+        stage = family.staged_memory((consumers, block_q, chunk), jnp.float32)
     elif not peaks and not _stores_through_query(family, width, value_width, dtype, out_dtype):
         stage = family.staged_memory((consumers, block_q, value_width), out_dtype or dtype)
     after = [stage] if stage is not None and stages_after_walks(family) else []
@@ -1606,7 +1626,7 @@ def _entry(program: _Program, layout: "_Layout", body: Callable, allocations: tu
 
 
 def _program_of(family: mosaic.Family, tiles: Tiles, spec: algebra.Forward, read: _Read, key, steps: int,
-                value_width: int, dtype, *, splits: int, peaks: bool, parts: int) -> _Program:
+                value_width: int, dtype, *, splits: int, peaks: bool, parts: int, training: bool) -> _Program:
     """A launch's program (`_Program`) of `steps` key tiles: no more ring stages than them (a slot past them
     would load past the keys), and its keys read a step ahead where it issues its logits so
     (`logits_ahead`). Such a program's consumers take no turns on the tensor cores (FlashAttention 3's
@@ -1615,7 +1635,8 @@ def _program_of(family: mosaic.Family, tiles: Tiles, spec: algebra.Forward, read
     12% slower than without either, row 5368)."""
     stages = min(tiles.stages, steps)
     ahead = logits_ahead(family, tiles, value_width, dtype, stages=stages, peaks=peaks, parts=parts,
-                         coded=_codes_of(key, read.hooked.scales) is not None)
+                         coded=_codes_of(key, read.hooked.scales) is not None, scaled=spec.headroom,
+                         training=training)
     return _Program(family, tiles, steps, stages, spec.keys, spec.form == "causal", spec.queries, splits,
                     _per_span(spec, read.spans), parts=parts, ahead=("keys",) if ahead else ())
 
@@ -1646,7 +1667,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     pair = consumers * block_q
     steps = keys_count // block_k
     program = _program_of(family, tiles, spec, read, key, steps, value_width, query.dtype, splits=splits,
-                          peaks=peaks, parts=parts)
+                          peaks=peaks, parts=parts, training=training)
     # The output stores through the query's stage where the two are as wide (its rows are read before the
     # store); else it takes a stage of its own beside the query's and the rings (`_forward_allocations`).
     out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
@@ -1726,7 +1747,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                      if scopes_products(family) else consumer), producer, exclusive=True)
 
     products = forward_products(tiles, value_width, query.dtype, peaks=peaks, parts=parts,
-                                ahead=bool(program.ahead))
+                                ahead=bool(program.ahead), scaled=spec.headroom, training=training)
     entry = functools.partial(_entry, program, layout, body, (scoped, rings, after, products),
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,

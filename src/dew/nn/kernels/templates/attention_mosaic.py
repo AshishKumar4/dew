@@ -490,6 +490,11 @@ class MosaicForward(_Mainloop[Tiles]):
         # tiles lower at widths 64 to 256 on sm80 and sm90, dd-k16b).
         if config.block_q < family.role_rows and config.block_k % (WARPGROUP_WARPS * 16):
             return False
+        # Its products' accumulators within the multiprocessor's tensor memory, where its issuer keeps them
+        # there (`Issuer.product_columns`: tcgen05's chunks, each consumer's sums across its walk beside its
+        # logits).
+        if family.product_columns(self._products(ba, config)) > (target.tmem_columns or 0):
+            return False
         # Its products' right operands, the keys' tile in S = Q·Kᵀ (the heads' width deep, a key tile's
         # columns) and the values' in P·V (a key tile's rows of the launch's value columns, `Tiles.columns`),
         # ones its family's products take (`Issuer.takes_right`: tcgen05's 64-row products pad a narrow one
@@ -703,10 +708,23 @@ class MosaicForward(_Mainloop[Tiles]):
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
         return resources.shared_bytes(family, launch_scope(family, allocations, reducing(
             family, config.consumers, self.score_reduces or self.output_mod is not None, flagged=flagged,
-            magnitudes=cached and self.scales_in_kernel(ba)),
-            products=forward_products(config, value_width, query.dtype, parts=self.parts, ahead=logits_ahead(
-                family, config, value_width, query.dtype, stages=min(config.stages, steps), parts=self.parts,
-                coded=_codes_of(ba.arguments["key"], ba.arguments.get("scales")) is not None))))
+            magnitudes=cached and self.scales_in_kernel(ba)), products=self._products(ba, config)))
+
+    def _products(self, ba: tokamax.BoundArguments, config: Tiles) -> tuple:
+        """The launch's products at `config` as its program scopes them (`forward_products`): its logits a
+        step ahead where it issues them so (`logits_ahead`), a scaled walk's small weights' accumulator beside
+        its sums where its kernel walks scaled (`scales_in_kernel`)."""
+        family = bundle_of(config, ba.arguments["query"].dtype)
+        query, value = ba.arguments["query"], ba.arguments["value"]
+        value_width = config.columns or _width(value.shape[-1], family, query.dtype)
+        steps = _padded(query.shape[1], _keys(ba), config)[1] // config.block_k
+        scaled = self.scales_in_kernel(ba)
+        coded = _codes_of(ba.arguments["key"], ba.arguments.get("scales")) is not None
+        training = ba.arguments.get("residuals") is Kept.SPLIT
+        ahead = logits_ahead(family, config, value_width, query.dtype, stages=min(config.stages, steps),
+                             parts=self.parts, coded=coded, scaled=scaled, training=training)
+        return forward_products(config, value_width, query.dtype, parts=self.parts, scaled=scaled,
+                                ahead=ahead, training=training)
 
     def cached(self, table, sources, scales) -> bool:
         """Whether a call walks a cache's keys (masked, split, paged, by rows or over codes: a decode step's
