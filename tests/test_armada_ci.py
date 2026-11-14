@@ -198,11 +198,12 @@ def test_each_scenario_is_marked_by_a_test_whose_marked_tests_alone_its_coverage
     marked = ("import pytest\n\n@pytest.mark.scenario(\"Pretraining\")\ndef test_trains():\n    pass\n\n"
               "def test_a_unit():\n    pass\n")
     written(tmp_path, {"test_train.py": marked, "test_other.py": "def test_other():\n    pass\n"})
-    assert ci.scenarios(check=True) == 1
+    assert ci.scenario_marks.scenarios(ci.test_files(), check=True) == 1
     written(tmp_path, {"test_serve.py": "import pytest\n\n@pytest.mark.scenario( \"Serving\" )\n"
                                         "def test_serves():\n    pass\n"})
-    assert ci.scenarios(check=True) == 0
-    assert ci.scenario_files() == {"Pretraining": {"tests/test_train.py"}, "Serving": {"tests/test_serve.py"}}
+    assert ci.scenario_marks.scenarios(ci.test_files(), check=True) == 0
+    assert ci.scenario_marks.marked(ci.test_files()) == {"Pretraining": {"tests/test_train.py"},
+                                                         "Serving": {"tests/test_serve.py"}}
     items = ci.coverage_items(300.0, {}, scenarios=True)
     assert [re.search(r"--tests='([^']*)'", item)[1] for item in items] == ["tests/test_serve.py",
                                                                            "tests/test_train.py"]
@@ -217,7 +218,7 @@ def test_each_scenario_is_marked_by_a_test_whose_marked_tests_alone_its_coverage
     # A mark naming no scenario is refused, by the files that hold it.
     written(tmp_path, {"test_typo.py": "import pytest\n\n@pytest.mark.scenario(\"Pretrain\")\n"
                                        "def test_typo():\n    pass\n"})
-    assert ci.scenarios(check=True) == 1
+    assert ci.scenario_marks.scenarios(ci.test_files(), check=True) == 1
 
 
 def test_a_scenario_mark_naming_no_scenario_stops_collection():
