@@ -174,6 +174,36 @@ def _appended(held, sown):
     return sown
 
 
+def pass_offset(loop: Loop, layers: int, step: int) -> int:
+    """Where later pass `step` (from 1) of a `loop` over a stack of `layers` keeps its block's layer entries
+    apart (`PassView.offset`): after the stack's, each pass's after the last's."""
+    first, end = loop.layers or (0, layers)
+    return layers + (step - 1) * (end - first)
+
+
+def exit_offset(loop: Loop, layers: int, step: int) -> int:
+    """Where pass `step`'s exit (from 0) keeps the entries of its coda, the layers after the block
+    (`run_loop`'s exit states): after the later passes' own, which a shared cache's passes do not keep
+    apart."""
+    first, end = loop.layers or (0, layers)
+    later = 0 if loop.shared_cache else (loop.steps - 1) * (end - first)
+    return layers + later + step * (layers - end)
+
+
+def pass_entries(loop: Loop, layers: int) -> tuple[tuple[int, int], ...]:
+    """Each layer entry a `loop`'s passes keep beyond the stack's own, as `(stored layer, layer)`: each later
+    pass's block's under a cache of its own (`shared_cache` off), and where every pass exits, each exit's
+    coda's (`pass_offset`, `exit_offset`)."""
+    first, end = loop.layers or (0, layers)
+    entries = [] if loop.shared_cache else [
+        (pass_offset(loop, layers, step) + layer - first, layer)
+        for step in range(1, loop.steps) for layer in range(first, end)]
+    if loop.exiting and end < layers:
+        entries += [(exit_offset(loop, layers, step) + layer - end, layer)
+                    for step in range(loop.steps - 1) for layer in range(end, layers)]
+    return tuple(entries)
+
+
 def run_loop(model, x, *, train: bool, decode: bool, **inputs):
     """Run `model`'s layer stack over `x` once, or as its `loop` says (the module doc): the layers before
     its block once, the block `steps` times, each later pass reading the last one's output, normed under
@@ -211,9 +241,7 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
         """Pass `step`'s exit state (from 0): its output, or the coda run on it in the pass's own cache."""
         if end == layers:
             return x
-        # After the block's later passes' own entries, which a shared cache's passes do not keep apart.
-        later = 0 if shared is not None else (loop.steps - 1) * (end - first)
-        view = PassView(layers + later + step * (layers - end), end, layers - end)
+        view = PassView(exit_offset(loop, layers, step), end, layers - end)
         coda = nn.map_variables(pass_coda, mapped_collections=WRITTEN, trans_in_fn=view.inside,
                                 trans_out_fn=view.outside, mutable=True)
         return coda(model, x)
@@ -234,7 +262,7 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
         return _stepped(loop, run(model, x, **inputs), x, injected)
 
     def own_view(step: int):
-        return shared or PassView(layers + (step - 1) * (end - first), first, end - first)
+        return shared or PassView(pass_offset(loop, layers, step), first, end - first)
 
     def later_passes(x, steps: range):
         """The later passes `steps` in order, none of them cut: one traced on its own, more under one scan,
@@ -244,7 +272,7 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
             for step in steps:
                 x = unrolled(x, step, own_view(step))
             return x
-        views = [PassView(layers + (step - 1) * (end - first), first, end - first) for step in steps]
+        views = [PassView(pass_offset(loop, layers, step), first, end - first) for step in steps]
         # The collections a pass sows into beside those a stack writes, which an unrolled pass appended
         # to: those the first pass made, and captured intermediates, which a capture of a module only the
         # later passes call first makes inside the scan (the final norm `_preamble` reads by).
@@ -252,8 +280,8 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
                              if model.is_mutable_collection(collection)) - {*WRITTEN, 'params', 'constants'}
         view = PassStack(views, shared=shared is not None, appended=appended)
         mapped = (*WRITTEN, *sorted(appended))
-        # Each shared pass reads the step's entering cache, else, where the step allocates it, the
-        # cache the first pass just allocated, whose later writes the scan's dropped carry takes.
+        # Each shared pass reads the step's entering cache, else, where the step enters none, the cache
+        # the first pass just opened, whose later writes the scan's dropped carry takes.
         entering = None if shared is None else (shared.entering if shared.entering is not None
                                                else model.variables.get('cache') or None)
 

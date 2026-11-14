@@ -1745,8 +1745,8 @@ def test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention
         listed = {route.kernel for route in routes if route.site.endswith("._one_work_list")}
         return kernels, listed
 
-    # Every route each step's own program takes (the cache's allocation, traced for its shapes alone,
-    # reports none: `generation.unforced`), by its selector and kernel, the kernels a rule never sees among
+    # Every route each step's own program takes (the cache's opening traces no forward, so reports none:
+    # `CausalTransformer.init_cache`), by its selector and kernel, the kernels a rule never sees among
     # them or not: a fused attention kernel of whole products, a paged kernel the rule's ownership refuses,
     # and the template's work list, which forms its products whole wherever it runs.
     from dew.nn import attention_kernels, kv_cache

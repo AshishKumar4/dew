@@ -23,7 +23,7 @@ from dew.batch import (
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import CrossContext, next_position
-from dew.nn.kv_cache import POSITION
+from dew.nn.kv_cache import POSITION, CacheSpec, Opened, cache_variables, kept, put_opened
 from dew.nn.progress import Progress
 from dew.nn.protocols import ExitPasses, OutputTable, ProjectionGroup, ReadsTrain, held_groups
 from dew.nn.sharding import explicit_spec
@@ -501,8 +501,7 @@ class MultimodalTransformer(DecoderWrapper):
         fused as without.
         """
         if decode:
-            allocated = self.has_variable("cache", POSITION)
-            cursor = self.variable("cache", POSITION, jnp.zeros, (tokens.shape[0],), jnp.int32)
+            cursor = cache_variables(self, self._position(tokens.shape[0]))[POSITION]
             valid = (jnp.ones(tokens.shape, bool) if coordinates is None or coordinates.valid is None
                      else coordinates.valid)
             positions = None if coordinates is None else coordinates.positions
@@ -516,8 +515,7 @@ class MultimodalTransformer(DecoderWrapper):
                                                       (POSITIONS_FIELD, positions)) if value is not None}
             following = next_position(fields, valid)
             assert following is not None
-            if allocated:
-                cursor.value = jnp.where(valid.any(axis=1), following, cursor.value)
+            kept(cursor, jnp.where(valid.any(axis=1), following, cursor.value), POSITION)
         # The towers read the media; the language model reads the context, and checks it.
         context, media = CrossContext.parted(conditioning)
         if media is None and self.is_initializing():
@@ -631,11 +629,21 @@ class MultimodalTransformer(DecoderWrapper):
         """The decoder's head rows (`CausalTransformer.vocabulary_rows`)."""
         return self.language_model.vocabulary_rows()
 
-    @nn.compact
+    @nn.nowrap
+    def _position(self, rows: int) -> dict[str, Opened]:
+        """Each row's next position, past the last its row holds (`POSITION`), 0 at first."""
+        return {POSITION: Opened((rows,), jnp.int32)}
+
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> CacheSpec:
+        """The decode cache for `rows` rows: the next-position counter and the language model's
+        (`CausalTransformer.cache_spec`); the towers keep none."""
+        return {**self._position(rows), "language_model": self.language_model.cache_spec(rows)}
+
     def init_cache(self, batch_size: int):
-        """Allocate the language model's cache and the next-position counter, without running the towers."""
-        self.variable("cache", POSITION, jnp.zeros, (batch_size,), jnp.int32)
-        self.language_model.init_cache(batch_size)
+        """Open the decode cache for `batch_size` rows as its holders state it (`cache_spec`), tracing no
+        forward."""
+        put_opened(self, self.cache_spec(batch_size))
 
     @property
     def loop(self) -> Loop | None:

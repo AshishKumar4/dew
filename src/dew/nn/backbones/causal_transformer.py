@@ -80,8 +80,7 @@ from ..gemma3n import AltUp, clamped_predictions, rescale_to
 from ..host_memory import on_host
 from ..hyper_connections import Carried, HyperConnections, enter_streams, leave_streams, stream_head
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates_of
-from ..kernels import generation
-from ..kv_cache import DecodeCursor, KVCache
+from ..kv_cache import CacheSpec, DecodeCursor, KVCache, put_opened
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
@@ -129,6 +128,7 @@ from .decoder_block import (
     remat_record,
     residual_normed,
 )
+from .decoder_cache import depths_cache, drafter_cache, trunk_cache
 from .decoder_fields import refuse_unbuildable, settle_fields, softmax_attention_layers
 from .decoder_stack import (
     DecoderBank,
@@ -1521,23 +1521,16 @@ class CausalTransformer(LinearProducts):
         return jnp.concatenate([prediction_inputs[f'layers_{layer}']['draft_context']
                                 for layer in self.dspark.target_layers], axis=-1)
 
-    @generation.unforced()
     def init_draft_cache(self, batch_size: int):
-        """Allocate the drafter's window caches, separately from the trunk's cache."""
+        """Open the drafter's window caches for `batch_size` rows, apart from the trunk's, as its stages
+        state them (`decoder_cache.drafter_cache`), tracing no forward."""
         assert self.dspark is not None
-        width = len(self.dspark.target_layers) * self.emb_features
-        self.draft(jnp.zeros((batch_size, 1, width), self.dtype or jnp.float32),
-                   jnp.zeros((batch_size,), jnp.int32), decode=True)
+        put_opened(self, drafter_cache(self, batch_size))
 
-    @generation.unforced()
     def init_mtp_cache(self, batch_size: int):
-        """Allocate the prediction depths' caches, separately from the trunk's cache."""
-        shape = ((batch_size, 1, self.emb_features) if self.mtp_hyper_connections is None else
-                 (batch_size, 1, self.mtp_hyper_connections.hc_mult, self.emb_features))
-        for block in self.mtp:
-            block(jnp.zeros(shape, self.dtype),
-                  jnp.zeros((batch_size, 1, self.emb_features), self.dtype), decode=True,
-                  prediction_phase="extend" if self.index_share_for_mtp_iteration else "ordinary")
+        """Open the prediction depths' caches for `batch_size` rows, apart from the trunk's, as the depths
+        state them (`decoder_cache.depths_cache`), tracing no forward."""
+        put_opened(self, depths_cache(self, batch_size))
 
     def hidden_states(self, tokens, **kwargs):
         """Return the final normalized states, without the vocabulary projection."""
@@ -1814,14 +1807,11 @@ class CausalTransformer(LinearProducts):
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         staged = stored_by_stage(self.variables)
         banked = () if staged else self.banked_collections()
-        allocating = not any(group_layers(name) for name in self.variables.get('cache', {}))
-        if decode and 'params' in banked and allocating:
-            # A decode over a store banked by run keeps the cache its layers allocate banked as the store
-            # keeps the weights, each run's layers one array under the run's name, as the run's scan carries
-            # it: every later call reads and writes it there, where a cache kept a layer at a time is
-            # stacked into the run's bank and cut apart again each call (at Qwen3-30B-A3B's layer shape, 8
-            # layers of 64 rows of 512 slots on an H100, 371 and 317 us a step, OM-1342-cache-base-2474a6e4c).
-            # A cache handed in a layer at a time goes back so.
+        held = self.variables.get('cache', {})
+        if decode and 'params' in banked and not any(group_layers(name) for name in held):
+            # A decode over a store banked by run that opens its cache opens it banked as `init_cache` does
+            # (`decoder_cache._banked_runs`), each run's layers' under the run's name, as the run's scan
+            # carries it; a cache handed in a layer at a time goes back so.
             banked = (*banked, 'cache')
         if stages == 1 and staged:
             if span is not None:
@@ -2154,19 +2144,22 @@ class CausalTransformer(LinearProducts):
                            input_quantizer=None if self.tie_embeddings else self._quantizer(self.lm_head),
                            scale=self._token_gains(), projection=projection)
 
-    @generation.unforced()
     def init_cache(self, batch_size: int):
-        """Allocate a zeroed decode cache for `batch_size` sequences.
+        """Open the decode cache for `batch_size` sequences, every row empty.
 
             cache = model.apply(params, batch_size, method=CausalTransformer.init_cache,
                                 mutable=['cache'])[1]['cache']
 
-        It runs the forward pass in decode mode on a single dummy token, and
-        that token's keys are never written: the first decode-mode call
-        allocates the cache, and the calls after it write to it. Traced for
-        its shapes alone, it takes no forced kernel (`generation.unforced`).
+        Each holder states its leaves (`cache_spec`), which its decode opens
+        and writes too, so no forward is traced; a decode over no cache opens
+        it so and writes nothing to it (`dew.nn.kv_cache.Opening`).
         """
-        self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
+        put_opened(self, self.cache_spec(batch_size))
+
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> CacheSpec:
+        """The trunk's decode cache for `rows` rows as its holders state it (`decoder_cache.trunk_cache`)."""
+        return trunk_cache(self, rows)
 
     # The serving and training hooks (`dew.nn.protocols`).
 

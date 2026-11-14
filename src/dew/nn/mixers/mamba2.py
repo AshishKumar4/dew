@@ -68,6 +68,7 @@ from dew.nn.kernels import recurrence, recurrence_algebra
 from dew.nn.kernels.generation import triton_runs
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kv_cache import Opened, compute_dtype
 from dew.nn.linear import (
     DepthwiseConv1d,
     decode_kernel,
@@ -75,6 +76,7 @@ from dew.nn.linear import (
     fused_token,
     held_scan,
     over_sequence,
+    scan_cache,
     sequence_conv,
 )
 from dew.nn.mixer_base import MixerBase, MixerContext
@@ -346,6 +348,14 @@ class Mamba2(nn.Module):
         wide = at_least_fp32(out.dtype)
         return (out.astype(wide) * nn.silu(gate.astype(wide))).astype(out.dtype)
 
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """The layer's decode cache for `rows` rows (`scan_cache`): the conv's history of x, B and C and the
+        state, both in at least fp32."""
+        wide = at_least_fp32(compute_dtype(self, self.dtype))
+        return scan_cache(rows, self.conv_kernel, self.conv_features, 'ssm_state',
+                          (self.num_heads, self.state_size, self.head_dim), wide, wide)
+
     def _sectioned(self, projected):
         """The in projection's output times its sections' factors (`section_multipliers`)."""
         if self.section_multipliers is None:
@@ -415,12 +425,8 @@ class Mamba2(nn.Module):
                 normed=False) == 'fused':
             token = self._fused_token(taps, bias, dt, valid, tokens.starts)
         out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads), state,
-                        decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide,
-                        dtype=compute, token=token)
-        if out is None:
-            # Allocation only, as the delta net: init_cache's dummy token
-            # must not consume a position or leave state behind.
-            return self.out_proj(jnp.zeros((batch, length, self.intermediate_size), self.dtype))
+                        decode=decode, coordinates=tokens, spec=self.cache_spec(batch) if decode else None,
+                        state_dtype=wide, conv_dtype=wide, dtype=compute, token=token)
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
         return self.out_proj(self._gated(out, gate))

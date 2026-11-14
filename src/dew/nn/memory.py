@@ -70,7 +70,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import ClassVar, Literal, NamedTuple
 
 import jax
@@ -88,7 +88,7 @@ from dew.nn import linear
 from dew.nn.dense import Dense
 from dew.nn.documents import within_documents
 from dew.nn.kernels import recurrence, recurrence_chunk
-from dew.nn.kv_cache import ROUNDING_KEYS
+from dew.nn.kv_cache import ROUNDING_KEYS, Opened, cache_variables, kept, stated
 from dew.nn.residuals import DELTA_RESIDUALS, MEMORY_RESIDUALS
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
@@ -351,7 +351,7 @@ class InContextMemory(LinearProducts):
         log_kept = jnp.logaddexp(jnp.log1p(-gate.scale), -logit) - jax.nn.softplus(-logit)
         return 1 - gate.scale * jax.nn.sigmoid(logit), log_kept
 
-    def _heads(self, features: int) -> tuple[_Head, ...]:
+    def _heads(self, features: int | None) -> tuple[_Head, ...]:
         """Each head's network as this call computes it (`_Head`).
 
         A head's network is its own child, so its parameters are its network's own (`head_0/...`): a
@@ -367,6 +367,7 @@ class InContextMemory(LinearProducts):
         to the float its values and scales hold (`decoded_stored`), the W_0 the steps move from."""
         networks = [getattr(self, f"head_{head}") for head in range(self.heads)]
         if self.is_initializing():
+            assert features is not None, "an initialization draws each network over the view's width"
             for network in networks:
                 network(jnp.zeros((features,), jnp.float32))
         wide = at_least_fp32(self.dtype)
@@ -540,22 +541,20 @@ class InContextMemory(LinearProducts):
         of W_0's share each row's document keeps (`KEPT`), zero for a fresh row, on either route: the
         recurrence's (`_recurrent`), or, where this call takes a head off it (`hooks` None), the
         general token path over each head's weights as that state makes them
-        (`_stepped_from_recurrence`). Its first call allocates it."""
+        (`_stepped_from_recurrence`)."""
         batch, features, wide = steps.real.shape[0], steps.key.shape[-1], at_least_fp32(self.dtype)
-        allocated = self.has_variable("cache", STATE)
-        held = self.variable("cache", STATE, lambda: rows_like(
-            jnp.zeros((batch, self.heads, features, features), wide), steps.real))
-        kept = self.variable("cache", KEPT, lambda: rows_like(
-            jnp.zeros((batch, self.heads), wide), steps.real))
+        spec = self.cache_spec(batch, heads)
+        stated(spec, STATE, (batch, self.heads, features, features), wide)
+        cache = cache_variables(self, {name: spec[name] for name in (STATE, KEPT)})
+        # The cache's rows placed as the stream's, so an Explicit axis that splits them splits these alike.
+        held, share_kept = (rows_like(cache[name].value, steps.real) for name in (STATE, KEPT))
         if hooks is None:
-            reads, state, share = self._stepped_from_recurrence(heads, steps, log_kept, held.value,
-                                                                kept.value)
+            reads, state, share = self._stepped_from_recurrence(heads, steps, log_kept, held, share_kept)
         else:
             reads, state, share = self._recurrent(hooks, heads, steps, log_kept, max_segments=max_segments,
-                                                  held=held.value, kept=kept.value)
-        if allocated:
-            held.value = state
-            kept.value = _at_last(share, steps.real, kept.value)
+                                                  held=held, kept=share_kept)
+        kept(cache[STATE], state, STATE)
+        kept(cache[KEPT], _at_last(share, steps.real, share_kept), KEPT)
         return reads
 
     def _stepped_from_recurrence(self, heads: tuple[_Head, ...], steps: _Steps, log_kept: jax.Array,
@@ -738,42 +737,67 @@ class InContextMemory(LinearProducts):
         return _unflattened(states[:, -1], state), _unflattened(moment[:, -1], momentum), reads
 
     def _decoded(self, heads: tuple[_Head, ...], steps: _Steps) -> jax.Array:
-        """A cached call: the cache's state continued token by token, its first call allocating it. The
-        call's first document continues the row's, whose real tokens the cache has counted; a document
-        that starts in the call starts from W_0, and the cache then counts that document's."""
-        rows = jax.tree.map(jnp.zeros_like, tuple(_rows(head.initial, steps.real) for head in heads))
-        allocated = self.has_variable("cache", STATE)
-        start = self.variable("cache", START, lambda: rows)
-        state = self.variable("cache", STATE, lambda: rows)
-        momentum = self.variable("cache", MOMENTUM, lambda: rows)
-        reads, carry = self._stepped(heads, steps, (start.value, state.value, momentum.value))
-        if allocated:
-            start.value, state.value, momentum.value = carry
+        """A cached call: the cache's state continued token by token. The call's first document continues
+        the row's, whose real tokens the cache has counted; a document that starts in the call starts from
+        W_0, and the cache then counts that document's."""
+        spec = self.cache_spec(steps.real.shape[0], heads)
+        cache = cache_variables(self, {name: spec[name] for name in (START, STATE, MOMENTUM)})
+        # The cache's rows placed as the stream's, so an Explicit axis that splits them splits these alike.
+        held = tuple(jax.tree.map(lambda leaf: rows_like(leaf, steps.real), cache[name].value)
+                     for name in (START, STATE, MOMENTUM))
+        reads, carry = self._stepped(heads, steps, held)
+        for name, value in zip((START, STATE, MOMENTUM), carry, strict=True):
+            kept(cache[name], value, name)
         return reads
+
+    @nn.nowrap
+    def _counts(self, rows: int) -> dict[str, Opened]:
+        """The cache's count of each row's document's real tokens (`COUNT`), and where a head rounds its
+        gradients stochastically (`dew.quantization.quantized_products`) each row's rounding key
+        (`ROUNDING_KEYS`), zeros where no server writes one."""
+        spec = {COUNT: Opened((rows,), jnp.int32)}
+        if any(quantized_products(self, f"head_{head}").stochastic for head in range(self.heads)):
+            default = jax.random.key_data(jax.random.key(0))
+            spec[ROUNDING_KEYS] = Opened((rows, *default.shape), default.dtype)
+        return spec
+
+    @nn.nowrap
+    def cache_spec(self, rows: int, heads: tuple[_Head, ...] | None = None) -> Mapping[str, object]:
+        """The memory's decode cache for `rows` rows, in at least float32: its counts (`_counts`) and, on
+        the shared recurrence (`_recurrence`), its state `[rows, heads, F, F]` and W_0's kept share
+        `[rows, heads]`, F its linear network's width; else each head's moving weights, a row's each, as
+        the steps' start, now and momentum, zeros at first (`_decoded`). `heads` are the call's own
+        (`_heads`), its networks' weights read where None."""
+        wide = at_least_fp32(self.dtype)
+        spec: dict[str, object] = dict(self._counts(rows))
+        heads = self._heads(None) if heads is None else heads
+        if self._recurrence() is not None:
+            features = jax.tree.leaves(heads[0].initial)[0].shape[0]
+            return {**spec, STATE: Opened((rows, self.heads, features, features), wide),
+                    KEPT: Opened((rows, self.heads), wide)}
+        weights = tuple(jax.tree.map(lambda leaf: Opened((rows, *leaf.shape), wide), head.initial)
+                        for head in heads)
+        return {**spec, START: weights, STATE: weights, MOMENTUM: weights}
 
     def _cached(self, steps: _Steps) -> tuple[_Steps, Callable[[], None]]:
         """A cached call's steps at their places in the row's document, counted from the real tokens of
         it the cache has seen (`COUNT`): the call's first document continues the row's, one that starts
         in the call counts from 0; and the count's update past this call's tokens, which the caller runs
-        once its read is done, and which an allocating call leaves. Where the call's quantization rounds a
+        once its read is done. Where the call's quantization rounds a
         head's gradients stochastically (`dew.quantization.quantized_products`), the steps'
         `stochastic_rounding` stream is the row's key in the cache (`ROUNDING_KEYS`) folded with each
         token's place and head (`_rounding_keys`), unless the call brings its own; a memory that rounds
         deterministically keeps no key, so its state is its tokens' alone."""
-        allocated = self.has_variable("cache", COUNT)
-        seen = self.variable("cache", COUNT, lambda: jnp.zeros_like(steps.real, jnp.int32)[:, 0])
-        places = steps.places + jnp.where(_documents(steps)[1], seen.value[:, None], 0)
+        rows = steps.real.shape[0]
+        cache = cache_variables(self, self._counts(rows))
+        seen = cache[COUNT]
+        places = steps.places + jnp.where(_documents(steps)[1], rows_like(seen.value, steps.real)[:, None], 0)
         keys = dict(steps.keys or {})
-        if any(quantized_products(self, f"head_{head}").stochastic for head in range(self.heads)):
-            default = jax.random.key_data(jax.random.key(0))
-            rounding = self.variable("cache", ROUNDING_KEYS, lambda: rows_like(
-                jnp.zeros((steps.real.shape[0], *default.shape), default.dtype), steps.real))
-            if not any(name == "stochastic_rounding" for name, _ in keys):
-                keys.update(_rounding_keys(rounding.value, places, self.heads))
+        if ROUNDING_KEYS in cache and not any(name == "stochastic_rounding" for name, _ in keys):
+            keys.update(_rounding_keys(rows_like(cache[ROUNDING_KEYS].value, steps.real), places, self.heads))
 
         def counted() -> None:
-            if allocated:
-                seen.value = _at_last(places + 1, steps.real, seen.value)
+            kept(seen, _at_last(places + 1, steps.real, rows_like(seen.value, steps.real)), COUNT)
 
         return steps._replace(places=places, keys=keys), counted
 

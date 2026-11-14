@@ -23,6 +23,7 @@ from dew.nn.kv_cache import (
     BOUND,
     TABLE,
     KVCache,
+    KVSpec,
     KVStore,
     _gather_pages,
     _gathered_attention,
@@ -47,8 +48,8 @@ class Holder(nn.Module):
     @nn.compact
     def __call__(self, key, value):
         rows, tokens, heads, width = key.shape
-        store = KVStore.open(self, self.layout, rows, tokens, heads, width, self.dtype,
-                             keys_as_values=self.keys_as_values)
+        store = KVStore.open(self, KVSpec(self.layout, rows, tokens, heads, width, self.dtype,
+                                          keys_as_values=self.keys_as_values))
         if self.has_variable("cache", "written"):
             store.write(key, value, jnp.broadcast_to(jnp.arange(tokens), (rows, tokens)))
         self.variable("cache", "written", lambda: True)
@@ -300,7 +301,7 @@ class Writer(nn.Module):
     @nn.compact
     def __call__(self, key, value, positions, mixed=False):
         rows, _, heads, width = key.shape
-        store = KVStore.open(self, self.layout, rows, self.capacity, heads, width, jnp.float32)
+        store = KVStore.open(self, KVSpec(self.layout, rows, self.capacity, heads, width, jnp.float32))
         if self.has_variable("cache", "written"):
             if mixed:
                 store.write_tokens(key[:, 0], value[:, 0], jnp.arange(rows), positions[:, 0])
@@ -321,7 +322,7 @@ class Decoder(nn.Module):
     @nn.compact
     def __call__(self, key, value, positions, query, lengths):
         rows, _, heads, width = key.shape
-        store = KVStore.open(self, self.layout, rows, self.capacity, heads, width, key.dtype)
+        store = KVStore.open(self, KVSpec(self.layout, rows, self.capacity, heads, width, key.dtype))
         if not self.has_variable("cache", "written"):
             self.variable("cache", "written", lambda: True)
             return None

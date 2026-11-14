@@ -67,7 +67,7 @@ from dew.interop.weights import AUTO, checkpoint_dtype
 from dew.mesh import LogicalAxes
 from dew.nn.attention import AttentionImpl
 from dew.nn.inputs import document_reach
-from dew.nn.kv_cache import cache_positions, filled_slots
+from dew.nn.kv_cache import cache_positions, cursor, filled_slots, put_opened
 from dew.nn.precision import at_least_fp32, broadcast_summed, configured_precision, exact_float32, scaled
 from dew.nn.programs import purely_called
 from dew.nn.protocols import Lacks, OutputTable
@@ -1388,20 +1388,28 @@ class TorchCausalLM(nn.Module):
                 "check holds against its whole prefill; serve it with whole-prompt admission")
 
     def init_cache(self, batch_size: int) -> None:
-        """Open the decode cache of `batch_size` rows (`Decoding`), every slot unfilled: one decoding
-        call of no valid token, which writes nothing, as Dew's decoders open theirs."""
-        tokens = jnp.zeros((batch_size, 1), jnp.int32)
-        self(tokens, decode=True, attention_mask=jnp.zeros((batch_size, 1), bool))
+        """Open the decode cache of `batch_size` rows (`Decoding`), every slot unfilled. Its leaves are an
+        external graph's, which only a step's trace states (`_layer_caches`): the one decoder whose cache's
+        opening traces its step, for its shapes alone, where Dew's own decoders' holders state theirs."""
+        for layer, zeros in self._layer_caches(batch_size).items():
+            self.put_variable("cache", f"layer_{layer}", zeros())
+        put_opened(self, cursor(batch_size))
 
     def with_cache_capacity(self, capacity: int) -> Self:
         """The model with a decode cache of `capacity` slots a row (`CacheCapacity`)."""
         return self.clone(max_seq_len=capacity)
 
     def _cached(self, rows: int) -> dict[int, Variable]:
-        """Each attention layer's keys and values by its `layer_idx`, opened at `rows` rows of
-        `max_seq_len` slots where they are not yet: their shapes and dtypes are those one decoding token
-        of each row writes (`TorchGraph.step` over no held cache). The rows' cursor is the model's own
-        (`cache_positions`), one for every layer."""
+        """Each attention layer's keys and values by its `layer_idx`, opened at `rows` rows where they are
+        not yet (`_layer_caches`). The rows' cursor is the model's own (`cache_positions`), one for every
+        layer."""
+        return {layer: self.variable("cache", f"layer_{layer}", zeros)
+                for layer, zeros in self._layer_caches(rows).items()}
+
+    def _layer_caches(self, rows: int) -> dict[int, Callable[[], dict[str, jax.Array]]]:
+        """Each attention layer's keys and values by its `layer_idx` at `rows` rows of `max_seq_len`
+        slots, every slot zero: their shapes and dtypes are those one decoding token of each row writes
+        (`TorchGraph.step` over no held cache, traced for its shapes alone)."""
         tokens = jnp.zeros((rows, 1), jnp.int32)
         slots = jnp.zeros((rows, 1), jnp.int32)
         filled = jnp.ones((rows, 1), bool)
@@ -1414,15 +1422,14 @@ class TorchCausalLM(nn.Module):
                         for name, shape in written.items()}
             return zeros
 
-        return {layer: self.variable("cache", f"layer_{layer}", opened(written))
-                for layer, written in sorted(shapes.items())}
+        return {layer: opened(written) for layer, written in sorted(shapes.items())}
 
     def _decoded(self, tokens, real, positions) -> jax.Array:
         tokens = jnp.asarray(tokens)
         rows, width = tokens.shape[:2]
         cache = self._cached(rows)
         # Each real token fills its row's next slot, the rest none (-1), as Dew's caches fill.
-        slots, _ = cache_positions(self, rows, width, real)
+        slots = cache_positions(self, rows, width, real)
         filled = filled_slots(self.get_variable("cache", "cache_index"), self.max_seq_len)
         places = jnp.maximum(slots, 0) if positions is None else jnp.asarray(positions, jnp.int32)
         # A decoding call's tokens reach their row's furthest real one, as a rotary's tables read it.

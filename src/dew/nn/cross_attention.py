@@ -71,11 +71,12 @@ from dew.nn.progress import END, Progress, progressed
 
 from .activations import GatedActivation
 from .attention import AttentionImpl
-from .attention_blocks import CROSS_KEY, CROSS_VALUE, NormalAttention, kept_context
+from .attention_blocks import CROSS_KEY, CROSS_VALUE, NormalAttention, context_cache, kept_context
 from .attention_masks import max_attention_logits, visibility_mask
 from .documents import CrossDocuments, holds_keys
 from .flops import counted_flops
 from .inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, CrossContext
+from .kv_cache import Opened, cache_variables, compute_dtype, kept
 from .norms import NormSite
 from .precision import L2NORM_EPS, at_least_fp32, float32_dot_general, l2norm, projection_role, sqrt_or_zero
 
@@ -508,6 +509,14 @@ class GatedCrossAttention(nn.Module):
         return (self.attention(parent=None).cross_flops(lengths, context_lengths, self.context_features)
                 + counted_flops(self.feedforward(parent=None), lengths))
 
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """A cached call's leaves for `rows` rows: the context's bookkeeping (`documents_cache`) and its
+        keys and values, which its attention keeps in the block's scope (`NormalAttention.context_spec`),
+        in the block's compute dtype."""
+        return {**documents_cache(rows, self.context_length),
+                **self.attention(parent=None).context_spec(rows, compute_dtype(self, self.dtype))}
+
     @nn.compact
     def __call__(self, stream: jax.Array, context: CrossContext | None, *,
                  read: Callable[[jax.Array], jax.Array] | None = None, decode: bool = False,
@@ -541,7 +550,7 @@ class GatedCrossAttention(nn.Module):
         seen = {} if documents is None else {"segment_ids": documents.query, "key_segment_ids": documents.key}
         output = attention(self._normed(self.norms[0], x), embeddings,
                            key_value_seq_lengths=jnp.maximum(lengths, 1), cached=decode,
-                           cache_dtype=x.dtype if self.dtype is None else self.dtype, **seen)
+                           cache_dtype=compute_dtype(self, self.dtype), **seen)
         present = _present(stream, documents, lengths)
         dropout = Dropout(rate=self.dropout_rate)
 
@@ -578,6 +587,15 @@ class SharedGatedCrossAttention(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """A cached call's leaves for `rows` rows: the context's bookkeeping (`documents_cache`) and its
+        keys and values at the layer's key heads (`heads`), in the block's compute dtype."""
+        key_heads, key_width, value_width = self.heads
+        return {**documents_cache(rows, self.context_length),
+                **context_cache(rows, self.context_length, ((key_heads, key_width), (key_heads, value_width)),
+                                compute_dtype(self, self.dtype))}
+
     @nn.compact
     def __call__(self, stream: jax.Array, context: CrossContext | None, *, layer: LayerReads,
                  read: Callable[[jax.Array], jax.Array] | None = None, decode: bool = False,
@@ -603,11 +621,7 @@ class SharedGatedCrossAttention(nn.Module):
         query, gate = attention.context_query(layer.normed(x))
         embeddings = None if context is None else context.embeddings
         if decode:
-            key_heads, key_width, value_width = self.heads
-            key, value = kept_context(self, x.shape[0], self.context_length,
-                                      ((key_heads, key_width), (key_heads, value_width)),
-                                      x.dtype if self.dtype is None else self.dtype, embeddings,
-                                      attention.context_keys)
+            key, value = kept_context(self, self.cache_spec(x.shape[0]), embeddings, attention.context_keys)
         else:
             assert embeddings is not None
             key, value = attention.context_keys(embeddings)
@@ -631,7 +645,7 @@ def _held(module: nn.Module, x: jax.Array, context: CrossContext | None,
           queries: jax.Array | None) -> tuple[jax.Array, CrossDocuments | None]:
     """Each row's real context tokens a cached call of a block reads and each query's and each context
     token's document (`CrossDocuments`; None for a call that carries a context naming none). A call that
-    carries a context reads it as an uncached one (`_read`) and, once the cache is allocated, keeps its
+    carries a context reads it as an uncached one (`_read`) and keeps its
     count, each token's document (`CROSS_DOCUMENTS`) and the row's last document (`CROSS_LAST`) beside its
     keys and values (`kept_context`), numbered on from the row's as a decoder's cache numbers a call's
     documents (`Append.documents`): its first document continues the row's last. A call without one reads
@@ -639,30 +653,34 @@ def _held(module: nn.Module, x: jax.Array, context: CrossContext | None,
     same way and the row's last moved on with them, so a document that continues the row's last reads its
     own context alone and a new one none, then and in every later call; under a kept context that names no
     documents every token of the row reads all of it, as it did."""
-    allocated = module.has_variable("cache", CROSS_LENGTHS)
-    rows, width = x.shape[0], module.context_length
-    lengths = module.variable("cache", CROSS_LENGTHS, jnp.zeros, (rows,), jnp.int32)
-    kept = module.variable("cache", CROSS_DOCUMENTS, jnp.zeros, (rows, width), jnp.int32)
-    last = module.variable("cache", CROSS_LAST, jnp.zeros, (rows,), jnp.int32)
+    rows = x.shape[0]
+    held = cache_variables(module, documents_cache(rows, module.context_length))
+    lengths, documented, last = held[CROSS_LENGTHS], held[CROSS_DOCUMENTS], held[CROSS_LAST]
     first = jnp.maximum(last.value, 1)[:, None]
     if context is not None:
         read, documents = _read(context)
-        if allocated:
-            tokens = jnp.arange(context.embeddings.shape[1])[None, :]
-            named = (tokens < context.lengths[:, None]).astype(jnp.int32) if documents is None else jnp.where(
-                documents.key > 0, first + documents.key - 1, 0)
-            lengths.value = read
-            kept.value = jnp.pad(named, ((0, 0), (0, width - named.shape[1])))
-            last.value = (jnp.zeros((rows,), jnp.int32) if documents is None
-                          else first[:, 0] + jnp.maximum(jnp.max(documents.query, axis=-1), 1) - 1)
+        tokens = jnp.arange(context.embeddings.shape[1])[None, :]
+        named = (tokens < context.lengths[:, None]).astype(jnp.int32) if documents is None else jnp.where(
+            documents.key > 0, first + documents.key - 1, 0)
+        kept(lengths, read, CROSS_LENGTHS)
+        kept(documented, jnp.pad(named, ((0, 0), (0, documented.value.shape[1] - named.shape[1]))),
+             CROSS_DOCUMENTS)
+        kept(last, jnp.zeros((rows,), jnp.int32) if documents is None
+             else first[:, 0] + jnp.maximum(jnp.max(documents.query, axis=-1), 1) - 1, CROSS_LAST)
         return read, documents
     own = jnp.ones(x.shape[:2], jnp.int32) if queries is None else jnp.asarray(queries, jnp.int32)
     numbered = jnp.where(own > 0, first + own - 1, 0)
     whole = last.value == 0
-    if allocated:
-        # The row's last document moves on with the call's, as the decoder's cache numbers them.
-        last.value = jnp.where(whole, 0, jnp.maximum(jnp.max(numbered, axis=-1), last.value))
-    return lengths.value, CrossDocuments(jnp.where(whole[:, None], 1, numbered), kept.value)
+    # The row's last document moves on with the call's, as the decoder's cache numbers them.
+    kept(last, jnp.where(whole, 0, jnp.maximum(jnp.max(numbered, axis=-1), last.value)), CROSS_LAST)
+    return lengths.value, CrossDocuments(jnp.where(whole[:, None], 1, numbered), documented.value)
+
+
+def documents_cache(rows: int, length: int) -> dict[str, Opened]:
+    """A cached call's bookkeeping of its context for `rows` rows of `length` tokens (`_held`): each row's
+    count of context tokens, each token's document and the row's last document."""
+    return {CROSS_LENGTHS: Opened((rows,), jnp.int32), CROSS_DOCUMENTS: Opened((rows, length), jnp.int32),
+            CROSS_LAST: Opened((rows,), jnp.int32)}
 
 
 def _present(stream: jax.Array, documents: CrossDocuments | None, lengths: jax.Array) -> jax.Array:

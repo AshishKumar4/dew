@@ -44,6 +44,7 @@ from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .kernels import recurrence
 from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, kernel_routed
+from .kv_cache import Opened, compute_dtype
 from .linear import (
     DepthwiseConv1d,
     RMSNormGated,
@@ -52,6 +53,7 @@ from .linear import (
     fused_token,
     held_scan,
     over_sequence,
+    scan_cache,
     split_delta_rule,
 )
 from .mixer_base import MixerBase, MixerContext
@@ -169,6 +171,14 @@ class KimiDeltaAttention(nn.Module):
             return self.lower_bound * nn.sigmoid(rate * gate)
         return -rate * jnp.where(gate > 20.0, gate, jnp.log1p(jnp.exp(jnp.minimum(gate, 20.0))))
 
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """The layer's decode cache for `rows` rows (`scan_cache`): the conv's history of its queries, keys
+        and values and the recurrent state, both in at least fp32."""
+        wide = at_least_fp32(compute_dtype(self, self.dtype))
+        return scan_cache(rows, self.conv_kernel, 3 * self.qkv_features, 'recurrent_state',
+                          (self.num_heads, self.head_dim, self.head_dim), wide, wide)
+
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
         decode, attention_metadata = call.decode, call.metadata
@@ -221,8 +231,7 @@ class KimiDeltaAttention(nn.Module):
                 starts=starts, max_segments=tokens.max_segments, write_bound=1.0,
                 firsts=tokens.firsts if forked is None else None, loads=loads, stores=stores, held=table)
 
-        # The decode state is GatedDeltaNet's pair, here in fp32; the
-        # allocation-only call returns before any state is written. The conv
+        # The decode state is GatedDeltaNet's pair, here in fp32 (`cache_spec`). The conv
         # normalises the queries and keys (`l2norm`) and rounds once, to the
         # dtype the rule takes: the projections' where the port runs it, as
         # fla's layer hands them over, the wide one for the math.
@@ -244,10 +253,9 @@ class KimiDeltaAttention(nn.Module):
         else:
             out = held_scan(self, projected, taps, None, scan,
                             (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,
-                            state='recurrent_state', state_dtype=wide, conv_dtype=wide, parts=heads,
+                            spec=self.cache_spec(B) if decode else None, state='recurrent_state',
+                            state_dtype=wide, conv_dtype=wide, parts=heads,
                             dtype=projected.dtype if ported else wide, token=token)
-        if out is None:
-            return self.o_proj(jnp.zeros((B, S, self.qkv_features), self.dtype))
         if token is not None:
             # The fused step gated and normalized its output (`FUSED`).
             return self.o_proj(out)

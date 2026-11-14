@@ -1,0 +1,138 @@
+"""A decoder's cache opens as its holders state it, tracing no forward: every mixer kind, every decoder
+family the capability matrix builds, a store banked by run and the prediction depths, each opened cache
+the one its decode opens and the one its decode leaves, leaf for leaf in tree, shape and dtype; and a
+server's start traces only what it runs."""
+
+import jax
+import jax.numpy as jnp
+import pytest
+from flax import linen as nn
+from model_support import decoder
+from test_capability_matrix import ALL, CACHE, CAUSAL, SEQ, loaded
+from test_mixers import COMPRESSED, KIND_FIELDS, tiny
+
+from dew.inference.banks import HeldBanks
+from dew.registry import mixers
+
+ROWS, PROMPT = 2, 4
+
+PRODUCTS = frozenset({"dot_general", "conv_general_dilated", "ragged_dot_general"})
+"""The primitives a forward computes by, none of which opening a cache traces."""
+
+
+def primitives(jaxpr) -> set[str]:
+    """Every primitive `jaxpr` and the jaxprs it holds bind."""
+    return {eqn.primitive.name for eqn in jaxpr.eqns} | {
+        name for eqn in jaxpr.eqns for inner in jax.extend.core.jaxprs_in_params(eqn.params)
+        for name in primitives(inner)}
+
+
+def typed(cache) -> dict[str, tuple[tuple[int, ...], jnp.dtype]]:
+    """Each leaf of `cache` by its path: its shape and dtype."""
+    return {jax.tree_util.keystr(path): (tuple(leaf.shape), jnp.dtype(leaf.dtype))
+            for path, leaf in jax.tree_util.tree_leaves_with_path(cache)}
+
+
+def assert_opens_as_it_decodes(model, variables, method: str = "init_cache", decoded=None):
+    """`model`'s cache opened by `method` for `ROWS` rows holds no product in its program, and is, leaf for
+    leaf, the cache a decode over none opens, the one a prefill over it leaves and the one a step after
+    that leaves (`decoded(variables, cache, tokens)`, the model's own cached call by default)."""
+    def opened(variables):
+        return model.apply(variables, ROWS, method=method, mutable=["cache"])[1]["cache"]
+
+    def call(variables, cache, tokens):
+        held = variables if cache is None else {**variables, "cache": cache}
+        return model.apply(held, tokens, decode=True, mutable=["cache"])[1]["cache"]
+
+    decoded = decoded or call
+    program = jax.make_jaxpr(opened)(variables).jaxpr
+    assert not primitives(program) & PRODUCTS, primitives(program) & PRODUCTS
+    cache = jax.eval_shape(opened, variables)
+    tokens = jnp.ones((ROWS, PROMPT), jnp.int32)
+    first = jax.eval_shape(decoded, variables, None, tokens)
+    prefilled = jax.eval_shape(decoded, variables, cache, tokens)
+    stepped = jax.eval_shape(decoded, variables, prefilled, tokens[:, :1])
+    assert typed(cache), "an opened cache holds leaves"
+    for name, made in (("a decode over none", first), ("a prefill", prefilled), ("a step", stepped)):
+        assert typed(made) == typed(cache), (name, typed(made), typed(cache))
+
+
+V4_FIELDS, V4_OVERRIDES = KIND_FIELDS["deepseek_v4"]
+KINDS = {**{kind: KIND_FIELDS.get(kind, ({}, {})) for kind in sorted(set(mixers.paths) - {"mlp"})},
+         **{f"deepseek_v4 {name}": ({**V4_FIELDS, **fields}, V4_OVERRIDES)
+            for name, fields in COMPRESSED.items()}}
+"""Every registered mixer kind but the tokenwise one, which keeps no cache, and DeepSeek V4's compressed
+layers, at the fields each needs to build tiny (`test_mixers.KIND_FIELDS`)."""
+
+
+@pytest.mark.parametrize("kind", sorted(KINDS))
+def test_each_mixers_cache_opens_as_its_decode_opens_and_writes_it(kind):
+    """A decoder of each mixer kind opens its cache from its holders' specs, tracing no product, as its
+    decode opens it over none and as its prefill and its step leave it: the spec states every leaf its
+    forward keeps, at the shape and dtype its writes carry."""
+    fields, overrides = KINDS[kind]
+    model = tiny(mixer=mixers.build(kind.split()[0], **fields), max_seq_len=32, **overrides)
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, PROMPT), jnp.int32)))
+    assert_opens_as_it_decodes(model, variables)
+
+
+CACHED = tuple(family for family in ALL if {CAUSAL, CACHE} <= family.facts)
+"""Every decoder family the capability matrix builds that decodes over a cache."""
+
+
+@pytest.mark.parametrize("family", CACHED, ids=str)
+def test_each_familys_cache_opens_as_its_decode_opens_and_writes_it(family):
+    """Each cached decoder family the capability matrix builds (its looped stacks, its multimodal wrappers,
+    its latent and recurrent hybrids) opens its cache as its decode opens it and as its prefill and step
+    leave it."""
+    held = loaded(family)
+    variables = held.variables or nn.unbox(held.model.init(jax.random.key(0), jnp.ones((1, SEQ), jnp.int32)))
+    assert_opens_as_it_decodes(held.model, variables)
+
+
+def test_a_banked_stores_cache_opens_banked_as_its_decode_opens_and_writes_it():
+    """A scanned stack over a store banked by run opens its cache banked, each run's layers one array
+    under the run's name, as its decode over none opens it and as its prefill and step leave it."""
+    plain = tiny(num_layers=4, max_seq_len=16)
+    variables = plain.init(jax.random.key(0), jnp.ones((1, PROMPT), jnp.int32))
+    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True)
+    banked = HeldBanks(variables).place(scanned)
+    cache = jax.eval_shape(lambda store: scanned.apply(store, ROWS, method="init_cache", mutable=["cache"]),
+                           banked)[1]["cache"]
+    assert "layers_0_3" in cache and not any(f"layers_{index}" in cache for index in range(4)), list(cache)
+    assert_opens_as_it_decodes(scanned, banked)
+
+
+@pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
+def test_prediction_depths_open_their_caches_as_their_steps_write_them(kind):
+    """A decoder's prediction depths open their caches apart from the trunk's (`init_mtp_cache`), tracing no
+    product, as a depth's step over none opens them and as its steps leave them."""
+    model = decoder(kind).clone(num_nextn_predict_layers=1, max_seq_len=16)
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, PROMPT), jnp.int32)))
+
+    def stepped(variables, cache, tokens):
+        held = variables if cache is None else {**variables, "cache": cache}
+        hidden = jnp.zeros((*tokens.shape, model.emb_features), jnp.float32)
+        return model.apply(held, hidden, tokens, depth=0, decode=True, mutable=["cache"],
+                           method="mtp_step")[1]["cache"]
+
+    assert_opens_as_it_decodes(model, variables, method="init_mtp_cache", decoded=stepped)
+
+
+def test_a_servers_start_traces_only_what_it_runs():
+    """A server's start traces each program it compiles and one more, the decoder state its admissions'
+    prefill leaves at an admission it runs (`serving_kernel.admitted_types`), whose types its free slots
+    hold beside a cache opened as the model states it: no forward is traced for the cache, nor for a
+    blank prompt of one row (JAX's public trace and compile events, `dew.telemetry.compiles`)."""
+    from model_support import serving_task
+
+    from dew.inference.serving import Server
+    from dew.telemetry.compiles import Compiles
+
+    with Compiles(None) as heard:
+        Server.from_task(serving_task(), slots=4, capacity=32, admission=2)
+    traced = [program.name for program in heard.programs if program.kind == "traced"]
+    compiled = {program.name.removeprefix("jit(").removesuffix(")")
+                for program in heard.programs if program.kind == "compiled"}
+    alone = [name for name in traced if name not in compiled]
+    assert len(alone) == 1 and "prefilled" in alone[0], (alone, traced, sorted(compiled))

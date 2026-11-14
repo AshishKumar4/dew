@@ -35,8 +35,8 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Literal
+from collections.abc import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -104,6 +104,162 @@ place and head, so a row's draws are its request's key's and its places' alone; 
 it from the request's key (`with_rounding_keys`), zeros where none does."""
 
 _LIMITS = {"int8": 127.0, "float8_e4m3fn": E4M3_MAX}
+
+
+@dataclasses.dataclass(frozen=True)
+class Opened:
+    """One decode-cache leaf as its holder opens it: its shape, its dtype, and what it holds before any
+    write, `fill` (the value every element takes, or a function of no argument that builds the leaf: a
+    paged cache's page table). Each holder states its leaves so, its `cache_spec`, and both its decode's
+    first write and `init_cache` open them from that statement (`cache_variables`, `opened`), so neither can
+    open a leaf the other does not. The dtype is the one the holder's writes carry, which `kept` holds
+    them to."""
+
+    shape: tuple[int, ...]
+    dtype: jax.typing.DTypeLike
+    fill: float | int | bool | Callable[[], jax.Array] = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "shape", tuple(int(size) for size in self.shape))
+        object.__setattr__(self, "dtype", jnp.dtype(self.dtype))
+
+    def __call__(self) -> jax.Array:
+        if callable(self.fill):
+            return self.fill()
+        return jnp.full(self.shape, self.fill, self.dtype)
+
+
+type CacheSpec = Mapping[str, Opened | CacheSpec]
+"""A cache's leaves as their holders state them (`Opened`), nested as the modules that hold them are: a
+holder's own leaves under their names, each child's under the child's name."""
+
+
+@runtime_checkable
+class HoldsCache(Protocol):
+    """A module that keeps a decode cache states it: its leaves for `rows` rows, its children's under their
+    names (`CacheSpec`), which its decode's writes and `init_cache` both open."""
+
+    def cache_spec(self, rows: int) -> CacheSpec: ...
+
+
+def cache_of(module: nn.Module, rows: int) -> CacheSpec:
+    """`module`'s decode cache for `rows` rows as it states it (`HoldsCache`), none for a module that keeps
+    none."""
+    return module.cache_spec(rows) if isinstance(module, HoldsCache) else {}
+
+
+@dataclasses.dataclass(frozen=True)
+class Opening:
+    """A cache variable the call that reads it opened (`cache_variables`): the call reads it as opened and
+    writes nothing to it, so a call that opens a cache only opens it, as `init_cache` and an initialization
+    do, and the call after it writes its first tokens."""
+
+    variable: nn.Variable
+
+    @property
+    def value(self):
+        return self.variable.value
+
+
+def cache_variables(module: nn.Module, spec: Mapping[str, object]) -> dict[str, nn.Variable | Opening]:
+    """`module`'s cache variables `spec` states, each an `Opened` leaf or a tree of them (a memory's
+    weights): the cache's where the cache holds it, else opened as `spec` states it (`Opening`)."""
+    held = {}
+    for name, value in spec.items():
+        opening = not module.has_variable("cache", name)
+        variable = module.variable("cache", name, functools.partial(jax.tree.map, _open, value))
+        held[name] = Opening(variable) if opening else variable
+    return held
+
+
+def _open(leaf: Opened) -> jax.Array:
+    return leaf()
+
+
+def stacked_spec(specs: Sequence[CacheSpec]) -> CacheSpec:
+    """The cache of a run of like layers, each of `specs` one layer's alike, stacked on a leading layer
+    axis as a scanned run's bank keeps it (`dew.nn.backbones.decoder_stack.StackView`)."""
+    def stacked(*leaves: Opened) -> Opened:
+        first = leaves[0]
+        if any(leaf.shape != first.shape or leaf.dtype != first.dtype for leaf in leaves):
+            raise ValueError(f"a run's layers keep alike caches, got {leaves}")
+        fill = first.fill
+        if callable(fill) or any(leaf.fill != fill for leaf in leaves):
+            # Each layer's own fill, a page table's among them, stacked.
+            fill = functools.partial(lambda held: jnp.stack([leaf() for leaf in held]), leaves)
+        return Opened((len(leaves), *first.shape), first.dtype, fill)
+
+    return jax.tree.map(stacked, *specs)
+
+
+def put_opened(module: nn.Module, spec: CacheSpec) -> None:
+    """Put the cache `spec` states into `module`'s cache collection, each leaf opened (`opened`), under
+    the names the holders keep them by, its children's in theirs: a model's `init_cache`, which traces no
+    forward."""
+    for name, value in opened(spec).items():
+        module.put_variable("cache", name, value)
+
+
+def opened(spec: CacheSpec) -> dict:
+    """The cache `spec` states, each leaf opened (`Opened`): what `init_cache` returns, with no forward
+    traced."""
+    return jax.tree.map(_open, dict(spec))
+
+
+def written_as(name: str, leaf: jax.typing.DTypeLike, written: jax.typing.DTypeLike) -> None:
+    """Refuse a write to the cache leaf `name` of values in another dtype than the leaf's, which its
+    holder's spec states (`Opened`): a defect of the spec or of the write, raised by the leaf's name
+    rather than converted."""
+    if jnp.dtype(written) != jnp.dtype(leaf):
+        raise TypeError(f"the cache leaf {name!r} holds {jnp.dtype(leaf)} as its holder states it, and a "
+                        f"write gave {jnp.dtype(written)}")
+
+
+def stated(spec: Mapping[str, object], name: str, shape: tuple[int, ...],
+           dtype: jax.typing.DTypeLike) -> None:
+    """Refuse a forward whose cache leaf `name` is `shape` in `dtype` where its holder's `spec` states it
+    otherwise: a defect of the spec's rule, raised by the leaf's name (`written_as`)."""
+    leaf = spec[name]
+    assert isinstance(leaf, Opened), f"{name!r} is a tree of leaves, which a forward states leaf by leaf"
+    written_as(name, leaf.dtype, dtype)
+    if leaf.shape != tuple(shape):
+        raise ValueError(f"the cache leaf {name!r} is {list(leaf.shape)} as its holder states it, and its "
+                         f"forward computes {list(shape)}")
+
+
+def kept(held: nn.Variable | Opening, value, name: str) -> None:
+    """Write `value` to the cache variable `held`, named `name`, which holds its dtypes and shapes as its
+    holder's spec states (`Opened`), a leaf or a tree of them: a value of another is refused by the
+    variable's name (`written_as`). A variable the call opened takes no write (`Opening`)."""
+    leaves, structure = jax.tree.flatten(held.value)
+    written, written_structure = jax.tree.flatten(value)
+    if written_structure != structure:
+        raise ValueError(f"the cache variable {name!r} holds {structure} as its holder states it, and a "
+                         f"write gave {written_structure}")
+    for leaf, new in zip(leaves, written, strict=True):
+        written_as(name, leaf.dtype, new.dtype)
+        if leaf.shape != new.shape:
+            raise ValueError(f"the cache leaf {name!r} holds {list(leaf.shape)} as its holder states it, and "
+                             f"a write gave {list(new.shape)}")
+    if not isinstance(held, Opening):
+        held.value = value
+
+
+def compute_dtype(module: nn.Module, dtype: jax.typing.DTypeLike | None) -> jnp.dtype:
+    """The dtype a module's activations carry, which its cache keeps them in: its compute `dtype` where
+    set, else what Flax promotes its float parameters to (float32 where it holds none), as its products
+    with an input of theirs give."""
+    if dtype is not None:
+        return jnp.dtype(dtype)
+    floats = [leaf.dtype for leaf in jax.tree.leaves(module.variables.get("params", {}))
+              if jnp.issubdtype(leaf.dtype, jnp.floating)]
+    return jnp.dtype(jnp.result_type(*floats)) if floats else jnp.dtype(jnp.float32)
+
+
+def cursor(rows: int) -> dict[str, Opened]:
+    """The cursor's leaf (`CURSOR`) for `rows` rows: each row's count of the tokens it holds, none at
+    first (`cache_positions`)."""
+    return {CURSOR: Opened((rows,), jnp.int32)}
 
 
 def leaf_name(path: tuple[jax.tree_util.KeyEntry, ...]) -> str | None:
@@ -543,6 +699,75 @@ def cache_leaf(module: nn.Module, name: str) -> jax.Array:
 
 
 @dataclasses.dataclass(frozen=True)
+class KVSpec:
+    """One attention module's key and value storage as the module states it (`KVStore`): `rows` rows of
+    `capacity` slots of `kv_heads` heads, keys `head_dim` wide and values `value_dim` wide (None for the
+    keys' width) in `dtype`, the dtype the module's keys and values carry, stored in `layout`. Values are
+    the keys themselves where `keys_as_values` and the layout stores keys as given (no rotation), which
+    keeps no storage of their own. `places` keeps each token's place beside its key (`Append.places`), and
+    `groups` each token's group of the fields it names (`GROUPS`, `Append.groups`), -1 where none has been
+    written."""
+
+    layout: KVCache
+    rows: int
+    capacity: int | None
+    kv_heads: int
+    head_dim: int
+    dtype: jnp.dtype
+    value_dim: int | None = None
+    keys_as_values: bool = False
+    places: bool = False
+    groups: tuple[str, ...] = ()
+
+    @property
+    def once(self) -> bool:
+        """Whether the values are the keys, kept once (`keys_as_values` with keys stored as given)."""
+        return self.keys_as_values and self.layout.key_rotation(self.head_dim) is None
+
+    def leaves(self) -> dict[str, Opened]:
+        """The storage's leaves (`Opened`). A paged layout raises `ValueError` when `capacity` is not a
+        multiple of `page_size`, or when `rows` does not split into the pool's groups; no capacity
+        raises too, a decode cache being fixed in size."""
+        layout = self.layout
+        if self.capacity is None:
+            raise ValueError("decoding needs max_seq_len for its fixed-capacity cache")
+        layout.key_rotation(self.head_dim)
+        storage = layout.storage(self.dtype)
+        leaves = {}
+        if layout.page_size is None:
+            shape = (self.rows, self.capacity, self.kv_heads, self.head_dim)
+        else:
+            if self.capacity % layout.page_size:
+                raise ValueError(f"a paged cache of {self.capacity} slots needs a multiple of "
+                                 f"page_size {layout.page_size}")
+            per_row = self.capacity // layout.page_size
+            if self.rows % layout.groups:
+                raise ValueError(f"{self.rows} rows do not split into the pool's {layout.groups} groups")
+            pages = self.rows * per_row if layout.pages is None else layout.pages
+            shape = (self.kv_heads, pages, layout.page_size, self.head_dim)
+            leaves[TABLE] = Opened((self.rows, per_row), jnp.int32, functools.partial(
+                default_page_table, self.rows, per_row, pages, layout.groups))
+        values = (*shape[:-1], self.head_dim if self.value_dim is None else self.value_dim)
+        payloads = (("cached_key", "key_scale"),) if self.once else (
+            ("cached_key", "key_scale"), ("cached_value", "value_scale"))
+        # A quantized pool's scales head-major, as a paged pool keeps its codes: each key head's run of a
+        # row's slots contiguous, which a kernel reads as a stream beside the codes (`scale_shape`).
+        for (name, scale), stored in zip(payloads, (shape, values), strict=False):
+            leaves[name] = Opened(stored, storage)
+            if layout.quantized is not None:
+                leaves[scale] = Opened(scale_shape(shape, layout), jnp.float32, 1.0)
+        leaves[BOUND] = Opened(scale_shape(shape, layout), bound_dtype(storage))
+        # A scale's storage with one head: every key head of a token sits at its place and in its group.
+        held = (*shape[:2], 1) if layout.page_size is None else (1, *shape[1:3])
+        if self.places:
+            leaves[PLACES] = Opened(held, jnp.int32)
+        leaves[DOCUMENTS] = Opened(held, jnp.int32)
+        for name in self.groups:
+            leaves[GROUPS[name]] = Opened(held, jnp.int32, -1)
+        return leaves
+
+
+@dataclasses.dataclass(frozen=True)
 class KVStore:
     """Reads and writes one attention module's key and value storage, opened for `rows` rows.
 
@@ -555,7 +780,9 @@ class KVStore:
     mask excludes it. A store whose values are its keys (`keys_as_values`, a
     head that serves as both) keeps them once where its keys are stored as
     given, with no rotation, and reads them back as its values; a rotated
-    layout's keys are not its values' layout, so it keeps both.
+    layout's keys are not its values' layout, so it keeps both. Keys and
+    values written carry the dtype the module's spec states (`KVSpec.dtype`),
+    which a write of another refuses by name.
     """
 
     module: nn.Module
@@ -565,54 +792,17 @@ class KVStore:
     head_dim: int
     dtype: jnp.dtype
     keys_as_values: bool = False
+    opening: bool = False
+    """Whether the call opened the storage, which then takes no write (`Opening`)."""
 
     @classmethod
-    def open(cls, module: nn.Module, layout: KVCache, rows: int, capacity: int, kv_heads: int,
-             head_dim: int, dtype: jnp.dtype, *, value_dim: int | None = None, keys_as_values: bool = False,
-             places: bool = False, groups: tuple[str, ...] = ()) -> KVStore:
-        """Declare the module's cache variables, allocating them on first use, and return the store.
-
-        Values are `value_dim` wide, None for the keys' `head_dim`, or are the keys themselves where
-        `keys_as_values` and the layout stores keys as given (no rotation), which allocates no storage
-        of their own. `places`
-        also keeps each token's place beside its key (`Append.places`), and
-        `groups` each token's group of the fields it names (`GROUPS`,
-        `Append.groups`), -1 where none has been written. A paged
-        layout raises `ValueError` when `capacity` is not a multiple of
-        `page_size`, or when `rows` does not split into the pool's groups.
-        """
-        once = keys_as_values and layout.key_rotation(head_dim) is None
-        store = cls(module, layout, rows, kv_heads, head_dim, jnp.dtype(dtype), once)
-        layout.key_rotation(head_dim)
-        storage = layout.storage(dtype)
-        if layout.page_size is None:
-            shape = (rows, capacity, kv_heads, head_dim)
-        else:
-            if capacity % layout.page_size:
-                raise ValueError(f"a paged cache of {capacity} slots needs a multiple of "
-                                 f"page_size {layout.page_size}")
-            per_row = capacity // layout.page_size
-            if rows % layout.groups:
-                raise ValueError(f"{rows} rows do not split into the pool's {layout.groups} groups")
-            pages = rows * per_row if layout.pages is None else layout.pages
-            shape = (kv_heads, pages, layout.page_size, head_dim)
-            module.variable("cache", TABLE, default_page_table, rows, per_row, pages, layout.groups)
-        values = (*shape[:-1], head_dim if value_dim is None else value_dim)
-        # A quantized pool's scales head-major, as a paged pool keeps its codes: each key head's run of a
-        # row's slots contiguous, which a kernel reads as a stream beside the codes (`scale_shape`).
-        for (name, scale), stored in zip(store.payloads, (shape, values), strict=False):
-            module.variable("cache", name, jnp.zeros, stored, storage)
-            if layout.quantized is not None:
-                module.variable("cache", scale, jnp.ones, scale_shape(shape, layout), jnp.float32)
-        module.variable("cache", BOUND, jnp.zeros, scale_shape(shape, layout), bound_dtype(storage))
-        # A scale's storage with one head: every key head of a token sits at its place and in its group.
-        held = (*shape[:2], 1) if layout.page_size is None else (1, *shape[1:3])
-        if places:
-            module.variable("cache", PLACES, jnp.zeros, held, jnp.int32)
-        module.variable("cache", DOCUMENTS, jnp.zeros, held, jnp.int32)
-        for name in groups:
-            module.variable("cache", GROUPS[name], jnp.full, held, -1, jnp.int32)
-        return store
+    def open(cls, module: nn.Module, spec: KVSpec) -> KVStore:
+        """Declare the module's storage leaves as `spec` states them (`cache_variables`), opening them
+        where the cache holds none, and return the store."""
+        held = cache_variables(module, spec.leaves())
+        opening = any(isinstance(leaf, Opening) for leaf in held.values())
+        return cls(module, spec.layout, spec.rows, spec.kv_heads, spec.head_dim, jnp.dtype(spec.dtype),
+                   spec.once, opening)
 
     @property
     def payloads(self) -> tuple[tuple[str, str], ...]:
@@ -630,7 +820,8 @@ class KVStore:
         return cache_leaf(self.module, name)
 
     def _put(self, name: str, value: jax.Array | Banked) -> None:
-        self.module.put_variable("cache", name, value)
+        if not self.opening:
+            self.module.put_variable("cache", name, value)
 
     def _write(self, name: str, write) -> None:
         """The leaf `name` rewritten by `write(buffer, layer)`: the layer's own buffer with `layer` None,
@@ -663,6 +854,8 @@ class KVStore:
         stores it, whichever write places it: its leaf's and its scales' names, the keys in the cache's
         rotation, its values in the storage dtype or a quantized cache's codes, and their scales (None
         unquantized)."""
+        for name, incoming in zip(("cached_key", "cached_value"), (key, value), strict=True):
+            written_as(name, self.dtype, incoming.dtype)
         if self.rotation is not None:
             key = rotated(key, self.rotation)
         encoded = []
@@ -1319,18 +1512,15 @@ def _pages_per_block(pages: int) -> int:
 class Append:
     """Stores a call's keys and values, then reads the cache; `open_kv_cache` returns one.
 
-    The allocation-only call (when the cache did not exist yet) stores
-    nothing. The keys it reads back are in the store's rotation, so the query
-    that attends to them must go through `query` first.
+    The keys it reads back are in the store's rotation, so the query that
+    attends to them must go through `query` first.
     """
 
     store: KVStore
     positions: jax.Array
-    allocated: bool
 
     def __call__(self, key: jax.Array, value: jax.Array) -> tuple[jax.Array, jax.Array]:
-        if self.allocated:
-            self.store.write(key, value, self.positions)
+        self.store.write(key, value, self.positions)
         return self.store.read()
 
     def query(self, query: jax.Array) -> jax.Array:
@@ -1348,8 +1538,7 @@ class Append:
         paged pool keeps the places in its pages, which a shared prefix's
         pages then carry.
         """
-        if self.allocated:
-            self.store.write_slots(PLACES, jnp.broadcast_to(places, self.positions.shape), self.positions)
+        self.store.write_slots(PLACES, jnp.broadcast_to(places, self.positions.shape), self.positions)
         return self.store.read_places()
 
     def documents(self, segments: jax.Array | None) -> jax.Array:
@@ -1359,24 +1548,22 @@ class Append:
         its first token continues the row's state (`Coordinates.starts`), the row's first document 1. So a
         later call reads its own document's keys alone (`dew.nn.mixers.attention`), and a call never names
         a document before the row's last: one whose state a recurrent layer no longer holds."""
-        if self.allocated:
-            held = self.store.read_slots(DOCUMENTS)
-            slots = jnp.arange(held.shape[-1])[None, :]
-            first = jnp.min(jnp.where(self.positions >= 0, self.positions, held.shape[-1]), axis=-1,
-                            keepdims=True)
-            last = jnp.max(jnp.where(slots < first, held, 0), axis=-1, keepdims=True)
-            own = jnp.asarray(self.positions >= 0 if segments is None else segments, jnp.int32)
-            numbered = jnp.where(own > 0, jnp.maximum(last, 1) + own - 1, 0)
-            self.store.write_slots(DOCUMENTS, numbered, self.positions)
+        held = self.store.read_slots(DOCUMENTS)
+        slots = jnp.arange(held.shape[-1])[None, :]
+        first = jnp.min(jnp.where(self.positions >= 0, self.positions, held.shape[-1]), axis=-1,
+                        keepdims=True)
+        last = jnp.max(jnp.where(slots < first, held, 0), axis=-1, keepdims=True)
+        own = jnp.asarray(self.positions >= 0 if segments is None else segments, jnp.int32)
+        numbered = jnp.where(own > 0, jnp.maximum(last, 1) + own - 1, 0)
+        self.store.write_slots(DOCUMENTS, numbered, self.positions)
         return self.store.read_slots(DOCUMENTS)
 
     def groups(self, name: str, groups: jax.Array | None) -> jax.Array:
         """Store the call's tokens' groups of field `name` `[rows, tokens]` beside their keys, -1 where it
         carries none, and return every slot's, `[rows, capacity]`: a later call's token reads its block's
         earlier keys by them, and a layer sharing these keys reads them too."""
-        if self.allocated:
-            written = jnp.full(self.positions.shape, -1, jnp.int32) if groups is None else groups
-            self.store.write_slots(GROUPS[name], written, self.positions)
+        written = jnp.full(self.positions.shape, -1, jnp.int32) if groups is None else groups
+        self.store.write_slots(GROUPS[name], written, self.positions)
         return self.store.read_groups(name)
 
 
@@ -1400,21 +1587,20 @@ def gather_cache_rows(cache, rows):
                                      banked=bool(row_axis(path))), cache)
 
 
-def cache_positions(module: nn.Module, batch: int, length: int, valid):
-    """Allocate compact cache slots for real tokens, independently per row.
+def cache_positions(module: nn.Module, batch: int, length: int, valid) -> jax.Array:
+    """Compact cache slots for real tokens, independently per row, `[batch, length]`, -1 for padding; the
+    module's cursor (`cursor`) advances by each row's real tokens.
 
     A row's tokens fill its slots in order, so the cursor alone says which
     hold one (`cached_validity`)."""
     valid = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
     if valid.shape != (batch, length):
         raise ValueError(f"cache validity must be {(batch, length)}, got {valid.shape}")
-    allocated = module.has_variable("cache", "cache_index")
-    index = module.variable("cache", "cache_index", jnp.zeros, (batch,), jnp.int32)
+    index = cache_variables(module, cursor(batch))[CURSOR]
     positions = index.value[:, None] + prefix_sum(valid, dtype=jnp.int32) - 1
     positions = jnp.where(valid, positions, -1)
-    if allocated:
-        index.value = index.value + jnp.sum(valid, axis=1, dtype=jnp.int32)
-    return positions, allocated
+    kept(index, index.value + jnp.sum(valid, axis=1, dtype=jnp.int32), CURSOR)
+    return positions
 
 
 def mixed_positions(index: jax.Array, admitted: Admitted, valid) -> jax.Array:
@@ -1442,9 +1628,13 @@ def mixed_counts(index: jax.Array, admitted: Admitted, positions: jax.Array) -> 
 
 class DecodeCursor(nn.Module):
     """A decoder's own count of each row's real tokens, the logical cursor a model-level reader
-    takes a cached call's places from (`cache_positions`): allocation-aware, so the call that
-    allocates the cache counts none, and kept whatever mixer a layer runs, a recurrent one that
-    keeps no cursor of its own included."""
+    takes a cached call's places from (`cache_positions`), kept whatever mixer a layer runs, a
+    recurrent one that keeps no cursor of its own included."""
+
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """The cursor's leaf for `rows` rows (`cursor`)."""
+        return cursor(rows)
 
     @nn.compact
     def __call__(self, valid, admitted: Admitted | None = None) -> jax.Array:
@@ -1454,10 +1644,11 @@ class DecodeCursor(nn.Module):
         (`mixed_positions`, `mixed_counts`)."""
         if admitted is None:
             batch, length = valid.shape
-            return cache_positions(self, batch, length, valid)[0]
-        index = self.variable("cache", "cache_index", jnp.zeros, (0,), jnp.int32)
+            return cache_positions(self, batch, length, valid)
+        # A mixed call continues the rows its server opened, the cursor among them.
+        index = self.variable("cache", CURSOR)
         positions = mixed_positions(index.value, admitted, valid)
-        index.value = mixed_counts(index.value, admitted, positions)
+        kept(index, mixed_counts(index.value, admitted, positions), CURSOR)
         return positions
 
 
@@ -1469,42 +1660,33 @@ def cached_validity(module: nn.Module, length: int) -> jax.Array:
     decode step writes no `[rows, capacity]` copy of it a layer: 28 kernels
     a step on Qwen3-0.6B, 0.6% of a 32-slot serving step on an RTX 4080
     (docs/performance.md)."""
-    return filled_slots(module.get_variable("cache", "cache_index"), length)
+    return filled_slots(module.get_variable("cache", CURSOR), length)
 
 
-_DEFAULT_LAYOUT = KVCache()
 
+def open_kv_cache(module: nn.Module, spec: KVSpec, key: jax.Array | jax.ShapeDtypeStruct, *,
+                  valid=None) -> tuple[jax.Array, Append]:
+    """Fixed-size K/V with a cursor and cached validity for each batch row, stored as the module states
+    it (`spec`), opened where the cache holds none.
 
-def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = _DEFAULT_LAYOUT,
-                  value_dim: int | None = None, keys_as_values: bool = False, places: bool = False,
-                  groups: tuple[str, ...] = ()):
-    """Fixed-size K/V with a cursor and cached validity for each batch row.
-
-    Returns [B, S] compact slot positions and a writer. Invalid tokens have
-    position -1 and do not advance the cursor. The allocation-only call leaves
-    every row empty. The writer returns full cache arrays, including unused
-    slots which the caller excludes with `cached_validity`. `layout` chooses the
-    storage behind the slots, dense or paged, full or quantized
-    (`dew.nn.kv_cache`); the slots and the cursor are the same for all. Values
-    are `value_dim` wide, None for the keys' width, or the keys themselves
-    where `keys_as_values` (`KVStore`). `places` also keeps each
-    token's place beside its key (`dew.nn.kv_cache.Append.places`), and
-    `groups` its groups of the fields named (`Append.groups`).
+    Returns [B, S] compact slot positions of `key` `[B, S, ...]`'s tokens and a writer. Invalid tokens
+    have position -1 and do not advance the cursor; a call that opens the cache writes nothing to it
+    (`Opening`). The writer returns full cache arrays, including
+    unused slots which the caller excludes with `cached_validity`. `spec.layout` chooses the storage
+    behind the slots, dense or paged, full or quantized (`dew.nn.kv_cache`); the slots and the cursor are
+    the same for all.
     """
     shards = sequence_shards()
     if shards > 1:
         raise LayoutRefused(
             f"decoding is not supported under a sequence axis of {shards}: the KV "
             "cache holds whole sequences. Generate on a mesh with sequence=1.")
-    if max_seq_len is None:
-        raise ValueError("decoding needs max_seq_len for its fixed-capacity cache")
-    batch, length, heads, head_dim = key.shape
-    if valid is None and length > max_seq_len:
-        raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
-    store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype, value_dim=value_dim,
-                         keys_as_values=keys_as_values, places=places, groups=groups)
-    positions, allocated = cache_positions(module, batch, length, valid)
-    return positions, Append(store, positions, allocated)
+    batch, length = key.shape[:2]
+    if valid is None and spec.capacity is not None and length > spec.capacity:
+        raise ValueError(f"{length} tokens do not fit a KV cache of {spec.capacity}.")
+    store = KVStore.open(module, spec)
+    positions = cache_positions(module, batch, length, valid)
+    return positions, Append(store, positions)
 
 
-__all__ = ["Append", "Banked", "KVCache", "KVStore"]
+__all__ = ["Append", "Banked", "CacheSpec", "HoldsCache", "KVCache", "KVSpec", "KVStore", "Opened", "Opening"]
