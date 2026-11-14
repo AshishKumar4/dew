@@ -64,6 +64,45 @@ def precision() -> ModelConfig:
     return dataclasses.replace(model, fields={**model.fields, "dtype": "float32", "attention_impl": "xla"})
 
 
+def test_a_resumed_pipeline_run_reads_none_of_the_pipelines_weights(pipelines, tmp_path, monkeypatch):
+    """A run that fine-tunes a published pipeline and resumes from its own checkpoint reads the pipeline's
+    weights' shapes alone, which its restore fills (docs/design/training.md, resume; row 6148): no tensor
+    of the pipeline's files is read (`safetensors_io.read_file`, which every read of their bytes goes
+    through), and it trains on from the step its checkpoint holds."""
+    from run_kinds import pictures, read
+
+    from dew.data import images as image_steps, presets
+    from dew.interop import safetensors_io, sources
+    from dew.training import MeshSpec
+
+    train, _ = pictures()
+    config = DiffusionRunConfig(
+        pretrained=str(pipelines / "sd3" / "pipeline"), preset=None, model=precision(),
+        data=read(train.pipe(presets.images, 16, batch=8, caption=image_steps.caption())), val_metrics=(),
+        objective=ObjectiveConfig("diffusion", {"solver": Euler(), "guidance": None, "steps": 2,
+                                                "unconditional_prob": 0.0, "ema_decay": None}))
+
+    def trained(steps: int):
+        # Named in its config, as the command line names it, so its build knows the run it resumes.
+        trainer = TrainerConfig(name="resumed", checkpoint_dir=str(tmp_path / "runs"), steps=steps,
+                                log_every=1, eval_every=None, checkpoint_every=None, multi_host=False,
+                                mesh=MeshSpec())
+        return dataclasses.replace(config, trainer=trainer).prepare().train("resumed")
+
+    first = trained(1)
+    assert int(first.step) == 1
+    read = []
+
+    def refused(path, *args, **kwargs):
+        read.append(str(path))
+        raise AssertionError(f"a resumed run read {path}'s tensors")
+
+    for module in (safetensors_io, sources):
+        monkeypatch.setattr(module, "read_file", refused)
+    resumed = trained(2)
+    assert read == [] and int(resumed.step) == 2
+
+
 def test_a_shape_only_pipeline_load_retains_geometry_without_eager_native_copies(pipelines, tmp_path,
                                                                                monkeypatch):
     """A shape-only load preserves every component's parameter geometry and storage dtype.
