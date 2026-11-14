@@ -1075,6 +1075,10 @@ class _Program[T: (Tiles, BackwardTiles)]:
     parts: int = 1
     """The bf16 parts each of an fp32 call's tiles is staged in, one above the other (`MosaicForward.parts`):
     its products their parts' (`parted`)."""
+    ahead: tuple[str, ...] = ()
+    """The streams its walks read a step ahead (`mosaic.Family.walk`'s `ahead`): a forward's keys, where it
+    issues each key tile's logits a step before its softmax reads them (`attention_mosaic_forward
+    .logits_ahead`, row 5368)."""
 
     def parted(self, tile, rows: int):
         """`tile` as the parts its products take (`operands.Parts`, each `rows` rows of it, an fp32 tile's),

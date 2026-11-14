@@ -46,14 +46,20 @@ def _unrolled(steps: int) -> int:
     return next(unrolled for unrolled in (UNROLLED, 4, 2, 1) if steps % unrolled == 0)
 
 
-def lanes(parts) -> int:
-    """The channels a program of a conv of `parts` (`(width, head)` each) takes, a vector of `lanes //
-    THREADS` a thread: the widest of 8, 4, 2 and 1 channels a thread (a 128-bit transfer of 16-bit
-    channels at 8) every piece's width holds whole, a normalised piece's head summed in at most a warp's
-    threads (`scan.grouped_summed`) or across the warpgroup at one a thread (`scan.summed`). A channel a
-    thread, each transfer a warp's 64 bytes, a GH200's conv training step took 1.07 ms against the Triton
-    conv's 0.77 (M-JS-20)."""
-    for vector in (8, 4, 2, 1):
+def lanes(parts, dtype) -> int:
+    """The channels a program of a conv of `parts` (`(width, head)` each) of `dtype` takes, a vector of
+    `lanes // THREADS` a thread: the narrowest whose warp's transfer fills an L1 line (`scan.LINE`: two
+    16-bit channels, one fp32), the most programs a conv's channels give whose warps still read whole lines,
+    then the wider ones, then the narrower; the first every piece's width holds whole, a normalised piece's
+    head summed in at most a warp's threads (`scan.grouped_summed`) or across the warpgroup at one a thread
+    (`scan.summed`), so a normalised 16-bit head of 128 channels takes four a thread. On Qwen3.5-27B's
+    conv, one unnormalised piece of 10,240 channels, two 16-bit channels a thread took an A100 0.1395 ms
+    forward and 0.6317 backward, a GH200 0.0655 and 0.2396, against eight's (a 128-bit transfer) 0.1688
+    and 0.6766, 0.0958 and 0.2950, four's between (M-JS-104, its probe at 13f3a3a27b5); one 16-bit channel
+    a thread, half a line a warp, a GH200's conv training step took 1.07 ms against the Triton conv's 0.77
+    (M-JS-20)."""
+    filling = max(1, scan.LINE // (scan.WARP * jnp.dtype(dtype).itemsize))
+    for vector in sorted((8, 4, 2, 1), key=lambda vector: (vector < filling, abs(vector - filling))):
         span = scan.THREADS * vector
         if all(width % span == 0 and (head is None or vector == 1 or head // vector <= scan.WARP)
                for width, head in parts):
@@ -173,7 +179,7 @@ def forward(x, taps, bias, valid, documents, *, parts: tuple, activation: bool, 
     Mosaic calls to one's four, jsf-r06p). A launch a piece, a decode token's conv took three, 10.1 us on an
     H100 against the Triton conv's one at 4.8 (M-JS-25)."""
     rows, length, _ = x.shape
-    count, tokens, lanes_ = taps.shape[1], _tokens(length), lanes(parts)
+    count, tokens, lanes_ = taps.shape[1], _tokens(length), lanes(parts, x.dtype)
     unrolled = _unrolled(tokens)
     operands = [x, taps.T, bias, valid, documents]
     bounds = [(first // lanes_, (first + width) // lanes_, first, head)
@@ -227,7 +233,7 @@ def backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation: 
     its piece's input gradient apart, which XLA joined: 0.66 of an A100's 2.65 ms conv training step at
     Qwen3.5-0.8B's widths (M-JS-18)."""
     rows, length, channels = x.shape
-    count, tokens, lanes_ = taps.shape[1], _tokens(length), lanes(parts)
+    count, tokens, lanes_ = taps.shape[1], _tokens(length), lanes(parts, x.dtype)
     blocks = pl.cdiv(length, tokens)
     operands = [x, taps.T, bias, valid, documents]
     bounds = [(first // lanes_, (first + width) // lanes_, first, head)

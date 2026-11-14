@@ -16,7 +16,7 @@ one process (`gpu_flow`), each cell its own file's property:
   (test_mosaic_toolkit).
 - The shared GEMM mainloop runs on Blackwell's tcgen05, exactly, on a B200 or a B300, sm100 and sm103 alike,
   and its epilogues (a column bias, a per-row scale, two outputs of two dtypes) hold check 1 at each
-  accumulator width and on a two-CTA pair (test_gemm_tcgen05).
+  accumulator width and on a two-CTA pair, the pair also on extents no tile divides (test_gemm_tcgen05).
 - The NVFP4 product's packed kernel (its mainloop decoding each stage in place) holds every order on an
   H100 and an A100 (test_contracts_gemm).
 - A grouped product whose producer gathers its rows from the tokens by a table (cp.async, row 1376) holds
@@ -222,6 +222,10 @@ def test_the_gemm_kernels_run_on_this_gpu():
                                 "k_major": k_major})
           for name, dtype in (("float32", jnp.float32), ("bfloat16", jnp.bfloat16))
           for k_major in (False, True)),
+        *(Cell(f"a pair's partial extents hold check 1: {rows}x{depth}x{width}{' transposed' * transposed}",
+               functools.partial(gemm_tcgen05.a_pairs_partial_extents_hold_check_1_on_blackwell, rows, depth,
+                                 width, transposed), "sm100", native={"launch": "tcgen05 pair partial"})
+          for rows, depth, width, transposed in gemm_tcgen05.PARTIALS),
         *(Cell(f"the NVFP4 product's packed kernel holds every order: {name} {edge}",
                functools.partial(contracts_gemm.test_an_nvfp4_products_kernels_hold_every_order, edge,
                                  "packed"), name,

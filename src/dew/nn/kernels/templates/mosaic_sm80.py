@@ -546,7 +546,6 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               ahead: Callable | None = None, settled: tuple[int, ...] = (),
                prefetched: Callable | None = None, registers: int | None = None,
                producer: int | None = None, shared: int | None = None,
                moves: bool | None = None) -> Callable:
@@ -555,8 +554,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         # Its programs read a table from global memory as any operand, and no producer runs beside them.
         del reducing_warpgroups, scalars, producer, moves  # one warpgroup: no roles to move registers between
         _one(consumers, clustered=cluster > 1)
-        built = launches.kernel(bodies.dependent(entry, interpret, ahead=ahead, settled=settled,
-                                                 prefetched=prefetched),
+        built = launches.kernel(bodies.dependent(entry, interpret, prefetched=prefetched),
                                 name=name or self.name,
                                 out_type=out_type, grid=grid, grid_names=grid_names,
                                 compiler_params=plgpu.CompilerParams(approx_math=approx_math,
@@ -567,8 +565,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                                                  else resources.register_model(self, consumers, registers,
                                                                                shared=shared))),
                                 cost_estimate=cost)
-        return mosaic.checked(built, name or self.name, resident, model_flops,
-                              settled if bodies.waits(interpret) else ())
+        return mosaic.checked(built, name or self.name, resident, model_flops)
 
     def program_scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
@@ -604,8 +601,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
-                unrolled: bool = False, accumulators: tuple = (), producer: int | None = None) -> None:
+                unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
+                pingpong: bool = False) -> None:
         del producer  # no producer role of its own
+        self.pingponged(pingpong)
         # Each tile's pipeline fills and drains before its output copy. Synchronize at that lifetime
         # boundary so the output's shared memory can reuse the pipeline's slots.
         del in_flight, unrolled, accumulators  # its walk carries its accumulators
@@ -639,9 +638,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
         # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
-        # each stage back as its step ends, so no step holds one past it.
+        # each stage back as its step ends, so no step holds one past it, nor reads one ahead.
+        if ahead:
+            raise NotImplementedError(f"{self.name}'s pipeline reads no stream ahead")
         del first, in_flight, unrolled
         blocks = streams.pipeline.blocks
         names = tuple(blocks)
@@ -659,9 +660,12 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 slots = mosaic.WholeSlots(dict(zip(names, refs[:-1], strict=True)))
                 return step(index + lo, slots, carried, accumulators)
 
-            # A tile's blocks staged swizzled for ldmatrix (`_staging`).
+            # A tile's blocks staged swizzled for ldmatrix (`_staging`), each read inside its operand: its
+            # launch extends every operand its rows read past (`bounded_loads`, `mosaic_gpu._walked_rows`),
+            # so cp.async's copies are promised in bounds, unchecked.
             specs = [plgpu.BlockSpec(blocks[name][0], functools.partial(_at, streams.views[name][1], lo),
-                                     transforms=_staging(blocks[name], streams.pipeline.swizzles.get(name)))
+                                     transforms=_staging(blocks[name], streams.pipeline.swizzles.get(name)),
+                                     oob_fill_mode=plgpu.OOBFillMode.PROMISE_IN_BOUNDS)
                      for name in names]
             pipeline = plgpu.emit_pipeline(body, grid=(hi - lo,), in_specs=specs,
                                            max_concurrent_steps=streams.pipeline.stages, init_carry=carry)
