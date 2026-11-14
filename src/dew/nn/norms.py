@@ -407,7 +407,8 @@ class _Shifted(nn.LayerNorm):
         if self.axis_name is not None:
             shift = jax.lax.pmean(shift, self.axis_name, axis_index_groups=self.axis_index_groups)
         normed = super().__call__(x.astype(wide) - jax.lax.stop_gradient(shift), mask=mask)
-        held = [self.get_variable("params", name) for name in ("scale", "bias")
+        # The parameters' values, out of the partitioning box a norm declaring its axes stores them in.
+        held = [nn.unbox(self.get_variable("params", name)) for name in ("scale", "bias")
                 if self.has_variable("params", name)]
         return normed.astype(canonicalize_dtype(x, *held, dtype=self.dtype))
 
