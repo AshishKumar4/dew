@@ -514,13 +514,13 @@ def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 2]
 
 
-def test_a_row_green_on_a_tree_is_reused_there_after_another_tree_ran_it_executing_another_set(
+def test_a_row_another_tree_ran_last_executing_another_set_runs_again_on_its_own_tree(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A row run green on a tree is reused when that tree is planned again, though a run of another tree came
-    after it and executed another set of inputs (a helper its test called there): the row's list keeps each
-    green run's executed set, and the plan keys this tree's inputs with its own set (2026-11-12: keyed with
-    the last run's set alone, train 781's CI kept 2 of 4,180 tasks, and a reach of a comment's change planned
-    7,161 rows)."""
+    """A row run green on a tree, then on another tree whose run executed another set of inputs (a helper its
+    test called there), runs again when the first tree is planned again: a lookup keys these inputs with the
+    last run's set alone, and the walk over a row's earlier sets that found the first tree's behind it is gone
+    (Main, 2026-11-14: it kept at most 93 rows of about 33,000 in ten trains and read about 39,000 records a
+    plan). Its other rows, which no other run re-recorded, are reused."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     armada_task(ci, monkeypatch, verdict)
     test_a = tmp_path / "tests/test_a.py"
@@ -533,18 +533,19 @@ def test_a_row_green_on_a_tree_is_reused_there_after_another_tree_ran_it_executi
     armada_task(ci, monkeypatch, verdict)
     helper.unlink()
     test_a.write_text(main)
-    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
     rows = armada_task(ci, monkeypatch, verdict)
     assert sorted((row["name"], row["exitCode"]) for row in rows) == [
         (f"3.12:tests/test_{name}.py", 0) for name in "abc"]
-    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [2, 1, 1]
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [3, 1, 1]
 
 
-def test_two_trees_alternating_each_reuse_their_rows_and_a_changed_unit_of_a_set_runs_its_row(
+def test_of_two_trees_the_one_that_ran_a_row_last_reuses_it_and_a_changed_unit_of_its_set_runs_it(
         ci, tmp_path, monkeypatch, cache_worker):
-    """Two trees whose runs of a row execute different sets, planned in turn, each reuse their own green rows
-    (main's and base's, a train's and a lane's); a unit of a recorded set changed in the tree runs the row
-    again: a set is a hit only where every input it names holds what it held."""
+    """Two trees whose runs of a row execute different sets, planned in turn: the tree that ran it last reuses
+    its row, the other runs it (no earlier set is looked up: Main, 2026-11-14), and a unit of the recorded set
+    changed in the tree runs the row again: a set is a hit only where every input it names holds what it
+    held."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     test_a = tmp_path / "tests/test_a.py"
     plain = test_a.read_text()
@@ -565,7 +566,8 @@ def test_two_trees_alternating_each_reuse_their_rows_and_a_changed_unit_of_a_set
         armada_task(ci, monkeypatch, verdict)
     for other in (False, True, False, True):
         tree(other=other)
-        assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"], other
+        assert planned() == (["tests/test_a.py tests/test_b.py tests/test_c.py"] if other
+                             else ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]), other
     # The other tree's helper changed in the unit test_a ran: its row runs, the rest reused.
     tree(other=True, body="def value():\n    return 2 - 1\n")
     assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
