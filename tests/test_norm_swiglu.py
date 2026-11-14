@@ -4,17 +4,12 @@ interpreted on a CPU: off a GPU the selectors take XLA's arithmetic, a kernel na
 Every operand gradient is checked, including the fp32 weight's column sum
 and Liger's fp32-intermediate VJP contract. Ragged tiles and enough rows to make
 each norm program accumulate multiple blocks exercise the masked paths.
-The fp32 activation/input-gradient fixtures retain a 1e-5 relative bound
-from XLA. Every output, including dscale, keeps the project's 2x-XLA RMS
-budget against the unrounded float64 function. A separate dscale check
-isolates accumulation: float64 sums dy times the identical rounded forward
-coefficient. Dew must be at least as close to that exact sum as XLA plus
-one final output rounding; at 24,576 rows it must also stay within 2 ulp.
-This does not reward XLA's lucky cancellation of coefficient-rounding
-error. The bf16 VJPs keep wider intermediates than XLA's autodiff,
-so their contract is distance from float64, not bitwise XLA agreement.
-Forwards retain each model's cast sites. Small-shape c53 fixtures also hold
-the fused VJPs to Liger's measured float64 distances.
+Every output and gradient, the weight's column sum among them, is held by
+check 1 against XLA's from the float64 function over its site's draws; a
+step of 24,576 repeated rows holds the column sum's accumulation alone. The
+bf16 VJPs keep wider intermediates than XLA's autodiff, so their contract is
+distance from float64, not bitwise XLA agreement. Forwards retain each
+model's cast sites.
 """
 
 import functools
@@ -24,7 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh
-from reference_error import assert_as_exact, distance, equations, with_gradients
+from reference_error import as_given, assert_as_exact, equations, with_gradients
 from tuned import each_config
 
 from dew.nn import attention, norms
@@ -35,21 +30,10 @@ from dew.nn.norms import RMSNorm, gated_rms_normalized, rms_normalized, stream_r
 pytestmark = pytest.mark.kernel
 
 
-def relative(got, want):
-    want = np.asarray(want, np.float64)
-    return np.max(np.abs(np.asarray(got, np.float64) - want)) / max(np.max(np.abs(want)), 1.0)
-
-
 def evaluated(function, operands, seed):
     """`function`'s output and its operands' gradients under the cotangent `seed`, pulled back through
     the gate (`reference_error.with_gradients`)."""
     return with_gradients(function)(*operands, seed)
-
-
-def scale_coefficient(x, dtype, after_cast: bool):
-    """The fused forward's normalized coefficient, before its optional weight."""
-    output = dtype if after_cast else jnp.float32
-    return fused_seam(1e-5, output, offset=False, after_cast=False)(x, None, None)[1]
 
 
 def fused_seam(epsilon: float, dtype, offset: bool, after_cast: bool, *, axes=None):
@@ -106,24 +90,6 @@ def fused_packed(*, axes=None):
         gate_up, packed_gated_product("swiglu", implementation="xla"), axes=axes)
 
 
-def assert_scale_accumulation(mine, reference, coefficient, seed):
-    """Float64 exact sum of identical rounded factors, not the unrounded RMS function."""
-    terms = np.asarray(coefficient, np.float64) * np.asarray(seed, np.float64)
-    exact_sum = np.sum(terms.reshape(-1, terms.shape[-1]), axis=0, dtype=np.float64)
-    rounded = jnp.asarray(exact_sum, mine.dtype)
-    above = np.asarray(jnp.nextafter(rounded, jnp.full_like(rounded, jnp.inf)), np.float64)
-    below = np.asarray(jnp.nextafter(rounded, jnp.full_like(rounded, -jnp.inf)), np.float64)
-    nearest = np.asarray(rounded, np.float64)
-    ulp = np.maximum(above - nearest, nearest - below)
-    final_rounding = float(np.sqrt(np.mean(np.square(0.5 * ulp))))
-    actual_error, reference_error = distance(mine, exact_sum), distance(reference, exact_sum)
-    detail = (f"dscale accumulation: dew={actual_error:.12g}, xla={reference_error:.12g}, "
-              f"final rounding={final_rounding:.12g}, rows={terms.size // terms.shape[-1]}")
-    assert actual_error <= reference_error + final_rounding, detail
-    if terms.size // terms.shape[-1] >= 24576:
-        assert np.all(np.abs(np.asarray(mine, np.float64) - exact_sum) <= 2 * ulp), detail
-
-
 def traced(fn, *args):
     """The equations of `fn`'s traced program, its sub-programs' in turn."""
     return list(equations(jax.make_jaxpr(fn)(*args)))
@@ -134,7 +100,8 @@ SEEDS = {(2, 3, 31): 32, (3, 257, 17): 32, (2, 3, 1000): 32, (4099, 256): 8, (24
          "unweighted, one value": 512,
          "step of distinct rows": 8, (5, 1000): 32, (2, 3, 4, 31): 64, (2, 64, 16, 128): 8,
          (2, 1, 16, 128): 32, (7, 1000): 32, (3, 4096): 32, (5, 37): 32, (24576, 1000): 8, (2, 31): 32,
-         "composed": 32, "gates": 8, (25, 9000): 8}
+         "composed": 32, "gates": 8, (25, 9000): 8, "module": 8, "per shard": 8, "c53 rms_norm": 8,
+         "c53 swiglu": 8}
 """Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
 XLA compared with itself resolves the factor in every output and gradient (on armada)."""
 
@@ -151,16 +118,14 @@ def assert_drawn_as_exact(fused, xla, exact, draw, leaves, label, seeds):
                     draw, label, seeds=seeds, truth_fn=truth)
 
 
-def compare(functions, draw, labels, seeds, *, coefficient=None, judged=None):
-    """Every output's dtype and accumulation on `draw`'s first operands (`gated`); the accuracy of the
-    `judged` labels (every one by default) held by check 1 over `draw`'s `seeds`
-    (`assert_drawn_as_exact`). `coefficient` of the first operands, where the weight gradient's
-    accumulation is held."""
+def compare(functions, draw, labels, seeds, *, judged=None):
+    """Every output's dtype on `draw`'s first operands (`gated`); the accuracy of the `judged` labels (every
+    one by default) held by check 1 over `draw`'s `seeds` (`assert_drawn_as_exact`)."""
     xla, pallas, exact = functions
     operands, seed = draw(0)
     reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
     actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
-    gated(labels, actual, reference, seed, coefficient and coefficient(operands))
+    gated(labels, actual, reference)
 
     def leaves(result):
         return {label: value for label, value in zip(labels, result, strict=True)
@@ -169,19 +134,13 @@ def compare(functions, draw, labels, seeds, *, coefficient=None, judged=None):
     assert_drawn_as_exact(pallas, xla, exact, draw, leaves, " ".join(judged or labels), seeds)
 
 
-def gated(labels, actual, reference, seed, coefficient):
-    """Every output and gradient's dtype and the weight gradient's accumulation (its accuracy is check
-    1's)."""
+def gated(labels, actual, reference):
+    """Every output and gradient's dtype, XLA's (its accuracy is check 1's)."""
     for label, mine, theirs in zip(labels, actual, reference, strict=True):
         if mine is None:
             assert theirs is None
             continue
         assert mine.dtype == theirs.dtype, label
-        if label == "scale":
-            assert coefficient is not None
-            assert_scale_accumulation(mine, theirs, coefficient, seed)
-        elif mine.dtype == jnp.float32 and reference[0].dtype == jnp.float32:
-            assert relative(mine, theirs) < 1e-5, label
 
 
 def norm_functions(dtype, offset, after_cast):
@@ -235,13 +194,9 @@ def test_a_wide_rows_norm_walks_its_columns_and_holds_the_float64_gate(dtype, st
     def without_branch(function):
         return function if streamed else lambda x, scale: function(x, None, scale)
 
-    def coefficient(operands):
-        x = operands[0] if not streamed else (operands[0] + operands[1])
-        return scale_coefficient(x, dtype, after_cast=False)
-
     compare((without_branch(functools.partial(xla, dtype)), without_branch(lambda x, b, s: seam(x, b, s)[1]),
              without_branch(functools.partial(xla, jnp.float64))),
-            draw, labels, SEEDS[(25, 9000)], coefficient=coefficient)
+            draw, labels, SEEDS[(25, 9000)])
 
 
 def test_an_activation_after_the_norm_is_the_kernels_where_it_maps_each_element_alone():
@@ -377,7 +332,7 @@ def test_a_norms_activation_and_every_gradient_hold_the_float64_gate(dtype, afte
 def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast):
     compare(norm_functions(dtype, offset, after_cast),
             lambda draw: norm_operands((2, 3, 31), dtype, scale_dtype, draw), ("y", "x", "scale"),
-            SEEDS[(2, 3, 31)], coefficient=lambda operands: scale_coefficient(operands[0], dtype, after_cast))
+            SEEDS[(2, 3, 31)])
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
@@ -414,8 +369,7 @@ def test_a_weight_folded_into_the_inverse_associates_as_flax_and_takes_every_gra
                                   np.asarray(expected, np.float32))
     compare((functools.partial(xla, dtype), fused, functools.partial(xla, jnp.float64)),
             lambda draw: norm_operands((2, 3, 31), dtype, scale_dtype, draw), ("y", "x", "scale"),
-            SEEDS[(2, 3, 31)],
-            coefficient=lambda operands: scale_coefficient(operands[0], dtype, after_cast=False))
+            SEEDS[(2, 3, 31)])
     with pytest.raises(ValueError):
         rms_normalized(x, scale, 1e-5, dtype, scale_offset=offset, scale_after_cast=True,
                        fp32_statistics=True, weight_first=True)
@@ -479,8 +433,7 @@ def test_the_fused_unweighted_norms_fp16_gradient_meets_fp16s_edge_where_xlas_do
 @pytest.mark.parametrize("shape", [(7, 1000), (3, 4096), (3, 257, 17)])
 def test_rms_ragged_widths_and_many_rows(dtype, shape):
     compare(norm_functions(dtype, offset=True, after_cast=True),
-            lambda draw: norm_operands(shape, dtype, jnp.float32, draw), ("y", "x", "scale"), SEEDS[shape],
-            coefficient=lambda operands: scale_coefficient(operands[0], dtype, after_cast=True))
+            lambda draw: norm_operands(shape, dtype, jnp.float32, draw), ("y", "x", "scale"), SEEDS[shape])
 
 
 @pytest.mark.parametrize("rows", ["repeated", "distinct"])
@@ -495,15 +448,12 @@ def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype, rows):
     (row 4458, NS4458-1)."""
     functions = norm_functions(dtype, offset=True, after_cast=True)
 
-    def coefficient(operands):
-        return scale_coefficient(operands[0], dtype, after_cast=True)
-
     if rows == "repeated":
         compare(functions, lambda draw: full_step(dtype, draw), ("y", "x", "scale"), SEEDS[(24576, 1000)],
-                coefficient=coefficient, judged=("scale",))
+                judged=("scale",))
     else:
         compare(functions, functools.partial(norm_operands, (8192, 1000), dtype, jnp.float32),
-                ("y", "x", "scale"), SEEDS["step of distinct rows"], coefficient=coefficient)
+                ("y", "x", "scale"), SEEDS["step of distinct rows"])
 
 
 def test_a_weight_gradient_past_fp32s_range_is_an_infinity_as_xlas():
@@ -537,7 +487,7 @@ def swiglu_operands(shape, dtype, draw: int = 0):
     return (gate, up), seed
 
 
-def each_config_holds(kernel, functions, draw, labels, seeds, coefficient=None):
+def each_config_holds(kernel, functions, draw, labels, seeds):
     """Each config the tuner may pick for `kernel` (`each_config` on `draw`'s first operands): the fused
     function, traced under it, held as `compare` holds it."""
     operands, seed = draw(0)
@@ -546,7 +496,7 @@ def each_config_holds(kernel, functions, draw, labels, seeds, coefficient=None):
     for config in configs:
         try:
             with tuning.pinned({kernel: config}):
-                compare(functions, draw, labels, seeds, coefficient=coefficient)
+                compare(functions, draw, labels, seeds)
         except AssertionError as error:
             error.add_note(f"{kernel.__name__} at {config}")
             raise
@@ -563,8 +513,7 @@ def every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, opera
                    "narrow rows": (functools.partial(norm_operands, (4099, 256), dtype, jnp.float32),
                                    (4099, 256))}[operands]
     each_config_holds(kernel, norm_functions(dtype, offset=True, after_cast=True), draw,
-                      ("y", "x", "scale"), SEEDS[shape],
-                      coefficient=lambda operands: scale_coefficient(operands[0], dtype, after_cast=True))
+                      ("y", "x", "scale"), SEEDS[shape])
 
 
 def every_config_of_the_swiglu_kernels_holds_the_float64_gate(kernel, dtype):
@@ -581,8 +530,7 @@ def test_random_bf16_gradients_keep_fp32_intermediates_near_float64():
     intermediate roundings."""
     compare(norm_functions(jnp.bfloat16, offset=True, after_cast=True),
             functools.partial(norm_operands, (24576, 17), jnp.bfloat16, jnp.float32), ("y", "x", "scale"),
-            SEEDS[(24576, 17)],
-            coefficient=lambda operands: scale_coefficient(operands[0], jnp.bfloat16, after_cast=True))
+            SEEDS[(24576, 17)])
 
 
 @pytest.mark.parametrize("input_dtype,output_dtype", [(jnp.bfloat16, jnp.float32),
@@ -594,8 +542,7 @@ def test_rms_output_dtype_is_independent_of_input(input_dtype, output_dtype, aft
         return operands, seed.astype(output_dtype)
 
     compare(norm_functions(output_dtype, offset=False, after_cast=after_cast), draw, ("y", "x", "scale"),
-            SEEDS[(5, 37)],
-            coefficient=lambda operands: scale_coefficient(operands[0], output_dtype, after_cast))
+            SEEDS[(5, 37)])
 
 
 def stream_seam(dtype, joined: bool, *, fused: bool = False):
@@ -612,9 +559,8 @@ def stream_seam(dtype, joined: bool, *, fused: bool = False):
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("shape", [(2, 3, 31), (3, 257, 17), (5, 1000)])
 def test_stream_seam_takes_the_add_and_the_stream_cotangent(joined, dtype, shape):
-    """The kernel's sum is XLA's to the bit, and the weight's gradient accumulates as it should, on the
-    first draw; the norm and every gradient, the stream's cotangent folded into dx, hold check 1 over
-    the shape's seeds."""
+    """The kernel's sum is XLA's to the bit on the first draw; the norm and every gradient, the stream's
+    cotangent folded into dx, hold check 1 over the shape's seeds."""
     def draw(seed):
         keys = jax.random.split(jax.random.fold_in(jax.random.key(23), seed), 5)
         x, dy, branch, ds = (jax.random.normal(keys[index], shape).astype(dtype) for index in (0, 2, 3, 4))
@@ -633,8 +579,6 @@ def test_stream_seam_takes_the_add_and_the_stream_cotangent(joined, dtype, shape
     if not joined:
         assert not np.any(np.asarray(gradients[1])) and not np.any(np.asarray(reference_gradients[1]))
     assert [gradient.dtype for gradient in gradients] == [gradient.dtype for gradient in reference_gradients]
-    assert_scale_accumulation(gradients[2], reference_gradients[2],
-                              scale_coefficient(stream, dtype, after_cast=True), seed[1])
     assert_drawn_as_exact(fused, stream_seam(dtype, joined), stream_seam(jnp.float64, joined), draw, leaves,
                           "stream seam", SEEDS[shape])
 
@@ -722,21 +666,23 @@ def test_a_packed_projections_swiglu_is_the_apart_one_read_in_place(fused, dtype
 @pytest.mark.parametrize("offset,after_cast,with_scale", [(False, True, True), (True, False, True),
                                                          (False, True, False)])
 def test_rms_module_uses_the_same_fused_vjp(offset, after_cast, with_scale):
-    """The module naming the fused norm: its values and gradients are XLA's within 1e-5: the kernel's on a
-    GPU, and on a CPU, where the selector takes XLA's arithmetic, XLA's own."""
-    x = jax.random.normal(jax.random.key(4), (2, 5, 31))
+    """The module naming the fused norm: its values and gradients on par with XLA's module from float64
+    (check 1, the XLA module on the inputs widened its truth): the kernel's on a GPU, and on a CPU, where
+    the selector takes XLA's arithmetic, XLA's own."""
     module = RMSNorm(scale_offset=offset, scale_after_cast=after_cast, with_scale=with_scale,
                      implementation="pallas")
-    params = module.init(jax.random.key(5), x)
     portable = module.clone(implementation="xla")
 
-    def differentiated(module):
-        return jax.value_and_grad(lambda p, x: jnp.sum(module.apply(p, x)), argnums=(0, 1))
+    def draw(seed):
+        x = jax.random.normal(drawn_key(4, seed), (2, 5, 31))
+        return module.init(drawn_key(5, seed), x), x, jax.random.normal(drawn_key(6, seed), x.shape)
 
-    mine = jax.jit(differentiated(module))(params, x)
-    theirs = jax.jit(differentiated(portable))(params, x)
-    for actual, expected in zip(jax.tree.leaves(mine), jax.tree.leaves(theirs), strict=True):
-        assert relative(actual, expected) < 1e-5
+    def differentiated(module):
+        return with_gradients(module.apply)
+
+    label = f"the fused RMSNorm module, offset {offset}, after cast {after_cast}, with scale {with_scale}"
+    assert_as_exact(jax.jit(differentiated(module)), jax.jit(differentiated(portable)), draw, label,
+                    seeds=SEEDS["module"])
 
 
 def test_a_swiglu_named_onto_the_kernel_takes_broadcast_mixed_and_wide_operands():
@@ -803,23 +749,21 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
     from dew.nn.sharding import MLP_HIDDEN, RESIDUAL
     from dew.training import MeshSpec
 
-    (x, scale), dy = norm_operands((4, 8, 31), jnp.float32, jnp.float32)
-    branch, ds = (jax.random.normal(jax.random.key(index), x.shape) for index in (28, 29))
-    gate, up, dout = (jax.random.normal(jax.random.key(index), (4, 8, 24)) for index in (30, 31, 32))
+    def run(seam, swiglu, packed):
+        def ran(x, branch, scale, ds, dy, gate, up, dout):
+            return (evaluated(seam, (x, branch, scale), (ds, dy)), evaluated(swiglu, (gate, up), dout),
+                    evaluated(packed, (jnp.stack([gate, up], -2),), dout))
+        return ran
 
-    def run(axes, hidden):
-        seam = evaluated(fused_seam(1e-5, x.dtype, offset=True, after_cast=True, axes=axes),
-                         (x, branch, scale), (ds, dy))
-        product = evaluated(fused_swiglu(axes=hidden), (gate, up), dout)
-        packed = evaluated(fused_packed(axes=hidden), (jnp.stack([gate, up], -2),), dout)
-        return seam, product, packed
-
-    alone = jax.jit(functools.partial(run, RESIDUAL, MLP_HIDDEN))()
-    with jax.set_mesh(MeshSpec(**{split: 2}).build(jax.devices()[:2])):
-        graph = traced(functools.partial(run, RESIDUAL, MLP_HIDDEN))
-        assert sum(equation.primitive.name == "shard_map" for equation in graph) >= 2
-        meshed = jax.jit(functools.partial(run, RESIDUAL, MLP_HIDDEN))()
-    assert_as_alone(meshed, alone)
+    fused = run(fused_seam(1e-5, jnp.float32, offset=True, after_cast=True, axes=RESIDUAL),
+                fused_swiglu(axes=MLP_HIDDEN), fused_packed(axes=MLP_HIDDEN))
+    mesh = MeshSpec(**{split: 2}).build(jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        graph = traced(fused, *_checked_shard_operands())
+    assert sum(equation.primitive.name == "shard_map" for equation in graph) >= 2
+    portable = run(stream_seam(jnp.float64, joined=True), gated_product("swiglu", implementation="xla"),
+                   packed_gated_product("swiglu", implementation="xla"))
+    assert_meshed_on_par(fused, mesh, lambda *operands: operands, portable, f"per shard over {split}")
 
 
 @pytest.mark.mesh(devices=2)
@@ -829,32 +773,45 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
     shards, their outputs and gradients on par with one device's."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
 
-    operands = _checked_shard_operands()
-    scale = operands[2]  # the weight, placed whole
-    alone = jax.jit(_checked_shard_run)(*operands)
     mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+
+    def placed(*operands):
+        return [jax.device_put(operand, NamedSharding(mesh, P() if index == 2 else P("data")))
+                for index, operand in enumerate(operands)]
+
     with jax.set_mesh(mesh):
-        placed = [jax.device_put(operand, NamedSharding(mesh, P() if operand is scale else P("data")))
-                  for operand in operands]
-        graph = traced(_checked_shard_run, *placed)
-        assert sum(equation.primitive.name == "shard_map" for equation in graph) >= 2
-        meshed = jax.jit(_checked_shard_run)(*placed)
-    assert_as_alone(meshed, alone)
+        graph = traced(_checked_shard_run, *placed(*_checked_shard_operands()))
+    assert sum(equation.primitive.name == "shard_map" for equation in graph) >= 2
+
+    def portable(x, branch, scale, ds, dy, gate, up, dout):
+        return (evaluated(stream_seam(jnp.float64, joined=True), (x, branch, scale), (ds, dy)),
+                evaluated(gated_product("swiglu", implementation="xla"), (gate, up), dout))
+
+    assert_meshed_on_par(_checked_shard_run, mesh, placed, portable, "per shard over an explicit mesh")
 
 
-def assert_as_alone(meshed, alone):
-    """Each of `meshed`'s leaves within 1e-6 of one device's (`alone`): a shard's rows are its own, and the
-    weight's gradient sums the shards' partials in another order."""
-    for mine, theirs in zip(jax.tree.leaves(meshed), jax.tree.leaves(alone), strict=True):
-        assert relative(mine, theirs) < 1e-6
+def assert_meshed_on_par(run, mesh, placed, truth, label: str) -> None:
+    """`run`'s outputs and gradients compiled and run on `mesh`, its operands placed (`placed`), on par with
+    `run` on one device over the drawn operands (`_checked_shard_operands`; check 1): a shard's rows are its
+    own, and the weight's gradient sums the shards' partials in another order. `truth`, XLA's arithmetic,
+    run on the operands in float64."""
+    compiled = jax.jit(run)
+
+    @as_given
+    def meshed(*operands):
+        with jax.set_mesh(mesh):
+            return compiled(*placed(*operands))
+
+    assert_as_exact(meshed, jax.jit(run), _checked_shard_operands, label, seeds=SEEDS["per shard"],
+                    truth_fn=truth)
 
 
-def _checked_shard_operands():
+def _checked_shard_operands(draw: int = 0):
     """The per-shard tests' operands (`_checked_shard_run`'s): the seam's and SwiGLU's, and their
     cotangents."""
-    (x, scale), dy = norm_operands((4, 8, 31), jnp.float32, jnp.float32)
-    branch, ds = (jax.random.normal(jax.random.key(index), x.shape) for index in (28, 29))
-    gate, up, dout = (jax.random.normal(jax.random.key(index), (4, 8, 24)) for index in (30, 31, 32))
+    (x, scale), dy = norm_operands((4, 8, 31), jnp.float32, jnp.float32, draw)
+    branch, ds = (jax.random.normal(drawn_key(index, draw), x.shape) for index in (28, 29))
+    gate, up, dout = (jax.random.normal(drawn_key(index, draw), (4, 8, 24)) for index in (30, 31, 32))
     return x, branch, scale, ds, dy, gate, up, dout
 
 
@@ -1024,60 +981,48 @@ def test_a_fused_norms_jvp_is_its_kernels_value_and_the_portable_tangent():
 
 # Same-session c53, A100-SXM4-40GB, Liger 0.8.4 / torch 2.11.0+cu130:
 # dew-aux-c53-norm-swiglu-20261010-job-1, result.json, accuracy shape [257,127].
-LIGER_RMS_ERRORS = {
-    "rms_norm": (0.0017684225615251462, 0.0012577999558486422, 0.03934815194557525),
-    "swiglu": (0.0014667377536021014, 0.0010115300863026556, 0.0009935534908141895),
-}
-
-
 @pytest.mark.parametrize("operation", ["rms_norm", "swiglu"])
-def test_c53_gradients_are_as_close_to_float64_as_xla_and_measured_liger(operation):
-    """The measured operands and independent float64 equations from c53.
-
-    CPU and CUDA can differ by a few fp32 ulps inside a reduction or exp.
-    Four fp32 epsilons of the truth's RMS allow that backend floor, not an
-    extra bf16 rounding: the old rounded VJPs miss these bounds by ~40%.
-    """
+def test_c53_gradients_are_on_par_with_xla_from_independent_float64_equations(operation):
+    """c53's bf16 norm and SiLU product, forward and both gradients: the fused VJPs on par with XLA's by
+    check 1 over drawn operands, the truth c53's independent float64 equations written apart from every
+    Dew path."""
     shape = (257, 127)
-    x = jnp.asarray(np.random.default_rng(61).standard_normal(shape, dtype=np.float32), jnp.bfloat16)
-    seed = jnp.asarray(np.random.default_rng(62).standard_normal(shape, dtype=np.float32), jnp.bfloat16)
-    second = np.random.default_rng(63).standard_normal(
-        (shape[-1],) if operation == "rms_norm" else shape, dtype=np.float32)
-    if operation == "rms_norm":
-        scale = jnp.asarray(np.float32(0.7) + np.float32(0.2) * second)
-        operands = (x, scale)
+    second_shape = (shape[-1],) if operation == "rms_norm" else shape
 
-        def function(fused):
-            if fused:
-                seam = fused_seam(1e-6, jnp.bfloat16, offset=False, after_cast=True)
-                return lambda x, scale: seam(x, None, scale)[1]
-            return lambda x, scale: rms_normalized(
-                x, scale, 1e-6, jnp.bfloat16, scale_offset=False, scale_after_cast=True,
-                fp32_statistics=True, implementation="xla")
-    else:
-        operands = (x, jnp.asarray(second, jnp.bfloat16))
+    def draw(seed):
+        x, dy = (jnp.asarray(np.random.default_rng([key, seed]).standard_normal(shape, dtype=np.float32),
+                             jnp.bfloat16) for key in (61, 62))
+        second = np.random.default_rng([63, seed]).standard_normal(second_shape, dtype=np.float32)
+        if operation == "rms_norm":
+            return (x, jnp.asarray(np.float32(0.7) + np.float32(0.2) * second)), dy
+        return (x, jnp.asarray(second, jnp.bfloat16)), dy
 
-        def function(fused):
+    def function(fused):
+        if operation == "swiglu":
             return fused_swiglu() if fused else gated_product("swiglu", implementation="xla")
+        if fused:
+            seam = fused_seam(1e-6, jnp.bfloat16, offset=False, after_cast=True)
+            return lambda x, scale: seam(x, None, scale)[1]
+        return lambda x, scale: rms_normalized(x, scale, 1e-6, jnp.bfloat16, scale_offset=False,
+                                               scale_after_cast=True, fp32_statistics=True,
+                                               implementation="xla")
 
-    reference = jax.jit(functools.partial(evaluated, function(fused=False)))(operands, seed)
-    actual = jax.jit(functools.partial(evaluated, function(fused=True)))(operands, seed)
-    first, second = (np.asarray(value, np.float64) for value in operands)
-    dy = np.asarray(seed, np.float64)
-    if operation == "rms_norm":
-        inverse = 1 / np.sqrt(np.mean(first * first, axis=-1, keepdims=True) + 1e-6)
-        normalized, m = first * inverse, dy * second
-        truth = (normalized * second,
-                 inverse * (m - normalized * np.mean(m * normalized, axis=-1, keepdims=True)),
-                 np.sum(dy * normalized, axis=0))
-    else:
-        sigmoid = 1 / (1 + np.exp(-first))
+    def truth(operands, dy):
+        first, second = (value.astype(jnp.float64) for value in operands)
+        dy = dy.astype(jnp.float64)
+        if operation == "rms_norm":
+            inverse = 1 / jnp.sqrt(jnp.mean(first * first, axis=-1, keepdims=True) + 1e-6)
+            normalized, m = first * inverse, dy * second
+            return (normalized * second,
+                    inverse * (m - normalized * jnp.mean(m * normalized, axis=-1, keepdims=True)),
+                    jnp.sum(dy * normalized, axis=0))
+        sigmoid = 1 / (1 + jnp.exp(-first))
         activated = first * sigmoid
-        truth = (activated * second, dy * second * (sigmoid + activated * (1 - sigmoid)), dy * activated)
-    for index, (mine, theirs, want, measured) in enumerate(zip(
-            actual, reference, truth, LIGER_RMS_ERRORS[operation], strict=True)):
-        floor = 4 * np.finfo(np.float32).eps * np.sqrt(np.mean(np.square(want)))
-        assert distance(mine, want) <= min(distance(theirs, want), measured) + floor, (operation, index)
+        return activated * second, dy * second * (sigmoid + activated * (1 - sigmoid)), dy * activated
+
+    assert_as_exact(jax.jit(functools.partial(evaluated, function(fused=True))),
+                    jax.jit(functools.partial(evaluated, function(fused=False))), draw, f"c53 {operation}",
+                    seeds=SEEDS[f"c53 {operation}"], truth_fn=truth)
 
 
 def test_a_context_choice_of_the_norm_forces_it_over_a_calls_own():
