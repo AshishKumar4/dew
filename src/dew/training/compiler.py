@@ -22,7 +22,7 @@ from dew.distributed.placement import Validation
 from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.sharding import Link, Schedule
-from dew.objectives.base import Objective, Pooled
+from dew.objectives.base import Objective
 from dew.state import TrainState, apart, occupied, together
 from dew.telemetry.instrumentation import StepFlops
 from dew.training._candidates import Stepping, candidate_for, lowered_for
@@ -383,10 +383,8 @@ class StepCompiler[L, E]:
                     outputs.append(tuple(output))
                 stepped = together(moving, frozen)
                 returned[0] = stepped.window_size
-                # A step's metrics a caller reads as numbers: a split step's, or one stating a statistic
-                # (`Aux.pooled`), through its whole, which pools them and reads each as its value.
-                pooling = split > 1 or any(isinstance(value, Pooled) for value in outputs[0][1].values())
-                return (stepped, *(whole(outputs) if pooling else outputs[0]))
+                # A split step's metrics through its whole, which pools them and reads each as its value.
+                return (stepped, *(whole(outputs) if split > 1 else outputs[0]))
         return run
 
     def _planned(self, stepping: Stepping, state: TrainState, batch: Batch,
@@ -498,7 +496,7 @@ class StepCompiler[L, E]:
                 advanced, loss, aux, committed = body(current, model_batch(batch), 0, batch_tokens(batch),
                                                       batch.get(CLOSES_WINDOW))
                 advanced, *stepped = outcome(current, advanced, loss, aux, committed, batch, 1,
-                                             batch_consumed(batch))
+                                             batch_consumed(batch), split=1)
                 # A leaf already where its placement says stays the array it
                 # is: the resident frozen collection crosses no boundary.
                 return transfer(advanced, placement), *stepped

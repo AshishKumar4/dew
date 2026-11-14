@@ -45,7 +45,7 @@ from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.precision import at_least_fp32
 from dew.nn.programs import on_host
-from dew.objectives.base import OMITTED, TEACHER, Aux, Omitted, Ratio, Shown, Step
+from dew.objectives.base import OMITTED, TEACHER, Aux, Omitted, Pooled, Ratio, Shown, Step
 from dew.objectives.diffusion.objective import DiffusionObjective, teacher_weights
 from dew.sampling.solvers import Solver
 from dew.sampling.solvers.dpm import DPMSolverMultistep
@@ -199,14 +199,14 @@ class DiffusionNFTObjective(DiffusionObjective):
         policy_row = jnp.mean(policy, axis=0)
         drift_row = jnp.mean(drift, axis=0)
         per_row = policy_row + self.kl * drift_row
-        metrics = {
-            "policy": self.row_mean(policy_row, batch).mean()[0],
-            "optimality": self.row_mean(r, batch).mean()[0],
+        metrics: dict[str, jax.Array | Pooled] = {
+            "policy": self.row_mean(policy_row, batch),
+            "optimality": self.row_mean(r, batch),
         }
         if self.kl > 0:
-            metrics["velocity_kl"] = self.row_mean(drift_row, batch).mean()[0]
+            metrics["velocity_kl"] = self.row_mean(drift_row, batch)
         if REWARDS_KEY in batch:
-            metrics["reward"] = self.row_mean(jnp.asarray(batch[REWARDS_KEY], jnp.float32), batch).mean()[0]
+            metrics["reward"] = self.row_mean(jnp.asarray(batch[REWARDS_KEY], jnp.float32), batch)
         # A sample of a repeated source row (`VALID_ROWS`, `real_samples`) weighs nothing in the mean.
         return self.row_mean(per_row, batch), Aux(metrics)
 
