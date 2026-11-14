@@ -2214,7 +2214,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         """`walk`, `freed(counter)` run after each step's slots are given back (step `counter`'s). Each
         segment walks its steps a step a trip or, `unrolled`, a rotation of the rings (`stepping`). A step
         reading `ahead` holds the next step's slot of those streams beside its own, so the rings hold two
-        steps' slots at least (`Tiles.stages`' floor, `ahead_stages`)."""
+        steps' slots at least (`Tiles.stages`' floor, `ahead_stages`); such a segment's first and last steps
+        are peeled from its loop (`peeled`)."""
         stages = min(ring.stages for ring in streams.values())
         if not 0 <= in_flight < stages:
             raise ValueError(f"a walk keeps fewer steps' products in flight than its rings' {stages} slots, "
@@ -2229,8 +2230,11 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             if freed is not None:
                 freed(turn.counter)
 
-        def turned(step, lo, hi, index, turn: Turn, carry, accumulators, *, before: int = 0):
-            slots = Slots(streams, turn, ahead, more=index + 1 < hi, first=index == lo)
+        def turned(step, lo, hi, index, turn: Turn, carry, accumulators, *, before: int = 0, first=None,
+                   more=None):
+            # Where the step stands in its range (`Slots.first`, `more`): tested, unless its loop knows it.
+            slots = Slots(streams, turn, ahead, more=index + 1 < hi if more is None else more,
+                          first=index == lo if first is None else first)
             groups = commits()
             carry, accumulators = step(index, slots, carry, accumulators)
             # The step's product groups (its completion tokens): a step `in_flight` back is done once no
@@ -2265,8 +2269,23 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
             return drain
 
+        def peeled(step, lo, hi) -> tuple[Loop, ...]:
+            # A segment reading ahead: its first step, which opens its own slots and reads the next's where
+            # more follow; its loop's steps, each reading the next's; and its last, reading none. No step of
+            # its loop tests where it stands, and each part issues what it runs: the first two products, the
+            # loop's one a step, the last none (a count of its emission reads them so, `emission.Role.step`).
+            parts = ((lo, jnp.minimum(lo + 1, hi), {"first": True}),
+                     (lo + 1, hi - 1, {"first": False, "more": True}),
+                     (jnp.maximum(hi - 1, lo + 1), hi, {"first": False, "more": False}))
+            return tuple(loop for begin, end, place in parts
+                         for loop in stepping(functools.partial(turned, step, lo, hi, **place), begin, end,
+                                              first, stages, unrolled=unrolled))
+
         loops: list[Loop] = []
         for step, lo, hi in segments:
+            if ahead:
+                loops += peeled(step, lo, hi)
+                continue
             run = stepping(functools.partial(turned, step, lo, hi), lo, hi, first, stages, unrolled=unrolled)
             loops += [*run[:-1], run[-1]._replace(then=drained(lo, hi) if in_flight else None)]
         return self.accumulated(tuple(loops), start, shapes, interpret, initial)
