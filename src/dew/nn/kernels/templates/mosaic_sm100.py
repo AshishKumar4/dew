@@ -1221,14 +1221,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         for acc, value in zip(accumulators, initial, strict=True):
             plgpu.async_store_tmem(_tensor_memory(acc), self.zeros(acc.shape) if value is None else value)
         plgpu.commit_tmem()
-        carry = start
-        for loop in segments:
-            def stepped(index, carry, step=loop.step):
-                return step(index, carry, accumulators)[0]
-
-            carry = lax.fori_loop(loop.lo, loop.hi, stepped, carry)
-            if loop.then is not None:
-                loop.then()
+        carry = mosaic.looped(segments, start, accumulators)
         return carry, tuple(_read(_tensor_memory(acc)) for acc in accumulators)
 
     def _awaited(self, acc: Accumulator) -> Accumulator:

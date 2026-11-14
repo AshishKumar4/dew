@@ -299,6 +299,21 @@ class Loop(NamedTuple):
     then: Callable[[], None] | None = None
 
 
+def looped[C](segments, start: C, accumulators: tuple) -> C:
+    """A walk's `segments` (`Loop`s) in turn over `accumulators` its issuer holds out of the loops' carries
+    (wgmma's scoped refs, tcgen05's tensor memory), each loop carrying `start` alone, then its `then()`
+    (`Issuer.accumulated`). Returns the carry."""
+    carry = start
+    for loop in segments:
+        def stepped(index, carry, step=loop.step):
+            return step(index, carry, accumulators)[0]
+
+        carry = lax.fori_loop(loop.lo, loop.hi, stepped, carry)
+        if loop.then is not None:
+            loop.then()
+    return carry
+
+
 def stepping(turned: Callable, lo, hi, first, stages: int, *, unrolled: bool) -> tuple[Loop, ...]:
     """Steps `lo` to `hi` of a ring of `stages` slots (its counters from `first`) as the loops a walk runs in
     turn (`Loop`); `turned(index, turn, *state, before=0) -> state` takes each step at
