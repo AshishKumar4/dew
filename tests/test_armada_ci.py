@@ -192,8 +192,8 @@ def test_a_task_states_the_same_key_in_every_plan_that_cuts_it_whatever_its_name
 def test_the_tested_pythons_are_named_once_and_a_collection_gate_for_another_set_is_refused(
         ci, tmp_path, monkeypatch):
     """`pythons --check` holds every file that names the tested Pythons to PYTHONS, the collection gates of
-    tools/check_gates among them: a gate for a Python no environment is built for fails every pull request, and
-    one missing collects nowhere (train 805's review, F1)."""
+    tools/check_gates among them: a gate for a Python no environment is built for fails every pull request,
+    and one missing collects nowhere (train 805's review, F1)."""
     (tmp_path / "tools").mkdir()
     (tmp_path / ".python-version").write_text(f"{ci.PYTHONS[0]}\n")
     (tmp_path / ".armada.json").write_text(json.dumps({"environment": {"smoke": " && ".join(
