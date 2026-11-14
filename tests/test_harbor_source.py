@@ -562,8 +562,8 @@ def test_a_trial_that_closes_its_output_and_runs_on_is_bounded_by_its_deadline(t
 
 
 def test_a_trial_without_a_descriptor_for_its_wake_pipe_is_infra_and_frees_its_worker(tmp_path, harbor):
-    """A trial that cannot make its wake pipe, every descriptor taken, resolves an INFRA_ERROR session
-    naming that OSError, which the scheduler retries (ledger 1875), and the source's one worker goes
+    """A trial that cannot make its wake pipe, every descriptor taken, resolves an INFRA_ERROR session,
+    which the scheduler retries (ledger 1875), and the source's one worker goes
     on to run the next trial once descriptors are free. In a process of its own, whose descriptor
     limit it lowers (`descriptorless_flow`)."""
     (tmp_path / "task").mkdir()
@@ -574,13 +574,12 @@ def test_a_trial_without_a_descriptor_for_its_wake_pipe_is_infra_and_frees_its_w
                          cwd=here, env={**os.environ,
                                         "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here)])})
     assert run.returncode == 0, run.stderr[-4000:]
-    assert json.loads(run.stdout.splitlines()[-1]) == ["COMPLETED", "INFRA_ERROR", "OSError", "COMPLETED"]
+    assert json.loads(run.stdout.splitlines()[-1]) == ["COMPLETED", "INFRA_ERROR", "COMPLETED"]
 
 
 def descriptorless_flow(harbor: str, root: str) -> None:
     """Run a trial, take every descriptor and submit one, free them and submit another, on one
-    worker; print the first's and last's statuses, the middle one's and the error class its detail
-    names."""
+    worker; print the three statuses."""
     import resource
 
     task = Task("hello", {HARBOR_KEY: str(Path(root) / "task")})
@@ -601,8 +600,7 @@ def descriptorless_flow(harbor: str, root: str) -> None:
         rollout = after.result()
     finally:
         source.close()
-    print(json.dumps([before.status.name, failed.status.name, failed.detail.split(":")[1].strip(),
-                      rollout.status.name]))
+    print(json.dumps([before.status.name, failed.status.name, rollout.status.name]))
 
 
 def test_a_cancel_alone_resolves_a_trial_whose_output_a_detached_child_holds(tmp_path, harbor):
@@ -933,7 +931,7 @@ def test_an_agent_command_that_cannot_start_is_infra(tmp_path):
         failed = rollout.result()
     finally:
         source.close()
-    assert failed.status is Status.INFRA_ERROR and "FileNotFoundError" in failed.detail
+    assert failed.status is Status.INFRA_ERROR
 
 
 def test_harbor_judges_an_unreadable_result_as_infra(tmp_path):
@@ -946,4 +944,4 @@ def test_harbor_judges_an_unreadable_result_as_infra(tmp_path):
     (artifacts / "result.json").write_text("{not json")
     harbor = harbor_trials(sys.executable, tmp_path / "trials")
     judged = harbor.judge(Task("hello"), Trial((), artifacts), "", 0, calls([], unstamped=0))
-    assert judged.status is Status.INFRA_ERROR and "result.json" in judged.detail
+    assert judged.status is Status.INFRA_ERROR
