@@ -90,6 +90,20 @@ def _lowers(hook, tiles: tuple, sides, rules) -> bool:
                for equation in equations(jax.make_jaxpr(hook)(*tiles, *sides).jaxpr))
 
 
+def lowering_rules(target) -> dict:
+    """The rules a hook's operations need on `target`'s Mosaic launches: a TPU core's TensorCore rules; a
+    GPU's at warpgroup semantics."""
+    if generation.tpu(target):
+        return mosaic_tpu_lowering.lowering_rules[tpu_core.CoreType.TC]
+    return mosaic_gpu_lowering.mosaic_lowering_rules[plgpu_core.WGxWG_SEMANTICS]
+
+
+def hook_lowers(hook, tiles: tuple, target) -> bool:
+    """Whether `target`'s Mosaic launches take `hook` on `tiles` (`_lowers`, `lowering_rules`): a caller's
+    hook asked before it is bound to a launch (`dew.nn.gated_mlp`'s gated product)."""
+    return _lowers(hook, tiles, (), lowering_rules(target))
+
+
 def _hooks_lower(ba, dtype, rules) -> bool:
     """Whether a lowering's `rules` take the launch's hooks (`_lowers`), traced on 128-wide tiles: the
     primitives a hook makes do not depend on its tile's extents."""
@@ -1043,12 +1057,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     @staticmethod
     def _hooks_lower(ba, dtype, target) -> bool:
-        """Whether the target's Mosaic lowering takes the launch's hooks (`_hooks_lower`): a TPU core's by its
-        TensorCore rules; a GPU's with warpgroup semantics, whose rules a hook's operations need. A side
-        operand the launch squeezes comes back broadcast across its tile (`_unsqueezed`)."""
-        if generation.tpu(target):
-            return _hooks_lower(ba, dtype, mosaic_tpu_lowering.lowering_rules[tpu_core.CoreType.TC])
-        return _hooks_lower(ba, dtype, mosaic_gpu_lowering.mosaic_lowering_rules[plgpu_core.WGxWG_SEMANTICS])
+        """Whether the target's Mosaic lowering takes the launch's hooks (`_hooks_lower`, `lowering_rules`). A
+        side operand the launch squeezes comes back broadcast across its tile (`_unsqueezed`)."""
+        return _hooks_lower(ba, dtype, lowering_rules(target))
 
     def staged_bytes(self, ba, config: mosaic_gpu.Tiles, target) -> int:
         # The kernel's own allocations at `config` (`mosaic_gpu.Allocations`), counted as Mosaic's resource
