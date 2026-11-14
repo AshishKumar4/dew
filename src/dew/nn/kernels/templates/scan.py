@@ -66,6 +66,11 @@ BANKS = 32
 """Shared memory's banks, a 4-byte word each (`generation.Multiprocessor.shared_bytes_per_clock`'s 128 bytes a
 clock)."""
 
+LINE = 128
+"""An L1 cache line's bytes, four of global memory's 32-byte sectors (the CUDA C++ Best Practices Guide,
+coalesced access to global memory): a warp whose threads' bytes fill a line in order takes its four sectors
+and wastes none."""
+
 
 def striped(positions: int) -> plgpu_core.SomeLayout:
     """The layout a block of `positions` takes across the threads: position `t + 128 i` thread `t`'s `i`-th,
