@@ -58,7 +58,7 @@ source .venv/bin/activate
 uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple
 ```
 
-To install the current revision of the repository instead of the release, name it: `uv pip install "dewml @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`, and pin a commit, `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`, to reproduce a run later. An install that names dewml resolves its dependencies afresh, unpinned and unhashed; one whose every file is verified installs a lock from a checkout instead, `uv pip install --require-hashes -r locks/cpu.txt` (or `locks/cuda12.txt`, `locks/cuda13.txt`), then the checkout itself with `--no-deps -e .`, the one part no hash holds. Dew installs its JAX build and the Flax release pyproject.toml's dependencies allow.
+To install the current revision of the repository instead of the release, name it: `uv pip install "dewml @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`, and pin a commit, `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`, to reproduce a run later. An install that names dewml resolves its dependencies afresh, unpinned and unhashed; one whose every file is verified installs a lock from a checkout instead, `sh tools/install_environment.sh cpu` (or `cuda12`, `cuda13`), which requires every hash and installs the checkout itself last, the one part no hash holds. Dew installs its JAX build and the Flax release pyproject.toml's dependencies allow.
 
 The CPU install is enough for the [Quickstart](getting-started.md).
 
