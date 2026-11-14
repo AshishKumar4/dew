@@ -813,7 +813,7 @@ def test_ahead_fails_where_a_trees_compile_ahead_fails_and_asks_none_of_a_tree_t
     monkeypatch.setattr(gate.subprocess, "run", child)
     args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", kind="a100",
                            lock="cpu", environments=str(tmp_path / "environments"),
-                           out=str(tmp_path / "ahead"), only=["step lm-dense 4x1024"], topology="")
+                           out=str(tmp_path / "ahead"), only=["step lm-dense 4x1024"])
     # A tree before the handoff: no tree's steps are compiled ahead, every arm compiling its own on the GPU,
     # so no arm runs another's tuning policy.
     assert gate.ahead_battery(args) == 0
@@ -826,49 +826,6 @@ def test_ahead_fails_where_a_trees_compile_ahead_fails_and_asks_none_of_a_tree_t
     assert gate.ahead_battery(args) == 0
     takes["head"] = (1, "")
     assert gate.ahead_battery(args) == 1
-
-
-def test_ahead_compiles_over_the_nodes_own_gpus_where_it_names_them_and_never_a_canonical_one_there(
-        gate, tmp_path, monkeypatch):
-    """Where the node names its GPUs' topology (`--topology`, its $DEW_NODE_TOPOLOGY), each tree's steps are
-    compiled over them, never over a canonical GPU of the kind, whose memory a run refuses as another target's
-    (2026-11-14: every head arm of two perf measurements broke on "memory 97925254348 bytes, not
-    96395591680"); where a tree's benchmark_step cannot compile over them none is compiled ahead, every arm's
-    GPU compiling, and with no topology named a canonical GPU of the kind is the target, as before."""
-    from types import SimpleNamespace
-
-    standing_in_environments(gate, monkeypatch)
-    battery = gate.subprocess.run
-    trees = {name: locked_tree(tmp_path / name) for name in ("main", "head")}
-    asked: dict[str, list[str]] = {}
-    takes = {"main": "usage: benchmark_step.py [--cases CASES] [--compile-ahead DIR] [--capacity-gib N]",
-             "head": "usage: benchmark_step.py [--cases CASES] [--compile-ahead DIR] [--topology FILE]"}
-
-    def child(command, **kwargs):
-        if len(command) < 2 or Path(command[1]).name != "benchmark_step.py":
-            return battery(command, **kwargs)
-        tree = Path(kwargs["cwd"]).name
-        if command[2:] == ["--help"]:
-            return subprocess.CompletedProcess(command, 0, takes[tree], "")
-        asked[tree] = command[2:]
-        return subprocess.CompletedProcess(command, 0, "", "")
-
-    monkeypatch.setattr(gate.subprocess, "run", child)
-    topology = str(tmp_path / "topology.bin")
-    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", kind="gh200",
-                           lock="cpu", environments=str(tmp_path / "environments"),
-                           out=str(tmp_path / "ahead"), only=["step lm-dense 4x1024"], topology=topology)
-    # The base cannot compile over the node's GPUs: neither tree is compiled ahead.
-    assert gate.ahead_battery(args) == 0
-    assert asked == {}
-    takes["main"] = takes["head"]
-    assert gate.ahead_battery(args) == 0
-    assert set(asked) == {"main", "head"}
-    assert all(words[words.index("--topology") + 1] == topology and "--capacity-gib" not in words
-               for words in asked.values())
-    asked.clear()
-    assert gate.ahead_battery(SimpleNamespace(**{**vars(args), "topology": ""})) == 0
-    assert all("--capacity-gib" in words and "--topology" not in words for words in asked.values())
 
 
 def test_a_steps_compiled_ahead_on_a_host_with_no_gpu_are_named_for_their_cases(tmp_path):
