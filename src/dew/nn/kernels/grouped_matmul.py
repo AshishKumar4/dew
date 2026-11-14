@@ -972,11 +972,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def _pair_refuses(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> bool:
         """Whether a pair's product refuses the call at `config` (`mosaic_gpu.pair_refuses`, the statement
-        `gmm`, `tgmm` refuse by): its prologue, second matrix, scales, gathered rows, exact sums, rewrite."""
+        `gmm`, `tgmm` refuse by): its prologue, scales, gathered rows, exact sums, rewritten stage."""
         return mosaic_gpu.pair_refuses(config, family, transpose_lhs=False,
                                        exact_sums=bool(ba.arguments.get('exact_sums')), scaled=self._scaled,
-                                       parts=(ba.arguments['hooks'].prologue, ba.arguments.get('paired'),
-                                              ba.arguments.get('gather')),
+                                       parts=(ba.arguments['hooks'].prologue, ba.arguments.get('gather')),
                                        rewritten=self.rewritten(ba, family))
 
     def _ran(self, ba, config: mosaic_gpu.Tiles) -> tuple:

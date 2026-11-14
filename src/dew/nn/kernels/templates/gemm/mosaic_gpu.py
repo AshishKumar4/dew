@@ -1330,8 +1330,9 @@ def pair_takes(tiles: Tiles, family: mosaic.Family) -> bool:
 def pair_refuses(tiles: Tiles, family: mosaic.Family, *, transpose_lhs: bool, exact_sums: bool,
                  scaled: bool, parts: tuple, rewritten: bool = False) -> bool:
     """Dew: whether a pair's product (`mosaic.Transport.pairs_product`) refuses a call at `tiles`: any but
-    a plain one's at a pair's tile (`pair_takes`), its step views its two operands' blocks alone
-    (`_gmm_views`, `_tgmm_scheduled`), so none of `parts` (a prologue, a second matrix, gathered rows), no
+    a plain one's at a pair's tile (`pair_takes`), its step views its operands' blocks alone, each matrix's
+    the pair's (`_gmm_views`: a paired product's second matrix too, its accumulators beside the first's in
+    tensor memory; `_tgmm_scheduled`), so none of `parts` (a prologue, gathered rows), no
     scales (`scaled`: a packed matrix's, step or block scales), transposed rows, exact sums, a split or a
     stage its family's role rewrites (`rewritten`, `rewrites`: the pair's persist sums and prepares
     nothing, `mosaic_sm100`). The one statement `gmm`'s and `tgmm`'s refusals (`_pair_refused`) and a
@@ -1366,7 +1367,7 @@ def _gmm_shape_refused(lhs, rhs, tiles: Tiles, extents: tuple, interpret, *, dty
                  partial=partial_runs(tiles, dtype, interpret, transpose_rhs=transpose_rhs, plain=plain,
                                       gathered=gather is not None, scattered=scatter is not None))
     _pair_refused(tiles, family, transpose_lhs=transpose_lhs, exact_sums=exact_sums, scaled=not plain,
-                  parts=(prologue, paired, gather))
+                  parts=(prologue, gather))
     _tables_refused(gather, scatter, tiles, family, prologue=prologue, dense=dense,
                     transpose_lhs=transpose_lhs)
 
@@ -1793,7 +1794,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     unstaged = not k_major and rows_unstaged(dense=dense or whole_steps, prologue=prologue,
                                              tabled=any(table is not None for table in tables))
     _pair_refused(tiles, family, transpose_lhs=False, exact_sums=exact_sums, scaled=step_scales is not None,
-                  parts=(prologue, None, gather), rewritten=rewrites(family, k_major, tables, unstaged))
+                  parts=(prologue, gather), rewritten=rewrites(family, k_major, tables, unstaged))
     group_sizes = group_sizes.astype(jnp.int32)
     out_dtype = jnp.dtype(out_dtype)
     if tiles.splits > 1:
