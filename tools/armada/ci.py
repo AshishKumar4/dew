@@ -8,8 +8,9 @@
     python3 tools/armada/ci.py gpu-lane --tests="tests/b.py#1/2" --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py gpu-lane --network [--tests=...] --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py gpu-lane --prepare --tests="tests/b.py#1/2" --out=FILE --processes=N
-    python3 tools/armada/ci.py coverage items --target=SECONDS --timings=FILE > ITEMS
+    python3 tools/armada/ci.py coverage items --target=SECONDS --timings=FILE [--scenarios] > ITEMS
     python3 tools/armada/ci.py coverage report DIR
+    python3 tools/armada/ci.py scenarios [--check]
     python3 tools/armada/ci.py gangs
 
 The plan prints a task matrix for each Python CI proves. Whole test files are
@@ -108,7 +109,10 @@ items, each running its files under coverage.py (pyproject.toml's
 test cache off, since a reused row covers nothing, and writing its data among
 the task's artifacts; a traced task records nothing in the cache either.
 `report` combines the artifacts' data under DIR and writes DIR/coverage.json and
-DIR/coverage.md, a module a line, the least covered first:
+DIR/coverage.md, a module a line, the least covered first. `items --scenarios` measures the
+scenario suite alone (docs/design/testing.md): a task a file whose tests mark a scenario
+(tests/conftest.py SCENARIOS), running those tests alone; `scenarios --check` refuses a scenario
+no test marks:
 
     armada map --commit=SHA --artifacts=DIR --items=ITEMS --timeout=6000 --secrets=DEW_XLA_CACHE_TOKEN \
         -- sh -c {item}
@@ -1358,7 +1362,8 @@ def ynn_switched(cases) -> list[dict]:
 
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
-         grace: float = session.GRACE, coverage: Path | None = None, census: bool = False) -> int:
+         grace: float = session.GRACE, coverage: Path | None = None, census: bool = False,
+         scenarios: bool = False) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
     their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
 
@@ -1368,7 +1373,8 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     at 300 seconds ran a median of 392. A task that ran out of time times its rows otherwise
     (`deadline_shares`): the file its tests were running in at least what it needs, a file that never
     started none. With `coverage`, pytest runs under coverage.py, whose data file goes there
-    (`coverage_items`)."""
+    (`coverage_items`); with `scenarios`, of its files the tests that mark a scenario alone
+    (`SCENARIO_SELECTION`)."""
     # Before any test writes under tests/, the inputs as the plan saw them; the rows its plan kept read
     # where it found their green runs (`kept_of`), a heavy file's kept groups each its own, and run where
     # their green run is not found there.
@@ -1379,8 +1385,9 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     # The census's tests run under check 1's CENSUS (tests/check1_wire.py, where the gate reads it), which
     # also keeps their rows from the records (`tested`).
     environ = {check1_wire().CENSUS: "1"} if census else {}
+    options = ("-m", SCENARIO_SELECTION) if scenarios else ()
     code = tested(python, names, split, out, deadline, cache, grace, common, environ, coverage,
-                  kept=whole_files)
+                  kept=whole_files, options=options)
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
     site = session.SITE.fullmatch(split)
@@ -1401,7 +1408,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
             continue
         part = out.with_name(f"{out.name}.{index}")
         code = max(code, tested(python, [name], group, part, left, cache, grace, common, environ, coverage,
-                                kept={name: at}))
+                                kept={name: at}, options=options))
         rows += json.loads(part.read_text())["rows"]
     out.write_text(json.dumps({"rows": rows}))
     return told(out, code)
@@ -2278,15 +2285,59 @@ COVERAGE_DEADLINE = 5400.0
 its files' coverage partial, which `coverage_report.report` refuses."""
 
 
-def coverage_items(target: float, timings: dict) -> list[str]:
+def coverage_items(target: float, timings: dict, scenarios: bool = False) -> list[str]:
     """The plan's tasks for the oldest Python, as armada map items: each runs its files under coverage.py
     with the test cache off, its rows and data among its artifacts, by `COVERAGE_DEADLINE`. A check-1 site's
-    map tasks run its code over every seed; its judge, which pools their draws, has none to pool here."""
-    return [f"mkdir -p {ARTIFACTS} && python3 tools/armada/ci.py task --python={entry['python']} "
-            f"--tests='{entry['tests']}' --split='{entry['split']}' --out={ARTIFACTS}/rows.json --cache=off "
-            f"--deadline={COVERAGE_DEADLINE:.0f} --coverage={ARTIFACTS}"
+    map tasks run its code over every seed; its judge, which pools their draws, has none to pool here. With
+    `scenarios`, the scenario suite alone: a task a file that marks a scenario (`scenario_files`), running its
+    marked tests alone."""
+    task = (f"mkdir -p {ARTIFACTS} && python3 tools/armada/ci.py task --python={PYTHONS[0]} --out={ARTIFACTS}"
+            f"/rows.json --cache=off --deadline={COVERAGE_DEADLINE:.0f} --coverage={ARTIFACTS}")
+    if scenarios:
+        marking = sorted(set().union(*scenario_files().values()))
+        return [f"{task} --tests='{name}' --scenarios" for name in marking]
+    return [f"{task} --tests='{entry['tests']}' --split='{entry['split']}'"
             for entry in plan(target, timings)
             if entry["python"] == PYTHONS[0] and entry["split"] != COLLECT and "after" not in entry]
+
+
+SCENARIO_MARK = re.compile(r'@pytest\.mark\.scenario\(\s*"([^"]+)"\s*\)')
+"""A test's scenario mark on its own decorator, its name a literal (tests/conftest.py SCENARIOS)."""
+SCENARIO_SELECTION = f"({session.SELECTION[1]}) and scenario"
+"""What a scenario coverage task runs of its file (`coverage_items`): the tests CI runs that mark one."""
+
+
+def declared_scenarios() -> tuple[str, ...]:
+    """tests/conftest.py's `SCENARIOS`, read from its source (the plan runs where no test imports)."""
+    tree = ast.parse(Path("tests/conftest.py").read_text())
+    return next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
+                and [target.id for target in node.targets if isinstance(target, ast.Name)] == ["SCENARIOS"])
+
+
+def scenario_files() -> dict[str, set[str]]:
+    """Each scenario of `declared_scenarios` and the test files whose tests mark it, read from the source, as
+    `sites` reads its marks; a name no scenario has, by the files that mark it."""
+    found: dict[str, set[str]] = {name: set() for name in declared_scenarios()}
+    for name in test_files():
+        for scenario in SCENARIO_MARK.findall(Path(name).read_text()):
+            found.setdefault(scenario, set()).add(name)
+    return found
+
+
+def scenarios(*, check: bool) -> int:
+    """Each scenario and the files that mark it, a line each; with `check`, refuse a scenario no test marks
+    and a mark naming no scenario (docs/design/testing.md: the scenario suite's coverage is published)."""
+    found, names = scenario_files(), set(declared_scenarios())
+    if not check:
+        for scenario, files in found.items():
+            print(scenario, *sorted(files), sep="\t")
+        return 0
+    problems = [f"no test marks the scenario {scenario!r} (@pytest.mark.scenario)"
+                for scenario, files in found.items() if scenario in names and not files]
+    problems += [f"{', '.join(sorted(files))}: mark the scenario {scenario!r}, which tests/conftest.py's "
+                 f"SCENARIOS does not name" for scenario, files in found.items() if scenario not in names]
+    print("\n".join(problems) if problems else f"{len(names)} scenarios, each marked", file=sys.stderr)
+    return 1 if problems else 0
 
 
 GANG = 4
@@ -2385,6 +2436,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.operation == "pythons":
         return pythons(check=args.check)
+    if args.operation == "scenarios":
+        return scenarios(check=args.check)
     if args.operation == "gangs":
         print(json.dumps(gangs()))
         return 0
@@ -2443,7 +2496,7 @@ def main() -> int:
         if args.stage == "report":
             return coverage_report.report(args.directory)
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
-        print(json.dumps(coverage_items(args.target, timings)))
+        print(json.dumps(coverage_items(args.target, timings, scenarios=args.scenarios)))
         return 0
     if args.operation == "policy":
         print(policy(args.base))
@@ -2455,7 +2508,7 @@ def main() -> int:
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
     return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
-                coverage=args.coverage, census=args.census == "1")
+                coverage=args.coverage, census=args.census == "1", scenarios=args.scenarios)
 
 
 def pinned(argv: list[str]) -> None:

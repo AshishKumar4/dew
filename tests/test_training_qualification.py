@@ -177,6 +177,7 @@ def ran(directory: Path) -> dict[str, bytes]:
             for path in ([kept] if kept.is_file() else sorted(kept.rglob("*"))) if path.is_file()}
 
 
+@pytest.mark.scenario("Pretrained fine-tuning")
 @pytest.mark.slow
 @pytest.mark.parametrize("kind", ["dense", "moe"])
 @pytest.mark.shards(units=1, per_task=1)

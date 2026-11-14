@@ -504,6 +504,7 @@ def test_reload_normalizes_source_precision_before_concatenating_projections():
     assert_same_draws(server(["12"], 5, key=3)[0], other("12", 5, key=3))
 
 
+@pytest.mark.scenario("Generation and serving")
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
 def test_quantized_weights_serve_the_same_greedy_text_as_the_task(dtype):
     from dew.quantization import Quantization
@@ -1137,6 +1138,7 @@ def shared_page(options: dict) -> int:
     return 4 if layout is not None and layout.page_size == 4 and options.get("prefix_cache", True) else 0
 
 
+@pytest.mark.scenario("Generation and serving")
 @pytest.mark.parametrize("options", [
     {"kv_cache": KVCache(page_size=16, pages=12)},
     {"kv_cache": KVCache(page_size=16, pages=12), "chunk": 2},
@@ -1505,6 +1507,7 @@ def test_a_server_runs_a_model_with_prediction_depths_without_them(options):
     assert not [path for path, _ in held if "mtp" in jax.tree_util.keystr(path).lower()]
 
 
+@pytest.mark.scenario("Generation and serving")
 @pytest.mark.parametrize("temperature, decode_steps, keys", [(0.0, 1, None), (1.0, 4, None), (1.0, 4, "rbg")],
                          ids=["greedy", "sampled-four-steps", "sampled-four-steps-rbg"])
 def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, decode_steps, keys):
