@@ -1,6 +1,7 @@
 """The encoder-free wrapper, its processor layout and its ordinary-forward mask policy."""
 
 import copy
+import functools
 import shutil
 from pathlib import Path
 
@@ -10,8 +11,18 @@ import numpy as np
 import optax
 import pytest
 import torch
+from arm_arithmetic import float64_held
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_error import as_given, assert_as_exact, indexed_recording, over_windows, recording, windows
+from model_support import float64_twin
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    indexed_recording,
+    over_windows,
+    recording,
+    widened,
+    windows,
+)
 from transformers import (
     AutoModelForImageTextToText,
     Gemma4UnifiedConfig,
@@ -45,22 +56,7 @@ def source():
 
 def forward_functions(source):
     native, reference, truth = source
-    processor = native.processor
-
-    @jax.jit
-    def forward(batch):
-        return native.model.apply(native.variables, batch.tokens, **batch.kwargs())
-
-    # Each arm runs row by row on the host (its row's length read from its mask), as given.
-    @as_given
-    def ours(inputs):
-        batch = processor.from_hf(inputs)
-        result = {}
-        for row, mask in enumerate(inputs["attention_mask"]):
-            count = int(np.sum(mask))
-            single = batch.take_rows(jnp.asarray([row])).slice_tokens(0, count)
-            result[f"row{row}"] = forward(single)
-        return result
+    ours = rows_forward(native)
 
     def theirs(model, inputs, *, wide=False):
         device = next(model.parameters()).device
@@ -82,11 +78,43 @@ def forward_functions(source):
     return ours, as_given(lambda inputs: theirs(reference, inputs)), oracle
 
 
+def rows_forward(native, wide: bool = False):
+    """Dew's forward of a draw's rows, each on its own valid length (read from its mask on the host), run as
+    given; `wide`, its float64 twin over its variables widened (`float64_twin`, Dew's own float64 path),
+    stating the program each row runs (`as_given`'s `programs`), which a recorded truth's roundings are
+    counted over."""
+    @functools.cache
+    def built():
+        # Under float64, at its first call, where `wide` (float64_held's arrays are float64 there).
+        if not wide:
+            return native.model, native.variables
+        return float64_twin(native.model), float64_held(native.variables)
+
+    @jax.jit
+    def forward(model_variables, batch):
+        return built()[0].apply(model_variables, batch.tokens, **batch.kwargs())
+
+    def rows(inputs):
+        batch = native.processor.from_hf(inputs)
+        for row, mask in enumerate(inputs["attention_mask"]):
+            single = batch.take_rows(jnp.asarray([row])).slice_tokens(0, int(np.sum(mask)))
+            yield forward, (built()[1], widened(single) if wide else single)
+
+    def run(inputs):
+        with jax.enable_x64(new_val=wide):
+            return {f"row{row}": program(*held) for row, (program, held) in enumerate(rows(inputs))}
+
+    return as_given(run, programs=rows if wide else None)
+
+
 def assert_forward(source, draw, label, site):
-    ours, _, _ = forward_functions(source)
+    """Check 1 of Dew's forward against the recorded transformers' over the site's draws (`<site>.npz`, its
+    evidence alone), Dew's own float64 forward held to the recorded truth at each (`rows_forward`)."""
+    ours = rows_forward(source[0])
     stored = recording(FIXTURE / f"{site}.npz")
     seeds = int(stored[f"{site}.seeds"])
-    drawn, reference, truth = indexed_recording(stored, site, seeds, inputs_of=draw)
+    drawn, reference, truth = indexed_recording(stored, site, seeds, inputs_of=draw,
+                                                truth_fn=rows_forward(source[0], wide=True))
     assert_as_exact(as_given(lambda index, inputs: ours(inputs)), reference, drawn,
                     label, seeds=seeds, truth_fn=truth)
 
@@ -311,27 +339,47 @@ def test_raw_media_train_and_reload_through_the_public_source(source, tmp_path):
                                   expected)
 
 
-def cached_functions(source):
-    native, reference, truth = source
-    model = native.model.clone(language_model=native.model.language_model.clone(max_seq_len=32))
+def cached_run(native, wide: bool = False):
+    """Dew's cached run of a draw's odd rows (`cached_functions`): the prefill of their first ten tokens and a
+    teacher-forced step a continuation token, run as given; `wide`, its float64 twin over its variables
+    widened (Dew's own float64 path), stating the program it runs (`as_given`'s `programs`)."""
+    @functools.cache
+    def built():
+        model = native.model.clone(language_model=native.model.language_model.clone(max_seq_len=32))
+        if not wide:
+            return model, native.variables
+        return float64_twin(model), float64_held(native.variables)
 
     @jax.jit
-    def ours_cached(batch, continuation):
-        cache = model.apply(native.variables, batch.tokens.shape[0],
-                            method="init_cache", mutable=["cache"])[1]["cache"]
-        prefill, changed = model.apply({**native.variables, "cache": cache}, batch.tokens,
-                                       **batch.kwargs(), decode=True, mutable=["cache"])
+    def cached(variables, batch, continuation):
+        model = built()[0]
+        _, made = model.apply(variables, batch.tokens.shape[0], method="init_cache", mutable=["cache"])
+        cache = made["cache"]
+        prefill, changed = model.apply({**variables, "cache": cache}, batch.tokens, **batch.kwargs(),
+                                       decode=True, mutable=["cache"])
         outputs = {"prefill": prefill}
         for step in range(continuation.shape[1]):
-            value, changed = model.apply({**native.variables, "cache": changed["cache"]},
-                                          continuation[:, step:step + 1], decode=True, mutable=["cache"])
+            value, changed = model.apply({**variables, "cache": changed["cache"]},
+                                         continuation[:, step:step + 1], decode=True, mutable=["cache"])
             outputs[f"step{step}"] = value
         return outputs
 
-    def ours(inputs, continuation):
+    def programs(inputs, continuation):
         rows = jnp.arange(1, inputs["input_ids"].shape[0], 2)
         batch = native.processor.from_hf(inputs).take_rows(rows).slice_tokens(0, 10)
-        return ours_cached(batch, continuation)
+        yield cached, (built()[1], widened(batch) if wide else batch, continuation)
+
+    def run(inputs, continuation):
+        with jax.enable_x64(new_val=wide):
+            ((program, held),) = programs(inputs, continuation)
+            return program(*held)
+
+    return as_given(run, programs=programs if wide else None)
+
+
+def cached_functions(source):
+    native, reference, truth = source
+    ours = cached_run(native)
 
     def theirs(model, inputs, continuation, *, wide=False):
         device = next(model.parameters()).device
@@ -396,12 +444,19 @@ def test_unified_runtime_observations_follow_the_reference(source, site, functio
         inputs, continuation = draw(seed)
         return {**inputs, "continuation": continuation}
 
+    def split(run):
+        return as_given(lambda inputs: run({name: value for name, value in inputs.items()
+                                            if name != "continuation"}, inputs["continuation"]),
+                        programs=None if run.programs is None else lambda inputs: run.programs(
+                            {name: value for name, value in inputs.items() if name != "continuation"},
+                            inputs["continuation"]))
+
     stored = recording(FIXTURE / f"{site}.npz")
     seeds = int(stored[f"{site}.seeds"])
-    recorded_draw, reference, truth = indexed_recording(stored, site, seeds, inputs_of=inputs_of)
-    assert_as_exact(as_given(lambda index, inputs: ours(
-        {name: value for name, value in inputs.items() if name != "continuation"}, inputs["continuation"])),
-        reference, recorded_draw, f"Gemma4 Unified {site}", seeds=seeds, truth_fn=truth)
+    recorded_draw, reference, truth = indexed_recording(stored, site, seeds, inputs_of=inputs_of,
+                                                        truth_fn=split(cached_run(source[0], wide=True)))
+    assert_as_exact(as_given(lambda index, inputs: split(ours)(inputs)), reference, recorded_draw,
+                    f"Gemma4 Unified {site}", seeds=seeds, truth_fn=truth)
 
 
 def optional_source(source, directory, media):

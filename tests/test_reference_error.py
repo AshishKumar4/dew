@@ -1760,10 +1760,10 @@ def test_a_truths_recording_holds_a_float64_path_to_the_references_function_belo
 
 
 def test_a_host_loops_float64_truth_is_held_by_the_programs_it_states():
-    """A float64 truth run as given, a host loop of compiled rows (each row's sums over its own valid length,
-    read from the draw on the host, as a decoder's rows run), states the programs a draw runs (`as_given`'s
-    `programs`), which the certifier traces to count the draw's roundings: it is held to a summarized
-    recording at every seed, and another function, a part in 2**30 off, is refused."""
+    """A float64 truth run as given, a host loop of compiled rows (each row's values over its own valid
+    length, read from the draw on the host, as a decoder's rows run), states the programs a draw runs
+    (`as_given`'s `programs`), which the certifier traces to count the draw's roundings: it is held to a
+    summarized recording at every seed, and another function, a part in 2**30 off, is refused."""
     from tool_support import load
 
     recorder = load("recorded_references")
@@ -1774,10 +1774,10 @@ def test_a_host_loops_float64_truth_is_held_by_the_programs_it_states():
 
     def evaluate(inputs):
         rows = [inputs["x"][row, :length] for row, length in enumerate(inputs["lengths"])]
-        return ({f"row{row}": np.cumsum(values, dtype=np.float32) for row, values in enumerate(rows)},
-                {f"row{row}": np.cumsum(values.astype(np.float64)) for row, values in enumerate(rows)})
+        return ({f"row{row}": values * values - np.float32(1) for row, values in enumerate(rows)},
+                {f"row{row}": values.astype(np.float64) ** 2 - 1 for row, values in enumerate(rows)})
 
-    summed = jax.jit(jnp.cumsum)
+    summed = jax.jit(lambda values: values * values - 1)
 
     def rows_of(inputs, scale=1.0):
         return [(summed, (jnp.asarray(inputs["x"][row, :length], jnp.float64) * scale,))
