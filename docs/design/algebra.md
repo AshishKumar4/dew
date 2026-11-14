@@ -255,8 +255,8 @@ fitted to them, and a rule set ships only with measured receipts.
     is built as an `OuterProgram` outside that one seam (SLOP025).
   - A training step's traced jaxpr already holds the backward, since autodiff runs at trace time.
   - Rewrites stay within checkpoint (remat) regions and never change what a step saves.
-  - The planner's gradient trace (`dew.training.footprint`) traces the same rewritten function before it prices
-    the program, so the planner prices what it compiles.
+  - The planner judges each candidate by XLA's memory analysis of the program it compiles, which the pass has
+    rewritten inside its lowering (docs/design/training.md §3), so the planner judges what it runs.
   - `dew.algebra.rewritten(fn)` is a public transform, and the seam's switch (`dew.algebra.passes`, §6.7) lets the
     accuracy gate run Dew's own programs with the pass on or off per arm (§3).
 - **Template hooks (compile time):** a hook is user code Dew cannot know in advance, a jaxpr, so it and its
@@ -872,7 +872,6 @@ class Rewrite:                        # one region's
 - The pass sits where a function is jitted (§2): an `OuterProgram` rewrites the trace its jit makes
   (`_traced`, `rewritten_program`), so `lower`, `trace`, `compiled` and every relowering read one program;
   `dew.training._candidates.step_program`'s step, the host-master phases and the rollouts are such programs.
-  `footprint` rewrites the jaxpr it traced the same way (`rewritten_program`) before it prices it.
 - A region is a window cluster (`program._windows`): each head a rule may lower the price at with the
   equations of the language that make its operands, `WINDOW` deep, windows that share an equation joined up to
   `CLUSTER` equations, each saturated and extracted in an e-graph of its own (§6.5), its cheaper roots' forms

@@ -99,7 +99,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                          "dew.decision.rows", "dew.decision.layout", "dew.decision.task",
                          "dew.decision.formats"]),
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.condition", "dew.inputs.encoders",
-                                   "dew.eval", "dew.eval.calibration",
+                                   "dew.interop.encoders", "dew.eval", "dew.eval.calibration",
                                    "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.lm", "dew.config.jepa", "dew.config.diffusion",
                        "dew.config.world_model", "dew.config.env", "dew.config.sweep"]),

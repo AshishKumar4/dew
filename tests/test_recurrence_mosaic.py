@@ -21,10 +21,10 @@ import jax.numpy as jnp
 import kernel_matrix
 import numpy as np
 import pytest
-from fla_sites import the_template_is_as_exact_as_fla
+from fla_sites import RECORDED, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU, lowers
 from kernel_compile import gate_generations
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, declared_seeds
 from test_recurrence_chunk import (
     FORMED,
     HOOKS,
@@ -135,17 +135,36 @@ def covering(routes: tuple) -> dict[tuple, frozenset]:
     case's launches run on every route's bundle in some arithmetic and pass. An fp32 call's gradient runs on
     every route: it trains on the interpreter's route alone and is checked refused on the others (the fast
     backward's 264 to 328 registers a thread), which no pair may count as covered. The whole cross took
-    52.3 task-hours of the suite at cd98dda014e, its covering 29.1 (jsf-forks6's draws)."""
+    52.3 task-hours of the suite at cd98dda014e, its covering 29.1 (jsf-forks6's draws). Each site is priced
+    by the seeds it draws (`recorded_seeds`), so the pairs a route must meet are met where they cost least:
+    priced alike, the covering put tcgen05's route, whose interpreted gradient took 9 s a draw against the
+    interpreter's own 1 to 2.3 (jsf-sitecost at 6a79aacd569), on two 256-seed gradients whose pairs a
+    128-seed gradient and the forward sites hold."""
     sites = sorted([(case, dtype, 'forward') for case, dtype in FORWARD_SITES]
                    + [site for site in INTERPRETED_GRADIENT if site[1] != 'fp32'])
     served = [{'route': route, 'case': case, 'dtype': dtype, 'pass': passed}
               for case, dtype, passed in sites for route in routes]
     seeded = [site for site in SEEDED_SITES if site['route'] in routes]
     covered = {site: frozenset(routes) for site in INTERPRETED_GRADIENT if site[1] == 'fp32'}
-    for cell in kernel_matrix.pairwise(served, seeded):
+    # The recording's seeds read once: the covering prices every combination each choice.
+    seeds = declared_seeds(RECORDED)
+    for cell in kernel_matrix.pairwise(served, seeded, cost=lambda site: recorded_seeds(site, seeds)):
         key = (cell['case'], cell['dtype'], cell['pass'])
         covered[key] = covered.get(key, frozenset()) | {cell['route']}
     return covered
+
+
+def recorded_site(case: str, dtype) -> str:
+    """Case `case`'s site of recorded fla-core in `dtype` at this machine's geometry (`fla_sites`)."""
+    label = {jnp.dtype(value): name for name, value in DTYPES.items()}[jnp.dtype(dtype)]
+    return f"mosaic/{case}/{label}/{'cpu' if mainloop.family_of() is None else 'gpu'}"
+
+
+def recorded_seeds(site: dict, seeds: dict[str, int]) -> int:
+    """The seeds a served site draws (`covering`'s price of it): its case's recorded fla-core seeds in its
+    dtype (`recorded_site`) of the recording's `seeds` (`declared_seeds`), which its forward and its gradient
+    each hold Dew to."""
+    return seeds[recorded_site(site['case'], DTYPES[site['dtype']])]
 
 
 COVERED = covering(ROUTES)
@@ -191,12 +210,6 @@ def geometry(case: str) -> dict:
     """Case `case`'s operands as `SHAPES` gives them, shortened and narrowed off a GPU of a family a bundle
     claims (`geometry_on`)."""
     return geometry_on(case, interpreted=mainloop.family_of() is None)
-
-
-def recorded_site(case: str, dtype) -> str:
-    """Case `case`'s site of recorded fla-core in `dtype` at this machine's geometry (`fla_sites`)."""
-    label = {jnp.dtype(value): name for name, value in DTYPES.items()}[jnp.dtype(dtype)]
-    return f"mosaic/{case}/{label}/{'cpu' if mainloop.family_of() is None else 'gpu'}"
 
 
 def geometry_on(case: str, interpreted: bool) -> dict:

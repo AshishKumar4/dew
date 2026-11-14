@@ -13,7 +13,7 @@ from flax.typing import PrecisionLike
 
 from dew import _cache
 from dew.mesh import mesh_axes
-from dew.nn.derivatives import Surrogate, contracted, declared_derivative
+from dew.nn.derivatives import KernelGlue, Surrogate, contracted, declared_derivative
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.formats import MxFp8, NvFp4Block
 from dew.nn.kernels.gemm import (
@@ -21,6 +21,7 @@ from dew.nn.kernels.gemm import (
     blockwise_fp8_product,
     gemm,
     gemm_t,
+    in_layer,
     mxfp8_product,
     nvfp4_block_product,
 )
@@ -320,10 +321,28 @@ def dot_general(xla, path: tuple | None = None):
             if launched(rows, rhs, out_dtype, precision):
                 out = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
                 return out.reshape(*lhs.shape[:-1], rhs.shape[1])
+            return _in_layer_product(xla, dimension_numbers, precision, preferred_element_type)(lhs, rhs)
         return xla(lhs, rhs, dimension_numbers, precision=precision,
                    preferred_element_type=preferred_element_type, **kwargs)
 
     return product
+
+
+def _in_layer_product(xla, dimension_numbers, precision, preferred_element_type):
+    """A projection's product no launch takes, XLA's own (`xla`), its reverse mode's cotangents leaving
+    together (`gemm.in_layer`), as the template's do: XLA's dot of its kernel gradient put off to the step's
+    end held its layer's cotangent to it (row 6027), whichever route the product's neighbours take. Its
+    forward and every derivative's value are `xla`'s, differentiated through it (`linear_tangent`)."""
+    def portable(lhs, rhs):
+        return xla(lhs, rhs, dimension_numbers, precision=precision,
+                   preferred_element_type=preferred_element_type)
+
+    def backward(saved, operands, cotangent):
+        del saved
+        return in_layer(*jax.vjp(portable, *operands)[1](cotangent))
+
+    return contracted("test_an_xla_projection_in_its_layer_holds_every_order")(generation.linear_tangent(
+        lambda lhs, rhs: (portable(lhs, rhs), ()), backward, portable, kind=KernelGlue()))
 
 
 def rows_split(lhs: jax.Array) -> jax.sharding.PartitionSpec | None:

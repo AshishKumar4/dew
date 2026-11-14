@@ -9,17 +9,26 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient, mosaic
-from dew.nn.kernels.templates.attention import Dropout
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    attention_gradient as gradient,
+    mosaic,
+    swizzling,
+)
+from dew.nn.kernels.templates.attention import Dropout, Param
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     TileWalk,
     _coords,
     _rows,
     _Spans,
+    held_params,
     issued_into,
     modelled,
+    param_types,
     reducing,
+    riding,
+    score_streams,
     staged_after,
     stages_after_walks,
     stated,
@@ -56,13 +65,14 @@ def dq_sums(dq: jax.Array, keyed: jax.Array, rows, count: int) -> gradient.DqSum
 
 
 def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
-                    stages: int) -> tuple[list, dict, list]:
+                    stages: int, params: tuple = ()) -> tuple[list, dict, list]:
     """The dQ program's allocations as `Family.scoped` takes them, in `_dq_launch`'s order, and those it
     scopes after its walks: its consumers' query and output-cotangent stages, their dQ output stage (fp32,
     its share of the config's `columns`; after the walks, in their slots, where the family scopes them apart,
     `stages_after_walks`) and their rows' stage, the two loads' barriers, each consumer's relay tile where
     its score cotangents reach dQ's product through shared memory (`Family.relay_bytes`, `_relayed`), and its
-    key and value streams in `stages` slots (`Family.streams`)."""
+    key and value streams in `stages` slots (`Family.streams`), beside them the streams of the score hook's
+    parameters that ride them (`params`, each its `Kind` and dtype: `score_streams`), staged plain."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     out = family.staged_memory((consumers, block_q, width // config.columns), jnp.float32)
     after = [out] if stages_after_walks(family) else []
@@ -73,15 +83,18 @@ def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, va
               family.load_barriers(consumers), family.load_barriers(consumers),
               *_relay_tiles(family, consumers, block_q, block_k, dtype)]
     blocks = {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}
+    hooked = score_streams(family, params, "keys", consumers * block_q, block_k)
     # The logits' and dP's products read the keys and values transposed.
-    return scoped, family.streams(blocks, stages, consumers,
-                                  swizzles=transposed_swizzles(config, "keys", "values")), after
+    swizzles = {**transposed_swizzles(config, "keys", "values"),
+                **dict.fromkeys(hooked, swizzling.UNSWIZZLED)}
+    return scoped, family.streams({**blocks, **hooked}, stages, consumers, swizzles=swizzles), after
 
 def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_of, whole, share, index, slots,
              rows, accumulators):
     """A dQ consumer's key tile `index`: its scores and score cotangents from the key and value slots
     (`slots`) and its queries and output cotangents (`operands`) under its rows' statistics (`stats`), the
-    tile's coordinates (`coords_of(k_first)`), its hook parameters (`params_of(like, k_first=k_first)`) and
+    tile's coordinates (`coords_of(k_first)`), its hook parameters (`params_of(like, k_first=k_first,
+    slots=slots)`, those riding the keys' stream its slots') and
     whether its block sees it whole (`whole(index)`). The row sums are carried (`rows`); dQ's and the keyed
     sums' products are issued into `accumulators` in place (`gradient.dq_issued`)."""
     q, do = operands
@@ -93,7 +106,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     s = family.product(q, k_slot.transpose((1, 0)), shape)
     dp = family.product(do, slots["values"].transpose((1, 0)), shape)
     slots.release("values")
-    params = params_of(s, k_first=k_first)
+    params = params_of(s, k_first=k_first, slots=slots)
     residual, mass, grads, weighed, keyed_mass, keyed_shift = rows
     # dQ's and the keyed sums' places stay empty: their products go to the accumulators.
     sums = gradient.DqSums(empty, residual, mass, grads, weighed, empty, keyed_mass, keyed_shift)
@@ -189,8 +202,8 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         out_smem, refs = (None, refs) if after is not None else (refs[0], refs[1:])
         row_smem, q_loaded, do_loaded, *relay = refs
         row, head, views, streams, pair_first, streamed = _query_program(
-            program, streams, k_ref, v_ref, spans_of, heads=heads, kv_heads=kv_heads, queries=queries,
-            consumers=consumers)
+            program, streams, k_ref, v_ref, spans_of, score=(score_refs, kinds), heads=heads,
+            kv_heads=kv_heads, queries=queries, consumers=consumers)
 
         def consumer(index):
             first = pair_first + index * block_q
@@ -205,7 +218,12 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
             # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
             coords_of = functools.partial(_coords, family, spans_of, row, first, shape=shape,
                                           draw=None if drop_of is None else drop_of.draw(row, head))
-            params_of = functools.partial(_score_params, family, score_refs, kinds, row, head, first)
+            # The query tile's parameters held across the walk, read once (`held_params`), each tile's of the
+            # keys' stream its step's (`_score_params`).
+            params_of = functools.partial(
+                _score_params, family, score_refs, kinds, row, head, first,
+                held=held_params(family, score_refs, kinds, row, head, first, block_q),
+                streamed=riding(family, kinds, "keys"), at=(index * block_q, 0))
             step = functools.partial(_dq_step, _relayed(walk, relay, index), operands, stats, coords_of,
                                      params_of, whole, share)
             start = (nothing, nothing, (nothing,) * len(kinds), (nothing,) * len(kinds), nothing,
@@ -239,7 +257,8 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         family.scheduled(consumers, consumer, producer)
 
     scoped, rings, after = _dq_allocations(family, program.tiles, width, value_width, query.dtype,
-                                           program.stages)
+                                           program.stages,
+                                           params=param_types(map(Param, score_params, kinds)))
 
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after))

@@ -20,7 +20,7 @@ from dew.nn.kernels.templates import (
     mosaic,
     swizzling,
 )
-from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, by_power, shared_place
+from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, Param, by_power, shared_place
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     TileWalk,
@@ -28,10 +28,15 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    held_params,
     holders,
     issued_into,
     modelled,
+    param_types,
     reducing,
+    riding,
+    score_streams,
+    score_views,
     split_queries,
     stages_after_walks,
     stated,
@@ -48,7 +53,8 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
 
 
 def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
-                     stages: int, columns: int = 1, tiled: bool = False) -> tuple[list, dict, list]:
+                     stages: int, columns: int = 1, tiled: bool = False,
+                     params: tuple = ()) -> tuple[list, dict, list]:
     """The dK/dV program's allocations as `Family.scoped` takes them, in `_dkv_launch`'s order: its consumers'
     resident keys and values; dK's output stage and dV's (the one stage where the widths agree), fp32, each
     its program's share of the `columns`; each consumer's stage for its key gradients' sums; the two loads'
@@ -61,7 +67,9 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     consumers feed their rings (`split_queries`) the consumers share one key block, held once, and each takes
     its share of a slot's queries: every block a product of theirs reads staged at the swizzle their share's
     contraction takes (`swizzling.swizzle_for`). The output and key gradients' stages, which no walk reads,
-    are scoped after the walks where the family scopes them apart (`stages_after_walks`), in their slots."""
+    are scoped after the walks where the family scopes them apart (`stages_after_walks`), in their slots. The
+    score hook's parameters that ride the stream of queries (`params`, each its `Kind` and dtype:
+    `score_streams`: a tile's keys-first block of the program's key block) take one each, staged plain."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     split = split_queries(family)
     holders, rows = (1, block_q // consumers) if split else (consumers, block_q)
@@ -102,7 +110,11 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     # stream's.
     transposed = transposed_swizzles(config, *(("logits",) if "logits" in blocks else ()), "douts")
     swizzles = transposed if swizzle is None else dict.fromkeys(blocks, swizzle)
-    return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles), after
+    # A tile parameter's blocks of one key block's, the one holder a launch streaming them takes
+    # (`MosaicBackward.legal`).
+    hooked = score_streams(family, params, "queries", block_k, block_q)
+    swizzles = {**swizzles, **dict.fromkeys(hooked, swizzling.UNSWIZZLED)}
+    return scoped, family.streams({**blocks, **hooked}, stages, consumers, swizzles=swizzles), after
 
 
 def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, store_tiles, shares, part,
@@ -112,11 +124,12 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     the product) and score cotangents from the query and output cotangent slots (`slots`) and its resident
     keys and values (`resident`), under the tile's queries' statistics (`rows_of(first query)`, in a column's
     layout), its coordinates (`coords_of(first query)`) and its hook parameters (`params_of(first query,
-    like)`). The weights and the score cotangents, their keys as their rows, are dV's and dK's left operands
-    from the registers (`algebra.value_operands`, `cotangent_product`'s `aᵀ @ b`), issued into `accumulators`
-    in place. The key gradients' sums (`carry`) take the pulled cotangents' row sums, and the tile gradients
-    go to `store_tiles(first query, pieces)`, `[bk, bq]` each. The consumer takes `part` of each slot's
-    queries (`(first, count)`, `split_queries`; the whole slot where its keys are its own)."""
+    like, slots=slots)`, those riding the queries' stream the slots'). The weights and the score cotangents,
+    their keys as their rows, are dV's and dK's left operands from the registers (`algebra.value_operands`,
+    `cotangent_product`'s `aᵀ @ b`), issued into `accumulators` in place. The key gradients' sums (`carry`)
+    take the pulled cotangents' row sums, and the tile gradients go to `store_tiles(first query, pieces)`,
+    `[bk, bq]` each. The consumer takes `part` of each slot's queries (`(first, count)`, `split_queries`; the
+    whole slot where its keys are its own)."""
     k_smem, v_smem = resident
     family, tiles, kinds = walk.program.family, walk.program.tiles, walk.kinds
     first_row, count = part
@@ -148,7 +161,8 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     read = walk.places_read(masked=True)
     fused = add_dq is not None
     coords = coords_of(q_first, shape=shape, read=read)
-    narrowed, logits, pieces = _weighed(walk, coords, params_of(q_first, s), s, dp, rows_of(q_first, count),
+    narrowed, logits, pieces = _weighed(walk, coords, params_of(q_first, s, slots=slots), s, dp,
+                                        rows_of(q_first, count),
                                         (do_slot.dtype, q_slot.dtype), one_part=fused)
     # dK's and dV's products against the program's share of the queries' and output cotangents' columns.
     (q0, q_share), (v0, v_share) = shares
@@ -497,8 +511,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         row, head = family.program_index("batch"), family.program_index("heads")
 
         named = {"queries": q_ref, "douts": do_ref, **({} if l_ref is None else {"logits": l_ref})}
-        views = _views_of(named, row, head)
-        streams = family.opened(streams, views)
+        views, streams = _query_streams(family, streams, named, (score_refs, kinds), row, head)
         pair_first = family.program_index("k_tiles") * pair
         holders = 1 if split else consumers
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
@@ -551,7 +564,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                                 lambda: family.stream(streams, views, *streamed))
 
     scoped, rings, after = _dkv_allocations(family, program.tiles, width, value_width, query.dtype,
-                                            stages=stages, columns=program.tiles.columns, tiled=tiled)
+                                            stages=stages, columns=program.tiles.columns, tiled=tiled,
+                                            params=param_types(map(Param, score_params, kinds)))
 
     def entry(*refs):
         summed = family.scoped(functools.partial(body, *refs), *scoped, streams=rings,
@@ -568,6 +582,17 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     return _dkv_launched(walk, launch, operands, graded, buffers, groups)
 
 
+def _query_streams(family: mosaic.Family, streams, named: dict, score: tuple, row, head) -> tuple[dict, dict]:
+    """A dK/dV program's views of its query streams (`named`'s refs, `_views_of`) beside those of its score
+    hook's parameters that ride them (`score`, their refs and kinds: `score_views`, at the program's key
+    tile), and its streams opened with them."""
+    refs, kinds = score
+    views = _views_of(named, row, head)
+    if riding(family, kinds, "queries"):
+        views |= score_views(family, refs, kinds, "queries", row, head, family.program_index("k_tiles"))
+    return views, family.opened(streams, views)
+
+
 def _consumer_step(walk: _Backward, place: tuple, k_first, index: int, holder: int, part: tuple, stage,
                    shares: tuple, *, refs: tuple, statistics) -> Callable:
     """A dK/dV consumer's step over the keys from `k_first` (`_dkv_step`), its query `part` of a slot, its
@@ -580,8 +605,13 @@ def _consumer_step(walk: _Backward, place: tuple, k_first, index: int, holder: i
                                     walk.interpret)
     coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first, keys_first=True,
                                   draw=None if drop_of is None else drop_of.draw(row, head))
-    params_of = functools.partial(_score_params, family, score_refs, walk.kinds, row, head, k_first=k_first,
-                                  keys_first=True)
+    # The key block's parameters held across the walk, read once (`held_params`), each query tile's of the
+    # queries' stream its step's, the consumer's queries of the slot (`_score_params`).
+    block_k = walk.program.tiles.block_k
+    params_of = functools.partial(
+        _score_params, family, score_refs, walk.kinds, row, head, k_first=k_first, keys_first=True,
+        held=held_params(family, score_refs, walk.kinds, row, head, k_first, block_k, along="queries"),
+        streamed=riding(family, walk.kinds, "queries"), at=(0, part[0]))
     adds = _fused_adds(walk, dq_ref, fused_stages, place, index, k_smem, holder)
     return functools.partial(_dkv_step, walk, (k_smem.at[holder], v_smem.at[holder]), statistics, coords_of,
                              params_of, store_tiles, shares, part, stage, adds)

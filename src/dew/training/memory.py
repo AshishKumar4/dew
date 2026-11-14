@@ -13,7 +13,6 @@ import logging
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -34,10 +33,7 @@ from dew.nn.kernels.templates import report
 from dew.nn.protocols import OffloadsResiduals, Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
-from dew.telemetry.instrumentation import compiled_memory
-
-if TYPE_CHECKING:
-    from dew.training.footprint import Footprint
+from dew.telemetry.instrumentation import CompiledMemory, compiled_memory
 
 _log = logging.getLogger(__name__)
 
@@ -341,8 +337,14 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     stats = compiled_memory(executable)
     if stats is None:
         return None
-    return admitted(devices, stats.argument - built, stats.output - stats.alias + held, stats.temp,
-                    placed=placed)
+    return admitted(devices, stats.argument - built, placed_beside(stats, held), stats.temp, placed=placed)
+
+
+def placed_beside(stats: CompiledMemory, held: int) -> int:
+    """The bytes a step's fit check places beside its temporaries (`step_headroom`): its outputs that write
+    over no donated argument, and the `held` bytes the loop keeps outside the step (copies, accumulators, a
+    state the devices hold none of yet), what a refusal states beside them (`Probe.beside`)."""
+    return stats.output - stats.alias + held
 
 
 MEMORY_STATS = ('bytes_limit', 'bytes_in_use', 'pool_bytes', 'largest_free_block_bytes', 'peak_bytes_in_use')
@@ -360,63 +362,40 @@ def peak_memory_gib() -> float | None:
     return max(peaks) / 1024 ** 3 if peaks else None
 
 
-def derived_headroom(footprint: Footprint | None, devices: Sequence, built: int = 0, *,
-                     placed: bool = True) -> tuple[int, int] | None:
-    """The least and most bytes the step would leave free, pooled over processes: its upper and lower
-    temporary bounds admitted beside its resident and held bytes by the same allocator rule as a
-    compiled step (`admitted`). One memory reading serves both bounds. None where no process can judge
-    a footprint. A nonnegative least fits; a negative most refuses; an interval spanning zero leaves the
-    compile to decide. A footprint with one bound keeps the previous single judgment."""
-    from dew._coordination import from_every_process
-
-    bounds: tuple[int, int] | None = None
-    if footprint is not None and (upper := footprint.temporaries) is not None:
-        lower = footprint.lower_temporaries
-        assert lower is not None
-        resident = sum(footprint.resident.values()) - built
-        memory = [device_memory(device, resident) for device in devices]
-        least = _admitted(devices, memory, footprint.held, upper, placed=placed)
-        most = least if lower == upper else _admitted(devices, memory, footprint.held, lower, placed=placed)
-        if least is not None and most is not None:
-            bounds = least, most
-    pooled = [value for value in from_every_process(bounds) if value is not None]
-    return None if not pooled else (min(value[0] for value in pooled), min(value[1] for value in pooled))
-
-
 def admitted(devices: Sequence, resident: int, beside: int, temporaries: int, *,
              placed: bool = True) -> int | None:
-    """The allocator's admission of a step, compiled (`step_headroom`) or derived (`derived_headroom`): the
-    bytes the tightest of `devices` has to spare once the step's `temporaries`, in one block, twice where
-    its allocator strands them (`stranding`), are placed beside `beside` more bytes, with `resident` bytes
-    in use already; None where a device states no memory. A compile-only GPU's stated memory holds
-    `resident` as it would (`device_memory`). Where the state is not `placed` yet, the devices' free bytes
-    in all hold them (`available`), not one block of them."""
+    """The allocator's admission of a compiled step (`step_headroom`): the bytes the tightest of `devices`
+    has to spare once the step's `temporaries`, twice where its allocator strands them (`stranding`), and
+    `beside` more bytes are placed, with `resident` bytes in use already (`_admitted`); None where a device
+    states no memory. A compile-only GPU's stated memory holds `resident` as it would (`device_memory`)."""
     memory = [device_memory(device, resident) for device in devices]
     return _admitted(devices, memory, beside, temporaries, placed=placed)
 
 
 def _admitted(devices: Sequence, memory: Sequence[Mapping[str, int]], beside: int,
               temporaries: int, *, placed: bool = True) -> int | None:
-    """The headroom at a fixed reading of the allocators, shared by both ends of a derived interval."""
+    """The headroom at a fixed reading of the allocators: the least, over `devices`, of two margins. XLA
+    takes a step's temporaries in one allocation, so they need one free block that large (`placeable`);
+    the bytes beside them (the outputs no donated argument holds, the copies, window and batches the loop
+    keeps) are allocations of their own, so with the temporaries they need the free bytes in all
+    (`available`), not that block: a GH200's 4B step, its 17.05 GiB of temporaries and 16.73 GiB of window
+    read in one 25.52 GiB block of 53.6 GiB free, was refused 8.26 GiB short (M-MC-3q). Where the state is
+    not `placed` yet, placing it reshapes the blocks, so the free bytes in all judge the temporaries too."""
     if not stated(memory):
         return None
-    room = placeable if placed else available
-    return min(room(m, unclaimed(d, m)) - beside - temporaries * stranding(d, m)
-               for d, m in zip(devices, memory, strict=True))
+    block = placeable if placed else available
+    margins = []
+    for device, held in zip(devices, memory, strict=True):
+        free = unclaimed(device, held)
+        needed = temporaries * stranding(device, held)
+        margins.append(min(block(held, free) - needed, available(held, free) - beside - needed))
+    return min(margins)
 
 
 def stated(memory: Sequence[Mapping[str, int]]) -> bool:
     """Whether every device's `memory` (`device_memory`) states its limit and its use, which a fit check
     reads; a CPU's states none, so no step's headroom on it is known ahead of its run."""
     return all('bytes_limit' in m and 'bytes_in_use' in m for m in memory)
-
-
-def judged(device) -> bool:
-    """Whether a step's footprint derived for `device` is judged against its memory (`derived_headroom`):
-    where it states its memory (`device_memory`), which a CPU does not, and a device with none attached (a
-    compile-only GPU, `dew.nn.kernels.generation.compile_only_gpus`) where its memory was stated. The plan's
-    walk and the footprint's trace read this one answer (`FitSearch.walked`)."""
-    return stated([device_memory(device)])
 
 
 def stranding(device, memory: Mapping[str, int]) -> int:
@@ -574,7 +553,7 @@ def temporaries_factor(mesh: Mesh) -> int:
 
 def pooled_headroom(headroom: int | None) -> int | None:
     """The pool's headroom, the same on every process: the tightest any process states of its own devices
-    (`headroom`, a compile's measure or a derivation's judgment), which reads only its own devices' memory;
+    (`headroom`, a compile's measure), which reads only its own devices' memory;
     a process that states none does not affect it, and None where none states one."""
     from dew._coordination import from_every_process
 
@@ -648,18 +627,11 @@ def recompute_more[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     return climbed(objective, base) is not None
 
 
-def headed_more[LossT, EffectsT](objective: Objective[LossT, EffectsT],
-                                  base: tuple[int, int] | None = None) -> bool:
-    """Move the objective one rung up its ladder where the rung is its head's (`climbed`'s without its
-    remat), and return whether there was one: a run that states its remat climbs no further."""
-    return climbed(objective, base, remat=False) is not None
-
-
 def climbed[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                              base: tuple[int, int] | None = None, *, remat: bool = True) -> str | None:
     """Move the objective one rung up its ladder as `recompute_more` does, and say what it moved to,
     None where there was no rung: the words a search that compiles again there logs
-    (`dew.training.planning.FitSearch.climb`), which a derivation's walk, compiling nothing, does not.
+    (`dew.training.planning.FitSearch.climb`).
     Without `remat` the ladder ends at its head's rungs (the generation's tile for the whole logits, then
     that tile unfused): a run that states its remat keeps it (docs/design/training.md, every choice can be
     overridden)."""

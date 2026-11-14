@@ -18,7 +18,6 @@ import importlib.metadata
 import json
 import os
 import pickle
-import subprocess
 from collections.abc import Callable, Mapping
 from functools import cached_property
 from pathlib import Path
@@ -382,11 +381,11 @@ def store_of(flow: Flow) -> Path:
 
 
 def stamp() -> str:
-    """The commit and JAX the flows' truths are prepared and read at: a truth another computed is never
-    read (`reference_error.stored_truths`)."""
-    commit = subprocess.run(["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
-                            check=True, capture_output=True, text=True).stdout.strip()
-    return f"{commit} jax {jax.__version__} jaxlib {importlib.metadata.version('jaxlib')}"
+    """The commit (`map_judge.commit`) and JAX the flows' truths are prepared and read at: a truth another
+    computed is never read (`reference_error.stored_truths`)."""
+    from map_judge import commit
+
+    return f"{commit()} jax {jax.__version__} jaxlib {importlib.metadata.version('jaxlib')}"
 
 
 def _flat(flow: Flow, program: Callable):

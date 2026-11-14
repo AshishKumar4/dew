@@ -9,7 +9,7 @@ Its layouts are its operands' dtype's (`Layout.MMA_ACC(dtype)`), so a bundle is 
 import abc
 import dataclasses
 import functools
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any, Self
 
 import jax
@@ -30,6 +30,7 @@ from dew.nn.kernels.templates import (
     persistent,
     report,
     resources,
+    stores,
     swizzling,
 )
 from dew.nn.kernels.templates.cost import Stated, Work
@@ -637,7 +638,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             def copied(smem):
                 # The row-copy ladder needs strided layouts, not optimized-only transfers.
                 plgpu.store(smem, value.astype(smem.dtype), optimized=False)
-                mosaic.store_rows(smem, ref, *place, copy=swizzling.copied,
+                stores.store_rows(smem, ref, *place, copy=swizzling.copied,
                                   widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
             pl.run_scoped(copied, staging[output])
@@ -657,10 +658,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, products: Sequence[mosaic.Product] = ()
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
         # each stage back as its step ends, so no step holds one past it, nor reads one ahead.
-        if ahead:
+        if mosaic.ahead_streams(products):
             raise NotImplementedError(f"{self.name}'s pipeline reads no stream ahead")
         del first, in_flight, unrolled
         segments = mosaic.stepped(segments)
@@ -725,7 +727,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 continue
             plgpu.store(smem, part.astype(smem.dtype), optimized=False)
             rows = smem.shape[0]
-            mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
+            stores.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
                               widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:

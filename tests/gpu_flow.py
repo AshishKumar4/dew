@@ -44,14 +44,18 @@ def held(combination: Mapping[str, str], *, values: bool = True) -> set:
     return {*itertools.combinations(items, 2), *((item,) for item in items if values)}
 
 
-def greedy(combinations: Sequence[Mapping[str, str]], left: set, *, values: bool = True) -> list[int]:
+def greedy(combinations: Sequence[Mapping[str, str]], left: set, *, values: bool = True,
+           cost: Callable[[Mapping[str, str]], float] | None = None) -> list[int]:
     """The indices of the fewest of `combinations` holding everything `left` names (`held`), chosen greedily:
-    the one holding the most not yet held first, a tie to the first in their order."""
+    the one holding the most not yet held first, a tie to the first in their order; where a `cost` prices
+    each combination, the most a unit of its cost, so the cheapest that hold what is left are taken."""
     chosen = []
     left = set(left)
+    priced = cost or (lambda combination: 1)
     while left:
         best = max(range(len(combinations)),
-                   key=lambda index: len(left & held(combinations[index], values=values)))
+                   key=lambda index: len(left & held(combinations[index], values=values))
+                   / priced(combinations[index]))
         if not left & held(combinations[best], values=values):
             raise ValueError(f"no combination holds {sorted(left)[:5]}")
         chosen.append(best)

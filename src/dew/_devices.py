@@ -230,9 +230,16 @@ opened before Dew prepared it."""
 
 WRITTEN = "DEW_POOL_WRITTEN"
 """The environment variable naming the fraction Dew wrote and what wrote it (`write_share`), as `share:by`:
-`dew`, its own share, or `sized`, lowered to leave the host's communicators room
-(`dew.communicators.sized_pool`). In the environment, so a process started from one Dew prepared (a data
-worker, a launcher's child) inherits it beside the fraction, which it states as Dew's, not the run's."""
+`dew`, its own share, `sized`, lowered to leave the host's communicators room
+(`dew.communicators.sized_pool`), or `named`, the run's own (`dew.training.share_pool`). In the
+environment, so a process started from one Dew prepared (a data worker, a launcher's child) inherits it
+beside the fraction, which it states as what wrote it (`pool_statement`)."""
+
+
+def allocator() -> str:
+    """The GPU allocator this process's backend will take, as JAX reads it (`XLA_PYTHON_CLIENT_ALLOCATOR`):
+    `default` or `bfc`, XLA's own pool, or `platform`, which holds none."""
+    return os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "default").lower()
 
 
 def write_share(share: float, by: str) -> None:
@@ -246,8 +253,13 @@ def pool_statement() -> dict[str, JSON]:
     """The pool's share this process planned against and its source, which a plan records: `named`, a
     fraction the run named; `dew` or `sized`, Dew's share written as Dew prepared the process
     (`write_share`); `jax`, JAX's default, where the backend opened before anything wrote one; `platform`,
-    the platform's allocator, which holds no pool and no share."""
-    if os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "default").lower() == "platform":
+    the platform's allocator, which holds no pool and no share; and a process without JAX's CUDA plugin
+    (a TPU's, a CPU's, ROCm's), whose devices hold no such share, its platform's name."""
+    if not cuda_plugin():
+        import jax
+
+        return {"share": None, "source": jax.default_backend()}
+    if allocator() == "platform":
         return {"share": None, "source": "platform"}
     named = next((os.environ[name] for name in FRACTIONS if name in os.environ), None)
     if named is None:
@@ -274,7 +286,7 @@ def pool_share() -> float:
     named = os.environ.get(fraction_name())
     if named is not None:
         return float(named)
-    if os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "default").lower() == "platform":
+    if allocator() == "platform":
         raise ValueError("XLA_PYTHON_CLIENT_ALLOCATOR=platform holds no pool, so no plan has a limit to be "
                          "made against: name XLA's own allocator, or a fraction")
     return DEW_SHARE
@@ -320,8 +332,7 @@ def pool_bound(*, cuda: bool) -> float | None:
     among them, which grows to that share, the room outside it its communicators and code take beside it as
     a preallocated pool's. None where the pool holds no share: a process off CUDA, or another allocator than
     XLA's own BFC pool."""
-    allocator = os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "default").lower()
-    if not cuda or allocator not in ("default", "bfc"):
+    if not cuda or allocator() not in ("default", "bfc"):
         return None
     return pool_share()
 
@@ -349,8 +360,7 @@ def preallocate_gpu_pool() -> None:
     (`dew.training.runtime.pooled`)."""
     if backend_open():
         return
-    platform = os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "default").lower() == "platform"
-    if cuda_plugin() and not platform and not any(name in os.environ for name in FRACTIONS):
+    if cuda_plugin() and allocator() != "platform" and not any(name in os.environ for name in FRACTIONS):
         write_share(DEW_SHARE, "dew")
 
 

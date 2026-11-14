@@ -65,6 +65,7 @@ from dew.nn.kernels.templates import (
     mosaic_sm100,
     resources,
     rings,
+    stores,
     swizzling,
     tail as tail_of,
 )
@@ -700,7 +701,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     deep, with no hooks, pair, packed matrix or split. With `mx_scales`, an MX product (`_mx_refused`; row
     4519). With `gather` (int32 `[rows]`), row `i` is `lhs[gather[i]]`, read where it lies by the producer
     (`gathered.Ring`; interpreted, `Ring.parts`); with `scatter` (int32 `[rows]`, a permutation), row `i`
-    lands at the outputs' row `scatter[i]`, once (`mosaic.Scattered`): a mixture of experts' sort and its
+    lands at the outputs' row `scatter[i]`, once (`stores.Scattered`): a mixture of experts' sort and its
     undoing fused into the loads and the stores (row 1376), each refused as `_tables_refused` says.
 
 Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of `lhs` (a cooperative
@@ -1014,7 +1015,7 @@ def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family,
     group, row_start, ni, _, gathered, program, split = tile
     # A depth split's run stores its partial in its own slice of each output.
     o_gmems = o_gmems if split is None else tuple(
-        dataclasses.replace(o_gmem, ref=o_gmem.ref.at[split]) if isinstance(o_gmem, mosaic.Scattered)
+        dataclasses.replace(o_gmem, ref=o_gmem.ref.at[split]) if isinstance(o_gmem, stores.Scattered)
         else o_gmem.at[split] for o_gmem in o_gmems)
     # This consumer's share of the tile: its first row, and its group's rows there.
     part_row, column = row_start + share_row, ni * part[1]
@@ -1226,10 +1227,10 @@ def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs
 
 
 def _outputs(o_gmems: tuple, scatter_gmem, interpret: bool) -> tuple:
-    """Dew: a `gmm` kernel's outputs, each `mosaic.Scattered` through `scatter_gmem` where the call has
+    """Dew: a `gmm` kernel's outputs, each `stores.Scattered` through `scatter_gmem` where the call has
     one."""
     if scatter_gmem is not None:
-        return tuple(mosaic.Scattered(o_gmem, scatter_gmem, interpret) for o_gmem in o_gmems)
+        return tuple(stores.Scattered(o_gmem, scatter_gmem, interpret) for o_gmem in o_gmems)
     return o_gmems
 
 
@@ -1296,7 +1297,7 @@ def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, den
     (`m` of them; `row_unit`: a TMA descriptor's 8; a tile's rows where its family stores whole tiles) and
     extended to the schedule's extent where the family's loads past
     the rows are not zeros (`bounded`), and a scattered product's table to the extent, its padded and
-    extended rows stored nowhere (`mosaic.Scattered`): `(lhs, gather, scatter, m, extent)`. The rows past
+    extended rows stored nowhere (`stores.Scattered`): `(lhs, gather, scatter, m, extent)`. The rows past
     the routed ones, the padding among them, are a last group, whose tiles store zeros; a group's tiles
     start at its first row (`tile_groups`), so a tile reads up to a tile's rows past the last group's first.
     Where the loads read zeros past an operand's rows (TMA's) the operands stay as they are; elsewhere every
@@ -1329,7 +1330,7 @@ def _tables_refused(gather, scatter, tiles: Tiles, family: mosaic.Family, *, pro
     """Dew: `gmm`'s refusal of a gathered product (`gather`) but on a family that gathers rows beside the
     matrix's whole loads (`Family.gathers_rows`, `gathers_alone`), of no prologue, transposed rows or dense
     call, and of a scattered one
-    (`scatter`) but a grouped call's on such a family (its stores `mosaic.staged_rows`')."""
+    (`scatter`) but a grouped call's on such a family (its stores `stores.staged_rows`')."""
     gathers = family.gathers_rows and family.gathers_alone
     if gather is not None and (prologue is not None or dense or transpose_lhs or not gathers):
         raise ValueError(f"a gathered product's rows are a ring family's gather, with no prologue, "
@@ -2166,7 +2167,7 @@ def ragged_rows(m: int, *, prologue, k_major: bool) -> bool:
 def _tgmm_place(m: int, start, column, tiles: Tiles) -> tuple:
     """Dew: where a consumer's share of a kernel gradient's tile from row `start` and `column` is stored
     (`Family.persist`'s `store`): its rows within the depth `m` (`ragged_rows`: a partial last tile's), in
-    `mosaic.store_rows`' ladder of the share's rows down to their least multiple the depth leaves; the share
+    `stores.store_rows`' ladder of the share's rows down to their least multiple the depth leaves; the share
     whole where the tile divides the depth."""
     share = tiles.block_m // tiles.warpgroups
     if m % tiles.block_m == 0:

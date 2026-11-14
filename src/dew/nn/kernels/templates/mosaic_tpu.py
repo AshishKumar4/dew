@@ -11,7 +11,7 @@ programs, one a core. A program is one role: no producer runs beside it, and not
 
 import contextvars
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -385,10 +385,11 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, products: Sequence[mosaic.Product] = ()
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         # Each step's blocks awaited before it and the next step's copied while it multiplies; a segment
         # of no steps copies nothing. Its products are synchronous: no stage outlives its step.
-        if ahead:
+        if mosaic.ahead_streams(products):
             raise NotImplementedError(f"{self.name}'s walk reads no stream ahead")
         del first, in_flight, unrolled, interpret
         segments = mosaic.stepped(segments)

@@ -129,7 +129,7 @@ def split_executable(run, args, specs, mesh: jax.sharding.Mesh):
 
 
 def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, truth_fn, moves=(),
-                          donate=(), arm=None, also=None) -> None:
+                          donate=(), arm=None, also=None):
     """The custom-kernel contract (module docstring): `fn` on `draw(seed)`'s arguments placed on `mesh`
     by `specs` (PartitionSpecs) is on par with `fn` on one device over the site's declared `seeds`
     (check 1, `assert_as_exact`), both measured from `truth_fn`, the float64 tree of `fn`'s outputs on
@@ -138,14 +138,15 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     exchange), which XLA, unable to split an opaque call, would otherwise insert to replicate it; and no
     copy or transpose at a kernel call's edge (`boundary_copies`). `donate` names the arguments `fn`
     takes in place, as its callers donate them (a kernel that aliases its state into its output): a
-    call that keeps them would make XLA copy each before the kernel overwrites it. Both arms are Dew's
-    programs, compiled here as the gate compiles two Dew arms (`without_ynn`) and run as given: the
-    split one is the executable whose collectives the contract reads. `arm`, when given, is the arm the
-    split is compared with in place of `fn` on one device: a call whose rounding depends on the shapes it
-    runs at is compared with the shapes its shards run. A caller passing `arm` also asserts the split
-    against the reference path (check 1 against float64), so the comparison with `arm` alone is not the
-    whole contract: `also`, `(label, arm)`, is that second arm, compared with the same split runs (each
-    draw's split run once, `assert_as_exact`'s further references)."""
+    call that keeps them would make XLA copy each before the kernel overwrites it. Every arm is Dew's
+    program, compiled here as the gate compiles two Dew arms (`without_ynn`) and run as given: the
+    split one is the executable whose collectives the contract reads, which it returns. `arm`, when
+    given, is the arm the split is compared with in place of `fn` on one device (a plain function,
+    compiled as the split is): a call whose rounding depends on the shapes it runs at is compared with
+    the shapes its shards run, a call through an exchange with the whole sequence. A caller passing
+    `arm` may also assert the split against the reference path (check 1 against float64): `also`,
+    `(label, arm)`, is that second arm, compiled alike and compared with the same split runs (each draw's
+    split run once, `assert_as_exact`'s further references)."""
     run = without_ynn(fn, donate_argnums=donate)
     compiled = split_executable(run, draw(0), specs, mesh)
     text = compiled.as_text()
@@ -165,9 +166,11 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     def one_device(*args):
         return run(*kept(args))
 
+    reference = as_given(one_device) if arm is None else as_given(without_ynn(arm))
+    further = None if also is None else {also[0]: as_given(without_ynn(also[1]))}
     # Each draw's split run once, against `also`'s arm too (`assert_as_exact`'s further references).
-    assert_as_exact(as_given(split), as_given(one_device) if arm is None else arm, draw, label, seeds=seeds,
-                    truth_fn=truth_fn, also=None if also is None else dict([also]))
+    assert_as_exact(as_given(split), reference, draw, label, seeds=seeds, truth_fn=truth_fn, also=further)
+    return compiled
 
 
 VIEWS = frozenset({"bitcast", "get-tuple-element", "tuple", "parameter"})

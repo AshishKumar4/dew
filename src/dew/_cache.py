@@ -348,6 +348,13 @@ WHOLE = jax.make_user_context(default_value=False)
 is: a trace reads it, so a call's identity states it with JAX's trace context, and a program traced whole
 is never run staged."""
 
+PLACING = jax.make_user_context(default_value=None)
+"""What places the traced program's parameters (`dew.nn.sharding.placing`: a trainer's layout, or
+`dew.nn.sharding.FORWARD` for a served or scored model's forward-only trace, each weight whole), None
+outside any, keyed on as `WHOLE` is: a projection mapped per shard reads it as it traces, so a call's
+identity states it with JAX's trace context, and a program traced under one placement is never run under
+another."""
+
 KERNEL_SEEN = jax.make_user_context(default_value=None)
 """The collection a lowering records its kernel launches into as it traces them
 (`dew.nn.kernels.tuning.seen`): JAX keys its trace caches on its identity, so a
@@ -398,6 +405,36 @@ QUANTIZED_TRACE = jax.make_user_context(default_value=None)
 so a trace of one taken under the swap holds its quantized product, which JAX's
 cache would hand a later plain call of the same shapes, and a plain trace a
 quantized call. In this context their traces are kept apart."""
+
+
+TRACED = (KERNEL_TUNES, ALGEBRA, DERIVED, WHOLE, PLACING, KERNEL_PINS, KERNEL_ASSUMED, KERNEL_CHOICES,
+          NUMERICS, PROJECTION_ROLE, QUANTIZED_TRACE)
+"""The contexts a program's trace reads, beside the contexts it records into (`RECORDING`): JAX keys its
+caches on each, and each holds per thread, so a trace in another thread (a run's later phases planned off
+its loop, `dew.training.ahead.LaterPlans`) reads them as its loop did only where they are carried
+(`carried`)."""
+
+
+def carried() -> Callable[[], contextlib.AbstractContextManager[None]]:
+    """This thread's trace-affecting states as they stand (`TRACED`, and JAX's default matmul precision and
+    x64, which hold per thread too), entered again by what this returns in another thread: a run's numerics
+    and kernel choices (`dew.config.RunConfig.traced`) among them, so a program it traces there is the one
+    its loop traces, under the same keys."""
+    from jax._src import config
+
+    held = [(context, context.value) for context in TRACED]
+    states = [(state, state.value) for state in (config.default_matmul_precision, config.enable_x64)]
+
+    @contextlib.contextmanager
+    def entered() -> Iterator[None]:
+        with contextlib.ExitStack() as stack:
+            for context, value in held:
+                stack.enter_context(context(value))
+            for state, value in states:
+                stack.enter_context(state(value))
+            yield
+
+    return entered
 
 
 def unintercepted[**Arguments, Result](function: Callable[Arguments, Result]) -> Callable[Arguments, Result]:

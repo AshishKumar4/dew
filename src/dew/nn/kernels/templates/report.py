@@ -728,7 +728,7 @@ def targeted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
              ) -> jax.stages.CompilerOptions | None:
     """`options` for the target `lowered` compiles for: on compile-only GPUs (`deviceless`) nothing runs to
     autotune a product on, and XLA's config assigner already gives each matmul its default config there
-    (`dew.training.footprint.gemm_workspace`) while its autotuner still compiles the candidates it cannot
+    while its autotuner still compiles the candidates it cannot
     time, and a GEMM fusion whose candidates are cuBLASLt's fails ("CublasLtBackend cannot enumerate
     configs in deviceless mode"), so the program skips them (`xla_gpu_autotune_level` 0), its memory the
     same (a frontier search's every probe and rung, 142 s to 99 s on armada, 11-02). A run's own XLA_FLAGS

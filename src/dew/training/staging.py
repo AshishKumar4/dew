@@ -14,8 +14,6 @@ barriers between the chunks: the same arithmetic in another schedule.
 
 from __future__ import annotations
 
-import contextlib
-import contextvars
 import dataclasses
 import math
 from collections.abc import Callable, Sequence
@@ -24,7 +22,7 @@ import jax
 import jax.extend.core as jcore
 from jax.core import ShapedArray
 
-from dew.distributed.placement import placed_bytes, placed_shapes
+from dew.distributed.placement import placed_shapes
 from dew.nn.programs import computed, inlined, purely_called
 
 CHUNKS = 16
@@ -122,25 +120,6 @@ def chunks(equations: Sequence[jcore.JaxprEqn], fields: Sequence[jcore.Var], siz
     return cut, taking, reads
 
 
-_MEASURED: contextvars.ContextVar[tuple[list[int], ...]] = contextvars.ContextVar("staged_bytes", default=())
-"""Where `staged` reports, as a step is traced, the bytes of its fields the device holds at once: each
-`measured` the trace runs within (`measured`)."""
-
-
-@contextlib.contextmanager
-def measured():
-    """The bytes of its host-resident fields a commit traced within holds on the device at once, each
-    `staged` region's (a device's share of each leaf: the chunk it computes and the one it fetches as it
-    stores the chunk before, the two largest): the planner's measure of a staged commit is the step's own
-    cut (`dew.training.footprint.Footprint.staged`). A measure within another reports to both."""
-    found: list[int] = []
-    token = _MEASURED.set((*_MEASURED.get(), found))
-    try:
-        yield found
-    finally:
-        _MEASURED.reset(token)
-
-
 def in_device(tree) -> bool:
     """Whether every leaf of `tree` is in device memory."""
     return all(jax.typeof(leaf).memory_space == jax.memory.Space.Device for leaf in jax.tree.leaves(tree))
@@ -195,12 +174,6 @@ def staged(fn: Callable, resting, shardings, arguments: tuple, after) -> tuple:
     cut, taking, reads = chunks(equations, variables, [math.prod(field.shape) * field.dtype.itemsize
                                                        for field in fields])
     chunk_of = {index: number for number, members in enumerate(cut) for index in members}
-    if measuring := _MEASURED.get():
-        # The scalar fields, no chunk's, are fetched first and held throughout.
-        shares = sorted((placed_bytes([shapes[index] for index in members]) for members in cut), reverse=True)
-        first = placed_bytes([shape for index, shape in enumerate(shapes) if index not in chunk_of])
-        for found in measuring:
-            found.append(min(placed_bytes(shapes), first + sum(shares[:2])))
     position = {variable: index for index, variable in enumerate(variables)}
 
     def phase(read: frozenset[int]) -> int:

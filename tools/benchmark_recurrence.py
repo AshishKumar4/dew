@@ -5,7 +5,7 @@ backward, timed in one GPU session for every arm that computes it, and one markd
 Arms, each on the same operands:
 
 - `template`: `recurrence_chunk.chunk`, its route as the GPU's row picks it (the short conv's is `hand`'s,
-  `linear.causal_conv1d`, the template's conv);
+  `linear.causal_conv1d`, the template's conv; log-linear attention's `log_linear.log_linear_attention`);
 - `mosaic`: the same call with the recurrence template named (`generation.chosen`), on the cells whose route
   takes a port (`recurrence_chunk.PORT_CELLS`, `SCAN_CELLS`) as on the rest;
 - `hand`: the kernel the template replaces, called directly: the delta rule's port (`fla_rule`,
@@ -13,7 +13,8 @@ Arms, each on the same operands:
   the shape), the short conv's kernel (`linear.causal_conv1d`);
 - `xla`: the portable math in XLA (`chunk` with `generation.chosen`'s 'xla', `linear.xla_conv1d`);
 - `fla`: fla's own torch/Triton kernels (`chunk_gated_delta_rule` on the queries and keys repeated
-  over the value heads, as the layers hand them to it, `chunk_kda`, `causal_conv1d`);
+  over the value heads, as the layers hand them to it, `chunk_kda`, `causal_conv1d`,
+  `chunk_log_linear_attn`);
 - `mamba_ssm`: mamba_ssm's `mamba_chunk_scan_combined`;
 - `flashqla`: FlashQLA's TileLang kernels (`flash_qla.chunk_gated_delta_rule`, Hopper and Blackwell only),
   the gated delta rule's queries and keys a key head each, as its API takes them.
@@ -60,7 +61,8 @@ import numpy as np
 class Shape:
     """A model's recurrent layer at one row of `length` tokens: `kind` 'gdn' (a decay a head),
     'kda' (a decay a key dimension), 'ssd' (Mamba2's, `key_heads` its groups, `key_width` its state,
-    `value_width` its head width) or 'conv' (the short conv over the gated delta net's projection)."""
+    `value_width` its head width), 'loglinear' (log-linear attention on Mamba2's backbone, its fields the
+    SSD's) or 'conv' (the short conv over the gated delta net's projection)."""
     kind: str
     key_heads: int
     value_heads: int
@@ -85,12 +87,16 @@ SHAPES = {
     'nemotron-h-30b-ssd': Shape('ssd', 8, 64, 128, 64, chunk=128),
     # The Qwen3.5-27B gated delta net's conv over its queries, keys and values.
     'qwen3.5-27b-conv': Shape('conv', 16, 48, 128, 128),
+    # fla's LogLinearMamba2Config (Mamba2Config's defaults): hidden 2048, expand 2, heads of 64, state 128,
+    # one group: 64 heads (row 1446).
+    'log-linear-mamba2': Shape('loglinear', 1, 64, 128, 64),
 }
 """The real shapes. Dory 1.0 4B has none: its layers are attention and MLP (its config.json)."""
 
 ARMS = {'gdn': ('template', 'mosaic', 'hand', 'xla', 'fla', 'flashqla'),
         'kda': ('template', 'mosaic', 'hand', 'xla', 'fla'),
-        'ssd': ('template', 'mosaic', 'hand', 'xla', 'mamba_ssm'), 'conv': ('hand', 'xla', 'fla')}
+        'ssd': ('template', 'mosaic', 'hand', 'xla', 'mamba_ssm'), 'conv': ('hand', 'xla', 'fla'),
+        'loglinear': ('template', 'mosaic', 'xla', 'fla')}
 
 JAX_ARMS = ('template', 'mosaic', 'hand', 'xla')
 """The arms `jax` mode runs (`jax_arms`), each on the shapes whose `ARMS` list it."""
@@ -107,6 +113,9 @@ def flops(shape: Shape) -> float:
         return model.conv_flops(lengths, channels, channels, shape.taps, groups=channels)
     if shape.kind == 'ssd':
         return model.ssd_flops(lengths, shape.value_heads, shape.key_width, shape.value_width)
+    if shape.kind == 'loglinear':
+        return model.log_linear_flops(lengths, shape.value_heads, shape.key_width, shape.value_width,
+                                      _levels(shape.length))
     return model.delta_flops(lengths, shape.value_heads, shape.key_width, shape.value_width)
 
 
@@ -137,11 +146,21 @@ def operands(shape: Shape, seed: int = 0) -> dict[str, np.ndarray]:
     q, k = (normal(batch, length, shape.key_heads, shape.key_width) for _ in range(2))
     q, k = (x / np.linalg.norm(x, axis=-1, keepdims=True) for x in (q, k))
     decay = (batch, length, shape.value_heads) + ((shape.key_width,) if shape.kind == 'kda' else ())
-    return {'q': q, 'k': k, 'v': normal(batch, length, shape.value_heads, shape.value_width),
-            'g': -np.log1p(np.exp(normal(*decay) + 2.0)).astype(np.float32) / 8,
-            'beta': 1 / (1 + np.exp(-normal(batch, length, shape.value_heads))),
-            'do': normal(batch, length, shape.value_heads, shape.value_width),
-            'dfinal': normal(batch, shape.value_heads, shape.key_width, shape.value_width)}
+    given = {'q': q, 'k': k, 'v': normal(batch, length, shape.value_heads, shape.value_width),
+             'g': -np.log1p(np.exp(normal(*decay) + 2.0)).astype(np.float32) / 8,
+             'beta': 1 / (1 + np.exp(-normal(batch, length, shape.value_heads))),
+             'do': normal(batch, length, shape.value_heads, shape.value_width),
+             'dfinal': normal(batch, shape.value_heads, shape.key_width, shape.value_width)}
+    if shape.kind == 'loglinear':
+        # Each query's level weights, softplus as fla's layer forms them.
+        given['scales'] = np.log1p(np.exp(normal(batch, length, shape.value_heads, _levels(length))))
+    return given
+
+
+def _levels(length: int) -> int:
+    """The level weights a token of a `length`-token sequence takes, fla's `ceil(log2 T) + 1`
+    (`log_linear.levels`, which `torch` mode, importing no Dew, cannot call)."""
+    return int(np.ceil(np.log2(length))) + 1
 
 
 def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, object]:
@@ -152,7 +171,7 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
     import jax.numpy as jnp
 
     from dew.nn import linear
-    from dew.nn.kernels import generation, mamba_ssd, recurrence
+    from dew.nn.kernels import generation, log_linear, mamba_ssd, recurrence
     from dew.nn.kernels.recurrence_chunk import SCAN, Chunk, chunk, fla_rule, scan_case
     from dew.nn.mixers.mamba2 import SSD
 
@@ -179,10 +198,22 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
                 return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, None, None, shape.chunk,
                                           not generation.triton_runs())
 
+            hands = {'hand': hand}
+
             # What the kernels take, whatever this GPU's row prefers.
             case = scan_case(x, B, shape.chunk)
             refusals['hand'] = '; '.join(refusal.detail for refusal in SCAN.kernel('pallas').refusals(case))
             cotangents = (given['dy'], given['dfinal'])
+        elif shape.kind == 'loglinear':
+            inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'], given['scales'])
+
+            def template(q, k, v, g, scales):
+                # Scaled by one, as fla's kernel is unscaled.
+                return (log_linear.log_linear_attention(q, k, v, g, scales, scale=1.0),)
+
+            # No kernel of its own beside the template's.
+            hands = {}
+            cotangents = (given['do'],)
         else:
             # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
             hooks = recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
@@ -196,6 +227,8 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
             def hand(q, k, v, g, beta):
                 return fla_rule(q, k, v, g, beta, scale=shape.key_width ** -0.5)
 
+            hands = {'hand': hand}
+
             cotangents = (given['do'], given['dfinal'])
 
         def xla(*args):
@@ -207,7 +240,7 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
             with generation.chosen(gated_delta_rule='mosaic_gpu', ssd='mosaic_gpu'):
                 return template(*args)
 
-        arms = {'template': template, 'mosaic': mosaic, 'hand': hand, 'xla': xla}
+        arms = {'template': template, 'mosaic': mosaic, **hands, 'xla': xla}
     return arms, refusals, inputs, cotangents
 
 
@@ -303,6 +336,20 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
             return rule(q=q, k=k, v=v, g=g, beta=beta, scale=shape.key_width ** -0.5, output_final_state=True)
 
         cotangents = (given['do'].to(bf16), given['dfinal'])
+    elif shape.kind == 'loglinear':
+        from fla.ops.log_linear_attn import chunk_log_linear_attn
+
+        leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'], given['scales']]
+
+        group = shape.value_heads // shape.key_heads
+
+        def run(q, k, v, g, scales):
+            # fla-core 0.5.2's kernel takes a key head a value head and no scale (unscaled): the layers'
+            # repeat inside the timed call, as the gated delta rule's arm takes it.
+            q, k = (x.repeat_interleave(group, dim=2) for x in (q, k))
+            return (chunk_log_linear_attn(q, k, v, g, scales)[0],)
+
+        cotangents = (given['do'].to(bf16),)
     elif shape.kind == 'conv':
         from fla.modules.convolution import causal_conv1d
 
