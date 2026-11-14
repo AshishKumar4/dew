@@ -177,7 +177,6 @@ def main() -> None:
     prepare_process()
 
     import jax
-    import optax
     from arm_arithmetic import float64_held
     from sharded import split_axes
 
@@ -187,6 +186,7 @@ def main() -> None:
     from dew.checkpoints import Checkpoints
     from dew.data.dataset import DataPartition, Loader
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
     from dew.registry import models
     from dew.training import Layout, MeshSpec, Trainer
 
@@ -207,7 +207,10 @@ def main() -> None:
         """The run's trainer over the model computing in `dtype` (None: the model's own, float32)."""
         model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=2,
                              num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN, dtype=dtype)
-        return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-2), key=jax.random.key(0),
+        # The optimizer as a config, which keys the step (`Trainer._step_key`): each draw's fit reads the step
+        # the first traced and lowered (`candidate_for`), where a built optimizer had each trace its own.
+        return Trainer(LMObjective(model, SEQ_LEN), OptimConfig(optimizer="adam", learning_rate=1e-2),
+                       key=jax.random.key(0),
                        mesh=MeshSpec(**json.loads(args.mesh)), layout=Layout(min_shard=TINY_SHARD), **options)
 
     losses = Losses()
