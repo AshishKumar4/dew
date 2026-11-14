@@ -1291,17 +1291,21 @@ def a_quantized_convolution_trains_and_serves_on_this_gpu_as_qwix_computes_it_on
     assert_as_exact(jax.jit(through(Quantization(bwd_qtype="int8").apply(conv))), on_cpu, draw,
                     "quantized-gradient convolution", seeds=GPU_CONVOLUTION_SEEDS, truth_fn=through(conv))
 
-    @as_given
-    def served(x, kernel, cotangent):
-        module, variables = quantize_for_serving(conv, {"params": {"kernel": kernel}}, Quantization(), x)
-        return module.apply(variables, x)
+    # Served: a kernel quantized once as a load stores it, over drawn inputs.
+    kernel = nn.unbox(conv.init(jax.random.key(0), jnp.zeros(shape)))["params"]["kernel"]
+    module, variables = quantize_for_serving(conv, {"params": {"kernel": kernel}}, Quantization(),
+                                             jnp.zeros(shape))
+    own_forward = jax.jit(lambda x, kernel: own.apply({"params": {"kernel": kernel}}, x))
+    wide = np.asarray(kernel, np.float64)
 
     @as_given
-    def own_served(x, kernel, cotangent):
-        return on_cpu(x, kernel, cotangent)[0]
+    def own_served(x):
+        return own_forward(*jax.device_put((x, kernel), cpu))
 
-    assert_as_exact(served, own_served, draw, "served quantized convolution", seeds=GPU_CONVOLUTION_SEEDS,
-                    truth_fn=lambda x, kernel, cotangent: conv.apply({"params": {"kernel": kernel}}, x))
+    assert_as_exact(jax.jit(lambda x: module.apply(variables, x)), own_served,
+                    lambda seed: (np.asarray(jax.random.normal(jax.random.key(seed), shape)),),
+                    "served quantized convolution", seeds=GPU_CONVOLUTION_SEEDS,
+                    truth_fn=lambda x: conv.apply({"params": {"kernel": wide}}, x))
 
 
 def test_a_quantized_convolution_trains_and_serves_as_qwix_computes_it_on_the_cpu():
