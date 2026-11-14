@@ -1366,6 +1366,25 @@ def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, r
     assert (outcome, refusals) == ((None, [error]) if refused else (error, []))
 
 
+def test_a_tight_start_compiles_twice_cold_and_once_warm(monkeypatch, tmp_path):
+    """What a run pays at its start where its batch does not fit whole (the owner's contract: "a single
+    trace and compile most often"): cold, the batch whole compiles and misses, and XLA's measure of that
+    compile names the split that fits (`Forecast`), which compiles and fits, two compiles; warm, the plan
+    its cold start recorded (`keep_rung`, beside the compilation cache) is the first candidate, one compile.
+    Which split it is, the search's to choose."""
+    whole, halves = needs(monkeypatch, lm(split=1)), needs(monkeypatch, lm(split=2))
+    assert halves < whole, (halves, whole)
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    free(monkeypatch, (whole + halves) // 2)
+    cold, warm = lm(), lm()
+    with Compiles("step") as compiles:
+        trained(cold, steps=0)
+    assert compiles.count == 2 and [fits for *_, fits in asked(cold)] == [False, True]
+    with Compiles("step") as compiles:
+        trained(warm, steps=0)
+    assert compiles.count == 1 and warm.plan["split"] == cold.plan["split"] > 1
+
+
 def test_a_run_that_sets_its_remat_compiles_its_step_once(monkeypatch, tmp_path):
     """An explicit full policy compiles one step, counted by the telemetry owner of JAX's public
     monitoring events rather than a private log's spelling (rows 2111, 2154)."""
