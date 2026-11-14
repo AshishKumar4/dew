@@ -1236,6 +1236,7 @@ def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tm
     own target and tuned (as a GPU host's prepare compiles one; here this CPU's, a CPU being no target a
     step compiles ahead for), takes the file, then refuses its step before it trains, and again on its next
     fit, rather than compiling its own (row 1915)."""
+    from dew.nn.kernels.generation import assumed
     from dew.training.ahead import AheadOfTime, BuildTarget, compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
@@ -1250,9 +1251,11 @@ def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tm
     own = dataclasses.replace(wide, built=BuildTarget.of(here), plan=tuned)
     own.save(tmp_path / "wide.dew-aot")
     run = fine_tune(MeshSpec().build(here), ahead=AheadOfTime.load(tmp_path / "wide.dew-aot"))
-    for _ in range(2):
-        with pytest.raises(ValueError):
-            run.fit(batch, steps=1, log_every=1)
+    # On the GPU it was compiled for, which a CPU is not, its program is what refuses it (train 332's review).
+    with assumed(own.target):
+        for _ in range(2):
+            with pytest.raises(ValueError):
+                run.fit(batch, steps=1, log_every=1)
 
 
 def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_nothing(tmp_path):
@@ -1562,15 +1565,17 @@ def a_run_handed_an_untuned_file_by_its_command_compiles_its_own(tmp_path, monke
     runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
     default = decision(tmp_path, drawn=False)
     stated = ["--trainer.checkpoint-dir", str(runs), *CLOCKED]
+    # The autotuner left on from the compile ahead on, as a user's flags leave it: XLA's flags are part of a
+    # step's target (`BuildTarget.flags`), which the run handed it holds to its own.
+    flags = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level")
+    monkeypatch.setenv("XLA_FLAGS", flags)
+    assert xla_flag("xla_gpu_autotune_level") is None
     own = BuildTarget.of(jax.devices()[:1])
     ahead = ["--trainer.compile-ahead.generation", own.generation, "--trainer.compile-ahead.devices", "1",
              "--trainer.compile-ahead.path", str(path)]
     with pytest.raises(CompiledAhead) as compiled:
         DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *ahead], default=default).run()
     assert not compiled.value.ahead.tuned
-    flags = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level")
-    monkeypatch.setenv("XLA_FLAGS", flags)
-    assert xla_flag("xla_gpu_autotune_level") is None
     handed = DecisionRunConfig.cli(["--trainer.name", "handed", *stated, "--trainer.ahead", str(path)],
                                    default=default)
     said: list[logging.LogRecord] = []
