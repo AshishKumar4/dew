@@ -83,8 +83,10 @@ def test_a_resumed_pipeline_run_reads_none_of_the_pipelines_weights(pipelines, t
                                                 "unconditional_prob": 0.0, "ema_decay": None}))
 
     def trained(steps: int):
-        trainer = TrainerConfig(checkpoint_dir=str(tmp_path / "runs"), steps=steps, log_every=1,
-                                eval_every=None, checkpoint_every=None, multi_host=False, mesh=MeshSpec())
+        # Named in its config, as the command line names it, so its build knows the run it resumes.
+        trainer = TrainerConfig(name="resumed", checkpoint_dir=str(tmp_path / "runs"), steps=steps,
+                                log_every=1, eval_every=None, checkpoint_every=None, multi_host=False,
+                                mesh=MeshSpec())
         return dataclasses.replace(config, trainer=trainer).prepare().train("resumed")
 
     first = trained(1)
