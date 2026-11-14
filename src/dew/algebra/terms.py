@@ -385,13 +385,14 @@ def parameter_key(value) -> Hashable:
     dtype by its name; an enumeration by its type and member; a dataclass by its type and fields; a mesh by
     its devices, axes and axis types, an abstract one by its sizes, axes, axis types and device; a sharding by
     its mesh, partitions, memory and logical device order; an abstract value by its shape, dtype, weak type,
-    sharding, memory space, layout and the manual axes it varies over, reduces or leaves unreduced; a layout
-    by its dimension order, tiling and sub-byte element size; an array by its dtype, shape and bytes' digest;
-    a function by its module and name, a partial one with its bound arguments. Any other object is its type's
-    name and the object itself, compared by its own equality, never by its printed form, which a key kept in
-    another process cannot read (`opaque`); an object that cannot be hashed (JAX's `WrappedFun` of a
-    derivative rule, hashing an `Unhashable` tree) by its identity, held alive by the key (`_Identity`), so it
-    is equal to itself alone. `value` is any parameter JAX's primitives take, which share no type."""
+    placement (partitions, mesh axes, memory), memory space, layout and the manual axes it varies over,
+    reduces or leaves unreduced; a layout by its dimension order, tiling and sub-byte element size; an array
+    by its dtype, shape and bytes' digest; a function by its module and name, a partial one with its bound
+    arguments. Any other object is its type's name and the object itself, compared by its own equality, never
+    by its printed form, which a key kept in another process cannot read (`opaque`); an object that cannot be
+    hashed (JAX's `WrappedFun` of a derivative rule, hashing an `Unhashable` tree) by its identity, held alive
+    by the key (`_Identity`), so it is equal to itself alone. `value` is any parameter JAX's primitives take,
+    which share no type."""
     if value is None or isinstance(value, (bool, str)):
         return type(value).__name__, value
     if isinstance(value, (int, np.integer)):
@@ -410,9 +411,15 @@ def parameter_key(value) -> Hashable:
         return ("array", str(value.dtype), array.shape, str(array.dtype),
                 hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
     if isinstance(value, ShapedArray):
-        manual = value.manual_axis_type
+        # Its placement by its partitions and its mesh's axes and memory, not the kind of device the mesh was
+        # made of, which a step compiled ahead for a GPU and the run on that GPU share no name of.
+        sharding, manual = value.sharding, value.manual_axis_type
+        mesh = sharding.mesh
+        placement = (parameter_key(sharding.spec), parameter_key(mesh.axis_sizes),
+                     parameter_key(mesh.axis_names), parameter_key(mesh.axis_types),
+                     parameter_key(sharding.memory_kind))
         return ("abstract", parameter_key(value.shape), parameter_key(value.dtype), value.weak_type,
-                parameter_key(value.sharding), parameter_key(value.memory_space), parameter_key(value.layout),
+                placement, parameter_key(value.memory_space), parameter_key(value.layout),
                 parameter_key((manual.varying, manual.unreduced, manual.reduced, manual.unreduced_kind)))
     if value is Layout.AUTO:
         # The layout XLA chooses, one singleton.

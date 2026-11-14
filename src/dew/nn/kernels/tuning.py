@@ -820,11 +820,6 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
         # another of its target share no name of.
         if isinstance(parameter, jax.sharding.AbstractMesh):
             parameter = parameter.update(abstract_device=None)
-        if isinstance(parameter, jax.core.ShapedArray) and isinstance(parameter.sharding.mesh,
-                                                                      jax.sharding.AbstractMesh):
-            # An abstract value's mesh alike: its axes, which its sharding names, not its device's kind.
-            mesh = parameter.sharding.mesh.update(abstract_device=None)
-            parameter = parameter.update(sharding=parameter.sharding.update(mesh=mesh))
         return opaque(parameter_key(parameter))
 
     def constants(values) -> None:
