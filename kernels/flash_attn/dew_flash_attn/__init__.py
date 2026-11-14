@@ -53,24 +53,31 @@ TARGETS: dict[str, Target] = {
     for prefix in ("dew_flash_mha", "dew_flash3_mha")
     for packed in (False, True) for backward in (False, True)}
 """Every FFI target of the two libraries by name (FlashAttention-2's `dew_flash_mha_*`, 3's
-`dew_flash3_mha_*`): `_registered` registers them and `_call` calls them, and a reader of a program's
+`dew_flash3_mha_*`): `registered` registers them and `_call` calls them, and a reader of a program's
 custom calls reads them (Dew's FLOP counter)."""
 
 
 @functools.cache
-def _registered() -> None:
-    """Both libraries' FFI targets (`TARGETS`), registered with jax once, at the first call that needs them:
-    importing the package to read ARCHITECTURES leaves jax's registry as it was."""
+def registered() -> None:
+    """Both libraries' FFI targets (`TARGETS`), registered with jax once: the callable its entry point names
+    (the `dew.kernel_wheels` group), which Dew runs before a program compiled ahead is loaded, and the first
+    call that needs them runs too. Importing the package to read ARCHITECTURES leaves jax's registry as it
+    was."""
     for name in TARGETS:
         library = _library3 if name.startswith("dew_flash3_") else _library
         jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(library, name)), platform="CUDA")
+
+
+_registered = registered
+"""The name Dew's releases through dewml 0.1.1, and its main until it loads this wheel through the
+`dew.kernel_wheels` group, call; this wheel's next release after Dew's lock takes 0.3.11 drops it."""
 
 
 def _call(name: str, results):
     """`jax.ffi.ffi_call` of one of the libraries' targets (`TARGETS`)."""
     if name not in TARGETS:
         raise ValueError(f"{name} is no target of the libraries: {sorted(TARGETS)}")
-    _registered()
+    registered()
     return jax.ffi.ffi_call(name, results)
 
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 # build.sh names the CUDA major: dew-flash-attn-cu12 or dew-flash-attn-cu13.
 name = "dew-flash-attn-cuXX"
-version = "0.3.10"
+version = "0.3.11"
 description = "FlashAttention for JAX: Dao-AILab's CUDA kernels as XLA FFI targets"
 readme = "README.md"
 license = "BSD-3-Clause AND Apache-2.0"
@@ -15,6 +15,11 @@ dependencies = ["jax>=0.11.2"]
 
 [project.urls]
 Source = "https://github.com/AshishKumar4/dew/tree/main/kernels/flash_attn"
+
+[project.entry-points."dew.kernel_wheels"]
+# Dew loads every wheel of this group, and each one's exact build is part of what a program compiled ahead
+# was built with (dew.training.ahead.BuildTarget.builds): its FFI targets, registered with jax.
+dew_flash_attn = "dew_flash_attn:registered"
 
 [tool.setuptools]
 packages = ["dew_flash_attn"]

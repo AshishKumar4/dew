@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 # build.sh names the CUDA major: dew-cutlass-cu12 or dew-cutlass-cu13.
 name = "dew-cutlass-cuXX"
-version = "0.2.2"
+version = "0.2.3"
 description = "CUTLASS's grouped GEMMs for JAX, as XLA FFI targets"
 readme = "README.md"
 license = "MIT AND BSD-3-Clause AND Apache-2.0"
@@ -15,6 +15,11 @@ dependencies = ["jax>=0.11.2"]
 
 [project.urls]
 Source = "https://github.com/AshishKumar4/dew/tree/main/kernels/cutlass"
+
+[project.entry-points."dew.kernel_wheels"]
+# Dew loads every wheel of this group, and each one's exact build is part of what a program compiled ahead
+# was built with (dew.training.ahead.BuildTarget.builds): its FFI targets, registered with jax.
+dew_cutlass = "dew_cutlass:registered"
 
 [tool.setuptools]
 packages = ["dew_cutlass"]
