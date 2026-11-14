@@ -462,7 +462,7 @@ def certifying(device) -> Iterator[None]:
 
 
 def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round: int | None = None
-              ) -> tuple["Binary", ...]:
+              ) -> tuple["Binary", ...] | None:
     """`op`'s kernels at `config` for `arguments` that spill as the GPU assembles them, each launch compiled
     alone before its program is: its kernels' binaries (`binaries`) as the plugin's own compiler makes them
     for the device the process compiles for (`_certifying_device`: its own GPU, or a compile-only one a
@@ -470,9 +470,10 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
     launch's derivation refuses a config that spills and takes its next (`tuning`'s `_chosen`), with no
     program retraced, where a compile's refusal retraces the whole program (`settled`): a B200's 4B step
     stepped its attention forward 19 times that way, 42 minutes, every rewalk a step's trace. None on a
-    process compiling for no GPU or an interpreted launch; none for a launch XLA or the GPU's compiler
-    refuses to compile alone though it lowered (a collective's, its devices the program's; an assembly the
-    PTX compiler rejects), which its program's compile reads as before (`settled`) and `uncertified` names;
+    process compiling for no GPU or an interpreted launch; None, read nowhere, for a launch XLA or the GPU's
+    compiler refuses to compile alone though it lowered (a collective's, its devices the program's; an
+    assembly the PTX compiler rejects), which its program's compile reads as before (`settled`) and
+    `uncertified` names;
     a launch Mosaic refuses as it lowers (a block past its shared memory) raises here as its program's
     lowering would. Once a process, by launch (`certifications`), and once a GPU model a
     machine: each verdict, an accepted config's and a refused one's, is stored with the kernel picks
@@ -487,6 +488,8 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
     with _GUARD:
         if key in _CERTIFIED:
             return _CERTIFIED[key].spilling
+        if key in _UNCERTIFIED:
+            return None
     stored = _verdict_key(op, arguments, config, reverse)
     verdict = None if stored is None else tuning.stored_verdict(device.device_kind, stored)
     if isinstance(verdict, dict):
@@ -501,7 +504,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
                          type(op).__name__, config, str(error)[:200])
             with _GUARD:
                 _UNCERTIFIED[key] = str(error)[:400]
-            return ()
+            return None
         if stored is not None:
             tuning.store_verdict(device.device_kind, stored, kernels)
     found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None,
@@ -512,7 +515,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
 
 
 def certified_together(op, arguments: tokamax.BoundArguments, configs: Sequence[Hashable]
-                       ) -> list[tuple["Binary", ...]]:
+                       ) -> list[tuple["Binary", ...] | None]:
     """Each of `configs` certified (`certified`) in one round, all at once on as many threads, each tracing
     under this thread's states (`dew._cache.carried`: the assumed GPU, the kernel choices, JAX's per-thread
     settings) in a copy of this context: a search's rungs, which the assembler answers only one yes or no each
@@ -522,7 +525,7 @@ def certified_together(op, arguments: tokamax.BoundArguments, configs: Sequence[
         return [certified(op, arguments, config, round=round) for config in configs]
     entered = _cache.carried()
 
-    def asked(config: Hashable) -> tuple["Binary", ...]:
+    def asked(config: Hashable) -> tuple["Binary", ...] | None:
         with entered():
             return certified(op, arguments, config, round=round)
 

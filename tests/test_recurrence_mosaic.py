@@ -1610,14 +1610,11 @@ def test_a_training_launchs_backward_kernels_carry_its_launch():
 
 
 
-@lowers('sm100')
-def test_a_launch_whose_producer_must_rise_climbs_its_ladder_a_round_at_a_time():
-    """A training call whose reverse walk spills at setmaxnreg's least producer on a compile-only B200
-    (Qwen3.5-4B's gated delta net over its 12,288-token row, certified as reverse mode runs it,
-    `report.pulled`) asks its producer's ladder (`Mosaic.rungs`, a setmaxnreg step a rung) a round at a time,
-    as many rungs a round as the host compiles at once (`report.rung_round`): the assembler answers only
-    whether a rung holds, so the least that holds is a search. A rung at a time, the walk's producer rose 24
-    to 80 over eight certification compiles, 95 s of the 4B's cold start."""
+def _reverse_walk_certified(op=None) -> list:
+    """Qwen3.5-4B's gated delta net over its 12,288-token row lowered for a compile-only B200 as a training
+    step runs it (its gradient, certified as reverse mode runs it, `report.pulled`), through `op`'s
+    certification where given (`tuning.KernelOp._certified` of its derived tiles), else through the call's
+    route: the template's certifications it made and the configs it refused."""
     from dew.nn.kernels.generation import compile_only_gpus
 
     # Qwen3.5-4B's linear attention: 16 key heads and 32 value heads, each 128 wide.
@@ -1626,20 +1623,51 @@ def test_a_launch_whose_producer_must_rise_climbs_its_ladder_a_round_at_a_time()
         ((1, 12288, 32, 128), jnp.bfloat16), ((1, 12288, 32), jnp.float32), ((1, 12288, 32), jnp.bfloat16))]
     options = {'max_segments': None, 'scale': None, 'delta': True, 'wide': False, 'bound': 1.0,
                'rounded': True}
-
-    loss = _route_loss(options)
-
     before = {id(certified) for certified in report.certifications()}
     with (report.refusals(), generation.assumed('sm100'), generation.chosen(gated_delta_rule='mosaic_gpu'),
           report.certifying(compile_only_gpus('sm100')[0]), report.pulled()):
-        jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(*operands).lower(lowering_platforms=('cuda',))
-    certified = [each for each in report.certifications()
-                 if id(each) not in before and each.op == type(template.MOSAIC).__name__]
-    climbed = [each for each in certified if each.config.producers.raised_to]
-    assert climbed, certified
-    # The first config's round, then the ladder's: as many as its rungs fill at the host's round size.
-    rounds = {each.round for each in certified}
-    assert len(rounds) <= 1 + -(-len(climbed) // report.rung_round()), (rounds, len(climbed))
+        if op is None:
+            jax.jit(jax.grad(_route_loss(options), argnums=(0, 1, 2))).trace(*operands).lower(
+                lowering_platforms=('cuda',))
+        else:
+            bound = op.bind(*operands, None, bound=1.0, rounded=True)
+            op._certified(bound, op.derived(bound, generation.gpu_target()))
+        refused = [config for _, config, _ in report.refused_launches()]
+    return [each for each in report.certifications()
+            if id(each) not in before and each.op == type(template.MOSAIC).__name__], refused
+
+
+@lowers('sm100')
+def test_a_launch_whose_producer_must_rise_is_certified_at_its_ladders_top_in_one_compile():
+    """A training call whose reverse walk spills at setmaxnreg's least producer on a compile-only B200
+    (`_reverse_walk_certified`) is certified at its producer's top, its program's entry share (two
+    warpgroups, two programs a multiprocessor: 128), in one compile: every role holds the entry share and
+    no register moves. From the ladder's foot up, the walk's producer rose 24 to 80 over eight
+    certification compiles, 95 s of the 4B's cold start."""
+    from dew.nn.kernels.templates import resources
+
+    certified, _ = _reverse_walk_certified()
+    raised = [each.config.producers.of('recurrence_reverse') for each in certified]
+    assert [cap for cap in raised if cap is not None] == [resources.entry_registers(2, 2)], raised
+
+
+@lowers('sm100')
+def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
+    """A ladder whose first rung the assembler rejects (the reverse walk's producer past its program's entry
+    share, the roles' setmaxnreg moves inverted: ptxas refuses the kernel) and whose next holds: the rejected
+    rung is refused as a spilling one is, and the derivation takes the one below it, never the one
+    certification could not read (`report.certified`'s None)."""
+    from dew.nn.kernels.templates import resources
+
+    class PastItsTop(type(template.MOSAIC)):
+        def rungs(self, ba, config):
+            yield from (template._producing(config, resources.Producers((('recurrence_reverse', cap),)))
+                        for cap in (232, 128))
+
+    certified, refused = _reverse_walk_certified(PastItsTop())
+    assert [each.config.producers.of('recurrence_reverse') for each in certified] == [None, 128], certified
+    caps = {config.producers.of('recurrence_reverse') for config in refused}
+    assert 232 in caps and 128 not in caps, caps
 
 
 @lowers('sm100')

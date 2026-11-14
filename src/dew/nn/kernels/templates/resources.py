@@ -9,7 +9,7 @@ estimates (`report`)."""
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Hashable, Iterable, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
@@ -65,15 +65,19 @@ class Producers:
         """The registers `launch`'s producer lowers to, None at the least (`producer_floor`)."""
         return dict(self.raised_to).get(launch)
 
-    def raised(self, launches: Iterable[str]) -> "Producers | None":
-        """These, with each of `launches`' producers a setmaxnreg step higher; None where one is at
-        setmaxnreg's most."""
+    def stepped(self, tops: Mapping[str, int]) -> "Producers | None":
+        """These, with each of `tops`' launches' producers at the next rung of its ladder, which runs from its
+        top down a setmaxnreg step at a time to a step above the least: an unraised producer to its top (its
+        program's entry share, where every role holds the same and no register moves: past it the roles'
+        setmaxnreg moves invert, the producer's drop a rise, and the assembler rejects the kernel), a raised
+        one a step lower; None where one is a step above the least already, or its top is not above it."""
         steps, held = facts().raises(), dict(self.raised_to)
-        for launch in launches:
-            higher = (held.get(launch) or steps.lowest) + steps.step
-            if higher > steps.highest:
+        for launch, top in tops.items():
+            cap = held.get(launch)
+            lower = min(top, steps.highest) if cap is None else cap - steps.step
+            if lower <= steps.lowest:
                 return None
-            held[launch] = higher
+            held[launch] = lower
         return Producers(tuple(sorted(held.items())))
 
 
