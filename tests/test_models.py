@@ -911,3 +911,65 @@ def test_layer_norm_is_flax_s_keeping_only_its_input_for_the_backward(rng, use_s
     _, pullback = jax.vjp(lambda value: ours.apply(params, value), x)
     held = [leaf for leaf in jax.tree.leaves(pullback) if np.size(leaf) == x.size]
     assert held and {leaf.dtype for leaf in held} == {x.dtype}
+
+
+MIXED_ROW_SEEDS = 64
+"""The layer norm's declared seeds for check 1 over bf16 rows of mixed magnitudes, sized by `seeds_for` on
+armada."""
+
+
+def test_a_layer_norm_centers_a_bf16_row_in_float32():
+    """A bf16 row of mixed magnitudes (outliers of 256 either side among values about one, as an
+    activation's channels hold them) is centered in float32, as flax's `nn.LayerNorm` centers it: run as
+    given, op by op, where no compiler keeps a bf16 difference wide, Dew's output and the gradients of its
+    input, scale and bias are on par with flax's (check 1) from float64, where a difference taken in bf16
+    rounds the values about one to its 8 bits."""
+    shape = (2, 6, 16)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 6)
+        outliers = 256.0 * jnp.sign(jax.random.normal(keys[1], shape)) * (
+            jax.random.uniform(keys[2], shape) < 0.125)
+        return (np.asarray((jax.random.normal(keys[0], shape) + outliers).astype(jnp.bfloat16)),
+                np.asarray(1.0 + 0.1 * jax.random.normal(keys[3], shape[-1:], jnp.float32)),
+                np.asarray(0.1 * jax.random.normal(keys[4], shape[-1:], jnp.float32)),
+                np.asarray(jax.random.normal(keys[5], shape, jnp.float32)))
+
+    assert_as_exact(as_given(normalized(LayerNorm(epsilon=1e-5))),
+                    as_given(normalized(nn.LayerNorm(epsilon=1e-5))), draw, "bf16 mixed-row layer norm",
+                    seeds=MIXED_ROW_SEEDS,
+                    truth_fn=normalized(nn.LayerNorm(epsilon=1e-5, dtype=jnp.float64)))
+
+
+SHARDED_LAYER_NORM_SEEDS = 64
+"""The sharded layer norm's declared seeds for check 1, sized by `seeds_for` on armada."""
+
+
+def test_a_layer_norm_over_sharded_features_centers_each_row_by_one_mean():
+    """A layer norm whose features lie in shards (flax's `axis_name`, its statistics over every shard) reads
+    each row less one mean, the same on every shard: over rows whose two shards' means differ (one about
+    zero, one about ten), mapped over the shards under that name, its output and the gradients of its
+    input, scale and bias are on par with flax's (check 1) from float64, where each shard less its own
+    mean would center it alone."""
+    # Two shards of four rows, eight features a shard.
+    shape = (2, 4, 8)
+
+    def sharded(module):
+        def apply(x, scale, bias):
+            def shard(x, scale, bias):
+                return module.apply({"params": {"scale": scale, "bias": bias}}, x)
+            return jax.vmap(shard, axis_name="shards")(x, scale, bias)
+        return with_gradients(apply)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 4)
+        offsets = np.array([0.0, 10.0], np.float32)[:, None, None]
+        return (np.asarray(jax.random.normal(keys[0], shape, jnp.float32)) + offsets,
+                np.asarray(1.0 + 0.1 * jax.random.normal(keys[1], (shape[0], shape[-1]), jnp.float32)),
+                np.asarray(0.1 * jax.random.normal(keys[2], (shape[0], shape[-1]), jnp.float32)),
+                np.asarray(jax.random.normal(keys[3], shape, jnp.float32)))
+
+    fields = {"epsilon": 1e-5, "axis_name": "shards"}
+    assert_as_exact(sharded(LayerNorm(**fields)), sharded(nn.LayerNorm(**fields)), draw,
+                    "sharded layer norm", seeds=SHARDED_LAYER_NORM_SEEDS,
+                    truth_fn=sharded(nn.LayerNorm(**fields, dtype=jnp.float64)))
