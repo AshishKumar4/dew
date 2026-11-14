@@ -1118,6 +1118,10 @@ class Trainer(Generic[Loss, Effects]):
         with signal_wake():
             plan = self._fit_plan(dataset, **asked)
             run = FitRun(time.perf_counter(), plan.startup)
+            # Each fit plans its step as the trainer's first did, at the split it was given, so a refit's
+            # first step is keyed as that fit's was and reads the step it traced (row 6022); a state that
+            # pools a window binds its own split as it compiles (`StepCompiler.compile`).
+            self._planned_afresh()
             # A display of this fit's own: one before it may have run other steps.
             self._display = TrainingDisplay()
             profile, checkpoints, profiler = self.profile, self.checkpoints, owned_capture(self.profile)
