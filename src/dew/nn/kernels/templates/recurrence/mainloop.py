@@ -1707,10 +1707,16 @@ def _states_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
         product_fragments(call, (held, chunk, call.block), (held, call.block, bv)),
         written)
                 if call.delta else written)
+    # The products' sums: a key block's, every block's where a family's products overlap, and where accurate
+    # three-part products issue apart each term's fresh sum (`Issuer.apart`), as the output launch states
+    # its: the lowered peak of an H100's fp32 write gate holds six (96 registers a 32-wide value block,
+    # where two key blocks' were stated; ptxas took 180 against 158 stated, and at two walk roles 168
+    # spilling 28 bytes, row 6233).
+    apart = call.family.products_overlap and max(keys.parts, held.parts) > 2
+    sums = (len(product.terms(keys.parts, held.parts)) if apart
+            else 1 if call.per_key or not call.family.products_overlap else call.width // call.block)
     phase = ([f32(chunk, bv)] * 2 + held_tile(values, chunk, bv) + held_tile(held, call.block, bv)
-             + products
-             + [f32(call.block, bv)] * (1 if call.per_key or not call.family.products_overlap
-                                        else call.width // call.block))
+             + products + [f32(call.block, bv)] * sums)
     if held.parts > 1:
         phase += [f32(chunk, bv), f32(call.block, 4), f32(32, bv)]
     if call.per_key:

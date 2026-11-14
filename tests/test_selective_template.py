@@ -411,11 +411,17 @@ def test_a_mamba_layer_from_a_held_state_out_of_the_template_is_as_exact_interpr
 def dispatched(forms: str, *, named: bool, c_dtype, target: str | None = None):
     """The selective scan's dispatch (`recurrence_chunk.selective_scan`) under the run's `forms`, the template
     named where `named` (interpreted off a GPU), `C` in `c_dtype` and every other operand as drawn, traced
-    for `target` where given (lowered for it, never run here): the output alone."""
+    for `target` where given (lowered for it on any host, its mesh's abstract devices stating that GPU,
+    `generation.gpu_mesh`: an A100 host's own device lowered a kernel for its cp.async copies, rows 6235 and
+    6236; never run here): the output alone."""
     def run(x, dt, a, b, c, skip):
         named_template = generation.chosen(selective_scan="mosaic_gpu") if named else contextlib.nullcontext()
-        assumed = contextlib.nullcontext() if target is None else generation.assumed(target)
-        with (assumed, named_template,
+        lowered_for = contextlib.ExitStack()
+        if target is not None:
+            lowered_for.enter_context(generation.assumed(target))
+            lowered_for.enter_context(jax.sharding.use_abstract_mesh(
+                generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), target)))
+        with (lowered_for, named_template,
               generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms))):
             return recurrence_chunk.selective_scan(x, dt, a, b, c.astype(c_dtype), skip, None, None,
                                                    portable=portable)[0]

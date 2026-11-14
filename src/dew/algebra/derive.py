@@ -652,11 +652,12 @@ def context() -> tuple:
     `scan.derive_scan`'s carry splits): forms traced under one abstract
     mesh hold its avals in their literals (a sharded step's bound under a local one's mesh refused to lower),
     and are priced for one target (`cost.target`), under one run's numerics and one matmul precision, with
-    the extractor oracle on or off (`Passes.checked`). Not the whole trace context, whose identity-keyed
-    collections (`dew._cache.KERNEL_ROUTES`, `KERNEL_SEEN`) are new in each lowering: every lowering derived
-    again and the cache grew without end."""
+    the extractor oracle on or off (`Passes.checked`), by every registered rule set but those the pass leaves
+    out (`Passes.without`, a receipt's arm, which shares no derivation or recognition with another arm). Not
+    the whole trace context, whose identity-keyed collections (`dew._cache.KERNEL_ROUTES`, `KERNEL_SEEN`) are
+    new in each lowering: every lowering derived again and the cache grew without end."""
     return (jax.sharding.get_abstract_mesh(), cost.target(), generation.numerics(),
-            jax.config.jax_default_matmul_precision, ALGEBRA.value.checked)
+            jax.config.jax_default_matmul_precision, ALGEBRA.value.checked, ALGEBRA.value.without)
 
 
 FORMS_HELD = 64

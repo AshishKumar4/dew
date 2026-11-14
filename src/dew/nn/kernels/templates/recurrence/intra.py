@@ -132,7 +132,7 @@ def _named(launch: str, products: tuple[str, ...]) -> str:
     system), else `<launch>_<output>`, so a walk of one output is a kernel of its own name beside the walk of
     both, which a training call's backward and forward each launch (a kernel's name is its identity,
     `report.named`: Kimi's sm90 training call ran two `recurrence_intra` bodies under one name)."""
-    return launch if len(products) > 1 else f"{launch}_{products[0]}"
+    return launch if len(products) > 1 else "_".join((launch, *products))
 
 
 def _intra_merges(call: Call) -> bool:

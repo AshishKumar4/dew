@@ -806,4 +806,7 @@ def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind], 
     copies = walk.consumers if walk.interpret else 1
     dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))
     dk, dv = launch(*operands, dq, *grads)
-    return jax.freeze(dq).sum(axis=0), dk, dv
+    added = jax.freeze(dq)
+    # One copy is the dQ itself: a sum over its one row is a second fp32 buffer of the queries' size, which
+    # XLA writes beside it (a Qwen3.5-4B training step on an H100: 805 MB more at its peak).
+    return (added[0] if copies == 1 else added.sum(axis=0)), dk, dv

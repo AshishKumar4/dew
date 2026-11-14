@@ -266,7 +266,9 @@ class Trainer(Generic[Loss, Effects]):
         rules name (`Layout.data_axes` its rows'). `microbatches` is how many a pipelined step feeds through
         the mesh's stage axis, a multiple of its size; None feeds one a stage. `lower_for`, a CUDA generation,
         lowers the first step for it in place of compiling it (`dew.training._lowering.Lowered`); `ahead`, a
-        step compiled ahead (`dew.training.ahead`), runs as the first step where it is that program.
+        step compiled ahead (`dew.training.ahead`), runs as the first step where it is that program, and
+        one compiled without its GPU kind's tuned choices (`AheadOfTime.tuned`) is not run: the run compiles
+        its step as without it, said once (`AheadOfTime.runnable`).
         `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its derived
         config. It measures each of Dew's own launches that declares variants to time (`KernelOp`: the
         kernel templates, `attention_impl="template"`, the norms, SwiGLU and decode attention); tokamax's
@@ -319,7 +321,10 @@ class Trainer(Generic[Loss, Effects]):
             diloco.admits(self.layout.host, record)
         # Where the fit ladder stands and the links its traces read (`StepCompiler`), and what the last
         # compile found (`Compiled`), which `plan`, `memory`, `executable`, `step_flops` and `links` read.
-        self._compiler = StepCompiler(objective, links, ahead, self.phase_passes)
+        # A step compiled ahead is taken once the process is readied (`_handed_ahead`): constructing a trainer
+        # opens no backend.
+        self._ahead_handed = ahead
+        self._compiler = StepCompiler(objective, links, None, self.phase_passes)
         self._compiled: Compiled | None = None
         # Whether a step has run since the last compile proved its plan fits (`memory`).
         self._unproven = False
@@ -659,6 +664,17 @@ class Trainer(Generic[Loss, Effects]):
         ahead runs the programs compiled with it as compiled (`AheadOfTime.taking`), compiling none."""
         return contextlib.nullcontext() if self._compiler.ahead is None else self._compiler.ahead.taking()
 
+    def _handed_ahead(self) -> None:
+        """Take the step compiled ahead this trainer was handed, once the process is readied
+        (`ready_process`, the backend opened at the run's share): the compiler runs it where it is tuned or
+        the run's compile would tune nothing either, a step of another target refused
+        (`AheadOfTime.runnable`); a fit takes it before it reads a batch, a placement before it places."""
+        if self._ahead_handed is None:
+            return
+        ready_process()
+        handed, self._ahead_handed = self._ahead_handed, None
+        self._compiler.ahead = handed.runnable(list(self.device_mesh.devices.flat))
+
     def _started(self, resume: Resume = "auto") -> Start:
         """What placing the state reads before it places anything: the objective's held tree and
         the key, resolved once, so that the shapes and the values are the same inputs through the
@@ -666,6 +682,7 @@ class Trainer(Generic[Loss, Effects]):
         state's shapes; the checkpoint a run resumes from as `resume` says (`Checkpoints.resumed`), the
         one every process agrees; and the placement of the state, once its checks pass (`_validated`)."""
         initializer, key = self.objective.initializer, self.key
+        self._handed_ahead()
         if self.host_master:
             from dew.distributed.host import transfer
             key = transfer(key, NamedSharding(self.state_mesh, P()))
@@ -1135,6 +1152,7 @@ class Trainer(Generic[Loss, Effects]):
         # The main thread's waits on the data's workers take a signal however it lands (`signal_wake`),
         # from the plan's first read of the data on.
         with signal_wake():
+            self._handed_ahead()
             plan = self._fit_plan(dataset, **asked)
             run = FitRun(time.perf_counter(), plan.startup)
             # Each fit plans its step as the trainer's first did, at the split it was given, so a refit's

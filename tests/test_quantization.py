@@ -1747,15 +1747,16 @@ def test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention
 
     # Every route each step's own program takes (the cache's allocation, traced for its shapes alone,
     # reports none: `generation.unforced`), by its selector and kernel, the kernels a rule never sees among
-    # them or not: a fused attention kernel of whole products, a paged kernel the rule's ownership refuses,
-    # and the template's work list, which forms its products whole wherever it runs.
-    from dew.nn import attention_kernels, kv_cache
+    # them or not, each by what it is: a fused attention kernel of whole products, every paged kernel but
+    # the generic one, which reads the rows through the layer's attention, and the template's work list,
+    # which forms its products whole wherever it runs.
+    from dew.nn import kv_cache
 
-    attending = (attention_kernels.ATTENTION, attention_kernels.DECODE)
-    past_the_rule = {(op.choice, kernel.name) for op in attending
-                     for kernel in op.kernels if attention_kernels._WHOLE_PRODUCTS in kernel.supports}
+    whole = _whole_product_kernels()
+    generic = {kernel.name for kernel in kv_cache.PAGED.kernels if kernel.generic}
+    past_the_rule = {(choice, name) for choice in (Choice.ATTENTION, Choice.DECODE) for name in whole}
     past_the_rule |= {(Choice.PAGED_DECODE, kernel.name) for kernel in kv_cache.PAGED.kernels
-                      if kv_cache._OWNED in kernel.supports}
+                      if kernel.name not in generic}
 
     def taken(kernels, listed):
         return ({(choice, name) for choice, names in kernels.items() for name in names}
@@ -1768,6 +1769,10 @@ def test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention
     assert beyond(plain), plain
     owned = taken(*routes_of(Quantization(dtype="int8").apply(model)))
     assert owned and not beyond(owned), owned
+    # The rule's paged reads are the generic kernel's alone: the decode step's, and the mixed step's where
+    # it takes one.
+    paged = {name for choice, name in owned if choice is Choice.PAGED_DECODE}
+    assert paged == generic if step == "decode" else paged <= generic, owned
 
 
 def test_an_int8_attention_block_on_xla_is_on_par_with_the_reference_path(monkeypatch):

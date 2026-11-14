@@ -324,3 +324,250 @@ def test_a_doublings_join_is_the_block_inverse_at_every_size():
     product = sympy.block_collapse(joined * system)
     identity = (sympy.Identity(n), sympy.ZeroMatrix(n, m), sympy.ZeroMatrix(m, n), sympy.Identity(m))
     assert [sympy.simplify(product.blocks[i, j]) for i in range(2) for j in range(2)] == list(identity)
+
+
+class _Rows(list):
+    """A chunk's per-token value blockwise (`_blocked`): each block's rows, a SymPy matrix expression; `token`
+    the raw token it is (None for a computed one), `read` the raw token whose rows read the state `h`
+    (`Q h`), and `inner` whether each block's value is the part a token's decay to it scales elementwise
+    (`E_b (.) inner`, a readout along the values)."""
+
+    def __init__(self, blocks, token=None, read=None, inner=False):
+        super().__init__(blocks)
+        self.token, self.read, self.inner = token, read, inner
+
+
+class _Out(tuple):
+    """A readout along the values blockwise: its decayed part (`_Rows`, `inner`) and its free part."""
+
+
+def _blocked(expr, chunk: dict, bound: dict):
+    """A chunk identity's right side over a chunk of one block or two (`chunk["sizes"]`, symbolic), each
+    operand a matrix symbol of its block (`_operand`), every decay relative to its block's start: a token's
+    rows decayed forward to it from its block's start `F(X)_b` (`X (.) e^{G'}`) or back `K(X)_b`
+    (`X (.) e^{-G'}`), a block's own masked pairs `G(L, R)_b` and spread `Sp_b`, each block's whole decay
+    `W_b`, and the second block's rows of a two-block chunk led by the first's whole decay (`e^{G_t} =
+    e^{G'_t} W_1`): each constructor's meaning (`linear_scan.Chunk`, `_BLOCKWISE`) at symbolic sizes, a pair
+    of rows across the split decayed through it (`F(L)_2 W_1 K(R)_1^T`). A plain loop over computed values
+    (the WY form's) is the declared dual form over them."""
+    expr = _inner(expr)
+    if isinstance(expr, decl.UnboundVarDecl):
+        return bound[expr.name]
+    if isinstance(expr, decl.LitDecl):
+        return expr.value
+    args = [_blocked(arg, chunk, bound) for arg in expr.args]
+    if _name(expr) == "plain":
+        return _blocked(chunk["dual"].rhs, chunk, {**bound, "given": args[0]})
+    return _BLOCKWISE[_name(expr)](chunk, *args)
+
+
+def _lead(chunk: dict) -> list:
+    """Each block's lead: the first block's whole decay before the second block of a two-block chunk."""
+    k = chunk["k"]
+    return [sympy.Identity(k)] if len(chunk["blocks"]) == 1 else [sympy.Identity(k), _operand("W", 1, k, k)]
+
+
+def _token_blocks(chunk: dict, name: str) -> _Rows:
+    """A token's rows, each block's own symbol: a strength's a diagonal."""
+    sizes, k, v = chunk["sizes"], chunk["k"], chunk["v"]
+    if name == "s":
+        return _Rows([_operand("S", b, sizes[b], sizes[b]) for b in chunk["blocks"]], token="s")
+    read, out = (v, k) if chunk["values_read"] else (k, v)
+    width = {"B": k, "C": k, "U": v, "Q": read, "R": out}
+    return _Rows([_operand(name, b, sizes[b], width[name]) for b in chunk["blocks"]], token=name)
+
+
+def _decayed_to(chunk: dict, rows: _Rows, part: str):
+    """`rows` decayed to each token (`times` a chunk's `entering` decay): a read along the values elementwise
+    after it (the second block's by the first's whole, `E_2 (.) X = E'_2 (.) (X W_1)`, a diagonal's
+    columns); a read along the keys of a scalar's decay, which commutes with it (`(X h) e^{G} = (X e^{G})
+    h`); a token's rows forward from its block's start, the second block's led by the first's whole."""
+    if part != "entering":
+        raise TypeError(f"no blockwise product with the {part} decay")
+    lead, sizes, k = _lead(chunk), chunk["sizes"], chunk["k"]
+    if rows.inner:
+        return _Rows([part * lead[i] for i, part in enumerate(rows)], inner=True)
+    if rows.read is not None:
+        return _Rows([_operand(f"F{rows.read}", b, sizes[b], k) * lead[i] * chunk["h"]
+                      for i, b in enumerate(chunk["blocks"])])
+    return _Rows([_operand(f"F{rows.token}", b, sizes[b], k) * lead[i]
+                  for i, b in enumerate(chunk["blocks"])])
+
+
+def _product(chunk: dict, left, right):
+    """`left @ right`: a block-lower square of pairs over rows, or rows over the state."""
+    if isinstance(left, dict):
+        return _Rows([sum((left[i, j] * right[j] for j in range(i + 1)), sympy.ZeroMatrix(*right[i].shape))
+                      for i in range(len(chunk["blocks"]))])
+    return _Rows([part * right for part in left], read=left.token)
+
+
+def _gram(chunk: dict, left: _Rows, right: _Rows, strict, between):
+    """Each block's own masked pairs, and the pairs across the split decayed through it."""
+    del between
+    sizes, k, blocks = chunk["sizes"], chunk["k"], chunk["blocks"]
+    own = {(i, i): _operand(f"G{left.token}{right.token}{strict}", b, sizes[b], sizes[b])
+           for i, b in enumerate(blocks)}
+    if len(blocks) == 2:
+        across = _operand(f"K{right.token}", 1, sizes[1], k).T
+        own[1, 0] = _operand(f"F{left.token}", 2, sizes[2], k) * _lead(chunk)[1] * across
+    return own
+
+
+def _spread(chunk: dict, readers: _Rows, given: _Rows, keys: _Rows, between):
+    """A readout along the values' local part, its part before the decay to each token: each block's own,
+    the second block's with the first's writes read through the split."""
+    del between
+    sizes, k, blocks = chunk["sizes"], chunk["k"], chunk["blocks"]
+    own = [_linear(f"Sp_{b}", given[i], sizes[b], k) for i, b in enumerate(blocks)]
+    if len(blocks) == 2:
+        written = _operand(f"K{keys.token}", 1, sizes[1], k) * _lead(chunk)[1]
+        own[1] = own[1] + readers[1] * given[0].T * written
+    return _Rows(own, inner=True)
+
+
+def _linear(name: str, given, rows, columns):
+    """An operator linear in `given` (a block's own spread over it), applied term by term to `given` expanded,
+    each term's scalar factor out: one symbol a term, so equal values however they were formed apply
+    alike."""
+    expanded = _diagonal(sympy.expand(given))
+    total = sympy.ZeroMatrix(rows, columns)
+    for term in expanded.args if isinstance(expanded, sympy.MatAdd) else (expanded,):
+        factor, rest = term.as_coeff_mmul() if isinstance(term, sympy.MatMul) else (1, term)
+        total = total + factor * sympy.MatrixSymbol(f"{name}[{rest}]", rows, columns)
+    return total
+
+
+def _diagonal(expr):
+    """`expr`, each whole decay's and strength's transpose the matrix itself (each a diagonal)."""
+    def diagonal(e) -> bool:
+        return isinstance(e, sympy.Transpose) and getattr(e.arg, "name", "")[:2] in ("W_", "S_")
+
+    return expr.replace(diagonal, lambda e: e.arg)
+
+
+def _scaled(chunk: dict, values, scale: _Rows):
+    """Rows (or a square's) scaled by each token's strength."""
+    del chunk
+    if isinstance(values, dict):
+        return {(i, j): scale[i] * part for (i, j), part in values.items()}
+    return _Rows([scale[i] * part for i, part in enumerate(values)])
+
+
+def _sum(chunk: dict, left, right, sign: int = 1):
+    """`left + sign right`: rows of one kind, a readout along the values' decayed part beside its free part
+    (`_Out`), or the state."""
+    del chunk
+    if isinstance(left, _Rows) and isinstance(right, _Rows) and left.inner == right.inner:
+        return _Rows([a + sign * b for a, b in zip(left, right, strict=True)], inner=left.inner)
+    if isinstance(left, _Rows) and isinstance(right, _Rows) and left.inner and sign == 1:
+        return _Out((left, right))
+    return left + sign * right
+
+
+def _written(chunk: dict, keys: _Rows, given: _Rows, to_last):
+    """The chunk's writes decayed to its last token: the first block's through the second's whole."""
+    del to_last
+    sizes, k, blocks = chunk["sizes"], chunk["k"], chunk["blocks"]
+    if len(blocks) == 1:
+        return _whole(chunk) * _operand(f"K{keys.token}", blocks[0], sizes[blocks[0]], k).T * given[0]
+    whole = _operand("W", 2, k, k)
+    return (whole * _lead(chunk)[1] * _operand(f"K{keys.token}", 1, sizes[1], k).T * given[0]
+            + whole * _operand(f"K{keys.token}", 2, sizes[2], k).T * given[1])
+
+
+def _solve(chunk: dict, system: dict, given: _Rows) -> _Rows:
+    """`(I + system)^-1 given` blockwise: a block-lower system solved block by block."""
+    solved = []
+    for i, b in enumerate(chunk["blocks"]):
+        earlier = sum((system[i, j] * solved[j] for j in range(i)), sympy.ZeroMatrix(*given[i].shape))
+        solved.append(sympy.Inverse(sympy.Identity(chunk["sizes"][b]) + system[i, i]) * (given[i] - earlier))
+    return _Rows(solved)
+
+
+_BLOCKWISE = {
+    "token": _token_blocks, "entering": lambda chunk: chunk["h"], "prefix": lambda chunk: None,
+    "decay": lambda chunk, part, prefix: part, "times": _decayed_to,
+    "applied": lambda chunk, h, readers: _Rows([part * h.T for part in readers], inner=True),
+    "matmul": _product, "gram": _gram, "spread": _spread, "rows": _scaled, "plus": _sum,
+    "minus": lambda chunk, left, right: _sum(chunk, left, right, -1),
+    "decayed": lambda chunk, h, whole: _whole(chunk) * h, "written": _written, "solve": _solve,
+    "pair": lambda chunk, outputs, state: (outputs, state),
+    "outputs": lambda chunk, pair: pair[0], "state": lambda chunk, pair: pair[1],
+}
+"""Each constructor's blockwise meaning (`_blocked`)."""
+
+
+def _operand(name: str, block: int, rows, columns):
+    """A block's operand, a matrix symbol named by what it is and its block."""
+    return sympy.MatrixSymbol(f"{name}_{block}", rows, columns)
+
+
+def _whole(chunk: dict):
+    """The chunk's whole decay: its block's, or the second's after the first's (`W_2 W_1`)."""
+    k, blocks = chunk["k"], chunk["blocks"]
+    return (_operand("W", blocks[0], k, k) if len(blocks) == 1
+            else _operand("W", 2, k, k) * _operand("W", 1, k, k))
+
+
+def _chunked(identities, blocks: tuple[int, ...], h, values_read: bool) -> dict:
+    """A chunk of `blocks` (1, 2 or both) of symbolic sizes for `_blocked`, entering the state `h`."""
+    m, n, k, v = sympy.symbols("m n k v", positive=True, integer=True)
+    dual = next(rule for rule in identities if _name(_inner(rule.lhs)) == "plain")
+    return {"blocks": blocks, "sizes": {1: m, 2: n}, "k": k, "v": v, "h": h, "values_read": values_read,
+            "dual": dual}
+
+
+def _agree(chunked, alone) -> bool:
+    """Whether a value of the two-block chunk equals its blocks' own in turn, part by part, each whole decay
+    and each strength its own transpose (diagonals)."""
+    if isinstance(chunked, _Out):
+        return _agree(chunked[0], alone[0]) and _agree(chunked[1], alone[1])
+    if isinstance(chunked, _Rows):
+        return all(_agree(a, b) for a, b in zip(chunked, alone, strict=True))
+    difference = _diagonal(sympy.expand(chunked - alone))
+    return sympy.simplify(sympy.expand(difference)) == sympy.ZeroMatrix(*difference.shape)
+
+
+def _in_turn(first, second):
+    """Two blocks' own values, the first's rows then the second's (`_agree`'s right side)."""
+    if isinstance(first, _Out):
+        return _Out((_in_turn(first[0], second[0]), _in_turn(first[1], second[1])))
+    return _Rows([*first, *second], inner=first.inner)
+
+
+CHUNK_FORMS = [(corrects, per_key, values_read) for corrects in (True, False) for per_key in (False, True)
+               for values_read in (False, True)]
+
+
+@pytest.mark.parametrize(("corrects", "per_key", "values_read"), CHUNK_FORMS,
+                         ids=[f"{'wy' if corrects else 'plain'}-{'per_key' if per_key else 'scalar'}"
+                              f"{'-values' if values_read else ''}"
+                              for corrects, per_key, values_read in CHUNK_FORMS])
+def test_every_chunk_identitys_right_side_composes_over_two_blocks_of_any_sizes(corrects, per_key,
+                                                                                 values_read):
+    """Each chunk identity's right side as declared (`linear_scan._identities`: the dual form, and where
+    tokens correct the state the WY form), evaluated blockwise at symbolic sizes (`_blocked`), over a chunk
+    of `m + n` tokens equals its first `m` tokens' followed by its last `n` tokens' from the state the
+    first leave: outputs and state. The loop its left side states composes so by its definition, so with
+    the identity at one token (`test_every_chunk_identity_holds_over_the_reals`, at three, holds it at one:
+    each output reads its own and earlier tokens alone), every declared identity holds at every chunk size:
+    the induction docs/design/algebra.md §6.9 states. A term the declaration added that vanishes at three
+    tokens (a power of a strictly lower system) breaks its composition here."""
+    identities = _declared(linear_scan._identities(corrects, not per_key, values_read))
+    composed = [rule for rule in identities if _name(_inner(rule.lhs)) in ("plain", "loop")]
+    assert len(composed) == 1 + corrects
+    for rule in composed:
+        chunk = _chunked(identities, (1, 2), None, values_read)
+        h0 = sympy.MatrixSymbol("h", chunk["k"], chunk["v"])
+
+        def evaluated(blocks: tuple[int, ...], h, side=rule.rhs):
+            held = _chunked(identities, blocks, h, values_read)
+            given = _Rows([_operand("U", b, held["sizes"][b], held["v"]) for b in blocks], token="U")
+            return _blocked(side, held, {"given": given})
+
+        whole = evaluated((1, 2), h0)
+        first = evaluated((1,), h0)
+        second = evaluated((2,), first[1])
+        assert _agree(whole[0], _in_turn(first[0], second[0])), f"{_name(_inner(rule.lhs))}: outputs"
+        assert _agree(whole[1], second[1]), f"{_name(_inner(rule.lhs))}: state"

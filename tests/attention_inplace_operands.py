@@ -26,7 +26,7 @@ from test_attention_mosaic import ON_HOPPER
 
 from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
+from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route, bundles
 from dew.nn.precision import at_least_fp32
 
 TILES = attention_mosaic.BackwardTiles
@@ -92,16 +92,11 @@ SPANNED = {"fused-64": 64, "fused-128": 128}
 """Row 3171's call (ET-3171-BAND-h100) by its head width: a packed windowed causal call, three documents and
 padding over 1024 keys (ids from 1: 0 is padding), a window of 256, 8 query heads over 2."""
 
-ONE_LAUNCHES = tuple(TILES(walked, rows, 2, consumers, fused=True, family="wgmma.fed")
-                     for rows in (64, 128) for walked in (128, 64) for consumers in (2, 1))
-"""The one launch's configs on wgmma's fed rings a span call may take, the larger tiles and more consumers
-first."""
-
-
 def one_launch(width: int, step_operands: tuple) -> TILES:
-    """The first of `ONE_LAUNCHES` this GPU's legality takes for row 3171's call at `width`
-    (`MosaicBackward.legal`): the one launch the call's backward is pinned to, whichever this GPU's
-    assemblers hold."""
+    """The one launch on wgmma's fed rings that the backward's derivation gives row 3171's call at `width`
+    on this GPU (`MosaicBackward.derived`'s search over the fed layout, `attention_mosaic._derived`, each
+    config held to this GPU's legality): the config the call's backward is pinned to, whichever the
+    derivation takes over that layout here."""
     query, key, value, dout = step_operands
     spans = _spans()
     # The residuals' shapes alone: legality reads no value.
@@ -111,7 +106,14 @@ def one_launch(width: int, step_operands: tuple) -> TILES:
                                                scale=None, natural=attention_mosaic.NATURAL,
                                                accurate=attention_mosaic.ACCURATE)
     ba, target = op.bind(*args, interpret=False), generation.gpu_target()
-    taken = next((config for config in ONE_LAUNCHES if op.legal(ba, config, target)), None)
+    fed = bundles.named("wgmma.fed", query.dtype)
+
+    def fed_fused(rows: int, walked: int, consumers: int) -> TILES:
+        return TILES(walked, rows, 2, consumers, fused=True, family=fed.name)
+
+    taken = attention_mosaic._derived(fed, query.dtype, key.shape[1], query.shape[1], fed_fused,
+                                      lambda config: op.legal(ba, config, target),
+                                      least_held=attention_mosaic._role_rows, overlapped=True)
     assert taken is not None, f"no one launch on wgmma's fed rings holds row 3171's call at width {width}"
     return taken
 

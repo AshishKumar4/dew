@@ -14,7 +14,7 @@ import functools
 import importlib
 import math
 from collections.abc import Callable
-from typing import Literal, get_args
+from typing import Literal, NamedTuple, get_args
 
 import jax
 import jax.numpy as jnp
@@ -124,6 +124,37 @@ def attention_implementation(name: str) -> AttentionImpl:
         if name == implementation:
             return implementation
     raise ValueError(f"Unknown attention implementation: {name}; one of {', '.join(get_args(AttentionImpl))}")
+
+
+class SeparableBias(NamedTuple):
+    """An additive bias of a query's term and a key's, `rows[b, h, q] + columns[b, h, k]`, `rows`
+    `[B or 1, H or 1, Q]` and `columns` `[B or 1, H or 1, K]`: FoX's cumulative log forget gate at the query
+    less the key's (`forgetting_attention`). The template reads the pair as a query and a key score
+    parameter, the logits adding their sum (`template.Biased`), so a logit takes their difference and not
+    each term's magnitude; every other route takes it written out (`dense`)."""
+
+    rows: jax.Array
+    columns: jax.Array
+
+    @property
+    def shape(self) -> tuple[int, int, int, int]:
+        """The `[B or 1, H or 1, Q, K]` bias it writes out (`dense`)."""
+        rows, columns = jnp.shape(self.rows), jnp.shape(self.columns)
+        return max(rows[0], columns[0]), max(rows[1], columns[1]), rows[2], columns[2]
+
+    @property
+    def dtype(self) -> jnp.dtype:
+        return jnp.result_type(self.rows, self.columns)
+
+    def dense(self) -> jax.Array:
+        """The bias written out, `[B or 1, H or 1, Q, K]`."""
+        return self.rows[..., :, None] + self.columns[..., None, :]
+
+
+def dense_bias(bias):
+    """`bias` as an array a route adds to its logits: a `SeparableBias` written out (`SeparableBias.dense`),
+    any other as it is."""
+    return bias.dense() if isinstance(bias, SeparableBias) else bias
 
 
 def widen_value_heads(query, value):
@@ -333,7 +364,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     probability dropout at `dropout_rate` drawn from `dropout_seed`. A softcap is a score hook, a `bias` a
     score hook added after it (`template.Biased`): one term a key `[B or 1, H or 1, 1, K]` (ALiBi's, over the
     keys' logical places) a key parameter, a dense `[B or 1, H or 1, Q, K]` one a tile parameter, read a
-    tile at a time and its gradient the tiles' pulled cotangents; sinks are the softmax's initial state. A
+    tile at a time and its gradient the tiles' pulled cotangents, a `SeparableBias` a query and a key
+    parameter (FoX's); sinks are the softmax's initial state. A
     `fill` (`mask_fill`) is every hidden key's logit, a score hook after the rest (`template.Filled`), the
     call walking every key. On
     a mesh it runs per shard (`on_attention_shards`), as the decode kernel does: the key heads repeat until
@@ -350,7 +382,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
 
     def local(query, key, value, sinks=None, segment_ids=None, lengths=None, starts=None,
               block_groups=None, image_groups=None, key_valid=None, key_runs=None, places=None,
-              query_slots=None, global_rows=None, global_heads=None, seed=None, bias=None):
+              query_slots=None, global_rows=None, global_heads=None, seed=None, bias=None, rows_bias=None,
+              columns_bias=None):
         batch, queries, keys = query.shape[0], query.shape[1], key.shape[1]
         spans = key_spans(queries, keys, causal, sliding_window, segment_ids, lengths, starts,
                           block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
@@ -363,13 +396,16 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
         elif seed is not None and global_rows is not None and global_heads is not None:
             drop = template.Dropout(seed, global_rows, global_heads, dropout_rate)
         capped = None if softcap is None else template.Capped(softcap)
-        if bias is None:
+        if rows_bias is not None and columns_bias is not None:
+            params = (template.Param(rows_bias, template.Kind.QUERY),
+                      template.Param(columns_bias, template.Kind.KEY))
+        elif bias is None:
             params = ()
         elif bias.shape[2] == 1:
             params = (template.Param(bias[:, :, 0], template.Kind.KEY),)
         else:
             params = (template.Param(bias, template.Kind.TILE),)
-        score_mod = capped if bias is None else template.Biased(capped)
+        score_mod = capped if not params else template.Biased(capped)
         if fill is not None:
             score_mod, params = template.Filled.over(spans, fill, score_mod, params)
             spans = template.spans(queries, keys, batch)
@@ -388,6 +424,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     # split (`on_attention_shards`'s coordinates), so it does not depend on the mesh or on the rules of the
     # other axes.
     rows = ("activation_batch",)
+    separable = bias if isinstance(bias, SeparableBias) else None
+    dense = None if isinstance(bias, SeparableBias) else bias
     return on_attention_shards(local, query, key, value, coordinates=dropout_seed is not None,
                       sinks=(sinks, ("activation_heads",)),
                       segment_ids=(segment_ids, ("activation_batch", None)), lengths=(lengths, rows),
@@ -397,14 +435,19 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
                       key_runs=(key_runs, ("activation_batch", None, None, None)),
                       places=(places, ("activation_batch", None)),
                       query_slots=(query_slots, ("activation_batch", None)), seed=(dropout_seed, (None,)),
-                      bias=(None if bias is None else jnp.broadcast_to(
-                          bias, (*jnp.shape(bias)[:3], key.shape[1])), _bias_axes(bias)))
+                      bias=(None if dense is None else jnp.broadcast_to(
+                          dense, (*jnp.shape(dense)[:3], key.shape[1])), _bias_axes(dense)),
+                      rows_bias=(None if separable is None else separable.rows,
+                                 _bias_axes(None if separable is None else separable.rows)[:3]),
+                      columns_bias=(None if separable is None else separable.columns,
+                                    _bias_axes(None if separable is None else separable.columns)[:3]))
 
 
 def _bias_axes(bias: jax.Array | None) -> tuple[str | None, ...]:
     """A template call's bias's axes on the mesh: its batch rows and heads split with the call's where it
     holds one a row and a head, and shared whole where it holds one for them all (`template.shared_place`:
-    T5's `[1, H, Q, K]` table read by every row, never broadcast); none for a call without one."""
+    T5's `[1, H, Q, K]` table read by every row, never broadcast); none for a call without one. A
+    `SeparableBias`'s term, `[B or 1, H or 1, Q or K]`, takes the first three."""
     if bias is None:
         return (None,) * 4
     rows, heads = jnp.shape(bias)[:2]
@@ -614,10 +657,10 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     is_causal, and `sliding_window=w` to the w most recent of those, or
     without `causal` to the keys within w - 1 of i (`window_sides`); both read
     the row index, so a decode step against a cache passes `mask` instead.
-    `bias` is additive and broadcasts to [B, H, Q, K] (T5's position table).
-    `sinks` is one learned value-free logit per query head in the denominator.
-    `softcap` is Gemma 2's tanh on the scaled logits. `wide_logits` forms them
-    wide, which the reference alone does (`reference_only`). `scale_logits`
+    `bias` is additive and broadcasts to [B, H, Q, K] (T5's position table) or is a
+    `SeparableBias` (FoX's). `sinks` is one learned value-free logit per query head
+    in the denominator. `softcap` is Gemma 2's tanh on the scaled logits. `wide_logits`
+    forms them wide, which the reference alone does (`reference_only`). `scale_logits`
     applies the scale `D ** -0.5` to the fp32 logits after the product (jax.nn's
     and the fused kernels' form) where by default the query in its dtype takes it
     before (flax's): the reference path's arithmetic alone, which every route takes
@@ -701,7 +744,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     if shards > 1:
         out = sequence_parallel_attention(
             kernel, query, key, value, shards, causal=causal,
-            sliding_window=sliding_window, mask=mask, bias=bias, sinks=sinks,
+            sliding_window=sliding_window, mask=mask, bias=dense_bias(bias), sinks=sinks,
             key_value_seq_lengths=key_value_seq_lengths,
             dropout_rate=dropout_rate if dropping else 0.0, dropout_seed=words)
     else:
@@ -764,7 +807,7 @@ def _fill_weighs(fill: float, query, key, bias, softcap) -> jax.Array:
     reach = norm(query) * norm(key) * query.shape[-1] ** -0.5
     if softcap is not None:
         reach = jnp.minimum(reach, softcap)
-    least = -reach if bias is None else jnp.min(jnp.asarray(bias, jnp.float32)) - reach
+    least = -reach if bias is None else jnp.min(jnp.asarray(dense_bias(bias), jnp.float32)) - reach
     return fill > least - 105.0 - jnp.abs(least) * 2.0 ** -6
 
 
@@ -965,6 +1008,10 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
              "image_groups": image_groups, "key_valid": key_valid, "key_runs": key_runs, "places": places,
              "query_slots": query_slots, "dropout": dropout_seed is not None, "wide_logits": wide_logits}
     resolved = resolve_implementation(implementation, query, key, **facts).kernel
+    if resolved != 'template' or FORWARD_MODE.get():
+        # The template reads a separable bias as its two terms (`template_attention`); every other route,
+        # 'inference''s two among them, adds it written out, as forward mode's reference and kernel do.
+        bias = dense_bias(bias)
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
@@ -1074,6 +1121,9 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     which weighs it by a score hook (`template.Filled`); the other kernels weigh a masked key nothing
     (`_filled`).
     """
+    if implementation != 'template':
+        # A separable bias reaches the template as its two terms alone (`template_attention`).
+        bias = dense_bias(bias)
     spanned = (block_groups, image_groups, key_valid, key_runs, places, query_slots)
     if any(x is not None for x in spanned) and implementation != 'template':
         mask = masked = visibility_mask(query.shape[-3], key.shape[-3], causal, sliding_window, mask,
@@ -1193,6 +1243,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
     `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
+    laid = None if bias is None else bias.shape if isinstance(bias, SeparableBias) else jnp.shape(bias)
     # Groups a call reads under causality, or past the window of its runs (`scaled_dot_product_attention`).
     grouped = ((bool(causal) or key_runs is not None)
                and (block_groups is not None or image_groups is not None))
@@ -1208,10 +1259,13 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         spans_only=(grouped or key_valid is not None or key_runs is not None or query_slots is not None
                     or (places is not None and sliding_window is not None)),
         mask=mask is not None, bias=bias is not None,
-        bias_hook=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] in (1, query.shape[1])
-                   and jnp.shape(bias)[0] in (1, query.shape[0]) and jnp.shape(bias)[1] in (1, query.shape[2])
+        bias_hook=(bias is not None and laid is not None and len(laid) == 4
+                   and laid[-2] in (1, query.shape[1]) and laid[0] in (1, query.shape[0])
+                   and laid[1] in (1, query.shape[2])
                    and jnp.dtype(bias.dtype).itemsize <= 4),
-        dense_bias=bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] > 1,
+        dense_bias=(laid is not None and len(laid) == 4 and laid[-2] > 1
+                    and not isinstance(bias, SeparableBias)),
+        separable_bias=isinstance(bias, SeparableBias),
         sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),

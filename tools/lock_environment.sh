@@ -58,10 +58,14 @@ resolve() {
       echo --exclude-newer-package "$package=$ENVIRONMENTS"; done) \
     --python-version "$python" "$@" -o "$output"
 }
+# Every lock holds each file's sha256 (every machine's and Python's wheels and sdists, --universal), which every
+# install of it requires (tools/install_environment.sh --require-hashes): a file whose bytes change, under the same
+# name and version on an index or a release, fails to install by name (ledger 6204's audit: the locks pinned no hash,
+# so a replaced wheel would install). A release's pin head moves its files' hashes with their versions.
 lock() {
   name=$1
   shift
-  resolve "$(tr -d '\n' < .python-version)" "locks/$name.txt" --extra ci --extra tutorials "$@"
+  resolve "$(tr -d '\n' < .python-version)" "locks/$name.txt" --extra ci --extra tutorials --generate-hashes "$@"
 }
 # A host with no GPU compiles kernels for one with the CUDA plugin of the kernel-compile extra; a GPU host's
 # own CUDA extra holds its plugin, and two CUDA plugins in one environment would both claim 'cuda'.
@@ -71,6 +75,11 @@ lock cpu --universal --torch-backend cpu --extra kernel-compile
 # a lock resolved for one machine and compared with the other's could not hold.
 lock cuda12 --universal --extra cuda12 --torch-backend cpu
 lock cuda13 --universal --extra cuda13 --torch-backend cpu
+# The site's managed container's own (site/live/container/setup-managed.sh): what its extras need, at the versions
+# the cpu lock holds (-c), hashed. Its own lock, as pip refuses an install that mixes hashed and unhashed
+# requirements, and Dew's tarball, which the container installs after it with --no-deps, has no stable hash.
+resolve "$(tr -d '\n' < .python-version)" locks/site.txt --universal --extra streaming --extra live --extra profile \
+  -c locks/cpu.txt --generate-hashes
 # Each GPU extra installs on every Python pyproject.toml admits, from requires-python's floor to its newest
 # classifier, on each machine: a CUDA plugin built for fewer Pythons fails here, at the pin, and not at a user's
 # install (row 3298: post42's plugins came for 3.12 and 3.14 alone, and dewml[cuda12] refused 3.13).

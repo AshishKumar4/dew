@@ -15,7 +15,18 @@ the algebra pass's fusion on ("pass") or off ("nopass").
 
     {"builder": "tools/timing_cases.py:fused", "cells": [{"shape": "qwen3.5-4b up"}],
      "arms": [{"name": "pass", "implementation": "pass"}, {"name": "nopass", "implementation": "nopass"}]}
+
+`stepped`: a perf gate step case's training step (tools/perf_gate.py's `STEP_CASES`), compiled and run as a
+run's step is, under the algebra pass with every registered rule set ("every") or without one ("without
+<set>"): a rule set's measured receipt (docs/design/algebra.md §1.6).
+
+    {"builder": "tools/timing_cases.py:stepped", "cells": [{"case": "step lm-dense 4x1024"}],
+     "arms": [{"name": "every", "implementation": "every"},
+              {"name": "without linear", "implementation": "without linear"}]}
 """
+import atexit
+import contextlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -102,3 +113,35 @@ def fused(cell: dict, implementation: str) -> tuple:
 
     jax.block_until_ready(call(*inputs))
     return call, lambda index: inputs
+
+
+def stepped(cell: dict, implementation: str) -> tuple:
+    """`cell["case"]`'s training step (tools/perf_gate.py's `STEP_CASES`) as a run compiles and runs it
+    (`benchmark_models.compiled_step`, on its first batch each call), under the algebra pass with every
+    registered rule set (`implementation` "every") or without the one it names ("without <set>",
+    `dew.algebra.program.passes`' `without`): each call steps the state the last left, its loss the output.
+    The pass acts as the program traces, so its compile and every call hold its switch; the step's batches
+    stay placed for the worker's life, the block that placed them closed at its exit."""
+    from benchmark_cases import Case
+    from benchmark_models import build_trainer, compiled_step
+    from perf_gate import STEP_CASES
+
+    from dew.algebra.program import passes
+
+    without = () if implementation == "every" else (implementation.removeprefix("without "),)
+    case = Case(**STEP_CASES[cell["case"]])
+    placed = contextlib.ExitStack()
+    with passes(without=without):
+        step = placed.enter_context(compiled_step(case, build_trainer(case), fixed_batch=True))
+    state = [step.state]
+
+    def call():
+        with passes(without=without):
+            state[0], loss, _ = step.step(state[0])
+        return loss
+
+    # The block that placed the step's batches, held for the worker process's life and closed at its exit,
+    # before the interpreter tears its modules down.
+    atexit.register(placed.close)
+    jax.block_until_ready(call())
+    return call, lambda index: ()
