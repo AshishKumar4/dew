@@ -52,7 +52,20 @@ from dew.nn.kernels.templates import (
     swizzling,
 )
 from dew.nn.kernels.templates.cost import Stated, Work
-from dew.nn.kernels.templates.rings import CLUSTER, Ref, Ring, Turn, drain, loads, passed, streamed
+from dew.nn.kernels.templates.rings import (
+    CLUSTER,
+    Beside,
+    Ref,
+    Ring,
+    Slots,
+    Turn,
+    drain,
+    loaded_once,
+    loads,
+    passed,
+    released,
+    streamed,
+)
 from dew.nn.kernels.templates.stores import output_staging, staged_rows, written
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
@@ -498,123 +511,6 @@ def _marked_step(step: Callable, marked: Callable, index, *rest):
     return step(marked(index), *rest)
 
 
-class WholeSlots:
-    """A step's operand slots by stream name (`Slots`' interface) where the walk hands the step its blocks
-    whole and refills a slot only after the step that read it (`emit_pipeline`'s on cp.async, a TPU core's
-    walk awaiting its blocks): releasing one early is nothing."""
-
-    def __init__(self, refs: dict):
-        self._refs = refs
-
-    def __getitem__(self, name: str):
-        return self._refs[name]
-
-    def release(self, name: str) -> None:
-        del name
-
-    def acquire_all(self) -> None:
-        """Every slot acquired: the step's blocks are its whole."""
-
-
-class Beside:
-    """A step's slots (`Slots`) beside its persistent tile's once streams' (`Family.persist`'s `once`), by
-    stream name: a once stream's its tile's slot, which the tile gives back, every other the step's own."""
-
-    def __init__(self, slots: "Slots", once: dict):
-        self._slots, self._once = slots, once
-        self.more, self.first = slots.more, slots.first
-
-    def __getitem__(self, name: str):
-        return self._once[name] if name in self._once else self._slots[name]
-
-    def release(self, name: str) -> None:
-        if name not in self._once:
-            self._slots.release(name)
-
-    def opened(self, name: str):
-        return self._slots.opened(name)
-
-    def following(self, name: str):
-        return self._slots.following(name)
-
-    def done(self) -> None:
-        self._slots.done()
-
-    def held(self) -> None:
-        self._slots.held()
-
-    def acquire_all(self) -> None:
-        self._slots.acquire_all()
-
-
-class Slots:
-    """A walk step's operand slots (`Family.walk`), by stream name: each acquired when the step first reads
-    it (`slots[name]`) and released at the step's end, once its MMAs are done, unless the step `release`s it
-    sooner (a slot its last product has read). A stream the walk reads a step `ahead` the step reads through
-    the next step's slot (`following`, where `more` steps follow in its range): its own slot was acquired by
-    the step before it, or by itself where it is its range's `first` (`opened`), and it gives that slot
-    back as any other."""
-
-    def __init__(self, rings: dict[str, Ring], turn: Turn, ahead: tuple[str, ...] = (), *, more=False,
-                 first=True):
-        self._rings, self._turn = rings, turn
-        self._held: dict[str, Ref] = {}
-        self._released: set[str] = set()
-        self._ahead, self.more, self.first = ahead, more, first
-
-    def __getitem__(self, name: str):
-        if name in self._ahead:
-            raise ValueError(f"{name}'s slot is read a step ahead: the step before read it (`following`), or "
-                             "the range's first step reads its own (`opened`)")
-        if name not in self._held:
-            self._held[name] = self._rings[name].acquire(self._turn)
-        return self._held[name]
-
-    def opened(self, name: str):
-        """Stream `name`'s own slot where the walk reads it ahead and no step before this one did: the range's
-        first step's (`first`), within its branch."""
-        return self._rings[name].acquire(self._turn)
-
-    def following(self, name: str):
-        """Stream `name`'s slot at the next step, which this one reads ahead of it where `more` steps follow:
-        acquired here, given back by the next step."""
-        stages = min(ring.stages for ring in self._rings.values())
-        return self._rings[name].acquire(self._turn.ahead(1, stages))
-
-    def release(self, name: str) -> None:
-        """Stream `name`'s slot given back now, its reads done (acquired first if the step read none, or by
-        the step before where the walk reads it ahead)."""
-        if name not in self._ahead:
-            self[name]
-        self._rings[name].release(self._turn)
-        self._released.add(name)
-
-    def done(self) -> None:
-        """Every slot the step has not given back given back, each acquired: each consumer waits on every load
-        (a wait takes its barrier's next phase), so a slot it never read is still acquired before it is
-        released."""
-        for name in self._rings:
-            if name not in self._released:
-                self.release(name)
-
-    def held(self) -> None:
-        """Every slot the step has not read acquired, none given back: a step whose products stay running
-        past it (`Family.walk`'s `in_flight`) gives its slots back a step later (`released`)."""
-        if self._released or self._ahead:
-            raise ValueError("a step whose products run past it gives back no slot early nor reads one ahead")
-        self.acquire_all()
-
-    def acquire_all(self) -> None:
-        """Every slot the step has not read acquired in the step's own trace: a slot first acquired inside a
-        loop's body (a rolled `lax.fori_loop`) is kept by its first read, which would carry that body's slot
-        index past it, a scalar the kernel then takes as an input (the Mosaic GPU lowering fails on it); a
-        step that reads its slots in a loop acquires them before it. A stream read ahead is not its own to
-        acquire."""
-        for name in self._rings:
-            if name not in self._ahead:
-                self[name]
-
-
 @dataclasses.dataclass(frozen=True)
 class Product:
     """A walk step's product declared as data (row 5368), which its family places (`Issuer.scored`,
@@ -671,12 +567,6 @@ class Kept:
         return dataclasses.replace(self, factor=factor)
 
 
-def released(rings: dict[str, Ring], turn: Turn) -> None:
-    """Every ring's slot of `turn` given back: a step's slots its walk held past it (`Slots.held`)."""
-    for ring in rings.values():
-        ring.release(turn)
-
-
 @dataclasses.dataclass(frozen=True)
 class Walk:
     """A program's walk of its tile, its steps storing what it computes (no accumulator past them, and its
@@ -702,21 +592,34 @@ class Walk:
     read: Callable | None = None
     """Where given, run by the consumer after the last step with the walk's carry and its `sums` as the family
     hands them back (`Issuer.read` takes each one's value): a walk's sums read and stored once."""
+    once: dict = dataclasses.field(default_factory=dict)
+    """Views of blocks every step reads alike (a tile's operands its key blocks all take), by stream name:
+    loaded once, one deep and outside the rings' rotation, awaited before the first step, each step reading
+    it among its slots (`rings.Beside`), given back after the last (`Transport.run`'s `once`)."""
 
-    def stepped(self) -> tuple:
-        """Its segments, each step given its prologue's value, the prologue run here (in the consumer)."""
+    def stepped(self, once: dict | None = None) -> tuple:
+        """Its segments, each step given its prologue's value, the prologue run here (in the consumer), and
+        its slots beside the `once` streams' acquired slots where given (`rings.Beside`)."""
         loaded = None if self.prologue is None else self.prologue()
-        return tuple((step if loaded is None else functools.partial(step, loaded=loaded), lo, hi)
-                     for step, lo, hi in (self.segments or ((self.step, 0, self.steps),)))
+        return tuple((_besides(step if loaded is None else functools.partial(step, loaded=loaded), once),
+                      lo, hi) for step, lo, hi in (self.segments or ((self.step, 0, self.steps),)))
 
     def persisted(self, walk: Callable) -> None:
         """Its one step walked by a persistent tile's `walk(step, start, shapes)` (`Transport.persist`'s)."""
-        if self.segments:
-            raise ValueError("a persistent tile walks its one step, not segments of its own")
+        if self.segments or self.once:
+            raise ValueError("a persistent tile walks its one step, not segments of its own, its once "
+                             "streams its tile's (`Transport.persist`'s `once`)")
         if self.sums or self.read is not None:
             raise ValueError("a persistent tile's sums are its own accumulators (`Transport.persist`'s)")
         ((step, _, _),) = self.stepped()
         walk(step, self.carry, ())
+
+
+def _besides(step: Callable, once: dict | None) -> Callable:
+    """`step` reading its slots beside the `once` streams' (`rings.Beside`), as it is where none."""
+    if not once:
+        return step
+    return lambda index, slots, *rest, **given: step(index, Beside(slots, once), *rest, **given)
 
 
 class Issuer[Accumulator](abc.ABC):
@@ -1739,20 +1642,53 @@ class Transport[Allocated, Opened](abc.ABC):
         self.passed(streams, hi, streamed[1], first=streamed[0], between=between)
         return walked
 
-    def run(self, allocated: Allocated, walk: Walk, interpret: bool, *, floor: int | None = None) -> None:
+    def run(self, allocated: Allocated, walk: Walk, interpret: bool, *, floor: int | None = None,
+            once: Allocated | None = None) -> None:
         """`walk` on a program's roles: the producer's loads of its views into `allocated`'s streams (opened
         here) where the family has one, lowered to `floor` (`roles`), and its consumer's walk of them, fed by
         the producer or by its own loads (`fed`), its sums held across the walk and then read
-        (`Walk.sums`, `Walk.read`)."""
-        streams = self.opened(allocated, walk.views)
+        (`Walk.sums`, `Walk.read`). Its once streams (`Walk.once`) are `once`'s, one deep (`walked_once`):
+        held apart from its rings where the family can (loaded once, acquired before the first step, given
+        back after the last), each step reading them among its slots."""
+        streams, views, held = self.walked_once(allocated, walk.views, once, walk.once)
 
         def consumer(wg):
-            carry, sums = self.walk(self.fed(streams, walk.views, 0, walk.steps, wg), walk.stepped(),
+            taken = self.taken_once(held, walk.once, wg)
+            carry, sums = self.walk(self.fed(streams, views, 0, walk.steps, wg), walk.stepped(taken),
                                     walk.carry, walk.sums, interpret)
+            for ring in held.values():
+                ring.release(ring.turn(0))
             if walk.read is not None:
                 walk.read(carry, sums)
 
-        self.scheduled(1, consumer, lambda: self.stream(streams, walk.views, 0, walk.steps), floor=floor)
+        def producer():
+            loaded_once(held, 0, walk.once)
+            self.stream(streams, views, 0, walk.steps)
+            drain(held.values(), 1)
+
+        self.scheduled(1, consumer, producer, floor=floor)
+
+    def walked_once(self, allocated: Allocated, views: dict, once: Allocated | None, once_views: dict
+                    ) -> tuple[Opened, dict, dict]:
+        """A walk's streams opened with their `views` beside its once streams' (`once` with `once_views`):
+        the opened streams, the views its walk loads, and the once streams it holds apart (their rings, by
+        name). A family whose walk loads its own blocks (a pipeline's, a TPU core's) folds them into its
+        walked streams (`folded`), each step's block the one block, which its walk loads as it loads the
+        others."""
+        if not once_views:
+            return self.opened(allocated, views), views, {}
+        merged = {**views, **once_views}
+        return self.opened(self.folded(allocated, once), merged), merged, {}
+
+    def folded(self, allocated: Allocated, once: Allocated | None) -> Allocated:
+        """`allocated` beside a walk's `once` streams, walked as they are (`walked_once`)."""
+        raise NotImplementedError(f"{self.name} walks no once streams")
+
+    def taken_once(self, held: dict, views: dict, wg) -> dict:
+        """Consumer `wg`'s slots of the once streams its walk holds apart (`walked_once`'s), acquired before
+        its first step: loaded by the producer (`run`'s)."""
+        del views, wg
+        return {name: ring.acquire(ring.turn(0)) for name, ring in held.items()}
 
     @abc.abstractmethod
     def stream(self, streams, views: dict, lo, hi) -> None:
@@ -2238,6 +2174,15 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         for ring_ in rings.values():
             ring_.initialized()
         return rings
+
+    def walked_once(self, allocated: dict, views: dict, once: dict | None, once_views: dict
+                    ) -> tuple[dict[str, Ring], dict, dict[str, Ring]]:
+        # Its once streams held apart, one deep, beside its rings.
+        if not once_views:
+            return self.opened(allocated, views), views, {}
+        if once is None:
+            raise ValueError("a walk's once streams take their allocations (`Transport.run`'s `once`)")
+        return self.opened(allocated, views), views, self.opened(once, once_views)
 
     def stream(self, streams, views: dict, lo, hi) -> None:
         rings = tuple(streams.values())

@@ -30,6 +30,7 @@ from dew.nn.kernels.templates import (
     persistent,
     report,
     resources,
+    rings,
     stores,
     swizzling,
 )
@@ -106,7 +107,7 @@ def _gathered_walk(streams, segments, carry, interpret: bool):
                 slot = lax.rem(index - lo, stages)
                 started, accumulators = carried
                 tiles = {name: ring.at[slot] for name, ring in zip(names, slots, strict=True)}
-                return step(index, mosaic.WholeSlots(tiles), started, accumulators)
+                return step(index, rings.WholeSlots(tiles), started, accumulators)
 
             return lax.fori_loop(lo, hi, body, carry)
 
@@ -605,6 +606,13 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         return Pipeline(blocks, stages, dict(swizzles or {}), tuple(gathered))
 
 
+    def folded(self, allocated: Pipeline, once: Pipeline | None) -> Pipeline:
+        # `emit_pipeline` copies a block whose index holds from step to step once.
+        if once is None:
+            raise ValueError("a walk's once streams take their allocations (`Transport.run`'s `once`)")
+        return dataclasses.replace(allocated, blocks={**allocated.blocks, **once.blocks},
+                                   swizzles={**allocated.swizzles, **once.swizzles})
+
     def lifetimes(self, streams: Pipeline, steps: int | None = None) -> tuple[tuple, tuple]:
         # `emit_pipeline` allocates a walk's slots in its own scope, no more of them than the walk's steps.
         slots = streams.stages if steps is None else min(streams.stages, steps)
@@ -680,7 +688,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
             def body(indices, *refs, step=step, lo=lo):
                 (index,), (carried, accumulators) = indices, refs[-1]
-                slots = mosaic.WholeSlots(dict(zip(names, refs[:-1], strict=True)))
+                slots = rings.WholeSlots(dict(zip(names, refs[:-1], strict=True)))
                 return step(index + lo, slots, carried, accumulators)
 
             # A tile's blocks staged swizzled for ldmatrix (`_staging`), each read inside its operand: its

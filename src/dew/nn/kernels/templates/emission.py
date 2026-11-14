@@ -265,7 +265,7 @@ class _Place:
     first trip (`at` "first"), its last ("last") or one between ("steady"), at its `parity`; `start` and
     `stop` its range's bounds as the count holds them. A step's guard on its place (`index == lo`,
     `index + 1 < hi`: a walk's first step opening its own slots, every step but the last reading the next's,
-    `mosaic.Slots`) and on its parity (`index % 2`: the accumulator of two a step issues ahead into) read
+    `rings.Slots`) and on its parity (`index % 2`: the accumulator of two a step issues ahead into) read
     concretely at each."""
 
     at: str

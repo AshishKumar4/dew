@@ -778,7 +778,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
             def load():
                 def loads(counter, active, steps, views, tile, done):
-                    rings.loaded_once(held_once, done, active, views)
+                    pl.when(active)(lambda: rings.loaded_once(held_once, done, views))
                     rings.loads(opened, counter, active, steps, views, tile, done)
 
                 loaded, tiled = persistent.tiled(tiles, schedule, loads, axis=axis)
@@ -834,7 +834,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
         return visit
 
-    def _issued(self, rings, issue: Callable, tensor: "Tensor", held: Callable, running: tuple, *,
+    def _issued(self, opened: dict, issue: Callable, tensor: "Tensor", held: Callable, running: tuple, *,
                 summed: int, interpret: bool, unrolled: bool, once: dict) -> Callable:
         """`persist`'s product warp's visit of a tile (`persistent.tiled`'s): each active tile's windows (its
         steps, where not `summed`) into a turn's accumulators once the window `turns` back has been read out
@@ -854,10 +854,10 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
                 def walked(lo, hi, start, shapes, accumulators: tuple, step):
                     def stepped(at, slots, carry, accs):
-                        return step(at - counter, mosaic.Beside(slots, once_slots) if once_slots else slots,
+                        return step(at - counter, rings.Beside(slots, once_slots) if once_slots else slots,
                                     carry, accs)
 
-                    return self.walk(rings, ((stepped, lo, hi),), start, shapes, interpret,
+                    return self.walk(opened, ((stepped, lo, hi),), start, shapes, interpret,
                                      initial=accumulators, unrolled=unrolled)
 
                 def walk(step, start, shapes, *, initial=None):

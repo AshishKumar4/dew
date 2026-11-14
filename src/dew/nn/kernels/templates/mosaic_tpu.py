@@ -21,7 +21,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import emission, handoffs, mosaic, persistent
+from dew.nn.kernels.templates import emission, handoffs, mosaic, persistent, rings
 from dew.nn.kernels.templates.cost import Stated
 
 STAGES = 2
@@ -310,6 +310,11 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                        'sems': pltpu.SemaphoreType.DMA((STAGES,))}
                 for name, (shape, dtype) in blocks.items()}
 
+    def folded(self, allocated: dict, once: dict | None) -> dict:
+        if once is None:
+            raise ValueError("a walk's once streams take their allocations (`Transport.run`'s `once`)")
+        return {**allocated, **once}
+
     def lifetimes(self, streams: dict, steps: int | None = None) -> tuple[tuple, tuple]:
         del steps
         return tuple(ring['slots'] for ring in streams.values()), ()
@@ -412,7 +417,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
                 for name in names:
                     streams.copy(name, index, slot).wait()
-                slots = mosaic.WholeSlots({name: streams.rings[name]['slots'].at[slot] for name in names})
+                slots = rings.WholeSlots({name: streams.rings[name]['slots'].at[slot] for name in names})
                 return step(index, slots, *carry)
 
             carry = lax.fori_loop(lo, hi, body, carry)

@@ -10,7 +10,7 @@ from jax.experimental import pallas as pl
 from dew.nn.kernels.templates import mosaic, resources
 from dew.nn.kernels.templates.handoffs import Role, Schedule
 from dew.nn.kernels.templates.mosaic import RingFamily
-from dew.nn.kernels.templates.rings import Ring, drain
+from dew.nn.kernels.templates.rings import Ring, drain, loaded_once
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,6 +76,11 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
 
     takes_pingpong = False  # its first consumer issues every ring's loads, its partner's tiles' too
     cluster = 1
+
+    def taken_once(self, held: dict, views: dict, wg) -> dict:
+        # Its loads its loading consumer's: a walk's once streams too, before the walk's first step.
+        pl.when(wg == self.loader)(lambda: loaded_once(held, 0, views))
+        return super().taken_once(held, views, wg)
     feeds_itself = True
     gathers_rows = True  # the loading consumer, a whole warpgroup, gathers a step's rows (`gathered.Ring`)
     loader = 0

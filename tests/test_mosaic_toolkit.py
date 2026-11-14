@@ -1736,3 +1736,53 @@ def test_a_product_issued_within_a_staged_block_is_refused():
 
     with pytest.raises(ValueError), WGMMA.staged_together():
         mosaic.committed()
+
+
+def _walked_once(x, w, *, family, interpret):
+    """`x[:, :PERSISTED_DEPTH] @` the sum of `w`'s `PERSISTED_STEPS` step blocks through one plain walk
+    (`Transport.run`) on `family`'s roles: `x`'s first block a once stream (`Walk.once`), loaded once outside
+    the ring and read by every step beside `w`'s ringed blocks, the walk's sums read out after its last
+    step (`Walk.read`)."""
+    rows, columns = family.rows, w.shape[1]
+    family = family.specialized(rows, columns)
+    shape = (rows, columns)
+
+    def body(x_gmem, w_gmem, o_gmem):
+        def scope(*, streams):
+            def read(carry, sums):
+                del carry
+                for first, (value,) in family.chunks(sums):
+                    o_gmem[:, pl.ds(first, value.shape[1])] = value
+
+            walk = mosaic.Walk({'w': (w_gmem, lambda j: (j, 0))}, _multiplying(family, 'x', 'w', interpret),
+                               steps=PERSISTED_STEPS, sums=(shape,), read=read,
+                               once={'x': (x_gmem, lambda j: (0, 0))})
+            family.run(streams["walked"], walk, interpret, once=streams["once"])
+
+        ringed, held = {'w': ((PERSISTED_DEPTH, columns), w.dtype)}, {'x': ((rows, PERSISTED_DEPTH), x.dtype)}
+        family.scoped(scope, streams={"walked": family.streams(ringed, 2, 1),
+                                      "once": family.streams(held, 1, 1)})
+
+    out = jax.ShapeDtypeStruct(shape, jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="walked_once")(x, w)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("bundle", ["wgmma", "fed", "mma"])
+def test_a_walks_once_stream_loads_once_and_every_step_reads_it(bundle):
+    """Interpreted: a plain walk whose left operand is a once stream (`Walk.once`), on each way a family
+    holds one: warpgroup MMA's producer loading it beside the ring, its consumer-fed bundle's loading
+    consumer before the walk (`fed.ConsumerFed.taken_once`), and mma.sync's pipeline walking it as a block
+    whose index holds (`folded`); every step reads it with its own ringed block, so the walk sums that
+    block times every step's: exactly, small integers in fp32. (tcgen05's plain walks' accumulators are
+    their persist's or their launch's tensor memory, which this one scopes none of.)"""
+    from dew.nn.kernels.templates import mosaic_sm80, mosaic_sm90
+    family, target = {"wgmma": (mosaic_sm90.WGMMA, "sm90"), "fed": (mosaic_sm90.FED, "sm90"),
+                      "mma": (mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)), "sm80")}[bundle]
+    x, w = _persisted_operands(family.rows)
+    x = x[:family.rows]
+    with generation.assumed(target):
+        got = np.asarray(_walked_once(x, w, family=family, interpret=INTERPRETED))
+    blocks = np.asarray(w, np.float32).reshape(PERSISTED_STEPS, PERSISTED_DEPTH, -1).sum(axis=0)
+    np.testing.assert_array_equal(got, np.asarray(x, np.float32)[:, :PERSISTED_DEPTH] @ blocks)
