@@ -218,15 +218,17 @@ def test_a_phased_runs_later_phase_compiles_ahead_as_the_run_lowers_it_at_its_bo
     host = compile_only_gpus("sm90", 8, 40 * 2**30)
     topology.write_bytes(topologies.TopologyDescription(list(host)).serialize())
     data = phased(tmp_path)
-    phases_target = AheadTarget("sm90", 8, topology=str(topology), capacity_gib=30.0, phases=(1,))
+    phases_target = AheadTarget("sm90", 8, topology=str(topology), phases=(1,))
+    # The topology states its GPUs' memory: a capacity beside it, which nothing would read, is refused.
+    with pytest.raises(ValueError):
+        dataclasses.replace(phases_target, capacity_gib=30.0).compile_only()
     with pytest.raises(CompiledAhead) as later:
         trained(run(tmp_path, STEPS, data), tmp_path, "ahead",
                 trainer={"steps": 4, "compile_ahead": phases_target})
     assert later.value.code == 0 and later.value.path is None
     assert not (tmp_path / "runs" / "ahead").exists()
     trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 3, "checkpoint_every": 1})
-    resumed_target = AheadTarget("sm90", 8, path=str(tmp_path / "resumed.ahead"), topology=str(topology),
-                                 capacity_gib=30.0)
+    resumed_target = AheadTarget("sm90", 8, path=str(tmp_path / "resumed.ahead"), topology=str(topology))
     with pytest.raises(CompiledAhead) as resumed:
         trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 4,
                                                                          "compile_ahead": resumed_target})
