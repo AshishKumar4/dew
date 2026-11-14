@@ -427,11 +427,10 @@ class AheadOfTime:
     def load(path: str | Path) -> AheadOfTime:
         """The step `save` wrote to `path`."""
         step = _saved(path, AheadOfTime, "step")
-        if ("starts" not in vars(step) or "planned_parts" not in vars(step)
-                or "autotuned" not in record(step.plan, "plan")):
+        if "starts" not in vars(step) or "autotuned" not in record(step.plan, "plan"):
             raise ValueError(f"{path} holds a step compiled ahead before steps carried their start's "
-                             "programs (`starts`), said whether XLA tuned them (`autotuned`) and recorded "
-                             "their planning by part (`planned_parts`); compile it ahead again")
+                             "programs (`starts`) and said whether XLA tuned them (`autotuned`); compile it "
+                             "ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
         _current(path, "step", [step.executable, *sampled])
         return step

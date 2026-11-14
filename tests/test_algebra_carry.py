@@ -34,17 +34,42 @@ def widened(h, a, b):
     return (jnp.matmul(a, h, preferred_element_type=wide) + jnp.matmul(b, h, preferred_element_type=wide),)
 
 
+def wide_draw(seed):
+    """A state of half-scale float16 values and two float16 matrices near half float16's largest."""
+    rng = np.random.default_rng(seed)
+    return (jnp.asarray(rng.uniform(0.5, 1.0, (3, 2)), jnp.float16),
+            *(jnp.asarray(rng.uniform(30000, 40000, (3, 3)), jnp.float16) for _ in range(2)))
+
+
 def test_products_accumulated_wide_keep_their_accumulation_through_the_split():
     """Float16 matrices near half float16's largest, each product with the state accumulated in float32:
     their sum is finite where adding the matrices first in float16 overflows; the split computes the
     function."""
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return (jnp.asarray(rng.uniform(0.5, 1.0, (3, 2)), jnp.float16),
-                *(jnp.asarray(rng.uniform(30000, 40000, (3, 3)), jnp.float16) for _ in range(2)))
-
-    assert_as_exact(jax.jit(split_run(widened, (0,))), jax.jit(widened), draw, "widened products",
+    assert_as_exact(jax.jit(split_run(widened, (0,))), jax.jit(widened), wide_draw, "widened products",
                     seeds=8)
+
+
+def test_a_split_without_its_reorderings_admits_none_and_computes_the_function():
+    """`widened`'s split, its saturation recorded (`report.rewrites`): with every set it admits the carry's
+    reorderings (`carried`), and with them left out (a receipt's arm, `algebra.program.passes`' `without`)
+    admits none and fires none, its traced forms computing the function (check 1)."""
+    from dew.algebra.program import passes
+    from dew.nn.kernels.templates import report
+
+    shapes = [jax.ShapeDtypeStruct(shape, jnp.float16) for shape in ((3, 2), (3, 3), (3, 3))]
+    for without, admitted in (((), ("carried",)), (("carried",), ())):
+        with report.refusals(), passes(without=without):
+            carry.split(widened, shapes[0], shapes[1:], (0,), saturation=SATURATION)
+            [made] = report.rewrites()
+        assert made.admitted == admitted
+
+    def split(*inputs):
+        # The split derives as the program traces, which the arm holds.
+        with passes(without=("carried",)):
+            return split_run(widened, (0,))(*inputs)
+
+    label = "widened products, the split's reorderings left out"
+    assert_as_exact(jax.jit(split), jax.jit(widened), wide_draw, label, seeds=8)
 
 
 def broadcast_sum(h, a, b, c):

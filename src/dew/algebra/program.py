@@ -96,12 +96,14 @@ class Rewrite:
 @contextlib.contextmanager
 def passes(on: bool = True, target: str | None = None, without: Collection[str] = ()) -> Iterator[None]:
     """Within the block, the programs Dew compiles are rewritten (`on`) or not, priced for the GPU `target`
-    names (None: the process's own), by every registered rule set but those `without` names (a receipt's
-    arm, §1.6; a name no set registers is refused, as an arm without it would measure nothing): a context of
-    JAX's trace, so a program held across the switch traces afresh (`dew._cache.ALGEBRA`). The accuracy gate
-    holds it off for a reference arm and the float64 truth."""
-    if unknown := sorted(set(without) - set(rules.RULES)):
-        raise ValueError(f"no rule set registers {unknown}: the registered sets are {sorted(rules.RULES)}")
+    names (None: the process's own), by every rule set but those `without` names (a receipt's arm, §1.6,
+    `rules.nameable`: a name no arm may leave out is refused, as an arm without it would measure nothing): a
+    context of JAX's trace, so a program held across the switch traces afresh (`dew._cache.ALGEBRA`). The
+    accuracy gate holds it off for a reference arm and the float64 truth."""
+    if unknown := sorted(set(without) - rules.nameable()):
+        raise ValueError(f"no arm leaves out {unknown}: an arm may leave out {sorted(rules.nameable())}; a "
+                         "dev-time set runs at dev time alone, and a derivation's defining set (decoupled, a "
+                         "scan's identities) makes its program, which no arm has without it")
     with ALGEBRA(dataclasses.replace(ALGEBRA.value, on=on, target=target, without=frozenset(without))):
         yield
 
