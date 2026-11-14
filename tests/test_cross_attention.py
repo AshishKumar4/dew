@@ -443,19 +443,23 @@ def source():
 
 
 def test_a_bundle_of_a_cross_attending_model_is_its_sources_carrying_it(source):
-    """A bundle of a model that reads a context through cross-attention (`PretrainedDecoder.from_model`,
+    """A bundle of a model that reads a context through cross-attention (`PretrainedDecoder.carrying`,
     which a run's load and a decision's release both build it through) is its source's, laid out as the
     model without its blocks, carrying the model: its config is the source's, its model the attached one,
-    and its export, which no family's format holds, is refused (ledger 4799)."""
+    and its export, which no family's format holds, is refused (ledger 4799); `from_model`, which writes
+    the layout the model's own family states, refuses the model at once."""
+    from dew.interop.decoder_parts import ExportRefused
     from dew.interop.pretrained import PretrainedDecoder
 
     attached = source.with_cross_attention(CrossAttention(layer_ids=(1,), context_length=3,
                                                           context_features=8), key=0)
-    bundle = PretrainedDecoder.from_model(attached.model, attached.variables)
+    bundle = PretrainedDecoder.carrying(attached.model, attached.variables)
     assert bundle.model == attached.model
     assert bundle.config == PretrainedDecoder.from_model(source.model, source.variables).config
     with pytest.raises(ValueError):
         bundle.export()
+    with pytest.raises(ExportRefused):
+        PretrainedDecoder.from_model(attached.model, attached.variables)
 
 
 def test_the_blocks_train_beside_an_adapter_with_the_source_frozen(source, tmp_path):

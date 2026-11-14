@@ -140,8 +140,8 @@ class PretrainedDecision(Pretrained):
         decision_format(head.release_format)
         encoder, backbone = task.model.backbone, thaw(part(task.variables, "backbone"))
         # A backbone a decision context reads through cross-attention is its source's, carrying the task's
-        # model (`PretrainedDecoder.from_model`).
-        decoder = PretrainedDecoder.from_model(encoder, backbone).bound(encoder, backbone)
+        # model (`PretrainedDecoder.carrying`).
+        decoder = PretrainedDecoder.carrying(encoder, backbone).bound(encoder, backbone)
         if decoder.adapter is None and any(isinstance(key, jax.tree_util.DictKey) and key.key in FACTORS
                                            for path, _ in jax.tree_util.tree_leaves_with_path(backbone)
                                            for key in path):
