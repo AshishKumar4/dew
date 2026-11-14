@@ -2247,9 +2247,13 @@ gated delta net's gates, which M-EM-36-gh200 and em35d timed at 24,576 tokens, e
 
 MEASURED: dict[tuple[str | None, Made], frozenset[tuple[int, int]]] = {
     (family, made): frozenset(FOUR_B) for family in ('wgmma', 'tcgen05')
-    for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT)}
+    for made in (Made.FORWARD, Made.INPUT_GRADIENT)}
 """The dense matrices each instruction family's receipts timed, by what the product makes: a product of one is
-a cell of its own (`Kind.matrix`), which its receipt's winner holds; every other product its kind's."""
+a cell of its own (`Kind.matrix`), which its receipt's winner holds; every other product its kind's. A kernel
+gradient has none: XLA's dot of one is deferred to the backward's end, holding every layer's cotangents
+live (the 4B's up, gate, key and value on a B200: 22.25 GB of the step's temporaries against 11.06 GB on
+the template, compile-only, so a four-row step needed 148 GiB against 95), which no per-call time
+prices."""
 
 M_EM_36 = ("M-EM-36-gh200 (a GH200, base/kernels df82480cb5c, CUPTI medians of 5 rounds, cuBLASLt autotuned "
            "at run, 24,576 tokens)")
@@ -2280,8 +2284,6 @@ DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str
              "10 projections at 8192 tokens"),
     ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT)):
         (XLA, "DENSE1 (H100): Mosaic 1.048x, Triton 1.738x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT)):
-        (XLA, "DENSE1 (H100): Mosaic 1.049x, Triton 1.149x XLA's dot"),
     ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 9216))): (
         MOSAIC, f"{M_EM_36}: the template 0.866x XLA's dot"),
     ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(9216, 2560))): (
@@ -2298,22 +2300,10 @@ DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str
         MOSAIC, f"{M_EM_36}: the template 0.949x XLA's dot"),
     ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 64))): (
         MOSAIC, f"{M_EM_36}: the template 0.93x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216))): (
-        XLA, f"{M_EM_36}: the template 1.095x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(9216, 2560))): (
-        MOSAIC, f"{M_EM_36}: the template 0.975x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024))): (
-        MOSAIC, f"{M_EM_36}: the template 0.973x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 64))): (
-        MOSAIC, f"{M_EM_36}: the template 0.376x XLA's dot"),
     ('tcgen05', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64))): (
         XLA, f"{B200_GRID}: the template 1.216x XLA's dot (em35d 1.225x)"),
     ('tcgen05', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 9216))): (
         XLA, f"{EM35D}: the template 1.009x XLA's dot"),
-    ('tcgen05', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216))): (
-        XLA, f"{B200_GRID}: the template 1.355x XLA's dot (em35d 1.303x)"),
-    ('tcgen05', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024))): (
-        XLA, f"{B200_GRID}: the template 1.148x XLA's dot (em35d 1.326x)"),
 }
 """The grouped GEMM's declared cells (`selection.Op.declared`), where a route measured faster than the
 template's default on a generation, each with its receipt (owner, bible da64ae5; "whatever is the
