@@ -557,8 +557,14 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     by its fields alone (`earlier_model`, ledgers 1622, 1898 and 2320), and a row of segments'
     question budgets, which it ignored and an earlier record wrote at their defaults (row 2006), and a
     step's attention form, which its numerics' forms hold now (row 2500), and a decision run's count of
-    questions a row, which no task reads. A record in today's shapes
+    questions a row, which no task reads, and an encoder's or conditioner's class by the import path it
+    has now (`dew.registry.moved_paths`, row 5996). A record in today's shapes
     passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
+    from dew.registry import moved_paths
+
+    moved = moved_paths(dict(record))
+    assert isinstance(moved, dict)
+    record = moved
     current = dict(record)
     for key in ("head", "layout"):
         held = record.get(key)

@@ -145,7 +145,7 @@ def import_path(member: Importable) -> str:
     return f"{module}:{name}"
 
 
-MOVED: Mapping[str, str] = {
+MOVED_PATHS: Mapping[str, str] = {
     f"dew.inputs.encoders:{name}": f"dew.interop.encoders:{name}"
     for name in ("CLIPText", "T5Text", "HFAudio")
 } | {
@@ -153,13 +153,26 @@ MOVED: Mapping[str, str] = {
     for name in ("DiffusionConditioner", "QwenImageConditioner", "HiddenStatesConditioner", "WanConditioner")
 }
 """Import paths an earlier Dew recorded, by the path each names now: the encoders that bind a released
-checkpoint, dew.interop's since row 5996, which a run's record or its layout named under dew.inputs. The one
-place a recorded path is translated (`imported`)."""
+checkpoint, dew.interop's since row 5996, which a run's record, its steps' artifacts or its data plan named
+under dew.inputs. The one table their readers of saved records translate by (`moved_paths`): a run's record
+(`dew.config.earlier.earlier_run`), a step's artifact (`dew.inference.tasks.earlier_shapes`) and a saved
+data plan's manifest (`dew.data.plan.Plan.check`); a path given today is read as given (`imported`)."""
+
+
+def moved_paths(value: JSON) -> JSON:
+    """`value`, a saved record's JSON, with every string an earlier Dew recorded as an import path
+    `MOVED_PATHS` holds read as the path it names now; the rest as it is."""
+    if isinstance(value, str):
+        return MOVED_PATHS.get(value, value)
+    if isinstance(value, dict):
+        return {key: moved_paths(held) for key, held in value.items()}
+    if isinstance(value, list):
+        return [moved_paths(held) for held in value]
+    return value
 
 
 def imported(path: str) -> Callable[..., Configured]:
-    """The class or function an import path names, importing its module; a path an earlier Dew recorded,
-    as it names it now (`MOVED`).
+    """The class or function an import path names, importing its module.
 
     Records arrive from the Hub, and importing a module runs its top level,
     so a record imports only Dew's own modules and modules already imported.
@@ -167,7 +180,7 @@ def imported(path: str) -> Callable[..., Configured]:
     them; a run of a package not yet imported loads once the caller trusts
     the package (`import_trusted`), as `trust_remote_code` does in
     transformers."""
-    module, _, name = MOVED.get(path, path).partition(":")
+    module, _, name = path.partition(":")
     if not module or not name:
         raise ValueError(f"{path!r} is not an import path, `module:Qualified.name`")
     if module != "dew" and not module.startswith("dew.") and module not in sys.modules:
