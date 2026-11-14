@@ -17,7 +17,7 @@ import dataclasses
 import functools
 import math
 import threading
-from collections.abc import Set
+from collections.abc import Iterable, Set
 from typing import ClassVar
 
 import jax
@@ -557,12 +557,14 @@ class Mosaic(base.Template[mainloop.Tiles]):
             # tiles.
             narrower = family is not None and (_widths(ba, family, training=False)[1]
                                                < _widths(ba, family)[1])
+            # The training call's tiles serve a forward alone only where no compile refused them for it.
+            serves = (trained not in refused[False]
+                      and self._product_holds(ba, trained, target, training=False))
             if alone is not None and target.multiprocessors is not None and not narrower and (
                     not self._one_wave(ba, alone, target)
-                    or self._one_wave(ba, trained, target, training=True)) and self._product_holds(
-                        ba, trained, target, training=False):
+                    or self._one_wave(ba, trained, target, training=True)) and serves:
                 alone = None
-            elif alone is None and not self._product_holds(ba, trained, target, training=False):
+            elif alone is None and not serves:
                 # No tiles at this chunk hold a forward alone, the training call's neither: none serve the
                 # call (a forked Nemotron-H 4B SSD forward on sm100 at the training call's 96-wide block asked
                 # 304,316 bytes of shared memory, its scan holding no program).
@@ -582,9 +584,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
                         (refused[False], forward, self.launches(ba, joined.forward or joined, target,
                                                                 backward=False), _spilled(self, ba, joined)))
             ran = [(tiles_refused, tiles) for tiles_refused, tiles, launches, kernels in products
-                   if any(kernel.startswith(launch.name) for kernel in kernels for launch in launches)]
-            assert ran, (f"the spilled kernels {sorted(_spilled(self, ba, joined))} are none of the call's "
-                         "launches")
+                   if _owners(kernels, launches)]
+            assert ran, (f"the spilled kernels {sorted(_spilled(self, ba, joined))} are none of the "
+                         "call's launches")
             for tiles_refused, tiles in ran:
                 tiles_refused.add(tiles)
 
@@ -602,19 +604,31 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def _raised(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                 target: generation.GpuTarget) -> resources.Producers | None:
-        """`joined`'s producers with those of its `spilled` launches whose programs lower a producer's
-        warpgroup a setmaxnreg step higher (`resources.Producers.raised`); None where none lowers one or one
-        can rise no further (its tiles then refused, the next derived). A raise moves registers within a
-        program's pool, which its launch plans at the least (`mainloop.launch_kernel`): whether the consumers
-        hold beside the raised producer is the assembler's, a compile that spills them refusing it."""
+        """`joined`'s producers with those of its `spilled` launches (each kernel's own, `_owners`) a
+        setmaxnreg step higher (`resources.Producers.raised`), each a launch whose program moves registers
+        from its producer at its planned residency (`resources.moves_registers`, as its schedule does); None
+        where none does, one can rise no further, or its consumers' share beside the raised producer would
+        fall below setmaxnreg's least (its tiles then refused, the next derived). A raise moves registers
+        within a program's pool, which its launch plans at the least (`mainloop.launch_kernel`): whether the
+        consumers hold beside the raised producer is the assembler's, a compile that spills them refusing
+        it."""
         family = bundle(target, _dtype(ba))
         assert family is not None
         launches = (*self.launches(ba, joined, target, backward=True),
                     *self.launches(ba, joined.forward or joined, target, backward=False))
-        lowering = {launch.name for launch in launches
-                    if (launch.family or family).roles(launch.consumers).lowers
-                    and any(kernel.startswith(launch.name) for kernel in spilled)}
-        return joined.producers.raised(lowering) if lowering else None
+        owned = _owners(spilled, launches)
+        moving = {launch.name: launch for launch in launches if launch.name in owned
+                  and resources.moves_registers(launch.registers, (launch.family or family).warpgroups(
+                      launch.consumers), launch.consumers, launch.resident)}
+        producers = joined.producers.raised(moving) if moving else None
+        if producers is None:
+            return None
+        least = resources.facts().raises().lowest
+        # Each raised launch's consumers keep a share setmaxnreg can move them to.
+        expressed = all(min(resources.role_registers((1,) * launch.consumers + (0,), launch.resident,
+                                                     floor=producers.of(name))[:-1]) >= least
+                        for name, launch in moving.items())
+        return producers if expressed else None
 
     def _derive(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, chunk: int, *,
                 training: bool, refused: Set[mainloop.Tiles] = frozenset()) -> mainloop.Tiles | None:
@@ -855,6 +869,14 @@ def _spilled(op, ba: tokamax.BoundArguments, tiles: mainloop.Tiles) -> frozenset
     forward alone's, at its own tiles where it has them (`Tiles.forward`)."""
     return report.spilled(op, ba, tiles) | (report.spilled(op, ba, tiles.forward) if tiles.forward
                                             else frozenset())
+
+
+def _owners(kernels: Iterable[str], launches: Iterable[mainloop.Launch]) -> frozenset[str]:
+    """The launches that ran `kernels`, by name: each kernel's the longest launch name it starts with, a name
+    another launch's extends (`recurrence_intra` beside `recurrence_intra_solve`) owning only its own."""
+    names = sorted({launch.name for launch in launches}, key=len, reverse=True)
+    return frozenset(owner for kernel in kernels
+                     if (owner := next((name for name in names if kernel.startswith(name)), None)))
 
 
 def _producing(tiles: mainloop.Tiles, producers: resources.Producers) -> mainloop.Tiles:

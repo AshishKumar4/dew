@@ -82,12 +82,6 @@ class Schedule:
     def raised(self) -> tuple[Role, ...]:
         return tuple(role for role in self.roles if role.weight)
 
-    @property
-    def lowers(self) -> bool:
-        """Whether its last warpgroup lowers to its `floor` (a producer's or its warp roles'): a program of
-        one role moves no registers."""
-        return bool(self.raised) and len(self.raised) < len(self.roles)
-
     def role(self, name: str) -> Role:
         return next(role for role in self.roles if role.name == name)
 

@@ -14,6 +14,7 @@ the stability suite holds the mainloop under its regimes there (tests/test_recur
 
 import dataclasses
 import functools
+import types
 from collections.abc import Callable
 
 import jax
@@ -1596,3 +1597,31 @@ def test_a_training_launchs_backward_kernels_carry_its_launch():
     assert set(training) - set(forward), (forward, training)
     assert len(set(training.values())) == 1 and None not in training.values(), training
 
+
+
+
+def test_a_forward_spilling_at_every_producer_raise_ends_its_derivation():
+    """A forked forward alone whose scan spills at its producer's every setmaxnreg step (a compile refusing
+    each raised config, `report.refuse_launch`) has its tiles refused past the last raise: its derivation
+    ends, on other tiles or none, the training call's tiles never taken again for a forward refused at them
+    (`Mosaic._chunked`)."""
+    facts = generation.gpu_target('sm100')
+    _, bound, tiles, _ = forked_case('sm100', 'kimi-linear-kda', training=False)
+    forward = tiles.forward or tiles
+    with generation.assumed(facts):
+        raised = forward
+        while raised is not None:
+            report.refuse_launch(template.MOSAIC, bound, raised, {'recurrence_scan'})
+            producers = raised.producers.raised({'recurrence_scan'})
+            raised = None if producers is None else template._producing(raised, producers)
+        derived = template.MOSAIC.derived(bound, facts)
+    assert derived is None or (derived.forward or derived) != forward
+
+
+def test_a_spilling_kernel_raises_only_the_launch_it_belongs_to():
+    """A kernel spilling under a launch name another launch's extends (`recurrence_intra_solve` beside
+    `recurrence_intra`) is that longer launch's alone (`template._owners`), so only its producer rises."""
+    launches = [types.SimpleNamespace(name=name)
+                for name in ('recurrence_intra', 'recurrence_intra_solve', 'recurrence_scan')]
+    owners = template._owners({'recurrence_intra_solve__l1f2', 'recurrence_scan__l3a4'}, launches)
+    assert owners == {'recurrence_intra_solve', 'recurrence_scan'}
