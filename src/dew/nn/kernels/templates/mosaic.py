@@ -711,7 +711,7 @@ class Issuer[Accumulator](abc.ABC):
         """The rows a walked tile (a forward's keys) comes in whole multiples of: the products' rows, which a
         consumer's weights' product takes as its depth (wgmma's and the chunks' 64, mma.sync's 16); a family
         whose products a role issues takes its weights from tensor memory, a swizzle tile's 64 rows of a
-        16-bit stream (`Tcgen05Placed`)."""
+        16-bit stream (`placed.Tcgen05Placed`)."""
         return self.rows
 
     @property
