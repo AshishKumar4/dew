@@ -17,8 +17,9 @@ def under_release(requirement: str, check: Callable[..., None], *arguments: str 
     interpreter's environment by `uv run --with`, Dew and the suite's modules importable and the Hub
     offline, as a test's own settings hold it; its failure, with its output, fails the test."""
     called = f"import {check.__module__} as module; module.{check.__qualname__}(*{arguments!r})"
+    path = os.pathsep.join(filter(None, (str(ROOT / "tests"), str(ROOT / "src"),
+                                         os.environ.get("PYTHONPATH"))))
     run = subprocess.run(["uv", "run", "--no-project", "--python", sys.executable, "--with", requirement,
                           "python", "-c", called], cwd=ROOT, capture_output=True, text=True, check=False,
-                         env={**os.environ, "HF_HUB_OFFLINE": "1", "PYTHONPATH": os.pathsep.join(filter(None, (
-                             str(ROOT / "tests"), str(ROOT / "src"), os.environ.get("PYTHONPATH"))))})
+                         env={**os.environ, "HF_HUB_OFFLINE": "1", "PYTHONPATH": path})
     assert run.returncode == 0, f"{requirement}: {run.stdout[-4000:]}{run.stderr[-8000:]}"
