@@ -1634,7 +1634,7 @@ def _reverse_walk_certified(op=None) -> list:
             op._certified(bound, op.derived(bound, generation.gpu_target()))
         refused = [config for _, config, _ in report.refused_launches()]
     return [each for each in report.certifications()
-            if id(each) not in before and each.op == type(template.MOSAIC).__name__], refused
+            if id(each) not in before and each.op == type(op or template.MOSAIC).__name__], refused
 
 
 @lowers('sm100')
