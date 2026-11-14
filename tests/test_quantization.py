@@ -1700,12 +1700,11 @@ def test_an_int8_models_masked_attention_runs_none_of_its_own_orders_whole_produ
 def test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention(step):
     """A paged CausalTransformer (16-slot pages, 4 query heads over 2, 64 wide, bf16) through a decode step
     and a mixed serving step (`Admitted`: rows decoding beside an admitted prompt), traced for a B200 on its
-    reported routes: plain, the pool read by a paged kernel (`kv_cache.PAGED`) and the mixed step's attention
-    by the template's work list (`CausalSelfAttention._one_work_list`), each forming its products whole;
-    under Qwix's int8 rule, which owns the steps' products, by neither (`PagedCase.owned`,
-    `AttentionCase.quantized`), the gathered rows read through the layer's attention, every attention route
-    the rule's arithmetic, no kernel forming its products past the rule (train 802's review F1 and F2: the
-    mixed step's work list and paged read ran whole products)."""
+    reported routes: plain, some route takes a kernel forming its products whole, inside a launch a rule
+    never sees (a paged kernel of `kv_cache.PAGED`, the template's work list); under Qwix's int8 rule, which
+    owns the steps' products, no route takes one (`PagedCase.owned`, `AttentionCase.quantized`), whichever
+    kernels the selectors then pick (train 802's review F1 and F2: the mixed step's work list and paged
+    read ran whole products)."""
     pytest.importorskip("qwix")
     from model_support import TINY_DECODER
 
@@ -1746,18 +1745,20 @@ def test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention
         listed = {route.kernel for route in routes if route.site.endswith("._one_work_list")}
         return kernels, listed
 
-    # The routes each step's own program takes: the cache's allocation, traced for its shapes alone,
-    # reports none (`generation.unforced`).
-    plain, listed = routes_of(model)
-    owned, owned_listed = routes_of(Quantization(dtype="int8").apply(model))
-    if step == "decode":
-        assert plain[Choice.PAGED_DECODE] - {"gathered"}, plain
-        assert owned[Choice.PAGED_DECODE] == {"gathered"}, owned
-    else:
-        assert listed == {"template"}, listed
-    attended = owned[Choice.ATTENTION] | owned[Choice.DECODE]
-    assert attended and not attended & _whole_product_kernels(), owned
-    assert not owned_listed, owned_listed
+    # Every route each step's own program takes (the cache's allocation, traced for its shapes alone,
+    # reports none: `generation.unforced`), the kernels a rule never sees among them or not.
+    from dew.nn import kv_cache
+
+    past_the_rule = _whole_product_kernels() | {
+        kernel.name for kernel in kv_cache.PAGED.kernels if kv_cache._OWNED in kernel.supports}
+
+    def taken(kernels, listed):
+        return set().union(*kernels.values(), listed)
+
+    plain = taken(*routes_of(model))
+    assert plain & past_the_rule, plain
+    owned = taken(*routes_of(Quantization(dtype="int8").apply(model)))
+    assert owned and not owned & past_the_rule, owned
 
 
 def test_an_int8_attention_block_on_xla_is_on_par_with_the_reference_path(monkeypatch):
