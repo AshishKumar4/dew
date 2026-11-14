@@ -21,6 +21,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Generic
 
 import jax
+import jax.extend.core as jcore
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -47,6 +48,7 @@ from dew.nn.inspection import (
 from dew.nn.kernels.options import owned_program
 from dew.nn.moe import fixed_routers
 from dew.nn.precision import at_least_fp32
+from dew.nn.programs import called, computed
 from dew.nn.sharding import auto_part, rows_spec
 from dew.objectives.base import (
     EXAMPLE_STREAM,
@@ -62,7 +64,6 @@ from dew.objectives.base import (
 from dew.objectives.routing import refuse_fixed_routers
 from dew.optim import clips_qk, post_step_order, stepped
 from dew.state import Accumulation, TokenCount, TrainState, apart, occupancy, together
-from dew.training.compiled_program import gradients_read
 from dew.training.distributed import microbatch
 from dew.training.inspection import Inspection, Summaries, stacked, summaries
 from dew.training.model_flops import step_counts
@@ -302,7 +303,7 @@ def pooled_by_mean(stats_shape) -> bool:
 def consumed_where_made(optimizer: optax.GradientTransformation, state: TrainState, window: int, *,
                         shared: bool, progressed: bool) -> bool:
     """Whether the step reads each gradient where it is made into the buffers its state donates, so it
-    holds none beside another (`footprint.gradient_peak`'s `consumed`): with the state it commits
+    holds none beside another: with the state it commits
     (`COMMIT_FIELDS`) in device memory, a window of several microbatches that pools them by mean (`shared`,
     `pooled_by_mean`) sums each into its accumulator's gradient leaf in device memory, where one that
     replays them keeps their gradients for the replay; and a window of one updates each by `optimizer`,
@@ -312,8 +313,7 @@ def consumed_where_made(optimizer: optax.GradientTransformation, state: TrainSta
     (`Transaction.past`), and an update that reads them together (clipping by the global norm) holds them
     all until it has read the last. A head that takes its gradient in the backward a tile at a time
     (`head_tile`, unfused) has XLA run every layer's weight gradient after the whole backward (row 3653),
-    which the footprint derives by running them there (`footprint.sunk`), each gradient then read where it
-    is made as any head's."""
+    each gradient then read where it is made as any head's."""
     if state.scale is not None or not in_device([getattr(state, field) for field in COMMIT_FIELDS]):
         return False
     if window > 1:
@@ -668,7 +668,7 @@ def attempt_step(state, variables, ema, batch, *, split: int, slots: int, attemp
     updates committed, which a model whose computation moves over a run reads (`Objective.progress`);
     and the microbatch's examples, its window `slot` of `slots`, its `part`, after the attempts the run
     rejected (`example_fields`). An attempt and its replay read it, and so do the traces that shape and
-    narrow the step (`dew.training.footprint.traced_loss`, `dew.training.narrow.narrow_copies`), which
+    narrow the step (`traced_loss`, `dew.training.narrow.narrow_copies`), which
     record nothing and watch nothing."""
     accepted = state.microstep if microstep is None else microstep
     return Step(accepted // split, jax.random.fold_in(state.key, attempt), with_ema(variables, ema),
@@ -1502,3 +1502,41 @@ class Transaction:
                                                     tokens)
             return together(advanced, held), loss, aux, committed
         return run
+
+
+def gradients_read(program: jcore.Jaxpr, read: Sequence[frozenset[int]]) -> list[frozenset[int]]:
+    """Which gradient leaves each result of `program` reads, its operands reading `read`: a call's
+    (`called`, an optax tree helper's `jit` among them) through its program, any other
+    equation each of its results all its operands read."""
+    reads = dict(zip(program.invars, read, strict=True))
+    for equation in program.eqns:
+        operands = [reads.get(value, frozenset()) if computed(value) else frozenset()
+                    for value in equation.invars]
+        program_called = called(equation)
+        if program_called is not None:
+            reads.update(zip(equation.outvars, gradients_read(program_called, operands), strict=True))
+        else:
+            reads.update(dict.fromkeys(equation.outvars, frozenset().union(*operands)))
+    return [reads.get(value, frozenset()) if computed(value) else frozenset() for value in program.outvars]
+
+
+def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: TrainState, window: int,
+                                 split: int) -> tuple[Callable, tuple]:
+    """The loss the step evaluates for `objective` over `state`, its update a `window` of microbatches,
+    each step read in `split`, with the abstract arguments it is traced over (but the batch): the
+    variables, the microstep, the key, the step, the EMA and the updates committed. Shapes
+    and dtypes only: a resident frozen leaf sits in another memory space than the moving ones, and
+    the loss the realization runs reads a snapshot in one space. The step's key is drawn inside the
+    trace, so an abstract state compiles a step as a placed one does."""
+    variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
+
+    def loss(variables, batch, microstep, key, step, ema, updates):
+        # The step's first attempt of its first part, as the transaction reads it (`attempt_step`).
+        current = dataclasses.replace(state, microstep=microstep, key=key, step=step, updates=updates)
+        shared = batch_statistics_shapes(objective, current, batch, window, split)
+        stats = None if shared is None else tuple(jnp.zeros(x.shape, x.dtype) for x in shared)
+        return objective._loss(variables, batch, attempt_step(
+            current, variables, ema, batch, split=split, slots=window, attempt=step * split, part=0,
+            slot=microstep % window, batch_statistics=stats))
+
+    return loss, (variables, state.microstep, state.key, state.step, state.ema, state.updates)

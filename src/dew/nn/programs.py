@@ -1,10 +1,9 @@
 """Reading a traced program (a jaxpr) as the platform it is lowered for runs it.
 
-`dew.nn.flops` counts a program's work as an accelerator runs it, `dew.training.compiled_program` reads
-the program XLA compiles for a platform, and `dew.interop.sequence_causality` walks a source's program for
-what each position reads; each meets the platform choices (`jax.lax.platform_dependent`) a model's numerics
-make (`dew.nn.precision`) and the programs an equation runs within it, and this is where they agree on
-which branch a platform runs and which bodies XLA sees.
+`dew.nn.flops` counts a program's work as an accelerator runs it, and `dew.interop.sequence_causality`
+walks a source's program for what each position reads; each meets the platform choices
+(`jax.lax.platform_dependent`) a model's numerics make (`dew.nn.precision`) and the programs an equation
+runs within it, and this is where they agree on which branch a platform runs and which bodies XLA sees.
 """
 
 from __future__ import annotations
@@ -58,13 +57,20 @@ which a Mosaic GPU kernel, `plgpu.kernel`, runs through), each one custom call w
 jax/_src/pallas/mpmd.py)."""
 
 
+
+def lowering_platform(device) -> str:
+    """The platform JAX lowers a program on `device` for, its lowering rules' name: a GPU's `cuda` or
+    `rocm`, as its client's platform version states (`PjRtClient::platform_version`, a compile-only
+    target's its device kind, CUDA's); any other device's own platform."""
+    if device.platform != "gpu":
+        return device.platform
+    return "rocm" if "rocm" in str(device.client.platform_version).lower() else "cuda"
+
 def opaque(equation: jcore.JaxprEqn) -> bool:
     """Whether XLA sees nothing of `equation`'s body: a native Pallas kernel's (`NATIVE_KERNELS`), one
     custom call whose results are its outputs alone, its body's values in registers and shared memory,
-    its products Triton's or Mosaic GPU's. A program `dew.training.compiled_program.compiled` reads holds
-    no interpreted grid call: it is its interpreter's program (`dew.training.compiled_program.interpreter`).
-    An interpreted core map is no native kernel: JAX lowers it through its interpreter
-    (`_mpmd_map_fallback_lowering`), so its body is read as XLA runs it."""
+    its products Triton's or Mosaic GPU's. An interpreted core map is no native kernel: JAX lowers it
+    through its interpreter (`_mpmd_map_fallback_lowering`), so its body is read as XLA runs it."""
     if equation.primitive is mpmd_map_p:
         return not equation.params["interpret"]
     return equation.primitive is pallas_call_p
@@ -250,7 +256,7 @@ def inlined(body: jcore.Jaxpr, operands: Sequence[jcore.Var | jcore.Literal],
     `consts`, and its results: a program run in its caller as one of its own, as one body traced once may
     be run more than once. A constant is the caller's variable or literal where `consts` gives one (a
     constant the caller holds among its own, `dew.algebra.program`'s span opened), else a literal of the
-    value given (a program compiled whole, `dew.training.compiled_program`)."""
+    value given (a program compiled whole)."""
     local: dict[jcore.Var, jcore.Var | jcore.Literal] = dict(zip(body.invars, operands, strict=True))
     for var, value in zip(body.constvars, consts, strict=True):
         local[var] = value if isinstance(value, jcore.Var | jcore.Literal) else jcore.Literal(value, var.aval)
@@ -268,8 +274,8 @@ def inlined(body: jcore.Jaxpr, operands: Sequence[jcore.Var | jcore.Literal],
 
 def called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
     """The program `equation` runs on its operands one for one, returning its results, else None: every
-    reader of a call through its program reads it here (`dew.training.compiled_program`'s `compiled` and
-    `gradients_read`, the kernel split's `_inlined`, the float64 terms, the algebra's normal forms). A call
+    reader of a call through its program reads it here (`dew.training.transaction.gradients_read`, the
+    kernel split's `_inlined`, the float64 terms, the algebra's normal forms). A call
     is a primitive JAX lowers to its program in the caller, which JAX states where it defines one
     (`Primitive.inlined_call`): a `jit`'s, which XLA's `CallInliner` inlines (`_pjit_lowering`,
     jax/_src/pjit.py; `GpuCompiler::RunPreSPMDPartitionerPasses`, xla/service/gpu/gpu_compiler.cc), an

@@ -24,6 +24,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   Muon's update FLOPs (`muon_update_flops`) are each stack's Newton-Schulz FLOPs, summed. A run compiled ahead
   over a host's topology (`AheadTarget.topology`), which states its GPUs' memory, refuses a `capacity_gib`
   beside it, which it ignored.
+
+- The memory planner's predictor is gone: XLA's memory analysis of each compiled candidate judges whether
+  it fits, on the devices' allocators (`step_fits`), where a traced walk of the gradient program judged it
+  first. `dew.training.footprint` and `dew.training.compiled_program` are removed (`traced_loss` is
+  `dew.training.transaction`'s), and a plan's record holds no `derived` table, and its probes no `derived`
+  or `derived_headroom`. A compiled step's temporaries need one free block; the bytes beside them need the
+  devices' free bytes in all, not that block, which refused a GH200's phase with 53.6 GiB free.
+
 - A plan the devices refuse (`PlanRefused`) states what each local device's allocator read as it refused
   (`PlanRefused.allocators`, the tightest in its message: its limit, its bytes in use, its largest free
   block and its pool), so a refusal at a phase's boundary names what holds the device; each refused

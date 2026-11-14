@@ -242,8 +242,7 @@ def test_ppo_trains_on_a_filled_batchs_real_sequences_alone():
 def test_ppo_split_step_preserves_whitening_draws_and_mid_window_resume(tmp_path):
     """Splitting a PPO step into microbatches whitens advantages over the logical minibatch (so two
     one-step sequences of advantages [1, 3] do not collapse to [0, 0] in singleton microbatches), draws
-    identical per-example entropy noise, adds no forward-to-backward residuals to the microbatch
-    footprint, and resumes mid-window from its stored `batch_statistics`."""
+    identical per-example entropy noise, and resumes mid-window from its stored `batch_statistics`."""
     from rl_split_support import assert_mid_window_resume, recorded_step_tapes
 
     from dew.distributed.placement import MeshSpec
@@ -282,14 +281,7 @@ def test_ppo_split_step_preserves_whitening_draws_and_mid_window_resume(tmp_path
     _, whole_tapes = recorded_step_tapes(objective, batch_a, split=1)
     np.testing.assert_array_equal(split_tapes["entropy noise"], whole_tapes["entropy noise"])
 
-    planned, mesh = assert_mid_window_resume(objective, batch_a, batch_b, str(tmp_path / "mid"))
-    half_trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(8), split=1,
-                           checkpoints=None, tracker=None)
-    half_trainer.device_mesh = mesh
-    half_planned = half_trainer._compiled_plan(half_trainer.initial_state(), control_sequences(2, 10),
-                                               None, None)
-    assert (planned.candidate.footprint is not None and half_planned.candidate.footprint is not None
-            and planned.candidate.footprint.residuals == half_planned.candidate.footprint.residuals)
+    assert_mid_window_resume(objective, batch_a, batch_b, str(tmp_path / "mid"))
 
 
 @struct.dataclass

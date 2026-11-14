@@ -298,8 +298,7 @@ def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(
     state = trained(trainer)
     split = trainer.plan["split"]
     assert split > 1 and trainer.objective.model.remat is None
-    # The search starts where the footprint's bound picks (`derived_start`): whatever it compiled whole did
-    # not fit, and the split it trains at did.
+    # Whatever it compiled whole did not fit, and the split it trains at did.
     probes = trainer.plan["probes"]
     assert not any(probe["fits"] for probe in probes if probe["split"] == 1), probes
     assert any(probe["fits"] for probe in probes if probe["split"] == split), probes
@@ -1083,19 +1082,14 @@ def asked(trainer) -> list[tuple[int, str | None, bool]]:
     return [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]]
 
 
-def assert_searched(probes, chosen, below, *, half=None, derived=False):
+def assert_searched(probes, chosen, below, *, half=None):
     """`probes`, a search that settled on `chosen` (split, remat): the batch whole asked first, no
     compile asked twice, every split that missed at no recomputation asked at the `half` rung next,
     `below`, the largest split under the plan, asked and missed at each rung it may fit at, a plan at
     the half rung missed at no recomputation before, and no optional frontier is asked. Which splits
     between are asked, and in what order, follows the memory each compile measured, which differs
-    between devices (`Forecast`). A `derived` search starts at the split its derivation forecasts
-    (row 3341) and asks none it rules out, so it asks neither the batch whole first nor `below`
-    necessarily, and none past the plan's split."""
-    if derived:
-        assert probes[0][1] is None and all(split <= chosen[0] for split, _, _ in probes)
-    else:
-        assert probes[0][:2] == (1, None) and not probes[0][2]
+    between devices (`Forecast`)."""
+    assert probes[0][:2] == (1, None) and not probes[0][2]
     assert len({probe[:2] for probe in probes}) == len(probes)
     assert (*chosen, True) in probes
     assert all(remat in (None, half) for _, remat, _ in probes)
@@ -1103,8 +1097,7 @@ def assert_searched(probes, chosen, below, *, half=None, derived=False):
         if half is not None and remat is None and not fits:
             assert probes[index + 1] == (split, half, probes[index + 1][2])
     rungs = [None] if half is None else [None, half] if chosen[1] is None else [half]
-    assert derived or all((below, remat, False) in probes for remat in rungs)
-    assert not derived or not any(fits for split, _, fits in probes if split < chosen[0])
+    assert all((below, remat, False) in probes for remat in rungs)
     if half is not None and chosen[1] == half:
         # A plan at the half rung missed at no recomputation first.
         assert probes.index((chosen[0], None, False)) < probes.index((*chosen, True))
@@ -1145,44 +1138,32 @@ def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monk
         trainer.compile(state, HALVED_BATCH, trials)
         assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
     assert trainer.objective.model.remat == REMAT_POLICIES[half]
-    # The derivation forecasts the split it asks first (row 3341), so the search starts there.
-    assert_searched(asked(trainer), (4, half), 2, half=half, derived=True)
+    assert_searched(asked(trainer), (4, half), 2, half=half)
 
 
 def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypatch):
     """An A100's plan: no recomputation fits the batch at four microbatches and not in fewer, so the plan
-    is four at no recomputation, which the derivation picks and its one compile confirms (row 3341): no
-    split it refuses, no half rung and no optional full-batch frontier is compiled."""
+    is four at no recomputation, which XLA's memory analysis of each compile decides, and no optional
+    full-batch frontier is compiled."""
     free(monkeypatch, needs(monkeypatch, lm(split=4, **DELTA)))
     trainer = lm(**DELTA)
     state, _, _ = trainer.place()
     trials = Trials(state, BATCH)
     trainer.compile(state, BATCH, trials)
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, None)
-    assert asked(trainer) == [(4, None, True)]
+    assert "frontier" not in trainer.plan
 
 
 def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monkeypatch):
-    """Without a delta rule no rung is a half rung: where the derivation cannot judge the step (its
-    devices state no memory to judge it against), the search asks the batch whole and the splits that
-    find the fewest microbatches that fit, each at no recomputation, and stops there; where it can, the
-    derivation picks the fewest that fit, four, and its one compile confirms them (row 3341)."""
-    from dew.training.planning import FitSearch
-
+    """Without a delta rule no rung is a half rung: the search asks the batch whole and the splits that
+    find the fewest microbatches that fit, each at no recomputation, and stops there."""
     free(monkeypatch, needs(monkeypatch, lm(split=4)))
-    for judging in (False, True):
-        with monkeypatch.context() as unjudged:
-            if not judging:
-                unjudged.setattr(FitSearch, "judging", lambda search: False)
-            trainer = lm()
-            state, _, _ = trainer.place()
-            trials = Trials(state, BATCH)
-            trainer.compile(state, BATCH, trials)
-        if judging:
-            assert asked(trainer) == [(4, None, True)]
-        else:
-            assert_searched(asked(trainer), (4, None), 2)
-            assert all(remat is None for _, remat, _ in asked(trainer))
+    trainer = lm()
+    state, _, _ = trainer.place()
+    trials = Trials(state, BATCH)
+    trainer.compile(state, BATCH, trials)
+    assert_searched(asked(trainer), (4, None), 2)
+    assert all(remat is None for _, remat, _ in asked(trainer))
 
 
 def test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool():

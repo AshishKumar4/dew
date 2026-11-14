@@ -170,7 +170,6 @@ from dew.training.distributed import (
     traced_start,
 )
 from dew.training.evaluation import EvalSuite, Evaluator, episodic
-from dew.training.footprint import traced_loss
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, logged_scalars
 from dew.training.memory import first_run, local_devices, recompute_record, refuse_wide_floats, split_share
@@ -194,6 +193,7 @@ from dew.training.transaction import (
     loss_scale,
     pooled_by_mean,
     refuse_unpassed_progress,
+    traced_loss,
 )
 
 _log = logging.getLogger(__name__)
@@ -805,7 +805,8 @@ class Trainer(Generic[Loss, Effects]):
             weak_type=aval.weak_type), jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals))
 
     def _loss_shape(self, state: TrainState, batch: Batch, window: int, split: int = 1):
-        """The loss's program (`footprint.traced_loss`, which narrow copies read) and its shapes."""
+        """The loss's program (`dew.training.transaction.traced_loss`, which narrow copies read) and its
+        shapes."""
         loss, (variables, *rest) = traced_loss(self.objective, state, window, split)
         return jax.make_jaxpr(loss, return_shape=True)(variables, self._model_shapes(batch), *rest)
 

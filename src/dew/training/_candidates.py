@@ -31,17 +31,14 @@ from dew.nn.kernels.options import owned_program, trace_context
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link, Schedule, spread_axes, spread_over
 from dew.state import Accumulation, TrainState, apart, taken, together
-from dew.training import staging
-from dew.training._lowering import KernelReport, Routed, kernel_report, routed
+from dew.training._lowering import Routed, kernel_report, routed
 from dew.training.diloco import group_of, windowed
 from dew.training.distributed import microbatch, microbatch_shapes
-from dew.training.footprint import Footprint, candidate_footprint, logits_floor
-from dew.training.memory import local_devices
 from dew.training.model_flops import batch_consumed, batch_tokens
 from dew.training.narrow import holds_copies, narrow_copies, narrowed
 from dew.training.planning import Candidate, splits
 from dew.training.stages import StageLocal
-from dew.training.transaction import COMMIT_FIELDS, consumed_where_made, outcome, pooled_by_mean
+from dew.training.transaction import COMMIT_FIELDS, outcome
 
 if TYPE_CHECKING:
     import optax
@@ -174,21 +171,10 @@ def _shapes(tree):
                         if hasattr(leaf, "dtype") else leaf, tree)
 
 
-def _footprinted(footprint: Footprint | None) -> Hashable:
-    """`footprint` as a value, its resident bytes by name in order."""
-    if footprint is None:
-        return None
-    return tuple((field.name, tuple(sorted(value.items())) if field.name == "resident" else value)
-                 for field in dataclasses.fields(footprint) if field.compare
-                 for value in (getattr(footprint, field.name),))
-
-
 def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
-                                   schedule: Schedule, placement, replicated, split: int, narrow: bool,
-                                   lowering: bool = True, *, mesh: Mesh | AbstractMesh | None = None,
-                                   platforms: tuple[str, ...] | None = None,
-                                   footprint: Footprint | None = None, derived: bool = True,
-                                   floored: bool = False) -> Candidate:
+                                   schedule: Schedule, placement, replicated, split: int, narrow: bool, *,
+                                   mesh: Mesh | AbstractMesh | None = None,
+                                   platforms: tuple[str, ...] | None = None) -> Candidate:
     """`_candidate`'s step, or the one an equal trainer traced in this process over the same shapes
     (`Trainer._step_key`; row 3873: each fit of a resumed run traced its step again, 6.5 to 12.9 s, and
     lowered it, 9 s), its pipeline's schedule the one its microbatches make; a trainer whose step no value
@@ -198,8 +184,8 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
     # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
     key = None if stated is None else (
-        stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow, lowering, mesh,
-        platforms, _footprinted(footprint), derived, floored, stepping.shape.rows,
+        stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow, mesh,
+        platforms, stepping.shape.rows,
         stepping.shape.split, stepping.shape.prefetch, stepping.shape.examples, report.refused_launches(),
         trace_context())
     if key is not None:
@@ -211,16 +197,13 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
                 sampled = _sampled(stepping, kept, batch, placement, replicated, split, platforms)
                 return dataclasses.replace(kept, sampled=sampled)
     candidate = _candidate(stepping, state, batch, schedule, placement, replicated, split, narrow,
-                           lowering, mesh=mesh, platforms=platforms, footprint=footprint,
-                           derived=derived, floored=floored)
+                           mesh=mesh, platforms=platforms)
     if key is not None:
         # Kept detached from this trainer: its batch as shapes, its inspection's step none (`_sampled`
         # builds the reader's own).
         with _KEEPING:
-            # Its trace not kept (`lowers`, `traces`): a kept derivation traces its step again where it is
-            # lowered, and a kept floor its gradient where the search asks.
             _CANDIDATES[key] = dataclasses.replace(candidate, micro=_shapes(candidate.micro), sampled=None,
-                                                   lowers=None, traces=None, spread=spread_axes())
+                                                   spread=spread_axes())
             while len(_CANDIDATES) > KEPT_CANDIDATES:
                 _CANDIDATES.popitem(last=False)
     return candidate
@@ -242,26 +225,16 @@ def _sampled[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], candidate: Ca
 
 
 def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
-                                schedule: Schedule, placement, replicated, split: int, narrow: bool,
-                                lowering: bool = True, *, mesh: Mesh | AbstractMesh | None = None,
-                                platforms: tuple[str, ...] | None = None,
-                                footprint: Footprint | None = None, derived: bool = True,
-                                floored: bool = False, ready: Prepared | None = None) -> Candidate:
-    """The step reading `batch` in `split` microbatches, lowered at the objective's current rung (traced
-    alone where not `lowering`, for its derived footprint), with what the fit check holds beside it.
-    Each launch takes its derived config, but where the run measures configs (`tune_kernels`), whose
-    lowering settles them (`tune`). `mesh` and `platforms` lower it for other devices, untuned
-    (`lowered_for`). `footprint` is the one its derivation traced, which it keeps (`FitSearch.footprints`).
-    One whose
-    executable is a step compiled ahead derives none (not `derived`): its compile judged the
-    derivation where it was compiled, and a run handed it does none of that work on its devices. A
-    derivation's candidate (`floored`, traced alone) whose head keeps its whole logits is their floor
-    (`logits_floor`), its gradient traced where the search asks (`Candidate.unfloored`), from the loss it
-    traced (`ready`, `prepared_for`'s)."""
+                                schedule: Schedule, placement, replicated, split: int, narrow: bool, *,
+                                mesh: Mesh | AbstractMesh | None = None,
+                                platforms: tuple[str, ...] | None = None) -> Candidate:
+    """The step reading `batch` in `split` microbatches, lowered at the objective's current rung, with what
+    the fit check holds beside it. Each launch takes its derived config, but where the run measures configs
+    (`tune_kernels`), whose lowering settles them (`tune`). `mesh` and `platforms` lower it for other
+    devices, untuned (`lowered_for`)."""
     settings = stepping.settings
     micro = microbatch_shapes(batch, split)
-    ready = ready or prepared_for(stepping, state, micro, schedule, split, narrow)
-    shapes, copies, prepared, loss = ready
+    shapes, copies, prepared, _ = prepared_for(stepping, state, micro, schedule, split, narrow)
     shardings = stepping.shardings(prepared)
     if mesh is not None:
         shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
@@ -288,66 +261,16 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
         lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
         *apart(prepared), given, part))
     tuned = settings.tune_kernels and platforms is None
-    # The step traced once, its dispatches' routes with it, whoever asks: a derivation's staged cut, its
-    # lowering (`Candidate.lowers`), the lowering here. A lowering that measures configs traces each.
-    traced = functools.cache(lambda: routed(lambda: jitted.trace(*apart(prepared), given, part)))
-
-    def lowers() -> tuple[jax.stages.Lowered, KernelReport]:
-        made, found = traced()
-        program = made.lower(lowering_platforms=platforms)
-        return program, kernel_report(found, program)
-
-    # The bytes its host-resident commit fields hold at once are its own staged cut's
-    # (`staging.measured`): read as the step is traced, by its lowering or, lowering none, a trace alone.
-    staging_measured = (settings.step is None and mesh is None
-                        and bool(set(COMMIT_FIELDS) & set(settings.layout.host)))
-    with staging.measured() as cuts:
-        kernels = KernelReport((), ())
-        if tuned and lowering:
-            # The configs it measures are not the ones a derivation traced: its footprint is traced again.
-            lowered, footprint = tuning.tune(lower, measure=True), None
-            kernels = lower.report()
-        else:
-            # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
-            lowered = None
-            if lowering:
-                lowered, kernels = lowers()
-        if staging_measured and not lowering:
-            traced()
-    window = split * settings.accumulation
-    # The floor of its whole logits, which the search judges first (`FitSearch.judged`): read from the
-    # shapes alone, alike on every process, it holds no judgment of memory a kept candidate could carry.
-    forward = None if loss is None else loss.jaxpr
-    flooring = floored and not lowering and derived and footprint is None and mesh is None
-    floor = (logits_floor(settings.objective, forward, prepared, held, micro)
-             if flooring and forward is not None else None)
-    if floor is not None:
-        traces = functools.partial(_candidate, stepping, state, batch, schedule, placement, replicated, split,
-                                   narrow, lowering, mesh=mesh, platforms=platforms,
-                                   derived=derived, ready=ready)
-        return Candidate(micro, shapes, copies, shardings, prepared, held, built, None, KernelReport((), ()),
-                         floor, floored=True, traces=traces)
-    if derived and footprint is None and shapes is not None and mesh is None:
-        footprint = candidate_footprint(
-            settings.objective, stepping.model_shapes(micro), window, prepared, held,
-            (local_devices(settings.device_mesh) or [*settings.device_mesh.devices.flat])[0], split,
-            functools.partial(consumes_where_made, stepping, prepared, micro, window, shapes),
-            max(cuts, default=0))
-    candidate = Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, kernels,
-                          footprint, lowers=None if lowering or tuned else lowers)
+    if tuned:
+        lowered, kernels = tuning.tune(lower, measure=True), lower.report()
+    else:
+        # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
+        made, found = routed(lambda: jitted.trace(*apart(prepared), given, part))
+        lowered = made.lower(lowering_platforms=platforms)
+        kernels = kernel_report(found, lowered)
+    candidate = Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, kernels)
     return dataclasses.replace(candidate, sampled=_sampled(stepping, candidate, batch, placement, replicated,
                                                            split, platforms))
-
-
-def consumes_where_made[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], prepared: TrainState,
-                                         micro: Batch, window: int, shapes) -> bool:
-    """Whether the step over `prepared` consumes each gradient where it is made
-    (`transaction.consumed_where_made`), over the state its commit reads: under DiLoCo a group's own
-    (`group_of`), not the outer optimizer's."""
-    settings = stepping.settings
-    with group_of(prepared, micro) as (view, _):
-        return consumed_where_made(settings.optimizer, view, window, shared=pooled_by_mean(shapes[0]),
-                                   progressed=stepping.shape.examples is not None)
 
 
 class Prepared(NamedTuple):
