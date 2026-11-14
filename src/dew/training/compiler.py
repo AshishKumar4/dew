@@ -28,7 +28,6 @@ from dew.telemetry.instrumentation import StepFlops
 from dew.training._candidates import Stepping, candidate_for, lowered_for
 from dew.training._lowering import Lowered, routed
 from dew.training.distributed import link_figure, link_figures, resumed_link_figures
-from dew.training.footprint import Footprint
 from dew.training.memory import (
     climb_to,
     head_tile_of,
@@ -388,6 +387,13 @@ class StepCompiler[L, E]:
         return dataclasses.replace(compiled, step=self.runner(stepping, planned.released(),
                                                               settings.device_mesh))
 
+    def taken_executables(self, executables: dict | None) -> None:
+        """The executables a plan elsewhere compiled (`FitSearch.compiled`: a later phase's off the loop,
+        `dew.training.ahead.LaterPlans`), which the next compile's search takes in place of compiling them
+        again; nothing where none."""
+        if executables:
+            self._executables = {**(self._executables or {}), **executables}
+
     def planned_unplaced(self, stepping: Stepping, state: TrainState, batch: Batch,
                          unplaced: int) -> None:
         """A fresh run's first step planned and compiled over `state`, its shapes, before the `unplaced`
@@ -395,7 +401,7 @@ class StepCompiler[L, E]:
         (`Trainer._opened`), not after it: each candidate is judged on the devices' free bytes in all beside
         the state's (`FitSearch.unplaced`), and the run's first compile over `batch` judges the one taken
         against their allocators once the state is on them (`compile`, `admitted_placed`). It holds a plan
-        only where its search refused nothing on the way to it, compiled or derived: the bytes the devices
+        only where its search refused nothing on the way to it: the bytes the devices
         hold before the state is placed may include arrays the start copies and lets go, so a candidate
         refused then may fit once it is, and the plan the run takes is the one its placed devices pick
         (a phased run's first phase read whole, bit for bit the run planned once its state was placed). Where
@@ -412,9 +418,7 @@ class StepCompiler[L, E]:
             return
         plan = record(compiled.plan, "plan")
         probes = listed(plan["probes"], "probes", read=record, what="probes")
-        derived = listed(plan["derived"], "derived", read=record, what="derived rungs")
-        if any(not boolean(probe["fits"], "fits") for probe in probes) or any(
-                str(rung["label"]).startswith("refuses") for rung in derived):
+        if any(not boolean(probe["fits"], "fits") for probe in probes):
             _log.info("the step's plan before its state is placed refused a candidate on the way; planned "
                       "once the state is placed")
             return
@@ -530,11 +534,8 @@ class StepCompiler[L, E]:
         placement = batch_shardings(mesh, batch)
         candidates = splits(stepping.shape.rows, batch, mesh, settings.microbatches, stepping.shape.split)
 
-        def lower(split: int, narrow: bool, footprint: Footprint | None = None, *, derived: bool = True,
-                  lowering: bool = True, floored: bool = False) -> Candidate:
-            return candidate_for(stepping, state, batch, schedule, placement, replicated, split,
-                                 narrow, lowering=lowering,
-                                 footprint=footprint, derived=derived, floored=floored)
+        def lower(split: int, narrow: bool) -> Candidate:
+            return candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -554,7 +555,6 @@ class StepCompiler[L, E]:
                 self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self.ahead,
-            derive=None if recorded is not None else functools.partial(lower, lowering=False, floored=True),
             unplaced=unplaced, compiled={} if executables is None else executables)
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
@@ -569,9 +569,7 @@ class StepCompiler[L, E]:
         if runs := pgle_runs():
             trials = Trials(state, batch, owned=False) if trials is None else trials
             run = self.runner(stepping, planned, mesh)
-            # A step lowered afresh past a spilled kernel derives no footprint, as the search's own do
-            # (`FitSearch.relowering`).
-            relower = functools.partial(lower, planned.split, planned.narrow, derived=False)
+            relower = functools.partial(lower, planned.split, planned.narrow)
             planned = planned.guided(trials.profiled(run, planned, mesh, runs), runs, mesh, relower)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).

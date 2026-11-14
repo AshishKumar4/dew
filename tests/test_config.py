@@ -924,3 +924,19 @@ def test_a_run_whose_model_names_a_component_by_its_alias_reads_back_and_takes_a
     run = LMRunConfig(model=ModelConfig("causal_transformer", fields), trainer=TrainerConfig(steps=1))
     assert LMRunConfig.from_dict(json.loads(json.dumps(run.to_dict()))).model == run.model
     assert run.override({"trainer.steps": 3}).model == run.model
+
+
+def test_a_saved_runs_encoder_by_its_earlier_path_reads_as_its_path_now_and_a_path_given_today_does_not():
+    """A run saved before the encoders that bind a released checkpoint moved to dew.interop (row 5996) names
+    one by its dew.inputs path, which its record reads as the path it has now (`earlier_run`); a path given
+    today is read as given, and the earlier one names nothing."""
+    from dew import registry
+    from dew.config.earlier import earlier_run
+
+    record = {"class": "dew.config:RunConfig",
+              "fields": {"conditions": {"text": {"encoder": {"class": "dew.inputs.encoders:CLIPText"}}}}}
+    read = earlier_run(record)
+    assert read["fields"]["conditions"]["text"]["encoder"]["class"] == "dew.interop.encoders:CLIPText"
+    with pytest.raises(ValueError):
+        registry.imported("dew.inputs.encoders:CLIPText")
+

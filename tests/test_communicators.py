@@ -97,6 +97,10 @@ if first == "jax":
     import jax
     jax.numpy.zeros(1).block_until_ready()
 import dew
+if first == "share":
+    # A run sharing its GPUs with another engine names the trainer's share before its first computation.
+    from dew.training import share_pool
+    share_pool(0.75)
 import jax
 from dew._devices import cuda_plugin
 from dew.training.planning import pool_record
@@ -115,15 +119,16 @@ print(json.dumps({"plugin": cuda_plugin(), "fraction": os.environ.get("XLA_PYTHO
     ({"XLA_PYTHON_CLIENT_MEM_FRACTION": "0.6", "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}, "dew", "0.6",
      "named"),
     ({"XLA_PYTHON_CLIENT_ALLOCATOR": "platform"}, "dew", None, "platform"),
-    ({}, "jax", None, "jax")])
+    ({}, "share", "0.75", "named"), ({}, "jax", None, "jax")])
 def test_a_process_dew_is_imported_into_holds_its_pool_to_dews_share_unless_the_run_names_a_fraction(
         named, first, fraction, source):
     """A fresh process that imports Dew before its first JAX computation (a notebook's: a key made, which
     opens the backend, before any Trainer) is held to Dew's 95%, its preallocation or its allocator named
     or not, where JAX held a pool that grows to 75% (a GH200's plans against 70.88 GiB of its 94.5); a
-    fraction the run names is its own, and the platform's allocator holds none; one whose backend opened
-    before `import dew` keeps JAX's 75%, its plans recording it as JAX's. The plan records the share and its
-    source (`pool_record`)."""
+    fraction the run names is its own, in its environment or by `share_pool` before its first computation
+    (a GPU shared with an inference engine), and the platform's allocator holds none; one whose backend
+    opened before `import dew` keeps JAX's 75%, its plans recording it as JAX's. The plan records the share
+    and its source (`pool_record`)."""
     env = {name: value for name, value in os.environ.items() if name not in POOL_SETTINGS}
     done = subprocess.run([sys.executable, "-c", POOLED, first], capture_output=True, text=True, timeout=300,
                           env={**env, **named, "JAX_PLATFORMS": "cpu"}, check=False)
@@ -132,7 +137,8 @@ def test_a_process_dew_is_imported_into_holds_its_pool_to_dews_share_unless_the_
     assert held["plugin"], "the CUDA plugin, which a fraction is written for, is installed"
     assert held["fraction"] == (named.get("XLA_PYTHON_CLIENT_MEM_FRACTION") or fraction)
     assert held["record"]["source"] == source
-    assert held["record"]["share"] == {"dew": 0.95, "named": 0.6, "jax": 0.75, "platform": None}[source]
+    unwritten = {"jax": 0.75, "platform": None}
+    assert held["record"]["share"] == (float(fraction) if fraction else unwritten[source])
 
 
 def test_a_process_started_from_one_dew_prepared_states_its_inherited_share_as_dews():

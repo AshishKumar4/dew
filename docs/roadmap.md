@@ -47,10 +47,9 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Training and parallelism
 
-- Time to first step: the compile path's re-derivations. [5556, 5558, 5669]
+- Time to first step: the compile path's re-derivations. [5556, 5558]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
-- CI time: every test within 120 seconds. [6050, 6051, 6052]
 - Training & Data's tests on check 1. [708]
 - XLA:CPU edges. [1591]
 
@@ -83,5 +82,4 @@ This page is generated from the maintainers' findings ledger as each change land
 ## CI and tooling
 
 - Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
-- 1364's ruling (docs/design/testing.md:78, :115). [3179]
 - The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]

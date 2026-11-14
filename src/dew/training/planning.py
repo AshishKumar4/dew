@@ -47,21 +47,16 @@ from dew.telemetry.instrumentation import compiled_memory
 from dew.telemetry.profile import Profiler, active_profile
 from dew.training.ahead import handed
 from dew.training.distributed import batch_divisor
-from dew.training.footprint import Footprint
 from dew.training.interval import latest
 from dew.training.memory import (
     climbed,
     compiled_if_it_fits,
-    derived_headroom,
     head_fused_of,
     head_tile_of,
-    headed_more,
-    judged,
     local_devices,
     offloads,
     placeable,
     placed_beside,
-    pooled_headroom,
     recompute_more,
     recompute_record,
     remat_half,
@@ -80,11 +75,6 @@ if TYPE_CHECKING:
     from dew.training.trainer import StepFn
 
 _log = logging.getLogger(__name__)
-
-MODEL_MISS = "dew_model_miss"
-"""The attribute a model miss's warning carries, the probe the derivation judged otherwise than its compile
-(`Probe.named`): what a reader selects a miss by, whatever its wording."""
-
 
 def read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn] | None, layout: Layout,
                rollout: Rollout | None, mesh: MeshSpec | Mesh) -> str | None:
@@ -149,37 +139,17 @@ class Candidate:
     """The bytes of `held` the step's arguments hold: the copies and accumulator its first call builds."""
     program: jax.stages.Lowered | None
     kernels: KernelReport
-    footprint: Footprint | None
-    """Its derived device footprint; None for a custom step not differentiating the objective."""
     sampled: Callable[[], jax.stages.Lowered] | None = None
     """The same step summarizing what the run inspects at its commit, lowered on call
     (`dew.training.inspection`); None in a run that inspects nothing."""
-    lowers: Callable[[], tuple[jax.stages.Lowered, KernelReport]] | None = None
-    """Where the candidate was traced alone (its derivation's), its step lowered from the trace it made,
-    at most one trace of the step whoever asks (`FitSearch.lowering`); None for a lowered candidate or one
-    whose lowering measures configs (`tune_kernels`), which lowers afresh for each."""
     spent: Mapping[str, float] = dataclasses.field(default_factory=dict)
     """The seconds JAX recorded of its step's work so far, by kind (`dew.telemetry.compiles.EVENTS`: traced,
-    lowered, compiled), its derivation's and its lowering's (`FitSearch.judged`, `lowering`), which its
-    probe adds its compile to (`Probe.spent`)."""
-    floored: bool = False
-    """Whether its footprint is its whole logits' floor alone (`dew.training.footprint.logits_floor`), its
-    gradient untraced: a derivation's candidate, which the search judges by the floor first
-    (`FitSearch.judged`), and traces where the floor leaves room (`unfloored`)."""
+    lowered, compiled), its lowering's (`FitSearch.lowering`), which its probe adds its compile to
+    (`Probe.spent`)."""
     spread: tuple[str, ...] = ()
     """The mesh axes a projection of its step spread over as it traced (`dew.nn.sharding.Link.spread`), which
     a step kept apart from its trace (`dew.training._candidates.candidate_for`) sets again on the links of
     the trace that reads it."""
-    traces: Callable[[], Candidate] | None = None
-    """For a candidate `floored`, the step at its rung with its gradient traced, from the forward its floor
-    read (`unfloored`); None where it was kept apart from the trace that made it
-    (`dew.training._candidates.candidate_for`)."""
-
-    def unfloored(self) -> Candidate:
-        """The candidate with its gradient traced and its footprint derived (`traces`)."""
-        assert self.traces is not None, "a candidate traced already, or kept apart from its trace"
-        return self.traces()
-
     @property
     def lowered(self) -> jax.stages.Lowered:
         """The program, which a plan's search and its guided compile read before it is released."""
@@ -318,28 +288,8 @@ def held_objects() -> Iterator[None]:
                 gc.set_threshold(*_THRESHOLDS)
 
 
-def judged_likely(headroom: int | None, under: int, *, forecast: bool) -> bool:
-    """Whether a step is likely to fit: by the `headroom` the derivation judged, past `under`, the most a
-    compile at its remat needed beyond its derivation, where it judged one; by the compiles' `forecast`
-    where it judged none. The derivation counts what a split changes beside the activations (the
-    accumulated gradient a split of two or more holds), which a forecast from a compile's temporaries
-    does not, so where it judges it orders the search alone (row 3341: Qwen3.5-4B at 4 x 2048 on an H100
-    compiled two microbatches the derivation judged 3.83 GiB short, on the forecast's word)."""
-    if headroom is None:
-        return forecast
-    return headroom - under >= 0
-
-
-def _judged_headroom(bounds: tuple[int, int] | None) -> int | None:
-    """A definite judgment of the pooled headroom interval; an interval spanning zero is undecided."""
-    if bounds is None or bounds[0] < 0 <= bounds[1]:
-        return None
-    return bounds[0] if bounds[0] >= 0 else bounds[1]
-
-
 def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
-            climb: Callable[[], bool], likely: Callable[[int], bool] = lambda split: False,
-            halved: Callable[[int], bool] | None = None) -> int | None:
+            climb: Callable[[], bool], likely: Callable[[int], bool] = lambda split: False) -> int | None:
     """The split a step reads its batch in, at the rung `climb` leaves the
     objective on, or None where no candidate fits.
 
@@ -366,14 +316,10 @@ def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
     takes its first point.
 
     Past a miss, the first split `likely` to fit by what the compiles
-    measured (`Forecast`) or the derivation judged is asked in place of the
-    largest, and where it misses, the next above it; the halving below a
-    split that fits asks `halved`, which may rule a compile out
-    (`FitSearch.refused`: Qwen3.5-4B at 4 x 2048 on an H100, two
-    microbatches, judged 3.83 GiB short for their accumulated gradient,
-    compiled a third time on main, row 3341). Replayed through it, the six compiles an A100-40 asked for
-    Qwen3.5-0.8B's packed 8 x 3072 step are five (no largest split), the
-    plan the same.
+    measured (`Forecast`) is asked in place of the largest, and where it
+    misses, the next above it. Replayed through it, the six compiles an
+    A100-40 asked for Qwen3.5-0.8B's packed 8 x 3072 step are five (no
+    largest split), the plan the same.
     """
     if fits(candidates[first]):
         return candidates[first]
@@ -385,7 +331,7 @@ def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
                 high = index
                 while high - low > 1:
                     middle = (low + high) // 2
-                    low, high = (low, middle) if (halved or fits)(candidates[middle]) else (middle, high)
+                    low, high = (low, middle) if fits(candidates[middle]) else (middle, high)
                 return candidates[high]
             low = index
         if not climb():
@@ -399,7 +345,7 @@ class Probe:
     its microbatch and the rung (`rung_record`) it compiled at, what
     the fit check read, this process's tightest headroom and XLA's
     temporaries and arguments and what the step places beside its temporaries (`beside`), None where none
-    were read, and what the candidate's shapes derived it would take (`Footprint`)."""
+    were read."""
     split: int
     rows: int
     rung: Mapping[str, JSON]
@@ -407,17 +353,14 @@ class Probe:
     headroom: int | None
     temp: int | None
     argument: int | None
-    derived: Footprint | None
     ahead: bool = False
-    """Whether the executable is the step compiled ahead (`FitSearch.ahead`), not the search's own."""
+    """Whether the executable was compiled before this search, not by it: the step compiled ahead
+    (`FitSearch.ahead`), or one a search before it compiled (`FitSearch.compiled`)."""
     compile_seconds: float = 0.0
     """Time spent compiling or loading this program, apart from its shape trace and lowering."""
     spent: Mapping[str, float] = dataclasses.field(default_factory=dict)
     """The seconds JAX recorded of the candidate's work, its traces, lowerings and backend compile by kind
     (`Candidate.spent` and its compile's), which the compiled-step record and the perf gate read."""
-    derived_headroom: int | None = None
-    """The headroom the derivation judged the candidate would leave (`derived_headroom`), None where it
-    judged none: beside `headroom`, which the compile measured, its error."""
     beside: int | None = None
     """The bytes the fit check placed beside the step's temporaries (`placed_beside`): its outputs that
     write over no donated argument and what the loop holds outside the step (copies, accumulators, a state
@@ -432,13 +375,13 @@ class Probe:
         beside = None if stats is None else placed_beside(stats, held)
         return cls(split, rows_of(candidate.micro), rung, fit, headroom,
                    None if stats is None else stats.temp, None if stats is None else stats.argument,
-                   candidate.footprint, beside=beside)
+                   beside=beside)
 
     def record(self) -> dict[str, JSON]:
         return {"split": self.split, "rows": self.rows, **self.rung, "fits": self.fits,
                 "headroom": self.headroom, "temp": self.temp, "argument": self.argument,
-                "derived": None if self.derived is None else self.derived.record(), "ahead": self.ahead,
-                "compile_seconds": self.compile_seconds, "derived_headroom": self.derived_headroom,
+                "ahead": self.ahead,
+                "compile_seconds": self.compile_seconds,
                 "beside": self.beside, "spent": dict(self.spent)}
 
     def named(self) -> str:
@@ -688,15 +631,15 @@ def compiled_key(lowered: jax.stages.Lowered, options: jax.stages.CompilerOption
 
 def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch,
             frontier: Sequence[Probe] | None = None) -> dict[str, JSON]:
-    """The admitted plan, its kernel report, every compile needed to find it, each rung the derivation
-    read before them (`FitSearch.derived`), and the kernels those compiles found spilling and the launch
+    """The admitted plan, its kernel report, every compile needed to find it, and the kernels those compiles
+    found spilling and the launch
     configs refused where it searched (`FitSearch.kernels`), which the run's telemetry reports with it
     (`StepCompiled`); planned ahead with its `frontier`, each rung above the plan that fits at fewer
     microbatches (`FitSearch.above`). There is no alternative-policy timing or selection in the record."""
     _log.info("the step's %s", planned.candidate.kernels.summary())
     above: dict[str, JSON] = {} if frontier is None else {"frontier": [probe.record() for probe in frontier]}
     return {**planned.record(), "kernels": planned.candidate.kernels.record(),
-            "probes": [probe.record() for probe in probes], "derived": list(search.derived), **search.kernels,
+            "probes": [probe.record() for probe in probes], **search.kernels,
             "pool": pool_record(local_devices(search.mesh)), **above}
 
 
@@ -741,12 +684,10 @@ def spill_record(miss: report.Miss) -> dict[str, JSON]:
 
 
 class Lower(Protocol):
-    """A search's step at a split and whether it keeps its narrow copies, at the objective's rung
-    (`FitSearch.lower`): lowered with the `footprint` its derivation traced of it, or one derived for it
-    where it is handed none and `derived`; or, not `lowering`, traced alone for its derived footprint."""
+    """A search's step at a split and whether it keeps its narrow copies, at the objective's rung, lowered
+    (`FitSearch.lower`)."""
 
-    def __call__(self, split: int, narrow: bool, footprint: Footprint | None = None, *, derived: bool = True,
-                 lowering: bool = True) -> Candidate: ...
+    def __call__(self, split: int, narrow: bool) -> Candidate: ...
 
 
 class _Spent(Compiles):
@@ -764,18 +705,6 @@ def spending(candidate: Candidate | None = None) -> Iterator[dict[str, float]]:
         yield held
     for made in compiles.programs:
         held[made.kind] = held.get(made.kind, 0.0) + made.seconds
-
-
-class _Traced(NamedTuple):
-    """A rung the derivation traced short (`FitSearch.walked`): its footprint, the bytes its first call
-    builds, and what it stood at: its narrow copies, remat and head."""
-
-    footprint: Footprint
-    built: int
-    narrow: bool
-    remat: str
-    tile: tuple[int, int] | None
-    fused: bool
 
 
 @dataclasses.dataclass
@@ -825,10 +754,6 @@ class FitSearch[LossT, EffectsT]:
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
     is that program (`AheadOfTime.taken`), lowered as its own compile lowered it (`handed`: within its
     refusals, for its GPU, `fits_here`)."""
-    derive: Callable[[int, bool], Candidate] | None = None
-    """The step at a split, at the objective's rung and `narrow`, traced and not lowered, for its derived
-    footprint (`dew.training.footprint`), which picks the search's first rung (`derived_start`); None
-    for a run that starts from a plan, recorded, compiled ahead or resumed, which the search tries first."""
     compiled: dict[tuple[str, str], jax.stages.Compiled] = dataclasses.field(default_factory=dict)
     """Each executable this search, or one before it over the same candidates, compiled, by its program and
     its options (`compiled_key`): one a search before the state was placed compiled is taken
@@ -843,35 +768,6 @@ class FitSearch[LossT, EffectsT]:
     one 38.88 GiB block its pool could give of 70.88 GiB free, 22.41 GiB short, fits). A candidate holds
     none of them (`Candidate.held`), so one cached for a
     placed state serves an unplaced one."""
-    derived: list[dict[str, JSON]] = dataclasses.field(default_factory=list)
-    """Each rung the derivation read before the first compile: its rung, terms, headroom and label."""
-    judged_at: dict[tuple[str, int], int | None] = dataclasses.field(default_factory=dict)
-    """The derived headroom of each candidate the derivation read, by its rung (`rung`) and split: what
-    orders the compiles (`likely`), a compile's measure correcting it (`under`)."""
-    copies_at: dict[tuple[str, int], bool] = dataclasses.field(default_factory=dict)
-    """Whether each candidate the derivation read keeps narrow copies (`Candidate.copies`)."""
-    footprints: dict[tuple[str, int], Footprint | None] = dataclasses.field(default_factory=dict)
-    """The footprint of each candidate the derivation read, which its lowering keeps (`lowering`): traced
-    again there, it was 22 of a Qwen3.5-4B step's 185 seconds of `compile_ahead` (row 4261). A spill's
-    refusal, which changes the configs its kernels take, clears it (`measured`)."""
-    derivations: dict[tuple[str, int], Candidate] = dataclasses.field(default_factory=dict)
-    """Each candidate the derivation traced (`judged`), until the search compiles it, lowered from it
-    (`lowering`)."""
-    built_at: dict[tuple[str, int], int] = dataclasses.field(default_factory=dict)
-    """The bytes each candidate the derivation read builds on its first call (`Candidate.built`), which the
-    rungs derived from its footprint without a trace build less of (`derived_bounds`)."""
-    under: dict[str, int] = dataclasses.field(default_factory=dict)
-    """By remat rung (`remat_rung`), the most bytes a compile there needed past its derived headroom: a
-    candidate there is judged to fit only where its derived headroom holds that much more, in proportion
-    to its derived temporaries (`missed_at`, `shortfall`)."""
-    missed_at: dict[str, int] = dataclasses.field(default_factory=dict)
-    """By remat rung, the derived temporaries of the compile that set its `under`: what the derivation
-    misses grows with what it derives, a step's activations with its microbatch, so a split of half the
-    rows misses about half as much (a 64-token test step on a CPU: 963 KB short at one microbatch, 0.6 MB
-    to spare at two, which a shortfall taken whole judged short and compiled four)."""
-    overstated: set[str] = dataclasses.field(default_factory=set)
-    """The remat rungs (`remat_rung`) a compile fit at that the derivation judged short: its refusals
-    there rule no compile out (`refused`)."""
     kernels: dict[str, JSON] = dataclasses.field(default_factory=dict)
     """What the templates' reports found where the search compiled (`admitted`): each kernel its compiles
     found spilling (`report.misses`, `spill_record`), each launch config they refused
@@ -891,27 +787,13 @@ class FitSearch[LossT, EffectsT]:
         self.required = compiler_options(*self.objective.towers()) or None
 
     def admitted(self, candidates: Sequence[int], first: int) -> tuple[Planned, tuple[Probe, ...]]:
-        """The first fitting plan found by the split-and-rung search, and every compile it made, its
-        first rung the one the derivation picks (`derived_start`). Once admission succeeds, no optional
-        alternate policy is compiled."""
-        # A run that states its split (one candidate) and its remat leaves the derivation the rungs below
-        # its remat to choose (the narrow copies, its head's tile): the one it judges to fit is the one
-        # compile, lowered from the trace that judged it, where compiling each rung to find it compiled
-        # seven programs for a 4B decoder's step (row 5556: 240 of its plan's 574 s, four probes of which
-        # three missed: the narrow copies, then the whole logits, and XLA's options, by 55, 48 and 2 GB).
-        # Its derivation is its trace's (row 5479's 47 minutes were the derivation's own, 13 s since).
-        # A rung fits where its most microbatches do; the derivation then finds its split there, which
-        # alone is compiled where it is right (`derived_split`). A step that fits at its fewest fits at
-        # every split, at the rung it stands on: one derivation says so, and no rung is walked. The plan's
-        # spills and refusals are those of its derivation's traces too: a launch certified as it traces
-        # (`report.certified`) refuses a spilling config there, before any compile.
+        """The first fitting plan the split-and-rung search finds (`planned`), and every compile it made:
+        each candidate compiled and judged by XLA's memory analysis of it on the devices' allocators
+        (`step_fits`), the ladder walked from its first rung, the compiles' measures ordering the splits
+        past a miss (`Forecast`). Once admission succeeds, no optional alternate policy is compiled."""
         seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
         passed = len(report.passes())
-        if not self.fits_at_fewest(candidates, first):
-            self.derived_start(candidates[-1])
-        first = self.derived_split(candidates, first)
-        split = planned(candidates, first, self.fits, self.climb, self.likely,
-                        functools.partial(self.fits, pruned=True))
+        split = planned(candidates, first, self.fits, self.climb, self.likely)
         spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
         refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()
                                if refusal not in held]
@@ -967,175 +849,6 @@ class FitSearch[LossT, EffectsT]:
         self.objective.substitute(list(modules))
         self.objective.restore_head(tile, fused=fused)
 
-    def fits_at_fewest(self, candidates: Sequence[int], first: int) -> bool:
-        """Whether the derivation judges the step to fit at the fewest of `candidates`, at the rung the
-        objective stands on, read before any rung is walked: that rung is then the least-recompute one,
-        and the fewest is the split the search compiles first (`derived_split`), on one derivation where
-        the walk and the halving read two (a step that fit at once traced its footprint at four
-        microbatches and at one, 34 s each, row 5361). It is the plan the walk at the most microbatches
-        and the halving reach where memory falls with the split (`planned`); where it grows with it (a
-        state that replays its microbatches), theirs climbs a rung the fewest never needed, and this one
-        stands. False where the search reads no derivation first (`derived_start`,
-        `derived_split`), judges none, or the fewest does not fit: the walk and the halving then read what
-        they did, the halving from this judgment where the walk ends on this rung."""
-        if not self.deriving() or self.resumed is not None or first != 0 or not self.judging():
-            return False
-        headroom = self.judged(candidates[0], self.narrow)
-        return headroom is not None and headroom >= 0
-
-    def derived_start(self, split: int) -> None:
-        """Move the objective to the least-recompute rung whose derived footprint at `split`, the run's
-        most microbatches, fits the devices (`derived_headroom`, labelled 'fits'), before anything
-        compiles, so the search's first compile confirms it and a miss climbs on as a correction; the
-        rungs read are `derived`. A rung the derivation cannot judge ('unknown': residuals over several
-        devices) or devices that state no memory to judge one against ('unstated') end the walk where it
-        started, at the base rung, as does a ladder no rung of which fits. A run that sets its remat
-        climbs its head's rungs alone (`headed_more`); its split is read there (`derived_split`). A
-        'fits' is the derivation's judgment, which the one compile confirms."""
-        if not self.deriving() or self.resumed is not None:
-            return
-        base = self.configuration()
-        label, narrow = self.walked(split)
-        if label != "fits":
-            self.restore(base)
-            narrow = self.narrow
-        elif self.remat_rung() != self.started:
-            _log.info("the derivation says the step fits from remat %s; compiling there first",
-                      self.remat_rung())
-        self.narrow = narrow
-
-    def walked(self, split: int) -> tuple[str, bool]:
-        """Climb the objective from its rung to the least-recompute one whose derived footprint at `split`
-        fits the devices, each rung read appended to `derived` (`judged`): the label the walk ends on, and
-        whether the rung keeps the narrow copies. It ends where a rung fits, where the derivation cannot
-        judge one ("unknown") and where the ladder ends; where no device states memory to judge a rung
-        against (`judging`), it reads none ("unstated")."""
-        assert self.derive is not None
-        narrow, label = self.narrow, "refuses"
-        if not self.judging():
-            # A device that states no memory leaves every rung unjudged (`admitted`), so no footprint is
-            # traced for it. A run that sets its remat hears what it asked for and is not told: nothing
-            # is judged, and the compiles decide; one that leaves its remat to the walk asked nothing.
-            self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": None,
-                                 "label": "unstated", "terms": None})
-            if self.remat_set:
-                _log.warning("the run sets remat %s, and its devices state no memory to judge its footprint "
-                             "against (a CPU), so the derivation "
-                             "picks no plan and the compiles decide it", self.remat_rung())
-            return "unstated", narrow
-        # The last rung traced short, from whose footprint the rungs after it are bounded without a trace
-        # of their own (`derived_bounds`): it is traced where its bounds leave it undecided.
-        last: _Traced | None = None
-        while True:
-            bounds = None if last is None else self.derived_bounds(last, narrow)
-            if bounds is not None and bounds[1] < 0:
-                self.derived.append({**self.current(), "narrow": narrow, "split": split,
-                                     "headroom": bounds[1], "label": "refuses by the last trace",
-                                     "terms": None})
-                label = "refuses"
-            else:
-                headroom = self.judged(split, narrow)
-                label = "unknown" if headroom is None else "fits" if headroom >= 0 else "refuses"
-                if bounds is not None:
-                    # The headroom its bounds said it would leave, beside the one its trace says.
-                    self.derived[-1] = {**self.derived[-1], "bounds": list(bounds)}
-                if bounds is not None and bounds[0] >= 0 and label == "refuses":
-                    # The bounds said the rung fits and its trace says it does not: the derivation's miss.
-                    self.derived[-1] = {**self.derived[-1], "miss": bounds[0]}
-                if label != "refuses":
-                    break
-                key = self.candidate_key(split, narrow)
-                footprint = self.footprints.get(key)
-                if footprint is not None:
-                    last = _Traced(footprint, self.built_at[key], narrow, self.remat_rung(),
-                                   head_tile_of(self.objective), head_fused_of(self.objective))
-            # The search's own climb drops the narrow copies first, at the same head and remat.
-            if narrow and self.copies_at[self.candidate_key(split, narrow)]:
-                narrow = False
-                continue
-            narrow = False
-            # A run that states its remat climbs its head's rungs alone (`headed_more`).
-            if not self.onward(functools.partial(headed_more if self.remat_set else recompute_more,
-                                                 self.objective, self.base)):
-                break
-        return label, narrow
-
-    def derived_bounds(self, last: _Traced, narrow: bool) -> tuple[int, int] | None:
-        """The least and the most headroom the step at the objective's rung and `narrow` can have, derived
-        from `last`, a rung traced short, without a trace of this one; None where it moved past what a
-        footprint bounds (its remat, or its head past the first tile). Without the narrow copies `last`
-        kept, it holds their bytes no more and converts its weights in the step at most all at once; with
-        its head tiled where `last` kept the whole logits, it holds `last`'s peak but for the logits and a
-        tile's share of them at most (`HeadTerms.tiled`)."""
-        footprint = last.footprint
-        tile, fused = head_tile_of(self.objective), head_fused_of(self.objective)
-        if footprint.peak is None or self.remat_rung() != last.remat or (narrow and not last.narrow):
-            return None
-        if (tile, fused) == (last.tile, last.fused):
-            least = footprint.peak if footprint.peak_lower is None else footprint.peak_lower
-            most = footprint.peak
-        elif last.tile is None and tile is not None and (head := footprint.head and footprint.head()):
-            # A CPU head's projection bounds its peak from above alone (`footprint._peak`).
-            least = head.headless if footprint.peak_lower is None else 0
-            most = head.tiled(tile, fused=fused)
-        else:
-            return None
-        copies = footprint.resident.get("compute", 0) if last.narrow and not narrow else 0
-        resident = {**footprint.resident, "compute": footprint.resident.get("compute", 0) - copies}
-        devices = local_devices(self.mesh)
-
-        bounded = dataclasses.replace(footprint, resident=resident, held=footprint.held - copies,
-                                      peak=most + copies, peak_lower=least)
-        return self._derived(bounded, devices, last.built - copies)
-
-    def judged(self, split: int, narrow: bool) -> int | None:
-        """The derived headroom of the step at `split` and `narrow` at the objective's rung, traced once a
-        candidate (`judged_at`), and recorded beside the rungs `walked` reads; None where the derivation
-        cannot judge it or no device states memory to judge it against. Every process reads it alike
-        (`memory.derived_headroom`, pooled), so each compiles the plan the others do. The candidate is kept,
-        so the one the search compiles is lowered from it (`lowering`)."""
-        key = self.candidate_key(split, narrow)
-        if key not in self.judged_at:
-            assert self.derive is not None
-            with spending() as spent:
-                candidate = self.derive(split, narrow)
-                bounds = self.headroom_bounds(candidate)
-                if candidate.floored and (bounds is None or bounds[1] >= 0):
-                    # Its whole logits' floor leaves room: its gradient is traced, which judges it, from
-                    # the forward the floor read, or afresh where the floor was kept apart from it.
-                    candidate = (candidate.unfloored() if candidate.traces is not None
-                                 else self.lower(split, narrow, lowering=False))
-                    bounds = self.headroom_bounds(candidate)
-            candidate = dataclasses.replace(candidate, spent=spent)
-            self.derivations[key] = candidate
-            footprint = candidate.footprint
-            headroom = _judged_headroom(bounds)
-            label = "unknown" if headroom is None else "fits" if headroom >= 0 else "refuses"
-            if candidate.floored:
-                # Its whole logits alone leave it short: no trace of its gradient was made.
-                label = "refuses by its whole logits"
-            self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": headroom,
-                                 "label": label, "terms": None if footprint is None else footprint.record(),
-                                 **({} if bounds is None or bounds[0] == bounds[1] else {
-                                     "headroom_bounds": list(bounds)})})
-            self.judged_at[key], self.copies_at[key] = headroom, bool(candidate.copies)
-            # A floor is no trace's footprint: its lowering, and the rungs after it, trace their own.
-            self.footprints[key] = None if candidate.floored else footprint
-            self.built_at[key] = candidate.built
-        return self.judged_at[key]
-
-    def headroom_bounds(self, candidate: Candidate) -> tuple[int, int] | None:
-        """The least and most headroom `candidate`'s derived footprint leaves the pool (`derived_headroom`,
-        the same on every process), None where it has none or no device states memory."""
-        return self._derived(candidate.footprint, local_devices(self.mesh), candidate.built)
-
-    def _derived(self, footprint: Footprint | None, devices: Sequence, built: int) -> tuple[int, int] | None:
-        """`derived_headroom` of `footprint` on `devices`, `built` of its held bytes built by the step's
-        first call, with the state's `unplaced` bytes beside it where the devices hold none of it yet."""
-        unplaced = self.unplaced or 0
-        if footprint is not None and unplaced:
-            footprint = dataclasses.replace(footprint, held=footprint.held + unplaced)
-        return derived_headroom(footprint, devices, built + unplaced, placed=self.unplaced is None)
 
     def fitting(self, executable: jax.stages.Compiled | None,
                 candidate: Candidate) -> tuple[bool, int | None]:
@@ -1151,134 +864,20 @@ class FitSearch[LossT, EffectsT]:
         return candidate.held + (self.unplaced or 0)
 
     def lowering(self, split: int) -> Candidate:
-        """The step at `split` at the objective's rung and the search's `narrow`, lowered: from the
-        candidate its derivation made (`derivations`, `Candidate.lowers`), so the step it judged is traced
-        once and lowered from that trace, its footprint with it; else lowered afresh, with the footprint the
-        derivation traced of it where it read it (`footprints`). One the step compiled ahead serves
-        (`ahead`) derives none, its compile having judged the derivation where it was compiled."""
-        key = self.candidate_key(split, self.narrow)
-        derived = self.derivations.pop(key, None)
-        if derived is not None and derived.lowers is not None:
-            with spending(derived) as spent:
-                program, kernels = derived.lowers()
-            return dataclasses.replace(derived, program=program, kernels=kernels, lowers=None, spent=spent)
+        """The step at `split` at the objective's rung and the search's `narrow`, lowered."""
         with spending() as spent:
-            lowered = self.lower(split, self.narrow, self.footprints.get(key), derived=self.ahead is None)
+            lowered = self.lower(split, self.narrow)
         return dataclasses.replace(lowered, spent=spent)
 
     def relowering(self, split: int) -> Candidate:
-        """The step at `split` lowered afresh past a kernel that spilled (`Relowered`), with no footprint:
-        a compile lowers its step once for each config it refuses on its way, and judges none of them but
-        the one it keeps, whose footprint is derived then (`footprinted`)."""
-        return self.lower(split, self.narrow, derived=False)
-
-    def footprinted(self, split: int, candidate: Candidate) -> Candidate:
-        """`candidate`, the step at `split` a compile kept after lowering it afresh past kernels that
-        spilled, with its derived footprint, traced once at the configs its launches settled on (`lower`,
-        not lowering): a kernel's next config can change the buffers the derivation traced at its first (a
-        Triton attention backward's partial gradients, a block of queries each), so the footprint the
-        search held is not this step's. Derived at each relowering, a hybrid's step that stepped down
-        twelve times traced twelve footprints, 11 s each, to judge one (row 5361)."""
-        traced = self.lower(split, self.narrow, lowering=False)
-        return dataclasses.replace(candidate, footprint=traced.footprint)
-
-    def candidate_key(self, split: int, narrow: bool) -> tuple[str, int]:
-        """The step at `split` and `narrow` at the objective's rung, as the derivation's judgments keep it."""
-        return json.dumps({**self.current(), "narrow": narrow}, sort_keys=True), split
-
-    def derived_split(self, candidates: Sequence[int], first: int) -> int:
-        """The index of the candidate the search compiles first: at the rung the derivation picked, the
-        fewest microbatches whose derived footprint fits the devices, found by halving the range below
-        the most, which fits (`derived_start`, memory falling with the split as `planned` assumes); the
-        derivation trusted where it refuses one, so the one compile at the most performant plan it admits
-        decides (row 3341). `first` where the run starts from a plan (a recorded one, or a checkpoint's
-        rung), where the derivation cannot judge the step, or where no candidate it reads fits."""
-        if not self.deriving() or self.resumed is not None or first != 0 or not self.judging():
-            return first
-        # From the fewest up: a step whose fewest microbatches fit traces that one candidate alone, the
-        # one the search compiles (`lowering`). Past it, the most, then halving between, as memory falls
-        # with the split (`planned`'s assumption, which a footprint that grows with the split would break:
-        # none here, its terms all of one microbatch or of the whole window).
-        fewest = self.judged(candidates[0], self.narrow)
-        if fewest is None or fewest >= 0 or len(candidates) == 1:
-            return first
-        headroom = self.judged(candidates[-1], self.narrow)
-        if headroom is not None and headroom < 0:
-            return first
-        low, high = 0, len(candidates) - 1
-        while high - low > 1:
-            middle = (low + high) // 2
-            judged = self.judged(candidates[middle], self.narrow)
-            fits = judged is None or judged >= 0
-            low, high = (low, middle) if fits else (middle, high)
-        return high
-
-    def judgment(self, split: int) -> int | None:
-        """The derivation's headroom of the step at `split` at the objective's rung, traced where the search
-        has not judged it yet (a trace, where a compile it saves is a minute and more), None where it
-        cannot judge."""
-        if self.deriving() and self.judging():
-            return self.judged(split, self.narrow)
-        return self.judged_at.get(self.candidate_key(split, self.narrow))
+        """The step at `split` lowered afresh past a kernel that spilled (`Relowered`)."""
+        return self.lower(split, self.narrow)
 
     def likely(self, split: int) -> bool:
         """Whether the step at `split` at the objective's rung is likely to fit, which orders the compiles
-        past a miss (`planned`): as the derivation judges it, corrected by what the compiles measured;
-        as the compiles' forecast guesses where the derivation cannot judge (`judged_likely`)."""
-        return judged_likely(self.judgment(split), self.shortfall(split),
-                             forecast=self.forecast.likely(self.rung(), split))
-
-    def shortfall(self, split: int) -> int:
-        """The bytes a step at `split` at the objective's remat is judged to need past its derived headroom
-        (`under`): the most a compile there missed, scaled by the step's derived temporaries against that
-        compile's (`missed_at`), or whole where either is not derived."""
-        rung = self.remat_rung()
-        under, missed = self.under.get(rung, 0), self.missed_at.get(rung)
-        footprint = self.footprints.get(self.candidate_key(split, self.narrow))
-        temporaries = None if footprint is None else footprint.temporaries
-        if not under or not missed or temporaries is None:
-            return under
-        return under * temporaries // missed
-
-    def learned(self, foreseen: int | None, measured: int | None, *, fit: bool,
-                temporaries: int | None) -> None:
-        """What a compile at the objective's remat teaches the derivation's next judgments there:
-        the headroom it `measured` short of the one `foreseen` corrects them (`under`), in proportion to the
-        derived `temporaries` it was short of (`missed_at`), and a compile that fit where the derivation
-        judged it short rules its refusals out (`overstated`)."""
-        rung = self.remat_rung()
-        if foreseen is not None and fit and foreseen < 0:
-            self.overstated.add(rung)
-        if foreseen is not None and measured is not None and foreseen - measured > self.under.get(rung, 0):
-            self.under[rung] = foreseen - measured
-            if temporaries:
-                self.missed_at[rung] = temporaries
-            else:
-                self.missed_at.pop(rung, None)
-
-    def refused(self, split: int) -> bool:
-        """Whether the derivation judges the step at `split` short by its own footprint, which the halving
-        below a split that fits does not compile (`planned`): no split it cannot judge, and none at a remat
-        where a compile it judged short fit (`overstated`: a tiny model's derived peak, its fixed buffers,
-        over-states the step many times). What a compile at another split missed past the derivation
-        (`shortfall`) orders the compiles (`likely`) and rules none out: scaled from one split to another
-        it states no bound on this one's need (row 5427: a correction from two microbatches judged four
-        short by 658,639 bytes, and they fit to the byte, so the search took eight)."""
-        rung = self.remat_rung()
-        if rung in self.overstated:
-            return False
-        derived = self.judgment(split)
-        return derived is not None and derived < 0
-
-    def deriving(self) -> bool:
-        """Whether the search derives footprints: it has the step to trace (`derive`)."""
-        return self.derive is not None
-
-    def judging(self) -> bool:
-        """Whether every process's devices judge a derived footprint (`memory.judged`), each process
-        answering alike: where one does not, every rung is unknown and no footprint is traced."""
-        local = all(judged(device) for device in local_devices(self.mesh))
-        return all(from_every_process(local))
+        past a miss (`planned`): as the compiles' measures guess it (`Forecast.likely`). A guess rules
+        nothing out."""
+        return self.forecast.likely(self.rung(), split)
 
     def current(self) -> dict[str, JSON]:
         return rung_record(self.objective, self.xla_defaults, narrow=self.narrow)
@@ -1296,18 +895,17 @@ class FitSearch[LossT, EffectsT]:
             moved = step()
         return moved
 
-    def fits(self, split: int, *, pruned: bool = False) -> bool:
+    def fits(self, split: int) -> bool:
         """Whether the step at `split` fits, at the objective's rung or its half rung (`remat_half`), a
-        compile asked at each; `pruned`, a rung the derivation judges short asks none (`refused`), the
-        half rung judged on its own. A run that states its remat has no half rung: its remat is its own."""
-        if self.fits_here(split, pruned):
+        compile asked at each. A run that states its remat has no half rung: its remat is its own."""
+        if self.fits_here(split):
             return True
         missed, held = self.rung(), None if self.remat_set else remat_half(self.objective)
         self.forecast.half_of[missed] = None if held is None else self.rung()
         if held is None:
             return False
         self.halves.add(self.remat_rung())
-        if self.fits_here(split, pruned):
+        if self.fits_here(split):
             return True
         self.objective.substitute(held)
         return False
@@ -1339,7 +937,7 @@ class FitSearch[LossT, EffectsT]:
             if ahead is not None:
                 executable, self.ahead = ahead.taken(candidate.lowered), None
             elif candidate.sampled is None and kept is not None:
-                executable = kept
+                executable, taken = kept, True
             else:
                 # A run that inspects compiles its sampled step beside the step, at once (`report.attempts`),
                 # its compile kept only where the step fits, as the step's own is kept first.
@@ -1352,12 +950,6 @@ class FitSearch[LossT, EffectsT]:
                 candidate = relowered.candidate(candidate)
                 if executable is not None and relowered.last is None:
                     self.compiled[key] = executable
-                if relowered.last is not None:
-                    # A spill's refusal changes the configs every derivation traced: each is traced again, the
-                    # kept step's here, and none is lowered from its derivation's trace.
-                    self.footprints.clear()
-                    self.derivations.clear()
-                    candidate = self.footprinted(split, candidate)
             fit, headroom = self.fitting(executable, candidate)
             self.sampled = None
             if fit and candidate.sampled is not None:
@@ -1383,9 +975,6 @@ class FitSearch[LossT, EffectsT]:
                         return lowered[-1]
                     compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled,
                                                    first=None if beside is None else firsts[1])
-                    if len(lowered) > 1:
-                        self.footprints.clear()
-                        self.derivations.clear()
                     self.sampled = (None if compiled is None
                                     else SampledStep(program_digest(lowered[-1]), compiled))
                 # Admitted by the plan whichever compiled it, ahead or here (training.md: the sampled step is
@@ -1394,34 +983,10 @@ class FitSearch[LossT, EffectsT]:
                                              candidate)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable, self.held(candidate))
-        foreseen = _judged_headroom(self.headroom_bounds(candidate))
-        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen,
-                                    spent=spent)
-        self.learned(foreseen, pooled_headroom(headroom), fit=fit,
-                     temporaries=None if candidate.footprint is None else candidate.footprint.temporaries)
-        if foreseen is not None and (foreseen >= 0) != fit:
-            # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names
-            # the need the compile found, which a sourced rule is to reach.
-            footprint = candidate.footprint
-            # The derived temporaries are what admission judges (`derived_headroom`): the gradient's peak,
-            # or the staged commit's fields beside the gradients where they hold more.
-            _log.warning("a model miss: the derivation judged %s %s with %d bytes to spare%s, and its "
-                         "compile %s with %s, its temporaries %s bytes against derived temporaries of %s "
-                         "(its peak %s, its staged commit %s; derived terms %s); the compile decides, and "
-                         "the derivation is to fix",
-                         probe.named(), "fits" if foreseen >= 0 else "does not fit", foreseen,
-                         "" if footprint is None or footprint.exact else " (its peak a bound from below)",
-                         "fits" if fit else "does not fit", headroom, probe.temp,
-                         None if footprint is None else footprint.temporaries,
-                         None if footprint is None else footprint.peak,
-                         None if footprint is None else footprint.staged,
-                         None if probe.derived is None else probe.derived.record(),
-                         extra={MODEL_MISS: probe.named()})
+        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, spent=spent)
         return options, candidate, executable, probe
 
-    def fits_here(self, split: int, pruned: bool = False) -> bool:
-        if pruned and self.refused(split):
-            return False
+    def fits_here(self, split: int) -> bool:
         key = (split, self.rung())
         if key not in self.lowered:
             # A step compiled ahead, its first compile, is lowered as its own compile lowered it (`handed`):

@@ -250,6 +250,39 @@ another's (a question's option lines' stream, its instructions', rows 2008 to 24
 means what today's, which has none, does. A saved run's records read without them (`earlier_fields`)."""
 
 
+MOVED_PATHS: Mapping[str, str] = {
+    f"dew.inputs.encoders:{name}": f"dew.interop.encoders:{name}"
+    for name in ("CLIPText", "T5Text", "HFAudio")
+} | {
+    f"dew.inputs.diffusion:{name}": f"dew.interop.conditioners:{name}"
+    for name in ("DiffusionConditioner", "QwenImageConditioner", "HiddenStatesConditioner", "WanConditioner")
+}
+"""Import paths an earlier Dew recorded, by the path each names now: the encoders that bind a released
+checkpoint, dew.interop's since row 5996, which a run's record, its steps' artifacts or its data plan named
+under dew.inputs. The one table their readers of saved records translate by (`moved_paths`): a run's record
+(`dew.config.earlier.earlier_run`), a step's artifact (`dew.inference.tasks.earlier_shapes`) and a saved
+data plan's manifest (`dew.data.plan.Plan.check`); a path given today is read as given
+(`dew.registry.imported`)."""
+
+
+def moved_record(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved record's fields, the JSON its file holds, with the import paths they name translated
+    (`moved_paths`)."""
+    return {name: moved_paths(json_value(value, name)) for name, value in record.items()}
+
+
+def moved_paths(value: JSON) -> JSON:
+    """`value`, a saved record's JSON, with every string an earlier Dew recorded as an import path
+    `MOVED_PATHS` holds read as the path it names now; the rest as it is."""
+    if isinstance(value, str):
+        return MOVED_PATHS.get(value, value)
+    if isinstance(value, dict):
+        return {key: moved_paths(held) for key, held in value.items()}
+    if isinstance(value, list):
+        return [moved_paths(held) for held in value]
+    return value
+
+
 def earlier_fields(value: JSON) -> JSON:
     """`value`, a saved run's records of components (a decision layout's segments, in its run.json or its
     checkpoint's task record), with each component's fields its class lost since (`REMOVED_FIELDS`) left

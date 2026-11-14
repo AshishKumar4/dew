@@ -38,8 +38,9 @@ itself (`judged_in_its_body`). Written beside their records as the test's manife
 
 @functools.cache
 def commit() -> str:
-    """The commit this checkout holds, which every record and manifest carries: a judge pools a map task's
-    records only where they are its own commit's."""
+    """The commit this checkout holds, read once a process: every record and manifest carries it, a judge
+    pooling a map task's records only where they are its own commit's, and a model flow's stored truths
+    are read only at it (`model_flows.stamp`)."""
     return subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent, capture_output=True,
                           text=True, check=True).stdout.strip()
 

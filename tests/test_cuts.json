@@ -17,9 +17,6 @@
 "tests/test_algebra_fusion.py::test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes[a causal window]",
 "tests/test_algebra_fusion.py::test_a_plain_programs_product_runs_the_template_its_call_names[grouped-fast]"
 ],
-"tests/test_algebra_scan.py": [
-"tests/test_algebra_scan.py::test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient[kimi_delta]"
-],
 "tests/test_architectures.py": [
 "tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer+gemma4_moe]",
 "tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer+glm4_moe]",
@@ -309,7 +306,7 @@
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-Kept.SPLIT-key-bias-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-Kept.SPLIT-softcap-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-256-Kept.NONE-softcap-bfloat16]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-Kept.NONE-none-bfloat16]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-Kept.NONE-key-bias-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-Kept.NONE-temperature-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-Kept.OUTPUT-sinks-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-Kept.SPLIT-key-bias-bfloat16]",
@@ -626,12 +623,6 @@
 "tests/test_compile_ahead.py::test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it",
 "tests/test_compile_ahead.py::test_compiling_ahead_on_gpus_of_no_stated_memory_is_refused_before_anything_traces[False]",
 "tests/test_compile_ahead.py::test_programs_kept_under_other_code_settings_or_target_are_refused_by_name[setting-process3-target3]"
-],
-"tests/test_config_cli.py": [
-"tests/test_config_cli.py::test_a_spec_field_the_dataset_lacks_is_a_command_line_error"
-],
-"tests/test_config_paths.py": [
-"tests/test_config_paths.py::test_a_run_trained_from_python_trains_as_dew_train_trains_it[jepa]"
 ],
 "tests/test_contracts_gemm.py": [
 "tests/test_contracts_gemm.py::test_a_gemm_prologue_holds_every_order[normal]",
@@ -1404,9 +1395,6 @@
 "tests/test_in_backward.py::test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time[groups]",
 "tests/test_in_backward.py::test_a_scanned_steps_runs_train_under_each_update[8-bit]"
 ],
-"tests/test_indexer_training.py": [
-"tests/test_indexer_training.py::test_padding_the_model_inputs_mask_leaves_out_counts_no_query[sparse-4]"
-],
 "tests/test_inference.py": [
 "tests/test_inference.py::test_a_restored_task_reads_the_training_steps_blank_to_the_bit",
 "tests/test_inference.py::test_a_run_on_a_mesh_packs_the_projections_its_layout_keeps_whole",
@@ -1624,9 +1612,6 @@
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp4]"
 ],
-"tests/test_level_stacking.py": [
-"tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[slower-first-layers]"
-],
 "tests/test_linear_attention.py": [
 "tests/test_linear_attention.py::test_a_cached_layer_traced_for_a_jvp_decodes_its_token[plain]",
 "tests/test_linear_attention.py::test_a_token_with_nothing_to_fuse_naming_the_fused_step_runs_the_step[512]",
@@ -1778,10 +1763,6 @@
 "tests/test_mesh_axes.py::test_a_sequence_split_holds_the_state_in_shares_and_trains_what_one_device_trains[sequence2]",
 "tests/test_mesh_axes.py::test_an_fsdp_step_splits_leading_dimensions_and_moves_no_activation[fused-projections]",
 "tests/test_mesh_axes.py::test_the_tensor_axis_changes_no_value"
-],
-"tests/test_minimax.py": [
-"tests/test_minimax.py::test_a_releases_own_config_and_its_transformers_config_read_as_one_model",
-"tests/test_minimax.py::test_a_scanned_minimax_decodes_as_its_plain_loop"
 ],
 "tests/test_mixed_step.py": [
 "tests/test_mixed_step.py::test_a_mixed_call_decodes_and_prefills_as_the_separate_calls_do[partial rope-True-paged]",
@@ -2130,9 +2111,6 @@
 "tests/test_perturbation.py::test_an_update_read_in_two_microbatches_estimates_what_its_batch_whole_does",
 "tests/test_perturbation.py::test_the_estimate_is_the_gradient_in_expectation[trailing-general]"
 ],
-"tests/test_pipeline_core.py": [
-"tests/test_pipeline_core.py::test_a_memory_mix_with_a_member_that_accepts_no_row_compiles_and_reads_the_others"
-],
 "tests/test_pipeline_golden.py": [
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[images_arrayrecord-workers=2,shares=2]",
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[images_tfds-workers=0,shares=1]",
@@ -2398,9 +2376,6 @@
 "tests/test_recurrence_witness.py::test_a_grouped_backwards_records_lie_in_their_key_heads_enclosures[keys gated-sm80]",
 "tests/test_recurrence_witness.py::test_an_amperes_inference_forward_is_witnessed_as_its_states_and_output_launches"
 ],
-"tests/test_recurrent_sequence_split.py": [
-"tests/test_recurrent_sequence_split.py::test_a_delta_rule_split_over_the_sequence_runs_its_rows_as_whole_ones[kimi delta attention-all_valid]"
-],
 "tests/test_reference_runs.py": [
 "tests/test_reference_runs.py::test_lm_fine_tune_steps_are_as_exact_as_torch",
 "tests/test_reference_runs.py::test_packed_documents_give_every_step_the_work_counted_for_one"
@@ -2656,11 +2631,11 @@
 "tests/test_serving.py::test_a_server_over_a_pool_draws_what_each_request_draws_alone[paged]",
 "tests/test_serving.py::test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter[dense]",
 "tests/test_serving.py::test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter[paged]",
-"tests/test_serving.py::test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_step",
+"tests/test_serving.py::test_a_server_over_split_rows_takes_its_projections_on_each_devices_rows[scanned]",
 "tests/test_serving.py::test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic[speculative-blocks]",
+"tests/test_serving.py::test_a_server_scores_its_draws_over_a_quantized_cache_as_its_rounding_does[int8-over-a-shared-prefix]",
 "tests/test_serving.py::test_a_server_scores_its_draws_over_a_quantized_cache_as_its_rounding_does[int8]",
-"tests/test_serving.py::test_a_sources_offloaded_cache_generates_what_a_resident_one_does",
-"tests/test_serving.py::test_a_text_prompt_through_the_hf_processor_serves_what_the_task_draws",
+"tests/test_serving.py::test_a_server_that_prefills_on_a_mesh_of_its_own_scores_its_draws_as_a_full_forward",
 "tests/test_serving.py::test_a_user_decoder_module_is_packed_where_it_names_its_groups",
 "tests/test_serving.py::test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone[1]"
 ],
@@ -2703,9 +2678,6 @@
 "tests/test_slot_sources.py::test_a_slot_release_loads_its_readout_and_exports_the_same_task[512-slot_lm]",
 "tests/test_slot_sources.py::test_a_slot_release_reads_the_labels_its_layout_states_in_their_order",
 "tests/test_slot_sources.py::test_a_slot_release_states_the_window_and_the_prompt_its_layout_accepted[slot_lm]"
-],
-"tests/test_source_schedulers.py": [
-"tests/test_source_schedulers.py::test_source_config_rebuilds_its_scheduler_trajectory_and_gradient[euler_ancestral.leading_zero_snr_v]"
 ],
 "tests/test_speculative.py": [
 "tests/test_speculative.py::test_a_longrope_crossing_reseeds_the_drafter_as_a_prefill_of_its_history_does[depth]",

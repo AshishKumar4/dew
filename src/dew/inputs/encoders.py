@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 import numpy as np
@@ -26,10 +25,6 @@ from dew.nn.blocks import table_rows
 from dew.nn.dit import TextContext
 from dew.nn.flops import ConditionWork
 from dew.registry import dtype_name, resolve_dtype
-
-if TYPE_CHECKING:
-
-    pass
 
 
 def char_codes(texts: Sequence[str], tokens: int, vocab: int) -> dict[str, np.ndarray]:

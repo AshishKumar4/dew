@@ -136,7 +136,6 @@ from dew.parity import (
 )
 from dew.parity_stages import REDRAW, staged_units
 from dew.telemetry.compiles import Compiles
-from dew.training.compiled_program import lowering_platform
 
 PRECISION = "precision"
 """The entry of a reference's array file that records the precision its generator's matmuls took."""
@@ -1024,7 +1023,7 @@ def _of_float64(label: str, truth_fn, inputs, truth) -> None:
     # The branch of a platform's choice that the truth's run keeps: on the device its evaluation runs on.
     with jax.enable_x64(new_val=True), evaluated_on(jax.tree.leaves(wide)) as device:
         program = lowered(trace(*wide).jaxpr).jaxpr
-    lowering = lowering_platform(device)
+    lowering = programs.lowering_platform(device)
     count = len(program.outvars)
 
     def narrow(fed: list[bool]) -> list[str]:

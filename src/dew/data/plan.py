@@ -22,7 +22,7 @@ import numpy as np
 from dew import _checkout
 from dew._hashing import array_header
 from dew._position import PER_SHARE, PlanChanged, unplaced
-from dew._records import ADDED, JSON, json_value, listed, record
+from dew._records import ADDED, JSON, json_value, listed, moved_paths, record
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 
@@ -900,7 +900,9 @@ class Plan:
                 "data plan contains a step without stable identity or a store given no name "
                 "(from_grain(..., identity=), from_iter(..., identity=)), which an exact resume cannot "
                 "check; name it, or resume relaxed (`data_resume='relaxed'`)")
-        manifest = record(saved.get("manifest"), "saved data manifest")
+        # Its steps' identities name an encoder by the import path it has now (row 5996).
+        manifest = record(moved_paths(json_value(saved.get("manifest"), "saved data manifest")),
+                          "saved data manifest")
         semantic = self.manifest.semantic()
         saved_steps = _identities(manifest.get("steps", []))
         # The saved order described, as this plan's is (`spelled_order`), whichever version recorded it.
