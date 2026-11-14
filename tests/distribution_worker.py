@@ -232,7 +232,10 @@ def main() -> None:
         if not args.float64:
             return {}
         with jax.enable_x64(new_val=False):
-            narrow = trainer_of(None).initial_state()
+            # Its optimizer built over the run's length, as each fit builds the run's (`Trainer.scheduled`).
+            narrowed = trainer_of(None)
+            narrowed.scheduled(args.steps)
+            narrow = narrowed.initial_state()
         return {"state": narrow.replace(variables=float64_held(narrow.variables),
                                         opt_state=float64_held(narrow.opt_state),
                                         ema=float64_held(narrow.ema))}
