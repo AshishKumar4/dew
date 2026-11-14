@@ -28,6 +28,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product. [4860]
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5278, 5327]
 - Derived resources: tiles, registers, residency and issued work. [5567]
+- The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm. [6030]
 - Exact on every path, every edge and every derivative order. [2656]
 - The suite's wall. [5478]
@@ -48,11 +49,13 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Training and parallelism
 
-- Time to first step: the compile path's re-derivations. [5556, 5558, 6082]
+- Time to first step: the compile path's re-derivations. [5556, 5558, 5669, 6082]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
+- CI time: every test within 120 seconds. [6237]
 - Training & Data's tests on check 1. [708]
 - XLA:CPU edges. [1591]
+- A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
 
 ## Data
 
@@ -64,6 +67,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Dory: the release qualified and its tests' oracles. [596]
 - Training and serving efficiency. [3330, 1880, 5292]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
+- A decoder computing in no dtype of its own. [6215]
 
 ## Algebra
 

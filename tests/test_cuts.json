@@ -451,6 +451,9 @@
 "tests/test_attention_witness.py": [
 "tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[0-causal]"
 ],
+"tests/test_autoencoder.py": [
+"tests/test_autoencoder.py::test_a_stochastic_encoder_samples_at_its_given_noise_and_a_deterministic_one_refuses_it[sd_vae]"
+],
 "tests/test_barren_reads.py": [
 "tests/test_barren_reads.py::test_a_mixture_of_corpora_each_kept_in_one_workers_inputs_reads_on[indexed]",
 "tests/test_barren_reads.py::test_a_worker_with_no_inputs_ends_and_the_others_read_on_and_resume",
@@ -658,7 +661,7 @@
 "tests/test_contracts_recurrence.py::test_the_chunked_delta_rule_holds_every_order[one sequence-near the largest-second orders, staged]",
 "tests/test_contracts_recurrence.py::test_the_chunked_delta_rule_holds_every_order[packed-normal-second jvp]",
 "tests/test_contracts_recurrence.py::test_the_decode_step_holds_every_order[near the least normal]",
-"tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[normal-fla_gdn-first orders]",
+"tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[near the least normal-fla_kda-jvp of grad]",
 "tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[normal-fla_kda-second orders, staged]",
 "tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-kimi_delta]",
 "tests/test_contracts_recurrence.py::test_the_derived_delta_rules_chunk_adjoint_holds_its_orders[near the largest]",
@@ -669,6 +672,9 @@
 "tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[normal-second orders, staged]",
 "tests/test_contracts_recurrence.py::test_the_ssd_port_holds_its_orders[near the least normal-jvp of grad]",
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[near the least normal-second orders, staged]"
+],
+"tests/test_cpu_only_jax.py": [
+"tests/test_cpu_only_jax.py::test_a_run_stops_where_the_gpu_would_sit_idle_and_import_dew_does_not[prepare-cpu]"
 ],
 "tests/test_cross_attention.py": [
 "tests/test_cross_attention.py::test_a_decoder_reads_a_context_of_its_own_tokens_by_its_table_or_its_own_pass",
@@ -1275,6 +1281,9 @@
 ],
 "tests/test_gemm_nvfp4.py": [
 "tests/test_gemm_nvfp4.py::test_a_stack_of_nvfp4_banks_is_read_at_its_layer_as_that_layers_bank[xla-gathered-rows]"
+],
+"tests/test_gemm_paired.py": [
+"tests/test_gemm_paired.py::test_the_templates_paired_product_holds_check_1[dense-sm90]"
 ],
 "tests/test_gemm_tcgen05.py": [
 "tests/test_gemm_tcgen05.py::test_tcgen05s_epilogues_hold_check_1[row scale-128x2]"
@@ -2155,6 +2164,9 @@
 "tests/test_perturbation.py::test_an_update_read_in_two_microbatches_estimates_what_its_batch_whole_does",
 "tests/test_perturbation.py::test_the_estimate_is_the_gradient_in_expectation[trailing-general]"
 ],
+"tests/test_pipeline_core.py": [
+"tests/test_pipeline_core.py::test_a_rows_count_and_its_rule_ride_through_the_steps_that_leave_its_targets[counted-again-then-copied-streamed]"
+],
 "tests/test_pipeline_golden.py": [
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[images_arrayrecord-workers=2,shares=2]",
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[images_tfds-workers=0,shares=1]",
@@ -2173,7 +2185,7 @@
 "tests/test_plan.py::test_a_plan_at_no_recomputation_stops_before_any_optional_frontier",
 "tests/test_plan.py::test_a_run_resumed_at_a_finer_split_lands_where_the_uninterrupted_run_does",
 "tests/test_plan.py::test_a_run_that_fails_after_its_profile_window_still_reports_the_window",
-"tests/test_plan.py::test_fit_keeps_an_explicit_policy_without_a_frontier_probe[minimal_with_context]"
+"tests/test_plan.py::test_a_waiting_window_reports_in_a_run_that_cannot_create_a_process"
 ],
 "tests/test_ppo.py": [
 "tests/test_ppo.py::test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged[sessions]"
