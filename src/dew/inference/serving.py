@@ -153,7 +153,7 @@ from dew.nn.progress import END, Progress
 from dew.nn.projections import pack_projections, packed_layout
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
 from dew.nn.scatter import DROPPED
-from dew.nn.sharding import Placed, placing, whole
+from dew.nn.sharding import FORWARD, placing, whole
 from dew.nn.visibility import with_served_blocks
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
@@ -823,23 +823,17 @@ class Server:
             self._host = {}
             self._read_pages, self._written_pages = map(Fetched, page_programs(formats, self._admitted))
 
-    @functools.cached_property
-    def _weights_placed(self) -> Placed | None:
-        """Where the served weights lie (`dew.nn.sharding.Placed`), which a projection mapped per shard reads
-        as it traces (`_context`): a reload keeps their placement. None off a mesh."""
-        return None if self.mesh is None else Placed.of(self.variables)
-
     @contextlib.contextmanager
     def _context(self) -> Iterator[None]:
         """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it,
-        and where its weights lie on it (`placing`), so a projection mapped per shard takes them where
-        they are, under the numerics its task's run trained in, with its rows' PRNG implementation the
-        default, so a key a layer draws (a stochastic rounding stream) is of the implementation its cache
-        was opened with, whatever thread serves it. The model runs its stack and sequences whole
+        and its projections' weights each whole (`placing`, `dew.nn.sharding.FORWARD`), so a projection
+        mapped per shard takes a launch on each device's rows, under the numerics its task's run trained
+        in, with its rows' PRNG implementation the default, so a key a layer draws (a stochastic rounding
+        stream) is of the implementation its cache was opened with, whatever thread serves it. The model runs its stack and sequences whole
         (`whole`): on a mesh with a stage or sequence axis the training forward pipelines the stack or
         splits a sequence's positions, which one token a step leaves nothing to do."""
         with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh), whole(),
-              placing(self._weights_placed),
+              placing(None if self.mesh is None else FORWARD),
               contextlib.nullcontext() if self.precision is None
               else generation.run_precision(self.precision),
               jax.default_prng_impl(self.prng)):

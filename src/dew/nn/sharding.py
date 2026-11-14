@@ -39,7 +39,6 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
-import functools
 import math
 import types
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
@@ -317,40 +316,21 @@ class Placing(Protocol):
 
 
 @dataclasses.dataclass(frozen=True)
-class Placed:
-    """The placement of variables already placed (`Placing`): each leaf's spec its own `NamedSharding`'s, by
-    its variables path, where a loader put it (`dew.inference.loading.place`, by its layout); a leaf on one
-    device, or not on a mesh, replicated. A served model traces under it (`placing`), so its projections
-    map per shard where its weights already lie, the layout that placed them read off the weights
-    themselves."""
-
-    specs: tuple[tuple[tuple[str, ...], tuple], ...]
-    """Each leaf's path, by its keys' names, and its spec's entries, in the variables' order: plain values
-    a call's identity states (`dew.training.identity`)."""
-
-    @classmethod
-    def of(cls, variables) -> Placed:
-        """`variables`' placement, read off its leaves."""
-        return cls(tuple(
-            (_named(path), tuple(leaf.sharding.spec) if isinstance(getattr(leaf, "sharding", None),
-                                                                   jax.NamedSharding) else ())
-            for path, leaf in jax.tree_util.tree_flatten_with_path(variables)[0]))
-
-    @functools.cached_property
-    def _by_path(self) -> dict[tuple[str, ...], tuple]:
-        return dict(self.specs)
+class Forward:
+    """The placement a forward-only trace's projections take their weights by (`Placing`): each whole,
+    gathered by the partitioner from wherever it lies as the map begins. A served or scored model
+    (`dew.inference`) traces under it (`FORWARD`): no gradient leaves its map, so where a weight came from
+    needs no reduce-scatter back to it, and no stored tree's path is read (a scanned stack's view, a
+    component applied to its own part, each sees other paths than the tree a loader placed)."""
 
     def leaf_spec(self, mesh, path, value) -> jax.sharding.PartitionSpec:
-        """The spec of the leaf at `path` (`('params', ..., 'kernel')`, a variables tree's), as it is placed
-        (`mesh` and `value` the protocol's, its placement already the leaf's own); a path the variables do
-        not hold is refused by its name."""
-        del mesh, value
-        return jax.sharding.PartitionSpec(*self._by_path[_named(path)])
+        """Every weight whole."""
+        del mesh, path, value
+        return jax.sharding.PartitionSpec()
 
 
-def _named(path) -> tuple[str, ...]:
-    """A variables path (`jax.tree_util`'s keys) by its keys' names."""
-    return tuple(str(getattr(key, "key", key)) for key in path)
+FORWARD = Forward()
+"""The one forward-only placement (`Forward`)."""
 
 
 @contextlib.contextmanager
