@@ -79,8 +79,9 @@ rounded twice to nearest."""
 PAIR_FRACTION = 2.0 ** -21
 """What `algebra.decayed` rounds off a pair's exponent: each side's fraction (where the side is under one, its
 distance from its floor rounds), their difference and its sum with the low halves', each under 2."""
-PAIR_FLOOR = recurrence_algebra.PAIR_FLOOR
-"""A pair whose integers differ by less weighs zero (`algebra.PAIR_FLOOR`)."""
+ZERO_WHOLE = -127
+"""A pair whose integers differ by this or less weighs zero (`algebra.between`'s exact power of two at its
+zero exponent bits, `attention_algebra.exact_power2`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -142,14 +143,14 @@ def raised_exponent(exponents: Iv, lane: Lane) -> Iv:
 def between(later, later_bound, earlier, earlier_bound, lane: Lane) -> Iv:
     """`algebra.between` of two separated prefixes, `exp2(later - earlier)` (broadcasting): each side's
     exponent within its bound of exact, their fractions' difference rounded (`PAIR_FRACTION`), exp2 at the
-    lane's reach and scaled by the wholes' difference exactly, zero where the integers' difference may pass
-    `PAIR_FLOOR`."""
+    lane's reach and scaled by the wholes' difference exactly (a product below fp32's normal range among its
+    subnormals unless the lane flushes them), zero where the integers' difference may reach `ZERO_WHOLE`."""
     difference = later - earlier
     spread = later_bound + earlier_bound + 2.0 ** -46 * (np.abs(later) + np.abs(earlier)) + PAIR_FRACTION
     found = raised_exponent(outward(difference - spread, np.minimum(difference + spread, 126.0)), lane)
     # The integers' difference lies within two of the exponent's.
-    lo = np.where(difference - spread < PAIR_FLOOR + 2, 0.0, found.lo)
-    return Iv(lo, np.where(difference + spread < PAIR_FLOOR - 2, 0.0, found.hi))
+    lo = np.where(difference - spread < ZERO_WHOLE + 2, 0.0, found.lo)
+    return Iv(lo, np.where(difference + spread < ZERO_WHOLE - 2, 0.0, found.hi))
 
 
 def _lags(size: int) -> np.ndarray:

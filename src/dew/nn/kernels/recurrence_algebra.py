@@ -193,28 +193,29 @@ def separated(hi, lo):
 
 def between(later, earlier):
     """`exp2(later - earlier)` of two separated exponents (`separated`, broadcasting), to fp32's resolution:
-    exp2 of the fractions' difference times the wholes' difference's exact power of two (`exact_power2`),
-    zero below 2^-127 (its zero exponent bits) and held at `PAIR_CEILING` above. A difference of the rounded
-    sums lost the fraction's last bits at the exponent's size, 1e-6 of the decay near -43, which put a port's
-    decay gradient under decays near zero 9 to 14 times the token-by-token recurrence's error from float64
-    (ledger 2098). The fractions' difference stays within two, its exp2 within [1/4, 4), for exponents
-    under 2^24, where a fraction's remainder `lo` is at most one: a chunk's prefix (its 64 tokens' at most
-    2^18 each). Truncating the difference into the scale, for any size, cost the template's forward 1% on an
-    H100 and 3% on an A100 (JS-954-57bf6dc05). Every pair's decay whose exponent may be either sign, the
-    ports' of their separated prefix and the template's of its halves (`decayed`), and the ports' ranges; a
-    decay whose exponent is at most zero is `decay`'s; the template's ranges (`range_decay`) and a decay from
-    the prefix's start are `raised`'s."""
+    exp2 of the fractions' difference times the wholes' difference's exact power of two (`exact_power2`), zero
+    where the wholes differ by -127 or less (its zero exponent bits; at -126 and -125 the product may lie
+    among fp32's subnormals, which a GPU's fast math flushes) and the difference held at `PAIR_CEILING` above.
+    A difference of the rounded sums lost the fraction's last bits at the exponent's size, 1e-6 of the decay
+    near -43, which put a port's decay gradient under decays near zero 9 to 14 times the token-by-token
+    recurrence's error from float64 (ledger 2098). The fractions' difference stays within two, its exp2 within
+    [1/4, 4), for exponents under 2^24, where a fraction's remainder `lo` is at most one: a chunk's prefix
+    (its 64 tokens' at most 2^18 each). Truncating the difference into the scale, for any size, cost the
+    template's forward 1% on an H100 and 3% on an A100 (JS-954-57bf6dc05). Every pair's decay whose exponent
+    may be either sign, the ports' of their separated prefix and the template's of its halves (`decayed`), and
+    the ports' ranges; a decay whose exponent is at most zero is `decay`'s; the template's ranges
+    (`range_decay`) and a decay from the prefix's start are `raised`'s."""
     (whole, fraction), (other, its_fraction) = later, earlier
     return jnp.exp2(fraction - its_fraction) * exact_power2(jnp.clip(whole - other, -127.0, PAIR_CEILING))
 
 
 def decay(later, earlier):
-    """`between` of a `later` exponent at most `earlier` (a decay, its exponent at most zero), held below
-    alone: no ceiling a decay never reaches. The intra walk's factored pairs and own bands and their
-    gradients' (`key_block_pairs`, `key_diagonal_bands`, `key_decayed_pairs_back`,
-    `key_diagonal_pairs_back`), where the exponent's two clips and a zero's select were 5.5k of a compute
-    warp's 28.9k issues in a B200's Kimi Linear intra walk once its prefix was separated (modelled at
-    191cb7975e4)."""
+    """`between` of a `later` exponent at most `earlier` (a decay, its exponent at most zero: a log decay at
+    most zero a token, the chunked forms' contract), held below alone: no ceiling a decay never reaches. The
+    intra walk's factored pairs and own bands and their gradients' (`key_block_pairs`, `key_diagonal_bands`,
+    `key_decayed_pairs_back`, `key_diagonal_pairs_back`), where the exponent's two clips and a zero's select
+    were 5.5k of a compute warp's 28.9k issues in a B200's Kimi Linear intra walk once its prefix was
+    separated (modelled at 191cb7975e4)."""
     (whole, fraction), (other, its_fraction) = later, earlier
     return jnp.exp2(fraction - its_fraction) * exact_power2(jnp.maximum(whole - other, -127.0))
 
@@ -736,8 +737,8 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], prefix
 
     def offset(e, bands):
         keys, *earlier = shifted(e)
-        decayed_keys, within = keys * decay(prefix, tuple(earlier)), index % sub >= e
-        return tuple(band + jnp.where(lane == e, jnp.sum(jnp.where(within, row * decayed_keys, 0.0),
+        pair, within = decay(prefix, tuple(earlier)), index % sub >= e
+        return tuple(band + jnp.where(lane == e, jnp.sum(jnp.where(within, row * keys * pair, 0.0),
                                                          axis=1)[:, None], 0.0)
                      for band, row in zip(bands, rows, strict=True))
 

@@ -73,8 +73,8 @@ CASES = [(name, regime, product, forms) for name in SITES for forms in forms_of(
 
 INTERPRETED = ('aligned keys', 'decays near zero')
 """The regimes the CPU interprets each form's forward under: where the template's tiles grow most, the
-inverse's fp16 doubling (aligned keys, the write gate near one) and its pairs' clip (`_scaled`,
-`PAIR_FLOOR`) over chunks spanning tens of e-folds."""
+inverse's fp16 doubling (aligned keys, the write gate near one) and its pairs' clip (`algebra.between`'s
+and `algebra.decay`'s, zero from a wholes' difference of -127) over chunks spanning tens of e-folds."""
 
 
 def bf16(operands: Chunk, hooks) -> Chunk:
