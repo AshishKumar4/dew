@@ -382,10 +382,20 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
         keyed, squares, gated_rows, referenced = staging
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
-        views = own_pairs.pairs_back_views(call, row, h, q_ref, k_ref, hi_ref, lo_ref, ds_ref, da_ref,
-                                           columns=chunk)
+        views = own_pairs.pairs_back_views(call, row, h, q_ref, k_ref, hi_ref, lo_ref)
 
-        def step(index, slots, d_betas, accumulators):
+        def pairs_gradients():
+            """Each pairs' gradient, the same every key block, read once from the program's chunk and staged
+            once in its parts, the scores' scaled as their pairs were: streamed and staged every key block,
+            two `[C, C]` fp32 tiles took two of the ring's slots and their split into parts each step."""
+            d_pairs = []
+            with family.staged_together():
+                for (ref, scaled), buffers in zip(((ds_ref, scale), (da_ref, 1.0)), squares, strict=True):
+                    (view,) = square.views(ref, row, chunk, h * chunk, chunk)
+                    d_pairs.append(operands.staged(family, family.tile_of(view) * scaled, buffers))
+            return d_pairs
+
+        def step(index, slots, d_betas, accumulators, loaded):
             # Every slot acquired in the step's own trace: the rolled sub-chunks read them.
             slots.acquire_all()
             betas = family.rows_of(beta_ref.at[h, span])
@@ -400,14 +410,9 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
                 del c
                 return tuple(family.columns_of(referenced.at[half, sub]) for half in (0, 1))
 
-            # Each pairs' gradient staged once in the step, its parts read by every product as they are and
-            # transposed; the scores' scaled as their pairs were.
-            d_pairs = []
-            with family.staged_together():
-                for (name, scaled), buffers in zip((("scores", scale), ("system", 1.0)), squares,
-                                                   strict=True):
-                    value = stream_tile(slots, name, square).value() * scaled
-                    d_pairs.append(operands.staged(family, value.astype(jnp.float32), buffers))
+            # Each pairs' gradient's parts, staged once (`pairs_gradients`), read by every product as they are
+            # and transposed.
+            d_pairs = loaded
             query = stream_tile(slots, "queries", given).value().astype(jnp.float32)
             key = stream_tile(slots, "keys", given).value().astype(jnp.float32)
 
@@ -444,10 +449,10 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
 
             return d_betas, accumulators
 
-        return mosaic.Walk(views, step, steps=steps, carry=family.as_row(family.zeros((chunk,))))
+        return mosaic.Walk(views, step, steps=steps, prologue=pairs_gradients,
+                           carry=family.as_row(family.zeros((chunk,))))
 
-    tiles = stream_blocks(scores=((chunk, chunk), square), system=((chunk, chunk), square),
-                          queries=((chunk, keys), given), keys=((chunk, keys), given),
+    tiles = stream_blocks(queries=((chunk, keys), given), keys=((chunk, keys), given),
                           gates=((chunk, keys), gates), lows=((chunk, keys), gates))
     staging, landing = _key_pairs_staged(call, keys)
     fp32_rows = square.shape(call.heads * width)
@@ -464,9 +469,9 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
 
 def _key_pairs_staged(call: Call, keys: int) -> tuple:
     """`_key_pairs_back`'s staging tiles and landings at key block `keys`: a key block's set (a sub-chunk's
-    keys gated up), two of a chunk's square (the pairs' gradients) and two of a key block's (the pairs' rows
-    gated down, staged once a key block) in `_parted`'s form, and the sub-chunks' references' plain tile; a
-    key block's landing."""
+    keys gated up), two of a chunk's square (the pairs' gradients, staged once before the walk) and two of a
+    key block's (the pairs' rows gated down, staged once a key block) in `_parted`'s form, and the sub-chunks'
+    references' plain tile; a key block's landing."""
     chunk = call.chunk
     parted = _parted(call)
     # The squares' and gated rows' sub-chunk products contract `algebra.SUB` rows, which tcgen05 issues in
@@ -491,7 +496,8 @@ def _key_pairs_held(call: Call, keys: int) -> Held:
     rolled sub-chunks (`algebra.key_decayed_pairs_back`) a key block's prefix halves, its rows' decays to
     their common points, its queries and keys, the rows' and keys' gradients carried and the rows' indices;
     in a sub-chunk's turn its keys' gate up, the keys raised, a product's sum and the operand its product
-    forms, its parts (`product.formed`) and their remainder, their mask, beside a product's fragments."""
+    forms, its parts (`product.formed`) and their remainder, their mask, beside a product's fragments. Before
+    the walk, each pairs' gradient read whole and split into its parts and their remainder in turn."""
     chunk = call.chunk
     parted = _parted(call)
     # As an sm100's lowered peak counts it (row 5298, jsf-sm100-backward): nine tiles a block, their masks,
@@ -502,6 +508,7 @@ def _key_pairs_held(call: Call, keys: int) -> Held:
                                         resources.OperandRead(parted.stored, parts=0),
                                         resources.OperandRead.of(parted))
     return Held(carried=[f32(chunk, 1)], phases=(
+        [f32(chunk, chunk)] * 2 + held_tile(parted, chunk, chunk),
         [f32(chunk, keys)] * 9 + masks(chunk, keys) * 2 + held_tile(parted, chunk, keys)
         + largest_live_set(
             product_fragments(call, (parted, chunk, chunk), (parted, chunk, keys)),

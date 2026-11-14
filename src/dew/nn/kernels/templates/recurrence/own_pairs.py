@@ -174,22 +174,18 @@ def _own_held(call: Call, block: int, outputs: int = 1) -> Held:
         [f32(chunk, algebra.SUB)] * 2))
 
 
-def pairs_back_views(call: Call, row: int, h, q_ref, k_ref, hi_ref, lo_ref, ds_ref, da_ref, *,
-                     columns: int) -> dict:
-    """The streams of a key pairs backward's program at chunk `row` and value head `h` (`key_pairs_own`'s,
-    `key_backward._key_pairs_back`'s): the pairs' gradients once, a chunk's `columns` of each (its square, or
-    its own pairs' bands, `algebra.own_bands`), and the queries, keys and the separated prefix's halves a key
-    block a step."""
+def pairs_back_views(call: Call, row: int, h, q_ref, k_ref, hi_ref, lo_ref) -> dict:
+    """The key-block streams of a key pairs backward's program at chunk `row` and value head `h`
+    (`key_pairs_own`'s, `key_backward._key_pairs_back`'s): the queries, keys and the separated prefix's
+    halves a key block a step."""
     chunk, width = call.chunk, call.width
-    given, gates, square = call.given, call.gates, fp32_operand(call)
+    given, gates = call.given, call.gates
     keyed = h // call.group * width
-    return {**stream_views(lambda i: (0, 0), scores=square.views(ds_ref, row, chunk, h * columns, columns),
-                           system=square.views(da_ref, row, chunk, h * columns, columns)),
-            **stream_views(lambda i: (0, i),
-                           queries=given.views(q_ref, row, chunk, keyed, width),
-                           keys=given.views(k_ref, row, chunk, keyed, width),
-                           gates=gates.views(hi_ref, row, chunk, h * width, width),
-                           lows=gates.views(lo_ref, row, chunk, h * width, width))}
+    return stream_views(lambda i: (0, i),
+                        queries=given.views(q_ref, row, chunk, keyed, width),
+                        keys=given.views(k_ref, row, chunk, keyed, width),
+                        gates=gates.views(hi_ref, row, chunk, h * width, width),
+                        lows=gates.views(lo_ref, row, chunk, h * width, width))
 
 
 def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, operands: tuple, grads: tuple):
@@ -226,8 +222,11 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
         shifts, = staging
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
-        views = pairs_back_views(call, row, h, q_ref, k_ref, hi_ref, lo_ref, ds_ref, da_ref,
-                                 columns=algebra.SUB)
+        # The pairs' own bands' gradients once, the same tile every step.
+        views = {**stream_views(lambda i: (0, 0),
+                                scores=square.views(ds_ref, row, chunk, h * algebra.SUB, algebra.SUB),
+                                system=square.views(da_ref, row, chunk, h * algebra.SUB, algebra.SUB)),
+                 **pairs_back_views(call, row, h, q_ref, k_ref, hi_ref, lo_ref)}
 
         def step(index, slots, d_betas, accumulators):
             slots.acquire_all()
