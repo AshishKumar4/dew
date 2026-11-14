@@ -217,14 +217,12 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       ahead, `Family.loads_ahead`, beside the one consumed and those whose products the family keeps in
       flight, `Family.in_flight`); a tile that cannot stage that deep gives way to the next
       narrower or shorter one, or a shallower step.
-    - Cluster: where the call's rows (a group's on average, or a kernel gradient's output rows, the inputs'
-      width) hold a tile's on a family whose cluster takes a pair (`Family.cluster`: warpgroup MMA's), that
-      many multiprocessors a cluster, running row tiles that load the block they share once between them
-      (multicast: a product's matrix, a kernel gradient's cotangent), CUTLASS's and cuBLASLt's pair on an
-      H100 (cuBLASLt's 2 x 4 cluster on the 4B's up kernel gradient read 35% less from device memory than the
-      template's one-multiprocessor tile, its tensor pipe 98.7% busy against 82.4%, M-EM-48-gh200); each multiprocessor's tile, stages and staged bytes as alone, its
-      legality unchanged. On layouts whose products span a pair (tcgen05's 2-SM MMA, which the caller
-      tries first where the rows hold its two row tiles, `paired_first`), every tile the pair's.
+    - Cluster: where the call's rows (a group's on average, a kernel gradient's output rows) hold a tile's
+      on a family whose cluster takes a pair (`Family.cluster`), a pair of multiprocessors whose row tiles
+      load the block they share once (a matrix, a kernel gradient's cotangent: cuBLASLt's cluster on the
+      4B's up dW read 35% less from device memory, its tensor pipe 98.7% busy against 82.4%, M-EM-48),
+      each multiprocessor's tile as alone. On layouts whose products span a pair (tcgen05's 2-SM MMA,
+      tried first where the rows hold its two row tiles, `paired_first`), every tile the pair's.
     - Band: the planar snake's column tiles a band (`resources.band`), the rows' and the columns' blocks
       balanced over a wave or, grouped, wider while a wave spans each group's row tiles whole, a
       cluster's tiles one program's.
