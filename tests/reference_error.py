@@ -2168,19 +2168,29 @@ def _recorded_following(decisions_at, certified, live):
     return followed
 
 
-def _draws_roundings(truth_fn, arguments) -> int:
+def _draws_roundings(truth_fn, arguments, counted: dict) -> int:
     """The roundings one draw of the float64 truth `truth_fn` chains on `arguments` (`chain_roundings`): its
-    program's, a window loop's its window's (each window a draw of its own); a truth run as given that
-    states the programs it runs (`as_given`'s `programs`: a host loop of compiled rows or steps), the sum
-    over them, each traced here in float64. The sum bounds every leaf's chain, which runs through some of
-    those programs in turn: looser than one program's count by at most their number, a draw's rows or
-    steps, so float64's bound on a leaf stays near 1e-13 of its norm where float32's rounding is 6e-8."""
-    stated = getattr(truth_fn, "programs", None)
-    if stated is not None:
-        with jax.enable_x64(new_val=True):
-            return sum(chain_roundings(jax.make_jaxpr(run)(*held)) for run, held in stated(*arguments))
+    program's, a window loop's its window's (each window a draw of its own), counted once (`counted`); a truth
+    run as given that states the programs it runs (`as_given`'s `programs`: a host loop of compiled rows or
+    steps), the sum over those this draw runs, each traced here in float64 once a program and signature, as
+    a draw's programs may vary with it. The sum bounds every leaf's chain, which runs through some of those
+    programs in turn: looser than one program's count by at most their number, a draw's rows or steps, so
+    float64's bound on a leaf stays near 1e-13 of its norm where float32's rounding is 6e-8."""
     program, traced = _one_draws_program(truth_fn, arguments)
-    return chain_roundings(jax.make_jaxpr(program)(*traced))
+    stated = getattr(program, "programs", None)
+    if stated is None:
+        if "draw" not in counted:
+            counted["draw"] = chain_roundings(jax.make_jaxpr(program)(*traced))
+        return counted["draw"]
+    total = 0
+    with jax.enable_x64(new_val=True):
+        for run, held in stated(*traced):
+            signature = (run, jax.tree.structure(held),
+                         tuple((np.shape(leaf), np.result_type(leaf)) for leaf in jax.tree.leaves(held)))
+            if signature not in counted:
+                counted[signature] = chain_roundings(jax.make_jaxpr(run)(*held))
+            total += counted[signature]
+    return total
 
 
 def certifier(site: str, truth_fn, shapes: Mapping[str, np.ndarray], recorded_sketch):
@@ -2188,14 +2198,13 @@ def certifier(site: str, truth_fn, shapes: Mapping[str, np.ndarray], recorded_sk
     truth (`live`), and `certified(index, *arguments)`, its leaves on `arguments` (a draw's inputs, a
     followed site's recorded decisions before them), each held to the recorded truth's sketch at draw
     `index` (`recorded_sketch(index, name)`, of the leaves `shapes` names) within float64's rounding of the
-    computation, its roundings counted once on its trace; past it, `UnrecordedTruth`: a summarized
-    recording's (`indexed_recording`), and a truths recording's (tests/recorded_truths.py)."""
-    live, roundings = _truth_program(truth_fn), {}
+    computation, its roundings counted on its trace (`_draws_roundings`); past it, `UnrecordedTruth`: a
+    summarized recording's (`indexed_recording`), and a truths recording's (tests/recorded_truths.py)."""
+    live, counted = _truth_program(truth_fn), {}
 
     def certified(index: int, *arguments):
         computed = live(*arguments)
-        if not roundings:
-            roundings["count"] = _draws_roundings(truth_fn, arguments)
+        count = _draws_roundings(truth_fn, arguments, counted)
         eps = float(np.finfo(np.float64).eps)
         if set(computed) != set(shapes):
             raise AssertionError(f"{site}: `truth_fn` gives the leaves {sorted(computed)}, the recording "
@@ -2214,7 +2223,7 @@ def certifier(site: str, truth_fn, shapes: Mapping[str, np.ndarray], recorded_sk
             norm = largest * float(np.linalg.norm(value / largest)) if largest > 0 else 0.0
             # The oracle rule's bound on the difference's norm, and the rounding of both sketches, the
             # recorded truth's magnitudes no more than this one's and the difference's (`sketch_rounding`).
-            oracle = 2 * roundings["count"] * eps * norm
+            oracle = 2 * count * eps * norm
             magnitude = float(np.sum(np.abs(value))) * (1 + value.size * eps) + np.sqrt(value.size) * oracle
             bound = (SKETCH_DEVIATIONS * oracle + 2 * sketch_rounding(magnitude)) * (1 + 1e-6)
             apart = truth_sketch(value, index) - recorded
@@ -2227,7 +2236,7 @@ def certifier(site: str, truth_fn, shapes: Mapping[str, np.ndarray], recorded_sk
                     f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not the recorded "
                     f"reference's: its sketch is {away:.3e} away (root mean square), past float64's "
                     f"rounding of the computation "
-                    f"({roundings['count']} roundings); `truth_fn` does not compute what the reference's "
+                    f"({count} roundings); `truth_fn` does not compute what the reference's "
                     f"truth did")
         return computed
 

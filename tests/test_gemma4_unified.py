@@ -343,9 +343,10 @@ def test_raw_media_train_and_reload_through_the_public_source(source, tmp_path):
 
 
 def cached_run(native, wide: bool = False):
-    """Dew's cached run of a draw's odd rows (`cached_functions`): the prefill of their first ten tokens and a
-    teacher-forced step a continuation token, run as given; `wide`, its float64 twin over its variables
-    widened (Dew's own float64 path), stating the program it runs (`as_given`'s `programs`)."""
+    """Dew's cached run of a draw's odd rows (`cached_functions`), its inputs and `continuation` in one
+    mapping: the prefill of their first ten tokens and a teacher-forced step a continuation token, run as
+    given; `wide`, its float64 twin over its variables widened (Dew's own float64 path), stating the program
+    it runs (`as_given`'s `programs`)."""
     @functools.cache
     def built():
         model = native.model.clone(language_model=native.model.language_model.clone(max_seq_len=32))
@@ -367,14 +368,15 @@ def cached_run(native, wide: bool = False):
             outputs[f"step{step}"] = value
         return outputs
 
-    def programs(inputs, continuation):
+    def programs(inputs):
+        media = {name: value for name, value in inputs.items() if name != "continuation"}
         rows = jnp.arange(1, inputs["input_ids"].shape[0], 2)
-        batch = native.processor.from_hf(inputs).take_rows(rows).slice_tokens(0, 10)
-        yield cached, (built()[1], widened(batch) if wide else batch, continuation)
+        batch = native.processor.from_hf(media).take_rows(rows).slice_tokens(0, 10)
+        yield cached, (built()[1], widened(batch) if wide else batch, inputs["continuation"])
 
-    def run(inputs, continuation):
+    def run(inputs):
         with jax.enable_x64(new_val=wide):
-            ((program, held),) = programs(inputs, continuation)
+            ((program, held),) = programs(inputs)
             return program(*held)
 
     return as_given(run, programs=programs if wide else None)
@@ -447,18 +449,11 @@ def test_unified_runtime_observations_follow_the_reference(source, site, functio
         inputs, continuation = draw(seed)
         return {**inputs, "continuation": continuation}
 
-    def split(run):
-        return as_given(lambda inputs: run({name: value for name, value in inputs.items()
-                                            if name != "continuation"}, inputs["continuation"]),
-                        programs=None if run.programs is None else lambda inputs: run.programs(
-                            {name: value for name, value in inputs.items() if name != "continuation"},
-                            inputs["continuation"]))
-
     stored = recording(FIXTURE / f"{site}.npz")
     seeds = int(stored[f"{site}.seeds"])
     recorded_draw, reference, truth = indexed_recording(stored, site, seeds, inputs_of=inputs_of,
-                                                        truth_fn=split(cached_run(source[0], wide=True)))
-    assert_as_exact(as_given(lambda index, inputs: split(ours)(inputs)), reference, recorded_draw,
+                                                        truth_fn=cached_run(source[0], wide=True))
+    assert_as_exact(as_given(lambda index, inputs: ours(inputs)), reference, recorded_draw,
                     f"Gemma4 Unified {site}", seeds=seeds, truth_fn=truth)
 
 
