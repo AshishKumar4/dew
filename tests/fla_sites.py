@@ -168,7 +168,9 @@ def _rwkv6_sites() -> dict[str, Site]:
     for label, dtype in (("bf16", jnp.bfloat16), ("fp32", jnp.float32)):
         for layout, packed in (("one sequence", False), ("packed", True)):
             def draw(seed, dtype=dtype, packed=packed):
-                (operands,) = chunked.draw(RWKV6, packed, seed)
+                # Values 16 wide: fla-core's rwkv6 backward takes a value block of at least 16 (its dA
+                # kernel's `tl.dot(do, v)`, K >= 16).
+                (operands,) = chunked.draw(RWKV6, packed, seed, value_width=16)
                 return dataclasses.replace(operands, **{name: getattr(operands, name).astype(dtype)
                                                         for name in ("query", "key", "value")})
 

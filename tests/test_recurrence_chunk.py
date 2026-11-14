@@ -200,16 +200,17 @@ def cotangents(operands: Chunk, seed: int) -> tuple[jax.Array, jax.Array]:
 
 
 def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENGTH,
-         value_heads: int = VALUE_HEADS) -> tuple[Chunk]:
+         value_heads: int = VALUE_HEADS, value_width: int | None = None) -> tuple[Chunk]:
     """A sequence's operands for `hooks` from `seed` (`hosted`), its keys' and values' dimensions each
     permuted by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries, keys
     and values (`NORMED_WIDTH` wide under the norm), a log decay a head or a key dimension in (-1, 0),
-    a gate in (0, 1), a skip, a memory entering, `length` tokens over `value_heads` value heads, and with
+    a gate in (0, 1), a skip, a memory entering, `length` tokens over `value_heads` value heads, the values
+    `value_width` wide where given, and with
     `packed` documents starting at tokens 0, 23 and 40 of the first row and 9 and 48 of the second, 48 a
     chunk's first token."""
     rng = np.random.default_rng(seed)
     normal = np.random.default_rng([seed, 1]).standard_normal
-    width = VALUE_WIDTH if hooks.output is None else NORMED_WIDTH
+    width = value_width or (VALUE_WIDTH if hooks.output is None else NORMED_WIDTH)
     key_order, value_order = rng.permutation(KEY_WIDTH), rng.permutation(width)
     query = normal((ROWS, length, KEY_HEADS, KEY_WIDTH))[..., key_order]
     key = unit(normal((ROWS, length, KEY_HEADS, KEY_WIDTH)))[..., key_order]
