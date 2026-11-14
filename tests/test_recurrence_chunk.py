@@ -982,3 +982,23 @@ def test_the_derived_rule_runs_in_a_shard_map_that_checks_varying_axes(entering,
         got = jax.jit(jax.value_and_grad(lambda *given: jnp.sum(mapped(*given) * do),
                                          argnums=range(len(operands))))(*operands)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(got))
+
+
+RWKV6_SITES = tuple(f"rwkv6/{dtype}/{layout}" for dtype in ("bf16", "fp32")
+                    for layout in ("one sequence", "packed"))
+"""RWKV6's recorded sites (`fla_sites.RWKV6`): its recurrence in bf16 and fp32, one sequence and packed."""
+
+
+@pytest.mark.parametrize("site", RWKV6_SITES)
+@pytest.mark.check1_shards(seeds=64, per_task=8)
+def test_rwkv6_through_the_chunked_op_is_as_exact_as_fla(site):
+    """RWKV6's recurrence (a decay a key dimension, its readout of the memory entering its token, its own
+    write weighed a key: `recurrence.Hooks.reads`, `Hooks.own_weight`) through the chunked op, its output,
+    final memory and every operand's gradient, the own weight's included, on par from float64 with
+    recorded fla-core's `chunk_rwkv6` at the site's declared seeds (check 1; the truth the recurrence a
+    token at a time in float64, which the recorder held to fla's `naive_recurrent_rwkv6`). The portable
+    math takes it on every route (`recurrence_chunk.READOUT_HANDOFF`)."""
+    from fla_sites import OWN_LEAVES, RWKV6, the_template_is_as_exact_as_fla
+
+    the_template_is_as_exact_as_fla(lambda operands: chunk(RWKV6, operands), site, OWN_LEAVES,
+                                    label=f"RWKV6 through the chunked op against fla, {site}")
