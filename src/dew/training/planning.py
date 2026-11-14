@@ -55,7 +55,6 @@ from dew.training.memory import (
     head_fused_of,
     head_tile_of,
     local_devices,
-    missed,
     offloads,
     placeable,
     placed_beside,
@@ -957,7 +956,7 @@ class FitSearch[LossT, EffectsT]:
         fit, headroom = probe.fits, probe.headroom
         self.probes.append(probe)
         if not fit and headroom is not None and probe.temp is not None:
-            self.misses[(self.rung(), split)] = missed(split, probe.temp, headroom, self.factor)
+            self.misses[(self.rung(), split)] = MemoryMiss(split, probe.temp, -headroom, self.factor)
         if fit:
             assert executable is not None
             self.fitted, self.fitted_sampled = (candidate, executable, self.chosen), self.sampled
