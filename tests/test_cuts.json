@@ -349,6 +349,9 @@
 "tests/test_attention_route.py::test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward[packed-documents-bfloat16]",
 "tests/test_attention_route.py::test_a_template_call_filling_with_minus_infinity_reads_nan_where_a_row_sees_no_key"
 ],
+"tests/test_attention_splash.py": [
+"tests/test_attention_splash.py::test_splash_agrees_with_the_reference_the_oracle_holds[sinks]"
+],
 "tests/test_attention_stability.py": [
 "tests/test_attention_stability.py::test_a_score_cotangent_past_bf16s_largest_keeps_the_gradients_finite[accurate]",
 "tests/test_attention_stability.py::test_an_unseen_keys_value_past_fp32s_largest_takes_no_part_in_a_gradient[bfloat16]",
@@ -1247,9 +1250,6 @@
 ],
 "tests/test_gemm_gather.py": [
 "tests/test_gemm_gather.py::test_a_gathered_grouped_product_reads_each_row_where_its_table_says"
-],
-"tests/test_gemm_tcgen05.py": [
-"tests/test_gemm_tcgen05.py::test_tcgen05s_epilogues_hold_check_1[row scale-128x2]"
 ],
 "tests/test_gemm_template.py": [
 "tests/test_gemm_template.py::test_a_dense_kernel_gradients_balanced_tail_holds_check_1[320-256-1408-fp32, exact sums]",
