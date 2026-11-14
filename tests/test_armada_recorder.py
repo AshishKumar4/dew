@@ -84,7 +84,7 @@ def test_a_python_child_uv_runs_over_this_environment_joins_its_files_record(ci,
     launched = ["uv", "run", "--offline", "--no-project", "--python", "{python}", "--with", str(wheel),
                 "python", "-c", "import layered, plain"]
     written(tmp_path, {
-        "plain.py": "def helper(): return 1\n",
+        "plain.py": "VALUE = 1\n",
         "test_layered.py": "import subprocess, sys\ndef test_layered():\n"
                            f"    words = [sys.executable if word == '{{python}}' else word\n"
                            f"             for word in {launched!r}]\n"
@@ -94,7 +94,8 @@ def test_a_python_child_uv_runs_over_this_environment_joins_its_files_record(ci,
     [row] = json.loads((tmp_path / "verdict.json").read_text())["rows"]
     assert row["exitCode"] == 0, row["output"]
     assert reusable_now(ci, ["tests/test_layered.py"]) == [True]
-    (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
+    # The child executed plain.py's module code: a change to it moves the file's key.
+    (tmp_path / "tests/plain.py").write_text("VALUE = 2\n")
     assert reusable_now(ci, ["tests/test_layered.py"]) == [False]
 
 
