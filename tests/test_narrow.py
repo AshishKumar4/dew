@@ -387,7 +387,9 @@ def test_a_scanned_decoder_reads_every_layers_kernels_through_copies_with_the_sa
     assert {f"layers_{index}" for index in range(4)} <= layers, names
 
 
-@pytest.mark.check1_shards(seeds=8, per_task=2)
+# One draw a map task: a mixture's draw first clears its routing margin, its longest task 662 s for two draws
+# in CI (row 6237).
+@pytest.mark.check1_shards(seeds=8, per_task=1)
 @pytest.mark.parametrize(("accumulation", "split", "mixture", "fsdp"), [
     (2, 1, False, 1), (1, 2, True, 1),
     pytest.param(2, 1, True, 2, marks=pytest.mark.mesh(devices=2)),
