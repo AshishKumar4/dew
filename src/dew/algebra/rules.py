@@ -741,8 +741,9 @@ def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]:
 ARMS: dict[str, Rules] = {}
 """Each derivation's own set a receipt's arm may leave out (`program.passes`' `without`) beside the registered
 sets, by name: one whose derivation still makes a program without it (`carry.CARRIED`: the split's traced
-forms). A derivation's defining set (`derive.DECOUPLED`, a scan's identities) makes its program, which no arm
-has without it, and a dev-time set runs at dev time alone: neither is an arm's."""
+forms). A derivation's defining set (`derive.DECOUPLED`, a scan's own identities, `linear_scan`'s, which no
+`Rules` holds) makes its program, which no arm has without it, and a dev-time set runs at dev time alone:
+neither is an arm's."""
 
 
 def armed(sets: Rules) -> Rules:
