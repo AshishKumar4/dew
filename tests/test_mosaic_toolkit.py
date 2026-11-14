@@ -372,6 +372,21 @@ def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_conf
                         for family in group]
 
 
+def test_a_launchs_register_model_runs_the_programs_its_shared_memory_holds():
+    """A launch's register model states the programs its plan runs: its registers' residency bounded by the
+    programs its staged bytes hold on the target it derives for, named or not (row 5523: a B200's gathered
+    input gradient staging 230,580 bytes was stated three programs, which its registers held, and ran one)."""
+    from dew.nn.kernels.templates import resources
+    from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
+
+    with generation.assumed("sm90"):
+        unstaged = resources.register_model(WGMMA, 1, 112)
+        staged = resources.register_model(WGMMA, 1, 112, shared=200 * 1024)
+        named = resources.register_model(WGMMA, 1, 112, shared=200 * 1024, target=generation.gpu_target())
+    assert unstaged.most > 1
+    assert staged.most == named.most == 1
+
+
 def test_a_kernel_named_with_its_register_model_states_it_on_its_launch():
     """A kernel named with its register model (`report.named`'s `model`) records it on the launch tracing it
     (`report.Launch.kernels`), by its name less the launch's suffix, where the compile point reads it before a
@@ -811,30 +826,41 @@ def test_the_tcgen05_persistent_walk_lowers_for_a_b200():
             lowering_platforms=("cuda",))
 
 
-def _relayed_products(q, k, v, *, interpret):
+def _relayed_products(q, k, v, *, interpret, weighed=lambda scores, side: scores * 2, side=None):
     """FlashAttention 4's relay on tcgen05's bundle: `S = q k` into tensor memory by the product warp, read
-    out by a role of the table (`Tcgen05Issuer.read`), doubled, narrowed and written back as `P`
+    out by a role of the table in tensor memory's own layout (`Tcgen05Issuer.read`), its weights
+    `weighed(S, side)` (doubled by default; `side`, where given, a vector over its columns the role loads in
+    the layout that takes each column's from its rows, `native_column`) narrowed and written back as `P`
     (`write`), and `O = P v` with `P` the left operand from tensor memory (the TS product); `O` read out
     and stored by the same role. Its roles wait on signals the products' commit and the role's publication
-    arrive at (`signals`)."""
+    arrive at (`signals`). A keys-first backward's relay is the same, its `q` the keys and its `k` the
+    queries' transpose (row 4839)."""
     from dew.nn.kernels.templates import mosaic_sm100
     family = mosaic_sm100.RINGS
     rows = q.shape[0]
     columns = v.shape[1]
+    sides = () if side is None else (side,)
 
-    def body(q_gmem, k_gmem, v_gmem, o_gmem):
-        def scoped(q_smem, k_smem, v_smem, o_smem, loaded, s_tmem, p_tmem, o_tmem, scored, weighed, summed):
+    def body(q_gmem, k_gmem, v_gmem, *refs):
+        *side_gmem, o_gmem = refs
+
+        def scoped(q_smem, k_smem, v_smem, o_smem, loaded, s_tmem, p_tmem, o_tmem, scored, weighed_, summed,
+                   *side_smem):
             s = mosaic_sm100.Accumulator(s_tmem, (rows, k.shape[1]))
             p = mosaic_sm100.Accumulator(p_tmem, (rows, k.shape[1]), dtype=jnp.bfloat16)
             o = mosaic_sm100.Accumulator(o_tmem, (rows, columns))
-            scored, weighed, summed = (family.signals().opened(each) for each in (scored, weighed, summed))
+            scored, weighed_, summed = (family.signals().opened(each) for each in (scored, weighed_, summed))
             first = rings.Turn.of(0, 1)
 
             def relay(index):
                 del index
+                taken = None
+                for smem in side_smem:
+                    plgpu.barrier_wait(loaded.at[3], phase=0)
+                    taken = plgpu.load(smem, layout=family.native_column)
                 plgpu.barrier_wait(scored.barriers.at[0], phase=0)
-                family.write(p, family.read(s) * 2)
-                weighed.published(first)
+                family.write(p, weighed(family.read(s, layout=mosaic_sm100.TMEM), taken))
+                weighed_.published(first)
                 plgpu.barrier_wait(summed.barriers.at[0], phase=0)
                 o_smem[...] = family.read(o)
                 plgpu.wait_load_tmem()
@@ -843,7 +869,8 @@ def _relayed_products(q, k, v, *, interpret):
                 plgpu.wait_smem_to_gmem(0)
 
             def load():
-                for gmem, smem, at in ((q_gmem, q_smem, 0), (k_gmem, k_smem, 1), (v_gmem, v_smem, 2)):
+                for at, (gmem, smem) in enumerate(zip((q_gmem, k_gmem, v_gmem, *side_gmem),
+                                                      (q_smem, k_smem, v_smem, *side_smem), strict=True)):
                     plgpu.copy_gmem_to_smem(gmem, smem, loaded.at[at])
 
             def products():
@@ -851,7 +878,7 @@ def _relayed_products(q, k, v, *, interpret):
                     plgpu.barrier_wait(loaded.at[at], phase=0)
                 family.products(s, q_smem, k_smem)
                 scored.committed(first)
-                plgpu.barrier_wait(weighed.barriers.at[0], phase=0)
+                plgpu.barrier_wait(weighed_.barriers.at[0], phase=0)
                 family.products(o, p, v_smem)
                 summed.committed(first)
 
@@ -862,14 +889,16 @@ def _relayed_products(q, k, v, *, interpret):
                 for each in (q, k, v)]
         signals = [family.signals().scratch(), family.signals(by_products=False).scratch(),
                    family.signals().scratch()]
-        pl.run_scoped(scoped, *smem, plgpu.SMEM((rows, columns), jnp.float32), plgpu.Barrier(num_barriers=3),
+        pl.run_scoped(scoped, *smem, plgpu.SMEM((rows, columns), jnp.float32),
+                      plgpu.Barrier(num_barriers=3 + len(sides)),
                       family.tensor_memory((rows, k.shape[1])),
                       family.tensor_memory((rows, k.shape[1]), jnp.bfloat16),
-                      family.tensor_memory((rows, columns)), *signals, collective_axes="wg")
+                      family.tensor_memory((rows, columns)), *signals,
+                      *(plgpu.SMEM(each.shape, each.dtype) for each in sides), collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
-                         interpret=interpret, name="relayed")(q, k, v)
+                         interpret=interpret, name="relayed")(q, k, v, *sides)
 
 
 def _relayed_operands():
@@ -899,6 +928,101 @@ def test_the_relay_through_tensor_memory_lowers_for_a_b200():
     with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(functools.partial(_relayed_products, interpret=False)).trace(q, k, v).lower(
             lowering_platforms=("cuda",))
+
+
+def _keys_first_products(k, q_t, statistic, do, *, interpret):
+    """A tcgen05 attention backward's keys-first relay (row 4839): `Sᵀ = k qᵀ` into tensor memory with keys as
+    its rows, each query's `statistic` taken from its column (`_relayed_products`' `side`), and
+    `dV = Pᵀ dO` with `Pᵀ` the left operand from tensor memory."""
+    return _relayed_products(k, q_t, do, interpret=interpret, side=statistic,
+                             weighed=lambda scores, taken: scores - taken[None, :])
+
+
+def _keys_first_operands():
+    """Small integers, so `(k qᵀ - statistic) dO` is exact in fp32 and `Pᵀ` exact in bf16."""
+    keys = jax.random.split(jax.random.key(5), 4)
+    k = jax.random.randint(keys[0], (128, 64), -1, 2).astype(jnp.bfloat16)
+    q_t = jax.random.randint(keys[1], (64, 64), -1, 2).astype(jnp.bfloat16)
+    statistic = jax.random.randint(keys[2], (64,), -2, 3).astype(jnp.float32)
+    do = jax.random.randint(keys[3], (64, 64), -2, 3).astype(jnp.bfloat16)
+    return k, q_t, statistic, do
+
+
+@INTERPRETS
+def test_a_keys_first_role_takes_each_querys_statistic_from_its_column_into_a_product_from_tensor_memory():
+    """Interpreted: transposed scores issued into tensor memory with keys as rows, read out by a role in
+    tensor memory's own layout, each query's statistic taken from its column (`native_column`), written back
+    narrowed and read as the left operand of `dV = Pᵀ dO` from tensor memory: exactly `(k qᵀ - l) dO`."""
+    k, q_t, statistic, do = _keys_first_operands()
+    got = np.asarray(_keys_first_products(k, q_t, statistic, do, interpret=INTERPRETED))
+    weights = np.asarray(k, np.float32) @ np.asarray(q_t, np.float32) - np.asarray(statistic)[None, :]
+    np.testing.assert_array_equal(got, weights @ np.asarray(do, np.float32))
+
+
+def test_the_keys_first_relay_lowers_for_a_b200():
+    """The keys-first relay lowers for a B200 on any host, as the GPU gate runs it."""
+    operands = tuple(jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _keys_first_operands())
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_keys_first_products, interpret=False)).trace(*operands).lower(
+            lowering_platforms=("cuda",))
+
+
+def _backward_tensor_memory(queries: int, block: int) -> tuple:
+    """A keys-first attention backward's tensor memory at `queries` a step and value columns `block` a launch
+    (row 4839): `Sᵀ` and `dPᵀ` in fp32, `Pᵀ` and `dSᵀ` in bf16, and dK's and dV's `block` columns."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    issuer = mosaic_sm100.RINGS
+    return (*(issuer.tensor_memory((128, queries)) for _ in range(2)),
+            *(issuer.tensor_memory((128, queries), jnp.bfloat16) for _ in range(2)),
+            *(issuer.tensor_memory((128, block)) for _ in range(2)))
+
+
+@pytest.mark.parametrize(("width", "block"), [(128, 128), (256, 128)])
+def test_a_launch_walks_the_widest_column_block_its_tensor_memory_holds_as_pallas_allocates_it(width, block):
+    """The widest of a launch's value-column blocks whose tensor memory a B200 holds
+    (`resources.widest_columns`): a keys-first backward at 64 queries a step holds dK's and dV's 128 columns
+    beside its scores and their gradients' 192 (448 of 512) and not 256 (704), and Pallas allocates a kernel
+    scoping them at the block taken and refuses one at the block above it, so the derivation and the allocator
+    agree."""
+    from dew.nn.kernels.templates import mosaic_sm100, resources
+    held = functools.partial(_backward_tensor_memory, 64)
+    assert resources.widest_columns(width, 16, held, generation.gpu_target("sm100")) == block
+    # A GPU without tensor memory holds no block of it.
+    assert resources.widest_columns(width, 16, held, generation.gpu_target("sm90")) is None
+
+    def scoping(columns):
+        def body(x_gmem, o_gmem):
+            pl.run_scoped(lambda *tmem: None, *_backward_tensor_memory(64, columns), collective_axes="wg")
+        return mosaic_sm100.RINGS.kernel(body, out_type=jax.ShapeDtypeStruct((8,), jnp.float32), grid=(1,),
+                                         grid_names=("programs",), consumers=1, interpret=False,
+                                         name="scoping")
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
+    operand = jax.ShapeDtypeStruct((8,), jnp.float32)
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(scoping(block)).trace(operand).lower(lowering_platforms=("cuda",))
+        if block < width:
+            with pytest.raises(ValueError):
+                jax.jit(scoping(2 * block)).trace(operand).lower(lowering_platforms=("cuda",))
+
+
+def test_a_four_bit_tile_takes_the_tensor_memory_columns_pallas_allocates_it():
+    """A packed 4-bit tile takes eight elements a column (`resources.tensor_memory_columns`): beside 448 fp32
+    columns, a 512-wide fp4 tile's 64 fill a B200's 512, and Pallas allocates a kernel scoping both."""
+    from dew.nn.kernels.templates import mosaic_sm100, resources
+    issuer = mosaic_sm100.RINGS
+    held = (issuer.tensor_memory((128, 448)), issuer.tensor_memory((128, 512), jnp.float4_e2m1fn))
+    assert resources.tensor_memory_columns(held) == generation.gpu_target("sm100").tmem_columns
+
+    def body(x_gmem, o_gmem):
+        pl.run_scoped(lambda *tmem: None, *held, collective_axes="wg")
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
+    launch = issuer.kernel(body, out_type=jax.ShapeDtypeStruct((8,), jnp.float32), grid=(1,),
+                           grid_names=("programs",), consumers=1, interpret=False, name="four_bit")
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(launch).trace(jax.ShapeDtypeStruct((8,), jnp.float32)).lower(lowering_platforms=("cuda",))
 
 
 def test_a_tpu_core_walks_the_persistent_tiles_interpreted():

@@ -202,6 +202,98 @@ def test_a_held_pass_scores_a_soft_target_as_its_training_charges_it(rule):
                     f"a soft target's held-out {rule.name}", seeds=SOFT_SEEDS[f"held {rule.name}"])
 
 
+@pytest.mark.parametrize("joint", [False, True], ids=["a question a row", "joint"])
+def test_a_training_reads_draws_lay_a_row_out_to_no_fewer_tokens_than_it_states(joint):
+    """A training read draws each row's layout (`LayoutRows`: a choice's options in a fresh order, a "none
+    of the above" beside its options or in place of its right one), and states the fewest tokens any draw
+    lays a row out to (`LayoutRows.shortest`), which bounds the documents a memory read's windows hold: no
+    draw is shorter, and the draws reach it. Over rows of one question, and joint rows of two whose right
+    options are long and whose states run past the window by less than, and more than, what one of them
+    gives back: the state refills the room one replaced option frees, but not what both free."""
+    from dew.decision import JointLayout, JointSchemaHead
+    from dew.decision.rows import ConfigureLayout, QuestionRows
+
+    rate = 0.9 if joint else 0.5
+    # Right options far longer than a "none of the above" in their place, the others short.
+    team = Choice("Which team?", {"billing": "b" * 150, "technical": "t"})
+    urgency = Choice("How urgent?", {"low": "l", "high": "h" * 150})
+    answers = {"team": "billing", "urgency": "high"}
+    examples = ([Example("x" * length, {"team": team, "urgency": urgency}, answers)
+                 for length in range(0, 1200, 20)] if joint else EXAMPLES)
+    layout = JointLayout(max_len=1536) if joint else LAYOUT
+    heads = {"head": JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)}
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout, none_of_the_above=rate,
+                                  **(heads if joint else {}))
+    fit, *_ = objective.data().train
+    drawing = ConfigureLayout(layout, TOKENIZER, SPECIALS, shuffle=True, none_of_the_above=rate, train=True)(
+        {"slots": {"questions": 2 if joint else 1, "options": 3}})
+    for example in examples:
+        for row in QuestionRows().flat_map(fit.map({"example": example})):
+            floor = drawing.shortest(row, "tokens")
+            drawn = [len(drawing.random_map(row, np.random.default_rng([7, seed]))["tokens"])
+                     for seed in range(64)]
+            assert min(drawn) == floor, (len(example.state), sorted(set(drawn)), floor)
+
+
+DOCUMENTS_SEEDS = 8
+"""Check 1's declared seeds for the loss at a read's declared documents against the objective's bound."""
+
+
+def test_a_training_read_of_rows_past_half_a_window_declares_one_document_a_window():
+    """A decision run's training read in memory, its rows drawn by its layout's encoding after it holds them,
+    declares from the fewest tokens that encoding lays each row out to (`LayoutRows.shortest`) the most
+    documents a window holds: one, for rows longer than half a window, where it declared the objective's cap
+    and the step read its windows packed (row 5916); its windows hold no more."""
+    layout = replace(LAYOUT, max_len=192)
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout)
+    long = [replace(example, state=f"{example.state} " + "x" * 120) for example in EXAMPLES]
+    opened = decision_rows(long, 4, objective=objective.data()).train(DataPartition())
+    try:
+        laid = [batch["tokens_coordinates"] for batch in itertools.islice(opened, 2)]
+    finally:
+        opened.close()
+    assert objective.bounds.segments > 1 and {coordinates.max_segments for coordinates in laid} == {1}
+    assert all(int(np.asarray(coordinates.segments).max()) == 1 for coordinates in laid)
+
+
+def test_a_step_reads_its_windows_at_the_documents_its_read_declares():
+    """A window's rows are its read's packer documents: a memory read measures the most a window holds and
+    declares it (`tokens_coordinates`, `dew.data.steps.generic.Coordinated`), and the step lays its
+    windows out at that bound, the objective's own (`DecisionObjective.segments`) a cap above it: rows
+    longer than half a window one document a window, the plain form a sequence kernel takes, short rows
+    as many as the read's windows took. At the declared bound the loss is on par (check 1) with the same
+    batch's at the objective's bound (row 5916)."""
+    from dew.decision.task import laid_out
+    from dew.objectives.base import Step
+
+    layout = replace(LAYOUT, max_len=192)
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout, shuffle_options=False)
+    cap = objective.bounds.segments
+    long = [replace(example, state=f"{example.state} " + "x" * 120) for example in EXAMPLES]
+    read = {}
+    for name, examples in (("long", long), ("short", EXAMPLES)):
+        data = decision_rows(examples, 4, examples, objective=objective.data())
+        (batch, *_) = list(data.val(DataPartition()))
+        declared = batch["tokens_coordinates"].max_segments
+        assert int(np.asarray(batch["segments"]).max()) <= declared <= cap
+        assert laid_out(batch, cap).max_segments == declared
+        read[name] = (batch, declared)
+    assert read["long"][1] == 1 < read["short"][1] <= cap
+    batch = read["long"][0]
+    capped = {name: value for name, value in batch.items() if name != "tokens_coordinates"}
+    assert laid_out(capped, cap).max_segments == cap
+    step = Step(jnp.asarray(0), jax.random.key(0), None)
+
+    def loss(read_batch):
+        return lambda variables: objective.scalar_loss(variables, read_batch, step)[0]
+
+    assert_as_exact(loss(batch), loss(capped), drawn_variables(objective), "the loss at a read's documents",
+                    seeds=DOCUMENTS_SEEDS)
+
+
 HELD = [Example(f"{index}" if index % 3 == 0 else f"{index} " + "x" * (12 + index),
                 {"team": INTENT, "urgent": Noul("Is it urgent?")},
                 {"team": ("billing", "technical", "sales")[index // 3 % 3]}
@@ -236,7 +328,7 @@ def test_a_held_pass_packs_its_rows_and_scores_every_row_once():
     seen, windows_seen = {}, set()
     shared, repeats = False, 0
     for batch in data.val(DataPartition()):
-        batch = {name: np.asarray(value) for name, value in batch.items()}
+        batch = jax.tree.map(np.asarray, dict(batch))
         found = np.asarray(objective.evaluate(variables, batch, step).probabilities)
         # A batch that repeats windows to fill itself marks its real ones.
         real = batch.get(VALID_ROWS, np.ones(len(batch["tokens"]), bool))
@@ -301,7 +393,7 @@ def test_a_decision_window_states_the_most_tokens_its_rows_score_from_its_shape(
                                   specials=SPECIALS, layout=layout, shuffle_options=False)
     data = decision_rows(HELD, 4, HELD, objective=objective.data())
     for batch in itertools.islice(data.val(DataPartition()), 3):
-        batch = {name: np.asarray(value) for name, value in batch.items()}
+        batch = jax.tree.map(np.asarray, dict(batch))
         width = objective.row_tokens(batch)
         assert width == batch["tokens"].shape[-1]
         assert 0 < objective.scored_tokens(batch).max() <= width

@@ -40,6 +40,13 @@ def owner():
     return qwix_pallas.get_current_rule("dot_general")
 
 
+def quantizing():
+    """The Qwix rule that owns this call's products and quantizes them (`owner`, not `whole`), or None: the
+    rule whose arithmetic a call's kernel computes (`dew.nn.attention.quantized_rule`, `PagedCase.owned`)."""
+    rule = owner()
+    return None if rule is None or whole(rule) else rule
+
+
 def whole(rule) -> bool:
     """Whether `rule`'s products of two activations stay whole: a rule that quantizes no activation (Qwix's
     weight-only one, `act_qtype` None) leaves attention's products, which multiply no weight, as they are

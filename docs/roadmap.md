@@ -8,14 +8,14 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5727, 5730, 5851]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392, 5437]
 - Performance measurements. [569, 285, 295, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
 - One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427, 1701, 5739]
 - The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293, 5368]
 - Inference through the templates. [3424, 3602]
-- Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5322, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848]
+- Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5322, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 5900]
 - The kernel challenge's lessons in the templates. [5271]
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353, 5288]
 - Convolution repairs above their owner. [5665]
@@ -23,7 +23,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822, 5391]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
 - Native TPU GEMM dispatch. [1560]
-- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987]
+- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 5895, 5988, 5989, 5990]
 - MoE transport, role-aware low precision and observability. [4515]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product. [4860]
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5278, 5327]
@@ -41,7 +41,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [1506, 1437]
 - Stacks, scans and looped models. [1568]
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
-- Every nn and interop primitive, seam, contract and derivative has one owner. [3270, 5450, 5625]
+- Every nn and interop primitive, seam, contract and derivative has one owner. [5450, 5625]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
 
 ## Training and parallelism
@@ -64,14 +64,13 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Algebra
 
-- One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 1551, 705, 5234, 5235, 5239, 5381, 5707]
+- One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 1551, 705, 5234, 5235, 5239]
 - Qwix's quantized convolution from its fork alone. [783]
 - Released checkpoints judged on GPUs. [1703, 1549]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Bit-level synthesis in dew.algebra. [3733]
 - RL batch-fill and microbatch-split invariants, rollout start/evaluation compilation and RL suite cost cuts. [5681]
-- algebra.md and the engine agree. [5780]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 

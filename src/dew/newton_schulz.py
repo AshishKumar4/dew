@@ -98,7 +98,7 @@ def orthogonalized(updates: optax.Updates, numbers, coeffs, steps: int, eps: flo
     where None (`spread_stacks`), and padded so no device idles on a remainder: on a GH200 a 4B decision
     step's update ran its 222 TFLOP of products as 31 joined stacks at 0.74 of peak and as 317 stacks one at
     a time (`group=1`) at 0.58, 82 ms a step slower, where the joined copies held 11.3 GB more at the step's
-    peak (row 5669). A plan sets `group` from the room it has. On a mesh
+    peak (row 5669); a run states its `group` (`OptimConfig`'s `ns_group`), which no plan sets. On a mesh
     with Explicit axes the spreading runs with them Auto (`jax.sharding.auto_axes`), where a constraint may
     name them and a split stack slices, each update leaving where it came; on one device, or none in
     context, each stack iterates whole. A tree of head `widths` (`head_widths`) splits an update's output
@@ -177,18 +177,6 @@ def spread_stacks(stacks: Sequence[jax.Array | jax.ShapeDtypeStruct], group: int
         alike.setdefault((tuple(stack.shape[1:]), str(stack.dtype)), []).append(index)
     return [members[start:start + (group or len(members))] for members in alike.values()
             for start in range(0, len(members), group or len(members))]
-
-
-def spread_matrices(stacks: Sequence[jax.Array | jax.ShapeDtypeStruct], devices: int, group: int | None
-                    ) -> list[tuple[int, int, int]]:
-    """Each stack `orthogonalized` iterates of `stacks` (`spread_stacks`), as its matrices, padding among
-    them, and their rows and columns."""
-    joined = []
-    for members in spread_stacks(stacks, group):
-        count = sum(stacks[index].shape[0] for index in members)
-        _, rows, columns = stacks[members[0]].shape
-        joined.append((count + -count % devices, rows, columns))
-    return joined
 
 
 def newton_schulz_flops(matrices: int, rows: int, columns: int, steps: int) -> float:
@@ -298,19 +286,5 @@ def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
     return iteration_dtype()
 
 
-def orthogonalized_leaf(update: jax.Array, steps: int,
-                       dimension_numbers: optax.contrib.MuonDimensionNumbers | None, *,
-                       coeffs=NEWTON_SCHULZ, eps: float = 1e-8,
-                       preconditioning: Preconditioning = "frobenius") -> jax.Array:
-    """`update` orthogonalized by Muon's `steps` quintic Newton-Schulz iterations at `coeffs`, one triple
-    or a schedule of them, after `preconditioning`: optax's own iteration (`orthogonalize_via_newton_schulz`,
-    which optax 0.2.8 does not export), in the update's dtype. A leaf with no `dimension_numbers` is one
-    matrix, its rows the reduction axis (a Linen kernel's), its other axes a stack of such matrices."""
-    numbers = optax.contrib.MuonDimensionNumbers() if dimension_numbers is None else dimension_numbers
-    return _muon.orthogonalize_via_newton_schulz(update, jnp.asarray(coeffs), steps, preconditioning, eps,
-                                                 numbers)
-
-
 __all__ = ["NEWTON_SCHULZ", "POLAR_EXPRESS_TABLE", "Preconditioning", "newton_schulz", "newton_schulz_flops",
-           "ns_operands", "orthogonalized", "orthogonalized_leaf", "polar_express", "spread_matrices",
-           "spread_stacks"]
+           "ns_operands", "orthogonalized", "polar_express", "spread_stacks"]

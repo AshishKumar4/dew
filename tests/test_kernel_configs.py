@@ -11,6 +11,7 @@ import tempfile
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any, NamedTuple
 
 import fla_gdn_support as support
 import jax
@@ -24,7 +25,8 @@ from kernel_compile import Uncounted, compile_kernels, failures, gate_generation
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
 from dew.nn.kernels.templates import bundles, report, resources
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
+from dew.nn.kernels.templates.gemm.hooks import Hooks
 
 
 def rule_launches(module) -> list:
@@ -203,7 +205,7 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
     serializes none (its note C7514, a wait for each HGMMA). A guard on every step of a rotation, a cond
     between a warpgroup's products, had it serialize the walk (K40's SASS: 16 waits for 16 HGMMAs), a loop
     the gate's registers and spills called clean."""
-    from kernel_compile import _compiled, ptxas_notes
+    from kernel_compile import _compiled, ptxas_notes, ptxas_read
 
     from dew.nn.kernels.templates.gemm import mosaic_gpu
 
@@ -224,18 +226,9 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
         assert "error" not in record, record["error"]
         (ptx,) = Path(directory).glob("*.ptx")
         notes = ptxas_notes(ptx.read_text(), "sm90")
-    assert "bytes spill stores" in notes, notes
-    assert "serialized" not in notes, notes
-
-
-class _OnlyTile(Uncounted):
-    """A launch with one tile, the wide one on a producer's layout, so refusing it exhausts its derivation
-    (a tile refused at the planner's first stage count, two, gives way to the next layout, which takes the
-    same shape: `wgmma.fed`)."""
-
-    def candidate(self, ba, config, target):
-        return (config.block_m == 128 and config.block_n == 256 and config.warpgroups == 2
-                and config.family == "wgmma" and super().candidate(ba, config, target))
+    assembled = ptxas_read(notes)
+    # A report that states the kernel's registers was read; none of its serialization codes is there.
+    assert assembled.registers > 0 and assembled.losses == (), notes
 
 
 def _spilling_forward(launch, rows: int, devices):
@@ -246,7 +239,7 @@ def _spilling_forward(launch, rows: int, devices):
                                    ((8, 2048, 4096), jnp.bfloat16), ((8,), jnp.int32))]
 
     def forward(x, gate, up, sizes):
-        return launch(x, gate, sizes, paired=up, hooks=grouped_matmul.Hooks(
+        return launch(x, gate, sizes, paired=up, hooks=Hooks(
             epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16", trans_rhs=False, interpret=False)
 
     return forward, shapes
@@ -264,46 +257,38 @@ def _lowering(forward, shapes, traced: list):
 
 
 @lowers("sm90")
-@pytest.mark.parametrize("exhausted", [False, True])
-def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_until_one_fits(exhausted):
+def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_until_one_fits():
     """A compile that finds a template launch's kernel spilling (`report.compiled`, owner 10-29) refuses that
     launch's config and lowers again, where the derivation takes its next tile by its own rule, for as long
     as a config not refused before spills; the kept program's own spills are recorded and not stepped. A
     paired SwiGLU forward whose model counts no registers, compiled for a compile-only H100 on this CPU
-    through ptxas. A derivation with no replacement keeps its first program; the refusals saved with that
-    program must derive it again."""
+    through ptxas; the refusals saved with the kept program derive it again. A derivation left no config
+    refuses the program (test_kernel_spills)."""
     from dew.nn.kernels.templates import report
     from dew.training.ahead import compile_only_gpus
 
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
     traced = []
-    lowered = _lowering(*_spilling_forward(_OnlyTile() if exhausted else Uncounted(), 4096, devices), traced)
+    lowered = _lowering(*_spilling_forward(Uncounted(), 4096, devices), traced)
 
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         original = lowered()
         report.compiled(original, relower=lowered)
         misses, refused = report.misses(), report.refused_launches()
-    first = traced[0]
-    if exhausted:
-        assert len(traced) == 1
-        assert [(miss.config, miss.stepped) for miss in misses] == [(first, False)]
-        assert not refused
-        kept = first
-    else:
-        *stepped, kept = traced
-        assert stepped and kept not in stepped
-        assert [miss.config for miss in misses if miss.stepped] == stepped
-        assert all(miss.config == kept for miss in misses if not miss.stepped)
-        assert {config for _, config, _ in refused} == set(stepped)
+    *stepped, kept = traced
+    assert stepped and kept not in stepped
+    assert [miss.config for miss in misses if miss.stepped] == stepped
+    assert all(miss.config == kept for miss in misses if not miss.stepped)
+    assert {config for _, config, _ in refused} == set(stepped)
     # Another process seeded with the run's refusals (its plan's) derives the tile this compile kept.
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         report.refuse(refused)
         lowered()
     assert traced[-1] == kept
-    # An already compiled artifact emits no new ptxas report. A fresh decision scope still steps past
-    # its observed spill, while an exhausted derivation retains the artifact without a false refusal.
+    # An already compiled artifact emits no new ptxas report; a fresh decision scope still steps past its
+    # observed spill.
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         report.compiled(original, relower=lowered)
@@ -396,14 +381,16 @@ GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 
                "llama up": (4096, 4096, 14336, 1), "qwen3.5-4b up": (24576, 2560, 9216, 1),
                "qwen3.5-4b down": (24576, 9216, 2560, 1), "qwen3.5-4b key": (24576, 2560, 1024, 1),
                "qwen3.5-4b gates": (24576, 2560, 64, 1), "narrow kernel gradient": (4096, 64, 256, 1),
-               "unaligned": (4096, 200, 100, 4)}
+               "unaligned": (4096, 200, 100, 4), "unaligned in whole 16 bytes": (4096, 200, 136, 4)}
 """Real projections' extents `(rows, depth, width, groups)` for the GEMM mainloops' compile gate, over which
 the derived tiles move: MoE expert products (Qwen3-30B-A3B's, Mixtral's and DeepSeek-V3's: rows a few tiles a
 group, or less than one, a wide and a deep product, and a decode step's, 8 tokens' top-8 rows over 256
 experts), dense ones (Llama 3 8B's up, and Qwen3.5-4B's training step at its 24,576 rows a device: its widest,
 deepest, narrow key and narrowest gate products, its HLO 10-28), and a kernel gradient of 64 output rows,
-which one consumer computes, and a grouped product of a depth and width no tile divides, run padded to
-whole tiles (`grouped_matmul._Mosaic._aligned`)."""
+which one consumer computes, and grouped products of a depth and width no tile divides: on a TMA family a
+product's last step and column tile run partial where its rows along them are whole 16 bytes (200 x 136;
+`mosaic_gpu.partial_runs`, row 5299), its width padded where they are not (100: 200-byte bf16 rows,
+`grouped_matmul._Mosaic._aligned`)."""
 
 PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "input gradient fp16",
                "kernel gradient", "kernel gradient fp32", "kernel gradient fp16", "dense kernel gradient")
@@ -455,7 +442,7 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
     # An FP8 product's operands (E4M3), its matrix K-major as Hopper's FP8 tensor cores read it (row 3620).
     x8, w8 = (jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn)
               for shape in ((rows, depth), (groups, width, depth)))
-    gmm, tgmm, hooks = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm(), grouped_matmul.Hooks
+    gmm, tgmm, hooks = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm(), Hooks
     norm = hooks(normed, (("rows",), ("depth",)))
     forward = {"interpret": False, "out_dtype": "bfloat16", "trans_rhs": False}
     backward = {"interpret": False, "out_dtype": "float32"}
@@ -522,14 +509,34 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
     ]
 
 
-def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_count: bool = False) -> list:
+class GemmCase(NamedTuple):
+    """A GEMM launch's compile case (`_gemm_mainloop_cases`): its form (`_gemm_forms`' name), its tile,
+    whether the derivation refused it for its registers, the consumer count of a family contract's case
+    (`every_consumer_count`, else None) and the kernel case compiled."""
+
+    form: str
+    tile: Any
+    refused: bool
+    consumers: int | None
+    case: support.KernelCase
+
+    @property
+    def kernel(self) -> tuple:
+        """Its kernel's identity: its form, refusal and tile, the band its tiles are walked in apart
+        (`Tiles.grid_block_n`), a contract case's count the tile's consumers stating it."""
+        return self.form, self.refused, dataclasses.replace(self.tile, grid_block_n=0)
+
+
+def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_count: bool = False,
+                         form: str | None = None) -> list[GemmCase]:
     """Each GEMM Mosaic launch form a `generation_name` GPU runs at the projection `shape`
     (`GEMM_SHAPES`, `_gemm_forms`), at the one tile its launch derives from the generation's facts
     (`Template.derived`) and at each tile the derivation refused for its registers alone
     (`_derived_and_refused`); each a family's mainloop only where it takes the call
     (`Template.eligible`). With `every_consumer_count`, each form at one consumer and at the family's most
-    (`Family.consumers`) where that tile is legal instead, each case named with its count (`x1`, `x2`)."""
-    calls = _gemm_forms(*GEMM_SHAPES[shape])
+    (`Family.consumers`) where that tile is legal instead, each case named with its count (`x1`, `x2`).
+    With `form`, that form's alone. Each a record (`GemmCase`)."""
+    calls = [call for call in _gemm_forms(*GEMM_SHAPES[shape]) if form is None or call[0] == form]
     cases = []
     with generation.assumed(generation_name):
         target = generation.gpu_target()
@@ -538,9 +545,10 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
             if not launch.eligible(ba, target):
                 continue
             config, refused = _derived_and_refused(launch, ba, target)
-            configs = {f"{name} {config}": config, **{f"{name} refused {tile}": tile for tile in refused}}
+            configs = {(f"{name} {config}", False, None): config,
+                       **{(f"{name} refused {tile}", True, None): tile for tile in refused}}
             if every_consumer_count:
-                family = mosaic_gpu.family_of(config, jnp.bfloat16)
+                family = pricing.family_of(config, jnp.bfloat16)
                 configs = {}
                 for consumers in sorted({1, min(family.consumers, mosaic_gpu.CONSUMERS)}):
                     # Each consumer keeps its share of the derived tile's rows, else the tile's rows split
@@ -565,14 +573,14 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                                  if isinstance(tile, mosaic_gpu.Tiles) and launch.legal(ba, tile, target)),
                                 None)
                     if tile is not None:
-                        configs[f"{name} x{consumers} {tile}"] = tile
+                        configs[(f"{name} x{consumers} {tile}", False, consumers)] = tile
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
-            for label, config in configs.items():
-                cases.append(support.KernelCase(label,
-                                                lambda launch=launch, ba=ba, config=config:
-                                                launch.lowering(ba, config),
-                                                {kernel: _model(launch, ba, config)},
-                                                required=launch.legal(ba, config, target)))
+            for (label, refusal, consumers), config in configs.items():
+                case = support.KernelCase(label, lambda launch=launch, ba=ba, config=config:
+                                          launch.lowering(ba, config),
+                                          {kernel: _model(launch, ba, config)},
+                                          required=launch.legal(ba, config, target))
+                cases.append(GemmCase(name, config, refusal, consumers, case))
     return cases
 
 
@@ -586,13 +594,17 @@ def _replaced(config, **changes):
 
 
 def _model(launch, ba, config) -> resources.RegisterModel:
-    """What a launch's model decides at `config` for the call `ba`, as the gate holds it to the compiled
-    kernel (`resources.register_model`, `kernel_compile.decisions`), and the shared memory the planner
-    sized it by (`resources.shared_bytes` of `launch_of`'s allocations, including barriers), against the
-    kernel's own."""
-    family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-    shared = resources.shared_bytes(family, launch.launch_of(ba, config).scope(config.stages))
-    return resources.register_model(family, config.warpgroups, launch.registers(ba, config), shared=shared)
+    """What a launch's model decides at `config` for the call `ba` at its residency (`Tiles.programs`, where
+    the launch's own model, `mosaic_gpu.gmm`'s `registers`, decides its register moves), as the gate holds
+    it to the compiled kernel (`resources.register_model`, `kernel_compile.decisions`), and the shared
+    memory the planner sized it by (`resources.shared_bytes` of `launch_of`'s allocations, including
+    barriers), against the kernel's own."""
+    family = pricing.family_of(config, ba.arguments['tokens'].dtype)
+    planned = launch.launch_of(ba, config)
+    shared = resources.shared_bytes(family, planned.scope(config.stages))
+    return resources.register_model(family, config.warpgroups, launch.registers(ba, config), shared=shared,
+                                    producer=planned.producer, programs=config.programs,
+                                    moves=mosaic_gpu.MOVES)
 
 
 def _derived_and_refused(launch, ba, target) -> tuple:
@@ -650,80 +662,147 @@ def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
     bundle refuses, on mma.sync's (row 4727). An eligibility regression fails here rather than leaving the
     compile gate fewer cases."""
     cases = _gemm_mainloop_cases(generation_name, shape)
+    assert {case.form for case in cases} == _gate_forms(generation_name)
+
+
+def _gate_forms(generation_name: str) -> set[str]:
+    """The forms a generation's GEMM launches emit (`_emitted_forms`), each on the most capable issuer
+    whose bundle takes it (`bundles.groups`): what its compile gate holds."""
     forms, taken = set(), set()
     for group in bundles.groups(generation_name, jnp.bfloat16, stated=True):
         own = _emitted_forms(group[0]) - taken
         taken |= own
         forms |= own
-    assert {case.name.split(" Tiles(")[0].removesuffix(" refused") for case in cases} == forms
-
-
-def _kernel_of(name: str) -> str:
-    """A case's kernel: its form at its tile, its band (`Tiles.grid_block_n`, the order its tiles are
-    walked) apart, its shared memory and registers the tile's; a count the form's name carries (` x2`, the
-    family contract's) apart too, the tile's consumers stating it."""
-    form, _, tile = name.partition(" Tiles(")
-    return f"{re.sub(r' x\d+$', '', form)} Tiles({re.sub(r'grid_block_n=\d+, ', '', tile)}"
+    return forms
 
 
 @functools.cache
-def _gate_cases(generation_name: str) -> list:
-    """Every projection's cases (`_gemm_mainloop_cases`), each distinct kernel once (`_kernel_of`)."""
+def _gate_cases(generation_name: str, form: str) -> list:
+    """A form's cases at every projection (`_gemm_mainloop_cases`), each distinct kernel once
+    (`GemmCase.kernel`)."""
     found = {}
     for shape in GEMM_SHAPES:
-        for case in _gemm_mainloop_cases(generation_name, shape):
-            found.setdefault(_kernel_of(case.name), case)
+        for case in _gemm_mainloop_cases(generation_name, shape, form=form):
+            found.setdefault(case.kernel, case)
     return list(found.values())
 
 
-def _gated(names: tuple[str, ...], cases: Callable[[str], list]) -> list:
-    """A test each case `cases(generation)` gives for each generation of `names`, marked as `generations`
-    marks it: `(generation, case's index)`, each id the generation and the case's name."""
-    return [pytest.param(name, index, marks=param.marks, id=f"{name}-{case.name}")
-            for param in generations(*names) for name in param.values
-            for index, case in enumerate(cases(name))]
+def _by_form(names: tuple[str, ...], forms_of: Callable[[str], set[str]]) -> list:
+    """A test each form `forms_of(generation)` names for each generation of `names`, marked as
+    `generations` marks it: `(generation, form)`, stated without deriving a tile, so collecting the
+    module derives nothing (row 5492: a derivation of every case at import cost each of the gate's rows
+    ~41 s)."""
+    return [pytest.param(name, form, marks=param.marks, id=f"{name}-{form}")
+            for param in generations(*names) for name in param.values for form in sorted(forms_of(name))]
 
 
-@pytest.mark.parametrize(("generation_name", "index"),
-                         _gated(gate_generations(stated=True), _gate_cases))
-def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, index):
-    """Every distinct GEMM Mosaic GPU kernel a generation runs at a real projection (`_gate_cases`), a test
-    each, at the tile its launch derives from the generation's facts and at each tile the derivation refused
-    for its registers, compiled by Mosaic for a compile-only device of the generation on this CPU through
-    ptxas. Required launches must spill nothing, and their register model decide as ptxas does
-    (`model_failures`: the GEMM's models match the compiler on every case, row 1971). Rejected
-    configurations supply model evidence; their spills are refusals, never qualified launches. Compiler
-    errors and missing reports fail either."""
+@pytest.mark.parametrize(("generation_name", "form"), _by_form(gate_generations(stated=True), _gate_forms))
+def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, form):
+    """Every distinct GEMM Mosaic GPU kernel of a form a generation runs at a real projection (`_gate_cases`),
+    a test each form, at the tile its launch derives from the generation's facts and at each tile the
+    derivation refused for its registers, compiled by Mosaic for a compile-only device of the generation on
+    this CPU through ptxas, with the JAX this checkout pins. Required launches must spill nothing, and their
+    register model decide as ptxas does (`model_failures`: the GEMM's models match the compiler on every
+    case, row 1971). Rejected configurations supply model evidence; their spills are refusals, never
+    qualified launches. Compiler errors and missing reports fail either. Beside them, each launch of the
+    form's family contract (`_family_cases`: each consumer count) the gate does not hold lowers, within the
+    block, spilling nothing, before any consumer adopts a Family head; no version guard skips it."""
     from kernel_compile import compile_mosaic_kernels, model_failures, mosaic_failures
 
-    cases = _gate_cases(generation_name)[index:index + 1]
-    found = compile_mosaic_kernels(cases, generation_name)
-    failed = failures(found)
-    required = [record for case, record in zip(cases, found, strict=True) if case.required]
+    cases = [each.case for each in _gate_cases(generation_name, form)]
+    contract = ([each.case for each in _family_cases(generation_name, form)]
+                if form in _family_forms(generation_name) else [])
+    assert cases
+    found = compile_mosaic_kernels(cases + contract, generation_name)
+    failed = failures(found) + mosaic_failures(found[len(cases):])
+    required = [record for case, record in zip(cases, found[:len(cases)], strict=True) if case.required]
     failed += mosaic_failures(required) + model_failures(required)
     assert not failed, "\n".join(failed)
     assert all(record["kernels"] and all(not kernel["unread"] for kernel in record["kernels"])
                for record in found)
 
 
+def test_a_b200s_gathered_input_gradient_fits_its_derived_resources():
+    """The expert down projection's input gradient from the hybrid compile-ahead step (row 5358), its
+    rows gathered by the load warp's TMA gathers, compiles at its derived tile without spilling and in the
+    shared memory its plan sized: its producer lowered to the registers its gathers hold
+    (`Transport.gathering_producer`, tcgen05's 40; at the floor's 24 it spilled 56 bytes), its gathered
+    stream's barriers as its family allocates them (`Allocations.gathered`; planned as plain ones, 976 bytes
+    short)."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    launch = grouped_matmul.MosaicGmm()
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    arguments = launch.bind(
+        shaped((4096, 1024)), shaped((4, 8192, 1024)), jax.ShapeDtypeStruct((4,), jnp.int32),
+        gather=jax.ShapeDtypeStruct((4096,), jnp.int32),
+        out_dtype="bfloat16", trans_rhs=True, interpret=False)
+    with report.refusals(), generation.assumed("sm100"):
+        tile = launch.derived(arguments, generation.gpu_target())
+        assert tile is not None
+        cases = [support.KernelCase("gathered input gradient",
+                                    lambda: launch.lowering(arguments, tile),
+                                    {"dew_gmm": _model(launch, arguments, tile)})]
+        found = compile_mosaic_kernels(cases, "sm100")
+    failed = failures(found) + mosaic_failures(found)
+    assert not failed, "\n".join(failed)
+
+
+def test_a_b200s_dense_kernel_gradient_runs_no_rewriting_role():
+    """The 4B's up projection's dense kernel gradient (24,576 rows of 2560 by 9216, fp32) on a compile-only
+    B200 derives a tile legal for its call (a pair's among its candidates, `mosaic_sm100.PAIR`), and its
+    kernel runs the threads its planning prices for a stage read as loaded
+    (`grouped_matmul._Mosaic.unstaged`): its producer's and its consumers' warpgroups (`.maxntid` 256), no
+    third warpgroup rewriting each step (em35d: 384 threads, 6.7x cuBLAS's instructions in that role's
+    predicated LDSM, PRMT and SEL), compiled within its resources."""
+    import kernel_compile as kc
+
+    from dew.nn.kernels import gemm
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    operands = (bf16((24576, 2560)), bf16((24576, 9216)))
+
+    def kernel_gradient(x, dy):
+        # At the default precision, a step's: no promoted sums (`templates.product.promoted`).
+        return gemm.gemm_t(x, dy, None, out_dtype=jnp.float32, precision=jax.lax.Precision.DEFAULT)
+
+    with generation.chosen(grouped_matmul="mosaic"), tuning.seen() as seen:
+        kc.PTX.clear()
+        found = kc.compile_mosaic_kernels([support.KernelCase("up kernel gradient",
+                                                              lambda: (kernel_gradient, operands))], "sm100")
+    with generation.assumed("sm100"):
+        target = generation.gpu_target()
+        assert seen.taken and all(op.legal(ba, config, target) for (op, _), (config, ba)
+                                  in zip(seen, seen.taken, strict=True)), seen.taken
+    threads = {int(each) for ptx in kc.PTX.values() for each in re.findall(r"\.maxntid (\d+),", ptx)}
+    assert threads == {256}, threads
+    failed = kc.mosaic_failures(found)
+    assert not failed, "\n".join(failed)
+
+
 @functools.cache
-@functools.cache
-def _contract_cases(generation_name: str) -> list:
-    """Each launch form at each consumer count of a family's contract (`_gemm_mainloop_cases(
-    every_consumer_count=True)`), at the first projection whose rows give it a legal tile (two consumers'
-    rows past a few rows a MoE expert takes, mma.sync's)."""
+def _contract_cases(generation_name: str, form: str | None = None) -> list:
+    """Each launch form (or `form` alone) at each consumer count of a family's contract
+    (`_gemm_mainloop_cases(every_consumer_count=True)`), at the first projection whose rows give it a legal
+    tile (two consumers' rows past a few rows a MoE expert takes, mma.sync's)."""
     found: dict = {}
     for shape in GEMM_SHAPES:
-        for case in _gemm_mainloop_cases(generation_name, shape, every_consumer_count=True):
-            found.setdefault(case.name.split(" Tiles(")[0], case)
+        for case in _gemm_mainloop_cases(generation_name, shape, every_consumer_count=True, form=form):
+            found.setdefault((case.form, case.consumers), case)
     return list(found.values())
 
 
-def _family_cases(generation_name: str) -> list:
-    """The family contract's cases (`_contract_cases`) the compile gate does not already hold
+def _family_cases(generation_name: str, form: str) -> list:
+    """A form's family contract cases (`_contract_cases`) the compile gate does not already hold
     (`_gate_cases`)."""
-    held = {_kernel_of(case.name) for case in _gate_cases(generation_name)}
-    return [case for case in _contract_cases(generation_name) if _kernel_of(case.name) not in held]
+    held = {case.kernel for case in _gate_cases(generation_name, form)}
+    contract = _contract_cases(generation_name, form)
+    return [case for case in contract if case._replace(consumers=None).kernel not in held]
+
+
+def _family_forms(generation_name: str) -> set[str]:
+    """The forms a generation's most capable bundle emits (`_emitted_forms`): its family contract's."""
+    return _emitted_forms(bundles.of(generation_name, jnp.bfloat16))
 
 
 @pytest.mark.parametrize("generation_name", generations(*gate_generations()))
@@ -731,29 +810,19 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
     """The whole contract a Mosaic GPU Family bundle offers its templates is present: every launch form it
     emits (`_emitted_forms`: plain and transposed right operands, 16-bit and fp32 stores, fixed and streamed
     side vectors and tiles, several outputs, the running sum) at one consumer and at the family's most
-    (`_contract_cases`)."""
+    (`_contract_cases`), each form among those the compile gate compiles for the generation, where its
+    contract compiles beside its picks."""
     family = bundles.of(generation_name, jnp.bfloat16)
     assert family is not None
+    # Every contract form is compiled beside the gate's picks (`test_each_gemm_mainloop_compiles_...`).
+    assert generation_name in {name for param in generations(*gate_generations(stated=True))
+                               for name in param.values}
+    assert _family_forms(generation_name) <= _gate_forms(generation_name)
     cases = _contract_cases(generation_name)
     counts = sorted({1, min(family.consumers, mosaic_gpu.CONSUMERS)})
-    expected = {f"{form} x{count}" for form in _emitted_forms(family) for count in counts}
-    got = {case.name.split(" Tiles(")[0] for case in cases}
+    expected = {(form, count) for form in _emitted_forms(family) for count in counts}
+    got = {(case.form, case.consumers) for case in cases}
     assert got == expected, (sorted(expected - got), sorted(got - expected))
-
-
-@pytest.mark.parametrize(("generation_name", "index"), _gated(gate_generations(), _family_cases))
-def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name, index):
-    """Each launch of the contract a Mosaic GPU Family bundle offers its templates that the compile gate
-    does not hold (`_family_cases`), a test each, compiled through ptxas for a compile-only GPU of the
-    generation on this CPU with the JAX this checkout pins, before any consumer adopts a Family head: it
-    lowers, within the block, spilling nothing. No version guard skips it: a JAX that breaks the contract
-    fails here."""
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
-
-    cases = _family_cases(generation_name)[index:index + 1]
-    found = compile_mosaic_kernels(cases, generation_name)
-    failed = mosaic_failures(found)
-    assert len(found) == len(cases) and not failed, "\n".join(failed)
 
 
 @pytest.fixture
@@ -787,7 +856,7 @@ def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
               {"out_dtype": "bfloat16", "trans_rhs": True}),
              ("kernel gradient", grouped_matmul.MosaicTgmm(),
               (bf16((rows, depth)), bf16((rows, width)), sizes), {"out_dtype": "bfloat16"})]
-    cases = []
+    cases, taken = [], set()
     with generation.assumed(tpu):
         target = generation.gpu_target()
         for name, launch, args, options in calls:
@@ -796,13 +865,14 @@ def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
                 continue
             config = launch.derived(ba, target)
             configured = functools.partial(launch.replace(config=config), interpret=False, **options)
+            taken.add(name)
             cases.append(support.KernelCase(f"{name} {config}",
                                             lambda configured=configured, args=args: (configured, args)))
     if not cases:
         assert generation.gpu_target(tpu).scoped_vmem is None
         pytest.skip(f"no measurement states {tpu}'s scoped VMEM, which the TPU launches fit their blocks to")
     forms = {"forward", "input gradient", "kernel gradient"}
-    assert {case.name.split(" Tiles(")[0] for case in cases} == forms
+    assert taken == forms
     found = compile_tpu_kernels(cases, tpu)
     failed = [f"{record['name']}: {record['error']}" for record in found if "error" in record]
     assert not failed, "\n".join(failed)
@@ -968,8 +1038,9 @@ def test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel(rows, name
     """An NVFP4 projection on a compile-only A100, its packed kernel named, or at a decode step's rows with no
     kernel named (`gemm.NVFP4_CELLS`' A100 decode cell, receipt W13-a100-4-M-NS-8b-a100: 2.6-3.6x the matrix
     decoded once a call): its program launches the template's packed product (`kernel_compile.Expected`, its
-    route evidence), which ptxas compiles, its E4M3 block scales decoded by integer arithmetic
-    (`mosaic_gpu._e4m3_values`) where their FP8 conversion took sm89's `cvt .e4m3x2` and an A100's ptxas
+    route evidence), which ptxas compiles, its E2M1 codes decoded by their form's PTX inline
+    (`inline_forms.registers`, row 3733), its E4M3 block scales by integer arithmetic
+    (`packed.e4m3_values`) where their FP8 conversion took sm89's `cvt .e4m3x2` and an A100's ptxas
     refused the kernel (W8-a100, M-NS-8; row 3621)."""
     from kernel_compile import Expected, compile_mosaic_kernels, route_failures
 
@@ -990,7 +1061,7 @@ def test_a_hoppers_nvfp4_decode_runs_its_packed_kernel():
 def test_a_hoppers_nvfp4_prefill_shares_its_stage_decode():
     """An NVFP4 projection at a prefill's 4096 rows on a compile-only H100, its packed kernel named: its
     consumers share each stage's decode, each its share of the columns, meeting at a named barrier
-    (`mosaic_gpu._shared_decode`, row 3621's prefill), which ptxas compiles (`kernel_compile.Expected`)."""
+    (`packed.shared_decode`, row 3621's prefill), which ptxas compiles (`kernel_compile.Expected`)."""
     _assert_launches("sm90", "nvfp4 4096 rows", functools.partial(_nvfp4_projected, 4096, "packed"), 1,
                      "dew_gmm")
 
@@ -1114,6 +1185,32 @@ def test_a_blackwells_mx_product_runs_the_template_named_for_it():
     _assert_launches("sm100", "mx projection", _mx_projection, 2, "dew_gmm")
 
 
+def test_an_mx_products_tile_holds_its_block_scale_rings_in_tensor_memory_too():
+    """An MXFP8 projection's tile on a B200 is legal only where its accumulators and its block-scale rings'
+    tensor memory, live in one scope, fit the device's 512 columns (`stream_tensor_columns`, its rings'
+    physical columns in the layout they are allocated in): 128 x 256 at two 128-deep stages, its
+    accumulators' 512 columns beside its rings' 24 more, refused (B7: the fork's allocator raised at
+    lowering); the tile its launch derives, legal."""
+    from kernel_compile import lowered_for
+
+    product, specs = _mx_projection()
+    with generation.assumed("sm100"), tuning.seen() as seen:
+        lowered_for(product, specs, "sm100")
+    taken = [(op, config, ba) for (op, _), (config, ba) in zip(seen, seen.taken, strict=True)
+             if isinstance(op, grouped_matmul.MosaicMxGmm)]
+    assert taken
+    wide = mosaic_gpu.Tiles(128, 256, 128, 2, 1, warpgroups=1, family="tcgen05")
+    with generation.assumed("sm100"):
+        target = generation.gpu_target()
+        assert all(op.legal(ba, config, target) and not op.legal(ba, wide, target)
+                   for op, config, ba in taken)
+        # Its rings' tensor memory, as the layout they are allocated in takes it: a's 8 columns and b's two
+        # 128-row tiles' 16.
+        family = pricing.family_of(wide, jnp.float8_e4m3fn)
+        op, _, ba = taken[0]
+        assert family.stream_tensor_columns(op._allocations(ba, wide, family).blocks, wide.stages) == 24
+
+
 def _nvfp4_block_projection():
     """An NVFP4 MoE projection, both operands E2M1 (`gemm.nvfp4_block_product`: 2048 deep, 768 wide, eight
     experts of whole 128-row blocks) through the template named."""
@@ -1184,11 +1281,10 @@ def test_records_a_failed_process_of_their_own_wrote_are_refused():
         compiled_apart((9, 0), test, 0)
 
 
-def test_a_capabilitys_cells_compile_in_one_process_of_their_own(monkeypatch, tmp_path):
-    """Every cell of the session that states a capability other than the one the process compiles for
-    (`kernel_compile.Gated`) runs in one pytest process of its own, the first to ask starting it, and each
-    reads its own records from it, none where its call did not pass there (a skip); a test that states none
-    runs in one of its own (`compiled_apart`)."""
+def test_a_capabilitys_cells_read_their_own_records_from_a_process_of_their_own(monkeypatch, tmp_path):
+    """A cell of the session that states a capability other than the one the process compiles for
+    (`kernel_compile.Gated`), and a test that states none, each read their own records from the process
+    that compiled them (`compiled_apart`), none where its call did not pass there (a skip)."""
     from types import SimpleNamespace
 
     import apart_records
@@ -1202,12 +1298,8 @@ def test_a_capabilitys_cells_compile_in_one_process_of_their_own(monkeypatch, tm
                cell("b", generation_name=Gated("sm90"), index=1),
                cell("c", generation_name=Gated("sm100"), index=0), SimpleNamespace(nodeid="d"),
                cell("e", generation_name=Gated("sm90"), index=2)]
-    started = []
-
     def ran_apart(tests):
-        started.append(tests)
-        directory = tmp_path / str(len(started))
-        directory.mkdir()
+        directory = Path(tempfile.mkdtemp(dir=tmp_path))
         monkeypatch.setenv(apart_records.RECORDS, str(directory))
         for test in tests:
             apart_records.written(directory, test, 0, [{"name": test}])
@@ -1226,7 +1318,6 @@ def test_a_capabilitys_cells_compile_in_one_process_of_their_own(monkeypatch, tm
     assert kernel_compile.compiled_apart((9, 0), "d", 0) == [{"name": "d"}]
     with pytest.raises(RuntimeError):
         kernel_compile.compiled_apart((9, 0), "e", 0)
-    assert started == [["a", "b", "e"], ["d"]]
 
 
 def test_the_resource_gate_refuses_spills_and_invalid_allocations():
@@ -1360,10 +1451,27 @@ def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
         reports({}, binaries)
     module = f"//\n{PTX_MODULE}\n.visible .entry k__l0123456789_mosaic_gpu_kernel(\n)\n{{\n}}\n"
     with tempfile.TemporaryDirectory() as directory:
-        write_modules(module, directory)
+        write_modules(module, "", directory, {"k__l0123456789"})
         assert [path.name for path in Path(directory).iterdir()] == ["k__l0123456789.ptx"]
     with tempfile.TemporaryDirectory() as directory, pytest.raises(ValueError):
-        write_modules(module * 2, directory)
+        write_modules(module * 2, "", directory, {"k__l0123456789"})
+
+
+def test_the_resource_gate_reads_the_ptx_its_program_runs():
+    """A kernel certification assembled as its program lowered (`report.certified`) and its program's compile
+    assembled again (a gradient's forward, another kernel of its name and launch) has the compile's PTX as its
+    evidence; a module of no kernel of the program (a config certification refused) is none."""
+    from kernel_compile import PTX_MODULE, write_modules
+
+    def module(entry: str, body: str) -> str:
+        return f"//\n{PTX_MODULE}\n.visible .entry {entry}_mosaic_gpu_kernel(\n)\n{{\n{body}\n}}\n"
+
+    lowering = module("k__l0123456789", "certified") + module("r__l0123456789", "refused")
+    with tempfile.TemporaryDirectory() as directory:
+        write_modules(lowering, module("k__l0123456789", "ran"), directory, {"k__l0123456789"})
+        written = {path.name: path.read_text() for path in Path(directory).iterdir()}
+    assert list(written) == ["k__l0123456789.ptx"]
+    assert "ran" in written["k__l0123456789.ptx"] and "certified" not in written["k__l0123456789.ptx"]
 
 
 @COMPILES_FOR_TPU

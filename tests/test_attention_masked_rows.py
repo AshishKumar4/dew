@@ -20,8 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import exact_attention, exact_value_and_grads, packed_ids, qkv, value_and_grads
-from reference_error import assert_as_exact, with_gradients
-from test_attention_splash import TOLERANCE
+from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.precision import FP32_SUMS
@@ -81,11 +80,18 @@ def test_a_row_that_sees_no_key_reads_nothing(implementation, case):
     and gradients are on par (check 1) with the fp32 reference attention's from float64 over drawn
     operands and cotangents."""
     structure = run(implementation, case, jnp.float32)[3]
+    _on_par(implementation, case, structure, jnp.float32, SEEDS[implementation, case])
+
+
+def _on_par(implementation: str, case: str, structure: dict, dtype, seeds: int) -> None:
+    """`implementation`'s output and gradients over `structure` on par (check 1) with the reference
+    attention's at the drawn `dtype`, from float64, over drawn `dtype` operands and cotangents."""
     shape = (2, 256, 4, 64)
+    extra = {"max_segments": 4} if implementation == "flash" else {}
 
     def draw(seed):
-        cotangent = jax.random.normal(jax.random.fold_in(jax.random.key(93), seed), shape, jnp.float32)
-        return (*qkv(shape, jnp.float32, seed=seed), cotangent)
+        cotangent = jax.random.normal(jax.random.fold_in(jax.random.key(93), seed), shape, dtype)
+        return (*qkv(shape, dtype, seed=seed), cotangent)
 
     def attended(implementation, **options):
         def attend(q, k, v):
@@ -100,17 +106,17 @@ def test_a_row_that_sees_no_key_reads_nothing(implementation, case):
             return attended("reference", precision=jax.lax.Precision.HIGHEST)(*drawn)
 
     exact = with_gradients(lambda q, k, v: exact_attention(q, k, v, anchored=True, **structure))
-    assert_as_exact(attended(implementation), reference, draw, f"{implementation} {case}",
-                    seeds=SEEDS[implementation, case], truth_fn=exact)
+    assert_as_exact(attended(implementation, **extra), reference, draw, f"{implementation} {case}",
+                    seeds=seeds, truth_fn=exact)
 
 
 @pytest.mark.parametrize("implementation, case", GPU, ids=[f"{i}-{c}" for i, c in GPU])
 def a_row_that_sees_no_key_reads_nothing_on_the_fused_gpu_kernels(implementation, case,
                                                                          without_deterministic_ops):
-    _, _, _, _, found, truth = run(implementation, case, jnp.bfloat16)
-    for name, mine, want in zip(("output", "query", "key", "value"), found, truth, strict=True):
-        assert np.abs(mine - want).max() <= TOLERANCE[jnp.bfloat16] * np.abs(want).max(), (
-            f"{implementation} {case} {name}")
+    """Each fused GPU kernel, bf16: a row that sees no key has a zero output and query gradient, and its
+    output and gradients are on par (check 1) with the bf16 reference attention's from float64."""
+    structure = run(implementation, case, jnp.bfloat16)[3]
+    _on_par(implementation, case, structure, jnp.bfloat16, FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize("implementation", ["reference", "xla", "template"])

@@ -311,6 +311,21 @@ class BitForm:
         return {unit: sum(step.op.issues for step in self.steps if step.unit is unit) for unit in Unit}
 
     @property
+    def live(self) -> int:
+        """The most registers a word's decode holds at once: its stored word and each step's value, each
+        from the step that makes it to the step that last reads it (whose result may take its register),
+        an output register's to the decode's end: what a consumer prices beside its tiles before it admits
+        one (`grouped_matmul.MosaicPackedGmm.registers`). `NVFP4_BFLOAT16_FORM` holds five."""
+        end = len(self.steps) + 1
+        last = {value: value for value in range(end)}
+        for index, step in enumerate(self.steps, start=1):
+            for arg in step.args:
+                last[arg] = index
+        for value in self.outputs:
+            last[value] = end
+        return max(sum(1 for value in range(at + 1) if last[value] > at or value == at) for at in range(end))
+
+    @property
     def depth(self) -> int:
         """Its dependent instructions' longest chain. An instruction of no operand (a constant, `IADD3` of
         its immediate alone) starts one."""
@@ -851,7 +866,7 @@ def packed[Words: (np.ndarray, jax.Array)](codes: Words, minifloat: Minifloat, x
     places = xp.arange(per, dtype=xp.uint32) * xp.uint32(minifloat.width)
     # The codes' bits are disjoint, so their sum is their union.
     natural = xp.sum(grouped << places, axis=-1, dtype=xp.uint32)
-    return _parities(natural, NVFP4_BFLOAT16_FORM.encoder, xp) if minifloat is E2M1 else natural
+    return _parities(natural, NVFP4_BFLOAT16_FORM.encoder, xp) if minifloat == E2M1 else natural
 
 
 def nvfp4_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:

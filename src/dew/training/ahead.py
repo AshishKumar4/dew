@@ -10,7 +10,7 @@ XLA's own reading of its cost and of each device's memory, and serialized as JAX
 executable (`jax.experimental.serialize_executable`), for a host of that topology to load and run
 (`AheadOfTime.loaded`) or read before booking it.
 
-    devices = compile_only_gpus("h100", 8)
+    devices = compile_only_gpus("h100", 8, 80 * 2**30)
     trainer = Trainer(objective, adamw(3e-4), mesh=MeshSpec(fsdp=8).build(devices))
     ahead = compile_ahead(trainer, batch)
     ahead.peak_bytes, ahead.flops.hardware
@@ -65,6 +65,7 @@ from jaxlib import xla_client
 
 from dew import communicators
 from dew._cache import cuda_libraries, plugin_builds, topology_digest, uncached
+from dew._devices import COMPILE_ONLY_MEMORY, device_memory
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.nn.kernels import options
@@ -99,7 +100,7 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-def target_config(target: GpuTarget, capacity: int | None = None) -> str:
+def target_config(target: GpuTarget, memory: int | None = None) -> str:
     """The `gpu_device_info` XLA compiles for, from the GPU `target` a build states (`built_target`: its
     CUDA generation's, its multiprocessors its own where stated): its compute capability, the shared memory
     a block may opt into, its multiprocessors, clock and bandwidth, its multiprocessor's and a block's
@@ -131,7 +132,7 @@ def target_config(target: GpuTarget, capacity: int | None = None) -> str:
   block_dim_limit_y: 65535
   block_dim_limit_z: 65535
   memory_bandwidth: {int(bandwidth)}
-  device_memory_size: {0 if capacity is None else capacity}
+  device_memory_size: {0 if memory is None else memory}
   clock_rate_ghz: {clock / 1e9}
   shared_memory_per_block_optin: {shared}
   cuda_compute_capability {{
@@ -155,23 +156,54 @@ def compile_only_tpus(topology: str) -> tuple:
     return tuple(topologies.get_topology_desc(topology, "tpu").devices)
 
 
-def compile_only_gpus(generation: str, count: int = 1, capacity: int | None = None,
+def compile_only_gpus(generation: str, count: int = 1, memory: int | None = None,
                       multiprocessors: int | None = None) -> tuple:
     """`count` compile-only devices of the CUDA `generation`, none attached: XLA's CUDA backend compiles a
     program over them, a mesh's collectives included, as for that many of the generation's GPUs, of the
-    `multiprocessors` a build states where it states them (`built_target`). `capacity` states bytes per device
-    to XLA's scheduler and rematerialization pass, not only Dew's admission check; absent it, XLA's target
-    states zero rather than a hardware capacity."""
+    `multiprocessors` a build states where it states them (`built_target`). `memory` states each GPU's
+    memory, its total bytes as the GPU states them (`nvidia-smi`'s total): XLA's scheduler and
+    rematerialization read it as the target's (`device_memory_size`), and every admission of a program
+    compiled for these devices reads the allocator's limit derived from it (`dew._devices.allocator_limit`,
+    `COMPILE_ONLY_MEMORY`), as the GPU's own allocator states it. Absent it, the devices state no memory: a
+    step is compiled ahead for them only where it is stated (`compile_ahead`)."""
+    if memory is not None:
+        _positive(memory)
     stated = built_target(generation, multiprocessors).multiprocessors
-    return _compile_only_gpus(generation, count, capacity, stated)
+    devices = _compile_only_gpus(generation, count, memory, stated)
+    if memory is not None:
+        COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
+    return devices
+
+
+@contextlib.contextmanager
+def stand_in_gpus(devices: Sequence, memory: int) -> Iterator[tuple]:
+    """`devices`, a host's own CPU devices (`jax.devices("cpu")`), each stated to hold a GPU's `memory`, its
+    total bytes as the GPU states them, while the block runs: every layout check and admission on them reads
+    the allocator's limit derived from it (`dew._devices.allocator_limit`, `COMPILE_ONLY_MEMORY`), as
+    `compile_only_gpus`' do, where JAX's CUDA plugin, which those need, does not install. `Trainer.validate`
+    checks a run's layout on them against the GPUs' limits; a program compiles for the CPU."""
+    _positive(memory)
+    devices = tuple(devices)
+    COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
+    try:
+        yield devices
+    finally:
+        for device in devices:
+            del COMPILE_ONLY_MEMORY[device]
+
+
+def _positive(memory: int) -> None:
+    """Refuse a GPU's stated memory that is not a positive count of bytes."""
+    if memory <= 0:
+        raise ValueError(f"a GPU states a positive count of bytes, not {memory}")
 
 
 @functools.cache
-def _compile_only_gpus(generation: str, count: int, capacity: int | None,
+def _compile_only_gpus(generation: str, count: int, memory: int | None,
                        multiprocessors: int | None) -> tuple:
     """`compile_only_gpus`, one topology for each GPU however a caller states it (the generation's own
     multiprocessors as None or as their count)."""
-    config = target_config(built_target(generation, multiprocessors), capacity)
+    config = target_config(built_target(generation, multiprocessors), memory)
     topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=config,
                                             topology=f"1x1x{count}")
     return tuple(topology.devices[:count])
@@ -193,8 +225,12 @@ def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
     # The CUDA plugin, which a serialized topology deserializes through, initialized as the generation's
     # compile-only GPUs initialize it: with no client and no GPU.
     compile_only_gpus(generation, 1)
-    devices = topologies.TopologyDescription.deserialize(Path(topology).read_bytes()).devices
+    serialized = Path(topology).read_bytes()
+    devices = topologies.TopologyDescription.deserialize(serialized).devices
     _HOSTS_GPUS.update(devices)
+    memory = topology_memory(serialized)
+    if memory is not None:
+        COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
     if len(devices) < count:
         raise ValueError(f"the topology at {topology} holds {len(devices)} GPUs, not {count}")
     held = gpu_target(devices[0].device_kind).generation
@@ -202,6 +238,24 @@ def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
         raise ValueError(f"the topology at {topology} holds {devices[0].device_kind} GPUs ({held}), not "
                          f"{generation}")
     return tuple(devices[:count])
+
+
+def topology_memory(serialized: bytes) -> int | None:
+    """The memory each GPU of a serialized GPU topology states, its total bytes, as XLA reads them for its
+    target (`device_memory_size`): `PjRtTopologyDescriptionProto.platform_specific_topology` (9,
+    xla/pjrt/proto/topology_description.proto), an `Any` whose value (2) is a `GpuTopologyProto`, its
+    `gpu_target_config` (8, xla/service/gpu_topology.proto), a `GpuTargetConfigProto`, its `gpu_device_info`
+    (1), a `GpuDeviceInfoProto`, its `device_memory_size` (14, xla/stream_executor/device_description.proto),
+    read through Dew's one reader of XLA's protos (`proto_fields`); jaxlib's topology hands no accessor of
+    it. None where the topology states none."""
+    message = serialized
+    for field in (9, 2, 8, 1):
+        found = report.proto_fields(message).get(field, [])
+        if len(found) != 1 or not isinstance(found[0], bytes):
+            return None
+        message = found[0]
+    stated = report.proto_fields(message).get(14, [])
+    return stated[0] if len(stated) == 1 and isinstance(stated[0], int) and stated[0] > 0 else None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -347,7 +401,8 @@ class AheadOfTime:
     """The seconds that search took, its derivations and every compile: the time a run spends planning
     before its first step on those GPUs."""
     capacity: int | None = None
-    """The stated bytes per target GPU, or None where no memory capacity was supplied."""
+    """The allocator's limit each target GPU holds the plan to, derived from the memory stated for it
+    (`dew._devices.allocator_limit`); None for a TPU's, whose topology states its own."""
     sampled: AheadProgram | None = None
     """The step that also summarizes what the run inspects (`Candidate.sampled`), compiled beside the step
     for a run that inspects, which a run handed the step takes in place of compiling it
@@ -510,9 +565,10 @@ class BuildTarget:
     flags: tuple[str, ...]
     host: str
     memory: int | None = None
-    """The bytes a device holds that the build's plan held each call to, where the build stated them (its
-    capacity: `built_target`'s `memory`): a device holding fewer (its allocator's limit) runs past what the
-    plan kept and is refused; a build stating none planned for the least of its target's parts."""
+    """The allocator's limit a device holds that the build's plan held each call to, derived from the
+    memory stated for its GPUs (`dew._devices.allocator_limit`; `built_target`'s `memory`): a device whose
+    limit is lower runs past what the plan kept and is refused, naming both limits; a build stating none
+    planned for the least of its target's parts."""
     cpu: str | None = None
     """A CPU target's own processor (`host_cpu`): XLA compiles a CPU's program to the instruction sets of
     the host that compiles it, so its executable runs on a host of the same ones. None for a GPU's or a
@@ -550,15 +606,16 @@ class BuildTarget:
     @staticmethod
     def of(devices: Sequence) -> BuildTarget:
         """The target `devices` are, each by its own facts whatever `assumed` says (`device_target`), the
-        least allocator limit among them its memory where they state one, a CPU's with its host's
+        least allocator limit among them its memory where they state one (`device_memory`: an attached
+        device's own, a compile-only GPU's derived from its stated memory), a CPU's with its host's
         processor (`host_cpu`), under this process's JAX, XLA flags and host; refused where they are not
         all of one generation and multiprocessors."""
         found = {(target.generation, target.multiprocessors) for target in map(device_target, devices)}
         if len(found) != 1:
             raise ValueError(f"these devices are of several targets, {sorted(found, key=str)}: programs "
                              "compiled ahead load onto devices of one")
-        limits = [stats["bytes_limit"] for device in devices
-                  if "bytes_limit" in (stats := device.memory_stats() or {})]
+        limits = [limit for device in devices
+                  if (limit := device_memory(device).get("bytes_limit")) is not None]
         own = device_target(devices[0])
         # No topology: the attached GPUs' serialization differs call to call (`topology`).
         built = BuildTarget.built(own, len(devices), min(limits, default=None))
@@ -836,7 +893,8 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
         def lowered(function=function, shapes=shapes, name=name) -> jax.stages.Lowered:
             """The program lowered for the target, afresh at each call (a relowering's, past a spill)."""
             try:
-                with assumed(target, portable=True), jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+                with (assumed(target, portable=True), jax.sharding.use_abstract_mesh(mesh.abstract_mesh),
+                      report.certifying(mesh.devices.flat[0])):
                     return owned_program(function, out_shardings=placed).lower(*shapes)
             except Unlowerable as refused:
                 raise refused.refusing(name) from refused
@@ -912,10 +970,12 @@ class AheadTarget:
     """Where a configured run compiles its first step ahead and saves it, then exits, training nothing
     (`TrainerConfig.compile_ahead`): for `devices` GPUs of the CUDA `generation` (`compile_only_gpus`),
     or the `devices` TPUs of the TPU topology it names ('v5e:4x4', `compile_only_tpus`), which this host
-    need not have, written to `path` (`AheadOfTime.save`). Where `capacity_gib` states each GPU's memory,
-    the run's own plan there is made and reported with it (`compile_ahead`): the offline answer to what
-    fits, a run with its remat set told of no rung but its own; a TPU states its own. The links it
-    compiles with are the run's (`TrainerConfig.links`), which no compile-only device measures."""
+    need not have, written to `path` (`AheadOfTime.save`). `capacity_gib` states each GPU's memory, its
+    total as the GPU states it, once: the run's own plan there is made and reported against the
+    allocator's limit derived from it (`compile_ahead`), the offline answer to what fits, a run with its
+    remat set told of no rung but its own. A host's own `topology` states its GPUs' memory instead, and a
+    TPU topology its own. The links it compiles with are the run's (`TrainerConfig.links`), which no
+    compile-only device measures."""
 
     generation: str
     devices: int
@@ -933,17 +993,15 @@ class AheadTarget:
     topology: str | None = None
     """A host's own serialized GPU topology (`host_gpus`), which states the GPUs it compiles for whole:
     their memory and multiprocessors, so it sets neither `capacity_gib` nor `multiprocessors`. A dew-ops
-    prepare is handed its node's ($DEW_NODE_TOPOLOGY), so its compiles key the cache the node's run reads.
-    With it, `capacity_gib` states the bytes the run's plan is admitted to on each GPU (the pool XLA's
-    allocator holds there), which the topology's own memory does not."""
+    prepare is handed its node's ($DEW_NODE_TOPOLOGY), so its compiles key the cache the node's run reads."""
     phases: tuple[int, ...] = ()
     """The run's data phases whose steps are compiled in place of the first's, each over a batch of its own
     (`phase_batch`), into the run's persistent compilation cache, where that phase's first compile in the
     run finds them (`LaterPhases`): none, the first step's alone."""
 
     @property
-    def capacity(self) -> int | None:
-        """The stated bytes per GPU, read both when building its topology and when planning."""
+    def memory(self) -> int | None:
+        """Each GPU's stated memory in bytes, which its compile-only devices carry (`compile_only_gpus`)."""
         return None if self.capacity_gib is None else int(self.capacity_gib * 2**30)
 
     def compile_only(self) -> tuple:
@@ -951,11 +1009,12 @@ class AheadTarget:
         `topology` (`host_gpus`), the TPU topology's, which must hold `devices`, or `devices` GPUs of the
         generation at the stated capacity."""
         if self.topology is not None:
-            if self.multiprocessors is not None:
-                raise ValueError("a host's topology states its GPUs' multiprocessors; set none with it")
+            if self.multiprocessors is not None or self.capacity_gib is not None:
+                raise ValueError("a host's topology states its GPUs' memory and multiprocessors; set neither "
+                                 "capacity_gib nor multiprocessors with it")
             return host_gpus(self.generation, self.topology, self.devices)
         if ":" not in self.generation:
-            return compile_only_gpus(self.generation, self.devices, self.capacity, self.multiprocessors)
+            return compile_only_gpus(self.generation, self.devices, self.memory, self.multiprocessors)
         if self.multiprocessors is not None:
             raise ValueError(f"a TPU topology ({self.generation}) states its own cores; set no "
                              "multiprocessors")
@@ -978,6 +1037,8 @@ class AheadTarget:
         if trainer.rollout is not None:
             raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
                              "its rollout's, which it makes only as it trains")
+        # Refused before its first batch is read and its state traced, where its GPUs state no memory.
+        stated_limit(list(trainer.device_mesh.devices.flat))
         batch = first_step_batch(trainer, loader, steps, examples, resume)
         topology = None if self.topology is None else Path(self.topology).read_bytes()
         if self.phases:
@@ -986,17 +1047,32 @@ class AheadTarget:
             last: AheadOfTime | None = None
             for phase in self.phases:
                 trainer._planned_afresh()
-                last = _compiled_ahead(trainer, phase_batch(trainer, batch, phase), self.capacity,
-                                       frontier=False, plan=None, topology=topology)
+                last = _compiled_ahead(trainer, phase_batch(trainer, batch, phase), frontier=False, plan=None,
+                                       topology=topology)
                 _log.info("the step of data phase %d compiled ahead in %.1f s", phase, last.planned_seconds)
             assert last is not None, "a target of phases names one"
             return CompiledAhead(None, last)
         if self.path is None:
             raise ValueError("a step compiled ahead is saved where its target's path says; name one")
-        ahead = _compiled_ahead(trainer, batch, self.capacity, frontier=self.frontier, plan=plan,
-                                topology=topology)
+        ahead = _compiled_ahead(trainer, batch, frontier=self.frontier, plan=plan, topology=topology)
         ahead.save(self.path)
         return CompiledAhead(self.path, ahead)
+
+
+def stated_limit(devices: Sequence) -> int | None:
+    """The allocator's limit a step compiled ahead for `devices` is planned against: the least their stated
+    memory gives (`device_memory`); None for a TPU topology's, which states its own. Compile-only GPUs that
+    state none are refused, before anything traces, naming how to state it once."""
+    if {device.platform for device in devices} == {"tpu"}:
+        return None
+    limits = [device_memory(device).get("bytes_limit") for device in devices]
+    if None in limits:
+        generation = gpu_target(devices[0].device_kind).generation
+        raise ValueError(f"the {generation} GPUs this step compiles for state no memory, which every plan "
+                         "for them is made against: state it once, with each GPU's memory "
+                         "(--trainer.compile-ahead.capacity-gib, compile_only_gpus' memory), or a host's own "
+                         "serialized topology (--trainer.compile-ahead.topology), which states its GPUs' own")
+    return min(limit for limit in limits if limit is not None)
 
 
 def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader: Loader, steps: int | None,
@@ -1007,13 +1083,14 @@ def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader:
     run checked (`Trainer.validate`), and the first batch of the stream of this process's share fit opens
     (`Trainer._stream_partition`, its ramp's stages beginning where updates do) from the position its
     checkpoint left a run resumed under `resume` at (`Checkpoints.position`), under the layout's rules,
-    as the run's resume reads it (`dew.training.startup.resume_admitted`, row 3917). A run its checkpoint
+    or started again where its plan changed and the run resumes its data relaxed, as the run's resume
+    reads it (`dew.training.startup.resume_admitted`, row 3917). A run its checkpoint
     completes has no step to take, and is refused. What a step compiled ahead (`AheadTarget.compiled`)
     and an offline view of a run (`dew.config.RunConfig.viewed`) start from."""
     from flax import linen as nn
 
     from dew.data.dataset import DataPartition
-    from dew.training._fit import first_batch
+    from dew.training._fit import data_resumed, first_batch
 
     trainer._declare_input(lambda: first_batch(loader, trainer._stream_partition()))
     trainer.reading(loader, examples=examples, steps=steps)
@@ -1023,11 +1100,16 @@ def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader:
     if resumed is not None and steps is not None and resumed >= steps:
         raise ValueError(f"the run is complete at step {resumed}, its last checkpoint written, so it has no "
                          "step to take")
-    # The shares fit reads by, its layout placing the rows, the saved one's among them.
+    # The shares fit reads by, its layout placing the rows, the saved one's among them, read on from or
+    # started again as the run's data resume decides (`Trainer.data_resume`, `data_resumed`).
     with nn.logical_axis_rules(trainer.layout.axis_rules):
-        position = None if checkpoints is None or resumed is None else checkpoints.position(
-            resumed, DataPartition.of(trainer.device_mesh))
-        return first_batch(loader, trainer._stream_partition(), position)
+        partition = trainer._stream_partition()
+        if checkpoints is None or resumed is None:
+            return first_batch(loader, partition)
+        saved = DataPartition.of(trainer.device_mesh)
+        position, _ = data_resumed(loader, partition, lambda: checkpoints.position(resumed, saved),
+                                   resume=trainer.data_resume, step=resumed)
+        return first_batch(loader, partition, position)
 
 
 class CompiledAhead(SystemExit):
@@ -1119,7 +1201,6 @@ class LaterPhases:
         """The process compiling the later phases of `trainer`'s run, started where they hold steps of other
         programs than the step of `batch`, its first (`later_phases`)."""
         from dew._cleanup import start
-        from dew.training.memory import device_memory
 
         devices = jax.local_devices()
         directory = jax.config.jax_compilation_cache_dir
@@ -1134,9 +1215,9 @@ class LaterPhases:
         self.held = tempfile.TemporaryDirectory(prefix="dew-later-phases-", dir=directory)
         held = Path(self.held.name)
         (held / "topology").write_bytes(topologies.get_attached_topology("cuda").serialize())
-        capacity = min(device_memory(device)["bytes_limit"] for device in devices)
+        # The host's topology states its GPUs' memory, which the phases' plans are made against.
         target = AheadTarget(gpu_target(devices[0].device_kind).generation, len(devices),
-                             topology=str(held / "topology"), phases=phases, capacity_gib=capacity / 2**30)
+                             topology=str(held / "topology"), phases=phases)
         command = self.command(self.recorded(target, trainer._compiler.links(trainer.device_mesh), held))
         with (held / "log").open("w") as written:
             self.process = start(command, stdout=written, stderr=subprocess.STDOUT,
@@ -1190,8 +1271,7 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
     return closes_window(device, trainer._shape.examples)
 
 
-def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
-                                   capacity: int | None = None, *, frontier: bool = False,
+def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool = False,
                                    fit: FitArguments | None = None, topology: bytes | None = None
                                    ) -> AheadOfTime:
     """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only devices its
@@ -1203,14 +1283,16 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     time the search took, and with `frontier` each rung above it that fits at fewer microbatches than
     every plan before it (`FitSearch.above`), compiled and not saved: the plans a run's speed is chosen
     among (the module's docstring). With `fit`, what the run's `Trainer.fit` over `batch` is asked for, its
-    evaluations' programs compile with its start's (`started`). `capacity` states bytes per GPU;
-    absent it, memory fit is unknown rather than measured. The GPU it compiles for is the one the mesh's
+    evaluations' programs compile with its start's (`started`). The GPUs' memory is the one their
+    compile-only devices carry (`compile_only_gpus`' `memory`, a host topology's own), the plan made against
+    the allocator's limit derived from it; GPUs that state none are refused before anything traces. The
+    GPU it compiles for is the one the mesh's
     compile-only GPUs state, as XLA compiles over them: their generation and multiprocessors
     (`compile_only_gpus`' `multiprocessors`, `built_target`), which the step's launches derive for and it
     records. `topology` is the serialized topology of a host's own GPUs the mesh's devices were read from
     (`host_gpus`), which the saved build names (`BuildTarget.topology`); None for a generation's canonical
     GPUs. Profiling, tuning and rollout require execution and are refused."""
-    return _compiled_ahead(trainer, batch, capacity, frontier=frontier,
+    return _compiled_ahead(trainer, batch, frontier=frontier,
                            plan=None if fit is None else fit_plan(trainer, batch, fit), topology=topology)
 
 
@@ -1220,13 +1302,10 @@ def fit_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], dataset: Datase
     return trainer._fit_plan(dataset, **fit)
 
 
-def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, capacity: int | None,
-                                     *, frontier: bool, plan: FitPlan | None, topology: bytes | None = None
-                                     ) -> AheadOfTime:
+def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool,
+                                     plan: FitPlan | None, topology: bytes | None = None) -> AheadOfTime:
     """`compile_ahead`'s step and programs, the evaluations' with `plan`, what the run's `fit` is asked for
     (`Trainer._fit_plan`), over its own data or a configured run's loader (`AheadTarget.compiled`)."""
-    if capacity is not None and capacity <= 0:
-        raise ValueError("compile-ahead capacity must be positive bytes per GPU")
     if trainer.host_master or trainer.rollout is not None or trainer.lower_for is not None:
         raise ValueError("compile-ahead needs a device-resident step over its loader, with no lower_for")
     if trainer.tune_kernels or pgle_runs():
@@ -1241,22 +1320,10 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
                          f"{sorted({device.device_kind for device in devices})}")
     (generation,) = generations
     on_tpus = platforms == {"tpu"}
+    # The allocator's limit the plan is made against, from the memory the GPUs' devices carry.
+    capacity = stated_limit(devices)
     # The GPU XLA compiles for, as its compile-only devices state it.
     stated = None if on_tpus else built_target(generation, devices[0].core_count, capacity)
-    if capacity is not None and on_tpus:
-        raise ValueError(f"a TPU topology states its own memory; compile it ahead for {generation} with no "
-                         "capacity")
-    if frontier and capacity is None and not on_tpus:
-        raise ValueError("a frontier lists the rungs that fit the GPUs' memory, which compile-only GPUs "
-                         "do not state; name it (--trainer.compile-ahead.capacity-gib, compile_ahead's "
-                         "capacity)")
-    if capacity is not None and not set(devices) <= _HOSTS_GPUS:
-        # A host's own GPUs state their memory to XLA; the capacity is its plan's admission alone.
-        mesh = trainer.device_mesh
-        devices = compile_only_gpus(generation, len(devices), capacity,
-                                    None if stated is None else stated.multiprocessors)
-        trainer.mesh = trainer.device_mesh = trainer.state_mesh = jax.sharding.Mesh(
-            np.asarray(devices).reshape(mesh.devices.shape), mesh.axis_names, axis_types=mesh.axis_types)
     began = time.perf_counter()
     start = trainer._started()
     if start.resume is not None and trainer.checkpoints is not None:
@@ -1268,13 +1335,17 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
     # The first step's pass count, the phase its batch was read in (`Trainer`'s `phase_passes`).
     trainer.phase_passes.at(batch)
     try:
-        # Traced with the target's first device as the default, so a library that reads the GPU it is traced
-        # for (JAX's cuDNN attention gates, row 5894) reads the target's, not this process's backend.
-        with (assumed(on, portable=portable), trainer.phase_passes.scoped(trainer, trainer._compiler),
+        # Each launch's derived config certified on one of the compile-only devices it compiles for
+        # (`report.certified`), as a run on that GPU certifies it: the cache it prepares holds that run's.
+        certifying = (contextlib.nullcontext() if on_tpus
+                      else report.certifying(trainer.device_mesh.devices.flat[0]))
+        # Traced with the target's first device as the default too, so a library that reads the GPU it is
+        # traced for (JAX's cuDNN attention gates, row 5894) reads the target's, not this process's backend.
+        with (assumed(on, portable=portable), certifying,
+              trainer.phase_passes.scoped(trainer, trainer._compiler),
               jax.default_device(trainer.device_mesh.devices.flat[0])):
             target = gpu_target()
-            planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity,
-                                             frontier)
+            planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, frontier)
             starts = started(trainer, start, planned, plan)
     except Unlowerable as refused:
         raise refused.refusing("step") from refused
@@ -1336,7 +1407,7 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     from dew.distributed.placement import placed_shapes
     from dew.state import apart, together
     from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest
-    from dew.training.planning import whole_step
+    from dew.training.planning import whole_step_program
 
     candidate, split = planned.candidate, planned.split
     placed = placed_shapes(start.abstract, start.shardings)
@@ -1349,8 +1420,9 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
             trainer._window_of(dataclasses.replace(placed, compute=None), candidate, window)
         for step in steps:
             moving, loss, aux, finite, accepted, committed = shapes_of(step.out_info)
+            # As the step runs it: its whole where it is split (`StepCompiler.runner`).
             if split > 1:
-                loss, aux, finite, accepted, committed = whole_step(
+                loss, aux, finite, accepted, committed = whole_step_program(trainer.objective)(
                     [(loss, aux, finite, accepted, committed)] * split)
             book = book_shapes(loss)
             counted = bookkeep(*booked(book, book, loss, finite, committed, aux or {}))

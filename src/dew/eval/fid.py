@@ -19,7 +19,7 @@ from numpy.typing import NDArray
 from dew.artifacts import ImageGrid
 from dew.inputs import unit_range
 from dew.nn.kernels.options import program
-from dew.objectives.base import Shown
+from dew.objectives.base import Shown, joined_moments
 
 from .common import metric_device
 
@@ -105,12 +105,11 @@ class GaussianStats:
             return self
         if self.count == 0:
             return other
-        count = self.count + other.count
-        delta = other.mean - self.mean
-        self.m2 += other.m2
-        self.m2 += np.outer(delta, delta) * (self.count * other.count / count)
-        self.mean += delta * (other.count / count)
-        self.count = count
+        # Counts as arrays beside the means, one kind of operand (`joined_moments`).
+        count, self.mean, delta, weight = joined_moments(np.asarray(self.count, np.float64), self.mean,
+                                                         np.asarray(other.count, np.float64), other.mean)
+        self.m2 += other.m2 + weight * np.outer(delta, delta)
+        self.count = int(count)
         if not np.isfinite(self.mean).all() or not np.isfinite(self.m2).all():
             raise ValueError("fid: non-finite pooled feature statistics")
         return self

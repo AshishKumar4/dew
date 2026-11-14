@@ -38,12 +38,14 @@ from dew.inference.models import ReleasesModel
 from dew.inputs import Field, InputSpec, unit_range
 from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites
 from dew.nn.inspection import INSPECTED
+from dew.nn.norms import LayerNorm
 from dew.nn.precision import accumulated, at_least_fp32
 from dew.nn.protocols import StagedStacks
 from dew.nn.sharding import explicit_spec, whole_spec
 from dew.objectives.base import (
     Aux,
     EMASpec,
+    Moments,
     Objective,
     ProgramModule,
     Ratio,
@@ -62,8 +64,9 @@ PREDICTOR = "predictor"
 LABEL_KEY = "label"
 
 
-def representation_health(z) -> dict[str, jax.Array]:
-    """Return two collapse measures for pooled embeddings `[B, D]`, as metrics.
+def representation_health(z) -> dict[str, Moments]:
+    """Return two collapse measures for pooled embeddings `[B, D]`, as metrics their batch's moments pool
+    (`Moments`), so a step read in several microbatches reports them as its whole batch would.
 
     `repr_std` is the per-dimension standard deviation across the batch. It
     goes to zero exactly when the encoder stops distinguishing inputs.
@@ -74,15 +77,10 @@ def representation_health(z) -> dict[str, jax.Array]:
     Both are computed in fp32, so a run's compute dtype does not set the
     noise floor of the drift, and bf16 and fp32 runs read off the same curves.
     """
-    batch_size, dim = z.shape
-    z = z.astype(jnp.float32)
-    centered = z - jnp.mean(z, axis=0, keepdims=True)
-    product = functools.partial(jnp.matmul, out_sharding=whole_spec(centered, 2))
-    cov = accumulated(product, centered.T, centered) / max(batch_size - 1, 1)
-    off_diagonal = cov * (1.0 - jnp.eye(dim, dtype=cov.dtype))
+    product = functools.partial(jnp.matmul, out_sharding=whole_spec(z, 2))
     return {
-        "repr_std": jnp.mean(jnp.std(z, axis=0)),
-        "repr_cov_offdiag": jnp.sqrt(jnp.sum(off_diagonal ** 2) / max(dim * (dim - 1), 1)),
+        "repr_std": Moments.of(z, "std"),
+        "repr_cov_offdiag": Moments.of(z, "offdiagonal", lambda a, b: accumulated(product, a, b)),
     }
 
 
@@ -96,8 +94,8 @@ def normalize_targets(x: jax.Array, epsilon: float = 1e-5) -> jax.Array:
     prediction problem keeps a fixed scale as the encoder drifts, and
     shrinking the representation does not lower the loss.
     """
-    normalized = nn.LayerNorm(epsilon=epsilon, use_scale=False, use_bias=False,
-                              use_fast_variance=False).apply({}, x)
+    normalized = LayerNorm(epsilon=epsilon, use_scale=False, use_bias=False,
+                           use_fast_variance=False).apply({}, x)
     # `mutable` is unset, so apply returns the output alone, not a pair.
     assert not isinstance(normalized, tuple)
     return normalized

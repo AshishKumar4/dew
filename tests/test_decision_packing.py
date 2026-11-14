@@ -114,7 +114,7 @@ def windows(objective, rows: int) -> dict:
         batch = next(reader)
     finally:
         reader.close()
-    return {name: np.asarray(value) for name, value in batch.items() if name != VALID_ROWS}
+    return jax.tree.map(np.asarray, {name: value for name, value in batch.items() if name != VALID_ROWS})
 
 
 def along(batch) -> tuple[str, ...]:
@@ -180,7 +180,8 @@ def in_place(batch, placed: list[tuple[int, int]]) -> dict:
     every product a row's tokens enter runs at the packed run's shapes. A window reads no other, so
     rows of different windows run alone together."""
     assert len({window for window, _ in placed}) == len(placed), "one row a window"
-    one = {name: np.zeros_like(value) for name, value in batch.items()}
+    # A window of its own rows apart: the read's layout of the windows (`tokens_coordinates`) is not its own.
+    one = {name: np.zeros_like(value) for name, value in batch.items() if name != "tokens_coordinates"}
     for window, row in placed:
         for name, value in at_offset(batch, window, row).items():
             one[name][window, :value.shape[1]] = value[0]
@@ -466,7 +467,8 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 
     # more sequence (`dew.nn.attention.flash_attention`).
     segments = objective.bounds.segments
     laid = laid_out(batch, segments).coordinates()
-    assert int(np.max(laid.segments)) <= laid.max_segments == segments
+    declared = batch["tokens_coordinates"].max_segments
+    assert int(np.max(laid.segments)) <= laid.max_segments == declared <= segments
     rows = apart(batch)
     wide = copy.copy(objective)
     wide.substitute(wide_modules)
@@ -629,7 +631,7 @@ def test_single_option_questions_fit_the_packing_bounds(questions):
                                                        heads=2, feedforward=64), shuffle_options=False)
     data = decision_rows([example], 1, [example], objective=objective.data())
     (batch,) = list(data.val(DataPartition()))
-    batch = {name: np.asarray(value) for name, value in batch.items()}
+    batch = jax.tree.map(np.asarray, dict(batch))
     np.testing.assert_array_equal(batch["tokens"][0, batch["segments"][0] == 1], encoded.tokens)
     assert int(batch["questions"].sum()) == questions
     assert int(batch["options"].sum()) == questions
@@ -701,7 +703,7 @@ def test_a_packed_loss_counts_only_real_scored_questions():
                                       layers=1, heads=2, feedforward=64), shuffle_options=False)
     data = decision_rows(examples, 3, examples, objective=objective.data())
     (batch,) = list(data.val(DataPartition()))
-    batch = {name: np.asarray(value) for name, value in batch.items()}
+    batch = jax.tree.map(np.asarray, dict(batch))
     real = batch[VALID_ROWS]
     assert real.sum() == 2 and (~real).sum() == 1
     assert int(batch["segments"][real].max()) > 1

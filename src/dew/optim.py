@@ -62,7 +62,6 @@ from dew.newton_schulz import (
     newton_schulz_flops,
     orthogonalized,
     polar_express,
-    spread_matrices,
 )
 from dew.nn.inspection import QK
 from dew.nn.precision import at_least_fp32
@@ -388,12 +387,10 @@ def _scale_by_shape(consistent_rms: float | None, per_head: Mapping[str, int] | 
     return optax.GradientTransformation(lambda params: optax.EmptyState(), update_fn)
 
 
-def muon_update_flops(params, steps: int, per_head: Mapping[str, int] | None = None, *, devices: int = 1,
-                      group: int | None = None) -> float:
+def muon_update_flops(params, steps: int, per_head: Mapping[str, int] | None = None) -> float:
     """Muon's Newton-Schulz FLOPs an update over `params` (`newton_schulz_flops`): each parameter it takes
     (`muon_weight_dimension_numbers`) as the stack of matrices it orthogonalizes, a head's alone where
-    `per_head` names its width (`head_widths`), joined `group` at a time and padded for its `devices` as the
-    iteration runs them (`spread_matrices`), at `steps` iterations."""
+    `per_head` names its width (`head_widths`), at `steps` iterations."""
     numbers = jax.tree.leaves(muon_weight_dimension_numbers(params), is_leaf=muon_leaf)
     widths = jax.tree.leaves(head_widths(params, per_head), is_leaf=lambda node: node is None)
     stacks = [jax.eval_shape(lambda held, shape=shape, width=width: headed(as_matrices(held, shape)[0],
@@ -401,7 +398,7 @@ def muon_update_flops(params, steps: int, per_head: Mapping[str, int] | None = N
               for leaf, shape, width in zip(jax.tree.leaves(params), numbers, widths, strict=True)
               if shape is not None]
     return sum(newton_schulz_flops(matrices, rows, columns, steps)
-               for matrices, rows, columns in spread_matrices(stacks, devices, group))
+               for matrices, rows, columns in (stack.shape for stack in stacks))
 
 
 def head_widths(updates, per_head: Mapping[str, int] | None):
@@ -1885,23 +1882,19 @@ class OptimConfig:
             solver = power_profiles(solver, self.ema_profiles)
         return solver
 
-    def update_flops(self, params, devices: int = 1) -> float | None:
+    def update_flops(self, params) -> float | None:
         """One update's analytic matrix work over `params` beyond the model's, the FLOPs a run reports as
         `train/update_flops` beside the model's `train/flops`: Muon's Newton-Schulz products over each matrix
-        it orthogonalizes as it runs them over its `devices` (`muon_update_flops`), at the iterations its
-        coefficients hold (a schedule's rows); None for any other optimizer, whose update multiplies no
-        matrices."""
+        it orthogonalizes (`muon_update_flops`), at the iterations its coefficients hold (a schedule's rows);
+        None for any other optimizer, whose update multiplies no matrices."""
         if self.optimizer not in ('muon', 'muonclip'):
             return None
         opts = self.optimizer_opts
-        steps, per_head, group = opts.get('ns_steps', 5), opts.get('per_head'), opts.get('ns_group')
-        if not isinstance(steps, int) or not (per_head is None or isinstance(per_head, Mapping)) or not (
-                group is None or isinstance(group, int)):
-            raise TypeError(f"Muon's ns_steps and ns_group are counts and per_head a mapping, got {steps!r}, "
-                            f"{group!r}, {per_head!r}")
+        steps, per_head = opts.get('ns_steps', 5), opts.get('per_head')
+        if not isinstance(steps, int) or not (per_head is None or isinstance(per_head, Mapping)):
+            raise TypeError(f"Muon's ns_steps is a count and per_head a mapping, got {steps!r}, {per_head!r}")
         table = _coefficients(opts.get('ns_coeffs', NEWTON_SCHULZ), steps)
-        return muon_update_flops(params, steps if table.ndim == 1 else table.shape[0], per_head,
-                                 devices=devices, group=group)
+        return muon_update_flops(params, steps if table.ndim == 1 else table.shape[0], per_head)
 
     def _spares(self, make: Callable[..., optax.GradientTransformation]) -> bool:
         """Whether the optimizer's decay takes timm's split (`weight_decay_mask`): a factory that takes a

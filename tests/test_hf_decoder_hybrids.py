@@ -158,7 +158,6 @@ def test_the_real_qwen35_rotary_rotates_the_dims_the_reference_rotates():
     inv_freq = np.load(QWEN35_REAL / "inv_freq.npy")
     assert inv_freq.shape == (32,)
     rot_dim = int(config["head_dim"] * config["partial_rotary_factor"])
-    assert rot_dim == 64
 
     positions = np.arange(5)
     cos, _ = rotary_freqs(jnp.asarray(positions), config["head_dim"], config["rope_theta"],

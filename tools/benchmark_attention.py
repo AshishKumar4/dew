@@ -15,7 +15,8 @@ tokamax's Pallas-Triton kernel behind Dew's adapter, which refuses what that
 adapter refuses (windows, softcap, sinks); cudnn; tpu; xla; and the reference
 einsum. Two are upstream arms called directly: `jax_cudnn`,
 `jax.nn.dot_product_attention`'s cuDNN call, which takes heads wider than
-Dew's cudnn path does, and `tokamax_triton`, `tokamax.dot_product_attention`'s
+Dew's cudnn path does, over the call's window and refusing a softcap it has no
+form for, and `tokamax_triton`, `tokamax.dot_product_attention`'s
 Triton kernel with its own window and softcap. Batch and head counts are picked so every
 implementation sees the same token x head count, which is the fair
 comparison at a fixed sequence length; `--batch-size` and `--heads` fix a
@@ -135,9 +136,14 @@ def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, sin
         raise ValueError(f"{implementation} takes no block groups")
     if runs is not None and implementation in ('jax_cudnn', 'tokamax_triton'):
         raise ValueError(f"{implementation} takes no key runs")
+    if softcap is not None and implementation == 'jax_cudnn':
+        raise ValueError("jax_cudnn takes no softcap")
     if implementation == 'jax_cudnn':
-        # jax.nn's own cuDNN call, which takes heads wider than Dew's cudnn path does.
-        return lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=causal, implementation='cudnn')
+        # jax.nn's own cuDNN call, which takes heads wider than Dew's cudnn path does, over the call's window:
+        # a causal one's w most recent keys, else the keys within w - 1 of the query on either side.
+        local = None if window is None else (window - 1, 0 if causal else window - 1)
+        return lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=causal,
+                                                            local_window_size=local, implementation='cudnn')
     if implementation == 'tokamax_triton':
         local = None if window is None else (window - 1, 0)
         return lambda q, k, v: tokamax.dot_product_attention(

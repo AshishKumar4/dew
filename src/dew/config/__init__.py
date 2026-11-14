@@ -63,7 +63,7 @@ from dew.data import records
 from dew.data.compile import fitted
 from dew.data.dataset import Closeable, Loader, Reader
 from dew.data.pipeline import Dataset, ObjectiveData
-from dew.data.plan import PLAN_VERSIONS, SCHEDULE, PlanOrderChanged
+from dew.data.plan import PLAN_VERSIONS, SCHEDULE, PlanOrderChanged, read_by
 from dew.distributed.placement import MeshSpec
 from dew.interop.weights import AUTO
 from dew.lora import LoRA
@@ -735,11 +735,11 @@ class RunConfig:
     every program it traces, its steps', evaluations' and samples' (`traced`): `--kernels attention xla`.
     None named, each op's pick for its call (row 4649)."""
     data_plan_version: int | None = None
-    """The data plan version the run reads its order by (`dew.data.plan.PLAN_VERSIONS`): None for the
-    saved run's it resumes, or else this Dew's, which `resumed` resolves on every path a run trains by and
-    its record holds, so a resume reads the order it read whatever a later Dew's is (`BUILT`); a saved run
-    that recorded none read by version 8, and one that recorded a `data_plan` of None by 9
-    (`earlier_data_plan`)."""
+    """The data plan version the run's positions are saved under (`dew.data.plan.PLAN_VERSIONS`), which
+    `resumed` resolves on every path a run trains by and its record holds (`BUILT`): this Dew's, where the
+    run resumes none or one of a version it reads; a version it reads none of is refused resumed exactly
+    and started again relaxed. A saved run that recorded none read by version 8, and one that recorded a
+    `data_plan` of None by 9 (`earlier_data_plan`)."""
     source: SourceOptions = dataclasses.field(default_factory=SourceOptions)
     """What the run builds of the source it starts from (`--source.text-only`,
     `--source.prediction-depths`), where it starts from one (`pretrained`)."""
@@ -971,8 +971,10 @@ class RunConfig:
         if "objective" in changed and _learns_alike(recorded.objective, self.objective):
             changed.remove("objective")
         # A relaxed resume reads by this Dew's data plan where the saved run's is none it reads, its data
-        # started again (`resumed`): its state resumes as it trained.
-        if "data_plan_version" in changed and self.trainer.data_resume == "relaxed":
+        # started again (`resumed`), and any resume of a version it reads reads it as its own (`read_by`):
+        # its state resumes as it trained.
+        if "data_plan_version" in changed and (self.trainer.data_resume == "relaxed" or (
+                recorded.data_plan_version in PLAN_VERSIONS and self.data_plan_version in PLAN_VERSIONS)):
             changed.remove("data_plan_version")
         if recorded.trainer.quantization != self.trainer.quantization:
             changed.append("trainer.quantization")
@@ -1118,9 +1120,10 @@ class RunConfig:
     def resumed(self, paths: Sequence[str] | None = None) -> Self:
         """This run with each field it leaves None for its build to resolve (`BUILT`, or those of them
         `paths` names) at the value the saved run it resumes under its name recorded, read as every
-        earlier shape of a saved run is (`earlier_run`), and its data plan version, where it resumes no
-        run that recorded one, or a relaxed resume (`TrainerConfig.data_resume`) one that recorded a version
-        this Dew reads none of, this Dew's (`PLAN_VERSIONS`): the one place a run's version is resolved,
+        earlier shape of a saved run is (`earlier_run`), and its data plan version this Dew's
+        (`PLAN_VERSIONS`), where it resumes no run that recorded one, one that recorded a version this Dew
+        reads, which it reads as its own (`dew.data.plan.read_by`), or, relaxed
+        (`TrainerConfig.data_resume`), any: the one place a run's version is resolved,
         on each path a run trains by (`prepare`, and `readied`, which a run trained in Python reaches
         alone), before its data compiles or its record is written; and, resolving every field (no
         `paths`), as `prepare` does before it builds them, each class it names, its model's and its
@@ -1147,8 +1150,10 @@ class RunConfig:
                 run = run._defaulted_as(recorded) if defaulting else run
         # A relaxed resume of a run saved under a version this Dew reads none of reads by this Dew's, its
         # data started again (`dew.training.Trainer._data_resumed`); an exact one is refused by it.
-        if "data_plan_version" in built and (run.data_plan_version is None or (
-                trainer.data_resume == "relaxed" and run.data_plan_version not in PLAN_VERSIONS)):
+        # A version this Dew reads it reads as its own (`read_by`), so the run's record states the version its
+        # positions are saved under.
+        if "data_plan_version" in built and (run.data_plan_version in (None, *PLAN_VERSIONS) or (
+                trainer.data_resume == "relaxed")):
             run = dataclasses.replace(run, data_plan_version=PLAN_VERSIONS[-1])
         return run
 
@@ -1234,8 +1239,10 @@ class RunConfig:
         # alone, `build_run`, resolves it here), which it always states.
         planned = self.resumed(("data_plan_version",)).data_plan_version
         assert planned is not None
+        # A run of a version this Dew reads none of, resumed exactly, is refused before its data compiles.
+        read_by(planned)
         trainer = self.trainer
-        return fitted(dataset, validation, objective=objective, seed=self.data_seed, plan_version=planned,
+        return fitted(dataset, validation, objective=objective, seed=self.data_seed,
                       resume=trainer.data_resume,
                       examples=trainer.examples, epochs=trainer.epochs, steps=trainer.steps,
                       tokens=trainer.tokens)
@@ -1370,15 +1377,10 @@ class RunConfig:
         self.check_process()
         # Its data plan version resolved before its data compiles and its record is written, a run trained
         # in Python reaching `readied` alone, as the run it trains under `name` reads it (train 589's
-        # review): a loader compiled already reads by its own plan's version, which it records.
+        # review); a loader compiled already reads as every version this Dew reads does
+        # (`dew.data.plan.read_by`).
         named = dataclasses.replace(self, trainer=dataclasses.replace(self.trainer, name=name))
-        plan = dataset.plan if isinstance(dataset, Loader) else None
-        if plan is not None and self.data_plan_version not in (None, plan.version):
-            raise ValueError(f"the run reads by data plan version {self.data_plan_version}, and the loader "
-                             f"it is given was compiled at {plan.version}; compile the loader at the run's "
-                             "version (`compile(..., plan_version=...)`), or leave the run's to the loader")
-        planned = (named.resumed(("data_plan_version",)) if plan is None
-                   else dataclasses.replace(named, data_plan_version=plan.version))
+        planned = named.resumed(("data_plan_version",))
         dataset, held = planned.compiled(objective.data(), dataset, validation)
         # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's.
         suites = planned.suites(dataset, held, metrics)

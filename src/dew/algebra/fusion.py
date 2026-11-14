@@ -95,7 +95,9 @@ def _fusing(replay: Callable, fused_gemm) -> Callable:
 class Index:
     """A body's equations by the values they make (`producer`), each value's readers (`readers`: the places
     of the equations that read it), the values the body returns (`escaping`) and its constants' values where
-    it holds them (`consts`): what the region finders read (`_regions`, `recognize.recognized`)."""
+    it holds them (`consts`): what the region finders read (`_regions`, `recognize.recognized`); and what
+    recognition finds once of the body, held as long as the index lives: its key (`key`), its values made
+    from constants alone (`constants`) and its walks from a value by direction and reach (`walks`)."""
 
     def __init__(self, jaxpr: jcore.Jaxpr):
         self.jaxpr = jaxpr
@@ -108,6 +110,9 @@ class Index:
                 if isinstance(var, jcore.Var):
                     self.readers[var].add(place)
         self.escaping = {var for var in jaxpr.outvars if isinstance(var, jcore.Var)}
+        self.key: Hashable | None = None
+        self.constants: frozenset[jcore.Var] | None = None
+        self.walks: dict[tuple[str, jcore.Var, int], dict[jcore.Var, int]] = {}
 
 
 class Written(NamedTuple):

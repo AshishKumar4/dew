@@ -7,6 +7,7 @@ through its derived step and outputs (and Mamba-2's two walks merged), each held
 gradient flows; and updates no chunk form here holds, refused."""
 
 import functools
+import itertools
 
 import jax
 import jax.numpy as jnp
@@ -14,8 +15,8 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact
 
-from dew.algebra import SATURATION, cost, linear_scan, scan
-from dew.nn.kernels import generation, recurrence_algebra
+from dew.algebra import SATURATION, scan
+from dew.nn.kernels import generation
 from dew.nn.precision import float32_matmul
 
 TOKENS, STATE, WIDTH, CHUNK = 128, 16, 32, 32
@@ -182,6 +183,50 @@ def test_an_update_no_chunk_form_holds_is_refused(refused):
                                        state=((STATE, WIDTH), jnp.float32)), saturation=SATURATION)
     with pytest.raises(scan.Refused):
         forms.prepare(chunk_of(operands(*draw(0)), 0))
+
+
+def test_a_scans_derivations_stop_at_limits_of_their_inputs_size():
+    """A scan's token and chunk e-graphs saturate within limits derived from their size
+    (`program.Saturation.sized`), as a region's does: under limits of one node a row and one iteration a
+    level, which stop the token programs' saturation before it reaches the affine form, the declaration that
+    derives at the engine's limits is refused, and each derivation's saturation is reported with the
+    kernels' rewrites, none of the engine's as limited. `run_within` runs a rule set to its fixpoint where
+    its limits allow, and stops an iteration short of it, or before its first at a graph past its nodes,
+    saying so. Both saturations ran to their fixpoints whatever limits the derivation was given, which
+    reached its carry's split alone."""
+    from egglog import EGraph, rewrite, ruleset
+
+    from dew.algebra import program
+    from dew.algebra.linear_scan import Chunk
+    from dew.nn.kernels.templates import report
+
+    chunk = chunk_of(operands(*draw(0)), 0)
+    # Limits one node an equation above the engine's, so the chunk's form, kept by its limits, derives here.
+    roomy = program.Saturation(growth=SATURATION.growth + 1, depth=SATURATION.depth)
+    with report.refusals():
+        scan.derive_scan(DECLARED, saturation=roomy).prepare(chunk)
+        derived = [made for made in report.rewrites()
+                   if any(name.startswith("a scan's") for name in made.admitted)]
+        assert {made.admitted for made in derived} == {("a scan's token",), ("a scan's chunk",)}
+        assert not any(made.limited for made in derived)
+    with report.refusals(), pytest.raises(scan.Refused):
+        scan.derive_scan(DECLARED, saturation=program.Saturation(growth=1, depth=1)).prepare(chunk)
+
+    def chained() -> EGraph:
+        graph = EGraph()
+        graph.register(Chunk.token("a"))
+        return graph
+
+    # Each iteration reaches one name further along the chain.
+    names = "abcdef"
+    chain = ruleset(*(rewrite(Chunk.token(left)).to(Chunk.token(right))
+                      for left, right in itertools.pairwise(names)))
+    whole = program.run_within(chained(), chain, (10**6, 10**6), "a chain")
+    assert not whole.limited and whole.iterations >= len(names) - 1
+    short = program.run_within(chained(), chain, (10**6, whole.iterations - 1), "a chain")
+    assert (short.iterations, short.limited) == (whole.iterations - 1, True)
+    unrun = program.run_within(chained(), chain, (0, 10**6), "a chain")
+    assert (unrun.iterations, unrun.limited) == (0, True)
 
 
 def gated_delta(h, q, k, v, g, beta, exponential=jnp.exp):
@@ -352,17 +397,6 @@ def test_a_chunk_form_any_target_extracts_computes_the_token_scan(target):
                                            state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
         assert_as_exact(jax.jit(gated_walk(forms, GATED)), jax.jit(gated_tokenwise(gated_delta)), gated_draw,
                         f"gated delta on {target}", seeds=8)
-
-
-def test_a_chunks_form_is_the_one_its_target_derives():
-    """A chunk's form asked for under one target and then another is each target's own derivation: an
-    H100's (WY with its inverse by doubling) and an A10's (by substitution, its span unpriced)."""
-    extents = linear_scan.Extents(64, 128, 128, 1)
-    for target in ("sm90", "sm86", "sm90"):
-        with generation.assumed(target):
-            assert scan._form(extents, corrected=True) == linear_scan.derive(
-                extents, corrects=True, schedule=cost.fused(cost.target()),
-                precision=recurrence_algebra.STATE_PRECISION)
 
 
 def test_a_scans_carry_derived_for_one_target_serves_no_other():

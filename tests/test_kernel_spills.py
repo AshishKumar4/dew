@@ -26,6 +26,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.options import Fetched, compiled_with, owned_program, program
 from dew.nn.kernels.templates import report
+from dew.nn.kernels.templates.gemm.hooks import Hooks
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
 from dew.telemetry.compiles import Compiles
@@ -55,7 +56,7 @@ class Experts(nn.Module):
         sizes = jnp.full((EXPERTS,), x.shape[0] // EXPERTS, jnp.int32)
         projected = Uncounted()(
             jax.lax.stop_gradient((x + self.nonce).astype(jnp.bfloat16)), gate, sizes, paired=up,
-            hooks=grouped_matmul.Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16",
+            hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16",
             trans_rhs=False, interpret=False)
         return projected * scale
 
@@ -98,7 +99,8 @@ nonce, refused = float(sys.argv[1]), sys.argv[3] == "refused"
 with report.refusals():
     if refused:
         report.refuse(pickle_load(sys.argv[2]))
-    ahead = compile_ahead(experts(MeshSpec().build(compile_only_gpus("sm90", 1)), nonce), BATCH)
+    # An H100's 80 GiB, which a step is compiled ahead against (`compile_only_gpus`' memory).
+    ahead = compile_ahead(experts(MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30)), nonce), BATCH)
     ahead.save(sys.argv[2] + (".again" if refused else ""))
     print(json.dumps({"program": ahead.program, "refusals": len(ahead.refusals),
                       "stepped": [miss.stepped for miss in report.misses()],
@@ -551,6 +553,28 @@ def test_a_programs_spilling_triton_launch_is_recorded_with_no_mosaic_kernel_bes
     assert missed == [("dew_softmax", True)]
 
 
+def _paired_step(launch):
+    """A compile-only H100's mesh, and a lowering of one paired SwiGLU step through `launch` over it, traced
+    afresh at each call (a compile's `relower`)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training.ahead import compile_only_gpus
+
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    operands = [jax.ShapeDtypeStruct(shape, jnp.bfloat16, sharding=NamedSharding(devices, PartitionSpec()))
+                for shape in ((ROWS, FEATURES), (EXPERTS, FEATURES, WIDTH), (EXPERTS, FEATURES, WIDTH))]
+
+    def lowered():
+        def stepped(x, gate, up):
+            sizes = jnp.full((EXPERTS,), ROWS // EXPERTS, jnp.int32)
+            return launch(x, gate, sizes, paired=up, out_dtype="bfloat16", trans_rhs=False,
+                          hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u),
+                          interpret=False)
+        return jax.jit(stepped).trace(*operands).lower()
+
+    return devices, lowered
+
+
 class TwiceUncounted(Uncounted):
     """`Uncounted`, its widest tiles its only ones until a compile has refused two of its configs: a launch
     whose model misses at two configs in turn."""
@@ -568,22 +592,7 @@ def test_a_launch_spilling_at_two_configs_steps_down_alone_and_its_program_compi
     compiled it whole (row 5359: about 18 s of a step-down's 30 on an sm100 step); the program kept spills
     nothing, as the launch's last step alone did not: a kernel's code alone is its code in the program, the
     fact the step-down rests on."""
-    from jax.sharding import NamedSharding, PartitionSpec
-
-    from dew.training.ahead import compile_only_gpus
-
-    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
-    operands = [jax.ShapeDtypeStruct(shape, jnp.bfloat16, sharding=NamedSharding(devices, PartitionSpec()))
-                for shape in ((ROWS, FEATURES), (EXPERTS, FEATURES, WIDTH), (EXPERTS, FEATURES, WIDTH))]
-
-    def lowered():
-        def stepped(x, gate, up):
-            sizes = jnp.full((EXPERTS,), ROWS // EXPERTS, jnp.int32)
-            return TwiceUncounted()(x, gate, sizes, paired=up, out_dtype="bfloat16", trans_rhs=False,
-                                    hooks=grouped_matmul.Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u),
-                                    interpret=False)
-        return jax.jit(stepped).trace(*operands).lower()
-
+    devices, lowered = _paired_step(TwiceUncounted())
     with (report.refusals(), generation.assumed("sm90"), Compiles("stepped") as compiles,
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         report.compiled(lowered(), relower=lowered)
@@ -591,6 +600,29 @@ def test_a_launch_spilling_at_two_configs_steps_down_alone_and_its_program_compi
     assert [miss.stepped for miss in misses] == [True, True], misses
     assert len({miss.config for miss in misses}) == 2 and all(miss.frame for miss in misses), misses
     assert compiles.count == 2
+
+
+class SpillingOnly(Uncounted):
+    """`Uncounted`'s first tile alone, which spills in every compile, and no tile once a compile refused it: a
+    launch whose every legal config spills."""
+
+    def candidate(self, ba, config, target):
+        return Uncounted.candidate(self, ba, config, target) and not report.refused_launches()
+
+
+@lowers("sm90")
+def test_a_program_whose_launch_spills_at_every_config_left_is_refused_not_kept():
+    """A program whose launch spills at every config its derivation has, compiled for a compile-only H100
+    (`report.compiled`): the compile raises (`report.Exhausted`) and keeps no executable, as a derived kernel
+    never spills (docs/design/kernel-templates.md), its misses recorded as not stepped (audit K2-6: the
+    program found spilling was kept)."""
+    devices, lowered = _paired_step(SpillingOnly())
+    with (report.refusals(), generation.assumed("sm90"),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        with pytest.raises(report.Exhausted):
+            report.compiled(lowered(), relower=lowered)
+        misses = report.misses()
+    assert misses and not any(miss.stepped for miss in misses), misses
 
 
 @lowers("sm90")
@@ -793,6 +825,11 @@ def test_the_sass_rules_find_what_ptxas_left_of_a_kernel(listing, found):
     assert found in finding
     assert report.sass_findings_of(CONVERTING_LISTING) == ()
     assert report.sass_findings_of(REGISTER_A_LISTING.replace("gsb0, 0x1", "gsb0, 0x0")) == ()
+    # A retire only some trips take (a predicated wait) retires nothing the walk can count on.
+    conditional = REGISTER_A_LISTING.replace("WARPGROUP.DEPBAR.LE gsb0, 0x1",
+                                             "@P0 WARPGROUP.DEPBAR.LE gsb0, 0x0")
+    (finding,) = report.sass_findings_of(conditional)
+    assert "register operand A before its group retired" in finding
 
 
 def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read():

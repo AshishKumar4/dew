@@ -304,17 +304,17 @@ def masked_grouped_product(rows, matrices):
 
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
 def test_a_portable_grouped_projection_holds_every_order(edge):
-    """`grouped_matmul.portable_projection` (its custom derivative, the rounded operands' products): every
+    """`xla_products.portable_projection` (its custom derivative, the rounded operands' products): every
     order finite wherever float64 is a normal float32 and the masked grouped product as written is. Near the
     largest its primal overflows a partial sum the masked product does not (ledger 2711), that row's head
     adds the edge."""
-    from dew.nn.kernels import grouped_matmul
+    from dew.nn.kernels import xla_products
 
     primals = normal_draw(1564, (8, 16), (3, 16, 4), scale=EDGES[edge])
     direction = normal_draw(1565, (8, 16), (3, 16, 4), scale=EDGES[edge])
     (cotangent,) = normal_draw(1566, (8, 4))
     def projected(rows, matrices):
-        return grouped_matmul.portable_projection(rows, matrices, GROUPS, None, None)
+        return xla_products.portable_projection(rows, matrices, GROUPS, None, None)
 
     assert_contract(projected, primals, direction, cotangent, f"a portable grouped projection {edge}",
                     truth_fn=masked_grouped_product, plain_fn=masked_grouped_product)

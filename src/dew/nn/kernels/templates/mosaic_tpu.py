@@ -231,11 +231,12 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                ahead: Callable | None = None, settled: tuple[int, ...] = (),
                prefetched: Callable | None = None, registers: int | None = None,
-               producer: int | None = None) -> Callable:
+               producer: int | None = None, shared: int | None = None,
+               moves: bool | None = None) -> Callable:
         # A program a core, its operands and outputs left in HBM for its walks' copies; no cluster, and no
         # program's roles launched ahead of the last's or prefetched (a GPU's dependent launch); its compiler
         # holds its values, no register budget (`budgets_registers`).
-        del approx_math, reducing_warpgroups, resident, model_flops, registers, producer
+        del approx_math, reducing_warpgroups, resident, model_flops, registers, producer, shared, moves
         if ahead is not None or settled or prefetched is not None:
             raise NotImplementedError("a TPU program is launched after the last; none is ahead of it")
         _one(consumers, clustered=cluster > 1)
@@ -322,9 +323,9 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             raise ValueError("a TPU ring's streams take their views where they open (its walk copies)")
         return Streams(allocated, views)
 
-    def stream(self, streams, views, lo, hi, *, adds: tuple | None = None) -> None:
+    def stream(self, streams, views, lo, hi) -> None:
         # No producer role: the walk issues its own copies.
-        del streams, views, lo, hi, adds
+        del streams, views, lo, hi
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,

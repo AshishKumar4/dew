@@ -7,11 +7,11 @@ only where CI keeps the whole output and a native backtrace of any task a signal
 A collector (`collect`) starts before pytest, outside it. A small library preloaded into every test process
 (`SHIM`) catches those signals after faulthandler has written the Python stacks (faulthandler puts back the
 action it found and raises the signal again) and does only what is safe in a dying process: it writes its id
-to the collector's pipe and waits, bounded, for the collector's word that py-spy has read every thread's
-native and Python frames from outside it; then it dies by the same signal, so the exit is unchanged. Nothing
-runs in the faulting process that could need a lock it holds (no fork, no allocation, no unwinding in it). The
-library is built with the container's C compiler once a process; where none builds it, or no collector runs,
-the task says so and runs as before."""
+to the collector's pipe and waits, bounded, for the collector's word that pystack (py-spy where it reads none)
+has read every thread's native and Python frames from outside it; then it dies by the same signal, so the exit
+is unchanged. Nothing runs in the faulting process that could need a lock it holds (no fork, no allocation, no
+unwinding in it). The library is built with the container's C compiler once a process; where none builds it,
+or no collector runs, the task says so and runs as before."""
 
 import functools
 import os
@@ -53,7 +53,24 @@ static size_t digits(char *out, long value) {
     return count;
 }
 
+/* done_dir/<name><this process's id>: the path a signalled process's marks are at. */
+static size_t marked(char *out, const char *name) {
+    size_t at = strlen(done_dir), named = strlen(name);
+    memcpy(out, done_dir, at);
+    memcpy(out + at, name, named);
+    at += named;
+    at += digits(out + at, (long)getpid());
+    out[at] = '\0';
+    return at;
+}
+
 static void caught(int signum) {
+    /* Seen first, whatever comes of its read: one never read (its word left in the pipe as the collector
+       ended) counts as unread (review, 2026-11-13). */
+    char seen[4200];
+    marked(seen, "/seen.");
+    int mark = open(seen, O_CREAT | O_WRONLY, 0644);
+    if (mark >= 0) close(mark);
     int fd = open(pipe_path, O_WRONLY | O_NONBLOCK);
     if (fd >= 0) {
         char line[64], done[4200];
@@ -64,12 +81,7 @@ static void caught(int signum) {
         ssize_t ignored = write(fd, line, length);
         (void)ignored;
         close(fd);
-        size_t at = strlen(done_dir);
-        memcpy(done, done_dir, at);
-        memcpy(done + at, "/done.", 6);
-        at += 6;
-        at += digits(done + at, (long)getpid());
-        done[at] = '\0';
+        marked(done, "/done.");
         struct timespec pause = {0, 100000000};
         struct stat held;
         for (int wait = 0; wait < armed_waits && stat(done, &held) != 0; wait++) nanosleep(&pause, NULL);
@@ -106,10 +118,11 @@ PYSTACK = ("uv", "tool", "run", "--quiet", "--from", "pystack==1.7.2", "pystack"
 """Bloomberg's pystack, which unwinds every OS thread of a live process from outside it, native frames and
 Python frames both, a thread with no Python state too (an XLA worker's abort): py-spy's native mode reads only
 the threads Python knows (review, 2026-11-13). Fetched by uv into its cache as a run's collector starts
-(`collect`), so a crash waits on no download."""
+(`collect`), so a crash waits on no download; pyproject's test extra takes it with the next environment change
+(train 791's review, F7: a lock change is a new environment, which waits for the next pin's train)."""
 COLLECT_SECONDS = 60
-"""How long a dying process waits for its stacks to be read (`SHIM`), and py-spy has to read them (`collect`).
-"""
+"""How long a dying process waits for its stacks to be read (`SHIM`), and pystack or py-spy has to read them
+(`collect`)."""
 
 
 @functools.cache
@@ -140,6 +153,7 @@ class Capture:
         self.stacks_file = self.where / "stacks.txt"
         self.variables: dict[str, str] = {}
         self.collector: subprocess.Popen | None = None
+        self.signalled = 0
         library, self.why = built()
         spy = spy.resolve()
         if library is None:
@@ -175,17 +189,35 @@ class Capture:
                 self.collector.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.collector.kill()
-        if self.stacks_file.is_file():
-            return self.stacks_file.read_text(errors="replace")
-        return f"no native stacks were captured: {self.why}\n" if self.why else ""
+        read = self.stacks_file.read_text(errors="replace") if self.stacks_file.is_file() else (
+            f"no native stacks were captured: {self.why}\n" if self.why else "")
+        # Each process a signal ended, read or not: its handler marks it first (`SHIM`).
+        self.signalled = len(list(self.done.glob("seen.*"))) if self.done.is_dir() else 0
+        shutil.rmtree(self.where, ignore_errors=True)
+        return read
+
+    def evidence(self, stacks: str) -> dict[str, str]:
+        """What a red row says of its capture (`stacks`, what it read): `capture`, "armed", or why it was not;
+        and where a signal ended a process of it, `natives`, "read" where every such process's stacks were
+        read, else "unread". The land queue publishes a red that does not repeat only on both (bible §88)."""
+        held = stacks.count(f"): {HELD}\n")
+        ended = max(self.signalled, stacks.count(" ended by signal "))
+        return {"capture": "armed" if self.variables else self.why or "not armed",
+                **({"natives": "read" if held == ended else "unread"} if ended else {})}
 
 
-def read(pid: str, spy: Path, warm: subprocess.Popen, began: float) -> str:
+UNREAD = "no native stack was read"
+"""What the collector's header says of a signalled process none of whose stacks it read (`collect`)."""
+HELD = "its threads' native stacks"
+"""What it says of one whose stacks it read."""
+
+
+def read(pid: str, spy: Path, warm: subprocess.Popen, began: float) -> tuple[str, bool]:
     """Every thread's stack of the stopped process `pid`, read from outside it within the time its handler
     waits (`COLLECT_SECONDS` from `began`): pystack's (`PYSTACK`), each OS thread's native and Python frames,
     once its fetch (`warm`) has ended, so a first crash's read waits on the download rather than racing it
     (review, 2026-11-13); py-spy's (`spy`), which reads Python's threads alone, with what time is left where
-    pystack read none."""
+    pystack read none; and whether either read them."""
     def left() -> float:
         return COLLECT_SECONDS - 5 - (time.monotonic() - began)
 
@@ -204,9 +236,9 @@ def read(pid: str, spy: Path, warm: subprocess.Popen, began: float) -> str:
             said.append(f"{command[:7]} read nothing: {error}")
             continue
         if done.returncode == 0 and done.stdout.strip():
-            return done.stdout
+            return done.stdout, True
         said.append(f"{command[:7]} read nothing: {done.stderr.strip()[-300:]}")
-    return "\n".join(said)
+    return "\n".join(said), False
 
 
 def collect(pipe: Path, done: Path, stacks: Path, spy: Path) -> None:
@@ -223,11 +255,11 @@ def collect(pipe: Path, done: Path, stacks: Path, spy: Path) -> None:
             if len(parts) != 2 or not all(part.isdigit() for part in parts):
                 continue
             pid, signum = parts
-            frames = read(pid, spy, warm, began)
+            frames, held = read(pid, spy, warm, began)
             with stacks.open("a") as out:
                 at = time.strftime("%H:%M:%SZ", time.gmtime())
-                out.write(f"== process {pid} ended by signal {signum} ({at}): its threads' native stacks\n"
-                          f"{frames}\n")
+                header = HELD if held else UNREAD
+                out.write(f"== process {pid} ended by signal {signum} ({at}): {header}\n{frames}\n")
             (done / f"done.{pid}").touch()
 
 

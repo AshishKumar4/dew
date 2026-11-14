@@ -77,7 +77,7 @@ SCALE_DEPTH = 128
 """The depth one block scale of a blockwise-scaled FP8 product covers: DeepSeek-V3's 1 x 128 activation and
 128 x 128 weight blocks (row 4518), each block's fp32 partial times its scales before its add. The template's
 step-scaled launches step it whole (`gemm.mosaic_gpu.gmm`'s and `tgmm`'s `step_scales`), and the portable
-product sums it a block at a time (`grouped_matmul.step_scaled`)."""
+product sums it a block at a time (`xla_products.step_scaled`)."""
 
 SUMMED_DEPTH = 128
 """The depth an exactly summed partial covers on a family whose accumulator carries across steps
@@ -108,7 +108,7 @@ def promoted(*, above: bool, outputs: tuple) -> bool:
     float64 at 8192 tokens and at depths of 128 to 2048 on an A100 and an H100 (M-EM-3), where its exact
     sums, 40 to 60 times closer to float64 than the reference, cost an H100 1.10-2.06x their time (W124) and
     an A100 the 128 x 128 tile; row 4331's premise (M-NS-1: 1.661x XLA's error at depth 128, 3.88x at 512)
-    did not reproduce. An underfilled wave's split of the contraction (`gemm.mosaic_gpu.split_count`)
+    did not reproduce. An underfilled wave's split of the contraction (`gemm.pricing.split_count`)
     shortens each sum as cuBLAS's split-K does. An FP8 product promotes apart whatever its outputs
     (`declared`)."""
     return above and jnp.dtype(jnp.float32) in {jnp.dtype(dtype) for dtype in outputs}

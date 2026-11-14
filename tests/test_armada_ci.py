@@ -189,6 +189,26 @@ def test_a_task_states_the_same_key_in_every_plan_that_cuts_it_whatever_its_name
     assert set(cold) == set(before) and all(cold[rows][0] != before[rows][0] for rows in before)
 
 
+def test_the_tested_pythons_are_named_once_and_a_collection_gate_for_another_set_is_refused(
+        ci, tmp_path, monkeypatch):
+    """`pythons --check` holds every file that names the tested Pythons to PYTHONS, the collection gates of
+    tools/check_gates among them: a gate for a Python no environment is built for fails every pull request,
+    and one missing collects nowhere (train 805's review, F1)."""
+    (tmp_path / "tools").mkdir()
+    (tmp_path / ".python-version").write_text(f"{ci.PYTHONS[0]}\n")
+    (tmp_path / ".armada.json").write_text(json.dumps({"environment": {"smoke": " && ".join(
+        f".venv-{version}/bin/python -c 'import dew'" for version in ci.PYTHONS)}}))
+    monkeypatch.setattr(ci, "REPO", tmp_path)
+
+    def gates(*versions: str) -> int:
+        (tmp_path / "tools/check_gates").write_text("".join(
+            f"collect-{version}\t.venv-{version}/bin/python -m pytest --co tests\n" for version in versions))
+        return ci.pythons(check=True)
+
+    assert gates(*ci.PYTHONS) == 0
+    assert gates(ci.PYTHONS[0]) == 1 and gates(*ci.PYTHONS, "3.15") == 1
+
+
 def test_the_newest_pythons_collection_is_planned_within_the_target_at_the_slowest_rate_it_ran_at(
         ci, tmp_path, monkeypatch):
     """Each collect task holds at most the target's seconds of files at the slowest per-file rate armada
@@ -401,10 +421,12 @@ def test_a_file_pytest_reports_nothing_of_is_red_unless_its_collection_shows_eve
 
 
 def install_compiler(directory: Path) -> None:
-    """A kernel's compiler under `directory`, named as the CUDA toolkit installs it (ptxas)."""
+    """A kernel's compiler and disassembler under `directory`, named as the CUDA toolkit installs them (ptxas,
+    nvdisasm), and imageio-ffmpeg's bundled ffmpeg."""
     directory.mkdir()
-    (directory / "ptxas").write_text("#!/bin/sh\necho 'ptxas: NVIDIA (R) Ptx assembler'\n")
-    (directory / "ptxas").chmod(0o755)
+    for name in ("ptxas", "nvdisasm", "ffmpeg-linux-x86_64-v7.0.2"):
+        (directory / name).write_text(f"#!/bin/sh\necho '{name}'\n")
+        (directory / name).chmod(0o755)
 
 
 def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_for_a_gpu(
@@ -420,8 +442,9 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     (test_a_python_child_joins_its_files_record), a shell's or any
     multiprocessing context's, has no key, so it is in, and no task reuses
     its row, whatever names its program (a descriptor, for `os.execve`); one
-    that asked a native tool about the host or compiled a kernel with ptxas
-    (`followed.TOOLS`) keeps its key. The command line
+    that asked a native tool about the host, compiled a kernel with ptxas and
+    read it back with nvdisasm, or ran imageio-ffmpeg's ffmpeg (`followed.TOOLS`)
+    keeps its key. The command line
     spreads the tier over its shards, each file once, and per batch names
     the files the checkout marks for a GPU."""
     url, stored, _ = cache_worker
@@ -453,6 +476,9 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
                         "def test_tool():\n"
                         "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n"
                         "    subprocess.run(['tests/compiler/ptxas', '--version'], check=True)\n"
+                        "    subprocess.run(['tests/compiler/nvdisasm', '-c', 'k.cubin'], check=True)\n"
+                        "    subprocess.run(['tests/compiler/ffmpeg-linux-x86_64-v7.0.2', '-i', 'a.wav'],\n"
+                        "                   check=True)\n"
                         "    assert platform.platform()\n",
         "test_shell.py": "import os, subprocess, sys\n"
                          "def test_shell(): subprocess.run('git --version', shell=True, check=True)\n"
@@ -903,9 +929,9 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
 @pytest.mark.parametrize(("changed", "policy"), [
     ({"src/pkg/mod.py": "VALUE = 2\n"}, "on"), ({"docs/page.md": "page\n"}, "on"),
     ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "on"),
-    ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "off"), ({"locks/cpu.txt": "jax==9\n"}, "off"),
-    ({"tools/armada/session.py": "# the session\n"}, "off"),
-    ({"tools/armada/executed.py": "# the recorder\n"}, "off"),
+    ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "cold"), ({"locks/cpu.txt": "jax==9\n"}, "cold"),
+    ({"tools/armada/session.py": "# the session\n"}, "cold"),
+    ({"tools/armada/executed.py": "# the recorder\n"}, "cold"),
     ({".github/workflows/ci.yml": "on: []\n"}, "on"),
     ({"Makefile": "all:\n"}, "off"),
     ({"CHANGELOG.md": "# Changes\n\n- an entry\n"}, "on"),
@@ -913,10 +939,10 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({"stubs/pkg/__init__.pyi": "VALUE: int\n"}, "on"), ({"licenses/NOTICE": "notice\n"}, "on"),
     ({".thresh/seams.toml": "[seam]\n"}, "on"), ({"MANIFEST.in": "include LICENSE\n"}, "on"),
     ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 400}\n'}, "on"),
-    ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "2"}, "pool": 160}\n'}, "off"),
+    ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "2"}, "pool": 160}\n'}, "cold"),
     ({"tools/armada/followed.py": '"""Followed, as each run reads."""\n\n\n# A note.\ndef read(path):\n'
                                   '    return path\n'}, "on"),
-    ({"tools/armada/followed.py": '"""Followed."""\n\n\ndef read(path):\n    return [path]\n'}, "off"),
+    ({"tools/armada/followed.py": '"""Followed."""\n\n\ndef read(path):\n    return [path]\n'}, "cold"),
 ], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
         "the test session", "the recorder", "a workflow", "a file no record places", "the changelog",
         "a native kernel package's wrapper", "a type stub", "a license", "thresh's annotations",
@@ -925,14 +951,15 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
 def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(
         ci, tmp_path, changed, policy):
     """CI's test cache policy for a change from main: each file's own inputs decide ('on') where the records
-    place what changed, a tool and a workflow among them, and every file runs ('off') for a change to what
-    every test process runs or reads, or to a file the records do not place. .armada.json's pool decides
-    where tasks run, not what a test sees (owner, 2026-10-27: a pool change reran every file), and a workflow
-    is an input of the files that read it alone (the maintainer, 2026-10-28: 5 of 10 trains ran with the cache
-    off, and 0.75% of rows were reused). The recorder (executed.py, followed.py, watched.py) stays every
-    file's input: an old record may lack a dependency a new recorder finds, by its code alone, so an edit of
-    what it says of itself keeps the cache on (Main, 2026-11-07: 12 of 20 trains ran cold on harness
-    edits)."""
+    place what changed, a tool and a workflow among them; every file runs ('off') for a change to a file the
+    records do not place; and for a change to what every test process runs or reads, which every key covers,
+    every file runs cold with its rows looked up ('cold'), so a round on the same inputs finds the first's.
+    .armada.json's pool decides where tasks run, not what a test sees (owner, 2026-10-27: a pool change reran
+    every file), and a workflow is an input of the files that read it alone (the maintainer, 2026-10-28: 5 of
+    10 trains ran with the cache off, and 0.75% of rows were reused). The recorder (executed.py, followed.py,
+    watched.py) stays every file's input: an old record may lack a dependency a new recorder finds, by its
+    code alone, so an edit of what it says of itself keeps the cache on (Main, 2026-11-07: 12 of 20 trains ran
+    cold on harness edits)."""
     armada = '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}\n'
     for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
                        "locks/cpu.txt": "jax==1\n", ".armada.json": armada,
@@ -984,6 +1011,76 @@ def test_a_fold_that_moves_a_test_between_groups_runs_each_test_once_in_its_new_
     (tmp_path / "runs").write_text("")
     assert run() == {"3.12:tests/test_moved.py#1/2": nodes[:2], "3.12:tests/test_moved.py#2/2": nodes[2:]}
     assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2"]
+
+
+def test_a_split_file_keeps_its_stored_cut_and_its_groups_records_whatever_armada_measured(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A split file runs as the cut main's CI last ran it (tests/test_cuts.json, which the durations fold
+    alone keeps or replaces), whatever armada's timings would cut it into: its groups keep their names and
+    their tests, so each finds its green record and runs nothing (Main, 2026-11-13: 43% of the plan's rows had
+    no record, a split file cut into 175 groups by one run's timings and 172 by the next's, no input changed).
+    A fold whose groups fit keeps the cut; a whole run drops it."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
+    nodes = [f"tests/test_steady.py::test_{index}" for index in range(3)]
+    (tmp_path / "tests/test_steady.py").write_text(
+        "from pathlib import Path\n"
+        + "".join(f"def test_{index}():\n    with Path('runs').open('a') as runs: runs.write('{index}')\n"
+                  for index in range(3)))
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict(zip(nodes, [300.0, 100.0, 100.0],
+                                                                           strict=True))))
+    (tmp_path / "tests/test_cuts.json").write_text(json.dumps({"tests/test_steady.py": [nodes[1]]}))
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+    groups = {"3.12:tests/test_steady.py#1/2": nodes[:1], "3.12:tests/test_steady.py#2/2": nodes[1:]}
+
+    def run(timings: dict | None = None) -> dict[str, list[str]]:
+        rows = armada_task(ci, monkeypatch, verdict, ci.policy(base), timings=timings)
+        assert all(row["exitCode"] == 0 for row in rows)
+        return {row["name"]: sorted(row["tests"]) for row in rows}
+
+    assert run() == groups
+    # Armada last measured the file as three groups, each within the target: cut by those timings, the plan
+    # would run it as three groups that no record names.
+    measured = {"rows": {f"3.12:tests/test_steady.py#{group}/3": seconds
+                         for group, seconds in ((1, 300.0), (2, 100.0), (3, 100.0))}}
+    (tmp_path / "runs").write_text("")
+    assert run(measured) == groups
+    assert (tmp_path / "runs").read_text() == ""
+    # Main's CI ran the stored cut green within its bounds: the fold keeps it; run whole within them, it
+    # drops it.
+    main_ci = tmp_path / ".verdict/main.json"
+    main_ci.write_text(json.dumps({"sha": base, "part": "all", "rows": [
+        {"name": "3.12:tests/test_steady.py#1/2", "exitCode": 0, "seconds": 310.0,
+         "tests": {nodes[0]: 310.0}},
+        {"name": "3.12:tests/test_steady.py#2/2", "exitCode": 0, "seconds": 190.0,
+         "tests": {nodes[1]: 95.0, nodes[2]: 95.0}}]}))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(main_ci)])
+    assert ci.main() == 0
+    assert json.loads((tmp_path / "tests/test_cuts.json").read_text()) == {"tests/test_steady.py": [nodes[1]]}
+    main_ci.write_text(json.dumps({"sha": base, "part": "all", "rows": [
+        {"name": "3.12:tests/test_steady.py", "exitCode": 0, "seconds": 400.0,
+         "tests": {nodes[0]: 250.0, nodes[1]: 75.0, nodes[2]: 75.0}}]}))
+    assert ci.main() == 0
+    assert json.loads((tmp_path / "tests/test_cuts.json").read_text()) == {}
+
+
+def test_a_stored_cut_a_group_of_which_has_outgrown_its_bound_is_cut_afresh(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A stored cut one of whose groups the record now times past `session.KEPT` of the target is not run as
+    it is: the plan and its tasks cut the file afresh alike, so a group past its deadline, which no green run
+    would fold away, never runs again as stored (train 793's review)."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
+    nodes = [f"tests/test_steady.py::test_{index}" for index in range(3)]
+    (tmp_path / "tests/test_steady.py").write_text("".join(f"def test_{index}():\n    pass\n"
+                                                           for index in range(3)))
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict(zip(nodes, [300.0, 200.0, 100.0],
+                                                                           strict=True))))
+    # Stored as [test_0, test_1] and [test_2]: its first group's 500 s is past 1.5 x 300.
+    (tmp_path / "tests/test_cuts.json").write_text(json.dumps({"tests/test_steady.py": [nodes[2]]}))
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(commit(tmp_path, "base")))
+    assert {row["name"]: sorted(row["tests"]) for row in rows} == {
+        "3.12:tests/test_steady.py#1/2": nodes[:1], "3.12:tests/test_steady.py#2/2": nodes[1:]}
 
 
 def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cuts_them(
@@ -1328,8 +1425,12 @@ def test_a_changed_workflow_reruns_only_the_files_that_read_it(ci, tmp_path, mon
     (tmp_path / "tools/armada/executed.py").write_text("# the recorder, as it records now\n")
     git(tmp_path, "add", "tools/armada/executed.py")
     commit(tmp_path, "the recorder changes")
-    assert ci.policy(base) == "off"
-    assert run("on") == [3, 2]
+    assert ci.policy(base) == "cold"
+    assert run() == [3, 2]
+    # A round on the same inputs, a train composed again, finds the rows the first ran green under them: the
+    # policy 'cold' looks rows up, every key holding the recorder (owner, 2026-11-13: train 793's second round
+    # reran all 4,113 tasks its first had run under the same inputs).
+    assert run() == [3, 2]
 
 
 def test_a_run_that_read_its_limits_runs_again_where_they_change(ci, tmp_path, monkeypatch, cache_worker):

@@ -273,6 +273,12 @@ def selective_cells() -> list[Cell]:
                functools.partial(selective_template.the_layer_is_as_exact_under_the_template, packed, held),
                "sm90", native={"documents": "packed" if packed else "one", "state": str(held)})
           for packed, held in ((False, None), (True, None), (False, "through the template"))),
+        # A forked call: its documents' states taken from and stored to its table across a program's chunks,
+        # each read back by threads other than its writers' (`Family.kept`, `mosaic.synced`).
+        *(Cell(f"the selective template is as exact over a forked call: {layout}",
+               functools.partial(selective_template.the_template_is_as_exact_over_a_forked_call, layout),
+               "sm90")
+          for layout in selective_template.FORKED),
     ]
 
 
@@ -307,8 +313,11 @@ def forked_cells() -> list[Cell]:
 
 
 def fp32_template_cells() -> list[Cell]:
-    """The template's fp32 forward and training step at the default precision on each GPU's instruction
-    family, in a user's process (`USERS`), where the default precision is JAX's own."""
+    """The template's fp32 forward and training step at the default precision (the fast forms, `formed`'s) on
+    each GPU's instruction family, in a user's process (`USERS`), where the default precision is JAX's own:
+    its products round as each family rounds an fp32 operand (mma.sync's TF32 'rna', a warpgroup MMA's TF32
+    read; the owner's "tf32 default") and its exponentials are ex2.approx's, which the interpreter computes
+    exactly."""
     return [
         # The fp32 forward each instruction family takes at a GPU's widths (an sm80's, an sm90's, an sm100's;
         # jsf-fp32-taken), its training an sm90's alone.

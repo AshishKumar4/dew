@@ -178,11 +178,12 @@ def pytest_runtest_makereport(item, call):
         gate.SWITCHED.clear()
         outcome.get_result().user_properties.append(switched)
         item.user_properties.append(switched)
-    # What the FP8 sites this test judged below a named arm measured (`reference_error.BELOW`), the JUnit
+    # What the FP8 sites this test judged below a named arm measured (`fp8_below.BELOW`), the JUnit
     # property `fp8_below`: each form's ratio to that arm and to the dequantized reference, of a pass too.
-    if call.when == "call" and gate is not None and gate.BELOW:
-        below = ("fp8_below", json.dumps(gate.BELOW))
-        gate.BELOW.clear()
+    fp8 = sys.modules.get("fp8_below")
+    if call.when == "call" and fp8 is not None and fp8.BELOW:
+        below = ("fp8_below", json.dumps(fp8.BELOW))
+        fp8.BELOW.clear()
         outcome.get_result().user_properties.append(below)
         item.user_properties.append(below)
     # A test of a process that computes as a user's does (`lane_environment.USERS_ARITHMETIC`, set for

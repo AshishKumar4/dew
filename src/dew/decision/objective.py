@@ -524,7 +524,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         term = self.input_terms(variables, inputs, batch, step) if self.input_lm else None
         loss = self._with_input_term(loss, term)
         if term is not None:
-            aux = replace(aux, metrics={**aux.metrics, "input_ce": term.mean()[0]})
+            aux = replace(aux, metrics={**aux.metrics, "input_ce": term})
         qk, inspected = step.observed(sown)
         return loss, replace(aux, qk_stats=qk, inspected=inspected)
 
@@ -694,8 +694,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         charges, passes = [charge for charge, _ in charged], tuple(logits for _, logits in charged)
         logits = passes[-1]
         correct = (jnp.argmax(logits, axis=-1) == batch["labels"]).astype(jnp.float32)
-        accuracy, _ = self.accuracy(correct, batch, scored).mean()
-        metrics = {"accuracy": accuracy}
+        metrics: dict[str, jax.Array | Ratio] = {"accuracy": self.accuracy(correct, batch, scored)}
         if self.exit_entropy is None or len(passes) == 1:
             charge = self._weighed(charges)
         else:
@@ -704,8 +703,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             hazards = [jnp.take_along_axis(gate, at, axis=1) for gate in gates]
             charge, expected, entropy = exit_objective(charges, hazards, self.exit_entropy, charges[-1].dtype)
             counted = self.row_mean(scored, batch).total
-            metrics["exit_ce"] = Ratio(self.row_mean(expected * scored, batch).total, counted).mean()[0]
-            metrics["exit_entropy"] = Ratio(self.row_mean(entropy * scored, batch).total, counted).mean()[0]
+            metrics["exit_ce"] = Ratio(self.row_mean(expected * scored, batch).total, counted)
+            metrics["exit_entropy"] = Ratio(self.row_mean(entropy * scored, batch).total, counted)
         loss = Ratio(self.row_mean(charge * scored, batch).total, self.row_mean(scored, batch).total)
         if not self.consistency:
             return loss, Aux(metrics=metrics)
@@ -717,7 +716,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         divergence, members = self._weighed([divergence for divergence, _ in divided]), divided[-1][1]
         term = Ratio(self.row_mean(divergence, batch).total, self.row_mean(members, batch).total)
         return (Weighted((loss, term), (1.0, self.consistency)),
-                Aux(metrics={**metrics, "consistency": term.mean()[0]}))
+                Aux(metrics={**metrics, "consistency": term}))
 
     def _weighed(self, terms: list[jax.Array]) -> jax.Array:
         """The passes' terms at their weights (`passes.weighed`), the last pass's where the loss weighs none

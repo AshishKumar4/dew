@@ -31,15 +31,16 @@ from jax.experimental.profiler import get_profiled_instructions_proto
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
+from dew._devices import device_memory
 from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
-from dew.nn.kernels.options import compiler_options, program, program_digest
+from dew.nn.kernels.options import OuterProgram, compiler_options, owned_program, program_digest
 from dew.nn.kernels.templates import report
-from dew.objectives.base import RECORD, Objective
+from dew.objectives.base import RECORD, Objective, Pooled
 from dew.state import TrainState, apart, together
 from dew.telemetry.compiles import EVENTS, Compiles
 from dew.telemetry.instrumentation import compiled_memory
@@ -58,6 +59,7 @@ from dew.training.memory import (
     judged,
     local_devices,
     offloads,
+    placeable,
     pooled_headroom,
     recompute_more,
     recompute_record,
@@ -67,6 +69,7 @@ from dew.training.memory import (
     step_fits,
     temporaries_factor,
 )
+from dew.training.model_flops import TOKENS, TRAINING_FLOPS
 from dew.training.profiling import PGLE_CAPTURE
 
 if TYPE_CHECKING:
@@ -205,30 +208,72 @@ class SampledStep(NamedTuple):
     executable: jax.stages.Compiled
 
 
-@program
-def whole_step(outputs):
-    """A step's outputs from those of the microbatches it was read in: the
-    last one's loss, pooled over the window where it commits, and its
-    report, as each step of an accumulating run reports its own
-    microbatch's; finite and accepted where every microbatch was; and the
-    commits' counts, tokens and norms summed, its inspection the latest
-    part's that committed (`interval.latest`), as a run's interval keeps
-    the latest sampled commit: a step of two commits (a window a rejection
-    left part filled, then the closing part of a run's last batch) reports
-    its second's summaries, never the two added."""
+def whole_step_program[L, E](objective: Objective[L, E]) -> OuterProgram:
+    """`whole_step` over `objective`'s statistics (`Objective.reduce_loss`), the one program a split step
+    runs on its microbatches' outputs, compiled under its towers' options, which a run compiled ahead
+    compiles with its step (`dew.training.ahead`)."""
+    return owned_program(functools.partial(whole_step, reduce=objective.reduce_loss,
+                                           shown=frozenset(objective.shown)), *objective.towers())
+
+
+def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
+                  shown: frozenset[str] = frozenset()):
+    """A step's outputs from those of the microbatches it was read in: its loss as an unsplit step logs it,
+    whatever the split (docs/design/training.md, the logged loss): where its last microbatch commits, the
+    update's, pooled over the window; elsewhere its own batch's, its microbatches' own statistics pooled
+    (`Committed.own`) and reduced by `reduce` (`Objective.reduce_loss`); its metrics pooled by their own
+    statistics (`_pooled`), a metric the objective shows (`shown`, which a run selects by) refused where it
+    states none; finite and accepted where every microbatch was; and the commits' counts,
+    tokens and norms summed, its inspection the latest part's that committed (`interval.latest`), as a
+    run's interval keeps the latest sampled commit: a step of two commits (a window a rejection left part
+    filled, then the closing part of a run's last batch) reports its second's summaries, never the two
+    added. A pure function, which a step compiles as a program of its own (`dew.training.compiler`) or
+    traces within its own (`dew.training.ahead`)."""
     losses, metrics, finite, accepted, committed = zip(*outputs, strict=True)
-    # A recording step's evaluations are every microbatch's, in the order they ran (`RECORD`).
-    report = {name: jnp.concatenate([part[name] for part in metrics]) if name.startswith(RECORD) else value
-              for name, value in metrics[-1].items()}
+    report = {name: _pooled(name, [part[name] for part in metrics]) for name in metrics[-1]}
+    if len(metrics) > 1:
+        # A metric that states no pooling is one microbatch's, named so (`Aux.metrics`); a shown one, which
+        # a run selects its best and its plateau by under its name, is refused.
+        unpooled = sorted(name for name in shown & set(report) if not isinstance(report[name], Pooled))
+        if unpooled:
+            raise ValueError(f"the objective shows {', '.join(unpooled)}, which state no pooling over the "
+                             "microbatches a step is read in; state each as a Ratio or Moments "
+                             "(`Aux.metrics`), or read the step whole (split=1)")
+        report = {(name if name.startswith(RECORD) or name in (TRAINING_FLOPS, TOKENS)
+                   or isinstance(value, Pooled) else f"{name}/last_microbatch"): value
+                  for name, value in report.items()}
+    loss = losses[-1]
+    if committed[-1].own is not None:
+        owns = [part.own for part in committed]
+        # Pooled as a window pools them (`Transaction.prepare_attempt`): a loss stated as one scalar as the
+        # mean of its equal microbatches', statistics by their sums.
+        scalar = all(isinstance(part, jax.Array) and part.ndim == 0 for part in owns)
+        own = reduce(jax.tree.map(lambda *values: sum(values), *owns))[0]
+        own = own / len(owns) if scalar else own
+        loss = jnp.where(committed[-1].count > 0, loss, own.astype(loss.dtype))
     summed = jax.tree.map(lambda *values: sum(values),
-                          *(dataclasses.replace(part, inspected=None) for part in committed))
+                          *(dataclasses.replace(part, inspected=None, own=None) for part in committed))
     sample = None
     for part in committed:
         if part.inspected is not None:
             sample = (part.count, part.inspected) if sample is None else latest(
                 (part.count, part.inspected), sample)
-    return (losses[-1], report, jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)),
+    # A pooled statistic leaves the step as its value, the number a caller reads (`Aux.metrics`).
+    report = {name: value.mean()[0] if isinstance(value, Pooled) else value for name, value in report.items()}
+    return (loss, report, jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)),
             dataclasses.replace(summed, inspected=None if sample is None else sample[1]))
+
+
+def _pooled(name: str, values: list):
+    """A step's metric `name` from its microbatches' `values`: a recording step's evaluations every
+    microbatch's in the order they ran (`RECORD`); a `Pooled` statistic by its own pooling
+    (`Pooled.pooled`); any other its last microbatch's (`Aux.metrics`), the model FLOPs and tokens among
+    them, which every microbatch counts of the whole batch it is read from (`step_counts`)."""
+    if name.startswith(RECORD):
+        return jnp.concatenate(values)
+    if isinstance(values[-1], Pooled):
+        return Pooled.pooled(values)
+    return values[-1]
 
 
 TRACING_COLLECTIONS = 50_000
@@ -412,11 +457,21 @@ def unplanned(probes: Sequence[Probe]) -> str:
 
 class PlanRefused(RuntimeError):
     """No candidate fits. `probes` holds every program the search compiled, including refusals, so
-    an offline gate reads failed admission evidence as objects rather than parsing the message."""
+    an offline gate reads failed admission evidence as objects rather than parsing the message, and
+    `allocators` what each local device's allocator stated as the search refused (`device_memory`): its
+    limit, its bytes in use, its largest free block and its pool, which the closest's headroom read."""
 
-    def __init__(self, probes: Sequence[Probe]):
-        self.probes = tuple(probes)
-        super().__init__(unplanned(self.probes))
+    def __init__(self, probes: Sequence[Probe], allocators: Sequence[Mapping[str, int]] = ()):
+        self.probes, self.allocators = tuple(probes), tuple(allocators)
+        gib = 1024 ** 3
+        read = [memory for memory in self.allocators if 'bytes_limit' in memory and 'bytes_in_use' in memory]
+        said = ""
+        if read:
+            tightest = min(read, key=placeable)
+            names = ('bytes_limit', 'bytes_in_use', 'largest_free_block_bytes', 'pool_bytes')
+            said = " Its tightest device's allocator: " + ", ".join(
+                f"{name} {tightest[name] / gib:.2f} GiB" for name in names if name in tightest) + "."
+        super().__init__(unplanned(self.probes) + said)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -731,9 +786,6 @@ class FitSearch[LossT, EffectsT]:
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
     is that program (`AheadOfTime.taken`), lowered as its own compile lowered it (`handed`: within its
     refusals, for its GPU, `fits_here`)."""
-    capacity: int | None = None
-    """The bytes a device that states none holds (`step_headroom`): a compile-only GPU's, as a step
-    compiled ahead for it states them (`AheadTarget.capacity`)."""
     derive: Callable[[int, bool], Candidate] | None = None
     """The step at a split, at the objective's rung and `narrow`, traced and not lowered, for its derived
     footprint (`dew.training.footprint`), which picks the search's first rung (`derived_start`); None
@@ -776,7 +828,7 @@ class FitSearch[LossT, EffectsT]:
     program's whole pass in seconds (`report.passes`), none the registry held before it searched."""
 
     def __post_init__(self):
-        self.factor = temporaries_factor(self.mesh, self.capacity)
+        self.factor = temporaries_factor(self.mesh)
         self.started = self.remat_rung()
         record = recompute_record(self.objective)
         # Whether any module the run trains sets its own remat, which it compiles at alone.
@@ -799,12 +851,14 @@ class FitSearch[LossT, EffectsT]:
         # Its derivation is its trace's (row 5479's 47 minutes were the derivation's own, 13 s since).
         # A rung fits where its most microbatches do; the derivation then finds its split there, which
         # alone is compiled where it is right (`derived_split`). A step that fits at its fewest fits at
-        # every split, at the rung it stands on: one derivation says so, and no rung is walked.
+        # every split, at the rung it stands on: one derivation says so, and no rung is walked. The plan's
+        # spills and refusals are those of its derivation's traces too: a launch certified as it traces
+        # (`report.certified`) refuses a spilling config there, before any compile.
+        seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
+        passed = len(report.passes())
         if not self.fits_at_fewest(candidates, first):
             self.derived_start(candidates[-1])
         first = self.derived_split(candidates, first)
-        seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
-        passed = len(report.passes())
         split = planned(candidates, first, self.fits, self.climb, self.likely,
                         functools.partial(self.fits, pruned=True))
         spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
@@ -816,7 +870,8 @@ class FitSearch[LossT, EffectsT]:
         passes: list[JSON] = list(report.passes()[passed:])
         self.kernels = {"spills": spills, "refused": refused, "rewrites": rewrites, "passes": passes}
         if split is None or self.fitted is None:
-            raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
+            allocators = [device_memory(device) for device in local_devices(self.mesh)]
+            raise PlanRefused(self.probes, allocators) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
 
     def above(self, candidates: Sequence[int], split: int) -> tuple[Probe, ...]:
@@ -914,7 +969,7 @@ class FitSearch[LossT, EffectsT]:
                                  "label": "unstated", "terms": None})
             if self.remat_set:
                 _log.warning("the run sets remat %s, and its devices state no memory to judge its footprint "
-                             "against (a CPU, or a compile-only GPU given no capacity), so the derivation "
+                             "against (a CPU), so the derivation "
                              "picks no plan and the compiles decide it", self.remat_rung())
             return "unstated", narrow
         # The last rung traced short, from whose footprint the rungs after it are bounded without a trace
@@ -980,7 +1035,7 @@ class FitSearch[LossT, EffectsT]:
 
         bounded = dataclasses.replace(footprint, resident=resident, held=footprint.held - copies,
                                       peak=most + copies, peak_lower=least)
-        return derived_headroom(bounded, devices, self.capacity, last.built - copies)
+        return derived_headroom(bounded, devices, last.built - copies)
 
     def judged(self, split: int, narrow: bool) -> int | None:
         """The derived headroom of the step at `split` and `narrow` at the objective's rung, traced once a
@@ -1021,7 +1076,7 @@ class FitSearch[LossT, EffectsT]:
     def headroom_bounds(self, candidate: Candidate) -> tuple[int, int] | None:
         """The least and most headroom `candidate`'s derived footprint leaves the pool (`derived_headroom`,
         the same on every process), None where it has none or no device states memory."""
-        return derived_headroom(candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built)
+        return derived_headroom(candidate.footprint, local_devices(self.mesh), candidate.built)
 
     def lowering(self, split: int) -> Candidate:
         """The step at `split` at the objective's rung and the search's `narrow`, lowered: from the
@@ -1148,10 +1203,9 @@ class FitSearch[LossT, EffectsT]:
         return self.derive is not None
 
     def judging(self) -> bool:
-        """Whether every process's devices judge a derived footprint (`memory.judged`) at the search's
-        capacity, each process answering alike: where one does not, every rung is unknown and no footprint
-        is traced."""
-        local = all(judged(device, self.capacity) for device in local_devices(self.mesh))
+        """Whether every process's devices judge a derived footprint (`memory.judged`), each process
+        answering alike: where one does not, every rung is unknown and no footprint is traced."""
+        local = all(judged(device) for device in local_devices(self.mesh))
         return all(from_every_process(local))
 
     def current(self) -> dict[str, JSON]:
@@ -1226,7 +1280,7 @@ class FitSearch[LossT, EffectsT]:
                     self.footprints.clear()
                     self.derivations.clear()
                     candidate = self.footprinted(split, candidate)
-            fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
+            fit, headroom = step_fits(executable, self.mesh, candidate.held, candidate.built)
             self.sampled = None
             if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:
                 # The sampled step compiled ahead with the step, lowered as its compile lowered it (`handed`),
@@ -1253,7 +1307,7 @@ class FitSearch[LossT, EffectsT]:
                     self.derivations.clear()
                 self.sampled = (None if compiled is None
                                 else SampledStep(program_digest(lowered[-1]), compiled))
-                fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
+                fit, headroom = step_fits(compiled, self.mesh, candidate.held, candidate.built)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
         foreseen = _judged_headroom(self.headroom_bounds(candidate))

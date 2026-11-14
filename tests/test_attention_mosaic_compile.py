@@ -16,7 +16,7 @@ from kernel_compile import gate_generations
 from test_attention_mosaic import BACKWARD_HOOKS, SHAPES, _check_backward, _residuals
 from test_attention_triton import SCORE_HOOKS, score_hooks
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
@@ -54,11 +54,15 @@ def _takes(generation_name: str, accurate: bool, hooks: str) -> bool:
                                                                                                  parametrized)
 
 
+COMPILED_HOOKS = [hooks for hooks in BACKWARD_HOOKS if hooks not in ("none", "resumed")]
+"""The score hooks whose launches the gates compile: every one but a resumed partial, an initial state as
+sinks are (`template.sinks`: a numerator of zeros), which a launch reads as arrays whatever their values, so
+its every kernel is the sinks' (the same module hash at each gate cell, 2026-11-12)."""
+
 BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in BACKWARD_GATED
                  for width in (64, 128, 256) for accurate in (False, True)]
 BACKWARD_GATE += [(generation_name, width, accurate, hooks) for generation_name in BACKWARD_GATED
-                  for width in (64, 128) for accurate in (False, True)
-                  for hooks in BACKWARD_HOOKS if hooks != "none"]
+                  for width in (64, 128) for accurate in (False, True) for hooks in COMPILED_HOOKS]
 BACKWARD_GATE += [("sm90", 256, False, "softcap")]
 BACKWARD_GATE = [case for case in BACKWARD_GATE if _takes(case[0], case[2], case[3])]
 SPILLING = {("sm86", 64, False, "temperature"), ("sm89", 64, False, "temperature")}
@@ -138,7 +142,7 @@ FORWARD_GATE = [(generation_name, width, training, "none") for generation_name i
                 for training in (template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT)]
 FORWARD_GATE += [(generation_name, width, training, hooks) for generation_name in GATED for width in (64, 128)
                  for training in (template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT)
-                 for hooks in BACKWARD_HOOKS if hooks != "none"]
+                 for hooks in COMPILED_HOOKS]
 FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for generation_name in GATED]
 FORWARD_GATE = [(*case, jnp.bfloat16) for case in FORWARD_GATE]
 FORWARD_GATE += [(generation_name, width, training, "none", jnp.float16) for generation_name in GATED
@@ -566,3 +570,130 @@ def test_an_fp16_backward_compiles_spill_free_as_its_model_decides(width):
         found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config))], "sm90")
     failed = mosaic_failures(found) + undercounts(found)
     assert not failed, "\n".join(failed)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("kept", [template.Kept.SPLIT, template.Kept.NONE], ids=["training", "inference"])
+@pytest.mark.parametrize("rows", [2, 1], ids=["step", "decision"])
+def test_each_tcgen05_forward_the_4b_steps_refusals_derive_lowers_for_a_b200(rows, kept):
+    """Qwen3.5-4B's attention (16 query heads over 4, 256 wide, 12,288 causal tokens: its step's two rows and
+    the planner's one-row decision) on a compile-only B200: each config its derivation offers on tcgen05's
+    chunks as a compile refuses the one before (`report.refuse_launch`, a spill's refusal) lowers, so a
+    refusal never steps the step onto a forward it cannot build (the B200 4B step, its spill refused onto 64 x
+    128 keys at 16 value columns, raised at its values' padded operand)."""
+    from dew.nn.kernels.templates import report
+
+    tokens, heads, kv_heads, width = 12288, 16, 4, 256
+    spans = template.spans(tokens, tokens, rows, causal=True)
+    query = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
+
+    def forward(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None, residuals=kept)
+
+    with generation.assumed("sm100"), report.refusals():
+        target = generation.gpu_target()
+        op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        ba = op.bind(*args, residuals=kept, interpret=False)
+        offered = 0
+        while (config := op.derived(ba, target)) is not None and config.family == "tcgen05.chunks":
+            with tuning.pinned({attention_mosaic.MosaicForward: config}):
+                jax.jit(forward).trace(query, key, key).lower(lowering_platforms=("cuda",))
+            report.refuse_launch(op, ba, config, {"attention_forward"})
+            offered += 1
+        assert offered
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("kept", [template.Kept.SPLIT, template.Kept.NONE], ids=["training", "inference"])
+@pytest.mark.parametrize("rows", [2, 1], ids=["step", "decision"])
+def test_the_4b_steps_forward_compiles_spill_free_on_tensor_memory_for_a_b200(rows, kept):
+    """Qwen3.5-4B's attention forward (16 query heads over 4, 256 wide, 12,288 causal tokens: the step's two
+    rows and the planner's one-row decision) at the config its derivation gives on a compile-only B200: on a
+    tensor-memory family, every launch compiled by ptxas spilling nothing, its register model's decision
+    ptxas's (`mosaic_failures`). A B200's 4B step stepped through 19 spilling chunks forwards for 42 minutes
+    and landed on the Ampere family's."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures, undercounts
+
+    tokens, heads, kv_heads, width = 12288, 16, 4, 256
+    spans = template.spans(tokens, tokens, rows, causal=True)
+    query = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
+
+    def forward(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None, residuals=kept)
+
+    with generation.assumed("sm100"):
+        op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        config = op.derived(op.bind(*args, residuals=kept, interpret=False), generation.gpu_target())
+        assert config is not None and config.family.startswith("tcgen05"), config
+        case = KernelCase("4B forward", lambda: (forward, (query, key, key)))
+        found = compile_mosaic_kernels([case], "sm100")
+    failed = mosaic_failures(found) + undercounts(found)
+    assert not failed, "\n".join(failed)
+
+
+CERTIFIED_FORWARD = """
+import json
+import jax
+import jax.numpy as jnp
+from kernel_compile import lowered_for
+from dew.nn.kernels.templates import attention as template, attention_mosaic, report
+from dew.training.ahead import compile_only_gpus
+
+tokens, heads, kv_heads, width = 640, 4, 2, 128
+spans = template.spans(tokens, tokens, 1, causal=True)
+query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16)
+key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16)
+with report.certifying(compile_only_gpus("sm90")[0]):
+    lowered_for(lambda q, k, v: attention_mosaic.forward(q, k, v, spans, None), (query, key, key), "sm90")
+print(json.dumps([[found.op, found.stored, {name: module for name, (module, _) in found.kernels.items()}]
+                  for found in report.certifications()]))
+"""
+"""A start's lowering of an H100's attention forward in a process of its own, each launch certified on a
+compile-only H100: each certification's op, whether its verdict was read back, and its kernels' modules."""
+
+
+@COMPILES_ON_CPU
+def test_a_launch_is_certified_once_a_machine(tmp_path):
+    """A launch certified by one process (`report.certified`: compiled alone, its verdict stored with the
+    kernel picks) is certified in the next on the same machine by its stored verdict, nothing compiled, the
+    same kernels by module: a warm start pays nothing to certify."""
+    from process_support import fresh, keeping_picks
+
+    def certified(found: list) -> list:
+        return sorted((op, sorted(modules.items())) for op, _, modules in found)
+
+    cold = fresh(CERTIFIED_FORWARD, cache_dir=tmp_path, flags=keeping_picks())
+    warm = fresh(CERTIFIED_FORWARD, cache_dir=tmp_path, flags=keeping_picks())
+    assert cold and not any(stored for _, stored, _ in cold), cold
+    assert all(stored for _, stored, _ in warm), warm
+    assert certified(warm) == certified(cold)
+
+
+@COMPILES_ON_CPU
+def test_a_start_runs_the_kernels_its_launches_certified():
+    """A launch's derived config certified as it traces (`report.certified`: its kernels compiled alone as
+    the GPU's compiler assembles them) on a compile-only B200, and then compiled within its program: every
+    Mosaic GPU kernel the program runs is one certification compiled, module for module (its kernel hash),
+    which Mosaic compiles once a process, so certification adds a start no second assembly."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    tokens, heads, kv_heads, width = 1600, 4, 2, 128
+    spans = template.spans(tokens, tokens, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16)
+
+    def forward(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None)
+
+    found = compile_mosaic_kernels([KernelCase("a start's forward", lambda: (forward, (query, key, key)))],
+                                   "sm100")
+    assert mosaic_failures(found) == []
+    record, = found
+    run = record["modules"]
+    assert run and {name: record["certified"].get(name) for name in run} == run

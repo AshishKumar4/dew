@@ -83,7 +83,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.batch import prefix_sum, valid_order
-from dew.newton_schulz import orthogonalized_leaf
+from dew.newton_schulz import NEWTON_SCHULZ, newton_schulz
 from dew.nn import linear
 from dew.nn.dense import Dense
 from dew.nn.documents import within_documents
@@ -269,7 +269,7 @@ class InContextMemory(LinearProducts):
     started from, a continuum-memory level's (Nested Learning Eq 71)."""
     orthogonalize: int = 0
     """Newton-Schulz steps orthogonalizing each matrix of a token's gradient before its step, Muon's own
-    iteration (`dew.newton_schulz.orthogonalized_leaf`, Nested Learning Sec 4.2's Muon-style inner
+    iteration (`dew.newton_schulz.newton_schulz`, Nested Learning Sec 4.2's Muon-style inner
     update); 0 steps the gradient as it is. Vectors (biases, norm scales) step as they are."""
     slow: tuple[str, ...] = ()
     """The network's parameters, by their top-level names (a submodule's or a parameter's), that the
@@ -622,7 +622,7 @@ class InContextMemory(LinearProducts):
             if path[-1].key == ADAPTER_B:
                 return jnp.zeros_like(leaf)
             if self.orthogonalize and leaf.ndim == 2:
-                return orthogonalized_leaf(leaf, self.orthogonalize, None)
+                return newton_schulz(leaf, NEWTON_SCHULZ, self.orthogonalize, 1e-8)
             return leaf
 
         return jax.tree_util.tree_map_with_path(stepped, gradient)

@@ -215,6 +215,13 @@ def test_the_gemm_kernels_run_on_this_gpu():
                functools.partial(gemm_tcgen05.tcgen05s_epilogues_hold_check_1_on_blackwell, case, tiles),
                "sm100", native={"launch": f"tcgen05 {tiles.family}", "epilogue": case})
           for tiles in (*gemm_tcgen05.TILES, gemm_tcgen05.PAIRED) for case in gemm_tcgen05.EPILOGUES),
+        *(Cell(f"a pair's dense kernel gradient holds check 1 into {name}, k_major={k_major}",
+               functools.partial(gemm_tcgen05.pairs_dense_kernel_gradient_holds_check_1_on_blackwell, dtype,
+                                 k_major),
+               "sm100", native={"launch": "tcgen05 tcgen05.pair", "kernel gradient": name,
+                                "k_major": k_major})
+          for name, dtype in (("float32", jnp.float32), ("bfloat16", jnp.bfloat16))
+          for k_major in (False, True)),
         *(Cell(f"the NVFP4 product's packed kernel holds every order: {name} {edge}",
                functools.partial(contracts_gemm.test_an_nvfp4_products_kernels_hold_every_order, edge,
                                  "packed"), name,

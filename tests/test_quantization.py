@@ -1562,6 +1562,184 @@ def test_an_int8_attention_block_under_each_qwix_rule_runs_where_its_attention_i
                                     jnp.zeros((2, 32, 64)))
 
 
+def _traced(block: nn.Module, chosen: list, target: str) -> list:
+    """What a module records into `chosen` as it traces (its init, then its apply) for the GPU generation
+    `target`: the kernels its calls chose."""
+    from dew.nn.kernels import generation
+
+    chosen.clear()
+    x = jnp.zeros((1, 8), jnp.bfloat16)
+    with generation.assumed(target):
+        jax.eval_shape(block.apply, jax.eval_shape(block.init, jax.random.key(0), x), x)
+    return list(chosen)
+
+
+def _whole_product_kernels() -> set[str]:
+    """The attention kernels that form their products inside a launch a quantized model's rule never sees
+    (`attention_kernels._WHOLE_PRODUCTS` among their supports)."""
+    from dew.nn import attention_kernels
+
+    return {kernel.name for op in (attention_kernels.ATTENTION, attention_kernels.DECODE)
+            for kernel in op.kernels if attention_kernels._WHOLE_PRODUCTS in kernel.supports}
+
+
+@pytest.mark.parametrize("target", ["sm100", "sm90"])
+def test_an_int8_attention_blocks_auto_attention_is_its_rules_where_a_cell_declares_a_fused_kernel(target):
+    """A causal bf16 attention block of 4 query heads over 1, 64 wide, at 256 tokens, its attention 'auto',
+    traced for a B200 and an H100: plain, its attention runs the kernel its call's cell declares
+    (`attention_kernels.DECLARED`, a fused kernel of whole products on both today); under Qwix's int8 rule
+    (`Quantization`), which owns its products (`attention_quantized.owner`), no kernel forming its products
+    past the rule, whatever any cell measured of other arithmetic (the complexity audit's A1: cuDNN returned
+    0.5 where the rule's products give about 0.4961)."""
+    pytest.importorskip("qwix")
+    from dew.nn.attention import attention_case
+    from dew.nn.attention_kernels import DECLARED
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.generation import Choice
+    from dew.nn.kernels.selection import Unlowerable
+    from dew.nn.mixers import MixerContext
+    from dew.nn.mixers.attention import CausalSelfAttention
+
+    context = MixerContext(emb_features=256, num_heads=4, num_kv_heads=1, head_dim=64, max_seq_len=256,
+                           attention_impl="auto", dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((1, 256, 256), jnp.bfloat16)
+    with generation.assumed(target):
+        cell = attention_case(jax.ShapeDtypeStruct((1, 256, 4, 64), jnp.bfloat16),
+                              jax.ShapeDtypeStruct((1, 256, 1, 64), jnp.bfloat16), causal=True).cell
+    assert cell in DECLARED, f"no declared cell holds this call on {target}: the plain arm tests nothing"
+
+    def kernels(block: nn.Module) -> set[str]:
+        # The kernels its routes report, or the one a host without that kernel's library refuses to lower
+        # for the target (`selection.Unlowerable`), the target's kernel all the same.
+        try:
+            with generation.assumed(target), generation.routes() as routes:
+                params = jax.eval_shape(block.init, jax.random.key(0), x)
+                jax.eval_shape(block.apply, params, x)
+        except Unlowerable as refused:
+            return {refused.kernel}
+        return {route.kernel for route in routes if route.choice is Choice.ATTENTION}
+
+    assert kernels(CausalSelfAttention(ctx=context)) == {DECLARED[cell][0].name}
+    owned = kernels(Quantization(dtype="int8").apply(CausalSelfAttention(ctx=context)))
+    assert owned and not owned & _whole_product_kernels(), owned
+
+
+@pytest.mark.parametrize("target", ["sm100", "sm90"])
+def test_an_int8_models_masked_attention_runs_none_of_its_own_orders_whole_product_kernels(target):
+    """A call that built its mask and hands it on as cuDNN's bias (`attention.mask_kernel`, a cached prefill's
+    or a verified draft's: Dew's own order cuDNN, xla, the reference path), traced in a module on a B200 and
+    an H100: plain, cuDNN; under Qwix's int8 rule, which owns the call's products, not cuDNN, whose products
+    the rule never sees, but xla's attention, whose dot_generals it quantizes (train 797's review F1: a soft
+    order ran cuDNN's whole products under the rule)."""
+    pytest.importorskip("qwix")
+    from dew.nn.attention import mask_kernel
+    from dew.nn.kernels.selection import Unlowerable
+
+    query = jnp.zeros((1, 64, 4, 64), jnp.bfloat16)
+    key = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
+    chosen = []
+
+    class Masked(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            # The kernel chosen, or the one a host without that kernel's library refuses to lower for the
+            # target (`selection.Unlowerable`), the target's kernel all the same.
+            try:
+                chosen.append(mask_kernel("auto", query, key, as_bias=True, dtype=jnp.bfloat16))
+            except Unlowerable as refused:
+                chosen.append(refused.kernel)
+            return nn.Dense(8)(x)
+
+    # Plain, the order's first kernel, of whole products; under the rule, none such.
+    whole = _whole_product_kernels()
+    plain = set(_traced(Masked(), chosen, target))
+    owned = set(_traced(Quantization(dtype="int8").apply(Masked()), chosen, target))
+    assert plain and plain <= whole, plain
+    assert owned and not owned & whole, owned
+
+
+@pytest.mark.parametrize("step", ["decode", "mixed"])
+def test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention(step):
+    """A paged CausalTransformer (16-slot pages, 4 query heads over 2, 64 wide, bf16) through a decode step
+    and a mixed serving step (`Admitted`: rows decoding beside an admitted prompt), traced for a B200 on its
+    reported routes: plain, the pool read by a paged kernel (`kv_cache.PAGED`) and the mixed step's attention
+    by the template's work list (`CausalSelfAttention._one_work_list`), each forming its products whole;
+    under Qwix's int8 rule, which owns the steps' products, by neither (`PagedCase.owned`,
+    `AttentionCase.quantized`), the gathered rows read through the layer's attention, every attention route
+    the rule's arithmetic, no kernel forming its products past the rule (train 802's review F1 and F2: the
+    mixed step's work list and paged read ran whole products)."""
+    pytest.importorskip("qwix")
+    from model_support import TINY_DECODER
+
+    from dew.batch import coordinates
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.inputs import Admitted
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.generation import Choice
+    from dew.nn.kv_cache import KVCache
+
+    rows, width = 4, 6
+    model = CausalTransformer(vocab_size=50, **{**TINY_DECODER, "num_kv_heads": 2, "head_dim": 64,
+                                                "max_seq_len": 128, "dtype": jnp.bfloat16},
+                              kv_cache=KVCache(page_size=16, pages=rows * 8))
+
+    def routes_of(model: nn.Module) -> dict:
+        params = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+
+        def run(params):
+            cache = model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"]
+            if step == "decode":
+                return model.apply({**params, "cache": cache}, jnp.zeros((rows, 1), jnp.int32),
+                                   attention_mask=jnp.ones((rows, 1), bool), decode=True, mutable=["cache"])
+            valid = jnp.ones((1, rows + 2 * width), bool)
+            tables = next(iter(cache.values()))["self_attn"]["page_table"][jnp.asarray([3, 0])]
+            admitted = Admitted(slots=jnp.asarray([3, rows]), cursors=jnp.asarray([0, 0]), continuing=True,
+                                tables=tables)
+            return model.apply({**params, "cache": cache}, jnp.zeros(valid.shape, jnp.int32),
+                               jnp.asarray([[0, 1]]), decode=True, mutable=["cache"], admitted=admitted,
+                               coordinates=coordinates(valid.shape, valid=valid),
+                               method="states_and_logits_at")
+
+        with generation.assumed("sm100"), generation.routes() as routes:
+            jax.eval_shape(run, params)
+        kernels = {choice: {route.kernel for route in routes if route.choice is choice}
+                   for choice in (Choice.PAGED_DECODE, Choice.ATTENTION, Choice.DECODE)}
+        # The work list's own selection, which it reports where the mixed step weighs it.
+        listed = {route.kernel for route in routes if route.site.endswith("._one_work_list")}
+        return kernels, listed
+
+    plain, listed = routes_of(model)
+    assert plain[Choice.PAGED_DECODE] - {"gathered"}, plain
+    assert listed == ({"template"} if step == "mixed" else set()), listed
+    owned, listed = routes_of(Quantization(dtype="int8").apply(model))
+    attended = owned[Choice.ATTENTION] | owned[Choice.DECODE]
+    assert owned[Choice.PAGED_DECODE] == {"gathered"}, owned
+    assert attended and not attended & _whole_product_kernels(), owned
+    assert not listed, listed
+
+
+def test_an_int8_attention_block_on_xla_is_on_par_with_the_reference_path(monkeypatch):
+    """A causal attention block quantized to int8 (`Quantization`, Qwix's training rule) whose run names
+    jax.nn's xla attention computes it there, its output and its gradients, its input's and each
+    projection's under a drawn cotangent, on par (check 1) with the block computing it on the reference
+    path, the truth that path in float64: both form their products as dot_generals the rule quantizes (train
+    799's reach run: four quantized runs naming xla were refused). Outside Dew's wide CPU arithmetic, which
+    hands xla's fp32 calls to the reference path (`attention_kernels.XLA_SUPPORTS`), so xla runs them."""
+    pytest.importorskip("qwix")
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.generation import Choice
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC
+
+    monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    block = _quantized_blocks(lambda model, implementation: Quantization(dtype="int8").apply(model))
+    x = jnp.zeros((2, 32, 64))
+    params = block("reference").init(jax.random.key(4), x)
+    with generation.routes() as routes:
+        jax.eval_shape(block("xla").apply, params, x)
+    assert {route.kernel for route in routes if route.choice is Choice.ATTENTION} == {"xla"}
+    _assert_blocks_on_par(block, "xla", "an int8 attention block on xla")
+
+
 HOST_SEEDS = 8
 """Check 1's declared seeds for a device's int8 run against the same run on the host."""
 

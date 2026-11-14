@@ -27,17 +27,26 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import reference_error as gate
-from fla_sites import LEAVES, RECORDED, the_template_is_as_exact_as_fla
+from fla_sites import LEAVES, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU
-from reference_error import FEWEST_SEEDS, assert_as_exact, recording, widened, with_gradients
+from map_judge import sharded
+from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import REFUSED, refuses_its_gradient, taken, template_call
-from test_recurrence_stability import GRADIENT_SEEDS, REGIMES, SEEDS, SITES, cotangents, restarting, stressed
+from test_recurrence_stability import (
+    GRADIENT_SEEDS,
+    REGIMES,
+    SEEDS,
+    SITES,
+    bounded,
+    cotangents,
+    restarting,
+    stressed,
+)
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.recurrence_chunk import Chunk
-from dew.nn.kernels.templates.recurrence import mainloop, template
+from dew.nn.kernels.templates.recurrence import template
 
 pytestmark = pytest.mark.kernel
 
@@ -77,17 +86,8 @@ def bf16(operands: Chunk, hooks) -> Chunk:
                                             for name in names})
 
 
-def fast_backward(operands: Chunk) -> bool:
-    """Whether the template's rule takes a gradient over `operands` on its fast backward: its launches hold at
-    the call's derived tiles on the device's bundle, or interpreted, the interpreted one's (`mosaic_rule`)."""
-    target = template.Mosaic.launched()
-    bound = template.MOSAIC.bind(operands.query, operands.key, operands.value, operands.log_decay,
-                                 operands.beta, operands.state, operands.starts, bound=HOOKS.inverse_bound)
-    tiles = template.MOSAIC.derived(bound, target)
-    return template.backward_holds(operands.query, operands.key, operands.value, operands.log_decay,
-                                   operands.beta, operands.state, tiles=tiles,
-                                   family=mainloop.issued()[0], target=target,
-                                   starts=operands.starts)
+FINITE_SEEDS = 2
+"""The first draws a site holds finite wherever the float64 truth is (`assert_finite`), before its check 1."""
 
 
 def assert_finite(fn, truth, operands, regime: str) -> None:
@@ -153,15 +153,12 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
     its reference arm's from float64 over the site's declared seeds (check 1); a form or gradient it refuses
     is checked refused and skipped."""
     hooks = SITES[name]
-    mosaic = functools.partial(chunk_on, 'mosaic_gpu', hooks)
-    reference, exact = reference_arm(hooks, forms), functools.partial(token_by_token, hooks)
     if product == 'forward':
-        dew, truth, seeds = mosaic, exact, SEEDS[name, regime]
+        seeds = SEEDS[name, regime]
 
         def draws(seed):
             return (bf16(stressed(hooks, regime, seed)[0], hooks),)
     else:
-        dew, reference, truth = (with_gradients(restarting(fn, regime)) for fn in (mosaic, reference, exact))
         seeds = GRADIENT_SEEDS[name, regime]
 
         def draws(seed):
@@ -169,12 +166,26 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
             return bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
 
     operands = restarting(lambda given: given, regime)(draws(0)[0])
+    mosaic = functools.partial(chunk_on, 'mosaic_gpu', hooks, **bounded(regime))
+    reference = functools.partial(reference_arm(hooks, forms), **bounded(regime))
+    exact = functools.partial(token_by_token, hooks)
+    if product == 'forward':
+        dew, truth = mosaic, exact
+    else:
+        dew, reference, truth = (with_gradients(restarting(fn, regime)) for fn in (mosaic, reference, exact))
     with under(forms):
         if not runs(dew, hooks, operands, draws(0), product):
             pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
-        for seed in range(2):
-            assert_finite(dew, truth, draws(seed), regime)
         label = f'the template, {name} under {regime}, its {product}'
+
+        def finite(start: int, stop: int) -> None:
+            for seed in range(start, stop):
+                assert_finite(dew, truth, draws(seed), regime)
+
+        # Its first draws held finite once a site: by the map task that draws them, the judge pooling its
+        # word (`sharded`), where every map task and the judge held them again, each a compile and two runs
+        # of every case's arms, Kimi delta attention's about 8 s a run interpreted (row 5906).
+        sharded(f'{label}, finite', finite, FINITE_SEEDS, upto=FINITE_SEEDS)
         if fla_recorded(hooks):
             the_template_is_as_exact_as_fla(mosaic, f"stability/{name}/{regime}/{product}",
                                             ('out', 'final') if product == 'forward' else LEAVES, label)
@@ -251,60 +262,43 @@ def test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_inter
     the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, 'forward', forms)
 
 
-@pytest.mark.parametrize('regime', REGIMES)
-def test_the_template_gradient_takes_the_fast_backward_where_its_launches_hold(regime):
-    """The template's gradient over each regime's draw takes its fast backward, its launches holding at the
-    call's derived tiles (`fast_backward`): off a GPU by the interpreted bundle, on a GPU by its own, an
-    A100's too (its keys launch a key block a program, its query/key launch's memory sum a product: their
-    loops' operand fragments spilled 64 to 200 bytes a thread past its 255 registers)."""
-    operands, _ = cotangents(HOOKS, regime, 0)
-    assert fast_backward(restarting(lambda given: given, regime)(bf16(operands, HOOKS)))
-
-
-@pytest.mark.whole_suite  # 130 s interpreted, past a group's two minutes (ledger 2145).
-def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpreted():
-    """The fast backward's log decay gradient, interpreted, as near float64 as recorded fla-core's
-    (`fla_sites`) under decays near zero on a draw: a chunk's ranges sum each token's terms before it
-    (`mainloop_backward.gradients`), never a token's own order-one term added and taken away, which rounded
-    away the `exp(-30)` terms before it (65 to 169 times the port's distance on three draws, the H100's
-    check 1 140 times, SE-numerics-h100-fd61e11eeb; 0.98 to 1.00 times after), held on one draw by the gate's
-    one-draw rule, pooled (the recording keeps no rows of it). On a GPU whose launches do not hold the fast
-    backward the rule refuses the gradient (row 1926)."""
-    regime = 'decays near zero'
-    operands, (out, final) = cotangents(HOOKS, regime, 0)
-    drawn = (bf16(operands, HOOKS), (out.astype(jnp.bfloat16), final))
-    template = with_gradients(functools.partial(chunk_on, 'mosaic_gpu', HOOKS))
-    if not fast_backward(restarting(lambda given: given, regime)(drawn[0])):
-        refuses_its_gradient(template, *drawn)
-        return
-    with jax.enable_x64(new_val=True):
-        exact = jax.jit(with_gradients(functools.partial(token_by_token, HOOKS)))(*widened(drawn))
-    mine = gate.distance(np.asarray(jax.jit(template)(*drawn)[1].log_decay), np.asarray(exact[1].log_decay))
-    # fla-core's own distance on the draw, recorded (`fla_sites`): its mean squared error from float64.
-    theirs = float(np.sqrt(recording(RECORDED)[f"stability/scalar delta/{regime}/gradient.mse.dg"][0]))
-    assert gate.within(mine, gate.FACTOR * theirs), (
-        f"the template, {regime}, its log decay gradient on a draw: {mine:.3e} from float64 (rms), recorded "
-        f"fla-core {theirs:.3e} (ratio {mine / theirs:.2f}, allowed {gate.FACTOR})")
-
-
-@COMPILES_ON_CPU
-def test_the_narrow_gated_delta_gradient_compiles_for_an_h100():
-    """The gated delta rule's bf16 gradient at the suite's narrow widths (16-wide keys, 8-wide values, its
-    gradient arms' heads), compiled for an H100 on this CPU (`kernel_compile.compile_mosaic_kernels`) with no
-    kernel failing: its values' backward, 8 programs a multiprocessor at its model, launched each thread
-    at 32 registers, under the 34 its 16-column warpgroup MMAs assemble at (`Issuer.entry_floor`, M-JS-63)."""
+def compiled_gradient(hooks, name: str) -> list[dict]:
+    """The template's bf16 gradient under `hooks` at the suite's narrow widths, compiled for a compile-only
+    H100 as a start compiles it (`kernel_compile.compile_mosaic_kernels`: each launch's derived config
+    certified as it traces, `report.certified`), its records."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+    from kernel_compile import compile_mosaic_kernels
 
-    operands, (d_out, d_final) = cotangents(HOOKS, 'decays near one', 0)
-    operands = bf16(operands, HOOKS)
+    operands, (d_out, d_final) = cotangents(hooks, 'decays near one', 0)
+    operands = bf16(operands, hooks)
 
     def loss(operands):
-        out, final = chunk_on('mosaic_gpu', HOOKS, operands)
+        out, final = chunk_on('mosaic_gpu', hooks, operands)
         return jnp.sum(out * d_out) + jnp.sum(final * d_final)
 
     def call():
         return jax.grad(loss), (jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), operands),)
 
-    found = compile_mosaic_kernels([KernelCase('the narrow gated delta gradient', call)], 'sm90')
-    assert mosaic_failures(found) == []
+    return compile_mosaic_kernels([KernelCase(name, call)], 'sm90')
+
+
+@COMPILES_ON_CPU
+def test_a_gradients_kernels_are_each_certified_as_its_program_lowers():
+    """The gated delta net's bf16 gradient compiled for a compile-only H100 as a start compiles it
+    (`compiled_gradient`): every Mosaic GPU kernel its program runs, its training forward's and its fast
+    backward's, is one certification compiled alone, its launch certified as reverse mode runs it
+    (`report.pulled`), so a spilling kernel of it refuses its config there, not in a retrace of the whole
+    program (row 5905)."""
+    record, = compiled_gradient(SITES['gated'], 'the gated delta net gradient')
+    assert record["modules"] and set(record["modules"]) <= set(record["certified"]), record
+
+
+@COMPILES_ON_CPU
+def test_the_narrow_gated_delta_gradient_compiles_for_an_h100():
+    """The gated delta rule's bf16 gradient at the suite's narrow widths (16-wide keys, 8-wide values, its
+    gradient arms' heads), compiled for an H100 on this CPU (`compiled_gradient`) with no kernel failing: its
+    values' backward, 8 programs a multiprocessor at its model, launched each thread at 32 registers, under
+    the 34 its 16-column warpgroup MMAs assemble at (`Issuer.entry_floor`, M-JS-63)."""
+    from kernel_compile import mosaic_failures
+
+    assert mosaic_failures(compiled_gradient(HOOKS, 'the narrow gated delta gradient')) == []

@@ -1239,7 +1239,8 @@ class Evaluator[L, E]:
 
     def evaluate(self, state: TrainState, shardings: Placement[TrainState], links: Mapping[str, Link],
                  reader: Split | None, metrics: Sequence[Metric], preview: bool, *, loss: bool = False,
-                 split: str = "val", training: Mapping[str, jax.Array] | None = None, warm: bool = False,
+                 split: str = "val", training: Mapping[str, jax.Array] | None = None,
+                 warm: bool = False,
                  scored_to: str | None = None, examples: int | None = None,
                  cooled: bool = False) -> Evaluation:
         """Score the validation split with this state's variables and report

@@ -123,8 +123,27 @@ def own_objective(name: str, held: Hashable, objective: Hashable) -> None:
                          "passes")
 
 
+class Pooled:
+    """A statistic a step pools over the microbatches it is read in before reading it (`Aux.metrics`,
+    `dew.training.planning.whole_step`): `pooled` combines its parts as the whole batch would have made it,
+    and `mean` reads it."""
+
+    def joined(self, later: Pooled) -> Pooled:
+        """This part and a `later` microbatch's of its own kind as one: by default their leaves summed."""
+        return jax.tree.map(lambda mine, theirs: mine + theirs, self, later)
+
+    @staticmethod
+    def pooled(parts: Sequence[Pooled]) -> Pooled:
+        """`parts`, one a microbatch, as one, each joined to those before it (`joined`)."""
+        return functools.reduce(lambda whole, later: whole.joined(later), parts)
+
+    def mean(self) -> tuple[jax.Array, jax.Array]:
+        """Its value, and whether it has any mass."""
+        raise NotImplementedError
+
+
 @struct.dataclass
-class Ratio:
+class Ratio(Pooled):
     """A loss numerator and its denominator, kept apart until the loss is reduced.
 
     Both parts sum across microbatches and devices, and only then does `mean`
@@ -145,6 +164,88 @@ class Ratio:
         active = mass > 0
         dtype = jnp.result_type(self.total.dtype, mass.dtype, jnp.float32)
         value = self.total.astype(dtype) / jnp.where(active, mass.astype(dtype), 1)
+        return jnp.where(active, value, 0), active
+
+
+@struct.dataclass
+class Exponentiated(Ratio):
+    """A metric that is the exponential of a pooled mean: a perplexity, `exp` of its cross entropy's
+    `Ratio`, pooled as that ratio is (`Aux.metrics`)."""
+
+    def mean(self) -> tuple[jax.Array, jax.Array]:
+        value, active = super().mean()
+        return jnp.where(active, jnp.exp(value), 0), active
+
+
+def joined_moments[M: (jax.Array, np.ndarray, float)](count: M, center: M, later_count: M, later_center: M
+                                                      ) -> tuple[M, M, M, M]:
+    """Two parts' row counts and means (by feature, arrays or floats) as the whole's, by Chan, Golub and
+    LeVeque's pairwise update, which no part's sum of squares cancels against its mean in; and the means'
+    difference and the weight the parts' summed squared deviations, or co-moments, join by: theirs added,
+    and `weight` times the difference's square, or its outer product. The whole holds a row."""
+    whole = count + later_count
+    delta = later_center - center
+    return whole, center + delta * later_count / whole, delta, count * later_count / whole
+
+
+@struct.dataclass
+class Summed(Pooled):
+    """A metric that is the sum of several ratios' means, each over its own mass (a router z-loss, a term
+    a router), each part pooled as its ratio is (`Pooled.joined`'s sum of their numerators and masses)."""
+
+    parts: tuple[Ratio, ...]
+
+    def mean(self) -> tuple[jax.Array, jax.Array]:
+        values, active = zip(*(part.mean() for part in self.parts), strict=True)
+        return functools.reduce(jnp.add, values), functools.reduce(jnp.logical_or, active)
+
+
+@struct.dataclass
+class Moments(Pooled):
+    """A batch's first and second moments over its rows, by feature: their `count`, `center` (the mean),
+    `squares` (the summed squared deviations from it) and `products` (their summed outer products, None
+    where `statistic` reads none), pooled over microbatches by Chan's parallel update, as the whole batch's
+    would be; read as `statistic`: `"std"`, the features' mean population standard deviation, or
+    `"offdiagonal"`, the RMS of the sample covariance's off-diagonal entries."""
+
+    count: jax.Array
+    center: jax.Array
+    squares: jax.Array
+    products: jax.Array | None
+    statistic: str = struct.field(pytree_node=False)
+
+    @classmethod
+    def of(cls, rows: jax.Array, statistic: str, product: Callable | None = None) -> Self:
+        """The moments of `rows` `[B, D]` in fp32, their co-moment by `product` (a matmul) where `statistic`
+        reads it."""
+        rows = rows.astype(jnp.float32)
+        center = jnp.mean(rows, axis=0)
+        deviations = rows - center
+        products = None if statistic == "std" else (product or jnp.matmul)(deviations.T, deviations)
+        squares = jnp.sum(deviations ** 2, axis=0)
+        return cls(jnp.asarray(rows.shape[0], jnp.float32), center, squares, products, statistic)
+
+    def joined(self, later: Pooled) -> Moments:
+        if not isinstance(later, Moments):
+            raise TypeError(f"moments join moments, not a {type(later).__name__}")
+        count, center, delta, weight = joined_moments(self.count, self.center, later.count, later.center)
+        squares = self.squares + later.squares + weight * delta ** 2
+        products = None if self.products is None or later.products is None else (
+            self.products + later.products + weight * jnp.outer(delta, delta))
+        return Moments(count, center, squares, products, self.statistic)
+
+    def mean(self) -> tuple[jax.Array, jax.Array]:
+        active = self.count > 0
+        count = jnp.where(active, self.count, 1)
+        if self.statistic == "std":
+            value = jnp.mean(jnp.sqrt(self.squares / count))
+        else:
+            if self.products is None:
+                raise ValueError("off-diagonal moments hold their products")
+            dim = self.center.shape[0]
+            covariance = self.products / jnp.maximum(count - 1, 1)
+            off = covariance * (1.0 - jnp.eye(dim, dtype=covariance.dtype))
+            value = jnp.sqrt(jnp.sum(off ** 2) / max(dim * (dim - 1), 1))
         return jnp.where(active, value, 0), active
 
 
@@ -501,7 +602,14 @@ class Aux(Generic[Effects]):
     collections. `effects` are additive observations that the optimizer
     applies once per committed update, not once per microbatch.
     """
-    metrics: dict[str, jax.Array]
+    metrics: Mapping[str, jax.Array | Pooled]
+    """The step's metrics, each the loss's own report, a number however it was stated: a metric stated as a
+    `Pooled` statistic (a `Ratio`, its numerator and its mass; an `Exponentiated` one, its exponential; a
+    batch's `Moments`) reads here as its value, and its statistic is kept in `pooled`, which the trainer
+    pools over the microbatches a step is read in, so the step logs it as the step read whole would
+    (docs/design/training.md, the logged metrics); an array is one microbatch's, which a step read in
+    several logs as its last's, under `<name>/last_microbatch`, and a metric the objective shows
+    (`Objective.shown`), which a run selects by, is refused as an array where a step is read in several."""
     variables: Variables | None = None
     """Whole nonparameter collections from one accepted microbatch, such as BatchNorm statistics.
 
@@ -527,6 +635,17 @@ class Aux(Generic[Effects]):
     """What a recording evaluation's `Step.sample` and `Step.boundary` calls produced (`Step.record`),
     which `Objective._loss` fills (`Evaluated`) and a transaction stacks with its replays' (`Recorded`);
     None otherwise."""
+    pooled: Mapping[str, Pooled] = struct.field(default_factory=dict)
+    """The statistics behind the metrics stated as `Pooled`, by name, which the trainer pools across a
+    step's microbatches (`dew.training.planning.whole_step`); set from `metrics` as an Aux is made."""
+
+    def __post_init__(self):
+        # A metric stated as a statistic reads as its value; the statistic is kept for the trainer's pooling.
+        stated = {name: value for name, value in self.metrics.items() if isinstance(value, Pooled)}
+        if stated:
+            object.__setattr__(self, "metrics", {name: value.mean()[0] if isinstance(value, Pooled) else value
+                                                 for name, value in self.metrics.items()})
+            object.__setattr__(self, "pooled", {**self.pooled, **stated})
 
 
 def _has_aux(loss: Loss | tuple[Loss, Aux[Effects]]) -> TypeIs[tuple[Loss, Aux[Effects]]]:
@@ -2031,9 +2150,12 @@ __all__ = [
     "OMITTED",
     "Aux",
     "EMASpec",
+    "Exponentiated",
     "Metric",
+    "Moments",
     "Objective",
     "Omitted",
+    "Pooled",
     "Prediction",
     "ProgramModule",
     "Ratio",
@@ -2041,6 +2163,7 @@ __all__ = [
     "Shown",
     "Source",
     "Step",
+    "Summed",
     "TrainingScalar",
     "TrainingScalars",
     "joined",

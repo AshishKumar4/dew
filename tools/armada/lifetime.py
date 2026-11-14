@@ -23,7 +23,7 @@ from pathlib import Path
 
 import followed
 from followed import CLOSED, EVIDENCE, PEAK, READ, SHARED, STARTED, UNOPENED, VISIT
-from session import DURATIONS
+from session import CUTS, DURATIONS
 
 LOG = "DEW_EXECUTED_LOG"
 """Where the recorder writes its log, named by the supervisor (ci.py's `tested`)."""
@@ -97,9 +97,9 @@ def pop() -> None:
 
 
 def kept(read: str | None) -> None:
-    # The durations record is split.py's, which cuts a split file from it, read or probed: the file's own
-    # entries are its groups' input (ci.py's `cache_key`), and no other file's.
-    if read is not None and read.removeprefix(followed.PROBED) != str(DURATIONS):
+    # The durations record and the stored cuts are split.py's, which cuts a split file from them, read or
+    # probed: the file's own entries are its groups' input (ci.py's `cache_key`, `members`), no other file's.
+    if read is not None and read.removeprefix(followed.PROBED) not in (str(DURATIONS), str(CUTS)):
         write(owner(), read)
 
 

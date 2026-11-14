@@ -47,15 +47,35 @@ class MmaFed(mosaic_sm80.MmaIssuer, fed.ConsumerFed):
 
 
 @dataclasses.dataclass(frozen=True)
+class MmaProduced(mosaic_sm80.MmaIssuer, mosaic.RingFamily):
+    """mma.sync's issuer and register home (`mosaic_sm80.MmaIssuer`) on TMA rings a producer warpgroup fills
+    (`mosaic.RingFamily`), on every device that moves its blocks by TMA (`legal`), composed from the two and
+    no template's: the layout a launch that streams through a producer takes on a device whose mma.sync has
+    no other (an attention backward's dQ launch, `attention_mosaic_program.runs_backward`, on consumer
+    Blackwell, whose cp.async Mosaic lowers no wait for and whose fed layout holds no backward of Qwen3-8B's
+    widths). One consumer a program, as `MmaFed`'s; after it among mma.sync's compositions, so a launch
+    that derives on the fed layout keeps it, and taken by a launch that states it streams through a producer
+    (`Launch.produced`) alone: a decode step, whose rows prefer mma.sync's 16 (`layouts`), would otherwise
+    leave its own issuer's walk for this one on a Hopper or a B200 unmeasured, its fp32 parts past its model
+    (the decode gate's six fp32 cells on sm90, sm100 and sm103)."""
+
+    name = "mma.sync.produced"
+    consumers = 1
+
+
+@dataclasses.dataclass(frozen=True)
 class Launch:
     """What a launch states of its call that a composition reads (`Composition.takes`): it states its tiles'
     accumulators (`stated`, `Transport.persist`'s `accumulators`: the GEMM template's), its program scopes the
     issuer's product scratch (`scoped`, `Issuer.products_in`: the recurrence template's), it is written
-    wholly against the family's seams (`tpu`, the module's account)."""
+    wholly against the family's seams (`tpu`, the module's account), it streams its operands through a
+    producer warpgroup on any issuer the device has (`produced`: the attention backward's dQ launch, which a
+    family whose consumers feed their own rings cannot run, `MmaProduced`)."""
 
     stated: bool = False
     scoped: bool = False
     tpu: bool = False
+    produced: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -82,9 +102,10 @@ COMPOSITIONS: dict[str, tuple[Composition, ...]] = {
     # wgmma: TMA rings a producer fills, then rings its consumers fill.
     mosaic_sm90.WGMMA.name: (Composition(lambda dtype: mosaic_sm90.WGMMA),
                              Composition(lambda dtype: mosaic_sm90.FED)),
-    # mma.sync, which every NVIDIA GPU from sm80 issues: TMA rings its consumer fills where the device moves
-    # blocks by TMA, cp.async where it does not (`legal`).
-    mosaic_sm80.Mma.name: (Composition(MmaFed), Composition(mosaic_sm80.Mma)),
+    # mma.sync, which every NVIDIA GPU from sm80 issues: TMA rings its consumer fills, then rings a producer
+    # fills, where the device moves blocks by TMA, cp.async where it does not (`legal`).
+    mosaic_sm80.Mma.name: (Composition(MmaFed), Composition(MmaProduced, lambda launch: launch.produced),
+                           Composition(mosaic_sm80.Mma)),
     # A TPU core's MXU, for a launch written wholly against the family's seams.
     "tpu": (Composition(lambda dtype: mosaic_tpu.MXU, lambda launch: launch.tpu),),
 }
@@ -92,8 +113,8 @@ COMPOSITIONS: dict[str, tuple[Composition, ...]] = {
 order: the one declaration a launch's selection (`groups`) and its tile's name (`named`) both read."""
 
 
-def groups(generation_name: str, dtype, *, stated: bool = False, scoped: bool = False, tpu: bool = False
-           ) -> tuple[tuple[mosaic.Family, ...], ...]:
+def groups(generation_name: str, dtype, *, stated: bool = False, scoped: bool = False, tpu: bool = False,
+           produced: bool = False) -> tuple[tuple[mosaic.Family, ...], ...]:
     """The bundles a launch on a device of `generation_name` (`'sm80'`, the assumed or a real one's) may run
     for operands of `dtype`, by matrix issuer, most capable first (`generation.Architecture.issuers`, stated
     per device, never implied by a generation's number): each issuer's compositions (`COMPOSITIONS`) that
@@ -105,7 +126,7 @@ def groups(generation_name: str, dtype, *, stated: bool = False, scoped: bool = 
     if architecture is None or (architecture.family != "tpu"
                                 and generation.capability(generation_name) is None):
         return ()
-    launch = Launch(stated=stated, scoped=scoped, tpu=tpu)
+    launch = Launch(stated=stated, scoped=scoped, tpu=tpu, produced=produced)
     found = (tuple(family for family in (composition.build(jnp.dtype(dtype))
                                          for composition in COMPOSITIONS[issuer] if composition.takes(launch))
                    if legal(family, architecture))
@@ -141,14 +162,14 @@ def useful_rows(family: mosaic.Family, rows: int) -> float:
 
 
 def layouts(generation_name: str, dtype, rows: int | None = None, *, stated: bool = False,
-            scoped: bool = False, tpu: bool = False) -> tuple[mosaic.Family, ...]:
+            scoped: bool = False, tpu: bool = False, produced: bool = False) -> tuple[mosaic.Family, ...]:
     """The bundles a launch on a device of `generation_name` may take for operands of `dtype`, in preference
     order: its most capable issuer's (`groups`' first), a producer's layout before one whose consumers fill
     their own rings. Given a launch's `rows`, every issuer's, ordered by the share of its padded rows the
     launch fills (`useful_rows`), the issuers' order on a tie: a decode step's 8 rows take mma.sync's 16
     before wgmma's 64 (row 4042), where a launch's tile pads its rows to the bundle's least. None where the
-    device has none; `stated`, `scoped` and `tpu` as `groups`'."""
-    found = groups(generation_name, dtype, stated=stated, scoped=scoped, tpu=tpu)
+    device has none; `stated`, `scoped`, `tpu` and `produced` as `groups`'."""
+    found = groups(generation_name, dtype, stated=stated, scoped=scoped, tpu=tpu, produced=produced)
     if rows is None:
         return found[0] if found else ()
     flat = [family for group in found for family in group]

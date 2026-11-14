@@ -5,7 +5,9 @@ implementations; and the cost model (`dew.nn.kernels.templates.cost`) on analyti
 
 import dataclasses
 import functools
+import importlib
 import itertools
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -23,7 +25,7 @@ from native_certificates import (
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32
 from reference_error import assert_as_exact, equations, with_gradients
 
-from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels import gemm, generation, grouped_matmul, selection, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 from dew.nn.moe import expert_projection
 
@@ -208,6 +210,69 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
     routed(dx, group, input_gradient_products(dy[:sum(sizes)], w, sizes), BFLOAT16, "dx")
     for index, held_products in enumerate(kernel_gradient_products(x, dy, sizes)):
         held(dw[index], held_products, FLOAT32, f"dw of group {index}")
+
+
+def test_a_16_bit_products_stated_dot_algorithm_reaches_xla():
+    """A dense float16 product through Dew's selector's portable arm (`gemm.gemm`, `grouped_matmul` chosen
+    `xla`, on this CPU) stating an explicit dot algorithm multiplies by it, as XLA's own dot does, where a
+    precision level on 16-bit operands is the default product's: one XLA:CPU lacks (`F16_F16_F16`, its
+    float16 accumulator) is refused as XLA's own dot refuses it, not run as the default product (audit
+    K2-7), and one it has (`BF16_BF16_F32` on bfloat16 operands) is XLA's own dot with it."""
+    preset = jax.lax.DotAlgorithmPreset
+
+    def through_dew(x, w, algorithm, out_dtype):
+        with generation.chosen(grouped_matmul="xla"):
+            return gemm.gemm(x, w, out_dtype=out_dtype, precision=algorithm)
+
+    def xla_own(x, w, algorithm, out_dtype):
+        return jax.lax.dot_general(x, w, (((1,), (0,)), ((), ())), precision=algorithm,
+                                   preferred_element_type=out_dtype)
+
+    x, w = jnp.asarray([[2048.0] + [1.0] * 6 + [-2048.0]], jnp.float16), jnp.ones((8, 1), jnp.float16)
+    refusals = []
+    for arm in (xla_own, through_dew):
+        with pytest.raises(jax.errors.JaxRuntimeError) as refused:
+            jax.block_until_ready(jax.jit(arm, static_argnums=(2, 3))(x, w, preset.F16_F16_F16, jnp.float16))
+        refusals.append(str(refused.value).splitlines()[0])
+    assert refusals[0] == refusals[1]
+    rng = np.random.default_rng(0)
+    xb, wb = (jnp.asarray(rng.normal(size=shape), jnp.bfloat16) for shape in ((4, 64), (64, 8)))
+    np.testing.assert_array_equal(
+        np.asarray(jax.jit(through_dew, static_argnums=(2, 3))(xb, wb, preset.BF16_BF16_F32, jnp.float32)),
+        np.asarray(jax.jit(xla_own, static_argnums=(2, 3))(xb, wb, preset.BF16_BF16_F32, jnp.float32)))
+
+
+def test_a_kept_calls_identity_states_the_installed_cutlass_wheel(tmp_path, monkeypatch):
+    """A call's identity (`dew.training.identity.facts`, what a kept program is handed by) states which
+    generations' kernels the installed dew-cutlass holds, as CUTLASS's eligibility reads them
+    (`generation.cutlass_built`): a process that installs the wheel, or another build of it, after a
+    program was kept is not handed that program, its route to CUTLASS untraced (audit P9). Two builds, one
+    holding Hopper's kernels and one Ampere's, stand in for the wheel ahead of any installed one."""
+    from dew.training import identity
+
+    fact = "dew.nn.kernels.generation.cutlass_built"
+    before = identity.facts()[fact]
+    path = list(sys.path)
+
+    def installed(minimum: tuple[int, int], built: str):
+        # Each build its own directory ahead of the installed packages, so no build's bytecode stands in
+        # for another's.
+        wheel = tmp_path / built
+        wheel.mkdir()
+        dispatch = f"return {built!r} if (major, minor) >= {minimum} else None"
+        (wheel / "dew_cutlass.py").write_text(f"def architecture(major, minor):\n    {dispatch}\n")
+        monkeypatch.setattr(sys, "path", [str(wheel), *path])
+        monkeypatch.delitem(sys.modules, "dew_cutlass", raising=False)
+        importlib.invalidate_caches()
+        return identity.facts()[fact]
+
+    hopper = installed((9, 0), "sm90")
+    built = generation.cutlass_built()
+    assert built["sm90"] == "sm90" and built["sm80"] is None
+    assert grouped_matmul.cutlass_built_for("sm90") == "sm90"
+    assert grouped_matmul.cutlass_built_for("sm80") is None
+    assert hopper != before
+    assert installed((8, 0), "sm80") != hopper
 
 
 def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
@@ -449,8 +514,8 @@ def test_a_paired_products_input_gradient_adds_its_parts_on_the_launch_its_plain
                for d, m in zip(cotangents, (first, second), strict=True))
     for generation_name in ("sm90", "sm80"):
         with generation.assumed(generation_name):
-            assert gemm._keeps_launch(cotangents[1], second, sizes, prior, jnp.bfloat16, (jnp.bfloat16,),
-                                      options), generation_name
+            assert gemm._keeps_launch(cotangents[1], second, sizes, gemm._added, (prior,), (jnp.bfloat16,),
+                                      (jnp.bfloat16,), options), generation_name
         with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
             [d_tokens] = jax.vjp(paired, tokens)[1](cotangents)
         np.testing.assert_array_equal(np.asarray(d_tokens), np.asarray(wide.astype(jnp.bfloat16)),
@@ -735,7 +800,7 @@ def test_a_row_scales_gradient_reads_the_accumulator_summed_at_its_own_width(ker
 
 def test_a_kernel_gradient_of_no_rows_on_a_hopper_is_its_groups_zeros():
     """A kernel gradient contracting no rows on an H100 (a step whose experts received no tokens): its
-    selection derives no split of an empty contraction (`mosaic_gpu.split_count`, which took the least of
+    selection derives no split of an empty contraction (`pricing.split_count`, which took the least of
     no counts) and the gradient is its group's zero block."""
     lhs, rhs = jnp.ones((0, 128), jnp.bfloat16), jnp.ones((0, 128), jnp.bfloat16)
     with generation.assumed("sm90"):
@@ -929,7 +994,7 @@ def test_a_ragged_products_portable_route_places_its_output_on_an_explicit_mesh(
     """XLA's ragged products on a CPU (`gemm.gemm` and its reverse pass, `gemm.gemm_t`, the portable route a
     fused producer's analysis replays) of rows an Explicit data axis splits, as a device step's are
     (test_device_image_augmentation): JAX infers no placement for a ragged dot, so each states its own
-    (`grouped_matmul.ragged_placement`): the forward's and the input gradient's rows split as the tokens'
+    (`xla_products.ragged_placement`): the forward's and the input gradient's rows split as the tokens'
     are, the kernel gradient's sum over the split rows whole; a replicated operand on that mesh, placed too.
     Integers, so each value is the unplaced program's bit for bit; and of no rows, each the empty product,
     the kernel gradient each group's zeros."""
@@ -967,54 +1032,62 @@ def test_a_ragged_products_portable_route_places_its_output_on_an_explicit_mesh(
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
+@pytest.mark.parametrize("layered", [False, True], ids=["matrices", "stack-layer"])
 @pytest.mark.parametrize("scattered", [False, True])
-def test_a_gathered_projection_is_its_gathered_rows_projection_in_every_order(scattered):
+def test_a_gathered_projection_is_its_gathered_rows_projection_in_every_order(scattered, layered):
     """`gemm.gemm`'s `gather` (row 1376) on a CPU (XLA's program): the projection of `tokens[gather]`, its
     value, its tangent and its reverse pass (each token's cotangent the sum of the slots reading it, a token
     no slot reads zero) bitwise the projection of the rows gathered first, plain and paired; `scattered`,
     each row written at its entry of a permutation (`scatter`), bitwise those rows put there after, its
-    cotangents read back through it; a gathered dense or stacked call, and a scattered dense one, refused."""
+    cotangents read back through it; `layered`, the matrices a stack's layer (a scanned MoE layer's gate and
+    up over its gathered tokens, row 5391), bitwise that layer's matrices'; a gathered dense call, and a
+    scattered dense one, refused."""
     rng = np.random.default_rng(3)
     tokens = jnp.asarray(rng.normal(size=(40, 64)), jnp.float32)
-    matrices = jnp.asarray(rng.normal(size=(2, 3, 64, 32)) / 8, jnp.float32)
-    a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng, scattered=scattered)
+    matrices = jnp.asarray(rng.normal(size=(2, *((3,) if layered else ()), 3, 64, 32)) / 8, jnp.float32)
+    layer = jnp.asarray(1, jnp.int32) if layered else None
+    a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng, scattered=scattered,
+                                                          layer=layer)
     table = jnp.asarray(rng.integers(0, 30, 72), jnp.int32)
-    sizes = jnp.asarray([20, 0, 44], jnp.int32)
-    for refused in ({"group_sizes": None}, {"layer": jnp.asarray(0, jnp.int32)}):
-        with pytest.raises(ValueError):
-            arguments = {"group_sizes": sizes, **refused}
-            stack = matrices if "layer" in refused else matrices[0]
-            gemm.gemm(tokens, stack, arguments.pop("group_sizes"), out_dtype=jnp.float32, gather=table,
-                      **arguments)
     with pytest.raises(ValueError):
-        gemm.gemm(tokens, matrices[0, 0], None, out_dtype=jnp.float32,
+        gemm.gemm(tokens, matrices.reshape(-1, 64, 32)[0], None, out_dtype=jnp.float32, gather=table)
+    with pytest.raises(ValueError):
+        gemm.gemm(tokens, matrices.reshape(-1, 64, 32)[0], None, out_dtype=jnp.float32,
                   scatter=jnp.arange(40, dtype=jnp.int32))
 
 
+@pytest.mark.parametrize(("name", "layered"), [("sm90", False), ("sm90", True), ("sm100", True)],
+                         ids=["h100", "h100-stack-layer", "b200-stack-layer"])
 @pytest.mark.parametrize("scattered", [False, True])
-def test_a_gathered_projections_reverse_pass_reads_its_rows_where_they_lie(scattered):
-    """`a_gathered_projection_is_its_gathered_rows_projection` through the template on an H100, interpreted
-    (row 1376's reverse pass): the kernel gradient reads the tokens through the gather table and a
-    scattered product's cotangent through its slots (`gemm_t`'s `gather`), and the input gradient reads
-    that cotangent through the slots (`gemm`'s `gather`), none of them gathered first. bf16 throughout, so
-    each gradient is the template's own product (an fp32 cotangent's would be XLA's); integer values, so
-    every sum is exact whatever tile each launch derives, and each side's one rounding the same."""
+def test_a_gathered_projections_reverse_pass_reads_its_rows_where_they_lie(scattered, name, layered):
+    """`a_gathered_projection_is_its_gathered_rows_projection` through the template, interpreted (row 1376's
+    reverse pass): on an H100 the kernel gradient reads the tokens through the gather table and a scattered
+    product's cotangent through its slots (`gemm_t`'s `gather`), and the input gradient reads that cotangent
+    through the slots (`gemm`'s `gather`), none of them gathered first; `layered`, the matrices a stack's
+    layer read in place (row 5391), the pair one launch on an H100 and its two products apart on a B200
+    (tcgen05's bundles take no pair, `Family.takes_pairs`: `gemm._apart`, each product at the layer). bf16
+    throughout, so each gradient is the template's own product (an fp32 cotangent's would be XLA's);
+    integer values, so every sum is exact whatever tile each launch derives, and each side's one rounding
+    the same."""
     rng = np.random.default_rng(5)
     tokens = jnp.asarray(rng.integers(-3, 4, size=(40, 128)), jnp.bfloat16)
-    matrices = jnp.asarray(rng.integers(-3, 4, size=(2, 3, 128, 128)), jnp.bfloat16)
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+    stacked = (3,) if layered else ()
+    matrices = jnp.asarray(rng.integers(-3, 4, size=(2, *stacked, 3, 128, 128)), jnp.bfloat16)
+    layer = jnp.asarray(2, jnp.int32) if layered else None
+    with generation.assumed(name), generation.chosen(grouped_matmul="mosaic"):
         a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng, scattered=scattered,
-                                                              interpret_on_cpu=True)
+                                                              interpret_on_cpu=True, layer=layer)
 
 
 def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng, *, scattered: bool,
-                                                          interpret_on_cpu: bool = False):
+                                                          interpret_on_cpu: bool = False, layer=None):
     """The projection of `tokens[gather]` (72 slots of 40 tokens, three groups, one empty, rows past them),
     its value, its tangent and its reverse pass (each token's cotangent the sum of the slots reading it, a
     token no slot reads zero), bitwise the projection of the rows gathered first, paired; `scattered`, each
     row written at its entry of a permutation, bitwise those rows put there after, its cotangents read
-    back through it. Its outputs, tangents and cotangents are in the tokens' dtype, the cotangents
-    integers."""
+    back through it; with `layer`, `matrices` two stacks read at that layer (`gemm`'s `layer`), bitwise the
+    layer's matrices' projection, each stack's gradient that layer's, every other zero. Its outputs,
+    tangents and cotangents are in the tokens' dtype, the cotangents integers."""
     table = jnp.asarray(rng.integers(0, 30, 72), jnp.int32)
     slots = jnp.asarray(rng.permutation(72), jnp.int32) if scattered else None
     sizes = jnp.asarray([20, 0, 44], jnp.int32)
@@ -1022,9 +1095,11 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
                "interpret_on_cpu": interpret_on_cpu}
 
     def fused(tokens, first, second):
-        return gemm.gemm(tokens, first, sizes, paired=second, gather=table, scatter=slots, **options)
+        return gemm.gemm(tokens, first, sizes, paired=second, gather=table, scatter=slots, layer=layer,
+                         **options)
 
     def apart(tokens, first, second):
+        first, second = (first, second) if layer is None else (first[layer], second[layer])
         outs = gemm.gemm(tokens[table], first, sizes, paired=second, **options)
         return outs if slots is None else tuple(jnp.zeros_like(out).at[slots].set(out) for out in outs)
 
@@ -1078,3 +1153,55 @@ def test_a_blackwells_projection_and_its_gradients_hold_check_1(sizes, out):
         # Mosaic's interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot carry them.
         assert_as_exact(on_the_template, jax.jit(with_gradients(on_xla())), draw, f"sm100 {sizes} into {out}",
                         seeds=SEEDS, truth_fn=with_gradients(on_xla(jnp.float64)))
+
+
+TIMED = [
+    ("sm90", "forward", (2560, 9216), "mosaic"), ("sm90", "forward", (9216, 2560), "xla"),
+    ("sm90", "forward", (2560, 1024), "mosaic"), ("sm90", "forward", (2560, 64), "xla"),
+    ("sm90", "input_gradient", (2560, 9216), "mosaic"), ("sm90", "input_gradient", (9216, 2560), "mosaic"),
+    ("sm90", "input_gradient", (2560, 1024), "mosaic"), ("sm90", "input_gradient", (2560, 64), "mosaic"),
+    ("sm90", "kernel_gradient", (2560, 9216), "xla"), ("sm90", "kernel_gradient", (9216, 2560), "mosaic"),
+    ("sm90", "kernel_gradient", (2560, 1024), "mosaic"), ("sm90", "kernel_gradient", (2560, 64), "mosaic"),
+    ("sm90", "forward", (2560, 3072), "xla"), ("sm90", "kernel_gradient", (3072, 2560), "xla"),
+    ("sm100", "forward", (2560, 64), "xla"), ("sm100", "forward", (2560, 9216), "mosaic"),
+    ("sm100", "input_gradient", (2560, 9216), "xla"), ("sm100", "input_gradient", (2560, 64), "mosaic"),
+    ("sm100", "kernel_gradient", (2560, 9216), "xla"), ("sm100", "kernel_gradient", (9216, 2560), "mosaic"),
+    ("sm100", "kernel_gradient", (2560, 1024), "xla"), ("sm100", "kernel_gradient", (2560, 64), "mosaic"),
+    ("sm100", "kernel_gradient", (3072, 2560), "mosaic"),
+]
+"""Each dense product the receipts timed (M-EM-36-gh200 on Hopper, em35d and lab-b200-20261113-grid on a
+B200: Qwen3.5-4B's up, down, key and gates matrices `[in, out]` at 24,576 tokens) beside the route its receipt
+timed fastest, and an untimed matrix (`[2560, 3072]`, `[3072, 2560]`), which keeps its kind's default
+(Hopper's XLA cells, the B200's template)."""
+
+
+def _named(value) -> str:
+    """A parameter's id: a matrix's extents joined by x, any other value as it prints."""
+    return "x".join(map(str, value)) if isinstance(value, tuple) else str(value)
+
+
+@pytest.mark.parametrize(("generation_name", "made", "matrix", "kernel"), TIMED, ids=_named)
+def test_a_timed_dense_product_takes_the_route_its_receipt_timed_fastest(generation_name, made, matrix,
+                                                                          kernel):
+    """A dense product of a matrix its family's receipts timed is a cell of its own (`grouped_matmul.Kind`'s
+    `matrix`, `MEASURED`), which the route its receipt timed fastest holds (`DECLARED`): the template where it
+    won, XLA's dot where it lost; a matrix no receipt timed takes its kind's cell, as before (owner, ops
+    361caffc)."""
+    from dew.nn.kernels.templates.product import declared
+
+    rows, (width_in, width_out) = 24576, matrix
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
+    product = declared(jnp.bfloat16, None, outputs=(jnp.bfloat16,))
+    with generation.assumed(generation_name):
+        if made == "kernel_gradient":
+            call = grouped_matmul.tgmm_call(bf16((rows, width_in)), bf16((rows, width_out)), sizes,
+                                            out_dtype=jnp.bfloat16, interpret=False, dense=True)
+        else:
+            transposed = made == "input_gradient"
+            tokens = bf16((rows, width_out if transposed else width_in))
+            call = grouped_matmul.gmm_call(tokens, bf16((1, width_in, width_out)), sizes,
+                                           out_dtype=jnp.bfloat16, trans_rhs=transposed, interpret=False,
+                                           dense=True)
+        case = grouped_matmul.grouped_case(*call, product=product, whole=True)
+        assert selection.selected(grouped_matmul.GROUPED, case).name == kernel, case.kind

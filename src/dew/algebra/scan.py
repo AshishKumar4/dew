@@ -142,7 +142,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         types = tuple((tuple(chunk[name].shape), str(chunk[name].dtype)) for name in names)
         if types not in decomposed:
             decomposed[types] = linear_scan.parts(_traced(declaration, declaration.update, names, chunk),
-                                                   _traced(declaration, declaration.readout, names, chunk))
+                                                   _traced(declaration, declaration.readout, names, chunk),
+                                                   saturation)
         return decomposed[types]
 
     def parts(chunk: Mapping):
@@ -171,7 +172,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         extents = linear_scan.Extents(tokens["B"].shape[0], shape[0], shape[1], exponent.shape[-1],
                                       affine.values_read)
         corrected = affine.correction is not None
-        form = _form(extents, corrected)
+        form = _form(extents, corrected, saturation)
         # The form's largest values that read no state, prepared with the chunk's decays and tokens: the
         # operands of its function, whose state the carry reads (`carry.split`).
         held = _prepared(form, tokens, decays, issue or _issued)
@@ -369,23 +370,27 @@ TOKENS = ("B", "U", "s", "C", "Q", "R")
 """A token's values (`_token`'s), as the chunk's form names them (`linear_scan.Chunk.token`)."""
 
 
-def _form(extents: linear_scan.Extents, corrected: bool) -> linear_scan.Form:
-    """The chunk's form at its extents, derived by the identities of affine scans and extracted by the
+def _form(extents: linear_scan.Extents, corrected: bool,
+          saturation: program.Saturation) -> linear_scan.Form:
+    """The chunk's form at its extents, derived by the identities of affine scans within `saturation`'s limits
+    and extracted by the
     work-span model under XLA's schedule (`linear_scan.derive`) on the target the trace compiles for, which
     prices the forms (`cost.target`, `cost.product_work`): a derivation under one target is no other's. Its
     products are priced at the precision they run at (`_portable`'s, IEEE float32 whatever the configured
     one), so the configured precision is no fact of the form."""
-    return _derived_form(extents, corrected, cost.target(), ALGEBRA.value.checked)
+    return _derived_form(extents, corrected, cost.target(), ALGEBRA.value.checked, saturation)
 
 
 @functools.cache
-def _derived_form(extents: linear_scan.Extents, corrected: bool, target, checked: bool) -> linear_scan.Form:
+def _derived_form(extents: linear_scan.Extents, corrected: bool, target, checked: bool,
+                  saturation: program.Saturation) -> linear_scan.Form:
     """`_form`'s, once for each of its facts, `checked` whether the extractor oracle holds its extraction
     (`Passes.checked`)."""
     from dew.nn.kernels import recurrence_algebra
 
     return linear_scan.derive(extents, corrects=corrected, schedule=cost.fused(target),
-                              precision=recurrence_algebra.STATE_PRECISION, checked=checked)
+                              precision=recurrence_algebra.STATE_PRECISION, saturation=saturation,
+                              checked=checked)
 
 
 def _magnitude(bound: float | tuple[float, float] | None) -> float | None:
@@ -525,10 +530,10 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
         value = of(args[0])[1]
     elif (args := get_callable_args(node, Chunk.gram)) is not None:
         strict = bool(terms.integer(args[2]))
-        value = _paired(of(args[0]), of(args[1]), decays.between, issue, "gram" if strict else "scores",
+        value = _paired(of(args[0]), of(args[1]), of(args[3]), issue, "gram" if strict else "scores",
                         strict=strict)
     elif (args := get_callable_args(node, Chunk.spread)) is not None:
-        value = _spread(of(args[0]), of(args[1]), of(args[2]), decays.between, issue)
+        value = _spread(of(args[0]), of(args[1]), of(args[2]), of(args[3]), issue)
     elif (args := get_callable_args(node, Chunk.applied)) is not None:
         value = issue("apply", of(args[1]), of(args[0]).T)
     elif (args := get_callable_args(node, Chunk.rows)) is not None:
@@ -546,9 +551,9 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
     elif (args := get_callable_args(node, Chunk.minus)) is not None:
         value = of(args[0]) - of(args[1])
     elif (args := get_callable_args(node, Chunk.decayed)) is not None:
-        value = decays.whole[:, None] * of(args[0])
+        value = of(args[1])[:, None] * of(args[0])
     elif (args := get_callable_args(node, Chunk.written)) is not None:
-        value = issue("carry", (of(args[0]) * decays.to_last).T, of(args[1]))
+        value = issue("carry", (of(args[0]) * of(args[2])).T, of(args[1]))
     elif (args := get_callable_args(node, Chunk.doubled)) is not None:
         # Differentiated by its own rule where Dew's products make it (`_lowered`); a mainloop's are forward.
         value = _lowered(of(args[0])) if issue is _issued else _doubled(of(args[0]), issue)

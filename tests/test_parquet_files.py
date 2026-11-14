@@ -2,7 +2,6 @@
 before the first record but the first file's, each file resumed within it, and a position saved under
 version 9 read by 9."""
 
-import dataclasses
 from typing import ClassVar
 
 import numpy as np
@@ -15,8 +14,7 @@ from dew.data import Loading
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
-from dew.data.plan import PLAN_VERSIONS
-from dew.data.sources import Concatenate, Files, Memory
+from dew.data.sources import Concatenate, Files
 from dew.data.storage import Store
 
 READ = Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)
@@ -315,61 +313,3 @@ def test_a_parquet_store_reads_each_footer_once_however_many_reads_count_its_row
     counts = [GROUPS * ROWS] * FILES
     assert [shard.rows for shard in first.shards] == [shard.rows for shard in again.shards] == counts
     assert len(Opening.opened) == opened and len(set(Opening.opened)) == FILES
-
-
-@pytest.mark.parametrize("version", [5, PLAN_VERSIONS[-1] + 1], ids=["before", "after"])
-def test_a_read_by_a_plan_version_this_dew_reads_by_none_of_is_refused(version):
-    """Every read builds by its data plan version (`dew.data.compile._build`): a pass, a publication and an
-    export at one this Dew reads by none of is refused, as a run's compile is, where one past the latest
-    read as one it reads (train 654's review, row 4583); a publication of it is refused where a version it
-    reads already published the store's generation too, which it would have returned."""
-    from uuid import uuid4
-
-    from dew.data.cache import Cache
-    from dew.data.compile import iterate, publish, validation
-
-    chain = Pipeline(Files(written(f"version-{version}"), format="parquet"))
-    with pytest.raises(ValueError):
-        next(iter(iterate(chain, plan_version=version)))
-    cache = Cache(f"memory://parquet-files-refused-{uuid4().hex}")
-    with pytest.raises(ValueError):
-        publish(chain, cache, plan_version=version)
-    publish(chain, cache, plan_version=PLAN_VERSIONS[-1] if version > PLAN_VERSIONS[-1] else PLAN_VERSIONS[0])
-    with pytest.raises(ValueError):
-        publish(chain, cache, plan_version=version)
-    # Refused before the read prepares anything: a memory read's steps, which it runs as it is compiled,
-    # run none (train 667's review, row 4659).
-    with pytest.raises(ValueError):
-        compile(Pipeline(Memory([{"id": 0}, {"id": 1}])).map(Unread()).batch(2), read="memory",
-                plan_version=version)
-    with pytest.raises(ValueError):
-        validation(Pipeline(Memory([{"id": 0}, {"id": 1}])).map(Unread()), batch=2, read="memory",
-                   plan_version=version)
-
-
-@dataclasses.dataclass(frozen=True)
-class Unread:
-    """A step a read that refuses its plan version never runs."""
-
-    def __call__(self, row):
-        raise RuntimeError("a refused read ran its steps")
-
-
-def test_a_token_export_reads_its_documents_by_the_plan_version_it_names(tmp_path):
-    """`dew data export --tokenizer --plan-version` exports a store's documents as tokens read by that plan
-    version, as `dew.data.text.export_tokens(plan_version=)` does, where it was refused; a version this Dew
-    reads by none of is refused (train 654's review, row 4584)."""
-    from token_support import export_byte_tokens
-
-    from dew.data.compile import iterate
-    from dew.data.sources import TokenFiles
-
-    documents = ["one", "two words", "three of them"]
-    for name in ("nine", "unread"):
-        (tmp_path / name).mkdir()
-    exported = export_byte_tokens(tmp_path / "nine", documents, "--plan-version", str(PLAN_VERSIONS[0]))
-    read = [bytes(row["text"][:-1].astype(np.uint8)).decode() for row in iterate(Pipeline(TokenFiles(
-        str(exported))), read="streamed")]
-    assert read == documents
-    with pytest.raises(ValueError):
-        export_byte_tokens(tmp_path / "unread", documents, "--plan-version", str(PLAN_VERSIONS[-1] + 1))

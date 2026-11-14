@@ -340,11 +340,13 @@ class StageLocal:
         restored, position = checkpoints.restore(self.state(template, self.checkpointed), step, share=share)
         return self.state(restored, self.restored), position
 
-    def stored(self, state: TrainState) -> TrainState:
+    def stored(self, state: TrainState, *, consumed: bool = False) -> TrainState:
         """`state` in its stored form, every field that holds or mirrors the variables with each layer whole
         on every stage (`whole`), as one device's run holds it (`Trainer.stored`). It holds what storing
-        every layer on every stage would."""
-        return self.state(state, self.whole)
+        every layer on every stage would; where `state` is `consumed` (a fit's last, which it hands on in
+        this form alone), each field's stacked arrays are donated to its own, so no field is held twice
+        (row 4833)."""
+        return self.state(state, functools.partial(self.whole, consumed=consumed))
 
     def refuse_unpipelined(self, schedule: Schedule, objective) -> None:
         """Refuse a stage axis under a model whose traced step ran no pipeline (`schedule`)."""
@@ -407,14 +409,16 @@ class StageLocal:
                 [shard.data for piece in pieces for shard in piece.addressable_shards])
         return self.staged(tree, stack)
 
-    def whole(self, variables):
+    def whole(self, variables, *, consumed: bool = False):
         """`variables` with each stacked run back on its stored layers, each layer on every stage
-        (`Trainer.stored`'s). It costs what a state that held every layer on every device held
-        throughout; variables that hold no stacked run are returned as they are."""
+        (`Trainer.stored`'s), their stacked arrays donated where they are `consumed`. It costs what a
+        state that held every layer on every device held throughout; variables that hold no stacked run are
+        returned as they are."""
         if not self.holds(variables):
             return variables
         placement = self.rows_placement(jax.tree.map(lambda leaf: leaf.sharding, variables))
-        return program(_layered_arrays, static_argnums=0, out_shardings=placement)(self, variables)
+        return program(_layered_arrays, static_argnums=0, out_shardings=placement,
+                       donate_argnums=(1,) if consumed else ())(self, variables)
 
 
 _MIRRORS = ("variables", "opt_state", "ema", "compute")

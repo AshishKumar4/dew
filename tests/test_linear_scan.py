@@ -218,6 +218,8 @@ def _chunk(expr, chunk: dict, bound: dict):
         return chunk["tokens"][args[0]]
     if name == "entering":
         return chunk["h"]
+    if name == "prefix":
+        return None
     if name == "decay":
         return decays[args[0]]
     if name in ("loop", "plain"):
@@ -227,13 +229,13 @@ def _chunk(expr, chunk: dict, bound: dict):
     if name in ("outputs", "state"):
         return args[0][0 if name == "outputs" else 1]
     if name == "gram":
-        left, right, strict = args
-        paired = [[np.sum(left[i] * right[j] * decays["between"][i, j]) if j < i or (j == i and not strict)
+        left, right, strict, between = args
+        paired = [[np.sum(left[i] * right[j] * between[i, j]) if j < i or (j == i and not strict)
                    else 0 for j in range(TOKENS)] for i in range(TOKENS)]
         return np.asarray(paired, dtype=object)
     if name == "spread":
-        readers, values, keys = args
-        return np.asarray([sum((np.dot(readers[i], values[j]) * keys[j] * decays["between"][i, j]
+        readers, values, keys, between = args
+        return np.asarray([sum((np.dot(readers[i], values[j]) * keys[j] * between[i, j]
                                 for j in range(i + 1)), np.zeros(KEYS, dtype=object))
                            for i in range(TOKENS)], dtype=object)
     if name == "applied":
@@ -244,9 +246,9 @@ def _chunk(expr, chunk: dict, bound: dict):
     if name in operations:
         return operations[name](*args)
     if name == "decayed":
-        return decays["whole"][:, None] * args[0]
+        return args[1][:, None] * args[0]
     if name == "written":
-        return (args[0] * decays["to_last"]).T @ args[1]
+        return (args[0] * args[2]).T @ args[1]
     if name in ("solve", "substituted"):
         return _solved(*args)
     if name == "doubled":

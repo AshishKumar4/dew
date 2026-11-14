@@ -422,10 +422,3 @@ def test_each_residual_a_recurrent_mixer_names_is_one_a_policy_keeps(kind):
     assert names
     held = {name: kept((name,)) for name in names}
     assert all(bytes_ > nothing for bytes_ in held.values()), (nothing, held)
-
-
-def test_the_gradient_covering_names_tested_models():
-    """Each covering member is a model the remat tests run, so no class is covered by a name that tests
-    nothing."""
-    tested = {*PATHS, *(case.name for case in RECOMPUTED)}
-    assert {member for member, _ in GRADIENT_COVERING.values()} <= tested

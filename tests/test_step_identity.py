@@ -127,14 +127,15 @@ def test_an_exact_resume_refuses_a_function_step_whose_code_changed(tmp_path, mo
     importlib.reload(shift)
     with pytest.raises(ValueError):
         resumed_changes(reader(), state)
-    assert resumed_changes(reader("relaxed"), state) == ("modules",)
+    (changed,) = resumed_changes(reader("relaxed"), state)
+    assert changed.startswith("code.")
 
 
 def test_a_function_step_that_declares_its_identity_resumes_exactly_over_a_change_to_its_code(
         tmp_path, monkeypatch):
     """A function step that declares what it computes (`identity=`) is that identity, as a configured step's
-    fields are: a change to its module's code is its environment's, which an exact resume reads on over and
-    reports (row 3938)."""
+    fields are: a change to its module's code decides no rows, so an exact resume reads on over it, its
+    position holding none of that code (row 3938, row 5862: the checkout is the checkpoint step's)."""
     module = tmp_path / f"shift_{uuid4().hex}.py"
     module.write_text(SHIFT.format(by=1))
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -147,4 +148,4 @@ def test_a_function_step_that_declares_its_identity_resumes_exactly_over_a_chang
     state = saved_after_one(reader)
     module.write_text(SHIFT.format(by=10))
     importlib.reload(shift)
-    assert resumed_changes(reader(), state) == ("modules",)
+    assert resumed_changes(reader(), state) == ()

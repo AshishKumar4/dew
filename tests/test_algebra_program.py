@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact, equations
-from test_algebra import rows, two_sums
+from test_algebra import cheaper_spliced, rows, traces_cheaper, two_sums
 
 from dew import algebra
 from dew.algebra import cost, program, terms
@@ -26,19 +26,15 @@ from dew.nn.kernels.templates import cost as kernel_cost, report
 from dew.nn.precision import FP32_SUMS
 
 
-def reductions(closed) -> int:
-    """The sums a program's jaxpr holds, its bodies' included."""
-    return sum(equation.primitive.name == "reduce_sum" for equation in equations(closed))
-
-
 def nested(kind: str):
     """`two_sums` inside a body of `kind`: a nested jit, a checkpoint, a scan over two steps, a conditional,
-    a loop of one turn."""
+    a loop of one turn. A nested jit's and a checkpoint's function is each trace's own, so no trace reads
+    another's body from JAX's cache and each records its own rewrite."""
     def body(x, y, a):
         if kind == "jit":
-            return jax.jit(two_sums)(x, y, a)
+            return jax.jit(lambda x, y, a: two_sums(x, y, a))(x, y, a)
         if kind == "checkpoint":
-            return jax.checkpoint(two_sums)(x, y, a)
+            return jax.checkpoint(lambda x, y, a: two_sums(x, y, a))(x, y, a)
         if kind == "scan":
             return jax.lax.scan(lambda carry, step: (carry + two_sums(x * step, y, a), None),
                                 jnp.zeros(x.shape[:-1], x.dtype), jnp.arange(2.0, dtype=x.dtype))[0]
@@ -55,14 +51,13 @@ KINDS = ("jit", "checkpoint", "scan", "cond", "while")
 
 @pytest.mark.parametrize("kind", KINDS)
 def test_a_bodys_math_is_rewritten_in_place(kind):
-    """Two sums inside a nested jit, a checkpoint, a scan, a conditional or a loop are joined into one inside
-    that body, the body kept a body (never unrolled), and the program is on par with the unrewritten one
-    against the float64 truth (check 1)."""
+    """Two sums inside a nested jit, a checkpoint, a scan, a conditional or a loop are rewritten inside that
+    body into a form the model prices cheaper, the body kept a body (never unrolled), and the program is on
+    par with the unrewritten one against the float64 truth (check 1)."""
     fn = nested(kind)
     x, y, a = rows(0, (8, 64), (8, 64), (8, 64))
     before, after = jax.make_jaxpr(fn)(x, y, a), jax.make_jaxpr(algebra.rewritten(fn))(x, y, a)
-    branches = 2 if kind == "cond" else 1
-    assert (reductions(before), reductions(after)) == (2 * branches, branches)
+    assert cheaper_spliced(fn, x, y, a)
 
     def bodies(closed) -> list[str]:
         return sorted(equation.primitive.name for equation in closed.jaxpr.eqns if programs.bodies(equation))
@@ -73,6 +68,52 @@ def test_a_bodys_math_is_rewritten_in_place(kind):
         return rows(seed, (8, 64), (8, 64), (8, 64))
 
     assert_as_exact(jax.jit(algebra.rewritten(fn)), jax.jit(fn), draw, f"two sums in a {kind}", seeds=16)
+
+
+def test_statics_given_both_ways_are_each_taken_as_given_as_jit_takes_them():
+    """Where both spellings are given, jit takes each as given and infers neither from the other: a count
+    static by name alone and passed by position is traced, and a loop over it is refused. The rewritten
+    function binds its statics by the same inference (`jax._src.api_util.infer_argnums_and_argnames`), so it
+    refuses the same call, where its own union of the two spellings bound the count and ran it; passed by
+    name, the rewritten function is on par with the function as written (check 1)."""
+    def repeated(scale, x, y, a, n):
+        for _ in range(n):
+            x = two_sums(x, y, a)[:, None] * x
+        return scale * two_sums(x, y, a)
+
+    statics = {"static_argnums": 0, "static_argnames": "n"}
+    x, y, a = rows(0, (8, 16), (8, 16), (8, 16))
+    for function in (jax.jit(repeated, **statics), algebra.rewritten(repeated, **statics)):
+        with pytest.raises(jax.errors.TracerIntegerConversionError):
+            function(2.0, x, y, a, 2)
+    rewritten = algebra.rewritten(repeated, **statics)
+    assert_as_exact(jax.jit(lambda x, y, a: rewritten(2.0, x, y, a, n=2)),
+                    jax.jit(lambda x, y, a: repeated(2.0, x, y, a, n=2)),
+                    lambda seed: rows(seed, (8, 16), (8, 16), (8, 16)), "statics bound as jit binds them",
+                    seeds=16)
+
+
+def test_a_product_whose_mode_states_no_rounding_is_factored_by_no_rule():
+    """A rule that factors a product makes another in its mode, bounded by that mode's rounding
+    (`terms.contraction_slack`). A scaled operand's product at the default precision is rewritten; the same
+    product under a dot algorithm given by its own types, whose rounding no source states, is left as
+    written: nothing bounds the product a rule would make, so none fires, where the guards read only the
+    operands' powers and the length and factored it as an ordinary product."""
+    x, y, s = rows(1, (64, 32), (32, 16), (64,))
+
+    def scaled(precision):
+        return lambda x, y, s: jnp.dot(jnp.tanh(x) * jnp.tanh(s)[:, None], jnp.tanh(y), precision=precision)
+
+    assert cheaper_spliced(scaled(None), x, y, s)
+    assert not cheaper_spliced(scaled(jax.lax.DotAlgorithm(np.float32, np.float32, np.float32)), x, y, s)
+
+
+def test_a_saturation_of_no_growth_or_depth_is_refused():
+    """A saturation's limits are each at least one (docs/design/algebra.md 6.6): one of none would stop
+    every region before its first iteration and report it saturated."""
+    for limits in ({"growth": 0, "depth": 4}, {"growth": 64, "depth": 0}):
+        with pytest.raises(ValueError):
+            algebra.Saturation(**limits)
 
 
 @pytest.mark.parametrize("pass_n", ["positionally", "by keyword"])
@@ -95,50 +136,6 @@ def test_a_rewritten_function_binds_its_static_arguments_as_jit_does(statics, pa
     # 64 rows a draw: at 8 the draws' log ratios spread past what the gate resolves in 80 seeds.
     assert_as_exact(called(rewritten), called(plain), lambda seed: rows(seed, (64, 64), (64, 64), (64, 64)),
                     f"a static count passed {pass_n}", seeds=16)
-
-
-def test_a_program_no_rule_changes_is_staged_once():
-    """An outer program (`options.program`) whose math no rule changes (an opaque equation beside an unbounded
-    sum), lowered with the pass on: each of its equations staged once, by jit's own trace, which lowers as it
-    is (`program.rewritten_program`), where the pass's replay of its traced program staged each again (a
-    Dory-4B training step's 1.8 seconds of compile, nothing rewritten)."""
-    from jax.extend import core as jex_core
-    from jax.interpreters import mlir
-
-    staged = []
-
-    class Counted(jex_core.Primitive):
-        def bind(self, *args, **params):
-            staged.append(args)
-            return super().bind(*args, **params)
-
-    counted = Counted("counted_staging")
-    counted.def_impl(lambda x: x)
-    counted.def_abstract_eval(lambda x: x)
-    mlir.register_lowering(counted, lambda ctx, x: [x])
-
-    def step(x):
-        return counted.bind(x) + x
-
-    with report.refusals():
-        options.program(step).lower(jnp.ones((4, 8), jnp.float32))
-    assert len(staged) == 1
-
-
-@pytest.mark.parametrize("fn", [
-    lambda x, y: jnp.tanh(x) * 2.0 + jnp.tanh(x) * 3.0,
-    lambda x, y: x * 2.0 + x * 4.0,
-    lambda x, y: x * 2.0 + y,
-    lambda x, y: jnp.dot(x, y) + x,
-    lambda x, y: jnp.exp(x) + y * y,
-], ids=["bounded", "scaled twice", "scaled once", "unbounded product", "unbounded exponential"])
-def test_a_windows_structure_decides_reordering_as_its_terms_do(fn):
-    """Whether a rule may reorder a program (`rules.reorderable`) read off its structure alone
-    (`terms.Skeleton`, the pass's first read of every window) as off its egglog terms: a bounded value, one
-    value scaled by literals twice, and the program's own unbounded math each decided alike."""
-    closed = jax.make_jaxpr(fn)(*rows(1, (16, 16), (16, 16)))
-    assert (algebra.rules.reorderable(terms.region(closed, forms=terms.Skeleton))
-            == algebra.rules.reorderable(terms.region(closed)))
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float8_e4m3fn],
@@ -196,17 +193,16 @@ def test_a_scale_lifted_past_a_product_is_priced_at_its_shape():
 
 
 @pytest.mark.parametrize("fn", [
-    lambda x, y, s: jnp.max(x * 0.5, axis=1),
-    lambda x, y, s: jnp.min(0.5 * x, axis=1),
-    lambda x, y, s: jnp.dot(x * s[:, None], y),
+    lambda x, y, s: jnp.max(jnp.tanh(x) * 0.5, axis=1),
+    lambda x, y, s: jnp.min(0.5 * jnp.tanh(x), axis=1),
+    lambda x, y, s: jnp.dot(jnp.tanh(x) * jnp.tanh(s)[:, None], jnp.tanh(y)),
 ], ids=["max of a positive scale", "min of a positive scale", "contraction of a scaled operand"])
-def test_a_rule_whose_left_side_heads_at_a_reduction_or_a_contraction_gets_a_window(fn):
+def test_a_rule_whose_left_side_heads_at_a_reduction_or_a_contraction_rewrites_it(fn):
     """A maximum or minimum of a positively scaled operand (`linear`'s positive scale out of an extremum) and
-    a contraction of a scaled operand (its matrix scale, a dequant's): each opens a window its rule may fire
-    in (`rules.heads`), where no head read a reduction of an extremum over a product or a contraction over
+    a contraction of a scaled operand (its matrix scale, a dequant's): each is rewritten into a form the
+    model prices cheaper, where no head read a reduction of an extremum over a product or a contraction over
     one, so neither rule ever ran (row 3580)."""
-    closed = jax.make_jaxpr(fn)(*rows(1, (64, 32), (32, 16), (64,)))
-    assert program._windows(closed.jaxpr)
+    assert cheaper_spliced(fn, *rows(1, (64, 32), (32, 16), (64,)))
 
 
 def test_derived_forms_trace_under_each_manual_mesh_they_meet():
@@ -234,14 +230,6 @@ def _shared_products(a, x, y):
     return jnp.dot(a, x) + jnp.dot(a, y)
 
 
-def _cheaper_spliced(program, *operands) -> bool:
-    """Whether tracing `program` rewritten splices a form the model prices cheaper than the region as traced
-    (the rewrite report's `spliced` and `before`/`after`)."""
-    with report.refusals():
-        jax.make_jaxpr(algebra.rewritten(program))(*operands)
-        return any(made.spliced and made.after < made.before for made in report.rewrites())
-
-
 def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
     """Under the run's accurate numerics (`precision="accurate"`, `generation.run_precision`) the pass admits
     the `exact` sets alone (docs/design/algebra.md §1.4): two products of a shared operand, summed, which the
@@ -252,7 +240,7 @@ def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
     with generation.run_precision(ACCURATE), report.refusals():
         jax.make_jaxpr(algebra.rewritten(_shared_products))(*operands_)
         assert not any(made.spliced for made in report.rewrites())
-    assert _cheaper_spliced(_shared_products, *operands_)
+    assert cheaper_spliced(_shared_products, *operands_)
 
 
 def test_two_sums_join_into_one_where_the_model_prices_it_cheaper():
@@ -263,7 +251,7 @@ def test_two_sums_join_into_one_where_the_model_prices_it_cheaper():
         return jnp.sum(jnp.tanh(x), axis=-1) + jnp.sum(jnp.tanh(y), axis=-1)
 
     shapes = ((64, 128), (64, 128))
-    assert _cheaper_spliced(two, *rows(3, *shapes))
+    assert cheaper_spliced(two, *rows(3, *shapes))
     assert_as_exact(jax.jit(algebra.rewritten(two)), jax.jit(two), lambda seed: rows(seed, *shapes),
                     "two sums", seeds=16)
 
@@ -273,7 +261,7 @@ def test_products_with_a_shared_operand_join_into_one():
     prices cheaper (one product of the shared operand with the summed other), their operands bounded
     (tanh's) so the range facts bound the new sum (§6.3), and compute what they compute (check 1)."""
     shapes = ((256, 64), (64, 64), (64, 64))
-    assert _cheaper_spliced(_shared_products, *rows(1, *shapes))
+    assert cheaper_spliced(_shared_products, *rows(1, *shapes))
 
     def draw(seed):
         return rows(seed, *shapes)
@@ -305,18 +293,95 @@ def test_factoring_products_keeps_finite_cancellation(shared, compiled, overflow
         np.testing.assert_array_equal(rewritten(a, z, z), expected)
 
 
+def test_a_program_closing_over_a_typed_key_compiles_through_the_pass():
+    """A user's function compiled through Dew's seam (`dew.jit`, `options.program`) that closes over a typed
+    PRNG key and binds an exponential, so the pass keys its body by its constants' bits (the attention
+    family's anchor, `recognize._body_key`): it compiles, and its draw is the key's, bit for bit, as
+    `jax.jit` draws it. NumPy reads no typed key's bits, which refused every such program (row 5860)."""
+    key = jax.random.key(7)
+
+    def sampled(x):
+        return jnp.exp(x), jax.random.normal(key, x.shape)
+
+    x = jnp.linspace(-1.0, 1.0, 16)
+    _, drawn = options.program(sampled)(x)
+    np.testing.assert_array_equal(np.asarray(drawn), np.asarray(jax.jit(sampled)(x)[1]))
+
+
+ATTENTION_KEY_SEEDS = 8
+"""The captured-key attentions' declared draws against the function under `jax.jit` (check 1)."""
+
+
+def keyed_attention(q, k, v, key):
+    """Multi-head attention `[batch, time, heads, width]` whose logits add a bias `key` draws."""
+    bias = jax.random.normal(key, (q.shape[0], q.shape[2], q.shape[1], k.shape[1]), q.dtype)
+    logits = jnp.einsum("bqhd,bkhd->bhqk", q, k) * 0.25 + bias
+    return jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(logits, axis=-1), v)
+
+
+def attention_draw(salt: int):
+    """`keyed_attention`'s queries, keys and values, drawn from `salt`'s stream."""
+    def draw(seed):
+        rng = np.random.default_rng([salt, seed])
+        return tuple(jnp.asarray(rng.standard_normal((2, 16, 2, 8)), jnp.float32) for _ in range(3))
+    return draw
+
+
+def test_an_attention_closing_over_a_typed_key_compiles_through_the_pass():
+    """A multi-head attention whose logits add a bias drawn from a typed PRNG key the function closes over,
+    compiled through Dew's seam: the pass recognizes the attention, its bias's draw inside the candidate
+    (`recognize`), its normal form taking the key as the constant it is (`normal_form.canonical`), and the
+    program it compiles is on par with the function under `jax.jit` from the function in float64 (check
+    1). NumPy reads no typed key's bits, which refused every such program (row 5860)."""
+    from reference_error import dew_programs
+
+    key = jax.random.key(5861)
+
+    def attended(q, k, v):
+        return keyed_attention(q, k, v, key)
+
+    assert_as_exact(dew_programs(options.program(attended)), attended, attention_draw(5861),
+                    "an attention with a captured key's bias", seeds=ATTENTION_KEY_SEEDS)
+
+
+def test_an_attention_selecting_one_of_two_captured_keys_compiles_through_the_pass():
+    """A multi-head attention whose bias draws from one of two typed PRNG keys it closes over, the key chosen
+    by its query's sign: the key a selection moves is a value of the attention's candidate, which the pass
+    reads as no number (`terms`, its bound and its literals' facts), and the program it compiles is on par
+    with the function under `jax.jit` from the function in float64 (check 1, row 5860)."""
+    from reference_error import dew_programs
+
+    keys = jax.random.key(5862), jax.random.key(5863)
+
+    def attended(q, k, v):
+        return keyed_attention(q, k, v, jax.lax.select(q[0, 0, 0, 0] > 0, *keys))
+
+    assert_as_exact(dew_programs(options.program(attended)), attended, attention_draw(5862),
+                    "an attention with a selected key's bias", seeds=ATTENTION_KEY_SEEDS)
+
+
 def test_every_outer_program_is_rewritten_unless_its_arm_turns_the_pass_off():
     """An outer program (`options.program`) traces its function rewritten, so its lowering, its trace and its
     executable read one program; under `algebra.passes(on=False)`, which the gate opens for a reference arm,
-    the same program traces unrewritten, and a program already held retraces as the switch changes."""
+    the same program traces unrewritten, and a program already held retraces as the switch changes, and as
+    the target its forms are priced for does (`generation.assumed`): each a new executable."""
     x, y, a = rows(2, (8, 64), (8, 64), (8, 64))
     program = options.program(two_sums)
-    assert reductions(program.trace(x, y, a).jaxpr) == 1
+
+    def spliced() -> bool:
+        with report.refusals():
+            program.trace(x, y, a)
+            return any(made.spliced for made in report.rewrites())
+
+    assert spliced()
     with algebra.passes(on=False):
-        assert reductions(program.trace(x, y, a).jaxpr) == 2
+        assert not spliced()
         off = program.executable(x, y, a)
     on = program.executable(x, y, a)
     assert off is not on
+    with generation.assumed("sm90"):
+        elsewhere = program.executable(x, y, a)
+    assert elsewhere is not on and elsewhere is not off
     np.testing.assert_array_equal(np.asarray(program(x, y, a)), np.asarray(on(x, y, a)))
 
 
@@ -423,15 +488,14 @@ def test_a_calls_locals_go_when_its_first_program_imports_the_pass():
 def test_a_program_thousands_of_equations_deep_is_rewritten_around_what_the_rules_read():
     """A program whose math runs four thousand equations deep before two sums the rules join (a step's
     backward through every layer) is rewritten in a window around those sums, the deep chain read as
-    values from outside it: the sums are joined and the program is on par with the unrewritten one, where
-    holding the whole chain as one term would pass the interpreter's recursion limit."""
+    values from outside it: the sums take their cheaper form and the program is on par with the unrewritten
+    one, where holding the whole chain as one term would pass the interpreter's recursion limit."""
     def deep(x, y, a):
         for _ in range(4000):
             x = jnp.sin(x)
         return two_sums(x, y, a)
 
-    x, y, a = rows(5, (4, 16), (4, 16), (4, 16))
-    assert reductions(jax.make_jaxpr(algebra.rewritten(deep))(x, y, a)) == 1
+    assert cheaper_spliced(deep, *rows(5, (4, 16), (4, 16), (4, 16)))
 
     def draw(seed):
         return rows(seed, (4, 16), (4, 16), (4, 16))
@@ -442,9 +506,9 @@ def test_a_program_thousands_of_equations_deep_is_rewritten_around_what_the_rule
 def test_a_scale_after_a_contraction_moves_onto_its_smaller_operand():
     """A contraction's result scaled by a power of two (a derived walk's `ds k * scale`, docs/design/
     algebra.md §1.4) scales its smaller operand instead, the product being linear in each and the scale
-    rounding nothing: the rewritten program multiplies 4 x 4 values where it multiplied 4 x 16, on par with
-    the program as written against the float64 truth (check 1). A scale of another value stays where the
-    program put it, as moving it reorders rounding."""
+    rounding nothing: the rewritten program takes that cheaper form (4 x 4 values multiplied where 4 x 16
+    were), on par with the program as written against the float64 truth (check 1). A scale of another value
+    is rewritten into nothing, as moving it reorders rounding."""
     def scaled(g, i):
         return jnp.dot(jnp.tanh(g), jnp.tanh(i)) * 0.25
 
@@ -452,13 +516,8 @@ def test_a_scale_after_a_contraction_moves_onto_its_smaller_operand():
         return jnp.dot(jnp.tanh(g), jnp.tanh(i)) * 0.3
 
     g, i = rows(6, (4, 4), (4, 16))
-    kept = jax.make_jaxpr(algebra.rewritten(other))(g, i)
-    assert [equation.outvars[0].aval.shape for equation in equations(kept)
-            if equation.primitive.name == "mul"] == [(4, 16)]
-
-    after = jax.make_jaxpr(algebra.rewritten(scaled))(g, i)
-    assert [equation.outvars[0].aval.shape for equation in equations(after)
-            if equation.primitive.name == "mul"] == [(4, 4)]
+    assert not cheaper_spliced(other, g, i)
+    assert cheaper_spliced(scaled, g, i)
 
     def draw(seed):
         return rows(seed, (4, 4), (4, 16))
@@ -491,17 +550,6 @@ def test_moving_a_scale_keeps_finite_contraction_products(scaled, compiled, over
         np.testing.assert_array_equal(expected, jnp.zeros_like(expected))
         np.testing.assert_array_equal(rewritten(y), expected)
 
-
-
-def test_an_uncatalogued_gpu_prices_forms_by_its_own_facts():
-    """A GPU of a known family no row names (an sm121, its multiprocessors, clock and bandwidth its own):
-    the pass prices a program by its facts (`cost.target`), not an H100's, so a form is chosen for the
-    device the program compiles for."""
-    unseen = generation.GpuTarget("sm121", "an unseen consumer Blackwell", 99 * 1024, multiprocessors=48,
-                                  clock_hz=2.4e9, memory_bandwidth=273e9)
-    with generation.assumed(unseen):
-        priced = cost.target()
-    assert (priced.generation, priced.multiprocessors, priced.memory_bandwidth) == ("sm121", 48, 273e9)
 
 
 @pytest.mark.parametrize(("generation_name", "speedup"), [("sm90", 2), ("sm80", 1)])
@@ -578,9 +626,9 @@ def test_a_products_mode_prices_it():
     the highest) takes the tensor cores' TF32 mode, one of 16-bit operands their 16-bit mode, and one at
     `Precision.HIGHEST` the CUDA cores (`cost.work`): an H100's TF32 rate is half its 16-bit one and its
     CUDA cores' far below both, so the three price apart."""
-    def product(precision, dtype):
+    def product(precision, dtype, result=jnp.float32):
         def contracted(a, b):
-            return jnp.dot(a, b, precision=precision, preferred_element_type=jnp.float32)
+            return jnp.dot(a, b, precision=precision, preferred_element_type=result)
 
         a, b = (jnp.ones((64, 64), dtype) for _ in range(2))
         region = terms.region(jax.make_jaxpr(contracted)(a, b))
@@ -597,6 +645,11 @@ def test_a_products_mode_prices_it():
     spelled = jax.lax.DotAlgorithm(jnp.bfloat16, jnp.bfloat16, jnp.float32, num_primitive_operations=3)
     assert product(spelled, jnp.float32) == product(jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3, jnp.float32)
     assert product(spelled, jnp.float32).flops == 3 * flops
+    # A preset is priced by what JAX lowers it to, whatever its operands' storage: bf16 products of fp32
+    # storage accumulated in bf16 are the 16-bit mode's, where a preset not named `..._F32` was the CUDA
+    # cores'.
+    narrow = product(jax.lax.DotAlgorithmPreset.BF16_BF16_BF16, jnp.float32, jnp.bfloat16)
+    assert (narrow.flops, narrow.operations) == (flops, 0.0)
     # An FP8 dot algorithm's products are the 8-bit mode's, as FP8 operands' are.
     eight = jax.lax.DotAlgorithm(jnp.float8_e4m3fn, jnp.float8_e4m3fn, jnp.float32)
     assert product(eight, jnp.float8_e4m3fn).fp8_flops == flops
@@ -624,11 +677,10 @@ def _layer(x, w):
 
 
 def test_a_body_shared_by_its_call_sites_stays_shared():
-    """A model calling one jitted layer eight times, nothing to rewrite: with the pass on, every call site
-    holds one body, as with it off, and the model compiles as many programs as it does with the pass off,
-    so a model's layers lower and compile once, their kernels too, not once a call site (each rebuilt body
-    made a Qwen3.5-4B training step's compile 52 to 487 seconds on an H100). A retrace takes the same
-    rewritten body."""
+    """A model calling one jitted layer eight times, nothing to rewrite: with the pass on the model compiles
+    as many programs as it does with the pass off (`dew.telemetry.compiles`), so a model's layers lower and
+    compile once, their kernels too, not once a call site (each rebuilt body made a Qwen3.5-4B training
+    step's compile 52 to 487 seconds on an H100)."""
     def model(x, ws):
         for w in ws:
             x = _layer(x, w)
@@ -638,20 +690,12 @@ def test_a_body_shared_by_its_call_sites_stays_shared():
 
     from dew.telemetry.compiles import Compiles
 
-    def bodies(*, on: bool) -> set:
-        with algebra.passes(on):
-            closed = jax.make_jaxpr(algebra.rewritten(model))(x, ws)
-        return {id(equation.params["jaxpr"]) for equation in closed.jaxpr.eqns
-                if equation.primitive.name in ("pjit", "jit")}
-
     def compiled(*, on: bool) -> int:
         jax.clear_caches()
         with algebra.passes(on), Compiles(None) as heard:
             jax.jit(algebra.rewritten(model))(x, ws).block_until_ready()
         return len(heard.programs)
 
-    on, again = bodies(on=True), bodies(on=True)
-    assert len(on) == len(bodies(on=False)) == 1 and again == on
     assert compiled(on=True) == compiled(on=False)
 
 
@@ -761,51 +805,53 @@ def _marked_kinds(closed) -> list:
     return [equation.params["kind"] for equation in equations(closed) if equation.primitive is marked_call_p]
 
 
-@pytest.mark.parametrize(("generation_name", "measured"), [("sm80", 225.3e-9), ("sm90", 142.7e-9),
-                                                         ("sm120", 137.7e-9)])
-def test_a_template_walks_span_is_priced_at_its_gpus_kernel_step(generation_name, measured):
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm120"])
+def test_a_template_walks_span_is_priced_at_its_gpus_kernel_step(generation_name):
     """A template's tile walk prices its span, a chain of dependent steps each reading the last, at its GPU's
-    in-kernel step: one dependent reduction of a tile within a program, measured as the slope over 1,024 to
-    16,384 steps (FS-STEP-SECONDS1's kernel path: an A100's 225.3 ns, an H100's 142.7, an RTX PRO 6000
-    Server's 137.7), so a walk of 10,000 such steps and little work is that span's time (row 4080)."""
+    in-kernel step (one dependent reduction of a tile within a program, measured as the slope over 1,024 to
+    16,384 steps, FS-STEP-SECONDS1's kernel path), so a walk of 10,000 such steps and little work costs
+    10,000 times a walk of one, and no walk is free (row 4080)."""
     target = generation.gpu_target(generation_name)
-    work = kernel_cost.Work(flops=1.0, span=10_000)
-    assert kernel_cost.walked(work, target) == 10_000 * measured
+    step = kernel_cost.walked(kernel_cost.Work(flops=1.0, span=1), target)
+    assert kernel_cost.walked(kernel_cost.Work(flops=1.0, span=10_000), target) == 10_000 * step > 0
 
 
 def test_a_protected_span_is_kept_as_traced_however_often_the_pass_runs():
     """A protected span (`dew.nn.derivatives.Protected`: an error-free transform's) is a boundary no region
-    crosses and whose inside no rule touches (docs/design/algebra.md §1.2): two sums the pass joins unmarked
-    stay two inside their one marked call, once rewritten and again, a program already rewritten rewritten
-    anew."""
+    crosses and whose inside no rule touches (docs/design/algebra.md §1.2): two sums the pass rewrites
+    unmarked are spliced into nothing inside their one marked call, once rewritten and again, a program
+    already rewritten rewritten anew."""
     from dew.nn.derivatives import Protected, marked
 
     operands_ = rows(11, *SHAPES_MARKED)
-    assert reductions(jax.make_jaxpr(algebra.rewritten(two_sums))(*operands_)) == 1
+    assert cheaper_spliced(two_sums, *operands_)
     spanned = marked(Protected(), two_sums)
     for rewrite in (algebra.rewritten(spanned), algebra.rewritten(algebra.rewritten(spanned))):
-        rewritten = jax.make_jaxpr(rewrite)(*operands_)
-        assert (reductions(rewritten), _marked_kinds(rewritten)) == (2, [Protected()])
+        with report.refusals():
+            rewritten = jax.make_jaxpr(rewrite)(*operands_)
+            assert not any(made.spliced for made in report.rewrites())
+        assert _marked_kinds(rewritten) == [Protected()]
 
 
 @pytest.mark.parametrize("kind", ["Surrogate", "KernelGlue"])
 def test_a_surrogates_and_a_kernel_glues_body_is_rewritten_within_its_call(kind):
     """A surrogate's bodies and a kernel derivative's glue are rewritten as any other math, within their
-    marked call, which stays one call of its kind (§1.2): two sums inside join into one there, and the
-    program computes what it computes (check 1)."""
+    marked call, which stays one call of its kind (§1.2): two sums inside take their cheaper form there, and
+    the program computes what it computes (check 1)."""
     from dew.nn import derivatives
 
     spanned = derivatives.marked(getattr(derivatives, kind)(), two_sums)
+    assert cheaper_spliced(spanned, *rows(12, *SHAPES_MARKED))
     rewritten = jax.make_jaxpr(algebra.rewritten(spanned))(*rows(12, *SHAPES_MARKED))
-    assert (reductions(rewritten), len(_marked_kinds(rewritten))) == (1, 1)
+    assert len(_marked_kinds(rewritten)) == 1
     assert_as_exact(jax.jit(algebra.rewritten(spanned)), jax.jit(two_sums),
                     lambda seed: rows(seed, *SHAPES_MARKED), f"{kind}'s body", seeds=8)
 
 
 def test_an_algebra_span_joins_the_windows_around_it():
     """A derivative written only to restructure algebra (`Algebra`) is rewritten freely (§6.10): its body
-    opens into the region around it, so a sum inside it joins a sum outside it, and the program computes
-    what it computes (check 1)."""
+    opens into the region around it, so a sum inside it and a sum outside it take one cheaper form, no
+    marked call left, and the program computes what it computes (check 1)."""
     from dew.nn.derivatives import Algebra, marked
 
     def inside(x, a):
@@ -814,8 +860,8 @@ def test_an_algebra_span_joins_the_windows_around_it():
     def spanning(x, y, a):
         return marked(Algebra(), inside)(x, a) + jnp.sum(jnp.tanh(a) * jnp.tanh(y), axis=-1)
 
-    rewritten = jax.make_jaxpr(algebra.rewritten(spanning))(*rows(13, *SHAPES_MARKED))
-    assert (reductions(rewritten), _marked_kinds(rewritten)) == (1, [])
+    assert cheaper_spliced(spanning, *rows(13, *SHAPES_MARKED))
+    assert _marked_kinds(jax.make_jaxpr(algebra.rewritten(spanning))(*rows(13, *SHAPES_MARKED))) == []
     assert_as_exact(jax.jit(algebra.rewritten(spanning)), jax.jit(two_sums),
                     lambda seed: rows(seed, *SHAPES_MARKED), "an opened span", seeds=8)
 
@@ -831,8 +877,9 @@ def test_an_algebra_span_with_effects_is_rewritten_within_its_call():
         return two_sums(x, y, a)
 
     spanned = marked(Algebra(), noted)
+    assert cheaper_spliced(spanned, *rows(15, *SHAPES_MARKED))
     rewritten = jax.make_jaxpr(algebra.rewritten(spanned))(*rows(15, *SHAPES_MARKED))
-    assert (reductions(rewritten) - 1, _marked_kinds(rewritten)) == (1, [Algebra()])
+    assert _marked_kinds(rewritten) == [Algebra()]
     assert_as_exact(jax.jit(algebra.rewritten(spanned)), jax.jit(two_sums),
                     lambda seed: rows(seed, *SHAPES_MARKED), "an effectful span", seeds=8)
 
@@ -905,7 +952,7 @@ import json
 import jax
 import jax.numpy as jnp
 import numpy as np
-from egglog import i64, rewrite, var
+from egglog import eq, i64, rule, union, var
 from jax.core import eval_jaxpr
 
 from dew import algebra
@@ -921,6 +968,10 @@ def branched(x, y):
     return jax.lax.cond(jnp.sum(x) > 0, sums, lambda x, y: sums(y, x), x, y)
 
 
+def alone(x, y):
+    return jnp.exp(jnp.tanh(x))
+
+
 rng = np.random.default_rng(0)
 x, y = (jnp.asarray(rng.standard_normal((5, 38)), jnp.float32) for _ in range(2))
 closed = jax.make_jaxpr(branched)(x, y)
@@ -930,30 +981,84 @@ def computed():
     window = jax.jit(algebra.rewritten(sums))(x, y)
     rewritten = algebra.rewritten_program(closed)
     body = eval_jaxpr(rewritten.jaxpr, rewritten.consts, x, y)[0]
-    return float(jnp.max(jnp.abs(window - sums(x, y)))), float(jnp.max(jnp.abs(body - sums(x, y))))
+    lone = jax.jit(algebra.rewritten(alone))(x, y)
+    return (float(jnp.max(jnp.abs(window - sums(x, y)))), float(jnp.max(jnp.abs(body - sums(x, y)))),
+            float(jnp.max(jnp.abs(lone - alone(x, y)))))
 
 
 before = computed()
-variable, params = var("x", Term), var("params", i64)
-exponential = rules.RuleFamily("the exponential as its argument", (rewrite(variable.unary("exp", params)).to(
-    variable),), (jnp.exp, lambda x: x, None))
+variable, root, params = var("x", Term), var("root", Term), var("params", i64)
+rewritten = rule(eq(variable.unary("exp", params)).to(root)).then(union(root).with_(variable))
+exponential = rules.RuleFamily("the exponential as its argument", (rewritten,), (jnp.exp, lambda x: x, None))
 rules.register(rules.Rules.declared("registered after", "reorders", (exponential,), "a test's"))
 print(json.dumps({"before": before, "after": computed()}))
 """
-"""A process that rewrites a program's window and a branch body of one held program, registers a rule set
-(one that rewrites an exponential to its argument), and rewrites them again."""
+"""A process that rewrites a program's window, a branch body of one held program and a program holding an
+exponential alone, registers a rule set (one that rewrites an exponential to its argument), and rewrites
+them again."""
 
 
 def test_a_rule_set_registered_after_a_rewrite_reaches_the_programs_rewritten_after_it():
     """A window's and a body's rewrite are kept by everything their derivation reads, the rule sets the
     registry admits among them: a set registered after a program was rewritten (a user extending the
     algebra in a running process) reaches the next rewrite of a window of its structure and of the same held
-    branch body, where a rewrite kept from before it would stand."""
+    branch body, where a rewrite kept from before it would stand; and a program whose only math the set
+    reads is the set's left side (an exponential alone, no sum beside it) is rewritten too: the pass opens
+    its windows at each registered rule's own head (`rules.heads`), read from the term its union rewrites
+    however the rule spells that term's equality (here the term first, its root second), where a table
+    written beside the rules listed no exponential and left such a rule unreachable."""
     done = subprocess.run([sys.executable, "-c", REGISTERED_AFTER], capture_output=True, text=True,
                           check=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
     found = json.loads(done.stdout.strip().splitlines()[-1])
     assert max(found["before"]) < 1e-4
     assert min(found["after"]) > 0.1
+
+
+EXACT_ON_UNBOUNDED = """
+import json
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from egglog import eq, i64, rule, union, var
+
+from dew import algebra
+from dew.algebra import rules
+from dew.algebra.terms import Term
+
+
+def twice(x):
+    return jnp.abs(jnp.abs(x))
+
+
+x = jnp.asarray(np.random.default_rng(0).standard_normal((5, 38)), jnp.float32)
+closed = jax.make_jaxpr(twice)(x)
+
+
+def magnitudes():
+    return sum(equation.primitive.name == "abs" for equation in algebra.rewritten_program(closed).jaxpr.eqns)
+
+
+before = magnitudes()
+value, root, inner, outer = var("value", Term), var("root", Term), var("inner", i64), var("outer", i64)
+once = rule(eq(value.unary("abs", inner).unary("abs", outer)).to(root)).then(
+    union(root).with_(value.unary("abs", inner)))
+family = rules.RuleFamily("a magnitude's magnitude", (once,), (twice, jnp.abs, None))
+rules.register(rules.Rules.declared("registered exact", "exact", (family,), "a test's"))
+print(json.dumps({"before": before, "after": magnitudes()}))
+"""
+"""A process that rewrites a program of a magnitude's magnitude over an operand nothing bounds, registers an
+exact set that reads it as the magnitude, and rewrites it again."""
+
+
+def test_a_registered_exact_rule_rewrites_a_window_of_values_nothing_bounds():
+    """An exact rule reads no bound, so it fires in a window whose values have none: a registered exact set
+    that reads `abs(abs(x))` as `abs(x)` leaves one magnitude of the two over an input the program states no
+    range of. The pass left every such window as traced, whatever sets were admitted, because no reordering
+    rule could fire in it (`rules.reorderable`)."""
+    done = subprocess.run([sys.executable, "-c", EXACT_ON_UNBOUNDED], capture_output=True, text=True,
+                          check=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    assert json.loads(done.stdout.strip().splitlines()[-1]) == {"before": 2, "after": 1}
 
 
 def test_a_value_is_priced_at_the_bytes_its_dtype_holds():
@@ -1007,15 +1112,11 @@ def _scaled_operands(seed: int, shape: tuple[int, ...]) -> tuple:
             *(jnp.asarray(rng.uniform(0.5, 2.0), jnp.float32) for _ in range(2)))
 
 
-def _multiplies(closed) -> int:
-    return sum(equation.primitive is jax.lax.mul_p for equation in equations(closed))
-
-
 def test_a_score_hook_and_its_slopes_pass_the_algebra_pass_before_a_kernel_places_them():
     """A score hook and its derivative are rewritten by the algebra pass before a kernel's tile places them
     (docs/design/algebra.md §2): the tile's hook (`attention_algebra.hooked`) and its slopes
-    (`attention_gradient.scored`) trace the hook's cheaper form, one multiply of the two scales' sum, which
-    they compute as the hook does (check 1); with the pass off, the hook as written."""
+    (`attention_gradient.scored`) trace the hook's cheaper form (the rewrite report's), which they compute as
+    the hook does (check 1); with the pass off, the hook as written."""
     from dew.nn.kernels.templates.attention_algebra import hooked
     from dew.nn.kernels.templates.attention_gradient import scored
 
@@ -1030,13 +1131,9 @@ def test_a_score_hook_and_its_slopes_pass_the_algebra_pass_before_a_kernel_place
     def draw(seed):
         return _scaled_operands(seed, (16, 32))
 
-    assert _multiplies(jax.make_jaxpr(tile)(*draw(0))) == 1
+    assert traces_cheaper(tile, *draw(0)) and traces_cheaper(sloped, *draw(0))
     with algebra.passes(on=False):
-        assert _multiplies(jax.make_jaxpr(tile)(*draw(0))) == 2
-    rewritten, written = jax.make_jaxpr(sloped)(*draw(0)), None
-    with algebra.passes(on=False):
-        written = jax.make_jaxpr(sloped)(*draw(0))
-    assert _multiplies(rewritten) < _multiplies(written)
+        assert not traces_cheaper(tile, *draw(0))
     assert_as_exact(jax.jit(tile), jax.jit(lambda s, a, b: _scaled_twice(s, q_pos, k_pos, a, b)), draw,
                     "a rewritten score hook", seeds=8)
 

@@ -9,6 +9,8 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
+from dew.batch import document_firsts
+
 from .scatter import gather_positions
 from .visibility import visible
 
@@ -83,6 +85,29 @@ def document_offsets(segment_ids, max_segments: int) -> jax.Array:
     ids = jnp.arange(1, max_segments + 2) % (max_segments + 1)
     counts = jnp.sum(segment_ids[:, None, :] == ids[None, :, None], axis=-1, dtype=jnp.int32)
     return jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(counts.reshape(-1), dtype=jnp.int32)])
+
+
+def own_runs(segment_ids: jax.Array, runs: int) -> tuple[jax.Array, jax.Array]:
+    """Each row's runs of one id in a call's own `segment_ids` `[B, S]`, its documents and the padding after
+    them, whatever their ids: whether each token begins one `[B, S]`, and each run's first token `[B, runs]`
+    (`document_firsts`: `S` past a row's last), at most `runs` a row. The packed sequences FlashAttention and
+    cuDNN run a call's own documents as (`attention.flash_attention`, `packed_runs`)."""
+    rows = segment_ids.shape[0]
+    changes = segment_ids[:, 1:] != segment_ids[:, :-1]
+    begins = jnp.concatenate([jnp.ones((rows, 1), bool), changes], axis=1)
+    return begins, document_firsts(begins, runs)
+
+
+def packed_runs(segment_ids: jax.Array, runs: int) -> tuple[jax.Array, jax.Array]:
+    """A call's own documents' runs (`own_runs`) as cuDNN's packed sequences take them
+    (`fused_attention_stablehlo.dot_product_attention`'s `q_offsets` and `q_seqlen`): each run's first token
+    `[B, runs + 1]` and its length `[B, runs]`, in order, -1 past a row's last."""
+    length = segment_ids.shape[1]
+    firsts = own_runs(segment_ids, runs)[1]
+    ends = jnp.concatenate([firsts[:, 1:], jnp.full((firsts.shape[0], 1), length, firsts.dtype)], axis=1)
+    held = firsts < length
+    offsets = jnp.pad(jnp.where(held, firsts, -1), ((0, 0), (0, 1)), constant_values=-1)
+    return offsets, jnp.where(held, ends - firsts, -1)
 
 
 def _padding_last(ids: jax.Array) -> jax.Array:

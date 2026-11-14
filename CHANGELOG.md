@@ -7,6 +7,35 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A host's CPU devices stand in for the GPUs a run is checked for where JAX's CUDA plugin does not install
+  (`dew.training.ahead.stand_in_gpus`, a block): `validate` holds the run's state to the allocator limits
+  their stated GPU memory gives, as over compile-only GPUs. `dew.newton_schulz.spread_matrices` is removed:
+  Muon's update FLOPs (`muon_update_flops`) are each stack's Newton-Schulz FLOPs, summed. A run compiled ahead
+  over a host's topology (`AheadTarget.topology`), which states its GPUs' memory, refuses a `capacity_gib`
+  beside it, which it ignored.
+- A plan the devices refuse (`PlanRefused`) states what each local device's allocator read as it refused
+  (`PlanRefused.allocators`, the tightest in its message: its limit, its bytes in use, its largest free
+  block and its pool), so a refusal at a phase's boundary names what holds the device.
+
+- A compile-only GPU states its memory once: `compile_only_gpus(generation, count, memory)` takes each GPU's
+  memory, its total as the GPU states it, which XLA compiles for and every admission of a program compiled
+  for it reads as the allocator's limit derived from it (`dew._devices.allocator_limit`, the run's pool
+  share, as the GPU's own allocator states it); a host's own serialized topology (`host_gpus`) states its
+  GPUs' memory itself. `compile_ahead` no longer takes `capacity`, and refuses before anything traces GPUs
+  that state no memory, where it planned by compiling; `Trainer.validate` and `Layout.validate` no longer
+  take `capacity`: a run is checked for GPUs on a host that holds none over compile-only GPUs of stated
+  memory. `AheadTarget.capacity_gib` is that memory, and `AheadOfTime.capacity` the limit the plan held to.
+
+
+- Dew requires its JAX build 0.12.0.1.post87 (Python alone; the CUDA and PJRT plugins stay post81's): a run under
+  a profiler or dumping XLA's programs reads the Mosaic GPU lowerings and kernel certifications an unprofiled run
+  stored, where it lowered and certified them afresh.
+- Dew requires its JAX build 0.12.0.1.post86 (Python alone; the CUDA and PJRT plugins stay post81's): a Mosaic
+  GPU kernel's identity reads its operations, not its source locations, so a kernel traced alone and again in a
+  step's gradient compiles once; cuDNN's attention gates read the capability of the GPU a program is traced
+  for, so compiling ahead for a compile-only GPU takes head dims past 128; the Mosaic GPU pipeline takes a
+  prefetch of a step's first values under the step before's last products; the TPU pipeline carries a value
+  across its steps.
 - Dew requires its JAX build 0.12.0.1.post85 (Python alone; the CUDA and PJRT plugins stay post81's): the
   GPU interpreter checks a barrier wait that names its phase at its waits alone, so consumers that take
   alternate tiles of one ring over several rotations, warps among them, are checked rather than refused.
@@ -38,17 +67,22 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `compile(..., resume=)` takes `"relaxed"` where it took `"non-exact"`, and a plan's refusal is a
   `dew.data.plan.PlanChanged` naming what differs (`differs`).
 
-- Data plan version 14, the last global one: a plan describes each step by its structure (its class and
-  fields, a callable by its own identity, an array by its fingerprint, a mapping in its order) and records,
-  by name, the rules its read takes its next rows by (`identity`, `shuffle`, `mix`, `dealing`, `grain`,
-  `phases`) and the shards a stream reads, each one value beside the code that implements it
-  (docs/design/data.md, the rules). A resume compares them and refuses a differing one by its name; a Grain
-  upgrade refuses only a position whose iterator state its iterators cannot restore. Phases that share a
-  corpus continue it from the draws the run trained. This Dew reads plans of 13 exactly (a run's resume
-  compiles its data at 13, and a per-share position of 13 resumes in a read compiled at 14 as 13 read it)
-  and refuses 8 to 12, naming both ways on: resume with the Dew that wrote it, or go on from its weights as
-  a new run that reads its data afresh. `Objective.bind_plan`, `dew.data.pipeline.earlier`, `Pipeline.at`
-  and `ObjectiveData.earlier` are gone, and `Source.manifest` takes no version.
+- Data plan version 15: a plan describes each step by its structure (its class and fields, a callable by
+  its own identity, an array by its fingerprint, a mapping in its order) once, in its manifest, its order
+  holding each stage by the place of the step that describes it, and records, by name, the rules its read
+  takes its next rows by (`identity`, `shuffle`, `mix`, `dealing`, `grain`, `phases`) and the shards a
+  stream reads, each one value beside the code that implements it (docs/design/data.md, the rules). A resume
+  compares them and refuses a differing one by its name; a Grain upgrade refuses only a position whose
+  iterator state its iterators cannot restore. Phases that share a corpus continue it from the draws the run
+  trained. This Dew reads plans of 14, which described each stage of its order again in place, exactly, as
+  its own, and refuses 8 to 13, naming both ways on: resume with the Dew that wrote it, or go on from its
+  weights as a new run that reads its data afresh; a relaxed resume of one starts its data again.
+  `Objective.bind_plan`, `dew.data.pipeline.earlier`, `Pipeline.at` and `ObjectiveData.earlier` are gone,
+  `Source.manifest` takes no version, and the data layer reads by this Dew's alone: `compile`, `iterate`,
+  `validation`, `publish`, `fitted`, `held` and `text.export_tokens` take no `plan_version`, nor `dew data
+  export` and `dew data publish` a `--plan-version`. A run resolves its version once
+  (`RunConfig.data_plan_version`): one it reads it reads as its own and records as this Dew's, the version
+  its positions are saved under; one it reads none of is refused resumed exactly and started again relaxed.
 
 - A schedule's step horizons (its warmup's and decay's lengths in steps) are operands of its solver's state
   (`RateState.horizons`) where a run builds it stated (`OptimConfig.build(stated=True)`), so a rehearsed run
@@ -57,8 +91,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   as `values(horizons, rates)` where it took `values(steps, rates)`: a subclass that read the run's length
   in `values` overrides `horizons` to state the lengths it reads, or reads `{}`.
 
-- Dew requires optax 0.2.8 or later (was 0.2.6): Muon's Newton-Schulz is optax's own iteration, its layout,
-  shape scalings and preconditionings (AOL, Schatten) included, which 0.2.8 first ships.
+- Dew requires optax 0.2.8 or later (was 0.2.6): Muon iterates Newton-Schulz in Dew's own form, on the matrices
+  as they are stored (no transposes), held to optax's iteration as its oracle; its layout, shape scalings,
+  coefficient presets and preconditionings (AOL, Schatten), which 0.2.8 first ships, are optax's.
 
 - A run resumes from what the current Dew and the one before it wrote, and refuses an earlier format by
   name with the ways on: a step that holds a decision run's projections packed (`q`, `k` and `v` in one
@@ -602,6 +637,18 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   microbatches than every plan before it (`compile_ahead(..., frontier=True)`,
   `--trainer.compile-ahead.frontier`), the plans `tools/benchmark_step.py` times on the GPUs; a run names
   the fastest by its remat, `--trainer.split` and `LMObjective.head_tile`.
+
+- A training step logs the loss and metrics of the rows it consumed, whatever split the planner reads it
+  in: a step that commits no update logs its own batch's loss, and a metric an objective states as a
+  statistic (`Aux.metrics` given a `Ratio`, an `Exponentiated` perplexity, a `Summed` sum of ratios or a
+  batch's `Moments`, all exported from `dew.objectives` with their base, `Pooled`) is pooled across the
+  step's microbatches by it. `Aux.metrics` holds numbers to every caller, the stated statistics kept in the
+  new `Aux.pooled`; a metric that states no pooling logs at a split step as
+  `<name>/last_microbatch`. A data position holds what decides its rows and none of the checkout or the
+  machine, which each checkpoint step records beside it (`Checkpoints.environment`) and a resume warns of; a
+  relaxed resume names each step outside Dew whose code changed (`code.<step>`). Positions saved before read
+  on.
+
 ## 0.2.0
 
 The first release on Dew's own package index, `pip install dewml --extra-index-url

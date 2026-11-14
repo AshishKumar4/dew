@@ -1,29 +1,14 @@
 """DeepSeek-V4.1-Flash against the release's own inference code.
 
-deepseek-v41-tiny comes from tools/deepseek_v41_reference.py: the release's
-inference/model.py at dba1be0a (DeepSeek-V4.1-Flash) run in fp32 over the
-torch stand-ins for its kernels. kernels.npz holds the release's own tilelang
-kernels' outputs (`--kernels`, on a GPU), which Dew's quantizers and the
-stand-ins are held to bit for bit on bf16 input. The architecture outputs are
-taken with the quantizers off and repeated with them on (`qat_*`), and every
-quantizer and top-k call of both forwards is recorded. reference_f64.npz is
-the same run widened to fp64 (`--fp64`), the truth Dew and the reference are
-both measured from by tests/reference_error.py's rule: Dew's RMS distance
-from it at most FACTOR times the reference's own, for every output and for
-the inputs of every quantizer and top-k call. Dew's quantizers are held bit
-for bit to each recorded call.
+deepseek-v41-tiny comes from tools/deepseek_v41_reference.py: the release's inference/model.py at dba1be0a
+(DeepSeek-V4.1-Flash) run in fp32 over the torch stand-ins for its kernels. kernels.npz holds the release's
+own tilelang kernels' outputs (`--kernels`, on a GPU), which Dew's quantizers and the stand-ins are held to
+bit for bit on bf16 input.
 
-A value within fp32 noise of where a rounding or a pick changes can go
-either way in two fp32 runs, and every seed leaves some (an L4 rounded one
-window key of the cached prefill the other way at the seed a CPU and an RTX
-4080 had passed). So each run compared here takes every rounding and pick
-from its own float64 twin (`decided`), the way the exact value goes, which
-is the way the reference went (`--fp64` refuses a fixture it did not):
-the rule then measures fp32 rounding alone, whatever the seed. Each twin is
-held within float64 rounding of the truth (`twin_close`), which a single
-rounding or pick taken otherwise than the truth's would move it far past.
-`tools/deepseek_v41_numerics.py residuals` reports every ratio and each
-twin's distance from the truth.
+tests/test_deepseek_v41_recorded.py holds Dew to the release's recorded runs (recording.npz).
+
+reference.npz and reference_f64.npz hold one seed's run and its float64 run, which the comparisons by
+`rounding` still read.
 """
 
 import dataclasses
@@ -32,14 +17,17 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
+import deepseek_v41_support
 import flax
 import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from deepseek_v41_support import ROOT, TINY
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import decode_through
+from quantized_arms import QUANTIZERS
 from quantized_basis import dequantized_in_own_basis
 from reference_error import FACTOR, as_given, assert_as_exact, distance
 
@@ -57,10 +45,8 @@ from dew.nn.sharding import down_projection
 from dew.nn.visibility import visible
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
-from tools.deepseek_v41_numerics import QUANTIZERS, unquantized, vision_bundle, vision_run
+from tools.deepseek_v41_numerics import next_token_loss, vision_bundle, vision_run
 
-ROOT = Path(__file__).parent / "fixtures" / "hf"
-TINY = ROOT / "deepseek-v41-tiny"
 RELEASED = ROOT / "deepseek-v41-flash"
 TRUTH = np.load(TINY / "reference_f64.npz")
 KERNELS = TINY / "kernels.npz"
@@ -70,17 +56,8 @@ KERNEL_QUANTIZERS = {
     "fp4_16_e4m3": lambda v: fake_quant_fp4(v, 16, e4m3_scale=True),
     "fp4_32_e8m0": lambda v: fake_quant_fp4(v, 32, e4m3_scale=False),
 }
-@pytest.fixture(scope="module", autouse=True)
-def fp32_matmuls():
-    """The reference multiplies in fp32, where a GPU's default is TF32."""
-    with jax.default_matmul_precision("highest"):
-        yield
-
-
-@pytest.fixture(scope="module")
-def source():
-    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
-    return loaded, unquantized(loaded.model), np.load(TINY / "reference.npz")
+fp32_matmuls = pytest.fixture(scope="module", autouse=True)(deepseek_v41_support.fp32_matmuls)
+source = pytest.fixture(scope="module")(deepseek_v41_support.source)
 
 
 def rounding(name: str) -> float:
@@ -167,21 +144,13 @@ def test_a_quantization_aware_step_is_never_wrong(source, monkeypatch):
     from certified import assert_certified
 
     from dew.nn.precision import WIDE_CPU_ARITHMETIC
-    from dew.objectives.base import Step
-    from dew.objectives.lm import LMObjective
 
     loaded, _, reference = source
     shape = reference["input_ids"].shape
-    objective = LMObjective(loaded.model, shape[1] - 1, ema_decay=None, pad_id=2)
     optimizer = optax.sgd(2.0 ** -4)
 
     def step(params, ids):
-        def loss(params):
-            statistics, _ = objective.loss({**loaded.variables, "params": params}, {"text": ids},
-                                           Step(step=jnp.int32(0), key=jax.random.key(0), ema=None))
-            return objective.reduce_loss(statistics)[0]
-
-        value, gradient = jax.value_and_grad(loss)(params)
+        value, gradient = jax.value_and_grad(next_token_loss(loaded.model, loaded.variables, ids))(params)
         updates, _ = optimizer.update(gradient, optimizer.init(params), params)
         return value, gradient, optax.apply_updates(params, updates)
 
@@ -306,135 +275,6 @@ def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(sourc
         "coordinates": coordinates(valid=valid)}
     logits = plain.apply(loaded.variables, jnp.pad(ids, ((0, 0), (pad, 0))), **padding)
     assert distance(logits[:, pad:], TRUTH["logits"]) <= FACTOR * rounding("logits")
-
-
-RECORDING = TINY / "recording.npz"
-"""The release's plain logits over drawn rows whose every selection clears `selection_margins.MARGIN`,
-every position's and a cached walk's past its prompt, summarized over seeds, beside the rows each seed drew
-(recording_rows.npz; tools/deepseek_v41_reference.py --record)."""
-
-
-@pytest.fixture(scope="module")
-def recorded_rows(source):
-    """The rows the recording drew (recording_rows.npz), each of whose selections, the release's cleared
-    when it was recorded, Dew's plain forward clears `selection_margins.MARGIN` by too: so Dew's float32
-    runs over them, its float64 one and the release's select alike, whichever positions a variant of the
-    forward computes them at (a gap, shifted positions, a cached walk), each of whose selections is one
-    of the plain forward's."""
-    import selection_margins
-
-    loaded, plain, _ = source
-    with np.load(TINY / "recording_rows.npz") as stored:
-        rows = stored["rows"]
-    selecting = jax.jit(functools.partial(selection_margins.capturing, plain))
-    for index, row in enumerate(rows):
-        _, captured = selecting(loaded.variables, jnp.asarray(row))
-        smallest = selection_margins.margin(loaded.model_config, captured, f"recorded row {index}")
-        assert smallest > selection_margins.MARGIN, (
-            f"Dew's selections over recorded row {index} clear {smallest:.3g}, not MARGIN")
-    return rows
-
-
-def held_to_the_release(plain, variables, rows, site: str, start: int = 0):
-    """A recorded site's draw of `rows`, the release's evidence and truth over its declared seeds, Dew's
-    plain forward in float64 past `start` its truth, held to the release's (`recorded_site`), and the
-    count."""
-    from model_support import float64_twin, recorded_site
-
-    wide = jax.jit(float64_twin(plain).apply)
-
-    def twin(inputs):
-        with jax.enable_x64(new_val=True):
-            held = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
-                                if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, variables)
-            return {"logits": wide(held, jnp.asarray(inputs["input_ids"]))[:, start:]}
-
-    return recorded_site(RECORDING, site, lambda seed: {"input_ids": rows[int(seed)]}, twin)
-
-
-@pytest.mark.shared_setup("recorded_rows")
-def test_an_interior_gap_leaves_every_window_on_its_rows_real_tokens(source, recorded_rows):
-    """Uncached, three padding slots inside each row leave each real token's sliding window counting
-    its row's real tokens (`counted_places`), as a cache's slots count them, and its compressed windows
-    and n-grams on them: over drawn rows the release selects over as it would without the gap, the real
-    tokens' logits are on par with the release's of the rows without it from its float64 run's (check 1,
-    the recording's), where a window counted by index let the gap crowd out the keys before it (audit
-    NN-02)."""
-    loaded, plain, _ = source
-    at, gap = 5, 3
-    draw, reference, truth, seeds = held_to_the_release(plain, loaded.variables, recorded_rows,
-                                                         "deepseek v41 plain rows")
-
-    @jax.jit
-    def gapped(ids):
-        filler = jnp.zeros((ids.shape[0], gap), ids.dtype)
-        tokens = jnp.concatenate([ids[:, :at], filler, ids[:, at:]], axis=1)
-        slots = jnp.arange(tokens.shape[1])
-        real = (slots < at) | (slots >= at + gap)
-        logits = plain.apply(loaded.variables, tokens, attention_mask=jnp.broadcast_to(real, tokens.shape))
-        return jnp.concatenate([logits[:, :at], logits[:, at + gap:]], axis=1)
-
-    assert_as_exact(as_given(lambda index, inputs: {"logits": gapped(jnp.asarray(inputs["input_ids"]))}),
-                    reference, draw, "an interior gap", seeds=seeds, truth_fn=truth)
-
-
-SHIFT = 8
-"""How far the shifted rows' given positions sit past their indices: a multiple of every compression
-rate, so a query that read entries by its given place would see SHIFT // rate windows of later tokens."""
-
-
-@pytest.mark.shared_setup("recorded_rows")
-def test_shifted_positions_compute_the_unshifted_rows_logits(source, recorded_rows):
-    """Uncached, positions given SHIFT past the tokens' indices: every rotation is relative, each
-    compressed entry is visible by its window's tokens' ranks and rotates at its window's first given
-    place, where its queries rotate (`window_origins`), so over drawn rows the logits are on par with
-    the release's of the rows at their indices from its float64 run's (check 1, the recording's);
-    entries visible by the given places showed each query windows of later tokens, and entries rotated
-    at zero-based origins sat SHIFT away from their queries (audit NN-03)."""
-    loaded, plain, _ = source
-    draw, reference, truth, seeds = held_to_the_release(plain, loaded.variables, recorded_rows,
-                                                         "deepseek v41 plain rows")
-
-    @jax.jit
-    def shifted(ids):
-        return plain.apply(loaded.variables, ids,
-                           positions=jnp.broadcast_to(jnp.arange(ids.shape[1]) + SHIFT, ids.shape))
-
-    assert_as_exact(as_given(lambda index, inputs: {"logits": shifted(jnp.asarray(inputs["input_ids"]))}),
-                    reference, draw, "shifted positions", seeds=seeds, truth_fn=truth)
-
-
-@pytest.mark.shared_setup("recorded_rows")
-def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(source, recorded_rows):
-    """Cached, a prompt at positions SHIFT past its indices, then the rest of each row one token at a
-    time: each compressed entry rotates at its window's first given place, which the cache carries
-    across the calls a window spans (`append_windows`), so over drawn rows every step's logits are on
-    par with the release's of the rows at their indices from its float64 run's (check 1, the
-    recording's), where entries rotated at their slots sat SHIFT away from their queries (audit NN-03).
-    The walk is one compiled program, its steps scanned."""
-    from dew.sampling.text import decode_ops, prefill_state
-
-    loaded, plain, reference = source
-    prompt = int(reference["decode_prompt"])
-    draw, recorded, truth, seeds = held_to_the_release(plain, loaded.variables, recorded_rows,
-                                                       "deepseek v41 plain walk", prompt - 1)
-
-    @jax.jit
-    def walked(ids):
-        ops = decode_ops(plain, loaded.variables, 0, None)
-        positions = jnp.broadcast_to(jnp.arange(prompt) + SHIFT, (ids.shape[0], prompt))
-        prompted = ModelInputs(ids[:, :prompt], {"positions": positions})
-        state, _ = prefill_state(plain, loaded.variables, prompted, ops)
-
-        def step(state, column):
-            state = ops.advance(state, column, jnp.ones(ids.shape[0], bool))
-            return state, state.logits
-
-        _, steps = jax.lax.scan(step, state, ids[:, prompt:].T)
-        return jnp.concatenate([state.logits[:, None], jnp.moveaxis(steps, 0, 1)], axis=1)
-
-    assert_as_exact(as_given(lambda index, inputs: {"logits": walked(jnp.asarray(inputs["input_ids"]))}),
-                    recorded, draw, "a shifted cached walk", seeds=seeds, truth_fn=truth)
 
 
 def test_a_llama3_ramp_reaches_every_layer_and_longrope_is_refused(source):

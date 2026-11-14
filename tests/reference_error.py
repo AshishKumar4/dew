@@ -114,7 +114,6 @@ from dew.parity import (
     GateFailure,
     Inconclusive,
     RecordedLeaf,
-    _below_one,
     _drawn_from,
     _Draws,
     _enough_seeds,
@@ -122,7 +121,6 @@ from dew.parity import (
     _example_ratios,
     _example_worst_rows,
     _interval,
-    _judged,
     _judged_leaves,
     _LaidTruths,
     _leaf_paths,
@@ -217,15 +215,17 @@ def without_ynn(fn, **jit_options):
     return compiled
 
 
-def as_given(fn):
+def as_given(fn, programs: Callable | None = None):
     """`fn`, an arm the gate runs as it is given and never compiles: a torch or NumPy reference, or a Dew
     arm that runs whole programs of its own (a trainer's fit, a placement on a mesh and the program
     run there, a host loop). The other arm of its check then compiles as Dew's users run it, with the
-    fusions (`_arms`), as the programs this one runs do."""
+    fusions (`_arms`), as the programs this one runs do. `programs`, where `fn` is a float64 truth held to
+    a recorded one (`certifier`): the programs a draw's run calls, `programs(*inputs)`, each a callable
+    and its arguments, which the certifier traces to count the run's roundings (`_draws_roundings`)."""
     @functools.wraps(fn)
     def given(*inputs, **options):
         return fn(*inputs, **options)
-    given.as_given = True
+    given.as_given, given.programs = True, programs
     return given
 
 
@@ -1329,9 +1329,18 @@ def _cancelling_terms(draw, truth, program=None):
     inputs = widened(draw(0))
     with jax.enable_x64(new_val=True):
         leaves = [*map(np.asarray, jax.tree.leaves(run(*inputs)))]
-        if not np.any(_LaidTruths.of(leaves).sizes == 0):
+        zero_leaves = [index for index, leaf in enumerate(leaves)
+                       if np.any(_LaidTruths.of([leaf]).sizes == 0)]
+        if not zero_leaves:
             return None
-        truths, terms = float64_terms(truth, *inputs)
+        # Only these leaves can change the decision below: a terms program of every output compiled each
+        # leaf's sums too (the SSD mesh contract's data mesh 205 s, 78 s on its zero leaf alone; rows 5770,
+        # 5961).
+        def selected(*args):
+            outputs = jax.tree.leaves(truth(*args))
+            return [outputs[index] for index in zero_leaves]
+
+        truths, terms = float64_terms(selected, *inputs)
     plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
         jax.tree.leaves(truths), _term_leaves(terms, truths))
     return truth if bool(np.any((plain.sizes == 0) & (termed.sizes > 0))) else None
@@ -1767,78 +1776,6 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
                else AssertionError(found))
 
 
-BELOW: list[dict] = []
-"""What each FP8 site this test judged measured (`assert_fp8_below`), the JUnit property `fp8_below`
-(tests/conftest.py) of a test that passes as of one that fails: a leaf, the arm it is held below, Dew's
-pooled ratio to that arm and its interval, Dew's ratio to the dequantized reference (the measured miss of
-check 1's parity, which goes to the owner) and the seeds they were measured over."""
-
-
-def _fp8_codes(operand) -> bool:
-    """Whether `operand` holds an FP8 format's codes: floats of eight bits with a significand (E4M3, E5M2
-    and their kin), which a block scale's E8M0 has none of, as JAX's dtypes read them."""
-    dtype = jnp.result_type(operand)
-    return jnp.issubdtype(dtype, jnp.floating) and jnp.finfo(dtype).bits == 8 and jnp.finfo(dtype).nmant > 0
-
-
-def assert_fp8_below(dew_fn, named_fn, draw, label: str, *, seeds: int, named: str, codes, reference_fn,
-                     truth_fn) -> None:
-    """The contract of an FP8 form whose scales are a whole operand's, where no FP8 kernel reaches check
-    1's parity (docs/design/testing.md, "FP8 products": a tensor core's running sum within a step is
-    narrower than fp32, and the dequantized reference's fp32 sums of FP8 products are exact): `dew_fn`'s
-    error from the float64 truth is below `named_fn`'s, the arm the spec names (`named`, cuBLASLt's FP8
-    GEMM, which sums the whole depth narrow), on the same draws. A block-scaled form sums a block as
-    cuBLASLt's GEMM of that block does and is held to parity with it, check 1's own (`assert_as_exact`
-    with that arm as its reference), not this.
-
-    It is check 1 against the named arm (`_staged`: its draws, its two pre-declared stages, its rows and
-    values) with one rule changed, the pooled ratio's: a leaf holds where its ratio's interval lies wholly
-    under one (`dew.parity._below_one`), where check 1 allows PARITY. A leaf the named arm holds exactly
-    has nothing to be below: Dew off float64 there fails as under check 1, and Dew exact there fails too,
-    as a form at parity holds check 1 itself. `truth_fn` is the float64 product of the operands as
-    quantized, a row that cancels sized by its terms as check 1 sizes it (`_site_terms`), and
-    `reference_fn` the dequantized product with fp32 sums, check 1's reference for an FP8 product: it runs
-    beside the two on the same draws and Dew's ratio to it is recorded with the verdict's (`BELOW`), never
-    judged.
-
-    Only an FP8 product's site takes this contract: `codes(*inputs)` gives the product's multiplicands of a
-    draw's inputs, and each must hold an FP8 format's codes (`_fp8_codes`: not a narrower format's, nor an
-    FP8 scale beside them), else the site is refused and holds check 1."""
-    _enough_seeds(seeds, label)
-    multiplied = tuple(codes(*draw(0)))
-    if not multiplied or not all(_fp8_codes(operand) for operand in multiplied):
-        raise TypeError(f"{label}: the product's multiplicands are "
-                        f"{[str(jnp.result_type(operand)) for operand in multiplied]}, not FP8 codes; an "
-                        f"error below a named arm's is the FP8 products' contract alone "
-                        f"(docs/design/testing.md), and this site holds check 1 (`assert_as_exact`)")
-    _refuse_numpy_arms(draw, dew_fn, named_fn, reference_fn)
-    dew_fn, named_fn, (reference_fn,) = _arms_with(dew_fn, named_fn, [reference_fn], label)
-    truth_program = _truth_program(truth_fn)
-    terms_fn = _site_terms(None, None, draw, truth_fn, truth_program)
-    arms = [dew_fn, named_fn, reference_fn]
-    # Each range's draws against the named arm and against the reference, Dew and the truth run once.
-    ranges: dict[tuple[int, int], list[_Draws]] = {}
-
-    def drawn(start, stop):
-        ranges[start, stop] = _drawn(dew_fn, named_fn, draw, range(start, stop), truth_program,
-                                     also=[reference_fn], terms_fn=terms_fn, label=label)
-        return ranges[start, stop][0]
-
-    held = f"{label}, against {named}"
-    over, unresolved, stage = _staged(drawn, seeds, held, ratio_rule=_below_one)
-    against, parity = (functools.reduce(_Draws.joined, each) for each in zip(*ranges.values(), strict=True))
-    for index, name in enumerate(against.names):
-        ratio, low, high = _judged(against, index)
-        BELOW.append({"leaf": held + name, "named": named, "seeds": len(against.mine), "ratio": ratio,
-                      "interval": [low, high],
-                      "reference_ratio": _pooled(parity.mine[:, index], parity.theirs[:, index])})
-    _logged(held, stage, _verdict(over, unresolved), _narrow(against), _mode_of(arms))
-    if over:
-        raise GateFailure(_with_mode(over + unresolved, arms))
-    if unresolved:
-        raise Inconclusive(_with_mode(unresolved, arms))
-
-
 def recorded_pilots(reference_fn, draw, count: int):
     """A view of `reference_fn`, a recorded reference (one `.recorded`), that holds `count` pilot draws
     from SIZING_FROM on, disjoint from every verdict's seeds, the reference and its truth recorded on the
@@ -2240,6 +2177,89 @@ def _recorded_following(decisions_at, certified, live):
     return followed
 
 
+def _draws_roundings(truth_fn, arguments, counted: dict) -> int:
+    """The roundings one draw of the float64 truth `truth_fn` chains on `arguments` (`chain_roundings`): its
+    program's, a window loop's its window's (each window a draw of its own), counted once (`counted`); a truth
+    run as given that states the programs it runs (`as_given`'s `programs`: a host loop of compiled rows or
+    steps), the sum over those this draw runs, each traced here in float64 once a program and signature, as
+    a draw's programs may vary with it. The sum bounds every leaf's chain, which runs through some of those
+    programs in turn: looser than one program's count by at most their number, a draw's rows or steps, so
+    float64's bound on a leaf stays near 1e-13 of its norm where float32's rounding is 6e-8."""
+    program, traced = _one_draws_program(truth_fn, arguments)
+    stated = getattr(program, "programs", None)
+    if stated is None:
+        if "draw" not in counted:
+            counted["draw"] = chain_roundings(jax.make_jaxpr(program)(*traced))
+        return counted["draw"]
+
+    def summed(window) -> int:
+        total = 0
+        for run, held in stated(*window):
+            signature = (run, jax.tree.structure(held),
+                         tuple((np.shape(leaf), np.result_type(leaf)) for leaf in jax.tree.leaves(held)))
+            if signature not in counted:
+                counted[signature] = chain_roundings(jax.make_jaxpr(run)(*held))
+            total += counted[signature]
+        return total
+
+    # A window loop's every window, each a draw of its own whose programs may differ: the most of them.
+    count = len(jax.tree.leaves(arguments)[0]) if isinstance(truth_fn, _Windowed) else 0
+    each = ([jax.tree.map(lambda leaf, at=at: leaf[at], arguments) for at in range(count)]
+            if count else [traced])
+    with jax.enable_x64(new_val=True):
+        return max(map(summed, each))
+
+
+def certifier(site: str, truth_fn, shapes: Mapping[str, np.ndarray], recorded_sketch):
+    """`truth_fn`, Dew's float64 path, as a recorded truth holds it: its program as the gate compiles a
+    truth (`live`), and `certified(index, *arguments)`, its leaves on `arguments` (a draw's inputs, a
+    followed site's recorded decisions before them), each held to the recorded truth's sketch at draw
+    `index` (`recorded_sketch(index, name)`, of the leaves `shapes` names) within float64's rounding of the
+    computation, its roundings counted on its trace (`_draws_roundings`); past it, `UnrecordedTruth`: a
+    summarized recording's (`indexed_recording`), and a truths recording's (tests/recorded_truths.py)."""
+    live, counted = _truth_program(truth_fn), {}
+
+    def certified(index: int, *arguments):
+        computed = live(*arguments)
+        count = _draws_roundings(truth_fn, arguments, counted)
+        eps = float(np.finfo(np.float64).eps)
+        if set(computed) != set(shapes):
+            raise AssertionError(f"{site}: `truth_fn` gives the leaves {sorted(computed)}, the recording "
+                                 f"{sorted(shapes)}")
+        for name, value in computed.items():
+            value = np.asarray(value, np.float64)
+            if value.shape != tuple(shapes[name].tolist()):
+                raise AssertionError(f"{site}: the truth of {name!r} recomputed is {value.shape}, the "
+                                     f"recorded reference's {tuple(shapes[name].tolist())}")
+            recorded = recorded_sketch(index, name)
+            if not np.isfinite(value).all():
+                raise AssertionError(f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not "
+                                     f"finite")
+            # The leaf's norm, scaled by its largest magnitude first so no square overflows.
+            largest = float(np.max(np.abs(value))) if value.size else 0.0
+            norm = largest * float(np.linalg.norm(value / largest)) if largest > 0 else 0.0
+            # The oracle rule's bound on the difference's norm, and the rounding of both sketches, the
+            # recorded truth's magnitudes no more than this one's and the difference's (`sketch_rounding`).
+            oracle = 2 * count * eps * norm
+            magnitude = float(np.sum(np.abs(value))) * (1 + value.size * eps) + np.sqrt(value.size) * oracle
+            bound = (SKETCH_DEVIATIONS * oracle + 2 * sketch_rounding(magnitude)) * (1 + 1e-6)
+            apart = truth_sketch(value, index) - recorded
+            # Its root mean square, scaled by its largest first so no square overflows.
+            widest = float(np.max(np.abs(apart))) if apart.shape == recorded.shape else np.inf
+            away = (widest * float(np.sqrt(np.mean(np.square(apart / widest)))) if 0 < widest < np.inf
+                    else widest)
+            if not (np.isfinite(bound) and away <= bound):
+                raise UnrecordedTruth(
+                    f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not the recorded "
+                    f"reference's: its sketch is {away:.3e} away (root mean square), past float64's "
+                    f"rounding of the computation "
+                    f"({count} roundings); `truth_fn` does not compute what the reference's "
+                    f"truth did")
+        return computed
+
+    return live, certified
+
+
 def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     """`indexed_recording` of a recording of the reference's evidence alone."""
     def tree(kind):
@@ -2261,7 +2281,6 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     if min(count, len(digests)) < staged_units(seeds):
         raise AssertionError(f"{site}: {min(count, len(digests))} recorded seeds, and check 1 over {seeds} "
                              f"may draw {staged_units(seeds)}")
-    roundings = {}
 
     def held(seed):
         """`seed`'s evidence, its input digests and its row in them: a verdict seed's, or a pilot's."""
@@ -2296,52 +2315,12 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     if pilots:
         reference.pilots = range(SIZING_FROM, SIZING_FROM + pilots)
 
-    # The truth recomputed, compiled as the gate compiles a truth; its roundings are counted on its trace.
-    live = _truth_program(truth_fn)
+    def recorded_sketch(index: int, name: str):
+        evidence, _, row = held(index)
+        return evidence["sketch"][name][row]
 
-    def certified(index: int, *arguments):
-        """`truth_fn` on `arguments` (a seed's inputs, a followed site's recorded decisions before them),
-        held to the recorded truth's sketch at seed `index`."""
-        computed = live(*arguments)
-        if not roundings:
-            # One draw's roundings, a window loop's its window's: each window is a draw of its own.
-            program, traced = _one_draws_program(truth_fn, arguments)
-            roundings["count"] = chain_roundings(jax.make_jaxpr(program)(*traced))
-        eps = float(np.finfo(np.float64).eps)
-        if set(computed) != set(sketch):
-            raise AssertionError(f"{site}: `truth_fn` gives the leaves {sorted(computed)}, the recording "
-                                 f"{sorted(sketch)}")
-        for name, value in computed.items():
-            value = np.asarray(value, np.float64)
-            if value.shape != tuple(shapes[name].tolist()):
-                raise AssertionError(f"{site}: the truth of {name!r} recomputed is {value.shape}, the "
-                                     f"recorded reference's {tuple(shapes[name].tolist())}")
-            evidence, _, row = held(index)
-            recorded = evidence["sketch"][name][row]
-            if not np.isfinite(value).all():
-                raise AssertionError(f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not "
-                                     f"finite")
-            # The leaf's norm, scaled by its largest magnitude first so no square overflows.
-            largest = float(np.max(np.abs(value))) if value.size else 0.0
-            norm = largest * float(np.linalg.norm(value / largest)) if largest > 0 else 0.0
-            # The oracle rule's bound on the difference's norm, and the rounding of both sketches, the
-            # recorded truth's magnitudes no more than this one's and the difference's (`sketch_rounding`).
-            oracle = 2 * roundings["count"] * eps * norm
-            magnitude = float(np.sum(np.abs(value))) * (1 + value.size * eps) + np.sqrt(value.size) * oracle
-            bound = (SKETCH_DEVIATIONS * oracle + 2 * sketch_rounding(magnitude)) * (1 + 1e-6)
-            apart = truth_sketch(value, index) - recorded
-            # Its root mean square, scaled by its largest first so no square overflows.
-            widest = float(np.max(np.abs(apart))) if apart.shape == recorded.shape else np.inf
-            away = (widest * float(np.sqrt(np.mean(np.square(apart / widest)))) if 0 < widest < np.inf
-                    else widest)
-            if not (np.isfinite(bound) and away <= bound):
-                raise UnrecordedTruth(
-                    f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not the recorded "
-                    f"reference's: its sketch is {away:.3e} away (root mean square), past float64's "
-                    f"rounding of the computation "
-                    f"({roundings['count']} roundings); `truth_fn` does not compute what the reference's "
-                    f"truth did")
-        return computed
+    # The truth recomputed, compiled as the gate compiles a truth, held to the recorded sketch.
+    live, certified = certifier(site, truth_fn, shapes, recorded_sketch)
 
     if decided:
         return draw, reference, _recorded_following(decisions_at, certified, live)
