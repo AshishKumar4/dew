@@ -403,9 +403,11 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
             # Each pairs' gradient staged once in the step, its parts read by every product as they are and
             # transposed; the scores' scaled as their pairs were.
             d_pairs = []
-            for (name, scaled), buffers in zip((("scores", scale), ("system", 1.0)), squares, strict=True):
-                value = stream_tile(slots, name, square).value() * scaled
-                d_pairs.append(operands.staged(family, value.astype(jnp.float32), buffers))
+            with family.staged_together():
+                for (name, scaled), buffers in zip((("scores", scale), ("system", 1.0)), squares,
+                                                   strict=True):
+                    value = stream_tile(slots, name, square).value() * scaled
+                    d_pairs.append(operands.staged(family, value.astype(jnp.float32), buffers))
             query = stream_tile(slots, "queries", given).value().astype(jnp.float32)
             key = stream_tile(slots, "keys", given).value().astype(jnp.float32)
 
@@ -415,12 +417,16 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
             staged_rows = iter(gated_rows)
 
             def staged(value):
-                """A pairs' rows gated down staged once a key block in `_parted`'s form, its own set."""
-                return operands.staged(family, value.astype(jnp.float32), next(staged_rows))
+                """A pairs' rows gated down staged once a key block in `_parted`'s form, its own set, its
+                parts published once (`Family.staged_together`)."""
+                with family.staged_together():
+                    return operands.staged(family, value.astype(jnp.float32), next(staged_rows))
 
             def raised(value):
-                """A sub-chunk's keys gated up staged in `_parted`'s form, every pairs' product reads."""
-                return operands.staged(family, value.astype(jnp.float32), keyed)
+                """A sub-chunk's keys gated up staged in `_parted`'s form, every pairs' product reads, its
+                parts published once."""
+                with family.staged_together():
+                    return operands.staged(family, value.astype(jnp.float32), keyed)
 
             found = {}
             algebra.key_decayed_pairs_back(
