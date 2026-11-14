@@ -124,15 +124,35 @@ def _stores_through_query(family: mosaic.Family, width: int, value_width: int, d
     return (value_width == width and out_dtype in (None, jnp.dtype(dtype)) and query_swizzle(family) is None)
 
 
-def forward_products(tiles: Tiles, value_width: int, dtype, *, peaks: bool = False, parts: int = 1) -> tuple:
+def forward_products(tiles: Tiles, value_width: int, dtype, *, peaks: bool = False, parts: int = 1,
+                     ahead: bool = False) -> tuple:
     """A forward program's products as its scope takes its issuer's scratch (`Family.scoped`'s `products`):
     each consumer's logits, a key tile wide, and, but a peak walk's, its weighted values, the values' width,
     whose left operand, the weights a key tile deep in the values' dtype (an fp32 call's bf16 parts), is a
-    register value (`Issuer.register_products`)."""
+    register value (`Issuer.register_products`); the logits issued a step ahead of their read where `ahead`
+    (`logits_ahead`), in the two accumulators of those alone."""
+    logits, ahead_logits = ((), (tiles.block_k,)) if ahead else ((tiles.block_k,), ())
     if peaks:
-        return (tiles.consumers, (tiles.block_k,), ())
-    return (tiles.consumers, (tiles.block_k, value_width),
-            ((tiles.block_k, jnp.bfloat16 if parts > 1 else dtype),))
+        return (tiles.consumers, logits, (), ahead_logits)
+    return (tiles.consumers, (*logits, value_width),
+            ((tiles.block_k, jnp.bfloat16 if parts > 1 else dtype),), ahead_logits)
+
+
+def logits_ahead(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, *, stages: int,
+                 peaks: bool = False, parts: int = 1, coded: bool = False) -> bool:
+    """Whether a forward program issues each key tile's logits a step before its softmax reads them, the next
+    tile's product running under this one's softmax (FlashAttention 4's S in flight, row 5368: at the 4B
+    decision call a tile's wait for its logits, 1.2k to 1.4k cycles, and its softmax, 2.5k, ran in series
+    against a 1.2k-cycle tensor floor, nvgpu-lean's model of the B200 forward): where its issuer keeps the
+    product in memory of its own (`Issuer.issues_ahead`, tcgen05's chunks), its operands 16-bit and plain
+    (no parts, no codes), its rings two steps deep (`mosaic.ahead_stages`), and every consumer's
+    accumulators, the logits' second one among them, within the multiprocessor's tensor memory
+    (`Issuer.product_columns`, `GpuTarget.tmem_columns`: two consumers' two 64-column logits and 128 value
+    columns fill 512)."""
+    if not family.issues_ahead or parts > 1 or coded or stages < mosaic.ahead_stages(("keys",)):
+        return False
+    columns = family.product_columns(forward_products(tiles, value_width, dtype, peaks=peaks, ahead=True))
+    return columns <= (generation.gpu_target().tmem_columns or 0)
 
 
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
@@ -852,6 +872,8 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     shape = (tiles.block_q, tiles.block_k)
     if product is not None:
         s = product()
+    elif program.ahead:
+        s = _logits_ahead(family, q, index, slots, shape)
     elif program.parts > 1:
         # An fp32 call's logits its parts' products (`product.terms`), smallest first, into one fresh
         # accumulator in place (`Family.issued`: a term's own accumulator read before the next serializes
@@ -886,6 +908,22 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
                    for ref, param, kept in zip(hooked.score, hooks.score_params, params_held, strict=True))
     logits, products = algebra.logits_of(spec, s, coords, params, masked=jnp.logical_not(whole(index)))
     return k_first, coords, logits, products
+
+
+def _logits_ahead(family: mosaic.Family, q, index, slots: mosaic.Slots, shape: tuple[int, int]) -> jax.Array:
+    """Key tile `index`'s logits where the walk reads its keys a step ahead (`_Program.ahead`): issued into
+    one of the consumer's two accumulators by the step before it, or by itself where it is its range's
+    first (`Slots.opened`), awaited and read; then the next tile's issued into the other (`Slots.following`),
+    which runs under this one's softmax. Such a program's consumers take no turns (`_program_of`)."""
+    buffer = lax.rem(index, 2)
+
+    def issue(keys, at) -> None:
+        family.issued_ahead(q, keys.transpose((1, 0)), shape, at)
+
+    pl.when(slots.first)(lambda: issue(slots.opened("keys"), buffer))
+    s = family.taken(shape, buffer)
+    pl.when(slots.more)(lambda: issue(slots.following("keys"), 1 - buffer))
+    return s
 
 
 def _initial(family: mosaic.Family, spec: algebra.Forward, hooked: _Hooked, rows: tuple) -> algebra.Partial:
@@ -1048,13 +1086,14 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
 
     def walked(streams, lo, hi, counted):
         if not training:
-            return inference(_walk_of(family, streams, lo, hi, counted, interpret=interpret))
+            return inference(_walk_of(family, streams, lo, hi, counted, interpret=interpret,
+                                      ahead=program.ahead))
         assert anchors is not None
         known = algebra.Argmax(family.rows_of(anchors[0].at[state_rows]),
                                family.rows_of(anchors[1].at[state_rows]))
         return _trained(spec, family, start, known, scored, values, (lo, hi), streams, counted,
                         largest=functools.partial(_largest, program, hooked, (row, place[2])),
-                        interpret=interpret)
+                        interpret=interpret, ahead=program.ahead)
 
     # The slots its partner reads around its own, the two turns a step would have taken
     # (`Family.walk_own`).
@@ -1210,12 +1249,14 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                   smem=residuals.keys_smem)
 
 
-def _walk_of(family: mosaic.Family, streams, lo, hi, counted, *, interpret: bool) -> Callable:
+def _walk_of(family: mosaic.Family, streams, lo, hi, counted, *, interpret: bool, ahead: tuple = ()
+             ) -> Callable:
     """A consumer's walk of its key tiles `lo` to `hi` over its program's `streams` from the program's
-    `counted`-th step (`Family.walk`), as `walk(step, start, shapes, initial=)` takes it."""
+    `counted`-th step (`Family.walk`, reading the streams `ahead` a step early), as `walk(step, start,
+    shapes, initial=)` takes it."""
     def walk(step, start, shapes, initial=None):
         return family.walk(streams, ((step, lo, hi),), start, shapes, interpret, first=counted,
-                           initial=initial)
+                           initial=initial, ahead=ahead)
 
     return walk
 
@@ -1317,14 +1358,15 @@ def _magnitudes(value: jax.Array, hooked: _Hooked, parts: int) -> jax.Array:
 
 
 def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partial, known: algebra.Argmax,
-             scored, values, reach, streams, first, *, largest, interpret: bool
+             scored, values, reach, streams, first, *, largest, interpret: bool, ahead: tuple = ()
              ) -> tuple[algebra.Partial, tuple]:
     """A training forward consumer's walk of its key tiles `reach` (`[lo, hi)`, the streams' steps from
     `first`) from `start` at the anchors and keys' largest logits `known` (`algebra.anchored`): each tile
     `algebra.anchored_step`, its split sums the family's accumulator, which takes each tile's product in place
     and no factor but a scaled tile's change of scale. `scored(index, slots)` gives a tile's place,
     coordinates, logits and products, `values(slots)` its value slot as an operand (`algebra.Operand`), and
-    on the scaled walk `largest(k_first, slots)` its keys' value magnitudes (`_largest`). Returns the state
+    on the scaled walk `largest(k_first, slots)` its keys' value magnitudes (`_largest`), the streams `ahead`
+    read a step early (`_Program.ahead`). Returns the state
     with the split sums as its sums, and what the walk leaves beside them: the anchor's own weight, the
     other keys' weights' sum and the anchor keys, every sum at its rows' scale where the walk is scaled
     (`algebra.SCALED_WALK`)."""
@@ -1347,7 +1389,7 @@ def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partia
 
     (total, own, others_total, *scale), (acc,) = family.walk(
         streams, ((step, *reach),), (state.total, own, others_total, *held), (state.acc.shape,), interpret,
-        first=first, initial=(state.acc,))
+        first=first, initial=(state.acc,), ahead=ahead)
     return (algebra.Partial(acc, state.m, total, algebra.Scale(*scale) if scale else None),
             (own, others_total, arg.key))
 
@@ -1387,7 +1429,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, s
     walked, _ = family.walk_own(
         streams, views, (lo, hi), streamed, consumer,
         lambda streams, lo, hi, counted: family.walk(streams, ((step, lo, hi),), start, (), interpret,
-                                                     first=counted),
+                                                     first=counted, ahead=program.ahead),
         between=lambda: (turn(), turn()))
     pl.when(consumer == 0)(turn)
     arg = walked
@@ -1562,6 +1604,22 @@ def _entry(program: _Program, layout: "_Layout", body: Callable, allocations: tu
                                 program.family.program_index("heads"), queries, walk_rows))(
             scoped_body)
 
+
+def _program_of(family: mosaic.Family, tiles: Tiles, spec: algebra.Forward, read: _Read, key, steps: int,
+                value_width: int, dtype, *, splits: int, peaks: bool, parts: int) -> _Program:
+    """A launch's program (`_Program`) of `steps` key tiles: no more ring stages than them (a slot past them
+    would load past the keys), and its keys read a step ahead where it issues its logits so
+    (`logits_ahead`). Such a program's consumers take no turns on the tensor cores (FlashAttention 3's
+    ping-pong, one's softmax under the other's products), which would only serialize two consumers each
+    running its next logits under its own softmax (nvgpu-lean's model of the 4B call: S ahead with turns
+    12% slower than without either, row 5368)."""
+    stages = min(tiles.stages, steps)
+    ahead = logits_ahead(family, tiles, value_width, dtype, stages=stages, peaks=peaks, parts=parts,
+                         coded=_codes_of(key, read.hooked.scales) is not None)
+    return _Program(family, tiles, steps, stages, spec.keys, spec.form == "causal", spec.queries, splits,
+                    _per_span(spec, read.spans), parts=parts, ahead=("keys",) if ahead else ())
+
+
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
                       "counted", "finishes", "target", "name", "splits", "page", "column_width", "shared_by",
                       "certified", "flags", "walk_rows", "parts", "registers"))
@@ -1587,9 +1645,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     spec = dataclasses.replace(spec, approximate=approx_math)
     pair = consumers * block_q
     steps = keys_count // block_k
-    # No more stages than key tiles: a slot past them would load past the keys.
-    program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal",
-                       spec.queries, splits, _per_span(spec, read.spans), parts=parts)
+    program = _program_of(family, tiles, spec, read, key, steps, value_width, query.dtype, splits=splits,
+                          peaks=peaks, parts=parts)
     # The output stores through the query's stage where the two are as wide (its rows are read before the
     # store); else it takes a stage of its own beside the query's and the rings (`_forward_allocations`).
     out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
@@ -1615,7 +1672,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                     block_k=block_k, batch=batch, parts=parts)
         # The rings opened once, before the roles' split (a gathered ring's barriers set once).
         streams = family.opened(streams, located()[3])
-        turn = functools.partial(family.turn, refs.schedule, consumers)
+        turn = functools.partial(family.turn, refs.schedule, 1 if program.ahead else consumers)
 
         placed = functools.partial(_placed, program, located, read.spans, queries=queries)
 
@@ -1668,7 +1725,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                                        run=lambda role, index: consumer(index))
                                      if scopes_products(family) else consumer), producer, exclusive=True)
 
-    products = forward_products(tiles, value_width, query.dtype, peaks=peaks, parts=parts)
+    products = forward_products(tiles, value_width, query.dtype, peaks=peaks, parts=parts,
+                                ahead=bool(program.ahead))
     entry = functools.partial(_entry, program, layout, body, (scoped, rings, after, products),
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,

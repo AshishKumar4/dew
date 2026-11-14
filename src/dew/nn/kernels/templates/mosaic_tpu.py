@@ -382,9 +382,11 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
         # Each step's blocks awaited before it and the next step's copied while it multiplies; a segment
         # of no steps copies nothing. Its products are synchronous: no stage outlives its step.
+        if ahead:
+            raise NotImplementedError(f"{self.name}'s walk reads no stream ahead")
         del first, in_flight, unrolled, interpret
         names = tuple(streams.views)
         carry = (start, self.started(shapes, initial))

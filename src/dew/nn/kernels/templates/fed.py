@@ -112,7 +112,9 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
+        if ahead:
+            raise NotImplementedError(f"{self.name}'s consumers feed their own rings: none is read ahead")
         if not isinstance(streams, Feed):
             raise NotImplementedError(f"{self.name}'s consumers feed their own rings (`fed`)")
         # The walk reads each step at the ring counter its feed loads it at, both from the feed's `lo`.

@@ -52,6 +52,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _whole,
     certified_walk,
     forward_products,
+    logits_ahead,
 )
 from dew.nn.kernels.templates.attention_mosaic_fused import _fused_allocations, staged_parts, stores_typed
 from dew.nn.kernels.templates.attention_mosaic_program import (
@@ -703,7 +704,9 @@ class MosaicForward(_Mainloop[Tiles]):
         return resources.shared_bytes(family, launch_scope(family, allocations, reducing(
             family, config.consumers, self.score_reduces or self.output_mod is not None, flagged=flagged,
             magnitudes=cached and self.scales_in_kernel(ba)),
-            products=forward_products(config, value_width, query.dtype, parts=self.parts)))
+            products=forward_products(config, value_width, query.dtype, parts=self.parts, ahead=logits_ahead(
+                family, config, value_width, query.dtype, stages=min(config.stages, steps), parts=self.parts,
+                coded=_codes_of(ba.arguments["key"], ba.arguments.get("scales")) is not None))))
 
     def cached(self, table, sources, scales) -> bool:
         """Whether a call walks a cache's keys (masked, split, paged, by rows or over codes: a decode step's
