@@ -2068,9 +2068,10 @@ def _counted(fn, *arrays) -> tuple[float, float]:
     ids=["causal", "causal-fewer-queries", "causal-more-queries", "causal-padded", "full", "full-padded"])
 def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, keys, pairs):
     """A bf16 call's plain forward, training forward and backward through the Mosaic mainloop, each lowered
-    for an H100: every launch states its hardware work (`attention_mosaic_program.stated`), which Dew's FLOP
-    count reads to size it (`instrumentation._stated_flops`: no launch unsized), and declares the model's
-    share of it; together the model's are the library's fused attention's own count, a multiply-add a
+    for an H100: every launch states its hardware work, counted from its kernel's emission
+    (`emission.costed`), which Dew's FLOP count reads to size it (`instrumentation._stated_flops`: no launch
+    unsized), and declares the model's share of it; together the model's are the library's fused
+    attention's own count, a multiply-add a
     reached pair, head and product column (a causal call's `pairs` each query's keys up to its own place,
     written out: the first key aligned to the first query, as the mainloop masks them): the forward's two
     products, the training forward's two and the backward's four (`instrumentation._fused_attention_flops`).

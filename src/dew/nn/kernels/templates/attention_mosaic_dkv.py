@@ -31,7 +31,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     holders,
     issued_into,
     modelled,
-    part_count,
     reducing,
     split_queries,
     stages_after_walks,
@@ -407,14 +406,9 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
         name=name,
         reducing_warpgroups=reducing(family, consumers, walk.reduces),
         registers=walk.registers(dq=False),
-        # The products this launch issues (`stated`): its `S` and `dP` recomputed, its share of dV's, and
-        # each part of its share of dK's and of dQ's where it adds it (`part_count`); the model's of them it
-        # owns (`modelled`): its shares of dK's and dV's, dP's in the first share's and dQ's where it adds it.
-        cost=stated(walk.spec, batch, heads,
-                    width + value_width + shares[1][1]
-                    + part_count(query.dtype, walk.accurate)
-                    * (shares[0][1] + (width if walk.fused else 0)),
-                    query, key, value, dout,
+        # Its walk's statement, its work its emission's (`stated`); the model's products it owns
+        # (`modelled`): its shares of dK's and dV's, dP's in the first share's and dQ's where it adds it.
+        cost=stated(walk.spec, batch, heads, query, key, value, dout,
                     tile_walk=TileWalk((queries, keys_padded), (tiles.block_q, tiles.block_k),
                                        holders(family, consumers), keyed=True,
                                        common=family.feeds_itself or tiles.staged_logits)),

@@ -11,6 +11,7 @@ shared memory. A primitive no rule here prices raises (`Unpriced`): the count st
 kernel emits."""
 
 import dataclasses
+import functools
 import math
 import operator
 import weakref
@@ -20,13 +21,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax._src import core as jax_core
-from jax._src.pallas import primitives as pallas
+from jax._src import ad_util, core as jax_core, pjit
+from jax._src.pallas import mpmd, pallas_call, primitives as pallas
+from jax._src.pallas.mosaic import primitives as tpu
 from jax._src.pallas.mosaic_gpu import core as gpu_core, primitives as gpu
 from jax._src.state import primitives as state, types as state_types
+from jax.experimental import pallas as pl
 
 from dew.nn import derivatives, programs
-from dew.nn.kernels.templates.cost import Work
+from dew.nn.kernels.templates.cost import Stated, Work
 
 
 class Unpriced(ValueError):
@@ -61,6 +64,13 @@ class Emitted:
         """A program's work outside its walks, every warpgroup's."""
         return sum((role.fixed for role in self.roles), Work())
 
+    def issued(self, unit: Callable[[Work], float], steps: int, programs: int) -> float:
+        """A launch's whole work in `unit`: a step of its walk (the most a walking warpgroup's takes) its
+        `steps` times, the steps every warpgroup walks (`cost.Stated.steps`), and each of its `programs`'
+        work outside its walks."""
+        stepping = [unit(_mean(role.walks)) for role in self.roles if role.walks]
+        return max(stepping, default=0) * steps + unit(self.fixed) * programs
+
 
 @dataclasses.dataclass(frozen=True)
 class Role:
@@ -72,21 +82,21 @@ class Role:
     walks: tuple[Work, ...]
 
     def step(self, unit: Callable[[Work], float]) -> float | None:
-        """One step of the role's walk in `unit` (a `Work` field's reading), every segment's alike in it;
-        none where it walks nothing. Segments whose steps differ in it raise: their trips apart would be a
-        statement the count does not have (a causal walk's masked diagonal segment takes more of the CUDA
-        cores' operations than its others, its products alike)."""
-        if not self.walks:
-            return None
-        found = {unit(walk) for walk in self.walks}
-        if len(found) > 1:
-            raise ValueError(f"a role's walk segments step unalike: {sorted(found)}")
-        return found.pop()
+        """One step of the role's walk in `unit` (a `Work` field's reading): the mean of its loops' steps
+        (`walks`), none where it walks nothing. It is the walk's step wherever its loops step alike in it (a
+        rotation's, `mosaic.stepping`; its products and exponentials over a causal walk's segments), and
+        where a segment's peeled first and last steps take together two of its loop's (a walk reading
+        ahead, `RingFamily._walked`'s `peeled`: its first issues two products, its last none, a segment of
+        any length its loop's one a step). The trips of each loop would be a statement the count does not
+        have: a unit a causal walk's masked segment takes more of (the CUDA cores' operations) is its
+        segments' mean."""
+        return unit(_mean(self.walks)) if self.walks else None
 
 
-def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str) -> Emitted:
-    """`body`, a kernel's jaxpr (its `mpmd_map`'s), as each of a program's `warpgroups` warpgroups along
-    `axis` runs it (`Emitted`)."""
+def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None) -> Emitted:
+    """`body`, a kernel's jaxpr (its `mpmd_map`'s or its `pallas_call`'s), as each of a program's
+    `warpgroups` warpgroups along `axis` runs it (`Emitted`; a program of one, no axis, a TPU's or an
+    mma.sync family's)."""
     roles = []
     for index in range(warpgroups):
         counted = _Counting(axis, index)
@@ -99,14 +109,19 @@ _OPERATIONS = frozenset({
     lax.abs_p, lax.add_p, lax.and_p, lax.ceil_p, lax.clamp_p, lax.div_p, lax.eq_p, lax.floor_p, lax.ge_p,
     lax.gt_p, lax.le_p, lax.lt_p, lax.max_p, lax.min_p, lax.mul_p, lax.ne_p, lax.neg_p, lax.not_p, lax.or_p,
     lax.rem_p, lax.select_n_p, lax.shift_left_p, lax.shift_right_logical_p, lax.shift_right_arithmetic_p,
-    lax.sign_p, lax.sub_p, lax.xor_p, lax.integer_pow_p, lax.sqrt_p, lax.rsqrt_p, lax.square_p})
-"""Elementwise operations of the CUDA cores, one an output element."""
+    lax.sign_p, lax.sub_p, lax.xor_p, lax.integer_pow_p, lax.sqrt_p, lax.rsqrt_p, lax.square_p, lax.round_p,
+    lax.one_minus_square_p, ad_util.add_jaxvals_p})
+"""Elementwise operations of the CUDA cores, one an output element (a cotangent's sum, `add_any`, among
+them)."""
 
 _REDUCTIONS = frozenset({lax.reduce_max_p, lax.reduce_min_p, lax.reduce_sum_p})
 """Reductions, one operation an input element."""
 
-_EXPONENTIALS = frozenset({lax.exp_p, lax.exp2_p, lax.log_p, lax.log2_p, lax.tanh_p, lax.logistic_p})
-"""The special-function units' operations, one an output element."""
+_EXPONENTIALS = frozenset({lax.exp_p, lax.exp2_p, lax.log_p, lax.log2_p, lax.log1p_p, lax.tanh_p,
+                           lax.logistic_p, lax.sin_p, lax.cos_p, lax.pow_p})
+"""The special-function units' operations, one an output element: those Mosaic GPU lowers to the hardware's
+approximate forms, or through them (`attention_mosaic_program.APPROXIMATED`'s, but its square roots, which
+the CUDA cores' operations count)."""
 
 _FREE = frozenset({
     lax.axis_index_p, gpu.barrier_arrive_p, gpu.barrier_wait_p, lax.bitcast_convert_type_p,
@@ -115,7 +130,8 @@ _FREE = frozenset({
     lax.optimization_barrier_p, gpu.set_max_registers_p, lax.slice_p, lax.squeeze_p, lax.reshape_p,
     lax.transpose_p, gpu.tcgen05_commit_arrive_p, gpu.wgmma_wait_p, gpu.wait_smem_to_gmem_p,
     gpu.wait_load_tmem_p, gpu.wgmma_accumulator_deref_p, gpu.wgmma_accumulator_store_p, gpu.load_p,
-    gpu.store_p, state.swap_p, gpu.async_load_tmem_p, gpu.async_store_tmem_p})
+    gpu.store_p, state.swap_p, gpu.async_load_tmem_p, gpu.async_store_tmem_p, state.get_p,
+    pallas.program_id_p, tpu.dma_wait_p, gpu.wait_gmem_to_smem_p, pjit.reshard_p})
 """What moves no data between memories and computes nothing a unit's rate prices: synchronization, layouts,
 indices, and a value's reads and writes between a role's registers and its scoped refs, which its products'
 operands and its copies count."""
@@ -234,7 +250,7 @@ class _Counting:
     and a step of each walk (`walks`), each scalar its index's arithmetic decides held concretely; within
     `loops` loops where it starts (a conditional's branch, `cond`)."""
 
-    def __init__(self, axis: str, index: int, loops: int = 0):
+    def __init__(self, axis: str | None, index: int, loops: int = 0):
         self.axis, self.index = axis, index
         self.fixed = Work()
         self.walks: list[Work] = []
@@ -294,6 +310,20 @@ class _Counting:
         elif primitive in _COPIES:
             copied = _copied(equation)
             self.add(Work(device_bytes=copied, shared_bytes=copied))
+        elif primitive is tpu.dma_start_p:
+            # A TPU core's copy between HBM and VMEM: its destination's bytes as its transforms read it.
+            copied = _bytes(params["tree"].unflatten([variable.aval for variable in equation.invars])[1])
+            self.add(Work(device_bytes=copied, shared_bytes=copied))
+        elif primitive is gpu.atomic_store_p:
+            # An atomic update of device memory (an add into a sum other programs add to): its value's bytes.
+            value = params["args_tree"].unflatten([variable.aval for variable in equation.invars])[2]
+            self.add(Work(device_bytes=_bytes(value)))
+        elif primitive is lax.dot_general_p:
+            # A TPU core's product on its MXU: `2 m n k`, its output's elements over its contracted ones.
+            (contracted, _), _ = params["dimension_numbers"]
+            lhs = equation.invars[0].aval
+            self.add(_tensor(lhs.dtype, 2 * _elements(equation.outvars[0].aval)
+                             * math.prod(lhs.shape[dimension] for dimension in contracted)))
         elif primitive is gpu.inline_mgpu_p:
             work = _STATED.get(params["mgpu_fn"])
             if work is None:
@@ -341,7 +371,7 @@ class _Counting:
         """A conditional: its branch where its index is concrete (a role's, by its warpgroup), else every
         branch's envelope, unit by unit (the most of each any branch issues, as the custom call's FLOP count
         takes a conditional), its steps' marks likewise; the walks its branches hold one walk, a step of it
-        the most of each unit any of theirs takes a step."""
+        the most of each unit any branch's walks take a step (their mean, `Role.step`)."""
         index, operands = values[0], values[1:]
         if _scalar(index):
             return self.run(branches[int(index)], operands)
@@ -352,11 +382,16 @@ class _Counting:
             trials.append(trial)
         self.fixed = self.fixed + _envelope(trial.fixed for trial in trials)
         if any(trial.walks for trial in trials):
-            self.walks.append(_envelope(walk for trial in trials for walk in trial.walks))
+            self.walks.append(_envelope(_mean(trial.walks) for trial in trials if trial.walks))
         if self.loops:
             self.loops[-1].work = self.loops[-1].work + _envelope(trial.loops[-1].work for trial in trials)
             self.loops[-1].marks += max(trial.loops[-1].marks for trial in trials)
         return [None] * len(branches[0].outvars)
+
+
+def _mean(walks: Sequence[Work]) -> Work:
+    """A step of `walks`, a role's loops: their steps' mean (`Role.step`)."""
+    return _times(sum(walks, Work()), 1 / len(walks))
 
 
 def _envelope(works) -> Work:
@@ -368,3 +403,56 @@ def _envelope(works) -> Work:
 
 def _scalar(value) -> bool:
     return isinstance(value, int | bool | float | np.integer | np.bool_ | np.floating)
+
+
+def built_with(cost: pl.CostEstimate | Stated | None) -> pl.CostEstimate | None:
+    """The estimate a launch of `cost` is built with: its own, or none where its emission counts it
+    (`costed`)."""
+    return None if isinstance(cost, Stated) else cost
+
+
+def costed(launch: Callable, cost: pl.CostEstimate | Stated | None) -> Callable:
+    """`launch` (a family's, `mosaic.Family.kernel`, built `built_with` its `cost`), its kernel's cost (its
+    `pallas_call`'s `cost_estimate`, which XLA and Dew's FLOP count read) counted from its emission where
+    the launch states its walk (`Stated`): traced once, its kernel's estimate filled (`_filled`), then bound
+    as traced. Any other cost is the launch's own."""
+    if not isinstance(cost, Stated):
+        return launch
+
+    @functools.wraps(launch)
+    def counted(*operands):
+        traced, shape = jax.make_jaxpr(launch, return_shape=True)(*operands)
+        filled = _filled(traced, cost)
+        return jax.tree.unflatten(jax.tree.structure(shape),
+                                  jax_core.eval_jaxpr(filled, filled.consts, *jax.tree.leaves(operands)))
+
+    return counted
+
+
+def _filled(jaxpr: jax_core.Jaxpr, stated: Stated) -> jax_core.Jaxpr:
+    """`jaxpr` with its kernel's estimate counted (`_estimate`), the calls holding it (a custom batching
+    rule's, `plgpu.kernel`'s) rewritten around it."""
+    def rewritten(equation):
+        if equation.primitive in (mpmd.mpmd_map_p, pallas_call.pallas_call_p):
+            return equation.replace(params={**equation.params, "cost_estimate": _estimate(equation, stated)})
+        return equation.replace(params={name: _filled(value, stated) if isinstance(value, jax_core.Jaxpr)
+                                        else value for name, value in equation.params.items()})
+
+    return jaxpr.replace(eqns=[rewritten(equation) for equation in jaxpr.eqns])
+
+
+def _estimate(kernel, stated: Stated) -> pl.CostEstimate:
+    """A kernel equation's cost from its body's emission: its tensor work (every precision's FLOPs) and its
+    exponentials, a step's `stated.steps` times and the rest each program's (`Emitted.issued`), and the
+    bytes it states."""
+    if kernel.primitive is mpmd.mpmd_map_p:
+        (mesh,), (body,) = kernel.params["meshes"], kernel.params["jaxprs"]
+        counted, programs = emitted(body, mesh.num_threads or 1, mesh.thread_name), math.prod(mesh.grid)
+    else:
+        body, programs = kernel.params["jaxpr"], math.prod(kernel.params["grid_mapping"].grid)
+        counted = emitted(body, 1, None)
+    return pl.CostEstimate(
+        flops=int(counted.issued(lambda work: work.flops + work.tf32_flops + work.fp8_flops, stated.steps,
+                                 programs)),
+        transcendentals=int(counted.issued(lambda work: work.exponentials, stated.steps, programs)),
+        bytes_accessed=stated.bytes_accessed)

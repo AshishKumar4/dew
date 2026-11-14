@@ -25,7 +25,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _streamed,
     _views_of,
     modelled,
-    part_count,
     reducing,
     stated,
 )
@@ -239,12 +238,11 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         registers=walk.registers(dq=False),
         # A score hook's warpgroups reserve their reduction scratch, and fp16's running scale's (`reducing`).
         reducing_warpgroups=reducing(family, consumers, walk.reduces, scaled=staged_parts(query.dtype) > 1),
-        # The products this launch issues (`stated`): its `S` recomputed, dP's, dV's, and each part of dK's
-        # and of dQ's (`part_count`); the model's of them it owns (`modelled`): dQ's, dK's, dV's and dP's.
-        cost=stated(walk.spec, batch, heads,
-                    width + 2 * value.shape[-1] + 2 * part_count(query.dtype, walk.accurate) * width,
-                    query, key, value, dout,
-                    tile_walk=TileWalk((queries, keys_padded), (block_q, block_k), keyed=True)),
+        # Its walk's statement, its work its emission's (`stated`); the model's products it owns
+        # (`modelled`): dQ's, dK's, dV's and dP's.
+        cost=stated(walk.spec, batch, heads, query, key, value, dout,
+                    tile_walk=TileWalk((queries, keys_padded), (block_q, block_k), keyed=True,
+                                       sharing=consumers)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
     dq = jax.new_ref(jnp.zeros((batch, queries, heads, width), jnp.float32))

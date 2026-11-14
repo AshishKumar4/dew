@@ -50,7 +50,7 @@ from dew.nn.kernels.templates import (
     resources,
     swizzling,
 )
-from dew.nn.kernels.templates.cost import Work
+from dew.nn.kernels.templates.cost import Stated, Work
 from dew.nn.kernels.templates.rings import CLUSTER, Ref, Ring, Turn, drain, loads, passed, streamed
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
@@ -110,7 +110,7 @@ def output_staging(columns: int, dtypes) -> tuple[int, int]:
 
 def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            interpret, family: str, name: str | None = None, scratch: tuple = (),
-           approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | None = None,
+           approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
            model_flops: int | None = None, reduction_scratch: int = 0, resident: int = 1,
            prefetched: Callable | None = None, model: resources.RegisterModel | None = None) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
@@ -126,8 +126,10 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
                             compiler_params=compiler_params(approx_math=approx_math, resident=resident,
                                                             reduction_scratch=reduction_scratch),
                             interpret=bodies.interpreted(interpret),
-                            kernel_name=report.named(name, model=model), cost_estimate=cost, **clustered)
-    return checked(built, name or family, resident, model_flops, moves=model is None or model.moves)
+                            kernel_name=report.named(name, model=model),
+                            cost_estimate=emission.built_with(cost), **clustered)
+    return checked(emission.costed(built, cost), name or family, resident, model_flops,
+                   moves=model is None or model.moves)
 
 
 def _is_ref(operand) -> bool:
@@ -1532,7 +1534,8 @@ class Transport[Allocated, Opened](abc.ABC):
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
+               cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
+               model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None,
                producer: int | None = None, shared: int | None = None,
@@ -2062,7 +2065,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
+               cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
+               model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None,
                producer: int | None = None, shared: int | None = None,
