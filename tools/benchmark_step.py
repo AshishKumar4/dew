@@ -539,6 +539,36 @@ def tuning_digest() -> dict[str, object] | None:
     return {"directory": str(directory), "results": len(files), "sha256": digest.hexdigest()}
 
 
+def timed_window(step, state, config: BenchmarkConfig):
+    """`config.steps` steps of `step` from `state` timed as a run dispatches them, after at least one warm
+    step: dispatched whole and read in parts (`WINDOW_PARTS`, `timed_parts`), each part's last loss
+    awaited in turn, so no wait drains the device inside the window, and a window that runs slow where it
+    starts (the device or its allocator warming) shows as a series that falls, where one running another
+    program stays slow throughout. The GPUs sampled from before the warm step, so nvidia-smi's start
+    (NVML's, up to half a second) is behind it, and summarized over the window alone (`DeviceSampler`).
+    Returns the last state, loss and finiteness, each part's (steps, seconds, dispatch seconds) and the
+    GPUs' summary."""
+    with DeviceSampler() as sampler:
+        state, _, _, _ = timed_steps(step, state, max(config.warmup, 1))
+        began = datetime.datetime.now()
+        state, loss, is_finite, parts = timed_parts(step, state, window_parts(config.steps))
+        ended = datetime.datetime.now()
+    return state, loss, is_finite, parts, sampler.summary((began, ended))
+
+
+def window_record(parts, synced: list[float], device, hits: float) -> dict:
+    """A row's diagnostics of its timed window, beside its step's time (the window's whole elapsed time):
+    each part's ms a step in order and its host dispatch's (a part slow in both was the host's, one slow
+    only to be ready the device's), every synced step's ms in order (2026-11-14: a perf gate round's first
+    arm read 40% slow on the very tree its others read), the GPUs under the window's load (`DeviceSampler`),
+    JAX's persistent-cache hits while the step was compiled (its state's and other programs' among them),
+    and the XLA autotuning results' directory as it stood at the row (`tuning_digest`)."""
+    return {"window_ms_series": [round(seconds / size * 1e3, 3) for size, seconds, _ in parts],
+            "window_dispatch_ms_series": [round(sent / size * 1e3, 3) for size, _, sent in parts],
+            "synced_ms_series": [round(seconds * 1e3, 3) for seconds in synced],
+            "device_window": device, "compile_cache_hits": hits, "tuning": tuning_digest()}
+
+
 def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None) -> Row:
     """Warm up, then time the compiled step over a fixed number of steps. `peaks` is each device's
     measured high-water (`measured_peak`), None in a pool."""
@@ -555,23 +585,7 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
     with compiled_step(case, trainer, fixed_batch=config.fixed_batch) as compiled:
         state, step, compile_seconds = compiled.state, compiled.step, compiled.compile_seconds
         hits = compilation_cache_counts().get("train/cache_hits", 0.0) - hits
-        # The GPUs sampled from before the warm step, so nvidia-smi's start (NVML's, up to half a second) is
-        # behind it when the window begins.
-        device_window = DeviceSampler().__enter__()
-        # At least one warm step, so the first dispatch of the executable is
-        # outside the timed window.
-        state, loss, is_finite, _ = timed_steps(step, state, max(config.warmup, 1))
-        # The timed window dispatched whole, as a run dispatches it, and read in parts (`WINDOW_PARTS`):
-        # each part's last loss awaited in turn once every step is dispatched, so no wait drains the device
-        # inside the window, and a window that runs slow where it starts (the device or its allocator
-        # warming) shows as a series that falls, where one running another program stays slow throughout.
-        # The GPUs sampled under the window's load (`DeviceSampler`).
-        window_began = datetime.datetime.now()
-        try:
-            state, loss, is_finite, parts = timed_parts(step, state, window_parts(config.steps))
-        finally:
-            window_ended = datetime.datetime.now()
-            device_window.__exit__()
+        state, loss, is_finite, parts, device = timed_window(step, state, config)
         elapsed = sum(seconds for _, seconds, _ in parts)
 
         # A second window of the same length, waiting on every step, for the
@@ -634,23 +648,7 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
             # or a stronger one where the step did not fit.
             "remat": recompute_record(trainer.objective),
             "ms_per_step": round(step_time * 1e3, 3),
-            # The timed window's parts, each's ms a step in order, and every synced step's ms in order:
-            # how the step's time moves from the window's start (2026-11-14: a perf gate round's first arm
-            # read 40% slow on the very tree its others read).
-            "window_ms_series": [round(seconds / size * 1e3, 3) for size, seconds, _ in parts],
-            # Each part's host dispatch, ms a step: a part slow here too was the host's (a pause of its
-            # process), one slow only to be ready the device's.
-            "window_dispatch_ms_series": [round(sent / size * 1e3, 3) for size, _, sent in parts],
-            "synced_ms_series": [round(seconds * 1e3, 3) for seconds in synced],
-            # The GPUs under the timed window's load: each one's samples' count in it, its SM clock,
-            # power and temperature as sampled through it, and the clock event reasons any sample held
-            # (`DeviceSampler`).
-            "device_window": device_window.summary((window_began, window_ended)),
-            # JAX's persistent-cache hits while the step was compiled, its state's and other programs'
-            # among them; and the XLA autotuning results' directory as it stood at the row
-            # (`tuning_digest`).
-            "compile_cache_hits": hits,
-            "tuning": tuning_digest(),
+            **window_record(parts, synced, device, hits),
             "p10_ms": round(float(p10), 3),
             "p50_ms": round(float(p50), 3),
             "p90_ms": round(float(p90), 3),

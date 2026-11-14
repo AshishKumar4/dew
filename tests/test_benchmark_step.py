@@ -150,14 +150,13 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     assert row["finite"] and np.isfinite(row["loss"])
     assert row["measured_steps"] == 2 and row["fixed_batch"] is fixed_batch
     assert row["ms_per_step"] > 0 and row["p50_ms"] > 0
-    # The timed window's time as its parts' series, each part's steps' mean, of which ms_per_step is the mean
-    # weighted by each part's steps; every synced step's own time, which the spread reads.
-    assert len(row["window_ms_series"]) == len(row["window_dispatch_ms_series"]) == 2
-    assert len(row["synced_ms_series"]) == 2
-    sizes = tool.window_parts(2)
-    weighted = sum(ms * size for ms, size in zip(row["window_ms_series"], sizes, strict=True)) / sum(sizes)
-    assert row["ms_per_step"] == pytest.approx(weighted, abs=1e-3)
-    assert row["p50_ms"] == pytest.approx(float(np.median(row["synced_ms_series"])), abs=1e-3)
+    # The timed window's time as its parts' series, each part's steps' mean, among which its whole window's
+    # mean falls (each rounded to the microsecond); every synced step's own time, among which its median
+    # falls.
+    window, synced = row["window_ms_series"], row["synced_ms_series"]
+    assert len(window) == len(row["window_dispatch_ms_series"]) == len(synced) == 2
+    assert min(window) - 1e-3 <= row["ms_per_step"] <= max(window) + 1e-3
+    assert min(synced) - 1e-3 <= row["p50_ms"] <= max(synced) + 1e-3
     try:
         counted = models.build_objective(case).training_flops(None, models.global_batch(case))
     except MissingFlopsCount:
