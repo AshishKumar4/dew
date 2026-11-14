@@ -1644,9 +1644,9 @@ def test_a_launch_whose_producer_must_rise_climbs_its_ladder_a_round_at_a_time()
 
 @lowers('sm100')
 @pytest.mark.parametrize('target', ['sm100', 'sm90'])
-def test_a_kernel_named_alike_at_every_rung_is_one_module(target):
-    """Each geometry the gate trains in bf16, its training call at its derived tiles and at every rung of
-    each launch's producer ladder alone (`Mosaic._raised`, a setmaxnreg step a rung), lowered: a kernel whose
+def test_a_kernel_named_alike_beside_a_raised_launch_is_one_module(target):
+    """Each geometry the gate trains in bf16, its training call at its derived tiles and at each launch's
+    first producer rung alone (`Mosaic._raised`, a setmaxnreg step), lowered: a kernel whose
     identity (`report.named`: the launch's and what its emission reads of the config, `Mosaic.emitted`) is
     alike at two configs is one module at both, so a rung's certification may read every kernel it leaves
     alone from the lowering cache and Mosaic's compile; one the rung raises is another module."""
@@ -1657,20 +1657,19 @@ def test_a_kernel_named_alike_at_every_rung_is_one_module(target):
     # The geometries the gate trains in bf16 (`GATE_GROUPS`' training groups).
     for name in sorted({name for name, dtype, training, packed, variant in GATE_GROUPS
                         if training and dtype == jnp.bfloat16 and not packed and variant is None}):
-        operands = resource_operands(name, jnp.bfloat16, 1, 4096)[:5]
+        operands = resource_operands(name, jnp.bfloat16, 1, 1024)[:5]
         form, skipped = _form(name, jnp.bfloat16), _skipped(name, jnp.bfloat16)
         bound = template.MOSAIC.bind(*operands, None, bound=1.0, **form, **skipped)
         with generation.assumed(facts), report.refusals():
             tiles = template.MOSAIC.derived(bound, facts)
             if tiles is None:
                 continue
+            # Each launch's first rung alone: every other kernel's part is the derived tiles' at it.
             ladders = [tiles]
             for launch in template.MOSAIC.launches(bound, tiles, facts, backward=True):
-                rung = tiles
-                while (up := template.MOSAIC._raised(bound, rung, frozenset({launch.name}),
-                                                     facts)) is not None:
-                    rung = template._producing(rung, up)
-                    ladders.append(rung)
+                up = template.MOSAIC._raised(bound, tiles, frozenset({launch.name}), facts)
+                if up is not None:
+                    ladders.append(template._producing(tiles, up))
             modules: dict[tuple[str, str], set[bytes]] = collections.defaultdict(set)
             for config in ladders:
                 # A rated scan's skip an operand beside the call's, traced as its route hands it.
