@@ -641,8 +641,9 @@ def test_diffusion_nft_trains_from_the_run_config_on_a_registered_reward():
     scored by PSNR against the prompt's own image, and one policy step on them (row 6126)."""
     from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
 
-    config = dataclasses.replace(grpo_run(), objective=ObjectiveConfig(
-        "diffusion_nft", {"kl": 0.0, "solver": Euler(), "steps": 2}))
+    config = dataclasses.replace(
+        grpo_run(), objective=ObjectiveConfig("diffusion_nft", {"kl": 0.0, "solver": Euler(), "steps": 2}),
+        rollout=FlowRolloutConfig(reward="psnr", groups=2, steps=3, train_steps=2))
     objective = config.build()
     assert isinstance(objective, DiffusionNFTObjective) and config.rollout is not None
     rollout = config.rollout.build(objective)
