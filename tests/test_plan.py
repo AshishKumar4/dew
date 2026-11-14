@@ -43,6 +43,7 @@ from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
+from dew.optim import OptimConfig
 from dew.registry import mixers
 from dew.state import TrainState, apart
 from dew.telemetry.compiles import Compiles
@@ -780,8 +781,10 @@ def regression_fit(x, directory, split: int, steps: int):
     rows = [{"x": row, "y": 2 * row[:2]} for row in x]
     data = compile(Pipeline(Memory(rows)).batch(8), read="memory", seed=0,
                    loading=Loading(workers=0, threads=1, read_buffer=1))
-    trainer = one_device(Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0), split=split,
-                                 checkpoints=Checkpoints(str(directory))))
+    # The optimizer stated as a config, which keys the step, so each seed's fits read the step the first
+    # traced (`Trainer._step_key`).
+    trainer = one_device(Trainer(Regression(), OptimConfig(optimizer="optax:sgd", learning_rate=0.1),
+                                 key=jax.random.key(0), split=split, checkpoints=Checkpoints(str(directory))))
     return trainer.fit(data, steps=steps, checkpoint_every=2).variables["params"]
 
 
