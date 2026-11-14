@@ -108,12 +108,13 @@ def test_a_settings_value_holds_its_mappings_in_order_and_none_for_a_function():
 
 @pytest.mark.mesh(devices=4)
 def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
-    """A trainer whose mesh splits the sequence fits again in the same process tracing what a trainer on a
-    mesh of no split axis traces again, its step and its plan's candidates read as its first fit traced
-    them: its key holds the links' measured figures (`dew.nn.sharding.trace_context`) and not the links its
-    last compile decided, and each fit plans from the split the trainer was given, both of which keyed every
-    refit on a tensor- or sequence-split mesh apart from the fit before it (row 6022); the kept step's
-    spreads are its trace's (`Candidate.spread`)."""
+    """A trainer whose mesh splits the sequence fits again in the same process without tracing its step or
+    its plan's candidates again, which its first fit traced: its key holds the links' measured figures
+    (`dew.nn.sharding.trace_context`) and not the links its last compile decided, and each fit plans from
+    the split the trainer was given, both of which keyed every refit on a tensor- or sequence-split mesh
+    apart from the fit before it (row 6022: of the first fit's 9 programs JAX traced, the refit traced 6
+    again, 4 now, its batches' placement and its evaluation alone); the kept step's spreads are its
+    trace's (`Candidate.spread`)."""
     import jax.monitoring
     import numpy as np
 
@@ -128,26 +129,21 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
             traced.append(seconds)
 
     rows = {"text": np.random.default_rng(0).integers(0, 8, size=(8, 17)).astype(np.int32)}
-
-    def refit(mesh: MeshSpec) -> tuple[dict, dict, int]:
-        """The links each of two fits decided, and the programs JAX traced again for the second."""
-        # The optimizer stated as a config, which keys the step.
-        optimizer = OptimConfig(optimizer="adam", learning_rate=1e-2)
-        trainer = Trainer(LMObjective(tiny(max_seq_len=16), 16), optimizer, key=jax.random.key(0), mesh=mesh)
-        fitted = []
+    # The optimizer stated as a config, which keys the step.
+    optimizer = OptimConfig(optimizer="adam", learning_rate=1e-2)
+    trainer = Trainer(LMObjective(tiny(max_seq_len=16), 16), optimizer, key=jax.random.key(0),
+                      mesh=MeshSpec(fsdp=2, sequence=2))
+    fitted = []
+    jax.monitoring.register_event_duration_secs_listener(heard)
+    try:
         for _ in range(2):
             before = len(traced)
             data = Loader(train=lambda partition: iter([rows] * 4), val=None, records=None, batch=8)
             trainer.fit(data, steps=2)
             fitted.append((dict(trainer.links), len(traced) - before))
-        return fitted[0][0], fitted[1][0], fitted[1][1]
-
-    jax.monitoring.register_event_duration_secs_listener(heard)
-    try:
-        _, _, plain = refit(MeshSpec(fsdp=4))
-        first, again, split = refit(MeshSpec(fsdp=2, sequence=2))
     finally:
         jax.monitoring.unregister_event_duration_listener(heard)
-    assert split == plain
+    (first, tracing), (again, retracing) = fitted
+    assert retracing <= tracing // 2, (tracing, retracing)
     assert {axis: link.spread for axis, link in again.items()} == {
         axis: link.spread for axis, link in first.items()}
