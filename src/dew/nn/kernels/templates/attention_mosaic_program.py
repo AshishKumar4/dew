@@ -72,16 +72,20 @@ def fewer_rows(family: mosaic.Family) -> tuple[int, ...]:
 
 def scopes_products(family: mosaic.Family) -> bool:
     """Whether `family`'s issuer keeps its products' accumulators in scratch a launch scopes
-    (`Issuer.product_scratch`: tcgen05's chunks')."""
-    return bool(family.product_scratch(1, (family.rows,)))
+    (`Issuer.product_scratch`: tcgen05's chunks' and rows'), asked of a program with a product of each kind
+    its scratch takes (one fresh, a register left operand, one issued ahead, a walk's sums): the rows' takes
+    exactly those."""
+    rows = family.rows
+    return bool(family.product_scratch(1, (rows,), ((rows, jnp.bfloat16),), (rows,), (rows,)))
 
 
 def qualified(family: mosaic.Family) -> bool:
     """Whether the attention mainloop runs on `family`: one whose consumers issue their products
     (`Family.issues_in_consumers`), whose walk's softmax and its rescales run between them in the registers
-    that hold them (wgmma's, mma.sync's, tcgen05's chunks, a TPU core's MXU); not a bundle whose one warp
-    issues them into tensor memory (`mosaic_sm100.RINGS`)."""
-    return family.issues_in_consumers
+    that hold them (wgmma's, mma.sync's, tcgen05's chunks, a TPU core's MXU), or one that places a walk's
+    declared products on a role of their own (`Issuer.places_on_role`, tcgen05's rows, FlashAttention 4's);
+    not a bundle whose one warp issues a persistent tile's (`mosaic_sm100.RINGS`)."""
+    return family.issues_in_consumers or family.places_on_role
 
 
 def bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
@@ -101,8 +105,11 @@ def layouts(generation_name: str | None, dtype, rows: int | None = None) -> tupl
     device has, by the share of its rows they fill), where its family is qualified (`qualified`)."""
     if generation_name is None:
         return ()
-    return tuple(family for family in bundles.layouts(generation_name, dtype, rows, scoped=True, tpu=True)
-                 if qualified(family))
+    found = [family for family in bundles.layouts(generation_name, dtype, rows, scoped=True, tpu=True)
+             if qualified(family)]
+    # A family that places its products on a role first, the others in the bundles' order (tcgen05's rows:
+    # nvgpu-lean's B200 at the 4B call, 1.23 ms a launch against the chunks' two launches' 2 x 2.49).
+    return tuple(sorted(found, key=lambda family: not family.places_on_role))
 
 
 def runs_backward(family: mosaic.Family) -> bool:
@@ -227,7 +234,9 @@ class Tiles:
     instruction family whose bundle runs it (`family`, `bundle`). A fold's call rewalks a row past its reach
     in the natural form at its own key tile and consumers (`relaunch_k`, `relaunch_consumers`; the config's
     where None, `relaunch`), which divide the config's so its padded blocks hold, and the value columns each
-    of its launches walks (`relaunch_columns`, a launch a block of them; all of them where None);
+    of its launches walks (`relaunch_columns`, a launch a block of them; all of them where None), on another
+    family and query block where it names them (`relaunch_family`, `relaunch_q`: a family whose program
+    takes no masked rewalk in place, `Issuer.rewalks`, rewalks on the device's register family);
     `natural_form` marks the natural form's tiles, whose register model differs (`MosaicForward.registers`),
     and `columns` the value columns a launch at them walks."""
 
@@ -239,6 +248,8 @@ class Tiles:
     relaunch_k: int | None = None
     relaunch_consumers: int | None = None
     relaunch_columns: int | None = None
+    relaunch_family: str | None = None
+    relaunch_q: int | None = None
     natural_form: bool = False
     columns: int | None = None
     narrow: bool = False
@@ -254,10 +265,12 @@ class Tiles:
     @property
     def relaunch(self) -> "Tiles":
         """The natural form's rewalk's tiles (`algebra.walked_launches`)."""
-        return dataclasses.replace(self, block_k=self.relaunch_k or self.block_k,
-                                   consumers=self.relaunch_consumers or self.consumers, relaunch_k=None,
-                                   relaunch_consumers=None, relaunch_columns=None, natural_form=True,
-                                   columns=self.relaunch_columns)
+        return dataclasses.replace(self, block_q=self.relaunch_q or self.block_q,
+                                   block_k=self.relaunch_k or self.block_k,
+                                   consumers=self.relaunch_consumers or self.consumers,
+                                   family=self.relaunch_family or self.family, relaunch_k=None,
+                                   relaunch_consumers=None, relaunch_columns=None, relaunch_family=None,
+                                   relaunch_q=None, natural_form=True, columns=self.relaunch_columns)
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -471,11 +484,14 @@ def most_consumers(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> int
 
 
 def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:
-    """Whether a program of `family` takes `tiles`: its query and key tiles positive whole multiples of the
-    rows a role's products cover (`Family.rows`), and one to its launch's count of consumers
-    (`most_consumers`), whose turns its walks are written for."""
+    """Whether a program of `family` takes `tiles`: its query tiles positive whole multiples of the rows a
+    role's products cover (`Family.rows`), its key tiles of the rows a walked tile comes in
+    (`Family.walked_rows`), and one to its launch's count of consumers (`most_consumers`), whose turns its
+    walks are written for; a family whose products a role issues (`Issuer.places_on_role`) one product's
+    rows, a row a consumer thread."""
+    rows = tiles.block_q == family.rows if family.places_on_role else tiles.block_q % family.rows == 0
     return (0 < tiles.consumers <= most_consumers(family, tiles) and tiles.block_q > 0 and tiles.block_k > 0
-            and tiles.block_q % family.rows == 0 and tiles.block_k % family.rows == 0)
+            and rows and tiles.block_k % family.walked_rows == 0)
 
 
 ROUNDED = Refusal('rounds', "a quantized model's weights round at their row's maximum in the anchored "
@@ -1081,10 +1097,15 @@ class _Program[T: (Tiles, BackwardTiles)]:
     parts: int = 1
     """The bf16 parts each of an fp32 call's tiles is staged in, one above the other (`MosaicForward.parts`):
     its products their parts' (`parted`)."""
-    ahead: tuple[str, ...] = ()
-    """The streams its walks read a step ahead (`mosaic.Family.walk`'s `ahead`): a forward's keys, where it
-    issues each key tile's logits a step before its softmax reads them (`attention_mosaic_forward
-    .logits_ahead`, row 5368)."""
+    products: tuple[mosaic.Product, ...] = ()
+    """Its walks' steps' products declared as data (`mosaic.Family.walk`'s `products`, which the family
+    places): a forward's logits and its weighted values' sums (`attention_mosaic_forward.declared`)."""
+
+    @property
+    def ahead(self) -> bool:
+        """Whether it issues a product a step ahead of its read: the logits, where it issues each key
+        tile's a step before its softmax reads them (`attention_mosaic_forward.logits_ahead`, row 5368)."""
+        return bool(mosaic.ahead_streams(self.products))
 
     def parted(self, tile, rows: int):
         """`tile` as the parts its products take (`operands.Parts`, each `rows` rows of it, an fp32 tile's),
@@ -1129,9 +1150,9 @@ class _Program[T: (Tiles, BackwardTiles)]:
 
     def __post_init__(self):
         if not whole_tiles(self.family, self.tiles):
-            raise ValueError(f"{self.tiles}: query and key tiles of whole {self.family.rows} rows and "
-                             f"{most_consumers(self.family, self.tiles)} consumers at most "
-                             f"({self.family.name})")
+            raise ValueError(f"{self.tiles}: query and key tiles of whole {self.family.rows} and "
+                             f"{self.family.walked_rows} rows and {most_consumers(self.family, self.tiles)} "
+                             f"consumers at most ({self.family.name})")
 
     def walked(self, first):
         """The key tiles a query block from `first` reads: those holding the call's keys (none wholly past
@@ -1554,6 +1575,14 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     A100's at width 128 spilled 128 bytes at 255).
     """
     block_q, block_k = tiles.block_q, tiles.block_k
+    if family.places_on_role:
+        # A consumer of products a role issues (`Issuer.places_on_role`, tcgen05's rows): its rows' maxima
+        # and denominators carried, and at a step's widest its logits read from tensor memory beside their
+        # weights, fp32 (its sums kept there, rescaled a block of columns at a time once the weights are
+        # written; its mask's places a row's scalar beside constant columns). A thread holds its row: ptxas
+        # held the 4B call's 128 x 64 walk at width 256 in 196 registers (et-rows-abi).
+        return resources.live_registers(family, [(block_q, 1, jnp.float32)] * 2,
+                                        [(block_q, block_k, jnp.float32)] * 2)
     hooked, vectors = _hook_live(family, block_q, block_k, params, held=True)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)

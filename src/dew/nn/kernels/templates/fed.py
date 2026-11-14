@@ -2,12 +2,12 @@
 consumer issues every ring's loads between its own steps (`Feed`), every consumer walking them."""
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import jax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels.templates import resources
+from dew.nn.kernels.templates import mosaic, resources
 from dew.nn.kernels.templates.handoffs import Role, Schedule
 from dew.nn.kernels.templates.mosaic import RingFamily
 from dew.nn.kernels.templates.rings import Ring, drain
@@ -112,8 +112,9 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
-        if ahead:
+                unrolled: bool = False, products: Sequence[mosaic.Product] = ()
+                ) -> tuple[C, tuple[jax.Array, ...]]:
+        if mosaic.ahead_streams(products):
             raise NotImplementedError(f"{self.name}'s consumers feed their own rings: none is read ahead")
         if not isinstance(streams, Feed):
             raise NotImplementedError(f"{self.name}'s consumers feed their own rings (`fed`)")

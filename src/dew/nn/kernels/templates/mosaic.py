@@ -23,7 +23,7 @@ import dataclasses
 import functools
 import math
 import operator
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
 import jax
@@ -662,10 +662,60 @@ class Slots:
                 self[name]
 
 
-def ahead_stages(ahead: tuple[str, ...]) -> int:
-    """The least slots a walk's rings take where its steps read `ahead` (`Family.walk`): the next step's slot
-    held beside the step's own, two where it reads any ahead, one otherwise."""
-    return 2 if ahead else 1
+@dataclasses.dataclass(frozen=True)
+class Product:
+    """A walk step's product declared as data (row 5368), which its family places (`Issuer.scored`,
+    `Issuer.accumulating`, `Issuer.issuing`): `left @ right` into the program's accumulator `into`
+    (`Family.scoped`'s `products`), its right operand a slot of stream `right` (read transposed where
+    `transposed`, the keys of `Q Kᵀ`), its left the program's tile named `left` (the query's stage) or,
+    where None, the one the consumer gives it each step (its weights, `Issuer.accumulating`); onto its
+    accumulator across the walk (`accumulate`: the weighted values' sums) or fresh each step (the logits);
+    and, `ahead`, issued a step before the step that reads it, its operands the program's own (the logits,
+    whose right stream the walk then reads a step early, `Slots.following`). A register family issues each
+    where the step reaches it (its consumer's own products, the ones it always issued); a family whose
+    products a warp issues (`Issuer.places_on_role`, tcgen05's rows) issues them on that warp's role, a step
+    ahead of the consumer that reads them (FlashAttention 4's structure)."""
+    right: str
+    into: str
+    left: str | None = None
+    transposed: bool = False
+    accumulate: bool = False
+    ahead: bool = False
+
+
+def ahead_streams(products: Sequence[Product]) -> tuple[str, ...]:
+    """The streams a walk's steps read a step early: each product's right stream it issues ahead."""
+    return tuple(dict.fromkeys(product.right for product in products if product.ahead))
+
+
+def declared_into(products: Sequence[Product], into: str) -> Product | None:
+    """The product of `products` into the accumulator `into`, or None."""
+    return next((product for product in products if product.into == into), None)
+
+
+def ahead_stages(products: Sequence[Product]) -> int:
+    """The least slots a walk's rings take where it issues `products` (`Family.walk`): the next step's slot
+    held beside the step's own, two where it issues any ahead, one otherwise."""
+    return 2 if ahead_streams(products) else 1
+
+
+@dataclasses.dataclass(frozen=True)
+class Kept:
+    """A walk's sums kept in its issuer's own memory past the walk (`Issuer.accumulated`: tcgen05's rows,
+    whose sums stay in tensor memory, their 256 fp32 columns a row past a thread's registers): the
+    accumulator `acc` (its issuer's) and, `scaled`, each row's factor its output takes (`algebra.inverse`
+    of its total), which the family applies where it stores them a block of columns at a time
+    (`Family.stored`)."""
+    acc: Any
+    factor: jax.Array | None = None
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return tuple(self.acc.shape)
+
+    def scaled(self, factor: jax.Array) -> "Kept":
+        """The sums each row taken by `factor`, as stored."""
+        return dataclasses.replace(self, factor=factor)
 
 
 def released(rings: dict[str, Ring], turn: Turn) -> None:
@@ -723,6 +773,14 @@ class Issuer[Accumulator](abc.ABC):
     role_rows: int
     """The rows a consumer role's products cover at least: one warpgroup's (wgmma's one MMA of 64 rows,
     mma.sync's four warps of 16 each)."""
+
+    @property
+    def walked_rows(self) -> int:
+        """The rows a walked tile (a forward's keys) comes in whole multiples of: the products' rows, which a
+        consumer's weights' product takes as its depth (wgmma's and the chunks' 64, mma.sync's 16); a family
+        whose products a role issues takes its weights from tensor memory, a swizzle tile's 64 rows of a
+        16-bit stream (`Tcgen05Placed`)."""
+        return self.rows
 
     @property
     def transposed_rows(self) -> int:
@@ -1098,6 +1156,54 @@ class Issuer[Accumulator](abc.ABC):
     def taken(self, shape: tuple[int, int], buffer) -> jax.Array:
         """The product of `shape` `issued_ahead` into accumulator `buffer`, awaited, its value."""
         raise NotImplementedError(f"{self.name} issues no product ahead of its read")
+
+    places_on_role: bool = False
+    """Whether its products are issued by a role of their own (`issuing`, `Family.scheduled`'s `issuer`), a
+    step ahead of the consumers that read their results and give them their left operands (`scored`,
+    `accumulating`), rather than by the consumers inline: tcgen05's rows, FlashAttention 4's product warp."""
+
+    rescales_kept: bool = False
+    """Whether a walk's sums its issuer keeps in its own memory (`keeps_sums`) take a step's factor there, an
+    inference walk's among them (tcgen05's rows, a row a lane, a block of its columns at a time); else only a
+    walk whose sums take no factor keeps them (the training walk's split sums, tcgen05's chunks)."""
+
+    rewalks: bool = True
+    """Whether its program takes the fold's masked natural rewalk in place (`algebra.walked_launches`'
+    `in_place`, its outputs' rows written where a flag keeps them); else the rewalk runs on the device's
+    register family (`Tiles.relaunch_family`)."""
+
+    def scored(self, declared: Product, lhs, index, slots, shape: tuple[int, int]) -> jax.Array:
+        """Step `index`'s value of the fresh product `declared` (`left @ right`, issued `ahead`: the logits)
+        of `shape`, its left `lhs`: issued into one of the consumer's two accumulators by the step before it,
+        or by itself where it is its range's first (`Slots.opened`), awaited and read; then the next step's
+        issued into the other (`Slots.following`), which runs under this one's softmax (`issued_ahead`,
+        `taken`, tcgen05's chunks). A family placing its products on a role reads the result its issuer
+        signals (`places_on_role`)."""
+        buffer = lax.rem(index, 2)
+
+        def issue(right, at) -> None:
+            self.issued_ahead(lhs, right.transpose((1, 0)) if declared.transposed else right, shape, at)
+
+        pl.when(slots.first)(lambda: issue(slots.opened(declared.right), buffer))
+        value = self.taken(shape, buffer)
+        pl.when(slots.more)(lambda: issue(slots.following(declared.right), 1 - buffer))
+        return value
+
+    def accumulating(self, declared: Product | None, slots, inline: Callable) -> Callable:
+        """The step's `algebra.Keys.accumulate` for the product `declared` whose left the consumer gives (its
+        weights onto the values' sums): `inline`, the consumer's own issue, on a register family; a family
+        placing its products on a role (`places_on_role`) takes the weights and the step's factor and gives
+        them to its issuer (`slots` the step's place)."""
+        del declared, slots
+        return inline
+
+    def issuing(self, streams, products: Sequence[Product], lo, hi, *, first, lefts: Mapping,
+                ready) -> None:
+        """The issuing role's walk of steps `lo` to `hi` (the streams' steps counted from `first`): each of
+        `products` issued as its consumer's walk reads it (`places_on_role`), its left operands the program's
+        tiles `lefts` names, once `ready` (the query's load) is done."""
+        del streams, products, lo, hi, first, lefts, ready
+        raise NotImplementedError(f"{self.name}'s consumers issue their own products")
 
     def product_columns(self, products: tuple | None) -> int:
         """The tensor-memory columns `Family.scoped`'s `products` take (`product_scratch`'s): none where the
@@ -1615,12 +1721,13 @@ class Transport[Allocated, Opened](abc.ABC):
         (setmaxnreg's least where None: a launch states more where its producer's issue loop holds more)."""
 
     def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None,
-                  exclusive: bool = False):
+                  exclusive: bool = False, issuer: Callable | None = None):
         """The family's roles run (`roles`, its producer lowered to `floor`): `consumer(index)` on its compute
-        roles and `producer()` on its producer's where it has one, each a branch of one switch where
-        `exclusive` (`handoffs.Schedule.run`); the consumers' value where they are its every warpgroup."""
+        roles, `producer()` on its producer's where it has one, and `issuer()` on its issuing role where its
+        products are issued on one (`Issuer.places_on_role`), each a branch of one switch where `exclusive`
+        (`handoffs.Schedule.run`); the consumers' value where they are its every warpgroup."""
         schedule = self.roles(consumers, floor)
-        bodies = {"consumer": consumer, "producer": producer}
+        bodies = {"consumer": consumer, "producer": producer, "issuer": issuer}
         return schedule.run(exclusive=exclusive, **{role.name: bodies[role.name] for role in schedule.roles})
 
     def lifetimes(self, streams: Allocated, steps: int | None = None) -> tuple[tuple, tuple]:
@@ -1718,7 +1825,8 @@ class Transport[Allocated, Opened](abc.ABC):
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, products: Sequence[Product] = ()
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         """A consumer's walk of `segments`, each `(step, lo, hi)`, `step(index, slots, carry, accumulators)
         -> (carry, accumulators)` given each stream's slots (`Slots`, the streams' steps counted from
         `first`), from `start`, with fp32 accumulators of `shapes` its products issue into in place, zero
@@ -1726,11 +1834,11 @@ class Transport[Allocated, Opened](abc.ABC):
         running past their step (0 or 1): their slots go back once they are done, a step later, so the next
         step's operands are waited for while they run. A ring's `unrolled` walk takes a rotation of its
         slots a trip, each step at a slot it knows (`mosaic.stepping`): for a step small beside its waits (a
-        GEMM's), where a ring's slots are few. The streams named `ahead` each step reads a step early
-        (`Slots.following`): a product issued for the next step while this one's runs (tcgen05's logits in
-        flight, row 5368), the mirror of `in_flight`'s late release, which it excludes; a family whose
-        streams are no producer's rings reads none ahead.
-        Returns the carry and the accumulators' values."""
+        GEMM's), where a ring's slots are few. Its steps' declared `products` (`Product`) the family places:
+        the right stream of each it issues `ahead` a step read early (`Slots.following`, `ahead_streams`), a
+        product issued for the next step while this one's runs (tcgen05's logits in flight, row 5368), the
+        mirror of `in_flight`'s late release, which it excludes; a family whose streams are no producer's
+        rings issues none ahead. Returns the carry and the accumulators' values."""
 
     @abc.abstractmethod
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
@@ -2251,27 +2359,29 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, products: Sequence[Product] = ()
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         return self._walked(streams, segments, start, shapes, interpret, first=first, in_flight=in_flight,
-                            initial=initial, unrolled=unrolled, ahead=ahead)
+                            initial=initial, unrolled=unrolled, products=products)
 
     def _walked[C](self, streams: dict[str, Ring], segments, start: C, shapes: tuple, interpret: bool, *,
                    first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                   freed: Callable | None = None, unrolled: bool = False, ahead: tuple[str, ...] = ()
-                   ) -> tuple[C, tuple[jax.Array, ...]]:
+                   freed: Callable | None = None, unrolled: bool = False,
+                   products: Sequence[Product] = ()) -> tuple[C, tuple[jax.Array, ...]]:
         """`walk`, `freed(counter)` run after each step's slots are given back (step `counter`'s). Each
         segment walks its steps a step a trip or, `unrolled`, a rotation of the rings (`stepping`). A step
-        reading `ahead` holds the next step's slot of those streams beside its own, so the rings hold two
-        steps' slots at least (`Tiles.stages`' floor, `ahead_stages`), and tests where it stands in its range
-        (`Slots.first`, `more`): its own slots read where it is the first, the next's where more follow, each
-        under its guard, which a count of its emission reads by the step's place (`emission`'s place guards).
-        Each step marked (`stepped`)."""
+        issuing a product ahead (`Product.ahead`) holds the next step's slot of its stream beside its own,
+        so the rings hold two steps' slots at least (`Tiles.stages`' floor, `ahead_stages`), and tests where
+        it stands in its range (`Slots.first`, `more`): its own slots read where it is the first, the next's
+        where more follow, each under its guard, which a count of its emission reads by the step's place
+        (`emission`'s place guards). Each step marked (`stepped`)."""
         segments = stepped(segments)
+        ahead = ahead_streams(products)
         stages = min(ring.stages for ring in streams.values())
         if not 0 <= in_flight < stages:
             raise ValueError(f"a walk keeps fewer steps' products in flight than its rings' {stages} slots, "
                              f"none or some, not {in_flight}")
-        if ahead and (in_flight or stages < ahead_stages(ahead)):
+        if ahead and (in_flight or stages < ahead_stages(products)):
             raise ValueError(f"a walk reading {ahead} a step ahead holds two steps' slots of rings of "
                              f"{stages}, and keeps no product in flight past its step ({in_flight})")
         def given(turn: Turn, *, release: bool = False) -> None:

@@ -9,7 +9,7 @@ Its layouts are its operands' dtype's (`Layout.MMA_ACC(dtype)`), so a bundle is 
 import abc
 import dataclasses
 import functools
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any, Self
 
 import jax
@@ -657,10 +657,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, products: Sequence[mosaic.Product] = ()
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
         # each stage back as its step ends, so no step holds one past it, nor reads one ahead.
-        if ahead:
+        if mosaic.ahead_streams(products):
             raise NotImplementedError(f"{self.name}'s pipeline reads no stream ahead")
         del first, in_flight, unrolled
         segments = mosaic.stepped(segments)
