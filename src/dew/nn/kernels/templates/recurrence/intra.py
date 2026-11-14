@@ -199,7 +199,7 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
     programs of): each step the block's prefix halves from its decay (`algebra.scanned_prefix`, staged in a
     padded shared tile whose rows the sub-chunks' references read), stored for the later launches, and the
     block's pairs' products issued into the sums the walk holds (`mosaic.Walk.sums`), read and stored once
-    after it: the scores (the queries' pairs, the queries scaled) and, under the delta rule, the keys' system
+    after it: the scores (the queries' pairs, scaled once gated) and, under the delta rule, the keys' system
     (the write-gated keys' pairs, strict), their factors formed once for both (`algebra.key_block_pairs`), and
     each sub-chunk's own pairs each their own decay (`algebra.key_diagonal_pairs`).
     Its prefix an XLA scan of its own, thirteen launches took 0.30 ms of Kimi Linear's 1.57 ms forward on an
@@ -246,18 +246,18 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                 return stream_tile(slots, name, call.given).value().astype(jnp.float32)
 
             def rows(name):
-                # The scores' queries scaled as their products take them: the sums held across the key blocks
-                # stay the scaled pairs', two unscaled blocks' near fp32's largest past it.
-                found = intra_rows(call, name, operand, beta_ref.at[h, span])
-                return found * scale if name == "scores" else found
+                return intra_rows(call, name, operand, beta_ref.at[h, span])
 
             def staged(value, s, r):
                 """A sub-chunk's operand staged in its own tiles (`_intra_staged`): its keys gated up, or row
                 set `r`'s rows gated down."""
                 return operands.staged(family, value, raised[s - 1] if r is None else lefts[r][s - 1])
 
+            # The scores' rows scaled as their products take them: the sums held across the key blocks stay
+            # the scaled pairs', two unscaled blocks' near fp32's largest past it.
             pairs = algebra.key_block_pairs([functools.partial(rows, name) for name in products],
-                                            operand("keys"), whole, at_token, staged, chunk=chunk)
+                                            operand("keys"), whole, at_token, staged, chunk=chunk,
+                                            scales=[scale if name == "scores" else 1.0 for name in products])
             issuer = Issuer(call)
             return carry, tuple(issuer.summed(found, into=acc)
                                 for found, acc in zip(pairs, accumulators, strict=True))
