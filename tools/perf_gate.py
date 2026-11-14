@@ -520,21 +520,25 @@ case = Case(**json.loads(sys.argv[1]))
 generation, capacity, attention = sys.argv[2], int(sys.argv[3]), sys.argv[4]
 ahead = ahead_of(case, generation, capacity, attention)
 print(json.dumps({"seconds": ahead.planned_seconds,
+                  "parts": dict(getattr(ahead, "planned_parts", None) or {}) or None,
                   "plan": {key: (ahead.plan or {}).get(key) for key in sys.argv[5].split(",")}}))
 """
 """A step's planning and compile ahead of its run, for compile-only GPUs of a generation (`compile`): the
-seconds the planner took, its derivations and every compile (`AheadOfTime.planned_seconds`), and the
-configuration it selected (`SELECTED`), a diagnostic beside the row."""
+seconds the planner took, its derivations and every compile (`AheadOfTime.planned_seconds`), those seconds by
+their parts (`AheadOfTime.planned_parts`: JAX's traces, lowerings and compiles, and the algebra's passes; None
+in a tree before them), and the configuration it selected (`SELECTED`), the last two diagnostics beside the
+row."""
 SELECTED = ("split", "rows", "remat", "head_tile", "head_fused", "xla_defaults", "narrow")
 """The fields of a compiled plan that name the configuration its planner selected (dew.training.planning's
 admitted record), kept with their own values beside each compile's seconds: a head that plans otherwise shows
 it."""
 
 
-def compiled_sample(printed: str) -> tuple[float, dict]:
-    """A compile ahead's printed result (`COMPILED`) as a row's sample and its plan: the planner's seconds."""
+def compiled_sample(printed: str) -> tuple[float, dict, dict | None]:
+    """A compile ahead's printed result (`COMPILED`) as a row's sample, the planner's seconds, its plan and
+    its seconds by their parts."""
     compiled = json.loads(printed.strip().splitlines()[-1])
-    return float(compiled["seconds"]), compiled["plan"]
+    return float(compiled["seconds"]), compiled["plan"], compiled.get("parts")
 
 
 def ahead_battery(args: argparse.Namespace) -> int:
@@ -607,7 +611,8 @@ def compile_battery(args: argparse.Namespace) -> int:
     arms = arms_of(base, head, base_path, head_path)
     results = {"base": base, "head": head, "alone": f"{base}{ALONE}", "rounds": args.rounds,
                "rows": [row.__dict__ for row in rows], "samples": {arm: [] for arm in ARMS}, "orders": [],
-               "plans": {arm: [] for arm in ARMS}, "target": {"kind": args.kind, "generation": generation,
+               "plans": {arm: [] for arm in ARMS}, "parts": {arm: [] for arm in ARMS},
+               "target": {"kind": args.kind, "generation": generation,
                                                               "capacity_gib": gib, "lock": args.lock},
                "seconds": {"first round": 0.0, "later rounds": 0.0}}
     beside = Path(args.out).resolve().parent
@@ -617,7 +622,7 @@ def compile_battery(args: argparse.Namespace) -> int:
 
         def sample(arm: str, round_: int) -> dict:
             tree, path = arms[arm]
-            taken, plans = {}, {}
+            taken, plans, parts = {}, {}, {}
             for name, case in cases.items():
                 if tree in unbuilt:
                     taken[name] = unbuilt[tree]
@@ -630,8 +635,9 @@ def compile_battery(args: argparse.Namespace) -> int:
                 if done.returncode != 0:
                     taken[name] = f"not run: {done.stderr[-400:]}"
                     continue
-                taken[name], plans[name] = compiled_sample(done.stdout)
+                taken[name], plans[name], parts[name] = compiled_sample(done.stdout)
             results["plans"][arm].append(plans)
+            results["parts"][arm].append(parts)
             return taken
 
         rounds(args, results, sample)
@@ -744,8 +750,13 @@ def report(args: argparse.Namespace) -> int:
         # A compile's plans, each arm's selected configurations, beside its verdict: why its planning moved.
         selected = {arm: [plans[row.name] for plans in results.get("plans", {}).get(arm, [])
                           if row.name in plans] for arm in ARMS}
+        # Its planning's seconds by their parts, each arm's every round, beside its verdict (row 6108): which
+        # part moved, where a compile's whole did.
+        spent = {arm: [parts[row.name] for parts in results.get("parts", {}).get(arm, [])
+                       if parts.get(row.name)] for arm in ARMS}
         verdicts[row.name] = {"state": state, "unit": row.unit, "gated": row.gated, **numbers,
-                              **({"plans": selected} if any(selected.values()) else {})}
+                              **({"plans": selected} if any(selected.values()) else {}),
+                              **({"parts": spent} if any(spent.values()) else {})}
         if (state in (*UNQUALIFIED, "broken", "failed") or (state == "regressed" and row.gated)
                 or (claiming and claimed(row) and state in
                     ("not measured on this hardware", "not compared"))):
@@ -755,6 +766,12 @@ def report(args: argparse.Namespace) -> int:
         if selected["base"] and any(plan != selected["base"][0] for plans in selected.values()
                                     for plan in plans):
             state += " (its arms planned otherwise: the verdicts' plans)"
+        if spent["base"] and spent["head"]:
+            shared = [part for part in spent["head"][0]
+                      if all(part in each for each in (*spent["base"], *spent["head"]))]
+            state += " (parts, median s base/head: " + ", ".join(
+                f"{part} {statistics.median(each[part] for each in spent['base']):.2f}/"
+                f"{statistics.median(each[part] for each in spent['head']):.2f}" for part in shared) + ")"
         if state.startswith("partial"):
             state += " (" + ", ".join(f"{arm} {count} of {rounds} rounds unmeasured"
                                       for arm, count in numbers["unmeasured rounds"].items()) + ")"
