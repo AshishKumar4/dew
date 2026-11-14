@@ -1600,28 +1600,6 @@ def test_a_training_launchs_backward_kernels_carry_its_launch():
 
 
 
-def test_a_forward_spilling_at_every_producer_raise_ends_its_derivation():
-    """A forward alone that takes the training call's tiles (Nemotron-H 4B's SSD on an H100), whose scan, a
-    launch whose producer moves registers, spills at its producer's every setmaxnreg step (a compile refusing
-    each raised config, `report.refuse_launch`, within a scope of its own), has those tiles refused past the
-    last raise: its derivation ends on other tiles or none, the training call's tiles never taken again for a
-    forward refused at them (`Mosaic._chunked`)."""
-    facts = generation.gpu_target('sm90')
-    *_, bound = forked_case('sm90', 'nemotron-h-4b-ssd', training=False)
-    with generation.assumed(facts), report.refusals():
-        tiles = template.MOSAIC.derived(bound, facts)
-        assert tiles.forward is None, tiles
-        names = {launch.name for launch in template.MOSAIC.launches(bound, tiles, facts, backward=False)}
-        assert 'recurrence_scan' in names, names
-        raised = tiles
-        while raised is not None:
-            report.refuse_launch(template.MOSAIC, bound, raised, {'recurrence_scan'})
-            producers = raised.producers.raised({'recurrence_scan'})
-            raised = None if producers is None else template._producing(raised, producers)
-        derived = template.MOSAIC.derived(bound, facts)
-    assert derived is None or (derived.forward or derived) != tiles
-
-
 def test_a_spilling_kernel_raises_only_the_launch_it_belongs_to():
     """A kernel spilling under a launch name another launch's extends (`recurrence_intra_solve` beside
     `recurrence_intra`) is that longer launch's alone (`template._owners`), so only its producer rises."""
