@@ -25,6 +25,12 @@ from pathlib import Path
 from etils import epath
 
 
+def is_uri(path: str) -> bool:
+    """Whether a path names a `<scheme>://` location, such as a gs:// bucket, which a store makes visible
+    whole and which has no rename to stage a write with."""
+    return "://" in path
+
+
 def stat_identity(path: str | os.PathLike) -> tuple[str, int, int]:
     """A file's resolved path, size and modification time in ns, which a
     conversion cache keys it by in place of a hash of its bytes.
@@ -51,7 +57,7 @@ def replacing(path: str | os.PathLike) -> Iterator[epath.Path]:
     the mode a plain write gives: the target's own, or a new file's under the
     umask. A location with a scheme yields `path` itself.
     """
-    if "://" in str(path):
+    if is_uri(str(path)):
         yield epath.Path(path)
         return
     target = Path(path)
