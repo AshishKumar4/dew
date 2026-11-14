@@ -25,17 +25,15 @@ def trunk_cache(model: CausalTransformer, rows: int) -> CacheSpec:
     """`model`'s trunk's decode cache for `rows` rows: its layers', its loop's passes' and its own
     holders' (the module doc)."""
     layers = [layer.cache_spec(rows) for layer in model.layers]
+    runs = _banked_runs(model) or tuple((index, 1) for index in range(model.num_layers))
+    entries = [(first, first, count) for first, count in runs]
+    entries += [] if model.loop is None else pass_entries(model.loop, model.num_layers, runs)
+    names = StackView(tuple((stored, count) for stored, _, count in entries)).bank_names()
     spec: dict = {}
-    runs = _banked_runs(model)
-    if runs is None:
-        entries = [(index, index) for index in range(model.num_layers)]
-        entries += [] if model.loop is None else pass_entries(model.loop, model.num_layers)
-        spec.update({f'layers_{stored}': layers[layer] for stored, layer in entries if layers[layer]})
-    else:
-        for name, (first, count) in zip(StackView(runs).bank_names(), runs, strict=True):
-            run = layers[first:first + count]
-            if run[0]:
-                spec[name] = run[0] if count == 1 else stacked_spec(run)
+    for name, (_, first, count) in zip(names, entries, strict=True):
+        run = layers[first:first + count]
+        if run[0]:
+            spec[name] = run[0] if count == 1 else stacked_spec(run)
     if model.position_embedding == 'learned':
         spec['decode_cursor'] = model.decode_cursor.cache_spec(rows)
     if model.engram is not None:

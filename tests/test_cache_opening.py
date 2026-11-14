@@ -12,6 +12,7 @@ from test_capability_matrix import ALL, CACHE, CAUSAL, SEQ, loaded
 from test_mixers import COMPRESSED, KIND_FIELDS, tiny
 
 from dew.inference.banks import HeldBanks
+from dew.nn.backbones.decoder_stack import Loop
 from dew.registry import mixers
 
 ROWS, PROMPT = 2, 4
@@ -90,16 +91,20 @@ def test_each_familys_cache_opens_as_its_decode_opens_and_writes_it(family):
     assert_opens_as_it_decodes(held.model, variables)
 
 
-def test_a_banked_stores_cache_opens_banked_as_its_decode_opens_and_writes_it():
+@pytest.mark.parametrize("loop", [None, Loop(steps=2), Loop(steps=2, shared_cache=True)],
+                         ids=["unlooped", "looped", "looped-shared"])
+def test_a_banked_stores_cache_opens_banked_as_its_decode_opens_and_writes_it(loop):
     """A scanned stack over a store banked by run opens its cache banked, each run's layers one array
-    under the run's name, as its decode over none opens it and as its prefill and step leave it."""
-    plain = tiny(num_layers=4, max_seq_len=16)
+    under the run's name, as its decode over none opens it and as its prefill and step leave it; looped
+    whole, each later pass's runs under their pass's names, but where the passes share one cache."""
+    plain = tiny(num_layers=4, max_seq_len=16, loop=loop)
     variables = plain.init(jax.random.key(0), jnp.ones((1, PROMPT), jnp.int32))
-    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True)
+    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, loop=loop)
     banked = HeldBanks(variables).place(scanned)
     cache = jax.eval_shape(lambda store: scanned.apply(store, ROWS, method="init_cache", mutable=["cache"]),
                            banked)[1]["cache"]
-    assert "layers_0_3" in cache and not any(f"layers_{index}" in cache for index in range(4)), list(cache)
+    passes = 1 if loop is None or loop.shared_cache else loop.steps
+    assert sorted(cache) == [f"layers_{4 * index}_{4 * index + 3}" for index in range(passes)], list(cache)
     assert_opens_as_it_decodes(scanned, banked)
 
 

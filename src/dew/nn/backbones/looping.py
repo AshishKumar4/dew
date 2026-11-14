@@ -190,17 +190,23 @@ def exit_offset(loop: Loop, layers: int, step: int) -> int:
     return layers + later + step * (layers - end)
 
 
-def pass_entries(loop: Loop, layers: int) -> tuple[tuple[int, int], ...]:
-    """Each layer entry a `loop`'s passes keep beyond the stack's own, as `(stored layer, layer)`: each later
-    pass's block's under a cache of its own (`shared_cache` off), and where every pass exits, each exit's
-    coda's (`pass_offset`, `exit_offset`)."""
+def pass_entries(loop: Loop, layers: int, runs: Sequence[tuple[int, int]] | None = None
+                 ) -> tuple[tuple[int, int, int], ...]:
+    """Each entry a `loop`'s passes keep beyond the stack's own, as `(stored first layer, first layer,
+    count)` over the stack's `runs` of `(first, count)` layers (one layer each where None, a store banked
+    by run's runs where given): each later pass's block's under a cache of its own (`shared_cache` off),
+    and where every pass exits, each exit's coda's (`pass_offset`, `exit_offset`); a run's name moves with
+    its first layer (`PassView`)."""
+    runs = tuple((layer, 1) for layer in range(layers)) if runs is None else tuple(runs)
     first, end = loop.layers or (0, layers)
+    block = [(start, count) for start, count in runs if first <= start < end]
+    coda = [(start, count) for start, count in runs if start >= end]
     entries = [] if loop.shared_cache else [
-        (pass_offset(loop, layers, step) + layer - first, layer)
-        for step in range(1, loop.steps) for layer in range(first, end)]
+        (pass_offset(loop, layers, step) + start - first, start, count)
+        for step in range(1, loop.steps) for start, count in block]
     if loop.exiting and end < layers:
-        entries += [(exit_offset(loop, layers, step) + layer - end, layer)
-                    for step in range(loop.steps - 1) for layer in range(end, layers)]
+        entries += [(exit_offset(loop, layers, step) + start - end, start, count)
+                    for step in range(loop.steps - 1) for start, count in coda]
     return tuple(entries)
 
 
