@@ -590,16 +590,24 @@ class KernelOp(tokamax.Op):
 
     def _certified(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """The derived `config`, or, where its kernels spill as the GPU assembles them alone
-        (`report.certified`), each refused, its misses recorded (`report.refuse_spilling`, so its legality
-        refuses it), and the next derived in turn: the first whose kernels hold. A derivation that offers a
+        (`report.certified`), each refused (`report.refuse_launch`, so its legality
+        refuses it) and its misses recorded (`report.missed_spilling`: stepped where the next was derived),
+        and the next derived in turn: the first whose kernels hold. A derivation that offers a
         refused config again (its legality reads no refusal) has it kept, its program's compile left to read
         it (`report.settled`). A pinned or a tuned pick is a measured choice, not certified here: its
         program's compile reads it."""
         seen = set()
         while config not in seen and (spilling := report.certified(self, ba, config)):
             seen.add(config)
-            report.refuse_spilling(self, ba, config, spilling)
-            config = self._get_heuristics_config(ba)
+            report.refuse_launch(self, ba, config, {binary.kernel for binary in spilling})
+            try:
+                stepped = self._get_heuristics_config(ba)
+            except report.Exhausted:
+                # No config left: its misses stepped nowhere.
+                report.missed_spilling(self, ba, config, spilling, stepped=False)
+                raise
+            report.missed_spilling(self, ba, config, spilling, stepped=stepped not in seen)
+            config = stepped
         return config
 
     def variants(self, ba: tokamax.BoundArguments) -> tuple[Hashable, ...]:
