@@ -102,13 +102,15 @@ WALKS = {"video": ("encode", 9, 128), "image": ("encode", 1, 128), "latent": ("d
 """Each walk's method, frames and declared check-1 seeds: nine frames encode to three latent frames, the
 first alone, then four at a time, each reading the frames before it; one frame, an image, to one; three
 latent frames decode to nine, the first to one, each later one to four. The seeds sized paired by
-`seeds_for` on armada (11-14): the encoder's and decoder's group norms' scale gradients resolve last."""
+`seeds_for` on armada (11-14): the encoder's and decoder's group norms' scale gradients resolve last. A
+draw of every parameter's gradient, three arms, takes about 3.5 s, so the long walks' draws run 16 a map
+task, about 60 s, which with their judge's 40 s keeps each chain inside the group's 120 s."""
 
 
 @pytest.mark.parametrize("walk", [
-    pytest.param("video", id="video", marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
+    pytest.param("video", id="video", marks=pytest.mark.check1_shards(seeds=128, per_task=16)),
     "image",
-    pytest.param("latent", id="latent", marks=pytest.mark.check1_shards(seeds=256, per_task=32))])
+    pytest.param("latent", id="latent", marks=pytest.mark.check1_shards(seeds=256, per_task=16))])
 def test_a_walk_and_its_gradients_match_the_source(source, loaded, walk):
     """The posterior's mean and standard deviation of drawn frames, or the pixels of a drawn code, and the
     gradients of drawn probes against the operand and every parameter, each parameter's written into its
