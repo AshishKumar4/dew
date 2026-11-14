@@ -24,6 +24,9 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Program,
     _streamed,
     _views_of,
+    riding,
+    score_stream,
+    score_views,
 )
 
 
@@ -123,10 +126,17 @@ def _relayed(walk: _Backward, relay: list, index) -> _Backward:
 
 
 def _score_params(family: mosaic.Family, refs, kinds: tuple[Kind, ...], row, head, first, like,
-                  k_first=None, *, keys_first: bool = False) -> tuple:
-    """A tile's score hook parameters (`_param`), one per kind of `kinds`, read from their refs."""
-    return tuple(_param(family, ref, kind, row, head, first, like, k_first, keys_first=keys_first)
-                 for ref, kind in zip(refs, kinds, strict=True))
+                  k_first=None, *, keys_first: bool = False, held: tuple | None = None, slots=None,
+                  streamed: tuple[int, ...] = (), at: tuple = (0, 0)) -> tuple:
+    """A tile's score hook parameters (`_param`), one per kind of `kinds`: those its walk holds its `held`
+    values (`held_params`), those riding its stream (`streamed`, by index: `riding`) the step's `slots`'
+    from `at`, every other read from its ref."""
+    held = (None,) * len(kinds) if held is None else held
+    laid = zip(refs, kinds, held, strict=True)
+    return tuple(_param(family, ref, kind, row, head, first, like, k_first, keys_first=keys_first, held=kept,
+                        slot=slots[score_stream(index)] if slots is not None and index in streamed else None,
+                        at=at)
+                 for index, (ref, kind, kept) in enumerate(laid))
 
 def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, coords: algebra.Coords, whole,
                  shape: tuple[int, int], *, masked: bool | None, whole_operands: bool = False
@@ -258,17 +268,21 @@ def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, d
                               pending=slots - 1)
 
 
-def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, heads: int, kv_heads: int,
-                   queries: int, consumers: int) -> tuple:
+def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, score: tuple = ((), ()), heads: int,
+                   kv_heads: int, queries: int, consumers: int) -> tuple:
     """A program over query tiles' place and key streams (the dQ launch's and dropout's first pass's): its
-    batch row and query head, its key and value views (`_views_of`) and their streams opened, its
-    consumers' first query (`_Program.query_tile`, a tile each) and the key tiles any of them reads
-    (`_Program.reach`, `_streamed`)."""
-    block_q = program.tiles.block_q
-    row, head = program.family.program_index("batch"), program.family.program_index("heads")
-    views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
-    streams = program.family.opened(streams, views)
+    batch row and query head, its key and value views (`_views_of`) and those of its score hook's parameters
+    that ride them (`score`, their refs and kinds: `score_views`), their streams opened, its consumers'
+    first query (`_Program.query_tile`, a tile each) and the key tiles any of them reads (`_Program.reach`,
+    `_streamed`)."""
+    block_q, family = program.tiles.block_q, program.family
+    row, head = family.program_index("batch"), family.program_index("heads")
     pair = consumers * block_q
+    refs, kinds = score
+    views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
+    if riding(family, kinds, "keys"):
+        views |= score_views(family, refs, kinds, "keys", row, head, program.query_tile(queries // pair))
+    streams = family.opened(streams, views)
     pair_first = program.query_tile(queries // pair) * pair
     streamed = _streamed([program.reach(pair_first + index * block_q, spans, row)[:2]
                           for index in range(consumers)])

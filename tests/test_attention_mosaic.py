@@ -274,14 +274,16 @@ def _dropping(shape) -> template.Hooks:
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
                  form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
                  natural: bool = False, seeds: int | None = None, width: int = 64,
-                 param_rows: int | None = None):
+                 param_rows: int | None = None, pins: tuple | None = None,
+                 target: generation.GpuTarget | None = None):
     """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `_form_tiles`
     (64 wide) under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
     (rows, queries, query and key heads, four and two under a hook) over the spans' keys in `dtype`, heads
     `width` wide, the forward's logits `natural` or folded. The backward differentiates the queries, keys,
     values, the hook's parameters and the initial state, over `seeds` draws where given (the site's own,
-    else the template site's)."""
+    else the template site's); its launches at the forward's and backward's configs `pins` where given
+    (`_pinned`), interpreted for `target` where given (`_device`)."""
     rows, queries, heads, _ = shape
     # A hook's parameters drawn for `param_rows` batch rows where given (one every row shares).
     score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, width,
@@ -303,8 +305,8 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
         hooks = hooked(params, initial)
         # The forward at the call forms' tiles 64 wide, else at its derivation's (two consumers' hooked sums
         # 128 wide pass their registers, and a hooked training forward's natural walk theirs 64 wide).
-        with _device(interpret), _pinned(_form_tiles() if width == 64 and not (backward and score) else None,
-                                         config):
+        pinned = pins or (_form_tiles() if width == 64 and not (backward and score) else None, config)
+        with _device(interpret, target), _pinned(*pinned):
             if not backward:
                 return attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
                                                 interpret=interpret)
@@ -351,6 +353,34 @@ def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
     spans = template.spans(queries, keys, rows, **called)
     _check_spans("causal-documents-window", spans, (rows, queries, 4, 2), interpret=interpret, score=score,
                  gate=gate, dtype=dtype, natural=natural)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
+def test_a_hooks_streamed_parameters_hold_check_1_through_the_rings_rotations_interpreted(hooks):
+    """The forward and the backward under a score hook whose parameters ride the producer's streams
+    (`attention_mosaic_program.riding`: a key's and a tile's the keys' in the forward and dQ, a tile's the
+    queries' in dK/dV, keys first, a key's held), over 256 causal tokens (four 64-token tiles a walk at most,
+    its two-stage rings each slot read twice), at wgmma's tiles, the forward on two consumers and the
+    backward on one (on two a tile bias's held 244 registers, past a thread's 240, at 64 x 64), dK/dV on the
+    producer's rings too (`BackwardTiles.dkv_family`): on par with the reference (check 1)."""
+    spans = template.spans(256, 256, 1, causal=True)
+    pins = (attention_mosaic.Tiles(64, 64, 2, 2, family=WGMMA),
+            attention_mosaic.BackwardTiles(64, 64, 2, 1, family=WGMMA, dkv_family=WGMMA))
+    _check_spans("causal", spans, (1, 256, 2, 1), interpret=True, backward=True, score=SCORE_HOOKS[hooks],
+                 pins=pins)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
+def test_a_hooks_streamed_parameters_hold_check_1_on_tcgen05s_chunks_interpreted(hooks):
+    """The forward under a score hook whose parameters ride the keys' stream on a B200's tcgen05 chunks, over
+    256 causal tokens on two consumers (its two-stage rings each slot read twice): on par with the reference
+    (check 1)."""
+    spans = template.spans(256, 256, 1, causal=True)
+    _check_spans("causal", spans, (1, 256, 2, 1), interpret=True, score=SCORE_HOOKS[hooks],
+                 pins=(attention_mosaic.Tiles(64, 64, 2, 2, family="tcgen05.chunks"), None),
+                 target=generation.gpu_target("sm100"))
 
 
 INTERPRETED_HOOK_SITES = {"none": ((1, 2, 1), 8), "alibi": ((1, 2, 1), 128), "key-bias": ((1, 2, 1), 16),
@@ -1504,6 +1534,37 @@ def test_the_forward_on_tcgen05s_rows_over_narrow_value_blocks_holds_check_1_int
     _check_forward("causal", jnp.bfloat16, (1, 192, 2, 1), natural=False, interpret=True, width=64,
                    value_width=64, tiles=dataclasses.replace(ROWS_TILES, columns=16),
                    target=generation.gpu_target("sm100"))
+
+
+@INTERPRETS
+def test_the_forward_on_tcgen05s_rows_holds_check_1_beside_a_parameter_no_score_hook_reads_interpreted():
+    """The forward on a B200's tcgen05 rows (`ROWS_TILES`), causal over 192 tokens, given a key bias and no
+    score hook to read it: the launch takes no stream of it, which no role of the rows would release (its
+    issuer streams the keys and values alone), and it computes the plain call, on par with the reference
+    (check 1)."""
+    shape = (1, 192, 2, 1)
+    spans = template.spans(shape[1], shape[1], shape[0], **CALLS["causal"])
+    draw_operands = _drawn(shape, jnp.bfloat16, width=64)
+    target = generation.gpu_target("sm100")
+
+    def draw(seed):
+        drawn = jax.random.fold_in(jax.random.PRNGKey(5), seed)
+        return *draw_operands(seed), jax.random.normal(drawn, (1, 2, shape[1]), jnp.float32)
+
+    def unread(bias):
+        return template.Hooks(score_params=(template.Param(bias, template.Kind.KEY),))
+
+    def ours(query, key, value, dout, bias):
+        del dout
+        with _device(interpret=True, target=target), _pinned(ROWS_TILES):
+            return attention_mosaic.forward(query, key, value, spans, unread(bias), interpret=True)
+
+    def reference(query, key, value, dout, bias):
+        del dout
+        return template.reference(query, key, value, spans, unread(bias))
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "mosaic forward rows unread key bias",
+                    seeds=SEEDS)
 
 
 @INTERPRETS
