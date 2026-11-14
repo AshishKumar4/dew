@@ -197,7 +197,6 @@ class Objective()  [dew.objectives.base]
   .unfuse_head(self) -> str | None
   .validation_loss(self, variables: Variables, batch: Batch, step: Step) -> Loss | tuple[Loss, Aux[Effects]]
   .validation_loss_refusal: property -> str | None
-  .whole_head_table(self, variables: Variables) -> tuple[int, int] | None
   .with_gradients(stats: Loss, gradients, params: Variables) -> Loss  [staticmethod]
 class Observe(every: int, call: Callable[[TrainState], Any], values: list[tuple[int, Any]] = <factory>) -> None  [dew.training.observe]
   .at(self, step: int, state: TrainState) -> None
@@ -299,7 +298,6 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .unfuse_head(self) -> str | None
   .validation_loss(self, variables: Variables, batch: Batch, step: Step) -> Loss | tuple[Loss, Aux[Effects]]
   .validation_loss_refusal: property -> str | None
-  .whole_head_table(self, variables: Variables) -> tuple[int, int] | None
   .with_gradients(stats: Loss, gradients, params: Variables) -> Loss  [staticmethod]
 class TensorBoardTracker(directory: str | Path)  [dew.training.tracker]
   .artifact(self, value: Reported, step: int) -> None

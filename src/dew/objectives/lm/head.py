@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from typing import ClassVar, Literal
 
-import jax
 from flax import linen as nn
 
 from dew.nn.protocols import AffineHead, OutputTable, head_table
@@ -94,18 +93,6 @@ class HeadedObjective(Objective[Loss, Effects]):
     def program_key(self) -> tuple[ProgramModule, ...]:
         return (self.head_program(self.model),)
 
-    def whole_head_table(self, variables) -> tuple[int, int] | None:
-        """The table its model's head scores where it keeps its whole logits (`Objective.whole_head_table`):
-        none where the head is tiled, or no matrix alone is (`head_program`'s)."""
-        if (self.head_tile is not None or not reads_states(self.model)
-                or not isinstance(self.model, AffineHead)):
-            return None
-        table = jax.eval_shape(lambda tree: head_table(self.model, tree), variables)
-        if table is None:
-            return None
-        rows, features = table.matrix.shape if table.vocab_major else table.matrix.shape[::-1]
-        return int(rows), int(features)
-
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that keeps its whole logits to `tile`, and report what it moved to.
 
@@ -127,8 +114,11 @@ class HeadedObjective(Objective[Loss, Effects]):
         return f"the head tiled {self.head_tile}, its gradient taken in the backward" if moved else None
 
     def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
+        # A head that keeps its whole logits fuses nothing (`head_program`, `fused_head`): its fusion is the
+        # tiling's default (`tile_head`), so a rung put back from a step's program (`head_fused_of`, which
+        # reads False there) keys the trace as the objective first stood (row 6022's refit, traced again).
         self.head_tile = tile
-        self.head_fused = fused
+        self.head_fused = fused or tile is None
 
 
 def _head_tile(tile, keeps_whole_logits: bool) -> tuple[int, int] | None:
