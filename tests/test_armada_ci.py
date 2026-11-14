@@ -1059,11 +1059,11 @@ def test_a_stored_cut_a_group_of_which_has_outgrown_its_bound_is_cut_afresh(
 
 def test_a_group_past_its_bound_is_cut_again_with_its_nearest_groups_alone_and_the_rest_keep_their_tests(
         ci):
-    """The fold cuts a group main's CI ran past `session.KEPT` of the target again with its nearest groups alone,
-    as few as bring each within it, a test heavier than the bound standing alone: the file's other groups keep
-    their tests and so their records and compiled programs (2026-11-14: one group past its bound re-cut
-    test_recurrence_stability.py whole, 9 of 11 bounds moved, every group run cold). Where no neighbourhood
-    short of the whole file fits, the file is cut anew whole."""
+    """The fold cuts a group main's CI ran past `session.KEPT` of the target again with its nearest groups
+    alone, as few as bring each within it, a test heavier than the bound standing alone: the file's other
+    groups keep their tests and so their records and compiled programs (2026-11-14: one group past its bound
+    re-cut test_recurrence_stability.py whole, 9 of 11 bounds moved, every group run cold). Where no
+    neighbourhood short of the whole file fits, the file is cut anew whole."""
     nodes = [f"tests/test_steady.py::test_{index:02d}" for index in range(12)]
     own = dict.fromkeys(nodes, 50.0) | {nodes[3]: 200.0}
     bounds = [nodes[2], nodes[4], nodes[6], nodes[8], nodes[10]]
