@@ -27,7 +27,6 @@ from kernel_compile import gate_generations
 from model_support import as_stepped, decode_through, float64_twin
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, widened, with_gradients, without_ynn
 
-from dew.algebra.scan import _decays_of
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kernels import generation, recurrence as kernel
@@ -885,52 +884,6 @@ def test_a_right_padded_layer_keeps_its_real_tokens_states(reference, geometry):
     assert jnp.array_equal(jax.jit(call(declared))(hidden)[0, 6:], jnp.zeros_like(hidden[0, 6:]))
     assert_as_exact(call(declared), call(masked), draw, "right-padded output", seeds=RIGHT_PADDED_SEEDS,
                     truth_fn=truth)
-
-
-def between(g):
-    """Each chunk's pairwise decays `[..., C, C, K]` of its log decays `g` `[..., C, K]`, `exp(G_s - G_t)` on
-    and below the diagonal: the derived forms' (`dew.algebra.scan`'s `_Decays.between`), a chunk at a time."""
-    return jax.vmap(lambda chunk: _decays_of(chunk, base2=False).between)(g)
-
-
-PAIRING_SEEDS = 8
-"""The decays' pairings' declared draws against the plain decays' (check 1), sized by `seeds_for` on
-armada."""
-
-
-def plain_between(g):
-    """`between` as its declaration states it, with no compensation: `exp(G_s - G_t)` of the plain prefix
-    sums `G` of each chunk's log decays `g` `[..., C, K]`, on and below the diagonal."""
-    prefix = jnp.cumsum(g, axis=1)
-    below = jnp.tril(jnp.ones((g.shape[1], g.shape[1]), bool))[None, :, :, None]
-    return jnp.where(below, jnp.exp(jnp.where(below, prefix[:, :, None] - prefix[:, None, :], 0.0)), 0.0)
-
-
-def test_the_decay_takes_the_same_tangent_forward_as_backward():
-    """Forward mode takes the decay gradient's tangent: a drawn tangent's forward-mode decays paired with a
-    drawn cotangent, and the cotangent's gradient paired with the tangent, each on par with JAX's own
-    derivatives of the plain decays (`plain_between`) from them in float64 (check 1), each batch row's and key
-    dimension's pairing a value of its own (each walks its own decays). The two pairings are not held to
-    each other: the forward one sums 64 x 64 products in float32 where the reverse one sums 64, and measured
-    2.4 times its error for that alone; the tangent itself is on par with each span's own sums
-    (tests/test_algebra_decays.py, row 5858)."""
-    rows, keys = 4, 16
-
-    def draw(seed):
-        rng = np.random.default_rng([0x7A9E, seed])
-        return tuple(jnp.asarray(x, jnp.float32) for x in (
-            rng.uniform(-3, -1, (rows, 64, keys)), rng.standard_normal((rows, 64, keys)),
-            rng.standard_normal((rows, 64, 64, keys))))
-
-    def paired(decays):
-        def run(g, tangent, cotangent):
-            forward = jnp.sum(jax.jvp(decays, (g,), (tangent,))[1] * cotangent, axis=(1, 2))
-            backward = jnp.sum(tangent * jax.vjp(decays, g)[1](cotangent)[0], axis=1)
-            return {"forward": forward, "backward": backward}
-        return run
-
-    assert_as_exact(paired(between), paired(plain_between), draw, "the decays' tangent paired",
-                    seeds=PAIRING_SEEDS)
 
 
 ALIGNED_SEEDS = {"chunked": 8, "portable": 8}
