@@ -1746,19 +1746,28 @@ def test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention
         return kernels, listed
 
     # Every route each step's own program takes (the cache's allocation, traced for its shapes alone,
-    # reports none: `generation.unforced`), the kernels a rule never sees among them or not.
-    from dew.nn import kv_cache
+    # reports none: `generation.unforced`), by its selector and kernel, the kernels a rule never sees among
+    # them or not: a fused attention kernel of whole products, a paged kernel the rule's ownership refuses,
+    # and the template's work list, which forms its products whole wherever it runs.
+    from dew.nn import attention_kernels, kv_cache
 
-    past_the_rule = _whole_product_kernels() | {
-        kernel.name for kernel in kv_cache.PAGED.kernels if kv_cache._OWNED in kernel.supports}
+    attending = (attention_kernels.ATTENTION, attention_kernels.DECODE)
+    past_the_rule = {(op.choice, kernel.name) for op in attending
+                     for kernel in op.kernels if attention_kernels._WHOLE_PRODUCTS in kernel.supports}
+    past_the_rule |= {(Choice.PAGED_DECODE, kernel.name) for kernel in kv_cache.PAGED.kernels
+                      if kv_cache._OWNED in kernel.supports}
 
     def taken(kernels, listed):
-        return set().union(*kernels.values(), listed)
+        return ({(choice, name) for choice, names in kernels.items() for name in names}
+                | {("work list", name) for name in listed})
+
+    def beyond(routes):
+        return {route for route in routes if route in past_the_rule or route[0] == "work list"}
 
     plain = taken(*routes_of(model))
-    assert plain & past_the_rule, plain
+    assert beyond(plain), plain
     owned = taken(*routes_of(Quantization(dtype="int8").apply(model)))
-    assert owned and not owned & past_the_rule, owned
+    assert owned and not beyond(owned), owned
 
 
 def test_an_int8_attention_block_on_xla_is_on_par_with_the_reference_path(monkeypatch):
