@@ -133,10 +133,11 @@ def test_a_server_over_split_rows_takes_its_projections_on_each_devices_rows():
     served = TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
                             RunProcessor(Digits()), sampling=task().sampling)
     with boxed(decoder_axes(model)):
-        placed = served.bind(place(served.variables, MeshSpec(), Layout(min_shard=1, tolerance=1.0)))
+        placed = served.bind(place(served.variables, MeshSpec().build(jax.devices()[:2]),
+                                   Layout(min_shard=1, tolerance=1.0)))
     with (generation.assumed("sm90", interpreted=True), generation.chosen(grouped_matmul="mosaic"),
           generation.routes() as routes):
-        Server.from_task(placed, slots=2, capacity=128)
+        Server.from_task(placed, slots=2, capacity=128, admission=2)
     assert any(route.choice is generation.Choice.GROUPED_MATMUL and route.kernel == "mosaic"
                for route in routes), routes
 
