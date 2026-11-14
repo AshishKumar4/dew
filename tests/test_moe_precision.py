@@ -1,6 +1,9 @@
 """The precision contract routed experts train under, against independent
 float64 arithmetic on the rounded operands.
 
+Every check-1 site here declares the fewest seeds (`FEWEST_SEEDS`), each sized by
+`seeds_for` on armada's CPUs (2026-11-14, at 9b89b74e338).
+
 Every check here would pass a gradient computed one way and fail it another:
 a partial sum rounded per shard, a kernel cotangent rounded to bf16, a
 tangent that dropped a representable 2^-30 residue. The Adam checks compare
@@ -19,7 +22,15 @@ import pytest
 from flax import linen as nn
 from generation_support import interpreted_projection
 from jax.sharding import NamedSharding, PartitionSpec as P
-from reference_error import as_given, assert_as_exact, with_gradients, without_ynn
+from reference_error import (
+    FEWEST_SEEDS,
+    as_given,
+    assert_as_exact,
+    assert_computes_the_oracle,
+    chain_roundings,
+    with_gradients,
+    without_ynn,
+)
 from scipy.special import erfc
 from tuned import each_config, taken
 
@@ -39,7 +50,6 @@ pytestmark = pytest.mark.kernel
 MESH_LAYOUTS = tuple(pytest.param(expert, fsdp, marks=pytest.mark.mesh)
                      for expert, fsdp in ((2, 4), (4, 2), (8, 1)))
 LAYOUTS = (pytest.param(1, 1, id='1-1'), *MESH_LAYOUTS)
-TOLERANCE = 3e-5
 # A mesh whose data axis splits the tokens as well as the expert axis.
 DATA_LAYOUT = pytest.param(2, 2, marks=pytest.mark.mesh, id='2-2-data2')
 
@@ -50,6 +60,28 @@ def rounded(value, dtype=ml_dtypes.bfloat16) -> np.ndarray:
 
 THREE_EACH = np.full(8, 3)
 """Three rows for each of eight experts, the projections' equal routing."""
+
+def projection_draw(input_dtype, master, rows: int = 24, depth: int = 16, width: int = 16, stream: int = 271):
+    """A projection's drawn operands: tokens `[rows, depth]` in `input_dtype`, eight experts' matrices
+    `[8, depth, width]` in `master` and an fp32 cotangent `[rows, width]`."""
+    def draw(seed):
+        rng = np.random.default_rng([stream, seed])
+        return (jnp.asarray(rng.normal(size=(rows, depth)), input_dtype),
+                jnp.asarray(rng.normal(size=(8, depth, width)), master),
+                jnp.asarray(rng.normal(size=(rows, width)), jnp.float32))
+    return draw
+
+
+def projected_products(sizes, cotangent_dtype=ml_dtypes.bfloat16):
+    """A bf16 projection's forward, kernel gradient and input gradient in float64 (check 1's truth): the
+    float64 sums of its operands as the projection rounds them, the cotangent rounded to
+    `cotangent_dtype` (`grouped_oracle`)."""
+    @as_given
+    def truth(x, kernel, dy):
+        qx, qk, qy = rounded(x), rounded(kernel), rounded(dy, cotangent_dtype)
+        forward, input_gradient, kernel_gradient = oracle.products(qx, qk, qy, sizes)
+        return forward, kernel_gradient, input_gradient
+    return truth
 
 
 def shardings(mesh, rows: bool):
@@ -109,14 +141,11 @@ def cases():
 @pytest.mark.parametrize('expert,fsdp', LAYOUTS)
 @pytest.mark.parametrize('rows', [True, False], ids=['rows', 'columns'])
 def test_a_projection_rounds_whole_contractions_once(case, master, input_dtype, expert, fsdp, rows):
-    """Forward, kernel cotangent and input cotangent against float64 sums of
-    the bf16 operands, with the kernel split on either of its dimensions and
-    the gradient returned placed or replicated."""
-    x, kernel, dy = next(values for name, *values in cases() if name == case)
+    """Forward, kernel cotangent and input cotangent, with the kernel split on either of its dimensions
+    and the gradient returned placed or replicated: on values whose every product and sum is exact
+    (`cases`'s round-once cases), the float64 sums of the bf16 operands rounded once, to the bit; on
+    drawn values, on par with the projection on one device by check 1, truth those float64 sums."""
     sizes = np.full(8, 3, np.int32)
-    forward = rounded(oracle.forward(rounded(x), rounded(kernel), THREE_EACH))
-    kernel_oracle = oracle.kernel_gradient(rounded(x), rounded(dy), THREE_EACH)
-    input_oracle = rounded(oracle.input_gradient(rounded(dy), rounded(kernel), THREE_EACH), input_dtype)
 
     def loss(kernel, x, dy, sizes):
         projected = jnp.asarray(expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None))
@@ -125,17 +154,42 @@ def test_a_projection_rounds_whole_contractions_once(case, master, input_dtype, 
     mesh = MeshSpec(expert=expert, fsdp=fsdp).build()
     kernels, inputs, outputs = shardings(mesh, rows)
     replicated = NamedSharding(mesh, P())
-    arrays = (jnp.asarray(kernel, master), jnp.asarray(x, input_dtype), jnp.asarray(dy), jnp.asarray(sizes))
-    arguments = tuple(jax.device_put(value, spec) for value, spec in zip(
-        arrays, (kernels, inputs, outputs, replicated), strict=True))
+
+    def meshed(spec):
+        compiled = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True),
+                           out_shardings=((replicated, outputs), (spec, inputs)))
+
+        @as_given
+        def run(x, kernel, dy):
+            arguments = tuple(jax.device_put(value, placed) for value, placed in zip(
+                (kernel, x, dy, jnp.asarray(sizes)), (kernels, inputs, outputs, replicated), strict=True))
+            with jax.set_mesh(mesh):
+                (_, y), (dk, dx) = compiled(*arguments)
+            return y, dk, dx
+        return run
+
+    @as_given
+    def alone(x, kernel, dy):
+        (_, y), (dk, dx) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(kernel, x, dy,
+                                                                                     jnp.asarray(sizes))
+        return y, dk, dx
+
     for spec in (kernels, replicated):
-        with jax.set_mesh(mesh):
-            (_, y), (dk, dx) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True),
-                                       out_shardings=((replicated, outputs), (spec, inputs)))(*arguments)
-        assert dk.dtype == master and dx.dtype == input_dtype
-        np.testing.assert_allclose(np.asarray(y, np.float64), forward, atol=TOLERANCE, rtol=TOLERANCE)
-        np.testing.assert_allclose(dk, kernel_oracle, atol=TOLERANCE, rtol=TOLERANCE)
-        np.testing.assert_allclose(np.asarray(dx, np.float64), input_oracle, atol=TOLERANCE, rtol=TOLERANCE)
+        if case != 'random':
+            x, kernel, dy = next(values for name, *values in cases() if name == case)
+            operands = (jnp.asarray(x, input_dtype), jnp.asarray(kernel, master), jnp.asarray(dy))
+            y, dk, dx = meshed(spec)(*operands)
+            assert dk.dtype == master and dx.dtype == input_dtype
+            forward, kernel_gradient, input_gradient = projected_products(sizes)(*operands)
+            np.testing.assert_array_equal(np.asarray(y, np.float64), rounded(forward))
+            np.testing.assert_array_equal(np.asarray(dk, np.float64), kernel_gradient)
+            np.testing.assert_array_equal(np.asarray(dx, np.float64), rounded(input_gradient, input_dtype))
+            continue
+        label = (f"a projection over expert {expert} fsdp {fsdp}, {'rows' if rows else 'columns'} split, "
+                 f"{jnp.dtype(master).name} master, {jnp.dtype(input_dtype).name} tokens, gradient "
+                 f"{'placed' if spec is kernels else 'replicated'}")
+        assert_as_exact(meshed(spec), alone, projection_draw(input_dtype, master), label, seeds=FEWEST_SEEDS,
+                        truth_fn=projected_products(sizes))
 
 
 @pytest.mark.parametrize('sizes', [
@@ -144,34 +198,38 @@ def test_a_projection_rounds_whole_contractions_once(case, master, input_dtype, 
     ids=['even', 'ragged', 'one-expert', 'fewer-rows', 'all-empty'])
 @pytest.mark.parametrize('input_dtype', [jnp.bfloat16, jnp.float32])
 def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
-    """Forward, input and kernel cotangents of the projection's kernels against
-    float64 sums of the bf16 operands (interpreted on a CPU, `interpreted_projection`): rows
-    past the routed ones, and every row when no expert is routed, come back
-    zero in the output and the input gradient."""
-    rng = np.random.default_rng(88)
-    x = rng.normal(size=(24, 16)).astype(np.float32)
-    kernel = rng.normal(size=(8, 16, 16)).astype(np.float32)
-    dy = rng.normal(size=(24, 16))
-    sizes = sizes.astype(np.int32)
-    qx, qk = rounded(x), rounded(kernel)
-    qy = rounded(dy)
-    forward, input_oracle, kernel_oracle = oracle.products(qx, qk, qy, sizes)
+    """Forward, kernel and input cotangents of the projection's kernels (interpreted on a CPU,
+    `interpreted_projection`) on par with XLA's ragged dot by check 1, truth the float64 sums of the bf16
+    operands: rows past the routed ones, and every row when no expert is routed, come back zero in the
+    output and the input gradient, to the bit."""
+    sizes = jnp.asarray(sizes, jnp.int32)
+    routed = int(sizes.sum())
 
-    def loss(x, kernel):
-        projected = jnp.asarray(interpreted_projection(x, kernel, jnp.asarray(sizes), jnp.bfloat16))
-        return jnp.sum(projected.astype(jnp.float32) * jnp.asarray(qy, jnp.float32)), projected
+    def arm(implementation):
+        def loss(x, kernel, dy):
+            projected = jnp.asarray(implementation(x, kernel, sizes, jnp.bfloat16))
+            cotangent = dy.astype(jnp.bfloat16).astype(jnp.float32)
+            return jnp.sum(projected.astype(jnp.float32) * cotangent), projected
 
-    # A CPU interprets the kernels as the A100 it states; a GPU runs its own.
-    with generation.assumed("sm80") if jax.default_backend() == "cpu" else contextlib.nullcontext():
-        (_, y), (dx, dk) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(
-            jnp.asarray(x, input_dtype), jnp.asarray(kernel))
+        @as_given
+        def run(x, kernel, dy):
+            # A CPU interprets the kernels as the A100 it states; a GPU runs its own.
+            interpreted = jax.default_backend() == "cpu"
+            with generation.assumed("sm80") if interpreted else contextlib.nullcontext():
+                (_, y), (dx, dk) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(x, kernel, dy)
+            return y, dk, dx
+        return run
+
+    kernels = arm(interpreted_projection)
+    draw = projection_draw(input_dtype, jnp.float32, stream=88)
+    y, dk, dx = kernels(*draw(0))
     assert dx.dtype == input_dtype and dk.dtype == jnp.float32
-    np.testing.assert_allclose(np.asarray(y, np.float64), rounded(forward), atol=TOLERANCE,
-                               rtol=TOLERANCE)
-    np.testing.assert_allclose(np.asarray(dx, np.float64), rounded(input_oracle, input_dtype),
-                               atol=TOLERANCE, rtol=TOLERANCE)
-    np.testing.assert_allclose(np.asarray(dk, np.float64), kernel_oracle, atol=TOLERANCE,
-                               rtol=TOLERANCE)
+    assert not np.any(np.asarray(y)[routed:]) and not np.any(np.asarray(dx)[routed:])
+    if routed:
+        xla = arm(lambda x, kernel, sizes, dtype: expert_projection(x, kernel, sizes, dtype, 'xla', None))
+        label = (f"the projection's kernels on one device, routed {sizes.tolist()}, "
+                 f"{jnp.dtype(input_dtype).name}")
+        assert_as_exact(kernels, xla, draw, label, seeds=FEWEST_SEEDS, truth_fn=projected_products(sizes))
 
 
 
@@ -264,21 +322,21 @@ TILE_SEEDS = 8
 def a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels(implementation):
     """The kernels are chosen where the call lowers, not by the process's
     default backend. On a GPU host, a projection placed on the CPU runs
-    XLA's program ('auto' and 'pallas' alike), and its forward is the float64
-    sum of the bf16 operands either way."""
+    XLA's program ('auto' and 'pallas' alike): its forward is XLA's ragged
+    dot's on the CPU, to the bit."""
     rng = np.random.default_rng(88)
     x = rng.normal(size=(24, 16)).astype(np.float32)
     kernel = rng.normal(size=(8, 16, 16)).astype(np.float32)
     cpu = jax.devices('cpu')[0]
-    project = jax.jit(lambda x, kernel, sizes: expert_projection(
-        x, kernel, sizes, jnp.bfloat16, implementation, None))
+    def project(implementation):
+        return jax.jit(lambda x, kernel, sizes: expert_projection(
+            x, kernel, sizes, jnp.bfloat16, implementation, None))
 
-    y = project(*jax.device_put((x, kernel, np.full(8, 3, np.int32)), cpu))
+    operands = jax.device_put((x, kernel, np.full(8, 3, np.int32)), cpu)
+    y = project(implementation)(*operands)
 
     assert y.devices() == {cpu}
-    np.testing.assert_allclose(np.asarray(y, np.float64),
-                               rounded(oracle.forward(rounded(x), rounded(kernel), THREE_EACH)),
-                               atol=TOLERANCE, rtol=TOLERANCE)
+    np.testing.assert_array_equal(np.asarray(y), np.asarray(project('xla')(*operands)))
 
 
 @pytest.mark.parametrize('sizes', [np.full(8, 3), np.array([0, 5, 0, 0, 12, 1, 0, 3])],
@@ -286,29 +344,33 @@ def a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels(implem
 def test_a_bf16_projection_at_the_highest_precision_holds_the_contract(sizes):
     """bf16 operands multiply exactly into fp32 sums at any precision, so
     'highest' asks for the product the default gives: forward and both
-    cotangents are float64 sums of the rounded operands, on every backend.
+    cotangents on par with the default's by check 1, truth the float64 sums of
+    the rounded operands, on every backend.
     XLA's TPU ragged-dot kernel refuses bf16 operands at fp32 contract
     precision (Mosaic "Bad lhs type" on a v6e, jax 0.11.2), which any run
     that sets jax_default_matmul_precision to 'highest' reaches."""
-    rng = np.random.default_rng(89)
-    x = rounded(rng.normal(size=(24, 16)))
-    kernel = rounded(rng.normal(size=(8, 16, 16)))
-    dy = rounded(rng.normal(size=(24, 16)))
-    sizes = sizes.astype(np.int32)
-    # Rows past the routed ones belong to no expert and come back zero.
-    forward, input_oracle, kernel_oracle = oracle.products(x, kernel, dy, sizes)
+    sizes = jnp.asarray(sizes, jnp.int32)
 
-    def loss(x, kernel):
-        projected = expert_projection(x, kernel, jnp.asarray(sizes), jnp.bfloat16, 'xla', 'highest')
-        return jnp.sum(projected.astype(jnp.float32) * jnp.asarray(dy, jnp.float32)), projected
+    def at(precision):
+        def loss(x, kernel, dy):
+            projected = expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', precision)
+            cotangent = dy.astype(jnp.bfloat16).astype(jnp.float32)
+            return jnp.sum(projected.astype(jnp.float32) * cotangent), projected
+
+        @as_given
+        def run(x, kernel, dy):
+            (_, y), (dx, dk) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(x, kernel, dy)
+            return y, dk, dx
+        return run
 
     # A float32 master kernel, as training keeps it: the projection rounds it
     # to bf16 for the product, and its gradient comes back in float32.
-    (_, y), (dx, dk) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(
-        jnp.asarray(x, jnp.bfloat16), jnp.asarray(kernel, jnp.float32))
+    draw = projection_draw(jnp.bfloat16, jnp.float32, stream=89)
+    _, dk, dx = at('highest')(*draw(0))
     assert dx.dtype == jnp.bfloat16 and dk.dtype == jnp.float32
-    for got, want in ((y, rounded(forward)), (dx, rounded(input_oracle)), (dk, kernel_oracle)):
-        np.testing.assert_allclose(np.asarray(got, np.float64), want, atol=TOLERANCE, rtol=TOLERANCE)
+    label = f"a bf16 projection at the highest precision, routed {sizes.tolist()}"
+    assert_as_exact(at('highest'), at(None), draw, label, seeds=FEWEST_SEEDS,
+                    truth_fn=projected_products(sizes))
 
 
 @pytest.mark.usefixtures('x64')
@@ -319,23 +381,27 @@ def test_a_bf16_projection_at_the_highest_precision_holds_the_contract(sizes):
 @pytest.mark.parametrize('rows', [True, False], ids=['rows', 'columns'])
 def test_a_projection_differentiates_the_same_law_in_every_direction(
         compute, input_dtype, master, expert, fsdp, rows):
-    """JVP, VJP, forward-over-reverse and reverse-over-forward against the
-    tangent law `dx @ Q(kernel) + Q(x) @ dkernel` in float64."""
-    rng = np.random.default_rng(943)
-    x = rng.normal(size=(24, 16)).astype(input_dtype)
-    kernel = rng.normal(size=(8, 16, 16)).astype(master)
-    dx = rng.normal(scale=.3, size=x.shape).astype(input_dtype)
-    dkernel = rng.normal(scale=.3, size=kernel.shape).astype(master)
-    cotangent = rng.normal(size=(24, 16))
+    """JVP, VJP, forward-over-reverse and reverse-over-forward on the mesh on par with one device's by
+    check 1, truth the tangent law `dx @ Q(kernel) + Q(x) @ dkernel` in float64."""
     sizes = jnp.full(8, 3, jnp.int32)
-    qx, qk, qc = (rounded(value, compute) for value in (x, kernel, cotangent))
-    expected = (
-        rounded(oracle.forward(qx, qk, THREE_EACH), compute),
-        rounded(oracle.forward(dx, qk, THREE_EACH) + oracle.forward(qx, dkernel, THREE_EACH), compute),
-        (rounded(oracle.input_gradient(qc, qk, THREE_EACH), input_dtype),
-         rounded(oracle.kernel_gradient(qx, qc, THREE_EACH), master)),
-        (rounded(oracle.input_gradient(qc, dkernel, THREE_EACH), input_dtype),
-         rounded(oracle.kernel_gradient(dx, qc, THREE_EACH), master)))
+
+    def draw(seed):
+        rng = np.random.default_rng([943, seed])
+        x = jnp.asarray(rng.normal(size=(24, 16)), input_dtype)
+        kernel = jnp.asarray(rng.normal(size=(8, 16, 16)), master)
+        dx = jnp.asarray(rng.normal(scale=.3, size=x.shape), input_dtype)
+        dkernel = jnp.asarray(rng.normal(scale=.3, size=kernel.shape), master)
+        return x, kernel, dx, dkernel, jnp.asarray(rng.normal(size=(24, 16)), jnp.float64)
+
+    @as_given
+    def law(x, kernel, dx, dkernel, cotangent):
+        qx, qk, qc = (rounded(value, compute) for value in (x, kernel, cotangent))
+        reverse_of_forward = (oracle.input_gradient(qc, dkernel, THREE_EACH),
+                              oracle.kernel_gradient(dx, qc, THREE_EACH))
+        return (oracle.forward(qx, qk, THREE_EACH),
+                oracle.forward(dx, qk, THREE_EACH) + oracle.forward(qx, dkernel, THREE_EACH),
+                (oracle.input_gradient(qc, qk, THREE_EACH), oracle.kernel_gradient(qx, qc, THREE_EACH)),
+                reverse_of_forward, reverse_of_forward)
 
     def evaluate(x, kernel, dx, dkernel, cotangent, sizes):
         def fn(x, kernel):
@@ -355,13 +421,21 @@ def test_a_projection_differentiates_the_same_law_in_every_direction(
     mesh = MeshSpec(expert=expert, fsdp=fsdp).build()
     kernels, inputs, outputs = shardings(mesh, rows)
     specs = (inputs, kernels, inputs, kernels, outputs, NamedSharding(mesh, P()))
-    arguments = tuple(jax.device_put(jnp.asarray(value), spec) for value, spec in zip(
-        (x, kernel, dx, dkernel, cotangent, sizes), specs, strict=True))
-    with jax.set_mesh(mesh):
-        actual = jax.jit(evaluate, out_shardings=(
-            outputs, outputs, (inputs, kernels), (inputs, kernels), (inputs, kernels)))(*arguments)
-    for a, b in zip(jax.tree.leaves(actual), jax.tree.leaves(expected + expected[-1:]), strict=True):
-        np.testing.assert_allclose(np.asarray(a, np.float64), b, atol=TOLERANCE, rtol=TOLERANCE)
+    compiled = jax.jit(evaluate, out_shardings=(
+        outputs, outputs, (inputs, kernels), (inputs, kernels), (inputs, kernels)))
+
+    @as_given
+    def meshed(*operands):
+        arguments = tuple(jax.device_put(value, spec) for value, spec in zip(
+            (*operands, sizes), specs, strict=True))
+        with jax.set_mesh(mesh):
+            return compiled(*arguments)
+
+    label = (f"a projection's derivatives over expert {expert} fsdp {fsdp}, {'rows' if rows else 'columns'} "
+             f"split, {jnp.dtype(compute).name} compute, {jnp.dtype(input_dtype).name} tokens, "
+             f"{jnp.dtype(master).name} master")
+    assert_as_exact(meshed, jax.jit(lambda *operands: evaluate(*operands, sizes)), draw, label,
+                    seeds=FEWEST_SEEDS, truth_fn=law)
 
 
 @pytest.mark.usefixtures('x64')
@@ -436,7 +510,9 @@ def test_gpt_oss_infers_one_compute_dtype_from_all_expert_operands():
     # so the gated intermediate is sigmoid(1.702), not the fp32 zero.
     expected = np.full((1, 3), 1 / (1 + np.exp(-1.702)), np.float64)
     assert actual.dtype == jnp.float64
-    np.testing.assert_allclose(actual, expected, atol=2e-15, rtol=2e-15)
+    roundings = chain_roundings(jax.make_jaxpr(model.apply)(variables, x, jnp.ones((1, 1), jnp.float32),
+                                                             jnp.zeros((1, 1), jnp.int32)))
+    assert_computes_the_oracle(np.asarray(actual), expected, "gpt-oss's promoted gate", roundings=roundings)
 
 
 
@@ -444,32 +520,46 @@ def test_gpt_oss_infers_one_compute_dtype_from_all_expert_operands():
 @pytest.mark.parametrize('dtype', [jnp.bfloat16, jnp.float32, jnp.float64])
 def test_the_exact_gelu_rounds_once_in_every_differentiation_mode(dtype):
     """Value, JVP, VJP and both mixed second derivatives against SciPy's
-    erfc, each rounded once to the activation dtype. Observed: bf16 exact,
-    fp32 within 4.8e-7, fp64 within 4.5e-16."""
-    rng = np.random.default_rng(1041)
-    values, cotangents, directions = rng.normal(size=(3, 1024))
-    x, ct, dx = ((values * 3).astype(dtype), cotangents.astype(dtype), (directions * .2).astype(dtype))
-    v, c, t = (array.astype(np.float64) for array in (x, ct, dx))
-    density = np.exp(-v * v / 2) / np.sqrt(2 * np.pi)
-    first = .5 * erfc(-v / np.sqrt(2)) + v * density
-    second = (2 - v * v) * density
-    expected = [rounded(array, dtype) for array in (
-        .5 * v * erfc(-v / np.sqrt(2)), first * t, first * c, second * c * t, second * t * c)]
+    erfc in float64: in bf16 and fp32 on par with XLA's erf GELU by check 1
+    over drawn values, and in float64 within float64's rounding of the
+    computation (`assert_computes_the_oracle`)."""
+    def draw(seed):
+        values, cotangents, directions = np.random.default_rng([1041, seed]).normal(size=(3, 1024))
+        return (jnp.asarray(values * 3, dtype), jnp.asarray(directions * .2, dtype),
+                jnp.asarray(cotangents, dtype))
 
-    def evaluate(x, dx, ct):
-        def scalar(x):
-            return jnp.sum(exact_gelu(x).astype(jnp.float64) * ct.astype(jnp.float64))
+    @as_given
+    def scipy(x, dx, ct):
+        v, t, c = (np.asarray(array, np.float64) for array in (x, dx, ct))
+        density = np.exp(-v * v / 2) / np.sqrt(2 * np.pi)
+        first = .5 * erfc(-v / np.sqrt(2)) + v * density
+        second = (2 - v * v) * density
+        return .5 * v * erfc(-v / np.sqrt(2)), first * t, first * c, second * c * t, second * t * c
 
-        def directional(x):
-            return jnp.sum(jax.jvp(exact_gelu, (x,), (dx,))[1].astype(jnp.float64) * ct.astype(jnp.float64))
+    def evaluated(gelu):
+        def evaluate(x, dx, ct):
+            def scalar(x):
+                return jnp.sum(gelu(x).astype(jnp.float64) * ct.astype(jnp.float64))
 
-        y, tangent = jax.jvp(exact_gelu, (x,), (dx,))
-        return (y, tangent, jax.grad(scalar)(x), jax.jvp(jax.grad(scalar), (x,), (dx,))[1],
-                jax.grad(directional)(x))
+            def directional(x):
+                return jnp.sum(jax.jvp(gelu, (x,), (dx,))[1].astype(jnp.float64) * ct.astype(jnp.float64))
 
-    actual = jax.jit(evaluate)(jnp.asarray(x), jnp.asarray(dx), jnp.asarray(ct))
-    for a, b in zip(actual, expected, strict=True):
-        np.testing.assert_allclose(np.asarray(a, np.float64), b, atol=TOLERANCE, rtol=TOLERANCE)
+            y, tangent = jax.jvp(gelu, (x,), (dx,))
+            return (y, tangent, jax.grad(scalar)(x), jax.jvp(jax.grad(scalar), (x,), (dx,))[1],
+                    jax.grad(directional)(x))
+        return jax.jit(evaluate)
+
+    if dtype == jnp.float64:
+        operands = draw(0)
+        roundings = chain_roundings(jax.make_jaxpr(evaluated(exact_gelu))(*operands))
+        names = ("value", "jvp", "vjp", "forward over reverse", "reverse over forward")
+        for name, mine, theirs in zip(names, evaluated(exact_gelu)(*operands), scipy(*operands), strict=True):
+            assert_computes_the_oracle(np.asarray(mine), theirs, f"the exact gelu's {name}",
+                                       roundings=roundings)
+        return
+    label = f"the exact gelu's derivatives, {jnp.dtype(dtype).name}"
+    assert_as_exact(evaluated(exact_gelu), evaluated(lambda x: jax.nn.gelu(x, approximate=False)), draw,
+                    label, seeds=FEWEST_SEEDS, truth_fn=scipy)
 
 
 def placed_experts(mesh, activation, skewed, scale_inputs, limit, implementation='xla'):
@@ -585,25 +675,20 @@ def test_a_bf16_combine_weighs_its_experts_in_fp32_and_rounds_once():
 def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, scale_inputs, limit,
                                                           expert, fsdp, implementation):
     """Three Adam steps of a bf16 routed layer: outputs, gradients, parameters
-    and moments agree between global and exchange dispatch. Observed maxima
-    1.5e-8 random and 6e-8 skewed. On a GPU 'pallas' runs its kernels on
-    every device's own rows, the exchange included on a mesh whose only split
-    axis is the expert one; a CPU runs XLA's program."""
+    and moments of the exchange dispatch on par with the global one's by
+    check 1 over drawn tokens and weights, truth the global dispatch's float64
+    layer on the CPU. On a GPU 'pallas' runs its kernels on every device's own
+    rows, the exchange included on a mesh whose only split axis is the expert
+    one; a CPU runs XLA's program."""
     mesh = MeshSpec(expert=expert, fsdp=fsdp).build()
-    model, parameters, specs, tokens, x, weights, choices = placed_experts(
-        mesh, activation, skewed, scale_inputs, limit, implementation)
+    model, _, specs, tokens, *_ = placed_experts(mesh, activation, skewed, scale_inputs, limit,
+                                                  implementation)
     optimizer = optax.adam(1e-3)
-    state = optimizer.init(parameters)
-    state_specs = jax.tree.map(
-        lambda value: NamedSharding(mesh, P()) if value.ndim == 0 else value.sharding, state)
-    outputs = ((NamedSharding(mesh, P()), tokens), (specs, tokens, tokens), specs, state_specs)
-    trajectories = []
-    for dispatch in ('global', 'exchange'):
-        network = model.clone(dispatch=dispatch)
 
-        def objective(parameters, x, weights, choices, *, network=network):
+    def trajectory(network):
+        def objective(parameters, x, weights, choices):
             y = jnp.asarray(network.apply(parameters, x, weights, choices))
-            return jnp.mean(jnp.sin(y.astype(jnp.float32))), y
+            return jnp.mean(jnp.sin(y.astype(jnp.promote_types(y.dtype, jnp.float32)))), y
 
         def step(parameters, state, x, weights, choices):
             result, gradients = jax.value_and_grad(objective, (0, 1, 2), has_aux=True)(
@@ -611,19 +696,46 @@ def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, sc
             updates, state = optimizer.update(gradients[0], state, parameters)
             return result, gradients, optax.apply_updates(parameters, updates), state
 
-        with jax.set_mesh(mesh):
-            compiled = jax.jit(step, out_shardings=outputs)
-            trajectory, (p, s) = [], (parameters, state)
+        compiled = jax.jit(step)
+
+        def run(parameters, x, weights, choices):
+            steps, (p, s) = [], (parameters, optimizer.init(parameters))
             for _ in range(3):
                 result = compiled(p, s, x, weights, choices)
-                trajectory.append(result)
+                steps.append(result)
                 p, s = result[2:]
-        trajectories.append(trajectory)
-    for first, second in zip(*trajectories, strict=True):
-        for a, b in zip(jax.tree.leaves(first), jax.tree.leaves(second), strict=True):
-            np.testing.assert_allclose(
-                np.asarray(a, np.float64), np.asarray(b, np.float64), atol=TOLERANCE, rtol=TOLERANCE
-            )
+            return steps
+        return run
+
+    def dispatched(dispatch):
+        run = trajectory(model.clone(dispatch=dispatch))
+
+        @as_given
+        def placed(parameters, x, weights, choices):
+            with jax.set_mesh(mesh):
+                return run(jax.device_put(parameters, specs), *jax.device_put((x, weights, choices), tokens))
+        return placed
+
+    def draw(seed):
+        rng = np.random.default_rng([341, seed])
+        x = jnp.asarray(rounded(rng.normal(size=(24, 8))), jnp.bfloat16)
+        weights = jnp.asarray(rng.uniform(.1, .9, size=(24, 2)), jnp.float32)
+        choices = jnp.asarray(np.tile([0, 1], (24, 1)) if skewed
+                              else np.argsort(rng.normal(size=(24, 8)), axis=-1)[:, :2], jnp.int32)
+        return nn.unbox(model.init(jax.random.key(seed), x, weights, choices)), x, weights, choices
+
+    host = jax.devices("cpu")[0]
+    wide = trajectory(model.clone(dispatch='global', dtype=jnp.float64))
+
+    @as_given
+    def truth(*inputs):
+        with jax.default_device(host):
+            return wide(*jax.device_put(inputs, host))
+
+    label = (f"three Adam steps of the exchange dispatch, {activation}, {'skewed' if skewed else 'random'}, "
+             f"expert {expert} fsdp {fsdp}, {implementation}")
+    assert_as_exact(dispatched('exchange'), dispatched('global'), draw, label, seeds=FEWEST_SEEDS,
+                    truth_fn=truth)
 
 
 DISPATCH_TANGENT_SEEDS = 8

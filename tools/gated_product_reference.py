@@ -12,26 +12,27 @@ values, torch's product and torch's gradients of gate and up.
 
 Every kept element has its two transcendental values, the activation and
 the gate's gradient, further in float64 from a bf16 rounding midpoint than
-64 fp32 roundings of the formula's own scale can move them: |gate| for the
-activation, |d activation| (1 + |gate|) for the gradient. Any fp32
-evaluation then rounds as float64 does, however it orders its terms and
-whichever exp, tanh or erf it calls; torch's `0.5 x (1 + erf)` and XLA's
+the gate's MARGIN (tests/selection_margins.py, `rounding_margin`) of the
+formula's own scale, past what an fp32 evaluation moves them (over 160 fp32
+roundings): |gate| for the activation, |d activation| (1 + |gate|) for the
+gradient. Any fp32 evaluation then rounds as float64 does, however it orders
+its terms and whichever exp, tanh or erf it calls; torch's `0.5 x (1 + erf)` and XLA's
 `x erfc / 2` disagree in the tail where one of them cancels, and such
 elements are redrawn. The products (bf16 times bf16) are exact in fp32.
 
 Run with Torch 2.14.0 CPU:
-  python tools/gated_product_reference.py --out tests/fixtures/gated_product/bf16.npz
+  PYTHONPATH=tests python tools/gated_product_reference.py --out tests/fixtures/gated_product/bf16.npz
 """
 
 import argparse
 import math
 
+import ml_dtypes
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 COUNT = 2048
-SLACK = 64 * 2.0 ** -24
 ROOT_2_OVER_PI = math.sqrt(2 / math.pi)
 ERFC = np.frompyfunc(math.erfc, 1, 1)
 
@@ -44,7 +45,8 @@ def silu(g):
 def gelu_tanh(g):
     inner = ROOT_2_OVER_PI * (g + 0.044715 * g ** 3)
     t = np.tanh(inner)
-    return 0.5 * g * (1 + t), 0.5 * (1 + t) + 0.5 * g * (1 - t * t) * ROOT_2_OVER_PI * (1 + 3 * 0.044715 * g * g)
+    slope = 0.5 * (1 + t) + 0.5 * g * (1 - t * t) * ROOT_2_OVER_PI * (1 + 3 * 0.044715 * g * g)
+    return 0.5 * g * (1 + t), slope
 
 
 def gelu_erf(g):
@@ -61,14 +63,12 @@ def bf16(values):
 
 
 def decided(values, scale):
-    """Whether each float64 value sits further from a bf16 rounding midpoint
-    than SLACK times `scale`, the most an fp32 evaluation can move it."""
-    magnitude = np.abs(values)
-    exponent = np.floor(np.log2(np.where(magnitude > 0, magnitude, 1.0)))
-    ulp = 2.0 ** (exponent - 7)
-    position = magnitude / ulp
-    distance = np.abs(position - np.floor(position) - 0.5) * ulp
-    return (magnitude == 0) | (distance > SLACK * scale)
+    """Whether each float64 value's bf16 rounding is decided: its margin from a rounding midpoint
+    (`selection_margins.rounding_margin`) above MARGIN times `scale`, past the most an fp32 evaluation
+    moves it."""
+    from selection_margins import MARGIN, rounding_margin
+
+    return rounding_margin(values, ml_dtypes.bfloat16) > MARGIN * scale
 
 
 def draw(rng, oracle):

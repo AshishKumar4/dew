@@ -349,10 +349,11 @@ is: a trace reads it, so a call's identity states it with JAX's trace context, a
 is never run staged."""
 
 PLACING = jax.make_user_context(default_value=None)
-"""What places the traced program's parameters (`dew.nn.sharding.placing`: a trainer's layout, or a served
-model's placed weights), None outside any, keyed on as `WHOLE` is: a projection mapped per shard reads it
-as it traces, so a call's identity states it with JAX's trace context, and a program traced under one
-placement is never run under another."""
+"""What places the traced program's parameters (`dew.nn.sharding.placing`: a trainer's layout, or
+`dew.nn.sharding.FORWARD` for a served or scored model's forward-only trace, each weight whole), None
+outside any, keyed on as `WHOLE` is: a projection mapped per shard reads it as it traces, so a call's
+identity states it with JAX's trace context, and a program traced under one placement is never run under
+another."""
 
 KERNEL_SEEN = jax.make_user_context(default_value=None)
 """The collection a lowering records its kernel launches into as it traces them

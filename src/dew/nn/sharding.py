@@ -335,13 +335,14 @@ FORWARD = Forward()
 
 @contextlib.contextmanager
 def placing(layout: Placing | None) -> Iterator[None]:
-    """Trace with `layout` (a `dew.distributed.placement.Layout`), the one that places the traced program's
-    parameters, which a projection mapped per shard reads (`placed_layout`) to take its weight in the map
-    where the layout places it; None, as outside a trainer's trace, none: such a projection stays with the
-    partitioner (a reference arm traced inside a step opts out so). The trainer's step and its evaluations
-    trace under it (`Trainer._traced_on`, `Evaluator.scoring`); a program cached by what it traced under
-    keys on it (`trace_context`), and a call's identity states it (`dew._cache.PLACING`, a JAX user
-    context)."""
+    """Trace with `layout`, which a projection mapped per shard reads (`placed_layout`) to take its weight in
+    the map: a `dew.distributed.placement.Layout`, the one that places a trainer's parameters, each weight
+    taken where it places it, so its gradient leaves the map to that placement; or `FORWARD`, a served or
+    scored model's forward-only trace, each weight taken whole. None, as outside both, none: such a
+    projection stays with the partitioner (a reference arm traced inside a step opts out so). The trainer's
+    step and its evaluations trace under their layout (`Trainer._traced_on`, `Evaluator.scoring`), a server
+    and a scoring server under `FORWARD`; a program cached by what it traced under keys on it
+    (`trace_context`), and a call's identity states it (`dew._cache.PLACING`, a JAX user context)."""
     with _cache.PLACING(new_value=layout):
         yield
 

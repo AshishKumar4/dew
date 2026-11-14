@@ -448,9 +448,6 @@
 "tests/test_barren_reads.py::test_a_workers_read_of_a_dropping_corpus_resumes_where_it_stopped",
 "tests/test_barren_reads.py::test_a_written_workers_split_reads_on_whatever_the_loadings_workers"
 ],
-"tests/test_beam_search.py": [
-"tests/test_beam_search.py::test_beams_are_transformers_beam_search[qwen3-tiny]"
-],
 "tests/test_benchmark_step.py": [
 "tests/test_benchmark_step.py::test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer[causal_transformer-False]",
 "tests/test_benchmark_step.py::test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer[simple_dit-False]"
@@ -1126,9 +1123,6 @@
 "tests/test_dreamer.py::test_dreamer_filled_batches_train_real_windows_alone[gru]",
 "tests/test_dreamer.py::test_dreamer_split_step_preserves_draws_percentiles_and_mid_window_resume",
 "tests/test_dreamer.py::test_pretraining_from_demonstrations_learns_the_world_and_clones_the_pilot"
-],
-"tests/test_dsa_kpool.py": [
-"tests/test_dsa_kpool.py::test_a_row_with_a_hole_pools_as_its_cache_does"
 ],
 "tests/test_end_to_end.py": [
 "tests/test_end_to_end.py::test_a_repae_step_s_loss_and_terms_are_train_repae_s",
@@ -2110,6 +2104,9 @@
 "tests/test_perturbation.py::test_an_indexer_warmup_trains_its_indexer_alone_without_backpropagation",
 "tests/test_perturbation.py::test_an_update_read_in_two_microbatches_estimates_what_its_batch_whole_does",
 "tests/test_perturbation.py::test_the_estimate_is_the_gradient_in_expectation[trailing-general]"
+],
+"tests/test_pipeline_core.py": [
+"tests/test_pipeline_core.py::test_a_rows_count_and_its_rule_ride_through_the_steps_that_leave_its_targets[counted-again-then-copied-streamed]"
 ],
 "tests/test_pipeline_golden.py": [
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[images_arrayrecord-workers=2,shares=2]",
