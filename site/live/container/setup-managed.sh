@@ -12,12 +12,15 @@ apt-get install -y --no-install-recommends python3 python3-venv ca-certificates 
 python3 -m venv /opt/venv
 # tools/pip.txt's pip first: older pips trust the roots of eMudhra's compromised CAs (2026-10-20).
 /opt/venv/bin/pip install --no-cache-dir --quiet -r "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/tools/pip.txt"
-# One pass under the suite's lock (tools/lock_environment.sh), which pins every package the live,
-# streaming and profile extras reach, so the container runs the versions CI tests and no package it
-# runs resolves on its own (pip's build tools for Dew's own tarball are outside the lock).
-/opt/venv/bin/pip install --no-cache-dir \
-    "dewml[streaming,live,profile] @ https://github.com/AshishKumar4/dew/archive/$commit.tar.gz" \
-    -c "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/locks/cpu.txt"
+# The site's own lock first (locks/site.txt, tools/lock_environment.sh): every package the live, streaming
+# and profile extras reach, at the versions CI tests, each file's bytes held to its sha256, so one replaced
+# under its name and version fails by name. Then Dew itself, its commit's tarball, with no dependency of its
+# own: the one install that takes no hash, named by the commit it is (pip refuses a pass that mixes hashed and
+# unhashed requirements; pip's build tools for the tarball are outside the lock).
+/opt/venv/bin/pip install --no-cache-dir --require-hashes \
+    -r "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/locks/site.txt"
+/opt/venv/bin/pip install --no-cache-dir --no-deps \
+    "dewml[streaming,live,profile] @ https://github.com/AshishKumar4/dew/archive/$commit.tar.gz"
 id -u model >/dev/null 2>&1 || useradd --uid 5000 --create-home --shell /usr/sbin/nologin model
 mkdir -p /opt/live /opt/models /opt/hf /opt/xla /opt/train /run/dew /sessions
 chown model:model /opt/models /opt/hf /opt/xla /opt/train
