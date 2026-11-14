@@ -70,7 +70,8 @@ def test_a_text_generation_and_an_rl_rollout_are_read_by_the_pass_unless_it_is_o
     with algebra.passes(on=False):
         TextGeneration(model, params, sampling=sampling)([[1, 2, 3]], 3, key=0)
     assert not passed()
-    assert passes_of(passed, lambda: TextGeneration(model, params, sampling=sampling)([[1, 2, 3]], 3, key=0)) >= 1
+    generate = TextGeneration(model, params, sampling=sampling)
+    assert passes_of(passed, lambda: generate([[1, 2, 3]], 3, key=0)) >= 1
     rollout = RolloutScheduler.sampled(objective, lambda text, record: float(len(text) % 3), groups=2,
                                        max_new_tokens=4, sampling=sampling)
     state = Trainer(objective, optax.sgd(.01), key=jax.random.key(1)).initial_state()
