@@ -1,18 +1,14 @@
 """The test cache's records on the dew-xla-cache Worker (ci.py's): where each lives, read and written, and the
-records that decide which green run of a row a lookup may reuse: each row's green runs' executed sets
-(`sets_key`, ccache's direct mode) and its epoch, which a red run begins anew so no green run recorded before
-it stands again (`epoch`). What a record holds and when a row is reused are ci.py's (`record`, `green_record`,
-`reused`)."""
+record that decides which green run of a row a lookup may reuse: its epoch, which a red run begins anew so no
+green run recorded before it stands again (`epoch`). What a record holds and when a row is reused are ci.py's
+(`record`, `green_record`, `reused`)."""
 
-import functools
-import hashlib
 import importlib.util
 import json
 import os
 import sys
 import time
 import uuid
-from collections.abc import Sequence
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -72,27 +68,12 @@ def green_key(python: str, row_name: str, held: str, key: str) -> str:
     return f"{CACHE_PREFIX}-green/{python}/{row_place(row_name, held)}/{key}"
 
 
-SETS_KEPT = 8
-"""How many of a row's green runs' distinct executed sets its list keeps (`sets_key`), the most recently used
-first. A row's key hashes the inputs its run executed (`cache_key`), and runs of other trees, which trains,
-base/kernels' CI and lanes' runs make all day, execute other sets: in the records on 2026-11-12, every one of
-40 green runs sampled per row had a set of its own, and a row kept a median of 57 green runs over the bucket's
-14 days (about 4 a day) and at most 732 (about 52 a day). Eight hold the median row's last two days and the
-busiest row's last four hours, a tree's own set reused since staying first (`remembered`); each candidate
-costs a lookup only where its units are this tree's (`matchable`)."""
-
-
-def sets_key(python: str, row_name: str, held: str) -> str:
-    """Where row `row_name`'s list on class `held` of its green runs' executed sets is (`remembered`,
-    `green_record`): their digests (`set_digest`), as ccache's direct mode keeps a source's manifests; each
-    set's inputs are kept once by its digest (`set_key`), as a set runs to thousands of inputs and files one
-    process ran share theirs."""
-    return f"{CACHE_PREFIX}-sets/{python}/{row_place(row_name, held)}"
-
-
-def set_key(digest: str) -> str:
-    """Where the executed set of digest `digest` is kept, its inputs in order (`executed_set`)."""
-    return f"{CACHE_PREFIX}-set/{digest}"
+def main_key(commit: str, python: str, row_name: str, held: str) -> str:
+    """Where commit `commit`'s own run of row `row_name` on class `held` names its green run (its key, which
+    `green_key` keeps it by): written by every task that ran the row green or reused it at `commit`, so main's
+    commit, a train's tip that published, names each of its rows whatever later runs of other trees re-record
+    them (a lane's, on its branch: Main, 2026-11-14)."""
+    return f"{CACHE_PREFIX}-main/{commit}/{python}/{row_place(row_name, held)}"
 
 
 def epoch_key(python: str, row_name: str, held: str, common: str) -> str:
@@ -186,50 +167,6 @@ def standing(found: dict, current: str | None) -> bool:
     return current is not None and found.get("epoch") == current
 
 
-@functools.lru_cache(maxsize=1024)
-def executed_set(digest: str, token: str) -> tuple[str, ...] | None:
-    """The inputs of the executed set of digest `digest` (`set_key`), read once a process however many rows
-    name it (a plan's threads share them); None where the Worker holds none, or one whose inputs hash
-    otherwise."""
-    found = recorded(set_key(digest), token)
-    held = tuple(found.get("depends", ())) if isinstance(found, dict) else ()
-    return held if held and set_digest(held) == digest else None
-
-
-def set_digest(depends: Sequence[str]) -> str:
-    """The digest of an executed set, its inputs in order."""
-    return hashlib.sha256(json.dumps(sorted(depends)).encode()).hexdigest()
-
-
-SETS_WRITTEN: set[str] = set()
-"""The executed sets this process has written (`remembered`), each once however many rows name it."""
-
-
-def remembered(python: str, row_name: str, held: str, depends: Sequence[str], token: str,
-               ran: bool = False) -> None:
-    """Row `row_name`'s executed set `depends` made the first of its list on class `held` (`sets_key`), the
-    least recently used leaving past `SETS_KEPT`: by every green run that records it (`ran`), and by every
-    task that reuses a green run by it, so a burst of other trees' runs evicts no set a tree still reuses. A
-    write lost to another at once loses a set from the list, never adds a wrong one: a miss, a run, never a
-    wrong reuse. A green run writes its set's inputs again (once a process), so they outlive every green
-    record that names them under the bucket's expiry, which counts from each object's last write (review,
-    2026-11-12)."""
-    digest = set_digest(depends)
-    # The set's inputs first, so a list never names a set the Worker lacks.
-    if ran and digest not in SETS_WRITTEN:
-        if not written(set_key(digest), token, json.dumps({"depends": sorted(depends)}).encode()):
-            return
-        SETS_WRITTEN.add(digest)
-    held_sets = (recorded(sets_key(python, row_name, held), token) or {}).get("sets", [])
-    if held_sets[:1] == [digest]:
-        return
-    if digest not in held_sets and digest not in SETS_WRITTEN and not written(
-            set_key(digest), token, json.dumps({"depends": sorted(depends)}).encode()):
-        return
-    kept = [digest, *(each for each in held_sets if each != digest)][:SETS_KEPT]
-    written(sets_key(python, row_name, held), token, json.dumps({"sets": kept}).encode())
-
-
 def recorded(key: str, token: str) -> dict | None:
     """The record at `key`, read (`record_of`), or None where there is none or the Worker did not give it."""
     found = record_of(key, token)
@@ -240,11 +177,10 @@ RECORD_TRIES = 4
 """How many times a record's write is tried, two, four and eight seconds apart."""
 
 
-def written(key: str, token: str, body: bytes) -> bool:
-    """Whether `body` was PUT at `key`, tried `RECORD_TRIES` times while the Worker is unavailable: a
-    record not written leaves the one before it, such as an older green row a red run should have
-    replaced."""
-    for attempt in range(RECORD_TRIES):
+def written(key: str, token: str, body: bytes, tries: int = RECORD_TRIES) -> bool:
+    """Whether `body` was PUT at `key`, tried `tries` times while the Worker is unavailable: a record not
+    written leaves the one before it, such as an older green row a red run should have replaced."""
+    for attempt in range(tries):
         if attempt:
             time.sleep(2 ** attempt)
         try:

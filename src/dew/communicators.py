@@ -61,6 +61,7 @@ from dew._devices import (
     gpu_place,
     nccl_version,
     pool_bound,
+    write_share,
 )
 from dew._files import write_atomically
 from dew.telemetry.instrumentation import compiled_memory, hlo_instructions
@@ -441,7 +442,7 @@ def sized_pool(*, measure: Callable[[], Needs | None] = needs_of,
     # compiles; each compiled program's own are held to the room left (`admit`).
     held = everything(memory)
     share = pool_share(needs, memory, bound, held)
-    os.environ[fraction_name()] = str(share)
+    write_share(share, "sized")
     sizing = Sizing(needs, bound, share, needs.needed(held, memory, runtime=True),
                     {gpu: free - int(share * total) for gpu, (free, total) in memory.items()})
     _log.info("XLA's pool takes %s of each GPU (the run's bound %s), leaving each GPU %s bytes for NCCL's "

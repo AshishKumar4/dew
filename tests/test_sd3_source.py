@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import extract_fixture, scaled_gap as relative_gap
+from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.interop.diffusion import component_tensors, sd3_fields, translate_sd3_weights
@@ -53,45 +54,81 @@ def transformer_case(directory: Path, arrays, name: str):
 
 CASES = ("plain", "qknorm", "dual", "rect_cropped", "deep")
 
+CASE_SEEDS = {"plain": 64, "qknorm": 128, "dual": 128, "rect_cropped": 64, "deep": 256}
+"""Each transformer's declared check-1 seeds, sized paired by `seeds_for` on armada (11-14)."""
+
 
 @pytest.mark.parametrize("name", CASES)
 def test_native_sd3_matches_the_source_forward_and_every_gradient(name, source):
-    """One published transformer's own tensors, read through the native model.
+    """One published transformer's own tensors, read through the native model, against the source's
+    `SD3Transformer2DModel` loaded from the same files: the output and the latent's, the text tokens', the
+    pooled vector's and every parameter's gradients (by its published name) under a drawn probe, over
+    drawn latents, tokens and pooled vectors at the case's timesteps, on par (check 1), the source's
+    float64 twin the truth (ledger 705). The variants are the ones whose wiring differs: plain, `qk_norm`,
+    SD3.5's dual attention with its ninefold modulation, a rectangular latent whose patch grid is smaller
+    than the position buffer, and a deeper stack."""
+    import torch
+    from diffusers import SD3Transformer2DModel
 
-    The variants are the ones whose wiring differs: plain, `qk_norm`, SD3.5's
-    dual attention with its ninefold modulation, a rectangular latent whose
-    patch grid is smaller than the position buffer, and a deeper stack. The
-    output and the latent, token and pooled gradients land within 6e-7 of the
-    source's own scale, and every parameter gradient within 4e-5: the
-    timestep embedder's first weight is the sinusoidal feature itself, where a
-    float32 `exp` differing by an ulp is multiplied by a timestep near a
-    thousand, and the rest sit under 2e-6.
-    """
+    from _dew_torch.precision import float64, float64_twin
+
     with np.load(source / "sd3_transformer.npz") as arrays:
-        forward, params, buffers, layouts, latent, condition = transformer_case(
-            source, arrays, name)
-        probe = jnp.asarray(arrays[f"{name}.probe"]).transpose(0, 2, 3, 1)
-        output = jax.jit(forward)(params, latent, condition.context, condition.pooled)
-        assert relative_gap(output.transpose(0, 3, 1, 2), arrays[f"{name}.output"]) < 1e-5
+        forward, params, buffers, layouts, _, _ = transformer_case(source, arrays, name)
+        fixture = {key: np.asarray(arrays[f"{name}.{key}"], np.float32)
+                   for key in ("latent", "context", "pooled", "times", "probe")}
         # The stored buffer is the source's, perturbed away from its own
         # sin/cos initializer, so a model that rebuilt it would not match.
-        assert relative_gap(buffers["pos_embed"], arrays[f"{name}.position_buffer"]) == 0.0
-        gradients = jax.jit(
-            jax.grad(
-                lambda p, noisy_latent, c, q: jnp.sum(forward(p, noisy_latent, c, q) * probe),
-                argnums=(0, 1, 2, 3),
-            )
-        )(params, latent, condition.context, condition.pooled)
-        assert relative_gap(gradients[1].transpose(0, 3, 1, 2), arrays[f"{name}.grad_latent"]) < 1e-5
-        assert relative_gap(gradients[2], arrays[f"{name}.grad_context"]) < 1e-5
-        assert relative_gap(gradients[3], arrays[f"{name}.grad_pooled"]) < 1e-5
-        layout = {entry.name: entry for entry in layouts}
-        prefix = f"{name}.grad_param."
-        recorded = [key for key in arrays.files if key.startswith(prefix)]
-        assert recorded, name
-        for key in recorded:
-            value = np.asarray(layout["transformer/" + key[len(prefix):]].export({"params": gradients[0]}))
-            assert relative_gap(value, arrays[key]) < 1e-4, key
+        np.testing.assert_array_equal(np.asarray(buffers["pos_embed"]), arrays[f"{name}.position_buffer"])
+    narrow = SD3Transformer2DModel.from_pretrained(source / name / "transformer",
+                                                   local_files_only=True).eval()
+    wide = float64_twin(narrow)
+    # Every parameter's layout; the position buffer's (held above) has no gradient.
+    buffers = {key for key, _ in narrow.named_buffers()}
+    tensors = {layout.name.removeprefix("transformer/"): layout for layout in layouts
+               if layout.name.removeprefix("transformer/") not in buffers}
+    assert set(tensors) == {key for key, _ in narrow.named_parameters()}
+    weights = {id(module): {key: value.detach().numpy() for key, value in module.named_parameters()}
+               for module in (narrow, wide)}
+
+    def draw(seed):
+        generator = np.random.default_rng([711, seed])
+        drawn = {key: generator.standard_normal(fixture[key].shape).astype(np.float32)
+                 for key in ("latent", "context", "pooled", "probe")}
+        return ({**drawn, "times": fixture["times"]},)
+
+    @jax.jit
+    def walk(latent, context, pooled, params, probe):
+        def channels_first(latent, context, pooled, params):
+            out = forward(params, jnp.transpose(latent, (0, 2, 3, 1)), context, pooled)
+            return jnp.transpose(out, (0, 3, 1, 2))
+        return with_gradients(channels_first)(latent, context, pooled, params, probe)
+
+    @as_given
+    def native(inputs):
+        out, grad_latent, grad_context, grad_pooled, grad_params = walk(
+            inputs["latent"], inputs["context"], inputs["pooled"], params, inputs["probe"])
+        return out, grad_latent, grad_context, grad_pooled, {
+            tensor: np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()}
+
+    def reference_walk(module, drawn):
+        dtype = torch.from_numpy(np.asarray(drawn["latent"])).dtype
+        timestep = torch.tensor(np.asarray(drawn["times"]), dtype=dtype)
+
+        def source_forward(latent, context, pooled, params):
+            return torch.func.functional_call(module, params, (), {
+                "hidden_states": latent, "encoder_hidden_states": context, "pooled_projections": pooled,
+                "timestep": timestep, "return_dict": False})[0]
+
+        return torch_with_gradients(source_forward)(drawn["latent"], drawn["context"], drawn["pooled"],
+                                                    weights[id(module)], drawn["probe"])
+
+    @as_given
+    def truth(inputs):
+        with float64():
+            return reference_walk(wide, inputs)
+
+    assert_as_exact(native, as_given(lambda inputs: reference_walk(narrow, inputs)), draw, f"SD3 {name}",
+                    seeds=CASE_SEEDS[name], truth_fn=truth)
 
 
 class Velocity(nn.Module):

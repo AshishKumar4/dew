@@ -12,7 +12,8 @@ of the first frame alone.
 
 Arrays are recorded `[B, C, T, H, W]`; the tests move channels last.
 Parameter gradients are written back into the source layout through the
-same `WeightLayout`s an export uses. Every gap is scaled by max(1, |reference|).
+same `WeightLayout`s an export uses. The tests hold the native model by check 1 to the source itself,
+loaded from those files, over drawn videos, codes and probes, its float64 twin the truth.
 """
 
 import json
@@ -24,13 +25,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import (
-    assert_coder_vjps,
     assert_layout_tensors,
     channels_last,
+    coder_draw,
+    coder_walk,
+    dtype_arms,
     extract_fixture,
     fixture_arrays,
     posterior_of,
     scaled_gap,
+    torch_coder_walk,
 )
 from reference_error import assert_as_exact
 
@@ -40,7 +44,7 @@ from dew.nn.autoencoders.wan import chunked_decode, chunked_moments
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5
-GRADIENT = 1e-4
+
 
 
 @pytest.fixture(scope="module")
@@ -80,16 +84,58 @@ def test_every_published_tensor_is_mapped_and_exports_bit_identical(source, load
     assert_layout_tensors(layouts, {"autoencoder": params}, tensors, "vae/")
 
 
-def test_the_posterior_of_a_video_matches_the_source(loaded, reference):
-    """Nine frames encode to three latent frames: the first alone, then four
-    at a time, each reading the frames before it."""
-    autoencoder, params, _, _ = loaded
-    mean, std = posterior(autoencoder.model, params, channels_last(reference["video"]))
-    assert mean.shape == (2, 3, 4, 6, 4)
-    gaps = {"mean": scaled_gap(mean, channels_last(reference["mean"])),
-            "std": scaled_gap(std, channels_last(reference["std"]))}
-    print(f"posterior gaps {gaps}")
-    assert max(gaps.values()) < FORWARD, gaps
+def source_walks(model):
+    """Each walk's Dew call and the source's, by name: the posterior's mean and standard deviation of a
+    video (`encode`), and the pixels of a code (`decode`), each a tuple of outputs."""
+    def encoded(module, video):
+        latent = module.encode(video).latent_dist
+        return latent.mean, latent.std
+
+    def decoded(params, latent):
+        return (model.apply({"params": params}, latent, method=model.decode),)
+
+    return {"encode": (lambda params, video: posterior(model, params, video), encoded),
+            "decode": (decoded, lambda module, latent: (module.decode(latent).sample,))}
+
+
+WALKS = {"video": ("encode", 9, 128), "image": ("encode", 1, 128), "latent": ("decode", 3, 256)}
+"""Each walk's method, frames and declared check-1 seeds: nine frames encode to three latent frames, the
+first alone, then four at a time, each reading the frames before it; one frame, an image, to one; three
+latent frames decode to nine, the first to one, each later one to four. The seeds sized paired by
+`seeds_for` on armada (11-14): the encoder's and decoder's group norms' scale gradients resolve last. A
+draw of every parameter's gradient, three arms, takes about 3.5 s, so the long walks' draws run 16 a map
+task, about 60 s, which with their judge's 40 s keeps each chain inside the group's 120 s."""
+
+
+@pytest.mark.parametrize("walk", [
+    pytest.param("video", id="video", marks=pytest.mark.check1_shards(seeds=128, per_task=16)),
+    "image",
+    pytest.param("latent", id="latent", marks=pytest.mark.check1_shards(seeds=256, per_task=16))])
+def test_a_walk_and_its_gradients_match_the_source(source, loaded, walk):
+    """The posterior's mean and standard deviation of drawn frames, or the pixels of a drawn code, and the
+    gradients of drawn probes against the operand and every parameter, each parameter's written into its
+    source tensor's layout as an export writes it: on par with the source's `AutoencoderKLWan` loaded from
+    its files (check 1), its float64 twin the truth (ledger 705)."""
+    import torch
+    from diffusers import AutoencoderKLWan
+
+    from _dew_torch.precision import float64_twin
+
+    autoencoder, params, layouts, _ = loaded
+    narrow = AutoencoderKLWan.from_pretrained(source / "vae", local_files_only=True).eval()
+    models = {torch.float32: narrow, torch.float64: float64_twin(narrow)}
+    assert {layout.name.removeprefix("vae/") for layout in layouts} == {
+        name for name, value in narrow.named_parameters() if value.requires_grad}
+    method, frames, seeds = WALKS[walk]
+    native, call = source_walks(autoencoder.model)[method]
+    latent_frames = 1 + (frames - 1) // 4 if method == "encode" else frames
+    pixels = (2, 3, 1 + 4 * (latent_frames - 1), 32, 48)
+    code = (2, narrow.config.z_dim, latent_frames, 4, 6)
+    draw = (coder_draw(707, pixels, (code, code), uniform=True) if method == "encode"
+            else coder_draw(708, code, (pixels,), uniform=False))
+    reference, truth = dtype_arms(lambda dtype, inputs: torch_coder_walk(models[dtype], call, dtype, inputs))
+    assert_as_exact(coder_walk(native, params, layouts), reference, draw, f"Wan VAE {walk}", seeds=seeds,
+                    truth_fn=truth)
 
 
 def test_an_image_is_the_one_frame_video(loaded, reference):
@@ -97,7 +143,6 @@ def test_an_image_is_the_one_frame_video(loaded, reference):
     model = autoencoder.model
     first = channels_last(reference["video"])[:, :1]
     latent = model.apply({"params": params}, first, method=model.encode)
-    assert scaled_gap(latent, channels_last(reference["image_mean"])) < FORWARD
     # The batch path runs the model jitted and the reference path op by op;
     # XLA fuses them differently, a float32 rounding apart.
     np.testing.assert_allclose(
@@ -105,16 +150,13 @@ def test_an_image_is_the_one_frame_video(loaded, reference):
     )
 
 
-def test_the_decode_matches_the_source(loaded, reference):
-    """Three latent frames decode to nine: the first to one, each later one
-    to four."""
+def test_a_three_frame_latent_decodes_to_nine_frames_within_the_pixel_range(loaded, reference):
+    """Three latent frames decode to nine: the first to one, each later one to four, each pixel clamped
+    to [-1, 1]."""
     autoencoder, params, _, _ = loaded
     model = autoencoder.model
     pixels = model.apply({"params": params}, channels_last(reference["latent"]), method=model.decode)
     assert pixels.shape == (2, 9, 32, 48, 3)
-    gap = scaled_gap(pixels, channels_last(reference["pixels"]))
-    print(f"decode gap {gap:.3g}")
-    assert gap < FORWARD
     assert float(jnp.abs(pixels).max()) <= 1.0
 
 
@@ -226,10 +268,6 @@ def test_the_published_vae_matches_the_source():
     print(f"published VAE gaps {gaps}")
     assert mean.shape == (1, 3, 16, 24, 16)
     assert max(gaps.values()) < FORWARD, gaps
-
-
-def test_the_coder_gradients_match_the_source(loaded, reference):
-    assert_coder_vjps(loaded, reference, "video", posterior, GRADIENT)
 
 
 def test_a_bfloat16_walk_matches_the_sources_bfloat16_walk(source):

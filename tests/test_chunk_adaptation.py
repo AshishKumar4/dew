@@ -17,7 +17,7 @@ import optax
 import pytest
 from affine_run import Replaying, dataset
 from flax import linen as nn
-from map_judge import drawing
+from map_judge import drawing, judged_in_its_body
 from reference_error import as_given, assert_as_exact, over_windows, widened, windows, with_gradients
 
 from dew.batch import TEXT_KEY
@@ -414,7 +414,9 @@ def corner_failure(dew, label: str) -> GateFailure | None:
                         truth_fn=reference(truth=True), conditioning=CORNER_SEEDS["forward", "documents"])
 
     if drawing():
-        # A map task records its draws, judging nothing; its judge pools them and decides the failure.
+        # A map task records its draws, judging nothing; its judge runs this body, which pools them and
+        # decides the failure it expects (`judged_in_its_body`).
+        judged_in_its_body(label)
         judged()
         return None
     with pytest.raises(GateFailure) as raised:

@@ -54,22 +54,14 @@ from dew.nn.precision import FP32_SUMS
 
 on_tpu = pytest.mark.tpu(reason="needs a TPU; the interpreter covers the rest here")
 
-INTERPRETED_FP32 = 2. ** -18
-"""How far the interpreted kernel's fp32 output and gradients sit from the fp32 reference's on a CPU, as a
-fraction of each array's own scale (`assert_agrees`), against a measured worst of 2^-19.5 over every oracle
-case: interpreted, the kernel's dots are XLA:CPU's, which sum 2.6 times less exactly than the reference's
-contraction, so this site holds the function and `test_splash_is_on_par_on_a_tpu` the numerics (check 1)."""
+SPLASH_SEEDS = {"cross": 32}
+"""The interpreted kernel's check-1 sites' declared seeds past the fewest (`FEWEST_SEEDS`), by oracle case:
+every case sized by `seeds_for` on armada's CPUs (2026-11-14, size-splash at 314eef0fe73)."""
 
 
 SHARDED_SEEDS = 8
 """The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
 `seeds_for`: the fewest for which one device compared with itself resolves the factor."""
-
-
-def assert_agrees(splash, reference):
-    for got, want in zip(splash, reference, strict=True):
-        assert got.shape == want.shape
-        assert np.abs(got - want).max() <= INTERPRETED_FP32 * np.abs(want).max()
 
 
 def _on_par_on_a_tpu(q_shape, kv_shape, dtype, structure, label: str, *, sunk: bool = False, bias=None):
@@ -191,14 +183,14 @@ def oracle_layout(case: str) -> tuple[tuple, tuple | None, dict, bool]:
 
 @pytest.mark.parametrize("case", ORACLE_CASES)
 def test_splash_agrees_with_the_reference_the_oracle_holds(case):
-    """Splash in fp32, forward and every gradient (the sinks' included),
-    within `INTERPRETED_FP32` of the fp32 reference attention it replaces, whose own
-    arithmetic in float64 is first held to attention computed in float64
-    apart from every Dew path (`exact_value_and_grads`). Each argument the
-    kernel takes, grouped key heads among them. Interpreted on a CPU, a
-    kernel's dots are XLA:CPU's, not the kernel's, so its numerics are held
-    to check 1 on a TPU (`test_splash_is_on_par_on_a_tpu`) and this site holds
-    the function.
+    """Splash in fp32, forward and every gradient (the sinks' included), on
+    par from float64 with the fp32 reference attention it replaces, summed as
+    the kernel's target sums (check 1 over drawn operands, the truth attention
+    computed in float64 apart from every Dew path, `exact_value_and_grads`),
+    whose own arithmetic in float64 is first held to that truth. Each argument
+    the kernel takes, grouped key heads among them. Interpreted on a CPU, a
+    kernel's dots are XLA:CPU's, not the kernel's, so its numerics on its own
+    hardware are held by `test_splash_is_on_par_on_a_tpu`.
 
     The sinks' gradients use 52 head-unit orders on both sides. Moving
     q, k and v's units together leaves the masks and sinks intact and only
@@ -224,11 +216,32 @@ def test_splash_agrees_with_the_reference_the_oracle_holds(case):
         expected = reference(query, key, value, **structure)
     ordered = "sinks" if case in ("sinks", "sinks-window") else None
     for name, mine, theirs, wide_theirs, want in zip(names, splash, expected, twin, truth, strict=True):
+        assert mine.shape == theirs.shape == want.shape, name
         # A key's logit sums the head width, its weight the keys.
         assert_computes_the_oracle(wide_theirs, want, f"{case} {name}",
                                    roundings=query.shape[-1] + key.shape[1])
-        if name != ordered:
-            assert_agrees((mine,), (theirs,))
+    judged = [index for index, name in enumerate(names) if name != ordered]
+
+    def draw(seed):
+        query, _, _ = qkv(q_shape, jnp.float32, seed=2 * seed)
+        _, key, value = qkv(kv_shape or q_shape, jnp.float32, seed=2 * seed + 1)
+        if not sunk:
+            return query, key, value
+        return query, key, value, 2.0 + jax.random.normal(jax.random.fold_in(jax.random.PRNGKey(2), seed),
+                                                          (q_shape[2],), jnp.float32)
+
+    def leaves(run):
+        @as_given
+        def judged_leaves(query, key, value, *sinks):
+            given = {**{name: value for name, value in structure.items() if name != "sinks"},
+                     **({"sinks": sinks[0]} if sinks else {})}
+            computed = run(query, key, value, **given)
+            return tuple(computed[index] for index in judged)
+        return judged_leaves
+
+    assert_as_exact(leaves(functools.partial(value_and_grads, 'tpu')), leaves(with_fp32_sums(reference)),
+                    draw, f"interpreted splash, {case}", seeds=SPLASH_SEEDS.get(case, FEWEST_SEEDS),
+                    truth_fn=leaves(exact_value_and_grads))
     if ordered is not None:
         sinks = structure.get("sinks")
         kwargs = {name: value for name, value in structure.items() if name != "sinks"}

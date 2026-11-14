@@ -174,13 +174,14 @@ def test_a_sites_unmeasured_map_tasks_weigh_its_measured_ones_rate_not_a_record_
     assert [weighed[name] for name in names] == [40.0, 80.0, 80.0]
 
 
-def test_a_sites_map_tasks_keep_their_declared_cut_within_four_targets_and_are_cut_finer_past_them(
+def test_a_sites_map_tasks_keep_their_declared_cut_within_two_targets_and_are_cut_finer_past_them(
         ci, tmp_path):
-    """A site's map tasks keep the cut its mark declares while a task of it takes at most four of the plan's
+    """A site's map tasks keep the cut its mark declares while a task of it takes at most two of the plan's
     targets by its measured rate (`costs.SITE_TARGETS`): every map task pays the site's setup again, so cut
     down to one target, sites declared at 8 to 64 draws a task ran as 640 tasks of one or two draws, and a
-    third of the suite's check-1 seconds were their setups (2026-11-12: 56 of 167 task-hours). One whose
-    declared task passes four targets is cut finer: as many units a task as four targets hold at that rate,
+    third of the suite's check-1 seconds were their setups (2026-11-12: 56 of 167 task-hours); and its chain,
+    its longest map task then its judge, holds within a train's wall bound (2026-11-14). One whose declared
+    task passes two targets is cut finer: as many units a task as two targets hold at that rate,
     each weighed at it, its later stage later still, and none is cut coarser than declared (row 4376: a
     64-seed shard of test_recurrence_template_stability ran 966 s, the train's critical path, where every
     other group took 256 s or less)."""
@@ -193,13 +194,14 @@ def test_a_sites_map_tasks_keep_their_declared_cut_within_four_targets_and_are_c
                 if entry["python"] == "3.12" and ".draws-" in entry["split"]]
 
     declared = ["test_site.draws-0-4", "test_site.draws-4-12", "test_site.draws-12-20"]
-    # 4 seeds in 40 s: 10 s a seed, so a task of the declared 8 takes 80 s: past the 30 s target, within four.
-    assert [split for split, _, _ in maps(30.0, 40.0)] == declared
-    # 4 seeds in 80 s: 20 s a seed, the declared 8 at 160 s past four targets: 6 a task within their 120 s.
+    # 4 seeds in 28 s: 7 s a seed, so a task of the declared 8 takes 56 s: past the 30 s target, within two.
+    assert [split for split, _, _ in maps(30.0, 28.0)] == declared
+    # 4 seeds in 80 s: 20 s a seed, the declared 8 at 160 s past two targets: 3 a task within their 60 s, the
+    # first stage's 4 too.
     assert maps(30.0, 80.0) == [
-        ("test_site.draws-0-4", 80.0, False),
-        *((f"test_site.draws-{start}-{min(start + 6, 20)}", 20.0 * (min(start + 6, 20) - start), True)
-          for start in range(4, 20, 6))]
+        ("test_site.draws-0-3", 60.0, False), ("test_site.draws-3-4", 20.0, False),
+        *((f"test_site.draws-{start}-{min(start + 3, 20)}", 20.0 * (min(start + 3, 20) - start), True)
+          for start in range(4, 20, 3))]
     # 4 seeds in 4 s fit a task of the declared 8 within the target, and of no more.
     assert [split for split, _, _ in maps(30.0, 4.0)] == declared
 
@@ -220,12 +222,13 @@ def test_a_sites_map_tasks_are_cut_by_their_setup_and_draws_apart_never_task_sec
         return [(entry["split"], entry["weight"]) for entry in ci.plan(256.0, {"rows": measured})
                 if entry["python"] == "3.12" and ".draws-" in entry["split"]]
 
-    # 480 s of setup and 5 s a draw: 500 s for 4 draws, 520 s for 8.
-    assert maps({task((0, 4)): 500.0, task((4, 12)): 520.0}) == [
-        ("test_site.draws-0-4", 500.0), ("test_site.draws-4-12", 520.0), ("test_site.draws-12-20", 520.0)]
-    # 480 s of setup and 60 s a draw: draws alone would fill the target at 4, but each task pays its setup.
-    assert maps({task((0, 4)): 720.0, task((4, 12)): 960.0}) == [
-        ("test_site.draws-0-4", 720.0), ("test_site.draws-4-12", 960.0), ("test_site.draws-12-20", 960.0)]
+    # 480 s of setup and 2 s a draw: 488 s for 4 draws, 496 s for 8, within two targets.
+    assert maps({task((0, 4)): 488.0, task((4, 12)): 496.0}) == [
+        ("test_site.draws-0-4", 488.0), ("test_site.draws-4-12", 496.0), ("test_site.draws-12-20", 496.0)]
+    # 600 s of setup, past two targets alone, and 60 s a draw: a finer cut would pay its setup again for
+    # nothing, so the declared one stands.
+    assert maps({task((0, 4)): 840.0, task((4, 12)): 1080.0}) == [
+        ("test_site.draws-0-4", 840.0), ("test_site.draws-4-12", 1080.0), ("test_site.draws-12-20", 1080.0)]
 
 
 def test_a_sites_map_tasks_are_cut_by_what_their_records_say_they_paid_whatever_their_sizes(ci, tmp_path):
@@ -739,15 +742,15 @@ def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
 
 def test_a_judge_after_a_cut_finer_than_declared_is_kept_on_what_its_map_tasks_drew(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A site cut finer than its mark declares (its measured rate past four targets, `cut_draws`) is judged
+    """A site cut finer than its mark declares (its measured rate past two targets, `cut_draws`) is judged
     over the map tasks that ran, and its judge keys on their inputs whatever their spans, so it is kept whole
     as a judge after its declared cut is, and a module only its draws ran, changed, plans it again (the review
     of row 4376: a judge read its declared cut's map tasks alone, found none, and kept no key)."""
     first = ci.site_task("3.12", "tests/test_site.py", "test_site", (0, 4))
     run_cached(ci, tmp_path, monkeypatch, cache_worker, SITE, later=True, target=30.0,
                timings={"rows": {first: 160.0}})
-    # 40 s a seed: 3 a task within four targets' 120 s, 8 map tasks where the declared cut makes 3.
-    assert runs(tmp_path) == [1, 8, 1]
+    # 40 s a seed: 1 a task within two targets' 60 s, 20 map tasks where the declared cut makes 3.
+    assert runs(tmp_path) == [1, 20, 1]
     ran = replanned_once_its_draws_change(ci, tmp_path)
     assert {ci.session.SITE.fullmatch(entry["split"])["test"] for entry in ran} == {"test_site"}
 
@@ -796,7 +799,7 @@ def test_a_sites_judge_and_map_tasks_leave_its_files_cut_and_recorded_times_as_t
 
 
 def test_a_sites_map_task_past_the_target_is_reported_though_its_test_is_recorded(ci):
-    """A check-1 site's map task that runs past the plan's bound on one (four targets, `cut_draws`) is a slow
+    """A check-1 site's map task that runs past the plan's bound on one (two targets, `cut_draws`) is a slow
     test to report, though main's record holds the site's test (its whole run's time): it names its map task
     and the fix, fewer units a task, where a map task within the bound, the site's judge and a recorded test
     of a file's own row pass unreported (row 3729: a map task ran 1,366 s, and nothing said so)."""
@@ -807,6 +810,6 @@ def test_a_sites_map_task_past_the_target_is_reported_though_its_test_is_recorde
             {"name": "3.12:tests/test_other.py", "tests": {"tests/test_other.py::test_old": 240.0}}]
     base = {test: 700.0, "tests/test_other.py::test_old": 240.0}
     assert ci.slow({"rows": rows}, 120.0, base) == [
-        {"test": test, "file": "tests/test_site.py", "seconds": 600.0, "target": 480.0,
+        {"test": test, "file": "tests/test_site.py", "seconds": 600.0, "target": 240.0,
          "map_task": "3.12:tests/test_site.py#test_site.draws-0-512",
          "fix": "fewer units a task (per_task, conditioning_per_task)"}]

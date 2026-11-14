@@ -14,7 +14,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import as_given, assert_as_exact, widened
+from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
 
 
 def allocated_bytes(monkeypatch, operation):
@@ -163,6 +163,80 @@ def torch_arms(reference, truth, *, widening=None):
         return given
 
     return arm(reference, contextlib.nullcontext), arm(truth, float64 if widening is None else widening)
+
+
+def dtype_arms(run):
+    """`run(dtype, *inputs)` in float32, and in float64 inside `float64` (`torch_arms`)."""
+    import torch
+
+    return torch_arms(lambda *inputs: run(torch.float32, *inputs),
+                      lambda *inputs: run(torch.float64, *inputs))
+
+
+def torch_coder_walk(model, call, dtype, inputs) -> dict:
+    """A source autoencoder's vector-Jacobian product, as check 1 compares it (`coder_walk`): `call(model,
+    operand)`'s outputs, a tuple, over a draw's channel-first `operand` at `dtype`, under the draw's
+    `probes`, differentiated for the operand and every parameter the source trains
+    (`reference_error.torch_with_gradients`, the parameters swapped in by `torch.func.functional_call`):
+    the outputs and the operand's gradient channels last, each parameter's gradient by its name."""
+    import torch
+
+    class Walked(torch.nn.Module):
+        """`call(model, operand)` as a module's forward, whose parameters `functional_call` swaps."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = model
+
+        def forward(self, operand):
+            return call(self.model, operand)
+
+    walked = Walked()
+    weights = {f"model.{name}": value.detach().numpy() for name, value in model.named_parameters()
+               if value.requires_grad}
+
+    def forward(operand, weights):
+        return torch.func.functional_call(walked, weights, (operand,))
+
+    width = np.float64 if dtype == torch.float64 else np.float32
+    # Its own graph: a torch arm runs under `torch.no_grad` (`torch_arms`).
+    with torch.enable_grad():
+        outputs, grad_operand, grad_weights = torch_with_gradients(forward)(
+            np.asarray(inputs["operand"], width), weights, tuple(inputs["probes"]))
+    return {"outputs": tuple(channels_last(output) for output in outputs),
+            "operand": channels_last(grad_operand),
+            "parameters": {name.removeprefix("model."): gradient for name, gradient in grad_weights.items()}}
+
+
+def coder_walk(call, params, layouts):
+    """Dew's arm of a source autoencoder's vector-Jacobian product (`torch_coder_walk`), run as given:
+    `call(params, operand)`'s outputs, a tuple, over a draw's channel-first `operand` moved channels last,
+    under its probes (`reference_error.with_gradients`), each of `layouts`' parameters' gradient written
+    into its source tensor's layout as an export writes it, by the source tensor's name."""
+    pulled = jax.jit(with_gradients(call))
+
+    @as_given
+    def walked(inputs):
+        probes = tuple(channels_last(probe) for probe in inputs["probes"])
+        outputs, grad_params, grad_operand = pulled(params, channels_last(inputs["operand"]), probes)
+        exported = {"autoencoder": grad_params}
+        return {"outputs": tuple(np.asarray(output) for output in outputs),
+                "operand": np.asarray(grad_operand),
+                "parameters": {layout.name.removeprefix("vae/"): np.asarray(layout.export(exported))
+                               for layout in layouts}}
+    return walked
+
+
+def coder_draw(salt: int, operand: tuple[int, ...], outputs: tuple[tuple[int, ...], ...], *, uniform: bool):
+    """Check 1's draw of a coder walk (`coder_walk`): a channel-first operand of shape `operand`, pixels
+    uniform in [-1, 1] where `uniform` else a standard normal code, and a standard normal probe of each of
+    `outputs`' shapes, a stream of its own by `salt`."""
+    def draw(seed):
+        generator = np.random.default_rng([salt, seed])
+        given = (generator.uniform(-1, 1, operand) if uniform else generator.standard_normal(operand))
+        return ({"operand": given.astype(np.float32),
+                 "probes": tuple(generator.standard_normal(shape).astype(np.float32) for shape in outputs)},)
+    return draw
 
 
 def transformers_arms(model, run, *, source=None, twin=None):

@@ -27,11 +27,14 @@ from dew import communicators
 from dew._cache import enable_compilation_cache, persist_compilations
 from dew._coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew._devices import (
+    DEW_SHARE,
+    FRACTIONS,
     apply_xla_flags,
     backend_open,
     cuda_plugin,
     flags_hold,
     flags_set,
+    pool_statement,
     preallocate_gpu_pool,
     refuse_cpu_only_jax,
     refuse_unsafe_cublas,
@@ -133,9 +136,35 @@ def unprepared(multi_host: bool | None, xla_flags: str | None,
     return missed
 
 
+_POOLED: list[bool] = []
+"""Whether this process's pool was decided (`pooled`), by its preparation or its first run."""
+
+
+def pooled(*, joins: bool) -> None:
+    """Decide XLA's pool once, before the backend opens: Dew's share written unless the run named a fraction
+    (`preallocate_gpu_pool`), sized on a host of several GPUs to leave its communicators room
+    (`dew.communicators.sized_pool`) unless the process `joins` a pool of processes, whose communicators
+    span hosts. A process whose backend opened first keeps the pool it took, its plans stating it
+    (`dew._devices.pool_statement`)."""
+    if _POOLED:
+        return
+    _POOLED.append(True)
+    if backend_open():
+        if pool_statement()["source"] == "jax" and cuda_plugin():
+            _log.warning("JAX's backend opened before Dew sized its GPU pool, so this run's plans are held "
+                         "to JAX's 75%% of each GPU; import dew before any JAX computation, or set %s=%s "
+                         "before the process starts, for Dew's", FRACTIONS[1], DEW_SHARE)
+        return
+    preallocate_gpu_pool()
+    if not joins:
+        communicators.hold(communicators.sized_pool())
+
+
 def ready_process() -> None:
-    """What every Dew run needs of its process and `import dew` leaves alone: Dew's log handler
-    (`dew._logging.configure`), the persistent compilation cache under the user's cache directory
+    """What every Dew run needs of its process and `import dew` leaves alone: its pool decided where nothing
+    has (`pooled`: a Trainer's run that opens the backend itself sizes it as `prepare_process` does, one
+    that joined a pool of processes itself as a joining process), Dew's
+    log handler (`dew._logging.configure`), the persistent compilation cache under the user's cache directory
     (`dew._cache.persist_compilations`), which a run's own directory, a pool whose processes do not
     share it, or JAX_ENABLE_COMPILATION_CACHE=false leaves alone, and the refusal of a machine with
     an NVIDIA GPU whose JAX opened with none (`dew._devices.refuse_cpu_only_jax`) and of a GPU holding
@@ -143,6 +172,8 @@ def ready_process() -> None:
     backend, so the cache's flags come first. `prepare_process` readies the process once
     its flags are set and its pool joined, and `Trainer.fit` readies one no `prepare_process` did;
     each step is idempotent."""
+    # A process that joined its pool of processes itself (`jax.distributed.initialize`) joins one.
+    pooled(joins=jax.distributed.is_initialized())
     configure_logging()
     persist_compilations()
     refuse_cpu_only_jax()
@@ -171,9 +202,7 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
         _log.warning("XLA_FLAGS %r cannot be shown to have been set before the process loaded jaxlib, "
                      "whose XLA may have parsed its flags since: they are unproven. Set XLA_FLAGS before "
                      "the process starts, as `dew train` does, to make them certain", xla_flags)
-    preallocate_gpu_pool()
-    if not joins:
-        communicators.hold(communicators.sized_pool())
+    pooled(joins=joins)
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)
 

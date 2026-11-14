@@ -29,7 +29,14 @@ from attention_oracle import (
 )
 from contract_support import normal_drawn
 from flax import linen as nn
-from reference_error import as_given, assert_as_exact, widened, with_gradients
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_computes_the_oracle,
+    chain_roundings,
+    widened,
+    with_gradients,
+)
 
 from dew.nn import kernels
 from dew.nn.attention import scaled_dot_product_attention, weighted_values
@@ -718,9 +725,13 @@ def test_a_query_reading_another_sequences_documents_reads_its_own_documents_key
         np.testing.assert_array_equal(out[0, 2:3], 0)
         np.testing.assert_array_equal(out[0, 4:], 0)
         np.testing.assert_array_equal(pull(jnp.ones_like(out))[0][0, 2:3], 0)
+        roundings = chain_roundings(jax.make_jaxpr(lambda q: attend(
+            q, key, value, segment_ids=queries, key_segment_ids=keys, max_segments=3))(query))
         for asking, read in ((slice(0, 2), slice(0, 3)), (slice(3, 4), slice(3, 5))):
-            np.testing.assert_allclose(out[:, asking], attend(query[:, asking], key[:, read], value[:, read]),
-                                       rtol=1e-12, atol=1e-14)
+            assert_computes_the_oracle(np.asarray(out[:, asking]),
+                                       np.asarray(attend(query[:, asking], key[:, read], value[:, read])),
+                                       f"queries {asking} over their document's keys {read}",
+                                       roundings=roundings)
 
 
 TPU_DOCUMENT_SEEDS = 8
@@ -783,7 +794,7 @@ def test_key_lengths_attend_as_the_mask_they_mean(implementation, causal):
     past = jnp.arange(9)[None, :, None, None] >= lengths[:, None, None, None]
     moved = key_length_call(implementation, query, jnp.where(past, 3.0, key),
                             jnp.where(past, -2.0, value), lengths, causal=causal)
-    np.testing.assert_allclose(moved[0], by_length[0], atol=1e-6, rtol=1e-6)
+    np.testing.assert_array_equal(moved[0], by_length[0])
     for gradient in by_length[2:]:
         assert not np.asarray(gradient)[np.asarray(past)[:, :, 0, 0]].any()
 

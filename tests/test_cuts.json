@@ -18,10 +18,7 @@
 "tests/test_algebra_fusion.py::test_a_plain_programs_product_runs_the_template_its_call_names[grouped-fast]"
 ],
 "tests/test_algebra_scan.py": [
-"tests/test_algebra_scan.py::test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient[kimi_delta]",
-"tests/test_algebra_scan.py::test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient[kimi_delta_float16]",
-"tests/test_algebra_scan.py::test_the_delta_rules_chunk_adjoint_is_the_token_scans_gradient[kimi_delta]",
-"tests/test_algebra_scan.py::test_the_delta_rules_derived_chunks_compute_their_token_scans[gated_delta]"
+"tests/test_algebra_scan.py::test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient[kimi_delta]"
 ],
 "tests/test_architectures.py": [
 "tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer+gemma4_moe]",
@@ -309,8 +306,8 @@
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-Kept.NONE-softcap-sinks-alibi-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-Kept.OUTPUT-none-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-Kept.OUTPUT-softcap-bfloat16]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-Kept.SPLIT-none-bfloat16]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-Kept.SPLIT-softcap-sinks-alibi-bfloat16]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-Kept.SPLIT-key-bias-bfloat16]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-Kept.SPLIT-softcap-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-256-Kept.NONE-softcap-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-Kept.NONE-none-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-Kept.NONE-temperature-bfloat16]",
@@ -660,9 +657,6 @@
 "tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[normal-second orders, staged]",
 "tests/test_contracts_recurrence.py::test_the_ssd_port_holds_its_orders[near the least normal-jvp of grad]",
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[near the least normal-second orders, staged]"
-],
-"tests/test_cpu_only_jax.py": [
-"tests/test_cpu_only_jax.py::test_a_run_stops_where_the_gpu_would_sit_idle_and_import_dew_does_not[prepare-cpu]"
 ],
 "tests/test_cross_attention.py": [
 "tests/test_cross_attention.py::test_a_decoder_reads_a_context_of_its_own_tokens_by_its_table_or_its_own_pass",
@@ -1606,9 +1600,6 @@
 "tests/test_kernel_matrix.py::test_a_familys_cells_cover_every_pair_of_axis_values_its_route_serves_and_nothing_else[recurrence_tpu]",
 "tests/test_kernel_matrix.py::test_every_matrix_flow_is_a_test_its_tier_selects[gpu]"
 ],
-"tests/test_kernel_spills.py": [
-"tests/test_kernel_spills.py::test_a_run_steps_its_spilling_launch_down_and_trains"
-],
 "tests/test_kimi_k3.py": [
 "tests/test_kimi_k3.py::test_forward_and_cached_decode_match_the_reference_over_left_padding",
 "tests/test_kimi_k3.py::test_greedy_generation_and_decode_steps_match_the_reference",
@@ -1632,9 +1623,6 @@
 "tests/test_layer_stack.py::test_runs_of_like_layers_scan_and_the_rest_unroll[deepseek]",
 "tests/test_layer_stack.py::test_runs_of_like_layers_scan_and_the_rest_unroll[deepseek_widths]",
 "tests/test_layer_stack.py::test_runs_of_like_layers_scan_and_the_rest_unroll[gemma4]"
-],
-"tests/test_layout_counts.py": [
-"tests/test_layout_counts.py::test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupted_read[first-fit-2-indexed]"
 ],
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp4]"
@@ -1737,9 +1725,6 @@
 "tests/test_mamba2.py::test_one_recurrent_step_matches_selective_state_update",
 "tests/test_mamba2.py::test_the_chunk_size_does_not_change_the_scan[256]",
 "tests/test_mamba2.py::test_the_layer_matches_mamba2_mixer"
-],
-"tests/test_mamba3.py": [
-"tests/test_mamba3.py::test_a_mimo_layer_draws_as_its_full_forward_scores"
 ],
 "tests/test_mamba_ssd.py": [
 "tests/test_mamba_ssd.py::test_a_packed_calls_skip_gradient_on_the_template_is_as_exact_as_on_mamba_ssms_port",
@@ -1970,9 +1955,6 @@
 "tests/test_mosaic_toolkit.py": [
 "tests/test_mosaic_toolkit.py::test_a_quantized_stage_converts_into_the_tile_its_products_read[sm80-int8-unscaled]"
 ],
-"tests/test_mtp.py": [
-"tests/test_mtp.py::test_the_term_adds_the_weighted_mean_depth_cross_entropy[mean_stream_trunk]"
-],
 "tests/test_multimodal_model.py": [
 "tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[llama4-gradient]",
 "tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[llama4-inputs]",
@@ -2149,7 +2131,7 @@
 "tests/test_perturbation.py::test_the_estimate_is_the_gradient_in_expectation[trailing-general]"
 ],
 "tests/test_pipeline_core.py": [
-"tests/test_pipeline_core.py::test_a_memory_loader_holds_the_rows_it_made_and_lets_the_read_it_made_them_from_go[False]"
+"tests/test_pipeline_core.py::test_a_memory_mix_with_a_member_that_accepts_no_row_compiles_and_reads_the_others"
 ],
 "tests/test_pipeline_golden.py": [
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[images_arrayrecord-workers=2,shares=2]",
@@ -2221,9 +2203,6 @@
 "tests/test_quantization_sites.py::test_the_scanned_stack_quantizes_each_layer_with_its_own_scales[tiny]",
 "tests/test_quantization_sites.py::test_the_served_pipeline_quantizes_as_the_loaded_model[e4m3]",
 "tests/test_quantization_sites.py::test_the_served_pipeline_quantizes_as_the_loaded_model[unrounded]"
-],
-"tests/test_qwen4_exp.py": [
-"tests/test_qwen4_exp.py::test_images_and_a_video_read_through_the_processor_as_transformers_reads_them"
 ],
 "tests/test_qwen_image_source.py": [
 "tests/test_qwen_image_source.py::test_a_published_qwen_image_prompt_walked_alone_matches_the_source",
@@ -2409,6 +2388,9 @@
 "tests/test_recurrence_witness.py::test_a_grouped_backwards_records_lie_in_their_key_heads_enclosures[keys gated-sm80]",
 "tests/test_recurrence_witness.py::test_an_amperes_inference_forward_is_witnessed_as_its_states_and_output_launches"
 ],
+"tests/test_recurrent_sequence_split.py": [
+"tests/test_recurrent_sequence_split.py::test_a_delta_rule_split_over_the_sequence_runs_its_rows_as_whole_ones[kimi delta attention-all_valid]"
+],
 "tests/test_reference_runs.py": [
 "tests/test_reference_runs.py::test_lm_fine_tune_steps_are_as_exact_as_torch",
 "tests/test_reference_runs.py::test_packed_documents_give_every_step_the_work_counted_for_one"
@@ -2532,9 +2514,6 @@
 "tests/test_samplers.py::test_every_registered_solver_samples_its_processes_and_refuses_the_rest[unmask]",
 "tests/test_samplers.py::test_heun_walks_edms_algorithm_2_with_its_churn[deterministic]",
 "tests/test_samplers.py::test_solver_matches_diffusers_latents_and_gradient[deis.3_short]"
-],
-"tests/test_saved_models.py": [
-"tests/test_saved_models.py::test_a_jepa_run_exports_and_loads_as_its_encoder"
 ],
 "tests/test_saved_runs.py": [
 "tests/test_saved_runs.py::test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_from_its_record[decision]",
@@ -2730,9 +2709,6 @@
 "tests/test_speculative.py::test_tree_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk[dspark]",
 "tests/test_speculative.py::test_tree_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk[recurrent]",
 "tests/test_speculative.py::test_tree_speculation_reproduces_the_greedy_walk_to_the_end_of_its_cache[two-two-one-2]"
-],
-"tests/test_ssd_kernel.py": [
-"tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[fixture-one-chunk-resets]"
 ],
 "tests/test_stage_local.py": [
 "tests/test_stage_local.py::test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own",
