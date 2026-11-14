@@ -123,8 +123,10 @@ def gated_case(x: jax.Array, projections_: Sequence[nn.Module], activation: str,
     `activation`'s clamped at `limit`."""
     gate, _, down = projections_
     found = projections_of(projections_)
+    # A kernel a wrapper owns the products of (a served model's quantized kernel, `found.intercepted`) is
+    # the wrapper's to read, never an array of the products' dtype.
     kernels = ([meta.unbox(projection.get_variable('params', 'kernel')) for projection in (gate, down)]
-               if found.held else None)
+               if found.held and not found.intercepted else None)
     dtype = canonicalize_dtype(x, *(kernels or ()), dtype=gate.dtype)
     return GatedCase(
         projections=found,
