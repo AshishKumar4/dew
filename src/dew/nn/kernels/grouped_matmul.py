@@ -2352,30 +2352,14 @@ Nothing is ranked at runtime. A
 call the template cannot run (its legality) takes the next route in `GROUPED`'s order, which is no cell of
 this list."""
 
-HELD: dict[tuple[str | None, Kind], tuple[int, str]] = {
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT)): (
-        1, "XLA's dot of each layer's kernel gradient deferred to the backward's end on this tree, each "
-           "layer's cotangent held to it (a 6-layer stack, compile-only: 184.5 MB of temporaries against the "
-           "template's 100.7; the 4B step on a GH200: 21.00 GB against 12.16, where main's bebce1c53 held "
-           "11.37 with the same cell, a cause under bisect)"),
-    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216))): (
-        1, "the 4B's up and gate kernel gradients' cotangents held to the backward's end, as the generic "
-           "cell's"),
-    ('tcgen05', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216))): (
-        1, "the 4B's up and gate kernel gradients' cotangents held to the backward's end: its step on a B200 "
-           "compile-only 22.25 GB of temporaries against 11.06 GB on the template"),
-    ('tcgen05', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024))): (
-        1, "the 4B's key and value kernel gradients' cotangents held to the backward's end, beside the up "
-           "and gate cell's"),
-    ('mma.sync', Kind(dense=True, made=Made.KERNEL_GRADIENT)): (
-        1, "XLA's dot of each layer's kernel gradient deferred to the backward's end, each layer's cotangent "
-           "held to it: Llama-3-8B's MLP at 8192 tokens 32 x 2 x 8192 x 14336 bf16, 15 GiB"),
-}
+HELD: dict[tuple[str | None, Kind], tuple[int, str]] = {}
 """The step memory a declared cell's route holds beyond the template's, which its receipt states beside its
-time (row 5972's P0: the B200's and GH200's kernel-gradient cells held the 4B's every layer's dgate and dup to
-the backward's end, a four-row step's temporaries 22.25 GB against 11.06 on the template): (instruction
-family, kind of call) to (the outputs of its call each layer holds, the receipt's statement). A cell absent
-holds none (tests/test_declared_cells_memory.py)."""
+time: (instruction family, kind of call) to (the outputs of its call each layer holds, the receipt's
+statement); none. XLA's dot of a kernel gradient was put off to the step's end, every layer's cotangent held
+to it (row 6027: the 4B's every layer's SwiGLU backward pair beside the template's input gradient, a four-row
+step's temporaries 80.50 GB on a compile-only GH200 against its parent's 20.42), until each product's reverse
+mode left its rows' cotangent only with its kernel gradient formed (`gemm.in_layer`), whichever route takes
+it. A cell absent holds none (tests/test_declared_cells_memory.py)."""
 
 
 GROUPED: selection.Op[GroupedCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
