@@ -23,6 +23,7 @@ from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from dew._coordination import from_every_process
 from dew._files import write_atomically
 from dew._records import JSON, number, record
+from dew.algebra.program import replaying
 from dew.batch import EXAMPLE_ROWS, Batch, Variables
 from dew.data.dataset import (
     Checkpointable,
@@ -37,7 +38,7 @@ from dew.data.dataset import (
 from dew.distributed.batches import Signature
 from dew.distributed.placement import Layout, Placement, link_topology, placed_shapes
 from dew.mesh import STAGE_AXIS, LayoutRefused, batch_axes
-from dew.nn.kernels.options import OuterProgram, Placements, owned_program
+from dew.nn.kernels.options import Compiling, OuterProgram, Placements, compiling, owned_program
 from dew.nn.sharding import microbatched
 from dew.objectives.base import Initializer
 from dew.state import TrainState, apart, together
@@ -485,18 +486,42 @@ def start_compiled(initial_state: Callable[[Initializer, jax.Array], TrainState]
     """The program `placed_start` runs to build a fresh state on `mesh` (`_start`), compiled through Dew's
     compile point over the shapes of its arguments (`held_shapes`, `key`'s): what a run compiled ahead
     compiles of its start, whose devices compile none of it (`dew.training.ahead.AheadOfTime.starts`)."""
+    program, arguments = _start_shapes(initial_state, initializer, abstract, shardings, through, mesh)
+    return program.compiled(*arguments, key)
+
+
+def start_compiling(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
+                    key: jax.ShapeDtypeStruct, abstract: TrainState, shardings: Placement[TrainState],
+                    through: Mapping[int, int], mesh: Mesh) -> Compiling:
+    """`start_compiled`'s program lowered and its compile begun in a thread of its own (`compiling`): a run
+    compiled ahead compiles its start beside its step's planning, which reads none of it, and takes it
+    where `start_compiled` lowers it (`attempting`). A Qwen3.5-4B's start took 97 s to compile for an
+    H100 after its step's 110 s."""
+    program, arguments = _start_shapes(initial_state, initializer, abstract, shardings, through, mesh)
+    return compiling(program, *arguments, key)
+
+
+def _start_shapes(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
+                  abstract: TrainState, shardings: Placement[TrainState], through: Mapping[int, int],
+                  mesh: Mesh) -> tuple[OuterProgram, tuple[list, list]]:
+    """The start's program and its held tree's two trees' shapes (`held_shapes`): what `start_compiled`
+    compiles over them and the key."""
     start = _start(initial_state, initializer, shardings, through)
     taken, kept = held_shapes(initializer, abstract.variables, shardings.variables, mesh, start.shared)
-    return start_program(start.function, start.out_shardings, taken).compiled(
-        _held_leaves(taken), _held_leaves(kept), key)
+    program = start_program(start.function, start.out_shardings, taken)
+    return program, (_held_leaves(taken), _held_leaves(kept))
 
 
 def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-                 key: jax.Array) -> tuple[TrainState, dict[int, int]]:
-    """The shapes of the fresh state `initial_state` builds, and which of its frozen leaves are the
-    initializer's arrays as they are: each such leaf's index among the frozen tree's leaves, to the
-    index of the initializer's leaf it is. An init that returns a held leaf as it is, by reference,
-    passes it through (`Objective.held_variables`); one trace finds both."""
+                 key: jax.Array
+                 ) -> tuple[TrainState, dict[int, int], Callable[[Initializer, jax.Array], TrainState]]:
+    """The shapes of the fresh state `initial_state` builds, which of its frozen leaves are the
+    initializer's arrays as they are, and its build replayed from the program its one trace made: each
+    passed leaf's index among the frozen tree's leaves, to the index of the initializer's leaf it is. An
+    init that returns a held leaf as it is, by reference, passes it through (`Objective.held_variables`);
+    one trace finds all three, and the start's program (`placed_start`, `start_compiled`) traces its
+    replay (`dew.algebra.program.replaying`), which runs no model code: a 4B decoder's init traced twice
+    took 41 and 36 s on a B200 host before its first step."""
     through: dict[int, int] = {}
 
     def traced(initializer: Initializer, key: jax.Array) -> TrainState:
@@ -506,7 +531,9 @@ def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], 
         through.update({index: inputs[id(leaf)] for index, leaf in enumerate(frozen) if id(leaf) in inputs})
         return state
 
-    return jax.eval_shape(traced, initializer, key), through
+    trace = owned_program(traced).trace(initializer, key)
+    abstract = trace.out_info
+    return abstract, through, replaying(trace.jaxpr, jax.tree.structure(abstract), (), ())
 
 
 def placed_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,

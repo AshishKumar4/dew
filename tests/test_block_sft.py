@@ -37,7 +37,7 @@ from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.base import Step, model_rngs
 from dew.objectives.diffusion.block import BlockDiffusionObjective, _cache_geometry
 from dew.objectives.lm.chunked import chunked_tile, model_logits
-from dew.optim import scale_by_qk_clip, stepped
+from dew.optim import post_step_order, scale_by_qk_clip, stepped
 from dew.training import MeshSpec
 from dew.training.transaction import compact_qk, example_fields
 
@@ -841,7 +841,8 @@ def assert_clipped_at_the_maxima(start, opt_state, final, clip_state, handed, li
     zero = jax.tree.map(np.zeros_like, start["params"])
     applied, after = jax.jit(qk_clip(limit).update)(zero, opt_state, start["params"], qk_stats=handed)
     jax.tree.map(np.testing.assert_array_equal, clip_state, jax.tree.map(np.asarray, after))
-    expected = jax.tree.map(np.asarray, stepped(start["params"], applied, opt_state, after))
+    expected = jax.tree.map(np.asarray, stepped(start["params"], applied, opt_state, after,
+                                                post_step_order(qk_clip(limit), start["params"])))
     jax.tree.map(np.testing.assert_array_equal, final["params"], expected)
     assert any(not np.array_equal(moved, before) for moved, before in
                zip(jax.tree.leaves(final["params"]), jax.tree.leaves(start["params"]), strict=True))
