@@ -726,23 +726,28 @@ def _padded(rows: int, family) -> int:
     return -(-rows // family.rows) * family.rows
 
 
-def _persisted_products(x, w, *, family, interpret, rows: int | None = None, resident: int = 1):
+def _persisted_products(x, w, *, family, interpret, rows: int | None = None, resident: int = 1,
+                        once: bool = False):
     """`x @ w` a tile at a time through `family`'s persistent walk (`Family.persist`): each tile the
     family's least rows covering `rows` (its own least where None; `_padded`), of which it stores `rows`,
     tile `t` the tiles' rows `t` on, each step `PERSISTED_DEPTH` of the contraction, the middle tile
     multiplying nothing (zeros); each tile issued (`issue`'s walk) and finished (`Issuer.chunks`, each
-    chunk stored at its columns), on the family's roles, launched for `resident` programs a multiprocessor."""
+    chunk stored at its columns), on the family's roles, launched for `resident` programs a multiprocessor.
+    With `once`, each tile's `x` block is its first step's, loaded once at the tile's start (`persist`'s
+    `once`) and read by every step: `x[:, :PERSISTED_DEPTH] @` the sum of `w`'s step blocks."""
     stored = family.rows if rows is None else rows
     rows, columns = _padded(stored, family), w.shape[1]
     family = family.specialized(rows, columns)
     shape = (rows, columns)
-    blocks = {'x': ((rows, PERSISTED_DEPTH), x.dtype), 'w': ((PERSISTED_DEPTH, columns), w.dtype)}
+    left = {'x': ((rows, PERSISTED_DEPTH), x.dtype)}
+    blocks = {**({} if once else left), 'w': ((PERSISTED_DEPTH, columns), w.dtype)}
 
     def body(x_gmem, w_gmem, o_gmem):
         def scope(*, streams):
             def schedule(index):
                 tile = index[0]
-                views = {'x': (x_gmem, lambda j: (tile, j)), 'w': (w_gmem, lambda j: (j, 0))}
+                views = {'x': (x_gmem, (lambda j: (tile, 0)) if once else (lambda j: (tile, j))),
+                         'w': (w_gmem, lambda j: (j, 0))}
                 return tile != 1, PERSISTED_STEPS, views, tile
 
             def issue(wg, tile, walk, *, active):
@@ -755,10 +760,12 @@ def _persisted_products(x, w, *, family, interpret, rows: int | None = None, res
                 for first, (value,) in family.chunks(accs):
                     store(0, value, o_gmem, (tile * rows, 0, stored, first, rows))
 
-            family.persist(streams, (PERSISTED_TILES,), schedule, issue, finish, consumers=1, axis="programs",
-                           outputs=((shape, jnp.float32),), interpret=interpret, accumulators=(shape,))
+            family.persist(streams["walked"], (PERSISTED_TILES,), schedule, issue, finish, consumers=1,
+                           axis="programs", outputs=((shape, jnp.float32),), interpret=interpret,
+                           accumulators=(shape,), once=streams["once"] if once else None)
 
-        family.scoped(scope, streams=family.streams(blocks, 2, 1))
+        family.scoped(scope, streams={"walked": family.streams(blocks, 2, 1),
+                                      **({"once": family.streams(left, 1, 1)} if once else {})})
 
     out = jax.ShapeDtypeStruct((PERSISTED_TILES * rows, columns), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
@@ -786,6 +793,24 @@ def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_i
     with generation.assumed("sm100"):
         got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED))
     expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+    expected[family.rows:2 * family.rows] = 0
+    np.testing.assert_array_equal(got, expected)
+
+
+@INTERPRETS
+def test_a_persistent_tiles_once_stream_loads_once_and_every_step_reads_it():
+    """Interpreted: a persistent walk on tcgen05's bundle whose tiles' left operand is a once stream
+    (`Family.persist`'s `once`): each tile's block loaded once at its start, outside the ring, and read by
+    every step beside the ring's right blocks, over three tiles (the one-deep slot turning each tile) with
+    the middle one multiplying nothing: each tile's rows its block times the sum of the steps' blocks."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.RINGS
+    x, w = _persisted_operands(family.rows)
+    with generation.assumed("sm100"):
+        got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED, once=True))
+    left = np.asarray(x, np.float32)[:, :PERSISTED_DEPTH]
+    steps = np.asarray(w, np.float32).reshape(PERSISTED_STEPS, PERSISTED_DEPTH, -1).sum(axis=0)
+    expected = left @ steps
     expected[family.rows:2 * family.rows] = 0
     np.testing.assert_array_equal(got, expected)
 

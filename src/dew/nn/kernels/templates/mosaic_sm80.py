@@ -622,9 +622,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
-                pingpong: bool = False) -> None:
+                pingpong: bool = False, once=None) -> None:
         del producer  # no producer role of its own
         self.pingponged(pingpong)
+        self.onced(once)
         # Each tile's pipeline fills and drains before its output copy. Synchronize at that lifetime
         # boundary so the output's shared memory can reuse the pipeline's slots.
         del in_flight, unrolled, accumulators  # its walk carries its accumulators

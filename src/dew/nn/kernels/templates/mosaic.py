@@ -1476,6 +1476,9 @@ class Transport[Allocated, Opened](abc.ABC):
     `pingpong`): where a producer of its own loads every tile's steps (`RingFamily`'s), so neither consumer
     loads a tile its partner walks."""
 
+    takes_once: bool = False
+    """Whether a persistent tile's once streams load at its start outside its ring (`persist`'s `once`)."""
+
     fixes_up: bool = False
     """Whether a tile's steps may be walked by several programs in turn (`tail.Tail`), each leaving its fp32
     partial in global memory and the last to arrive at the tile's GPU-scope counter merging them
@@ -1732,7 +1735,7 @@ class Transport[Allocated, Opened](abc.ABC):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
-                pingpong: bool = False) -> None:
+                pingpong: bool = False, once=None) -> None:
         """A persistent kernel's tiles, the grid `tiles` spread over the launch's programs along `axis`, its
         streams (`streams`, as `scoped` hands them) running on across them: `schedule(index)` gives a tile's
         `(active, steps, views, tile)`, whether it streams anything, its step count, each stream's view
@@ -1755,7 +1758,11 @@ class Transport[Allocated, Opened](abc.ABC):
         `resources.producer_floor` where None), the floor its launch plans with; a family without a producer
         role takes none. With `pingpong`, on a family that takes it (`takes_pingpong`), its two consumers take
         alternate tiles whole, their products in turn (`persistent.consumed`'s `turns`), each consumer's tile
-        its own share (`gemm.mosaic_gpu.Tiles.pingpong`)."""
+        its own share (`gemm.mosaic_gpu.Tiles.pingpong`). With `once` (streams as `scoped` hands them, one
+        deep), on a family that takes them (`takes_once`), each tile's block of each once stream is loaded
+        once at the tile's start, outside its ring, and every step of the tile reads it by its name among the
+        step's slots (`views` holds its view, step 0's tile): a tile's operands its steps all read (a
+        recurrence's queries and keys across its value heads) ride no ring step by step."""
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
@@ -1858,6 +1865,11 @@ class Transport[Allocated, Opened](abc.ABC):
         del rewrites
         self.pingponged(pingpong)
         return ((self.meeting(consumers),) if pingpong else ()), 0
+
+    def onced(self, once) -> None:
+        """Refuse `once` streams on a family that takes none (`takes_once`)."""
+        if once is not None and not self.takes_once:
+            raise NotImplementedError(f"{self.name} loads no persistent tile's once streams")
 
     def pingponged(self, pingpong: bool) -> None:
         """Refuse `pingpong` on a family that takes none (`takes_pingpong`): a consumer-fed ring's partner
@@ -2215,8 +2227,9 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
-                pingpong: bool = False) -> None:
+                pingpong: bool = False, once=None) -> None:
         del accumulators  # its consumers' walks carry their own
+        self.onced(once)
         self.pingponged(pingpong)
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
         # a tile's first loads go out while the consumers store the last one (`_tiled`).

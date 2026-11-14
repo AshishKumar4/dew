@@ -101,6 +101,16 @@ def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
             ring.load(ring.turn(counter + step), ring.viewed(views[name], step))
 
 
+def loaded_once(rings: dict, done, active, views: dict) -> None:
+    """A producer's loads of one persistent tile's once streams (`Family.persist`'s `once`): each its block,
+    which every step of the tile reads, into its one-deep ring at the tile's turn (`done`, the active tiles
+    before it), none where the tile streams nothing."""
+    @pl.when(active)
+    def _():
+        for name, ring in rings.items():
+            ring.load(ring.turn(done), ring.viewed(views[name], 0))
+
+
 def streamed(rings: tuple, views, lo, hi) -> None:
     """A producer's loads of steps `lo` to `hi` into `rings`, each ring's step counted from `lo` and loaded
     from its view of `views(step)`, then each ring drained."""
