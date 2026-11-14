@@ -414,10 +414,11 @@ def chunked(value: jax.Array, view, smem) -> list[tuple[jax.Array, Ref]]:
     return [(piece, view.at[..., pl.ds(first, width)]) for first, piece in column_chunks(value, width)]
 
 
+@emission.stating(lambda: Work())
 def _fenced(ctx) -> None:
     """An inline body (`plgpu.inline_mgpu`) ordering the thread's global writes the async proxy made (TMA's)
     before its generic loads (PTX's `fence.proxy.async.global`); it returns nothing, an inline body's
-    results its returned values alone."""
+    results its returned values alone. A fence alone: no work a count prices."""
     del ctx
     nvvm.fence_proxy(nvvm.ProxyKind.async_global)
 
@@ -762,6 +763,8 @@ class Issuer[Accumulator](abc.ABC):
             taken = group + jnp.clip(rows % period - shift, 0, period - 1)
             return jnp.take_along_axis(tile, taken, axis=0)
 
+        # A warp's shuffles: values moved between its lanes' registers, no work a count prices.
+        @emission.stating(lambda array, by: Work())
         def shifted(ctx, array, by):
             del ctx
             [value] = by.registers.flat
@@ -1377,17 +1380,12 @@ class Issuer[Accumulator](abc.ABC):
         (`column_scratch` fp32 entries), as the block's other warpgroups reduce at once."""
         if interpret:
             return value.sum(axis=0)
-
-        def sums(ctx, tile, scratch):
-            del ctx
-            return tile.reduce("add", axis=0, scratch=scratch)
-
         # Mosaic GPU's own reduction across the warps, through the given scratch; inline_mgpu passes the
         # launch context first and takes the tile and its scratch.
         summed: Callable[..., jax.Array] = plgpu.inline_mgpu(
             arg_types=(self.layout, plgpu.RefType()),
             return_type=plgpu.ShapeDtypeStruct((value.shape[1],), jnp.dtype(jnp.float32),
-                                               layout=self.column))(sums)
+                                               layout=self.column))(_column_sums)
         return summed(value, scratch)
 
     def as_row(self, vector: jax.Array) -> jax.Array:
@@ -1398,6 +1396,14 @@ class Issuer[Accumulator](abc.ABC):
         """`value` `[rows, columns]` in the accumulator's layout, whatever its own (a walk's carry, a TF32
         product's accumulator on mma.sync)."""
         return plgpu.layout_cast(value, self.layout)
+
+
+@emission.stating(lambda tile, scratch: Work(operations=math.prod(tile.shape)))
+def _column_sums(ctx, tile, scratch):
+    """A tile's column sums across the warps holding its rows (`Issuer.column_sums`), inlined: a reduction,
+    one addition an element, its warps' partials exchanged through `scratch`."""
+    del ctx
+    return tile.reduce("add", axis=0, scratch=scratch)
 
 
 def _selected(predicate, taken, other):

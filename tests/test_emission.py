@@ -21,13 +21,21 @@ def _operations(work: Work) -> float:
     return work.operations
 
 
-def _walked(work):
-    """A walk of four steps, each marked and doing `work` to the row."""
-    def step(row, index):
-        _STEP(index)
-        return work(row), None
+def _exponentials(work: Work) -> float:
+    return work.exponentials
 
-    return lambda row: lax.scan(step, row, jnp.arange(4))[0]
+
+_TRIPS = jax.ShapeDtypeStruct((), jnp.int32)
+"""A walk's trips, which its data decides (a while loop's)."""
+
+
+def _walked(work):
+    """A walk its data decides the trips of, each step marked and doing `work` to the row."""
+    def step(index, row):
+        _STEP(index)
+        return work(row)
+
+    return lambda row, trips: lax.fori_loop(0, trips, step, row)
 
 
 def _emitted(fn, *args) -> emission.Emitted:
@@ -37,19 +45,27 @@ def _emitted(fn, *args) -> emission.Emitted:
 
 def test_a_step_counts_each_trip_of_a_loop_inside_it():
     """A walk step holding a loop of four trips counts its body four times."""
+    walk = _walked(lambda row: lax.scan(lambda row, _: (jnp.exp(row), None), row, length=4)[0])
+    assert [role.step(_exponentials) for role in _emitted(walk, _ROW, _TRIPS).roles] == [4 * 128] * 2
+
+
+def test_a_walk_of_stated_trips_counts_each_trip_where_it_stands():
+    """A walk whose trips its jaxpr states (a scan's) counts its body each trip, its work the program's own:
+    no step a launch's statement multiplies."""
     def walk(row):
         def step(row, index):
             _STEP(index)
-            return lax.scan(lambda row, _: (row + 1, None), row, length=4)[0], None
+            return row + 1, None
 
-        return lax.scan(step, row, jnp.arange(8))[0]
+        return lax.scan(step, row, jnp.arange(4))[0]
 
-    assert [role.step(_operations) for role in _emitted(walk, _ROW).roles] == [4 * 128] * 2
+    counted = _emitted(walk, _ROW)
+    assert [(role.fixed.operations, role.step(_operations)) for role in counted.roles] == [(512, None)] * 2
 
 
 def _one(row, index):
     _STEP(index)
-    return row + 1
+    return jnp.exp(row)
 
 
 def _two(row, index):
@@ -59,25 +75,25 @@ def _two(row, index):
 def test_a_step_divides_by_the_steps_its_warpgroups_branch_takes():
     """A trip whose warpgroup's branch takes one step for one warpgroup and two for the other counts each
     one step's work: a step's work over the marks the warpgroup runs, not the most any branch holds."""
-    def walk(row):
-        def step(row, index):
-            return lax.cond(lax.axis_index("wg") == 0, _one, _two, row, index), None
+    def walk(row, trips):
+        def step(index, row):
+            return lax.cond(lax.axis_index("wg") == 0, _one, _two, row, index)
 
-        return lax.scan(step, row, jnp.arange(8))[0]
+        return lax.fori_loop(0, trips, step, row)
 
-    assert [role.step(_operations) for role in _emitted(walk, _ROW).roles] == [128, 128]
+    assert [role.step(_exponentials) for role in _emitted(walk, _ROW, _TRIPS).roles] == [128, 128]
 
 
 def test_a_scoped_bodys_results_resolve_the_roles_after_it():
     """A warpgroup's index a scoped body returns (`pl.run_scoped`'s) resolves the role's branch after it."""
-    def walk(row):
-        def step(row, index):
+    def walk(row, trips):
+        def step(index, row):
             role = pl.run_scoped(lambda scratch: lax.axis_index("wg"), plgpu.SMEM((8,), jnp.float32))
-            return lax.cond(role == 0, _one, _two, row, index), None
+            return lax.cond(role == 0, _one, _two, row, index)
 
-        return lax.scan(step, row, jnp.arange(8))[0]
+        return lax.fori_loop(0, trips, step, row)
 
-    assert [role.step(_operations) for role in _emitted(walk, _ROW).roles] == [128, 128]
+    assert [role.step(_exponentials) for role in _emitted(walk, _ROW, _TRIPS).roles] == [128, 128]
 
 
 def test_an_unknown_branch_counts_the_most_of_each_unit_any_branch_issues():
@@ -92,30 +108,30 @@ def test_an_unknown_branch_counts_the_most_of_each_unit_any_branch_issues():
 
 
 def test_an_unknown_branch_between_walks_steps_the_costliest():
-    """A conditional its data decides between a walk of two segments of one operation a row a step and a
+    """A conditional its data decides between a walk of two segments of one exponential a row a step and a
     walk of three a step counts a step of three."""
-    once, thrice = _walked(lambda row: row + 1), _walked(lambda row: row + 1 + 1 + 1)
+    once, thrice = _walked(jnp.exp), _walked(lambda row: jnp.exp(jnp.exp(jnp.exp(row))))
 
-    def either(row, index):
-        return lax.switch(index, [lambda row: once(once(row)), thrice], row)
+    def either(row, index, trips):
+        return lax.switch(index, [lambda row: once(once(row, trips), trips), lambda row: thrice(row, trips)],
+                          row)
 
     index = jax.ShapeDtypeStruct((), jnp.int32)
-    assert _emitted(either, _ROW, index).roles[0].step(_operations) == 3 * 128
+    assert _emitted(either, _ROW, index, _TRIPS).roles[0].step(_exponentials) == 3 * 128
 
 
 def test_a_peeled_walks_step_is_its_parts_mean():
     """A walk reading ahead, its first and last steps peeled from its loop (`RingFamily._walked`): its first
-    step two operations a row, its loop's one, its last none, counts one a step, under a guard its data
+    step two exponentials a row, its loop's one, its last none, counts one a step, under a guard its data
     decides too (a program's active tile's)."""
-    first, loop, last = (_walked(lambda row: row + 1 + 1), _walked(lambda row: row + 1),
-                         _walked(lambda row: row))
+    first, loop, last = _walked(lambda row: jnp.exp(jnp.exp(row))), _walked(jnp.exp), _walked(lambda row: row)
 
-    def peeled(row):
-        return last(loop(first(row)))
+    def peeled(row, trips):
+        return last(loop(first(row, trips), trips), trips)
 
-    def guarded(row, active):
-        return lax.cond(active, peeled, lambda row: row, row)
+    def guarded(row, trips, active):
+        return lax.cond(active, peeled, lambda row, trips: row, row, trips)
 
     active = jax.ShapeDtypeStruct((), jnp.bool_)
-    assert [role.step(_operations) for role in _emitted(peeled, _ROW).roles] == [128, 128]
-    assert [role.step(_operations) for role in _emitted(guarded, _ROW, active).roles] == [128, 128]
+    assert [role.step(_exponentials) for role in _emitted(peeled, _ROW, _TRIPS).roles] == [128, 128]
+    assert [role.step(_exponentials) for role in _emitted(guarded, _ROW, _TRIPS, active).roles] == [128, 128]

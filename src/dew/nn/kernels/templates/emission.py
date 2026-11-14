@@ -1,10 +1,10 @@
 """A launch's work by emission (row 5895): its kernel body's jaxpr, each equation priced in Dew's units
 (`cost.Work`) as each of a program's warpgroups runs it, its roles' branches resolved by its warpgroup's index
 (`handoffs.Schedule.run`'s conditionals and switch on `lax.axis_index`). A loop of trips its jaxpr states
-(`scan`) counts its body that many times, one whose trips its data decides (`while`) once; the outermost loop
-whose trips run its walk's steps (`derivatives.WalkStep` marks, `mosaic.stepped`) counts one step of its walk
-(`Role.step`), a trip's work over the steps the trip runs, which the launch's statement of its walk's steps
-multiplies. A tensor-core product counts its logical operands' shapes
+(`scan`) counts each trip as it runs, where it stands. The outermost loop whose trips its data decides
+(`while`) and that runs its walk's steps (`derivatives.WalkStep` marks, `mosaic.stepped`) counts one step of
+its walk (`Role.step`), a trip's work over the steps the trip runs, which the launch's statement of its walk's
+steps multiplies; any other such loop its body once. A tensor-core product counts its logical operands' shapes
 (its refs' transforms applied), by its operands' precision; an exponential, a conversion and each other
 operation of the CUDA cores its output's elements; a copy between memories its bytes, in device memory and in
 shared memory. A primitive no rule here prices raises (`Unpriced`): the count states every instruction a
@@ -64,7 +64,7 @@ class Emitted:
         """A program's work outside its walks, every warpgroup's."""
         return sum((role.fixed for role in self.roles), Work())
 
-    def issued(self, unit: Callable[[Work], float], steps: int, programs: int) -> float:
+    def issued(self, unit: Callable[[Work], float], steps: float, programs: int) -> float:
         """A launch's whole work in `unit`: a step of its walk (the most a walking warpgroup's takes) its
         `steps` times, the steps every warpgroup walks (`cost.Stated.steps`), and each of its `programs`'
         work outside its walks."""
@@ -335,9 +335,9 @@ class _Counting:
         elif primitive is lax.cond_p:
             return self.cond(params["branches"], values)
         elif primitive is lax.while_p:
-            self.loop(params["body_jaxpr"], 1)
+            self.loop(params["body_jaxpr"])
         elif primitive is lax.scan_p:
-            self.loop(params["jaxpr"], params["length"])
+            return self.scanned(params, values)
         elif primitive is pallas.run_scoped_p:
             # Its operands are its body's constants; its body's inputs are the refs it allocates.
             return self.run(params["jaxpr"], [None] * len(params["jaxpr"].invars), values)
@@ -351,21 +351,37 @@ class _Counting:
             raise Unpriced(f"no rule prices {primitive} in a kernel's body")
         return unknown
 
-    def loop(self, body: jax_core.Jaxpr, trips: int) -> None:
-        """A loop's body, `trips` trips where its trips are static (a scan's; a while's data decides its own,
-        counted one): the outermost loop whose trips run walk steps (`derivatives.WalkStep` marks along the
-        branches its warpgroup takes) a walk, its trip's work over its marks one step of it (`walks`); any
-        other loop's work its trips' where it stands, and its marks its enclosing loop's."""
+    def loop(self, body: jax_core.Jaxpr) -> None:
+        """A loop whose trips its data decides (a while's): the outermost such loop that runs walk steps
+        (`derivatives.WalkStep` marks along the branches its warpgroup takes) a walk, its trip's work over its
+        marks one step of it (`walks`), which the launch's statement of its steps multiplies; any other its
+        trip counted once where it stands, its marks its enclosing loop's."""
         self.loops.append(_Loop())
         self.run(body, [None] * len(body.invars))
-        found = self.loops.pop()
+        self.ended(self.loops.pop(), walks=True)
+
+    def scanned(self, params, values: list) -> list:
+        """A loop of the trips its jaxpr states (a scan's), each trip counted as it runs, its carry's
+        concrete values carried to the next (a walk's step index, so a step's guard on it takes its
+        branch): its work where it stands, its marks its enclosing loop's; its outputs' concrete carry."""
+        body, length = params["jaxpr"], params["length"]
+        consts, carried, xs = map(list, params["ft_in"].update(values).unpack())
+        self.loops.append(_Loop())
+        for _ in range(length):
+            carried = self.run(body, [*consts, *carried, *([None] * len(xs))])[:len(carried)]
+        self.ended(self.loops.pop(), walks=False)
+        return [*carried, *([None] * (len(body.outvars) - len(carried)))]
+
+    def ended(self, found: _Loop, *, walks: bool) -> None:
+        """A loop counted (`found`): its work and marks its enclosing loop's, else a walk where it `walks`
+        steps, else the program's own work."""
         if self.loops:
-            self.loops[-1].work = self.loops[-1].work + _times(found.work, trips)
-            self.loops[-1].marks += found.marks * trips
-        elif found.marks:
+            self.loops[-1].work = self.loops[-1].work + found.work
+            self.loops[-1].marks += found.marks
+        elif walks and found.marks:
             self.walks.append(_times(found.work, 1 / found.marks))
         else:
-            self.fixed = self.fixed + _times(found.work, trips)
+            self.fixed = self.fixed + found.work
 
     def cond(self, branches, values: list) -> list:
         """A conditional: its branch where its index is concrete (a role's, by its warpgroup), else every

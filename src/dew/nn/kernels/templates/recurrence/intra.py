@@ -16,7 +16,6 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, operands, product, resources, swizzling
-from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
@@ -25,13 +24,11 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _doubling_held,
     _inverse_flops,
     _key_blocks,
-    _merged,
     _merges,
     _merging,
     _resident,
     chunk_liveness,
     f32,
-    issued_flops,
     key_block,
     launch_kernel,
     lowered_once,
@@ -112,8 +109,7 @@ def _intra_solve(system, taken, call: Call):
                          grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"),
                          blocks=stream_blocks(system=((chunk, chunk), solved)),
-                         stages=2, live=chunk_liveness(1), work=Work(flops=_inverse_flops(chunk), span=1),
-                         hardware=issued_flops(call, _inverse_flops(chunk), *(_merged(call),) * 2),
+                         stages=2, live=chunk_liveness(1), steps=1, model=_inverse_flops(chunk),
                          held=Held(phases=(_doubling_held(call),)),
                          staging=_merges(call), landing={"square": held.landing(chunk, chunk)},
                          persistent=True)(
@@ -327,18 +323,15 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
     formed = [held if name == "scores" else systems(call) for name in products]
     out_type = (*(form.shape(call.heads * chunk) for form in formed),
                 *((gates.shape(call.heads * width),) * 2 if scored else ()))
-    # Each output's product a key sub-chunk's columns; the exponentials a key block's rows gated down and its
-    # keys up.
-    work = Work(flops=outputs * 2 * chunk * chunk * width, span=steps,
-                exponentials=2 * chunk * width)
+    # Each output's product a key sub-chunk's columns, the model's.
+    model = outputs * 2 * chunk * chunk * width
     staging, landing = _intra_staged(call, keys, products=products)
     # Its rings as deep as its residency holds them (`resources.plan`): one deep, a B200's Kimi Linear walk
     # waited on each key block's loads at two programs a multiprocessor, 24.5% of its warps active and
     # long_scoreboard 6.2 cycles an issued instruction, 819 us against fla's intra rows' 589 (M-JS-118).
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=blocks, stages=(1, 2),
-                         live=chunk_liveness(4), work=work,
-                         hardware=issued_flops(call, work.flops, *(_pairing_operand(call),) * 2),
+                         live=chunk_liveness(4), steps=steps, model=model,
                          held=_intra_held(call, keys, outputs), staging=staging, landing=landing,
                          name="recurrence_intra" if scored else "recurrence_intra_system",
                          # Each stream staged at its key block's row: a tile slices only whole swizzle rows.

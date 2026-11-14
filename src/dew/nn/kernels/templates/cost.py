@@ -38,11 +38,11 @@ def stored(*arrays) -> int:
 class Stated:
     """What a launch states of its cost beside its kernel's emission, which counts the rest
     (`emission.costed`): the steps of its walks, every consumer's over the call's batch and heads (`steps`,
-    attention's `walked_steps`), the trips its data decides, which the count multiplies a step's work by;
-    and the bytes it reads and writes, each of its operands and outputs once (`bytes_accessed`,
-    `estimate`'s)."""
+    attention's `walked_steps`, the recurrence's `launch_kernel`'s: a laid call's mean chunks a sequence over
+    its sequences), the trips its data decides, which the count multiplies a step's work by; and the bytes it
+    reads and writes, each of its operands and outputs once (`bytes_accessed`, `estimate`'s)."""
 
-    steps: int
+    steps: float
     bytes_accessed: int
 
 

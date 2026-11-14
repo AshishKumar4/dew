@@ -21,7 +21,6 @@ from dew.nn.kernels.templates.recurrence.intra import intra_rows, systems
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Held,
-    Work,
     chunk_liveness,
     f32,
     fp32_operand,
@@ -128,13 +127,13 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
 
     blocks = _own_streamed(call, keys, queries=scored)
     out_type = tuple(_band_form(call, name).shape(call.heads * algebra.SUB) for name in products)
-    # Each output's pairs a key a term, a sub-chunk's offsets; the decay's exponentials once an offset.
-    work = Work(flops=len(products) * 3 * chunk * algebra.SUB * width, span=steps,
-                exponentials=chunk * algebra.SUB * width)
+    # Each output's pairs a key a term, a sub-chunk's offsets: the model's.
+    model = len(products) * 3 * chunk * algebra.SUB * width
     staging, landing = _own_staged(call, keys, products=products)
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=blocks, stages=(1, 2),
-                         live=chunk_liveness(5), work=work, held=_own_held(call, keys, len(products)),
+                         live=chunk_liveness(5), steps=steps, model=model,
+                         held=_own_held(call, keys, len(products)),
                          staging=staging, landing=landing, name="recurrence_intra_own", issues=False,
                          swizzles={name: resources.widest_swizzle(dtype, keys)
                                    for name, (_, dtype) in blocks.items()})(q, k, hi, lo, beta, taken)
@@ -268,11 +267,11 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
     staging, landing = _key_own_staged(call, keys)
     fp32_rows = square.shape(call.heads * width)
     out_type = (fp32_rows, fp32_rows, fp32_rows, jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
-    # Each offset's two pairs' terms a key, forward and moved up; the decay's exponentials once an offset.
+    # Each offset's two pairs' terms a key, forward and moved up: the model's.
     terms = 2 * 2 * 3 * chunk * algebra.SUB * width
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=(1, 2), live=chunk_liveness(7),
-                         work=Work(flops=terms, span=steps, exponentials=algebra.SUB * chunk * width),
+                         steps=steps, model=terms,
                          held=_key_own_held(call, keys), staging=staging, landing=landing,
                          name="recurrence_key_pairs_own", issues=False)(
         q, k, hi, lo, beta, *(algebra.own_bands(d, chunk=chunk) for d in (d_scores, d_system)), taken)

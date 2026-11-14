@@ -32,7 +32,7 @@ from dew.nn.kernels.templates import (
     resources,
     swizzling,
 )
-from dew.nn.kernels.templates.cost import Stated
+from dew.nn.kernels.templates.cost import Stated, Work
 
 
 def _staging(block: tuple, swizzle: int | None) -> tuple:
@@ -469,7 +469,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         issued: Callable[..., jax.Array] = plgpu.inline_mgpu(
             arg_types=(self.layout, self.lhs, self.rhs),
             return_type=plgpu.ShapeDtypeStruct(acc.shape, jnp.dtype(jnp.float32), layout=self.layout))(
-            lambda ctx, acc, left, right: mgpu.mma(acc, left, right))
+            _tf32_product)
         # The accumulator laid as the product takes it: a fresh one's splat passed in whole left a cast no
         # pass lowers (tf32-dump-sm80 at ca3dd0f0a, a splat to the accumulator's registers).
         return issued(plgpu.layout_cast(acc, self.layout), left, right)
@@ -507,6 +507,14 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
     def settled(self, pending: int = 0) -> None:
         del pending
+
+
+@emission.stating(lambda acc, left, right: Work(tf32_flops=2 * acc.shape[0] * acc.shape[1] * left.shape[1]))
+def _tf32_product(ctx, acc, left, right):
+    """`acc + left @ right`, fp32's operands as TF32 by one mma.sync (`MmaIssuer._mma`), inlined: `2 m n k`
+    TF32 FLOPs, its accumulator `[m, n]` and its left operand `[m, k]`."""
+    del ctx
+    return mgpu.mma(acc, left, right)
 
 
 class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):

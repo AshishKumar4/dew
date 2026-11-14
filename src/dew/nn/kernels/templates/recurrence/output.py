@@ -11,7 +11,6 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, operands, product, resources, swizzling
-from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
@@ -262,9 +261,9 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
     out_type = jax.ShapeDtypeStruct((call.rows, call.heads * value_width), out_dtype)
     # The prefix twice, as the solve's.
     # The chunk's scores once (the intra launch's under a decay a key dimension), then each value block's
-    # memory and local products.
+    # memory and local products: the model's.
     scored = 0 if call.per_key else 2 * chunk * chunk * width
-    work = Work(flops=scored + 2 * chunk * (width + chunk) * value_width, span=steps)
+    model = scored + 2 * chunk * (width + chunk) * value_width
     landing = {"out": ((chunk, bv), out_dtype)}
     swizzle = None if call.per_key else _output_swizzle(call, bv, staging, landing)
     keys = None if swizzle is None else {f"keys{p}": swizzle for p in range(call.given.parts)}
@@ -272,7 +271,7 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
     # launch for the function its program is defined in, here `output_launch`).
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          name="recurrence_output", grid_names=("chunks", "heads"), blocks=blocks, stages=1,
-                         live=chunk_liveness(8), work=work,
+                         live=chunk_liveness(8), steps=steps, model=model,
                          held=_output_held(call, bv, swizzle), staging=staging, landing=landing,
                          # A 16-bit call's takes no reduction (an A100's asked for its tiles' 49152 bytes
                          # alone).

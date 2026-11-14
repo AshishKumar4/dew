@@ -559,37 +559,6 @@ def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(ta
         jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4))).trace(*operands).lower(lowering_platforms=("cuda",))
 
 
-@pytest.mark.parametrize('dtype', [jnp.bfloat16, jnp.float32], ids=['bf16', 'fp32-accurate'])
-def test_a_launch_states_the_part_pairs_it_issues_and_declares_the_models_products(dtype):
-    """A gated delta rule's forward through the template, lowered for an H100: each launch
-    states the products it issues, its operands' part pairs (`product.terms`: one for bf16, six for an fp32
-    operand's three bf16 parts under the accurate forms), and declares the model's products apart
-    (`lowered.KernelCall.model_flops`), which Dew's FLOP count reads for the model's work."""
-    from dew.nn.kernels import lowered
-    from dew.nn.kernels.templates import product
-    from dew.nn.precision import ACCURATE
-
-    rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 64
-    operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), dtype)] * 2 + [
-        jax.ShapeDtypeStruct((rows, length, value_heads, width), dtype),
-        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.float32),
-        jax.ShapeDtypeStruct((rows, length, value_heads), dtype)]
-
-    rule = functools.partial(mosaic_rule, tiles=NARROW, bound=1.0)
-    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    with generation.assumed("sm90"), generation.run_precision(ACCURATE), jax.sharding.use_abstract_mesh(mesh):
-        program = jax.jit(rule).trace(*operands).lower(lowering_platforms=("cuda",))
-    launches = [call for call in lowered.kernel_calls(program) if call.kind == "mosaic_gpu"]
-    assert launches and all(call.model_flops is not None for call in launches)
-    ratios = {(call.flops or 0.0) / call.model_flops for call in launches if call.model_flops}
-    if dtype == jnp.bfloat16:
-        assert ratios == {1.0}
-    else:
-        # A launch over fp32 operands issues every part pair; one over the rule's bf16 gates, one.
-        pairs = float(len(product.terms(product.EXACT_PARTS, product.EXACT_PARTS)))
-        assert pairs in ratios and ratios <= {1.0, pairs}
-
-
 def test_a_ranged_calls_inverse_states_the_fp32_parts_its_merges_issue():
     """A bf16 Kimi delta attention forward with no bound on its inverse, lowered for an H100: its chunk
     inverse's doubling merges in fp32 (`Call.ranged`), two bf16 parts on warpgroup products, which take no
