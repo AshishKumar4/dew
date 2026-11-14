@@ -27,6 +27,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.algebra import scan
 from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_algebra import portable_einsum
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
@@ -79,8 +80,8 @@ def _within(q, k, v, g, weights, positions, *, scale: float, documents: int):
     """The pairs within each `WITHIN`-aligned block of a document's `positions` `[B, T]`, levels zero to
     `log2 WITHIN`: each token laid at its block's slot (a row's blocks in order, at most `ceil(T / WITHIN)`
     and its `documents` more), each block's queries and keys one masked attention, a pair `(l, c)` at
-    `exp(G_l - G_c) lambda_l[level(l, c)] (q_l . k_c)` (`G` the block's running log decay), its output read
-    back at each token's slot."""
+    `exp(G_l - G_c) lambda_l[level(l, c)] (q_l . k_c)` (`G` the block's running log decay, `scan.between`),
+    its output read back at each token's slot."""
     rows, length, groups, _ = q.shape
     heads, offset = v.shape[2], positions % WITHIN
     count = min(length, -(-length // WITHIN) + documents)
@@ -93,9 +94,10 @@ def _within(q, k, v, g, weights, positions, *, scale: float, documents: int):
         return blocks.reshape(rows, count, WITHIN, *x.shape[2:])
 
     q, k, v, g, weights = (laid(x) for x in (q, k, v, g, weights))
-    running = jnp.cumsum(g, axis=2).transpose(0, 1, 3, 2)
+    # Each block's decays as the recurrence's derivation forms them (`scan.between`: compensated, a
+    # vanished decay ending a segment), `[B, n, H, l, c]`.
+    decay = jax.vmap(jax.vmap(scan.between))(g).transpose(0, 1, 4, 2, 3)
     causal = np.tril(np.ones((WITHIN, WITHIN), bool))
-    decay = jnp.exp(jnp.where(causal, running[..., :, None] - running[..., None, :], -jnp.inf))
     # A pair's level: zero for a token's own key, else the bit length of their offsets' XOR; past the
     # sequence's levels, a pair of slots no token takes.
     offsets = np.arange(WITHIN)
@@ -103,5 +105,8 @@ def _within(q, k, v, g, weights, positions, *, scale: float, documents: int):
     level = np.minimum(np.frexp(np.bitwise_xor.outer(offsets, offsets))[1], weights.shape[-1] - 1)
     weighed = weights.transpose(0, 1, 3, 2, 4)[..., offsets[:, None], level]
     scores = jnp.repeat(portable_einsum('bxign,bxjgn->bxgij', q, k), heads // groups, axis=2)
-    out = scale * portable_einsum('bxhij,bxjhp->bxihp', decay * weighed * scores, v)
+    # The scores past a token selected away before they meet their zero decay: one that overflows there
+    # times zero is a NaN, in the output and, as the product's factor, in every gradient through it.
+    pairs = decay * weighed * jnp.where(causal, scores, 0.0)
+    out = scale * portable_einsum('bxhij,bxjhp->bxihp', pairs, v)
     return out.reshape(rows, count * WITHIN, heads, -1)[each, slot]

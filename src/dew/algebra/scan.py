@@ -848,6 +848,13 @@ def _decays(exponents, base2: bool) -> _Decays:
     return _decays_of(exponents, base2)
 
 
+def between(exponents, *, base2: bool = False) -> jax.Array:
+    """`exponents` `[T, K]`'s decays of the spans after token `j` through token `i`, `[T, T, K]`, zero above
+    the diagonal (`_decays`' `between`): compensated within each segment, a vanished token ending one, so no
+    span's sum holds a -2**70 or two -2**127 (`_decays_value`)."""
+    return _decays(exponents, base2).between
+
+
 def _walked(exponents, base2: bool) -> jax.Array:
     """A chunk's whole decay in natural units, per key, as a walk's state carries it (`Derived.step`,
     `merge`): its exponents' compensated sum, or its dtype's vanished decay where a token's decay vanishes

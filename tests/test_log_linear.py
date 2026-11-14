@@ -5,6 +5,7 @@ from float64, one sequence and packed documents (check 1)."""
 import functools
 import math
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -79,3 +80,22 @@ def test_the_masked_form_is_as_exact_as_flas_level_by_level(packed):
         log_linear_attention
     assert_packed_on_par(dew, naive, draw, 'log-linear attention', packed=packed, documents=DOCUMENTS,
                          length=LENGTH, seeds=SEEDS[packed])
+
+
+def test_a_blocks_pairs_keep_a_decay_past_a_vanished_one_and_no_future_overflow():
+    """Within a block (`log_linear.WITHIN`), a pair's decay after a vanishing one is its own (a running sum
+    of -2**70 rounds a later -1 away, its pair decayed by one), and a future pair's overflowing score reaches
+    neither the output nor a gradient (an infinity times its zero decay is a NaN)."""
+    ones = jnp.ones((1, 2, 1, 1), jnp.float32)
+    weights = jnp.ones((1, 2, 1, levels(2)), jnp.float32)
+    vanished = jnp.asarray([[[-2.0 ** 70], [-1.0]]], jnp.float32)
+    out = log_linear_attention(ones, ones, ones, vanished, weights, scale=1.0)
+    np.testing.assert_allclose(np.asarray(out)[0, :, 0, 0], [1.0, 1.0 + math.exp(-1.0)], rtol=1e-6)
+    query, key = (jnp.asarray(x, jnp.float32).reshape(1, 2, 1, 1) for x in ([1e20, 0.0], [0.0, 1e20]))
+
+    def summed(query, key, g):
+        return log_linear_attention(query, key, ones, g, weights, scale=1.0).sum()
+
+    value, grads = jax.value_and_grad(summed, argnums=(0, 1, 2))(query, key, jnp.zeros((1, 2, 1), jnp.float32))
+    assert value == 0.0
+    assert all(np.isfinite(np.asarray(grad)).all() for grad in grads)
