@@ -40,8 +40,7 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    moved = registry.moved_paths(dict(record))
-    assert isinstance(moved, dict)
+    moved = registry.moved_record(record)
     earlier = earlier_none_of_the_above(earlier_profile(earlier_newton_schulz(earlier_trainer(moved))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
     return records.earlier_chains(earlier_data_plan(earlier), _chains())

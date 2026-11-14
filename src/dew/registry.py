@@ -159,6 +159,11 @@ under dew.inputs. The one table their readers of saved records translate by (`mo
 data plan's manifest (`dew.data.plan.Plan.check`); a path given today is read as given (`imported`)."""
 
 
+def moved_record(record: Mapping[str, JSON]) -> dict[str, JSON]:
+    """A saved record's fields with the import paths they name translated (`moved_paths`)."""
+    return {name: moved_paths(value) for name, value in record.items()}
+
+
 def moved_paths(value: JSON) -> JSON:
     """`value`, a saved record's JSON, with every string an earlier Dew recorded as an import path
     `MOVED_PATHS` holds read as the path it names now; the rest as it is."""

@@ -560,11 +560,9 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     questions a row, which no task reads, and an encoder's or conditioner's class by the import path it
     has now (`dew.registry.moved_paths`, row 5996). A record in today's shapes
     passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
-    from dew.registry import moved_paths
+    from dew.registry import moved_record
 
-    moved = moved_paths(dict(record))
-    assert isinstance(moved, dict)
-    record = moved
+    record = moved_record(record)
     current = dict(record)
     for key in ("head", "layout"):
         held = record.get(key)
