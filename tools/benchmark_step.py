@@ -56,14 +56,17 @@ Usage:
 
 import contextlib
 import dataclasses
+import datetime
 import hashlib
 import importlib
 import io
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -430,7 +433,7 @@ class DeviceSampler:
         try:
             self.process = subprocess.Popen(
                 ["nvidia-smi",
-                 "--query-gpu=index,clocks.sm,power.draw,temperature.gpu,clocks_event_reasons.active",
+                 "--query-gpu=timestamp,index,clocks.sm,power.draw,temperature.gpu,clocks_event_reasons.active",
                  "--format=csv,noheader,nounits", f"-lms={self.PERIOD_MS}"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         except OSError:
@@ -444,13 +447,23 @@ class DeviceSampler:
             self.process.send_signal(signal.SIGINT)
             self.lines, _ = self.process.communicate(timeout=30)
 
-    def summary(self) -> dict[str, dict[str, object]] | None:
-        """Each GPU's samples: their count, the least and greatest of each reading, and every clock
-        event reason any sample held (nvidia-smi's bitmask, or'd); None where nothing was sampled."""
+    def summary(self, window: tuple[datetime.datetime, datetime.datetime] | None = None
+                ) -> dict[str, dict[str, object]] | None:
+        """Each GPU's samples taken within `window` (host-clock times, nvidia-smi stamping each sample in
+        local time; every sample where none is given): their count, the least and greatest of each reading,
+        and every clock event reason any sample held (nvidia-smi's bitmask, or'd); None where nothing was
+        sampled in it."""
         gpus: dict[str, list[list[str]]] = {}
         for line in self.lines.splitlines():
-            index, *values = (value.strip() for value in line.split(","))
-            if len(values) == len(self.FIELDS):
+            stamp, index, *values = (value.strip() for value in line.split(",")) if line.count(",") > 1 \
+                else ("", "", "")
+            if len(values) != len(self.FIELDS):
+                continue
+            try:
+                taken = datetime.datetime.strptime(stamp, "%Y/%m/%d %H:%M:%S.%f")
+            except ValueError:
+                continue
+            if window is None or window[0] <= taken <= window[1]:
                 gpus.setdefault(index, []).append(values)
         if not gpus:
             return None
@@ -473,19 +486,31 @@ class DeviceSampler:
 
 
 def timed_parts(step, state, parts: list[int]):
-    """`sum(parts)` steps dispatched back to back from `state`, then each part's last loss awaited in
-    turn, the seconds from the first dispatch to each read: no wait inside the window. Returns the last
-    state, loss and finiteness, and each part's (steps, seconds)."""
+    """`sum(parts)` steps dispatched back to back from `state`, each part's last loss handed as it is
+    dispatched to a thread that awaits each in turn and stamps the seconds since the first dispatch as it
+    becomes ready: no wait inside the window, and a part's stamp its readiness whether the host's dispatch or
+    the device is the slower (a host-bound step's parts all ready before a wait after the whole dispatch
+    could read them). Returns the last state, loss and finiteness, and each part's (steps, seconds)."""
+    ready: queue.Queue = queue.Queue()
+    ends: list[float] = []
+
+    def waited() -> None:
+        while (loss := ready.get()) is not None:
+            jax.block_until_ready(loss)
+            ends.append(time.perf_counter() - started)
+
+    waiter = threading.Thread(target=waited, name="timed-parts")
     started = time.perf_counter()
-    carry, marks = (state, None, None), []
-    for size in parts:
-        for _ in range(size):
-            carry = step(carry[0])
-        marks.append(carry[1])
-    ends = []
-    for loss in marks:
-        jax.block_until_ready(loss)
-        ends.append(time.perf_counter() - started)
+    waiter.start()
+    carry = (state, None, None)
+    try:
+        for size in parts:
+            for _ in range(size):
+                carry = step(carry[0])
+            ready.put(carry[1])
+    finally:
+        ready.put(None)
+        waiter.join()
     jax.block_until_ready(carry)
     begins = [0.0, *ends[:-1]]
     return (*carry, [(size, end - begun) for size, end, begun in zip(parts, ends, begins, strict=True)])
@@ -537,9 +562,11 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
         # inside the window, and a window that runs slow where it starts (the device or its allocator
         # warming) shows as a series that falls, where one running another program stays slow throughout.
         # The GPUs sampled under the window's load (`DeviceSampler`).
+        window_began = datetime.datetime.now()
         try:
             state, loss, is_finite, parts = timed_parts(step, state, window_parts(config.steps))
         finally:
+            window_ended = datetime.datetime.now()
             device_window.__exit__()
         elapsed = sum(seconds for _, seconds in parts)
 
@@ -608,10 +635,10 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
             # read 40% slow on the very tree its others read).
             "window_ms_series": [round(seconds / size * 1e3, 3) for size, seconds in parts],
             "synced_ms_series": [round(seconds * 1e3, 3) for seconds in synced],
-            # The GPUs under the warm step's and the timed window's load: each one's samples' count, its
-            # SM clock, power and temperature as sampled through them, and the clock event reasons any
-            # sample held (`DeviceSampler`).
-            "device_window": device_window.summary(),
+            # The GPUs under the timed window's load: each one's samples' count in it, its SM clock,
+            # power and temperature as sampled through it, and the clock event reasons any sample held
+            # (`DeviceSampler`).
+            "device_window": device_window.summary((window_began, window_ended)),
             # JAX's persistent-cache hits while the step was compiled, its state's and other programs'
             # among them; and the XLA autotuning results' directory as it stood at the row
             # (`tuning_digest`).

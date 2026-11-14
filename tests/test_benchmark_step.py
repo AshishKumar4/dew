@@ -297,9 +297,34 @@ def test_a_device_samplers_summary_holds_each_gpus_span_and_every_clock_event_re
     and greatest, and the clock event reasons any sample held, or'd, GpuIdle (between steps) not among
     them."""
     sampler = load("benchmark_step").DeviceSampler()
-    sampler.lines = ("0, 1980, 410.5, 51, 0x0000000000000001\n0, 1755, 690.25, 58, 0x0000000000000004\n"
-                     "0, 1830, 650.0, 57, 0x0000000000000000\n")
-    assert sampler.summary() == {"0": {"samples": 3, "sm_mhz": [1755.0, 1980.0], "power_w": [410.5, 690.25],
-                                       "temperature_c": [51.0, 58.0], "event_reasons": "0x4"}}
+    import datetime
+
+    sampler.lines = ("2026/11/14 16:00:00.000, 0, 1410, 144.0, 45, 0x0000000000000001\n"
+                     "2026/11/14 16:00:01.000, 0, 1980, 410.5, 51, 0x0000000000000001\n"
+                     "2026/11/14 16:00:01.250, 0, 1755, 690.25, 58, 0x0000000000000004\n"
+                     "2026/11/14 16:00:01.500, 0, 1830, 650.0, 57, 0x0000000000000000\n")
+    window = (datetime.datetime(2026, 11, 14, 16, 0, 0, 500000), datetime.datetime(2026, 11, 14, 16, 0, 2))
+    # The idle sample before the window is not among its samples.
+    assert sampler.summary(window) == {"0": {"samples": 3, "sm_mhz": [1755.0, 1980.0],
+                                             "power_w": [410.5, 690.25], "temperature_c": [51.0, 58.0],
+                                             "event_reasons": "0x4"}}
+    assert sampler.summary()["0"]["samples"] == 4
     sampler.lines = ""
-    assert sampler.summary() is None
+    assert sampler.summary(window) is None
+
+
+def test_a_windows_parts_are_stamped_as_each_becomes_ready_whether_dispatch_or_device_is_slower():
+    """Each part's stamp is its last step's readiness, read by a thread as the part is dispatched: a step
+    whose dispatch is the slower (its work done before the next is dispatched) reads each part's own time,
+    none 0, where awaiting the parts after the whole dispatch reads the first part as all of it."""
+    import time
+
+    tool = load("benchmark_step")
+
+    def step(state):
+        time.sleep(0.02)  # the host's dispatch, slower than the device's work
+        return state + 1, np.float32(state), True
+
+    *_, parts = tool.timed_parts(step, 0, [2, 2, 2])
+    assert [size for size, _ in parts] == [2, 2, 2]
+    assert all(seconds >= 0.03 for _, seconds in parts), parts
