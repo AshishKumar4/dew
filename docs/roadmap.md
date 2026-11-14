@@ -64,6 +64,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Metamorphic run flows: a run equals its saved, reloaded and restarted self. [4511]
 - The diffusion kinds' starts keep no record and their refits trace again. [6297]
+- A distillation objective states no trace key, so its refits and warm starts trace their step again. [6303]
 
 ## RL and serving
 
