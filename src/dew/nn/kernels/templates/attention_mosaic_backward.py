@@ -95,7 +95,8 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                      approx_math, score_places(hooks), drop is not None, hook_reduces(hooks), rounded,
                      registered)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1], spec.keys)
-    spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k, readers=True)
+    spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k, readers=True,
+                      pair=tiles.consumers * tiles.block_q)
     # The queries taken by the call's power: the logits' operand of the two launches (`_dkv_step`).
     scaled = by_power(query, prescale)
     # The dK/dV launch on its own layout (`BackwardTiles.dkv`).

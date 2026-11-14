@@ -24,6 +24,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Program,
     _streamed,
     _views_of,
+    indexed_views,
     riding,
     score_stream,
     score_views,
@@ -282,6 +283,10 @@ def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, score: tu
     views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
     if riding(family, kinds, "keys"):
         views |= score_views(family, refs, kinds, "keys", row, head, program.query_tile(queries // pair))
+    if spans is not None and spans.walk_count is not None:
+        # Each step's key tiles, read through its pair's ranges where its walk is indexed
+        # (`_Program.tile_of`).
+        views = indexed_views(views, program.tile_of(program.query_tile(queries // pair) * pair, spans, row))
     streams = family.opened(streams, views)
     pair_first = program.query_tile(queries // pair) * pair
     streamed = _streamed([program.reach(pair_first + index * block_q, spans, row)[:2]

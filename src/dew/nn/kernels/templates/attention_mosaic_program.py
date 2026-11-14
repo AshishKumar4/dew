@@ -1096,6 +1096,33 @@ class _Spans(NamedTuple):
     key_ids: jax.Array | None = None
     query_doc: jax.Array | None = None
     key_doc: jax.Array | None = None
+    walk_lo: jax.Array | None = None
+    walk_offset: jax.Array | None = None
+    walk_count: jax.Array | None = None
+
+
+def indexed_views(views: dict, tile: Callable | None) -> dict:
+    """`views` (`rings.viewed`'s, each a ref and its step's block indices) of a walk whose step `j` reads key
+    tile `tile(j)` (`_Program.tile_of`); the same views where the walk's steps are its tiles (None)."""
+    if tile is None:
+        return views
+    found = tile
+    return {name: (ref, lambda step, index=index: index(found(step))) for name, (ref, index) in views.items()}
+
+
+def indexed_walk(spans: KeySpans, pair: int, block_k: int) -> tuple[jax.Array, ...]:
+    """A call of runs' walks over the key tiles its query blocks of `pair` queries select (the indexed form,
+    docs/design/kernel-templates.md §5): each block's ranges of tiles (`BlockMap.ranges`, merged, sorted),
+    flattened `[B, Qp // pair * R]`, their first tiles (`walk_lo`) and each range's first step among the
+    block's (`walk_offset`, its ranges' lengths before it), and each block's step count (`walk_count`,
+    `[B, Qp // pair]`): its walk steps those alone, the tiles between its ranges none of its queries reads."""
+    ranges = block_map(spans, pair, block_k).ranges
+    assert ranges is not None, "a call's indexed walk reads its runs"
+    lo, hi = ranges[..., 0], ranges[..., 1]
+    lengths = hi - lo
+    offsets = jnp.cumsum(lengths, axis=-1) - lengths
+    rows = lo.shape[0]
+    return lo.reshape(rows, -1), offsets.reshape(rows, -1), jnp.sum(lengths, axis=-1)
 
 
 def reached(spec: algebra.Forward, queries: int) -> int | None:
@@ -1176,15 +1203,16 @@ def modelled(spec: algebra.Forward, batch: int, heads: int, queries: int, widths
     return None if pairs is None else 2 * batch * heads * pairs * widths
 
 
-def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: int, *, readers: bool = False
-              ) -> _Spans | None:
+def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: int, *, readers: bool = False,
+              pair: int | None = None) -> _Spans | None:
     """A spans call's `_Spans` at `block_q` by `block_k` tiles over its padded keys (None for a full or
     causal call, whose programs take their tiles from their places), with each key block's query readers
     where a launch walks key blocks (`readers`: the backward's; computed for no other, two reductions a
     decode step's forward ran for nothing, ET-DECODE8-h100). A call's runs (`KeySpans`) lie run by
     run, `[B, R, Qp]`, so a program reads each run's bounds as a row (`_coords`); its blocks walk their
     runs' envelopes (`attention.block_map`), each tile masked by the union of its queries' runs
-    (`algebra.seen`)."""
+    (`algebra.seen`), or where a launch walks query blocks of `pair` queries the tiles their runs select
+    alone (`indexed_walk`)."""
     if spec.form != "spans":
         return None
     if call.per_span > 1:
@@ -1194,9 +1222,11 @@ def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: in
     blocks = block_map(KeySpans(call.start, call.end, call.query_ids, call.key_ids, call.key_rows),
                        block_q, block_k)
     start, end = (jnp.moveaxis(bound, 2, 1) if bound.ndim == 3 else bound for bound in (call.start, call.end))
+    walk = (indexed_walk(KeySpans(call.start, call.end, call.query_ids, call.key_ids, call.key_rows), pair,
+                         block_k) if pair is not None and call.start.ndim == 3 else (None, None, None))
     return _Spans(start, end, blocks.lo, blocks.hi, blocks.full_lo, blocks.full_hi,
                   blocks.q_lo if readers else None, blocks.q_hi if readers else None,
-                  call.query_ids, call.key_ids, blocks.query_doc, blocks.key_doc)
+                  call.query_ids, call.key_ids, blocks.query_doc, blocks.key_doc, *walk)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1317,7 +1347,40 @@ class _Program[T: (Tiles, BackwardTiles)]:
             doc = at(spans.query_doc, block)
             return inside & (doc != 0) & (doc == at(spans.key_doc, index))
 
+        if spans.walk_count is not None:
+            # An indexed walk's steps (`indexed_walk`): its pair's selected tiles, each step's read through
+            # `tile_of`.
+            tile = self.tile_of(first, spans, row)
+            assert tile is not None
+            count = at(spans.walk_count, lax.div(first, self.tiles.consumers * self.tiles.block_q))
+            return *self._sliced(jnp.int32(0), count), lambda index: whole(tile(index))
         return *self._sliced(at(spans.lo, block), at(spans.hi, block)), whole
+
+    def tile_of(self, first, spans: _Spans | None, row) -> Callable | None:
+        """The key tile a walk's step `index` reads for the query block from `first` (batch row `row`): None
+        where it is the step's own index, but where the call's runs select its pair's tiles
+        (`indexed_walk`), the step's tile among its pair's ranges, found by a search of their first steps
+        (log2 R reads a step, R the ranges a pair holds; held across the walk, 2R scalars would hold 128
+        registers at R 64)."""
+        if spans is None or spans.walk_count is None:
+            return None
+        walk_lo, walk_offset = spans.walk_lo, spans.walk_offset
+        assert walk_lo is not None and walk_offset is not None
+        ranges = walk_lo.shape[1] // spans.walk_count.shape[1]
+        base = lax.div(first, self.tiles.consumers * self.tiles.block_q) * ranges
+        at = functools.partial(self._entry, row=row)
+
+        def tile(index):
+            # The last range whose first step is at or before the step's (an empty range's first step its
+            # successor's: the search lands on the latest of equal ones, which holds the step).
+            low, span = jnp.int32(0), ranges
+            while span > 1:
+                half = span // 2
+                low = jnp.where(at(walk_offset, base + low + half) <= index, low + half, low)
+                span -= half
+            return at(walk_lo, base + low) + index - at(walk_offset, base + low)
+
+        return tile
 
     def _positions(self, first, spans: _Spans, row, step, carry):
         """`carry` through `step(carry, position, start, end, holds)` over the positions a query block from

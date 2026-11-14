@@ -76,6 +76,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     bundle_of,
     held_params,
     hook_reduces,
+    indexed_views,
     issued_into,
     issued_pairs,
     modelled,
@@ -530,7 +531,7 @@ def _form_tiles(spec: algebra.Forward, call, form: algebra.Forward, tiles: Tiles
     at = tiles.relaunch
     if (at.block_q, at.block_k, at.consumers) == (tiles.block_q, tiles.block_k, tiles.consumers):
         return at, spans_of
-    return at, _spans_of(spec, call, at.block_q, at.block_k)
+    return at, _spans_of(spec, call, at.block_q, at.block_k, pair=at.consumers * at.block_q)
 
 
 def _output_hooked(out: jax.Array, hooks: Hooks, hooked: _Hooked) -> jax.Array:
@@ -687,7 +688,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         hooked = hooked._replace(scales=tuple(
             jnp.pad(array.astype(jnp.float32), ((0, 0), (0, 0), (0, keys - array.shape[-1])))
             for array in scales))
-    read = (_spans_of(spec, call, tiles.block_q, tiles.block_k), hooked)
+    read = (_spans_of(spec, call, tiles.block_q, tiles.block_k, pair=tiles.consumers * tiles.block_q), hooked)
     return call, spec, operands, read, taken, hooks
 
 
@@ -913,7 +914,7 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
             hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool, params_held: tuple,
             share: int = 0, held: tuple | None = None, product: Callable[[], jax.Array] | None = None,
             interpret: bool = False, codes: _Codes | None = None, training: bool = False,
-            first_at: Callable | None = None) -> tuple:
+            first_at: Callable | None = None, tile: Callable | None = None) -> tuple:
     """A key tile's first key, coordinates and logits under the score hook (batch row and head `place`, its
     queries from `first`, or from `first_at()` formed at its mask), and their products where the logits are a
     factor of them (`algebra.logits_of`), every walk's (`_consumer`'s, `_peak_consumer`'s), so a peak walk's
@@ -948,7 +949,8 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
         keys = slots["keys"] if codes is None else codes.keys(slots["keys"])
         s = family.product(q, keys.transpose((1, 0)), shape, turn)
     slots.release("keys")
-    k_first = index * tiles.block_k
+    # The step's key tile, its own index but where the walk is indexed (`_Program.tile_of`).
+    k_first = (index if tile is None else tile(index)) * tiles.block_k
     if codes is not None:
         # The quantized keys' products their codes', each key's column scaled to its keys' (`_Codes`).
         s = s * algebra.across(codes.key_scales(k_first), s)
@@ -1119,6 +1121,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         # Its weights reach the values' product through its own tile (`relays`).
         family = family.relaying(relay)
     lo, hi, whole = program.reach(first, spans, row)
+    tile = program.tile_of(first, spans, row)
     q = _query_of(program, spec, q_view, q_smem, q_loaded, hooks, hooked, place, first)
     # The weighted values' running sums live in the family's accumulator (`Family.walk`), from the initial
     # state's where there is one; the walk carries the maxima and denominators, the state's `acc` an empty
@@ -1138,7 +1141,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     def scored(index, slots, product=None):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
                        hooks=hooks, drawn=hooked.drop is not None, held=held, params_held=params_held,
-                       share=consumer * tiles.block_q, product=product,
+                       share=consumer * tiles.block_q, product=product, tile=tile,
                        interpret=interpret, codes=codes, training=training,
                        first_at=(first_at if family.in_flight and family.retires_register_products
                                  else None))
@@ -1507,6 +1510,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, s
     (`_consumer`)."""
     family, tiles = program.family, program.tiles
     lo, hi, whole = program.reach(first, spans, place[0])
+    tile = program.tile_of(first, spans, place[0])
     q = _query_of(program, spec, q_view, q_smem, q_loaded, hooks, hooked, place, first)
     # Every consumer but the first a turn ahead, as `_consumer`'s.
     pl.when(consumer > 0)(turn)
@@ -1519,7 +1523,8 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, s
         # The peak walk's logits draw no dropout.
         _, coords, logits, _ = _scored(program, spec, q, index, slots, first, spans, hooked, place[:2], whole,
                                        turn, hooks=hooks, drawn=False, held=held, params_held=params_held,
-                                       share=consumer * tiles.block_q, interpret=interpret, training=True)
+                                       share=consumer * tiles.block_q, interpret=interpret, training=True,
+                                       tile=tile)
         # The partner's turn, as a training step's value product would take it.
         turn(wait=False)
         turn(arrive=False)
@@ -1791,7 +1796,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
         located = functools.partial(_program_views, program, refs, read, peaks=peaks, group=group, page=page,
                                     batch=batch, parts=parts, queries=queries, kinds=kinds)
         # The rings opened once, before the roles' split (a gathered ring's barriers set once).
-        streams = family.opened(streams, located()[3])
+        streams = _opened(program, streams, located, read.spans, queries=queries)
         turn = functools.partial(family.turn, refs.schedule, 1 if program.ahead else consumers)
 
         placed = functools.partial(_placed, program, located, read.spans, queries=queries)
@@ -1896,6 +1901,16 @@ def _written_refs(written: tuple, read: _Read) -> tuple:
     return written
 
 
+def _opened(program: _Program, streams, located: Callable, spans: _Spans | None, *, queries: int):
+    """A forward program's rings opened (`Family.opened`) with the views a family whose walk loads them reads
+    (`located`, `_program_views`; `indexed_views`: its pair's tiles where its walk is indexed)."""
+    row, _, _, views = located()
+    if spans is not None and spans.walk_count is not None:
+        pair = program.tiles.consumers * program.tiles.block_q
+        views = indexed_views(views, program.tile_of(program.query_tile(queries // pair) * pair, spans, row))
+    return program.family.opened(streams, views)
+
+
 def _placed(program: _Program, located: Callable, spans: _Spans | None, *, queries: int) -> tuple:
     """A role's place: its batch row, head, column block and key views (`located`, `_program_views`), its
     pair's first query and their streamed range, formed in the role that reads them, its grid coordinates
@@ -1908,6 +1923,8 @@ def _placed(program: _Program, located: Callable, spans: _Spans | None, *, queri
     pair_first = program.query_tile(queries // pair, fresh=True) * pair
     streamed = _streamed([program.reach(pair_first + index * tiles.block_q, spans, row)[:2]
                           for index in range(tiles.consumers)])
+    # Each step's key tiles, its own index but where the pair's walk is indexed (`_Program.tile_of`).
+    views = indexed_views(views, program.tile_of(pair_first, spans, row))
     return row, head, column, views, pair_first, streamed
 
 
