@@ -215,15 +215,17 @@ def without_ynn(fn, **jit_options):
     return compiled
 
 
-def as_given(fn):
+def as_given(fn, programs: Callable | None = None):
     """`fn`, an arm the gate runs as it is given and never compiles: a torch or NumPy reference, or a Dew
     arm that runs whole programs of its own (a trainer's fit, a placement on a mesh and the program
     run there, a host loop). The other arm of its check then compiles as Dew's users run it, with the
-    fusions (`_arms`), as the programs this one runs do."""
+    fusions (`_arms`), as the programs this one runs do. `programs`, where `fn` is a float64 truth held to
+    a recorded one (`certifier`): the programs a draw's run calls, `programs(*inputs)`, each a callable
+    and its arguments, which the certifier traces to count the run's roundings (`_draws_roundings`)."""
     @functools.wraps(fn)
     def given(*inputs, **options):
         return fn(*inputs, **options)
-    given.as_given = True
+    given.as_given, given.programs = True, programs
     return given
 
 
@@ -2175,21 +2177,51 @@ def _recorded_following(decisions_at, certified, live):
     return followed
 
 
+def _draws_roundings(truth_fn, arguments, counted: dict) -> int:
+    """The roundings one draw of the float64 truth `truth_fn` chains on `arguments` (`chain_roundings`): its
+    program's, a window loop's its window's (each window a draw of its own), counted once (`counted`); a truth
+    run as given that states the programs it runs (`as_given`'s `programs`: a host loop of compiled rows or
+    steps), the sum over those this draw runs, each traced here in float64 once a program and signature, as
+    a draw's programs may vary with it. The sum bounds every leaf's chain, which runs through some of those
+    programs in turn: looser than one program's count by at most their number, a draw's rows or steps, so
+    float64's bound on a leaf stays near 1e-13 of its norm where float32's rounding is 6e-8."""
+    program, traced = _one_draws_program(truth_fn, arguments)
+    stated = getattr(program, "programs", None)
+    if stated is None:
+        if "draw" not in counted:
+            counted["draw"] = chain_roundings(jax.make_jaxpr(program)(*traced))
+        return counted["draw"]
+
+    def summed(window) -> int:
+        total = 0
+        for run, held in stated(*window):
+            signature = (run, jax.tree.structure(held),
+                         tuple((np.shape(leaf), np.result_type(leaf)) for leaf in jax.tree.leaves(held)))
+            if signature not in counted:
+                counted[signature] = chain_roundings(jax.make_jaxpr(run)(*held))
+            total += counted[signature]
+        return total
+
+    # A window loop's every window, each a draw of its own whose programs may differ: the most of them.
+    count = len(jax.tree.leaves(arguments)[0]) if isinstance(truth_fn, _Windowed) else 0
+    each = ([jax.tree.map(lambda leaf, at=at: leaf[at], arguments) for at in range(count)]
+            if count else [traced])
+    with jax.enable_x64(new_val=True):
+        return max(map(summed, each))
+
+
 def certifier(site: str, truth_fn, shapes: Mapping[str, np.ndarray], recorded_sketch):
     """`truth_fn`, Dew's float64 path, as a recorded truth holds it: its program as the gate compiles a
     truth (`live`), and `certified(index, *arguments)`, its leaves on `arguments` (a draw's inputs, a
     followed site's recorded decisions before them), each held to the recorded truth's sketch at draw
     `index` (`recorded_sketch(index, name)`, of the leaves `shapes` names) within float64's rounding of the
-    computation, its roundings counted once on its trace; past it, `UnrecordedTruth`: a summarized
-    recording's (`indexed_recording`), and a truths recording's (tests/recorded_truths.py)."""
-    live, roundings = _truth_program(truth_fn), {}
+    computation, its roundings counted on its trace (`_draws_roundings`); past it, `UnrecordedTruth`: a
+    summarized recording's (`indexed_recording`), and a truths recording's (tests/recorded_truths.py)."""
+    live, counted = _truth_program(truth_fn), {}
 
     def certified(index: int, *arguments):
         computed = live(*arguments)
-        if not roundings:
-            # One draw's roundings, a window loop's its window's: each window is a draw of its own.
-            program, traced = _one_draws_program(truth_fn, arguments)
-            roundings["count"] = chain_roundings(jax.make_jaxpr(program)(*traced))
+        count = _draws_roundings(truth_fn, arguments, counted)
         eps = float(np.finfo(np.float64).eps)
         if set(computed) != set(shapes):
             raise AssertionError(f"{site}: `truth_fn` gives the leaves {sorted(computed)}, the recording "
@@ -2208,7 +2240,7 @@ def certifier(site: str, truth_fn, shapes: Mapping[str, np.ndarray], recorded_sk
             norm = largest * float(np.linalg.norm(value / largest)) if largest > 0 else 0.0
             # The oracle rule's bound on the difference's norm, and the rounding of both sketches, the
             # recorded truth's magnitudes no more than this one's and the difference's (`sketch_rounding`).
-            oracle = 2 * roundings["count"] * eps * norm
+            oracle = 2 * count * eps * norm
             magnitude = float(np.sum(np.abs(value))) * (1 + value.size * eps) + np.sqrt(value.size) * oracle
             bound = (SKETCH_DEVIATIONS * oracle + 2 * sketch_rounding(magnitude)) * (1 + 1e-6)
             apart = truth_sketch(value, index) - recorded
@@ -2221,7 +2253,7 @@ def certifier(site: str, truth_fn, shapes: Mapping[str, np.ndarray], recorded_sk
                     f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not the recorded "
                     f"reference's: its sketch is {away:.3e} away (root mean square), past float64's "
                     f"rounding of the computation "
-                    f"({roundings['count']} roundings); `truth_fn` does not compute what the reference's "
+                    f"({count} roundings); `truth_fn` does not compute what the reference's "
                     f"truth did")
         return computed
 
