@@ -29,7 +29,6 @@ import numpy as np
 
 from dew.algebra import scan
 from dew.nn.kernels import recurrence
-from dew.nn.kernels.recurrence_algebra import portable_einsum
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.precision import at_least_fp32
 
@@ -79,9 +78,9 @@ def log_linear_attention(query, key, value, g, level_scales, *, scale: float | N
 def _within(q, k, v, g, weights, positions, *, scale: float, documents: int):
     """The pairs within each `WITHIN`-aligned block of a document's `positions` `[B, T]`, levels zero to
     `log2 WITHIN`: each token laid at its block's slot (a row's blocks in order, at most `ceil(T / WITHIN)`
-    and its `documents` more), each block's queries and keys one masked attention, a pair `(l, c)` at
-    `exp(G_l - G_c) lambda_l[level(l, c)] (q_l . k_c)` (`G` the block's running log decay, `scan.between`),
-    its output read back at each token's slot."""
+    and its `documents` more), each block's reads the derived scan's (`scan.spread`, its decays
+    `scan.between`), each pair's read times its query's weight of the pair's level, its output read back at
+    each token's slot."""
     rows, length, groups, _ = q.shape
     heads, offset = v.shape[2], positions % WITHIN
     count = min(length, -(-length // WITHIN) + documents)
@@ -91,23 +90,19 @@ def _within(q, k, v, g, weights, positions, *, scale: float, documents: int):
 
     def laid(x):
         blocks = jnp.zeros((rows, count * WITHIN, *x.shape[2:]), x.dtype).at[each, slot].set(x)
-        return blocks.reshape(rows, count, WITHIN, *x.shape[2:])
+        return blocks.reshape(rows * count, WITHIN, *x.shape[2:])
 
+    q, k = (jnp.repeat(x, heads // groups, axis=2) for x in (q, k))
     q, k, v, g, weights = (laid(x) for x in (q, k, v, g, weights))
-    # Each block's decays as the recurrence's derivation forms them (`scan.between`: compensated, a
-    # vanished decay ending a segment), `[B, n, H, l, c]`.
-    decay = jax.vmap(jax.vmap(scan.between))(g).transpose(0, 1, 4, 2, 3)
-    # A pair's level: zero for a token's own key, else the bit length of their offsets' XOR; past the
-    # sequence's levels, a pair of slots no token takes.
+    # A pair's level: zero for a token's own key, else the bit length of their offsets' XOR (the exponent
+    # `frexp` gives, 1 for 1, 0 for 0); past the sequence's levels, a pair of slots no token takes.
     offsets = np.arange(WITHIN)
-    # A bit length is the exponent `frexp` gives (1 for 1, 0 for 0).
     level = np.minimum(np.frexp(np.bitwise_xor.outer(offsets, offsets))[1], weights.shape[-1] - 1)
-    weighed = weights.transpose(0, 1, 3, 2, 4)[..., offsets[:, None], level]
-    scores = jnp.repeat(portable_einsum('bxign,bxjgn->bxgij', q, k), heads // groups, axis=2)
-    # The scores of every pair whose decay is zero (past a token, or through a vanished decay) selected
-    # away before they meet it: one that overflows there times zero is a NaN, in the output and, as the
-    # product's factor, in every gradient through it; the recurrence decays the memory before the query
-    # reads it, so no such product forms.
-    pairs = decay * weighed * jnp.where(decay != 0, scores, 0.0)
-    out = scale * portable_einsum('bxhij,bxjhp->bxihp', pairs, v)
-    return out.reshape(rows, count * WITHIN, heads, -1)[each, slot]
+
+    def head(query, key, value, decay, weight):
+        pairs = weight[offsets[:, None], level]
+        return scan.spread(query, key, value, scan.between(decay[:, None]), weights=pairs)
+
+    # A block's heads, then every row's blocks.
+    out = jax.vmap(jax.vmap(head, in_axes=1, out_axes=1))(q, k, v, g, weights)
+    return (scale * out).reshape(rows, count * WITHIN, heads, -1)[each, slot]
