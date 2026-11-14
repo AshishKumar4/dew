@@ -403,6 +403,32 @@ def test_a_rewrite_is_recorded_in_the_kernel_report():
     assert made.spliced == 1
 
 
+def test_a_pass_without_a_rule_set_leaves_its_rewrites_untaken():
+    """A pass that leaves registered sets out (`algebra.program.passes`' `without`, a rule set's receipt's
+    arm) admits them nowhere and takes none of their rewrites: the sums the `linear` set joins (as the test
+    above records) are rewritten without it by no `linear` match, and without it and `joined`, the other
+    set that joins them, by none at all, their program computing what the program with no pass computes; a
+    set no name registers is refused, as an arm without it would measure nothing."""
+    from dew.algebra.program import passes
+
+    def joined(x, y, a):
+        return two_sums(x, y, a)
+
+    x, y, a = rows(3, (8, 64), (8, 64), (8, 64))
+    with report.refusals(), passes(without=("linear",)):
+        options.program(joined).compiled(x, y, a)
+        [made] = report.rewrites()
+    assert "linear" not in made.admitted and "linear" not in made.fired
+    with report.refusals(), passes(without=("linear", "joined")):
+        computed = options.program(joined).compiled(x, y, a)(x, y, a)
+        assert not report.rewrites()
+    with passes(on=False):
+        traced = options.program(joined).compiled(x, y, a)(x, y, a)
+    np.testing.assert_array_equal(np.asarray(computed), np.asarray(traced))
+    with pytest.raises(ValueError), passes(without=("lineal",)):
+        pass
+
+
 def test_a_programs_whole_pass_is_recorded_by_either_entry():
     """Each program's whole pass is recorded in seconds whichever entry runs it (`report.passes`, row 5339):
     the compile point's rewrite of a jit's trace (`options.program`) and a function's own
