@@ -636,6 +636,28 @@ def test_the_4b_steps_forward_compiles_spill_free_on_tensor_memory_for_a_b200(ro
     assert not failed, "\n".join(failed)
 
 
+@pytest.mark.parametrize("kept", [template.Kept.SPLIT, template.Kept.NONE], ids=["training", "inference"])
+def test_the_4b_steps_forward_issues_its_logits_ahead_on_a_b200(kept):
+    """Qwen3.5-4B's attention forward (16 query heads over 4, 256 wide, 12,288 causal tokens) at the config
+    its derivation gives on a compile-only B200: its program issues each key tile's logits a step before its
+    softmax reads them (`attention_mosaic_forward.logits_ahead`, row 5368), its two consumers' value
+    accumulators and two logits' each within the multiprocessor's tensor memory."""
+    from dew.nn.kernels.templates.attention_mosaic_forward import logits_ahead
+    from dew.nn.kernels.templates.attention_mosaic_program import bundle_of
+
+    tokens, heads, kv_heads, width = 12288, 16, 4, 256
+    spans = template.spans(tokens, tokens, 2, causal=True)
+    query = jax.ShapeDtypeStruct((2, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, tokens, kv_heads, width), jnp.bfloat16)
+    with generation.assumed("sm100"):
+        op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        config = op.derived(op.bind(*args, residuals=kept, interpret=False), generation.gpu_target())
+        assert config is not None and config.family == "tcgen05.chunks", config
+        family = bundle_of(config, jnp.bfloat16)
+        assert logits_ahead(family, config, config.columns or width, jnp.bfloat16, stages=config.stages)
+
+
 CERTIFIED_FORWARD = """
 import json
 import jax

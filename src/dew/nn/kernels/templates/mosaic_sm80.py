@@ -638,9 +638,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
         # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
-        # each stage back as its step ends, so no step holds one past it.
+        # each stage back as its step ends, so no step holds one past it, nor reads one ahead.
+        if ahead:
+            raise NotImplementedError(f"{self.name}'s pipeline reads no stream ahead")
         del first, in_flight, unrolled
         blocks = streams.pipeline.blocks
         names = tuple(blocks)

@@ -556,21 +556,42 @@ class WholeSlots:
 class Slots:
     """A walk step's operand slots (`Family.walk`), by stream name: each acquired when the step first reads
     it (`slots[name]`) and released at the step's end, once its MMAs are done, unless the step `release`s it
-    sooner (a slot its last product has read)."""
+    sooner (a slot its last product has read). A stream the walk reads a step `ahead` the step reads through
+    the next step's slot (`following`, where `more` steps follow in its range): its own slot was acquired by
+    the step before it, or by itself where it is its range's `first` (`opened`), and it gives that slot
+    back as any other."""
 
-    def __init__(self, rings: dict[str, Ring], turn: Turn):
+    def __init__(self, rings: dict[str, Ring], turn: Turn, ahead: tuple[str, ...] = (), *, more=False,
+                 first=True):
         self._rings, self._turn = rings, turn
         self._held: dict[str, Ref] = {}
         self._released: set[str] = set()
+        self._ahead, self.more, self.first = ahead, more, first
 
     def __getitem__(self, name: str):
+        if name in self._ahead:
+            raise ValueError(f"{name}'s slot is read a step ahead: the step before read it (`following`), or "
+                             "the range's first step reads its own (`opened`)")
         if name not in self._held:
             self._held[name] = self._rings[name].acquire(self._turn)
         return self._held[name]
 
+    def opened(self, name: str):
+        """Stream `name`'s own slot where the walk reads it ahead and no step before this one did: the range's
+        first step's (`first`), within its branch."""
+        return self._rings[name].acquire(self._turn)
+
+    def following(self, name: str):
+        """Stream `name`'s slot at the next step, which this one reads ahead of it where `more` steps follow:
+        acquired here, given back by the next step."""
+        stages = min(ring.stages for ring in self._rings.values())
+        return self._rings[name].acquire(self._turn.ahead(1, stages))
+
     def release(self, name: str) -> None:
-        """Stream `name`'s slot given back now, its reads done (acquired first if the step read none)."""
-        self[name]
+        """Stream `name`'s slot given back now, its reads done (acquired first if the step read none, or by
+        the step before where the walk reads it ahead)."""
+        if name not in self._ahead:
+            self[name]
         self._rings[name].release(self._turn)
         self._released.add(name)
 
@@ -585,17 +606,25 @@ class Slots:
     def held(self) -> None:
         """Every slot the step has not read acquired, none given back: a step whose products stay running
         past it (`Family.walk`'s `in_flight`) gives its slots back a step later (`released`)."""
-        if self._released:
-            raise ValueError("a step whose products run past it gives back no slot early")
+        if self._released or self._ahead:
+            raise ValueError("a step whose products run past it gives back no slot early nor reads one ahead")
         self.acquire_all()
 
     def acquire_all(self) -> None:
         """Every slot the step has not read acquired in the step's own trace: a slot first acquired inside a
         loop's body (a rolled `lax.fori_loop`) is kept by its first read, which would carry that body's slot
         index past it, a scalar the kernel then takes as an input (the Mosaic GPU lowering fails on it); a
-        step that reads its slots in a loop acquires them before it."""
+        step that reads its slots in a loop acquires them before it. A stream read ahead is not its own to
+        acquire."""
         for name in self._rings:
-            self[name]
+            if name not in self._ahead:
+                self[name]
+
+
+def ahead_stages(ahead: tuple[str, ...]) -> int:
+    """The least slots a walk's rings take where its steps read `ahead` (`Family.walk`): the next step's slot
+    held beside the step's own, two where it reads any ahead, one otherwise."""
+    return 2 if ahead else 1
 
 
 def released(rings: dict[str, Ring], turn: Turn) -> None:
@@ -991,15 +1020,37 @@ class Issuer[Accumulator](abc.ABC):
 
         return resources.widest_swizzle(dtype, columns)
 
-    def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = ()) -> tuple | dict:
+    def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
+                        ahead: tuple[int, ...] = ()) -> tuple | dict:
         """The memory a program's products take where the issuer keeps each product's accumulator itself
         (tcgen05's chunks: tensor memory of each product width in `widths` and a tensor-core barrier, a
         consumer role each), and stages a register left operand of each `(depth, dtype)` in `lefts` where
         it takes none in registers (`takes_register_left`: a shared tile a role), allocated at the program's
         scope: a role's own scope may not allocate (Mosaic GPU's thread-collective allocations wait for
-        every warpgroup); none where its products need none."""
-        del consumers, widths, lefts
+        every warpgroup); none where its products need none. A product of each width in `ahead` a role
+        issues a step before it reads it (`issued_ahead`) takes two accumulators and a barrier each."""
+        del consumers, widths, lefts, ahead
         return ()
+
+    issues_ahead: bool = False
+    """Whether a role issues a product into memory of the issuer's own a step before it reads it
+    (`issued_ahead`, `taken`): tcgen05's chunks, its accumulators tensor memory, where a walk's next
+    logits run while its softmax does (row 5368)."""
+
+    def issued_ahead(self, lhs, rhs, shape: tuple[int, int], buffer) -> None:
+        """`lhs @ rhs` of `shape` issued into the building role's accumulator `buffer` (0 or 1, traced) of
+        the products it reads a step later (`product_scratch`'s `ahead`), not awaited (`taken`)."""
+        raise NotImplementedError(f"{self.name} issues no product ahead of its read")
+
+    def taken(self, shape: tuple[int, int], buffer) -> jax.Array:
+        """The product of `shape` `issued_ahead` into accumulator `buffer`, awaited, its value."""
+        raise NotImplementedError(f"{self.name} issues no product ahead of its read")
+
+    def product_columns(self, products: tuple | None) -> int:
+        """The tensor-memory columns `Family.scoped`'s `products` take (`product_scratch`'s): none where the
+        issuer keeps no accumulator there."""
+        del products
+        return 0
 
     def product_shared(self, scratch) -> tuple:
         """Of a program's product scratch (`product_scratch`'s), what a multiprocessor's shared memory holds:
@@ -1600,7 +1651,7 @@ class Transport[Allocated, Opened](abc.ABC):
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
         """A consumer's walk of `segments`, each `(step, lo, hi)`, `step(index, slots, carry, accumulators)
         -> (carry, accumulators)` given each stream's slots (`Slots`, the streams' steps counted from
         `first`), from `start`, with fp32 accumulators of `shapes` its products issue into in place, zero
@@ -1608,7 +1659,10 @@ class Transport[Allocated, Opened](abc.ABC):
         running past their step (0 or 1): their slots go back once they are done, a step later, so the next
         step's operands are waited for while they run. A ring's `unrolled` walk takes a rotation of its
         slots a trip, each step at a slot it knows (`mosaic.stepping`): for a step small beside its waits (a
-        GEMM's), where a ring's slots are few.
+        GEMM's), where a ring's slots are few. The streams named `ahead` each step reads a step early
+        (`Slots.following`): a product issued for the next step while this one's runs (tcgen05's logits in
+        flight, row 5368), the mirror of `in_flight`'s late release, which it excludes; a family whose
+        streams are no producer's rings reads none ahead.
         Returns the carry and the accumulators' values."""
 
     @abc.abstractmethod
@@ -2129,19 +2183,25 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
         return self._walked(streams, segments, start, shapes, interpret, first=first, in_flight=in_flight,
-                            initial=initial, unrolled=unrolled)
+                            initial=initial, unrolled=unrolled, ahead=ahead)
 
     def _walked[C](self, streams: dict[str, Ring], segments, start: C, shapes: tuple, interpret: bool, *,
                    first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                   freed: Callable | None = None, unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
+                   freed: Callable | None = None, unrolled: bool = False, ahead: tuple[str, ...] = ()
+                   ) -> tuple[C, tuple[jax.Array, ...]]:
         """`walk`, `freed(counter)` run after each step's slots are given back (step `counter`'s). Each
-        segment walks its steps a step a trip or, `unrolled`, a rotation of the rings (`stepping`)."""
+        segment walks its steps a step a trip or, `unrolled`, a rotation of the rings (`stepping`). A step
+        reading `ahead` holds the next step's slot of those streams beside its own, so the rings hold two
+        steps' slots at least (`Tiles.stages`' floor, `ahead_stages`)."""
         stages = min(ring.stages for ring in streams.values())
         if not 0 <= in_flight < stages:
             raise ValueError(f"a walk keeps fewer steps' products in flight than its rings' {stages} slots, "
                              f"none or some, not {in_flight}")
+        if ahead and (in_flight or stages < ahead_stages(ahead)):
+            raise ValueError(f"a walk reading {ahead} a step ahead holds two steps' slots of rings of "
+                             f"{stages}, and keeps no product in flight past its step ({in_flight})")
         def given(turn: Turn, *, release: bool = False) -> None:
             # `turn`'s slots given back (`release`: here, a step its products ran past), then `freed`.
             if release:
@@ -2149,8 +2209,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             if freed is not None:
                 freed(turn.counter)
 
-        def turned(step, lo, index, turn: Turn, carry, accumulators, *, before: int = 0):
-            slots = Slots(streams, turn)
+        def turned(step, lo, hi, index, turn: Turn, carry, accumulators, *, before: int = 0):
+            slots = Slots(streams, turn, ahead, more=index + 1 < hi, first=index == lo)
             groups = commits()
             carry, accumulators = step(index, slots, carry, accumulators)
             # The step's product groups (its completion tokens): a step `in_flight` back is done once no
@@ -2187,7 +2247,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
         loops: list[Loop] = []
         for step, lo, hi in segments:
-            run = stepping(functools.partial(turned, step, lo), lo, hi, first, stages, unrolled=unrolled)
+            run = stepping(functools.partial(turned, step, lo, hi), lo, hi, first, stages, unrolled=unrolled)
             loops += [*run[:-1], run[-1]._replace(then=drained(lo, hi) if in_flight else None)]
         return self.accumulated(tuple(loops), start, shapes, interpret, initial)
 

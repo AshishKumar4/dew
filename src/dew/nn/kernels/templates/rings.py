@@ -147,6 +147,13 @@ class Turn:
         """The parity of the phase its fill completes, which a wait for it takes."""
         return self.rotation % 2 == 1
 
+    def ahead(self, steps: int, stages: int) -> "Turn":
+        """The turn `steps` after it (fewer than `stages`), its slot constant where this one's is."""
+        if isinstance(self.slot, int):
+            slot = self.slot + steps
+            return Turn(self.counter + steps, slot % stages, self.rotation + slot // stages)
+        return Turn.of(self.counter + steps, stages)
+
     def back(self, steps: int, stages: int) -> "Turn":
         """The turn `steps` before it (fewer than `stages`), its slot constant where this one's is."""
         if isinstance(self.slot, int):
