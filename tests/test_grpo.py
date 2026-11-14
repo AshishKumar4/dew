@@ -486,3 +486,82 @@ def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
         dataclasses.replace(config, rollout=None)
     with pytest.raises(ValueError):
         dataclasses.replace(config, objective=ObjectiveConfig("lm"))
+
+
+COUNT_LOW, COUNT_HIGH = 3, 31
+"""The counting language's ids: each token follows its predecessor by one, wrapping from COUNT_HIGH to
+COUNT_LOW."""
+COUNT_RUNS, COUNT_STEPS, COUNT_GROUPS, COUNT_TOKENS = 8, 40, 4, 4
+"""A GRPO policy's runs, each its own initialization and prompts, and each run's updates over eight prompts of
+two tokens, `COUNT_GROUPS` completions of `COUNT_TOKENS` a prompt."""
+COUNT_MARGIN = 2.0
+"""The claim: forty updates halve each run's held-out loss of the language's own continuations."""
+
+
+def counted(start, length: int) -> np.ndarray:
+    """`length` ids counting up from `start` by the language's rule."""
+    span = COUNT_HIGH - COUNT_LOW
+    return (COUNT_LOW + (np.asarray(start)[..., None] - COUNT_LOW + np.arange(length)) % span).astype(np.int32)
+
+
+def counting_reward(text: str, record) -> float:
+    """The share of a completion's tokens that follow the language's rule from the token before, the
+    prompt's last for the first (its record's `ground_truth`)."""
+    previous = int(record.ground_truth)
+    followed = []
+    for token in (int(word) for word in text.split()):
+        followed.append(token == counted(previous, 2)[1])
+        previous = token
+    return float(np.mean(followed)) if followed else 0.0
+
+
+def counting_prompts(seed) -> dict:
+    """Eight two-token prompts of the language from drawn first ids, each record naming its last token."""
+    starts = np.random.default_rng(seed).integers(COUNT_LOW, COUNT_HIGH, size=8)
+    prompts = counted(starts, 2)
+    return {PROMPT_KEY: prompts, LENGTH_KEY: np.full(8, 2, np.int32),
+            SOURCE_KEY: np.stack([_utf8("count", 8) for _ in starts]),
+            TRUTH_KEY: np.stack([_utf8(str(int(last)), 8) for last in prompts[:, -1]]),
+            INFO_KEY: np.stack([_utf8("", 8) for _ in starts])}
+
+
+def test_a_grpo_policy_rewarded_for_its_language_learns_it():
+    """Language RL's scenario (docs/design/testing.md: collect rollouts, score them, update a policy): a
+    policy drawing completions of two-token prompts, rewarded for each token that follows the counting
+    language's rule (`counting_reward`), trained by GRPO on its own draws (`RolloutScheduler.sampled`), cuts
+    its held-out loss of the language's own continuations, the rule's next tokens after prompts no run trained
+    on, by COUNT_MARGIN times, over independent runs, each from its own initialization and prompts, as the
+    learning gate judges a learning claim (`learning_gate.assert_learns`)."""
+    import itertools
+
+    import optax
+    from learning_gate import assert_learns
+
+    from dew.data.dataset import Loader, replayed
+    from dew.training import Trainer
+
+    objective = GRPOObjective(TinyHead(vocab_size=COUNT_HIGH + 1), 2 + COUNT_TOKENS - 1)
+    rollout = RolloutScheduler.sampled(objective, counting_reward, groups=COUNT_GROUPS,
+                                       max_new_tokens=COUNT_TOKENS, sampling=Sampling(temperature=1.0))
+    scored = jax.jit(objective.per_token_log_probs)
+
+    def held_out_loss(variables, run: int) -> float:
+        """The policy's mean loss of the rule's continuation after each of 64 held-out prompts."""
+        starts = np.random.default_rng([run, 10_000]).integers(COUNT_LOW, COUNT_HIGH, size=64)
+        rows = counted(starts, 2 + COUNT_TOKENS)
+        return float(-jnp.mean(scored(objective.model_variables(variables), jnp.asarray(rows))[:, 1:]))
+
+    def contrasts(runs):
+        drops = []
+        for run in runs:
+            trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(int(run)), rollout=rollout)
+            start = trainer.initial_state()
+            data = Loader(replayed(lambda partition, run=run: (counting_prompts([run, step])
+                                                               for step in itertools.count())),
+                          None, batch=8, records=None)
+            state = trainer.fit(data, steps=COUNT_STEPS, log_every=COUNT_STEPS)
+            drops.append(np.log(held_out_loss(start.variables, run) / held_out_loss(state.variables, run))
+                         - np.log(COUNT_MARGIN))
+        return {"training halves the held-out loss of the language's continuations": np.asarray(drops)}
+
+    assert_learns(contrasts, "a GRPO policy learning its language", units=COUNT_RUNS)
