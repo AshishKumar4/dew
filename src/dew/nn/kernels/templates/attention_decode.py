@@ -41,6 +41,7 @@ from dew.nn.kernels.templates.attention import (
     KeySpans,
     grouped_rows,
     prescale,
+    prologues_taken,
     ungrouped_rows,
 )
 
@@ -269,8 +270,15 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     reading no value to choose it; given none, the call takes each key's from the values it reads, one pass
     over them (a quantized cache's codes times their scales), where the scaled walk a cache's call takes
     unchosen (`MosaicForward.cached`) took 2.25 times the unscaled kernel's time (a bf16 step at 8 rows over
-    32768 keys, 64 wide, on an H100: 522 against 232 us, M-ET-61c and M-ET-49b)."""
+    32768 keys, 64 wide, on an H100: 522 against 232 us, M-ET-61c and M-ET-49b). The prologues are taken
+    as XLA's program before the launch; a paged or quantized cache's keys none (its pages and codes hold
+    them under their prologue, taken as they were cached). A caller whose dense keys already hold their
+    prologue passes none."""
     hooks = Hooks() if hooks is None else hooks
+    if hooks.key_mod is not None and (table is not None or scales is not None):
+        raise ValueError("a paged or quantized cache holds its keys under their prologue, taken as they were "
+                         "cached: a call over its pages or codes takes no key prologue")
+    query, key, hooks = prologues_taken(query, key, hooks)
     if not packable(hooks):
         raise NotImplementedError("the template's decode packs no query-placed hook, parameter, output "
                                   "hook or dropout (`packable`)")

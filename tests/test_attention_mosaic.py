@@ -1783,9 +1783,9 @@ mainloop's own list."""
 
 @pytest.mark.parametrize("operation", APPROXIMATED_BY_MOSAIC)
 def test_every_approximated_operation_in_a_hook_takes_exact_math(operation):
-    """A score hook and an output hook each computing one operation Mosaic GPU approximates under
-    `approx_math` (`APPROXIMATED_BY_MOSAIC`) take exact math, in the forward and differentiated: no such
-    operation of a hook passes unseen."""
+    """A score hook, an output hook and a query prologue each computing one operation Mosaic GPU approximates
+    under `approx_math` (`APPROXIMATED_BY_MOSAIC`) take exact math, in the forward and (the score hook)
+    differentiated: no such operation of a hook passes unseen."""
     def applied(x):
         return getattr(jax.lax, operation)(jnp.abs(x) + 1.0)
 
@@ -1796,10 +1796,18 @@ def test_every_approximated_operation_in_a_hook_takes_exact_math(operation):
     def output_mod(out):
         return applied(out)
 
+    def query_mod(q, q_pos):
+        del q_pos
+        return applied(q.astype(jnp.float32)).astype(q.dtype)
+
     for hooks in (template.Hooks(score_mod), template.Hooks(output_mod=output_mod)):
         for differentiated in (False, True):
             assert not attention_mosaic_program.approximate(hooks, (64, 64), 64,
                                                             differentiated=differentiated)
+    # A query prologue a launch takes on its query tile (`attention_mosaic_forward._prologued`).
+    assert not attention_mosaic_program.approximate(
+        template.Hooks(query_mod=query_mod), (64, 64), 64, differentiated=False,
+        query=(64, 64, jnp.bfloat16))
 
 
 def _fullest(op, ba, target):

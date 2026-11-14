@@ -15,6 +15,7 @@ import jax
 import jax.extend.core as jax_core
 import jax.numpy as jnp
 from jax import lax
+from jax.core import ShapedArray
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
@@ -518,14 +519,15 @@ APPROXIMATED = frozenset({jax.lax.exp_p, jax.lax.exp2_p, jax.lax.log_p, jax.lax.
 exp, exp2, log, log2, tanh, sin, cos, sqrt and rsqrt; jax's logistic, log1p and pow lower through them)."""
 
 
-def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differentiated: bool) -> bool:
+def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differentiated: bool,
+                query: tuple | None = None) -> bool:
     """Whether a launch running `hooks` on `tile` takes the hardware's approximate transcendentals
     (`Family.kernel`'s `approx_math`): only where no hook computes one Mosaic GPU approximates
     (`APPROXIMATED`), with `differentiated` the score hook's pullback too. The mainloop's own exponentials
     hold check 1 at ex2.approx; a hook's need not: on an H100 a softcap's tanh.approx (2^-11 relative) beside
     an initial state put the state's sums' gradient at 7.04 times the reference's error from float64, every
     hook on par with exact math (the hooked backward, HOOKS-FIX-h100)."""
-    traced = _hook_jaxprs(hooks, tile, value_width, differentiated=differentiated)
+    traced = _hook_jaxprs(hooks, tile, value_width, differentiated=differentiated, query=query)
     return not any(_primitives(jaxpr) & APPROXIMATED for jaxpr in traced)
 
 
@@ -582,10 +584,18 @@ def _off_tile(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> bool:
 
 
 def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
-                 differentiated: bool = False) -> list[jax_core.Jaxpr]:
+                 differentiated: bool = False, query: tuple | None = None) -> list[jax_core.Jaxpr]:
     """`hooks` traced as a launch runs them on `tile`, its outputs `value_width` wide: the score hook (and,
-    `differentiated`, its pullback along the logits and its floating parameters) and the output hook."""
+    `differentiated`, its pullback along the logits and its floating parameters), the output hook, and the
+    query prologue where the launch takes it on its query tile, `query`'s `(rows, D, dtype)`
+    (`attention_mosaic_forward._prologued`: its parameters as the tile's entries, each in its own dtype)."""
     traced = []
+    if query is not None and callable(hooks.query_mod):
+        rows, width, dtype = query
+        traced.append(jax.make_jaxpr(hooks.query_mod)(
+            jax.ShapeDtypeStruct((rows, width), dtype), jax.ShapeDtypeStruct((rows, 1), jnp.int32),
+            *(jax.ShapeDtypeStruct(() if param.kind is Kind.HEAD else (rows, width), param.value.dtype)
+              for param in hooks.query_params)).jaxpr)
     # A keyed launch's hook is its fingerprint (`tuning.program`), whose lowering its live call established.
     if callable(hooks.score_mod):
         traced += _score_jaxprs(hooks.score_mod, tuple((param.kind, param.value.dtype)
@@ -842,6 +852,9 @@ class _Hooked(NamedTuple):
     """A scaled walk's keys' value magnitudes `[B, Hk, Kp]` fp32, each key's largest over the launch's value
     columns (`attention_mosaic_forward._largest`), read a key tile's columns at a time as the keys' scales
     are; None where a launch reads them from its value slots (a cache's walk)."""
+    query: tuple[jax.Array, ...] = ()
+    """The query prologue's parameters (`Hooks.query_params`'), `[H]`, `[B, H, Qp]` or `[H, D]`, which a
+    consumer reads once a query tile where it takes the prologue (`attention_mosaic_forward._query_of`)."""
 
 
 def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
@@ -856,7 +869,7 @@ def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
     output = tuple(_columns(value, unit) if param.kind == Kind.OUTPUT else value
                    for value, param in zip(call.output_params, hooks.output_params, strict=True))
     return _Hooked(call.score_params, output, initial,
-                   placed_draws(hooks.drop, call.query.shape[1], call.key_rows))
+                   placed_draws(hooks.drop, call.query.shape[1], call.key_rows), query=call.query_params)
 
 
 def placed_draws(drop: Dropout | None, queries: int, keys: int) -> Dropout | None:
@@ -1741,23 +1754,48 @@ class ForwardRegisters:
     per_span: int = 1
     merged: bool = False
     started: bool = False
+    prologue: tuple | None = None
+    """The query prologue its consumers take on their query tiles (`MosaicForward.query_mod`), with its
+    parameters' kinds and dtypes, `(hook, kinds, dtypes)`; None where it has none."""
 
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
            columns: int | None = None) -> int | None:
         """A consumer's registers at `tiles` on `family`: its walk's over the values' columns its launch
-        walks (`columns`, a block of them; the tiles' own by default), or its peak walk's (`peaks`); None on
-        a family that budgets none (`Family.budgets_registers`)."""
+        walks (`columns`, a block of them; the tiles' own by default), or its peak walk's (`peaks`), and its
+        query prologue's before either walks (`prologue_registers`); None on a family that budgets none
+        (`Family.budgets_registers`)."""
         if not family.budgets_registers:
             return None
         width = _width(self.width, family, self.dtype)
+        before = (0 if self.prologue is None
+                  else prologue_registers(family, tiles.block_q, width, self.dtype, *self.prologue))
         if peaks:
-            return peaks_registers(family, tiles, self.dtype, params=self.params, width=width)
+            return max(before, peaks_registers(family, tiles, self.dtype, params=self.params, width=width))
         value_width = columns or tiles.columns or _width(self.value_width, family, self.dtype)
-        return forward_registers(family, tiles, value_width, self.dtype, self.residuals,
-                                 natural=tiles.natural_form or self.natural, params=self.params,
-                                 width=width, parts=self.parts, scaled=self.scaled, codes=self.codes,
-                                 positions=self.positions, per_span=self.per_span, merged=self.merged,
-                                 started=self.started)
+        return max(before, forward_registers(
+            family, tiles, value_width, self.dtype, self.residuals,
+            natural=tiles.natural_form or self.natural, params=self.params, width=width, parts=self.parts,
+            scaled=self.scaled, codes=self.codes,
+            positions=self.positions, per_span=self.per_span, merged=self.merged, started=self.started))
+
+
+def prologue_registers(family: mosaic.Family, block_q: int, width: int, dtype, hook: Callable,
+                       kinds: tuple[Kind, ...], dtypes: tuple[str, ...]) -> int:
+    """The registers a consumer's query prologue holds before its walk
+    (`attention_mosaic_forward._prologued`): every tile its traced program makes at a query tile of
+    `block_q` rows `width` wide in `dtype`, the tile it reads and its parameters' among them, priced live at
+    once, its program's order being ptxas's (a light prologue's live tiles alone priced the 4B call's
+    inference forward's natural rewalk within a B200 consumer's 240 registers, which spilled 48 bytes,
+    et-a6-h; Qwen3's QK-norm and RoPE at 64 x 256 held more at every config, et-a6-d)."""
+    params = [jax.ShapeDtypeStruct(() if kind is Kind.HEAD else (block_q, width), kept)
+              for kind, kept in zip(kinds, dtypes, strict=True)]
+    closed = jax.make_jaxpr(hook)(jax.ShapeDtypeStruct((block_q, width), dtype),
+                                  jax.ShapeDtypeStruct((block_q, 1), jnp.int32), *params)
+    values = [var.aval for var in (*closed.jaxpr.invars,
+                                   *(var for equation in closed.jaxpr.eqns for var in equation.outvars))]
+    tiles = [(aval.shape[0], aval.shape[1], aval.dtype) for aval in values
+             if isinstance(aval, ShapedArray) and len(aval.shape) == 2 and aval.shape[0] == block_q]
+    return resources.live_registers(family, [], tiles)
 
 
 DQ_ROWS = 7

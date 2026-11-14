@@ -36,9 +36,12 @@ from dew.nn.kernels.templates.attention import (
     Split,
     gradients,
     kept_dtype,
+    key_prologue_taken,
     logit_scale,
     power_of_two,
     prescale,
+    prologued,
+    prologues_taken,
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import _launch_backward
 from dew.nn.kernels.templates.attention_mosaic_coop import _coop_allocations
@@ -364,12 +367,20 @@ class MosaicForward(_Mainloop[Tiles]):
     the backward's residuals (`forward`'s). Its configs come from the family's facts and the call's extents
     (`derived`), legal within the device's block and a consumer's registers (`legal`)."""
 
-    HOOKS = ("score_mod", "output_mod")
+    HOOKS = ("score_mod", "output_mod", "query_mod")
     config_cls = Tiles
     output_mod: Callable | None = None
     output_kinds: tuple[Kind, ...] = ()
     output_dtypes: tuple[str, ...] = ()
     output_width: int = TRACED_TILE
+    query_mod: Callable | None = None
+    """The query prologue (`Hooks.query_mod`), which each consumer takes on its query tile where it loads it,
+    once a tile (`attention_mosaic_forward._query_of`); None where the call has none or its caller took it
+    (`_forward_call`)."""
+    query_kinds: tuple[Kind, ...] = ()
+    query_dtypes: tuple[str, ...] = ()
+    query_width: int = TRACED_TILE
+    query_dtype: str = "float32"
     out_dtype: str | None = None
     """The inference walk's output dtype, the query's where None: fp32 for a split launch's slices, which a
     merge takes (`attention_decode`)."""
@@ -395,15 +406,16 @@ class MosaicForward(_Mainloop[Tiles]):
     over the largest magnitudes its cache states, `attention_decode.attend`'s `bounds`), so its kernels walk
     unscaled, a `cached` call's too, reading no value to choose them."""
 
-    def _hooks(self, score_params, output_params, initial, drop) -> Hooks:
+    def _hooks(self, score_params, output_params, initial, drop, query_params=()) -> Hooks:
         """The call's hooks from its parameters, state and draw, its static hooks the op's."""
         return Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial,
-                     self.output_mod, tuple(map(Param, output_params, self.output_kinds)), drop, self.rounds)
+                     self.output_mod, tuple(map(Param, output_params, self.output_kinds)), drop, self.rounds,
+                     self.query_mod, tuple(map(Param, query_params, self.query_kinds)))
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
-             drop=None, table=None, sources=None, scales=None, *, residuals: Kept, interpret: bool,
-             config: Tiles, return_residuals: bool = False):
-        hooks = self._hooks(score_params, output_params, initial, drop)
+             drop=None, table=None, sources=None, scales=None, query_params=(), *, residuals: Kept,
+             interpret: bool, config: Tiles, return_residuals: bool = False):
+        hooks = self._hooks(score_params, output_params, initial, drop, query_params)
         if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False,
                              family=bundle_of(config, query.dtype)):
             raise NotImplementedError(reason)
@@ -438,7 +450,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                 initial=None if initial is None else initial.acc,
                                 amplified=1.0 if drop is None else drop.bound)
         arguments = (query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
-                     drop, table, sources, scales)
+                     drop, table, sources, scales, query_params)
 
         def rare():
             # A pin of this op's where the scaled op can take it, else its own config, which derives wherever
@@ -777,7 +789,9 @@ class MosaicForward(_Mainloop[Tiles]):
                                 positions=math.ceil(query.shape[1] / self.per_span)
                                 if self.form == "spans" and self.per_span > 1 else 0, per_span=self.per_span,
                                 merged=initial is not None and residuals is not Kept.SPLIT,
-                                started=initial is not None and residuals is Kept.SPLIT)
+                                started=initial is not None and residuals is Kept.SPLIT,
+                                prologue=(None if self.query_mod is None
+                                          else (self.query_mod, self.query_kinds, self.query_dtypes)))
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
@@ -894,12 +908,16 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     gives it a call some row of which can be scaled); `bounded` the unscaled
     one, a cache's call too, where its caller bounded its values (`MosaicForward.bounded`).
     """
+    # The key prologue taken as XLA's program before the launch (`key_prologue_taken`); the query's where the
+    # call's consumers cannot take it (`_forward_call`).
+    key, hooks = key_prologue_taken(key, Hooks() if hooks is None else hooks)
     if residuals is Kept.SPLIT:
         # The training walk reads an interval a query (`KeySpans.per_query`); the inference walk by position.
         spans = spans.per_query()
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
                              out_dtype=out_dtype, masked=masked, splits=splits, table=table, sources=sources,
-                             subtracted=subtracted, scales=scales, scaled=scaled, bounded=bounded)
+                             subtracted=subtracted, scales=scales, scaled=scaled, bounded=bounded,
+                             residuals=residuals)
     return op(*args, residuals=residuals, interpret=interpret)
 
 
@@ -909,7 +927,9 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     """Why `forward` runs no call of these arrays compiled on this device, or None
     (`MosaicForward.declined`)."""
     spans = spans.per_query() if residuals is Kept.SPLIT else spans
-    op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
+    key, hooks = key_prologue_taken(key, Hooks() if hooks is None else hooks)
+    op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
+                             residuals=residuals)
     return op.declined(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target())
 
 
@@ -919,7 +939,9 @@ def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     one (no P·V a step late): those tiles, and `certified_walk`'s output and its state after each of their key
     tiles. Off in production; tests/attention_witness.py holds each state to one step's enclosure of the one
     before. A call no config holds raises the reason the forward declines it (`MosaicForward.declined`: an
-    unqualified family's, or the device's block and registers)."""
+    unqualified family's, or the device's block and registers). Its query and key as `forward` takes them,
+    under their prologues where the launch does not take them (`key_prologue_taken`, `_forward_call`)."""
+    key, hooks = key_prologue_taken(key, Hooks() if hooks is None else hooks)
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
     ba = op.bind(*args, residuals=Kept.NONE, interpret=interpret)
     target = generation.gpu_target()
@@ -928,23 +950,35 @@ def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         raise ValueError(f"the Mosaic forward declines the call: {op.declined(ba, target)}")
     arguments = ba.arguments
     registered = op.registered(arguments["query"], arguments["value"], arguments["score_params"], Kept.NONE)
-    return config, certified_walk(query, key, value, spans, hooks or Hooks(), scale=op.scale,
-                                  natural=op.natural, tiles=config, interpret=interpret,
-                                  registered=registered)
+    if hooks.query_mod is not None and op.query_mod is None:
+        # A query prologue the launch does not take where it loads the query (`_forward_call`), taken here.
+        query = prologued(query, hooks.query_mod, hooks.query_params)
+        hooks = dataclasses.replace(hooks, query_mod=None, query_params=())
+    return config, certified_walk(query, key, value, spans, hooks, scale=op.scale, natural=op.natural,
+                                  tiles=config, interpret=interpret, registered=registered)
 
 
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
                   scale: float | None, natural: bool, out_dtype=None, masked: bool = False,
                   splits: int = 1, table: jax.Array | None = None, sources: jax.Array | None = None,
                   subtracted: bool = False, scales: tuple[jax.Array, jax.Array] | None = None,
-                  scaled: bool = False, bounded: bool = False) -> tuple[MosaicForward, tuple]:
+                  scaled: bool = False, bounded: bool = False, residuals: Kept = Kept.NONE
+                  ) -> tuple[MosaicForward, tuple]:
     """`forward`'s op and its arguments, a dropping call's draw among them, which its legality rule refuses
     (`refused`): the op it launches, `scaled` or `bounded` as the call names (`MosaicForward.scaled`,
     `MosaicForward.bounded`), so a plan of it derives that launch's config and reads that launch's
-    refusals (`attention_decode.plan`)."""
+    refusals (`attention_decode.plan`). A query prologue its consumers take where they load the query
+    (`MosaicForward.query_mod`) where the launch keeping `residuals` holds it at its own config
+    (`_holds_prologue`), else XLA's program before the launch takes it."""
     hooks = Hooks() if hooks is None else hooks
     fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
     parts = product.EXACT_PARTS if fp32 else 1
+    if hooks.query_mod is not None and (parts > 1 or power_of_two(query.shape[3]) != query.shape[3]):
+        # A query prologue its consumers cannot take where they load the query: an fp32 call's query enters as
+        # its parts, and a padded width's rows hold zeros past it (a norm over them is another norm); XLA's
+        # program before the launch takes it.
+        query = prologued(query, hooks.query_mod, hooks.query_params)
+        hooks = dataclasses.replace(hooks, query_mod=None, query_params=())
     if parts > 1:
         # fp32 operands as their bf16 parts, stacked along the batch axis (`MosaicForward.parts`); the
         # output fp32, the call's. Its fold's logits a difference of raw products scaled after it
@@ -963,11 +997,42 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
                        splits=splits, subtracted=subtracted, per_span=spans.per_span,
-                       parts=parts, rounds=hooks.rounds, scaled=scaled, bounded=bounded)
-    return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
-                tuple(param.value for param in hooks.score_params),
-                tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop,
-                table, sources, scales)
+                       parts=parts, rounds=hooks.rounds, scaled=scaled, bounded=bounded,
+                       query_mod=hooks.query_mod,
+                       query_kinds=tuple(param.kind for param in hooks.query_params),
+                       query_dtypes=tuple(jnp.dtype(param.value.dtype).name for param in hooks.query_params),
+                       query_width=query.shape[3], query_dtype=jnp.dtype(query.dtype).name)
+    args = (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
+            tuple(param.value for param in hooks.score_params),
+            tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop,
+            table, sources, scales, tuple(param.value for param in hooks.query_params))
+    if op.query_mod is not None and not _holds_prologue(op, args, residuals):
+        taken = dataclasses.replace(hooks, query_mod=None, query_params=())
+        return _forward_call(prologued(query, hooks.query_mod, hooks.query_params), key, value, spans, taken,
+                             scale=scale, natural=natural, out_dtype=out_dtype, masked=masked, splits=splits,
+                             table=table, sources=sources, subtracted=subtracted, scales=scales,
+                             scaled=scaled, bounded=bounded, residuals=residuals)
+    return op, args
+
+
+def _holds_prologue(op: MosaicForward, args: tuple, residuals: Kept) -> bool:
+    """Whether a forward launch keeping `residuals` takes its query prologue where its consumers load the
+    query (`MosaicForward.query_mod`) at the config it derives without it: a neighbour joins a kernel that
+    still holds its residency (kernel-templates.md's hooks), never one whose prologue's registers
+    (`ForwardRegisters.prologue`) cost it a consumer or a tile its walk would run (Qwen3's QK-norm and RoPE
+    at width 128 on a B200 priced 236 of a consumer's 240 registers, et-prologue-fits)."""
+    target = generation.gpu_target()
+
+    def holds(op: MosaicForward) -> bool:
+        plain = dataclasses.replace(op, query_mod=None, query_kinds=(), query_dtypes=())
+        held = op.fits(op.bind(*args, residuals=residuals, interpret=False), target)
+        alone = plain.fits(plain.bind(*args[:-1], (), residuals=residuals, interpret=False), target)
+        return bool(held) and held == alone
+
+    # Its scaled op's too where the call may launch it (`MosaicForward._fwd`): the prologue is the call's,
+    # either branch's.
+    rare = op.scaled or op.bounded or op.rounds is not None or not algebra.headroom(args[2].dtype)
+    return holds(op) and (rare or holds(dataclasses.replace(op, scaled=True)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1338,7 +1403,10 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     (`MosaicBackward.derived`). Every
     call form of bf16 operands, under every score hook and the initial state. The output hook is no part of
     it: a differentiated call applies `output_mod` past the kernel, where its own derivative runs, and passes
-    `dout` before it. `interpret` runs it on the CPU, as a GPU of the family `generation.assumed` names."""
+    `dout` before it. `interpret` runs it on the CPU, as a GPU of the family `generation.assumed` names. Its
+    query's and key's gradients are under their prologues (`attention_route._pulled` takes them back)."""
+    # The prologues taken as XLA's program before the launch (`prologues_taken`).
+    query, key, hooks = prologues_taken(query, key, hooks)
     op, args = _backward_call(query, key, value, spans, hooks, dout, residuals, scale=scale, natural=natural,
                               accurate=accurate, rounded=rounded)
     return op(*args, interpret=interpret)
