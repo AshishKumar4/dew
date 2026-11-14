@@ -1,15 +1,14 @@
 """The performance gate's verdict (tools/perf_gate.py), on samples written here."""
 
-import base64
 import hashlib
 import json
 import shutil
 import subprocess
 import sys
-import zipfile
 from pathlib import Path
 
 import pytest
+import wheels
 from tool_support import load
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -314,24 +313,6 @@ version = "0"
 """
 
 
-def wheel(directory: Path, version: str) -> Path:
-    """A wheel of the package `probe_wheel` at `version`: its module, metadata and record, zipped."""
-    info = f"probe_wheel-{version}.dist-info"
-    files = {"probe_wheel/__init__.py": f"__version__ = {version!r}\n",
-             f"{info}/METADATA": f"Metadata-Version: 2.1\nName: probe-wheel\nVersion: {version}\n",
-             f"{info}/WHEEL": ("Wheel-Version: 1.0\nGenerator: tests\nRoot-Is-Purelib: true\n"
-                               "Tag: py3-none-any\n")}
-
-    def digest(text: str) -> str:
-        return base64.urlsafe_b64encode(hashlib.sha256(text.encode()).digest()).rstrip(b"=").decode()
-    record = "".join(f"{name},sha256={digest(text)},{len(text.encode())}\n" for name, text in files.items())
-    path = directory / f"probe_wheel-{version}-py3-none-any.whl"
-    with zipfile.ZipFile(path, "w") as archive:
-        for name, text in {**files, f"{info}/RECORD": f"{record}{info}/RECORD,,\n"}.items():
-            archive.writestr(name, text)
-    return path
-
-
 def test_a_tree_imports_the_wheels_its_lock_names_and_dew_from_its_own_source(gate, tmp_path):
     """Built for real by each tree's own installer: a tree's process imports the wheel version its
     lock names and Dew from its own src, also where two trees whose locks agree share one
@@ -340,7 +321,7 @@ def test_a_tree_imports_the_wheels_its_lock_names_and_dew_from_its_own_source(ga
     for name, version in (("main", "1.0"), ("head", "2.0")):
         tree = trees[name] = tmp_path / name
         (tree / "locks").mkdir(parents=True)
-        built = wheel(tmp_path, version)
+        built = wheels.wheel(tmp_path, "probe-wheel", version)
         # As every lock holds it: each file's sha256, which Dew's installer requires.
         digest = hashlib.sha256(built.read_bytes()).hexdigest()
         (tree / "locks" / "cpu.txt").write_text(f"probe-wheel @ {built.as_uri()} --hash=sha256:{digest}\n")
