@@ -373,10 +373,8 @@ def test_a_call_over_requests_scores_in_a_servers_passes_over_its_programs(decid
 
 
 def test_a_tasks_later_calls_trace_and_compile_nothing(decide):
-    """A task's calls score over one scoring plan (`RowScoring`: its passes' shapes, window bounds and
-    packs, and the programs compiled for them), which its first call builds and the rest read: a later
-    call of a request the first one shaped traces no program and compiles none (`Compiles`; ledger 4807),
-    and answers as the first did."""
+    """A task's later call of a request its first one shaped traces no program and compiles none
+    (`Compiles`), its call's server included, and answers as the first did."""
     from dew.decision import Question
     from dew.telemetry.compiles import Compiles
 
@@ -388,6 +386,15 @@ def test_a_tasks_later_calls_trace_and_compile_nothing(decide):
         assert compiles.programs == [], [program.name for program in compiles.programs]
         for name, answer in again.items():
             np.testing.assert_array_equal(answer.probabilities, first[name].probabilities)
+
+
+def test_a_tasks_scorings_hold_one_plan(decide):
+    """Every scoring of a task, its Jev bodies' (`Decide.scoring`, `systemone`'s) and its calls', holds one
+    task without weights, whose plan (its passes' shapes, each pass length's window bounds and its packs)
+    is built once for them all: two scorings' pass shapes are one (ledger 4807: a plan rebuilt at each
+    scoring is another)."""
+    first, second = decide.scoring()[0], decide.scoring(details=True)[0]
+    assert first.decide.pass_shapes is second.decide.pass_shapes
 
 
 def test_a_scoring_pass_looks_at_every_waiting_request(decide):
