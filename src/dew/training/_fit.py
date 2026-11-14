@@ -53,13 +53,14 @@ from dew.held_updates import waiting
 from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
 from dew.optim import OptimConfig
 from dew.optim_schedules import reclocked
+from dew.scores import Summary
 from dew.state import TrainState, occupied
 from dew.telemetry.profile import Profiler, region
 from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Branch, Cooldowns
 from dew.training.diloco import regrouped
-from dew.training.evaluation import Declared, EvalSuite, Evaluation, Split, SplitLoss, Summary, episodic
+from dew.training.evaluation import Declared, EvalSuite, Evaluation, Split, SplitLoss, episodic
 from dew.training.interval import Interval, LogWriter, Taken, TokenClock
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS
 from dew.training.observe import Observe

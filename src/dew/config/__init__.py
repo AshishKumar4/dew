@@ -88,6 +88,7 @@ from dew.registry import (
     trusted_packages,
     wants_tuple,
 )
+from dew.scores import Summary
 from dew.state import TrainState
 from dew.telemetry.profile import CaptureOptions
 from dew.telemetry.records import RunRecord, TrialFinished, packages_installed, tracker_json
@@ -95,7 +96,7 @@ from dew.training._fit import FitArguments
 from dew.training.ahead import AheadOfTime, CompiledAhead, LaterPhases, fit_plan
 from dew.training.budget import Pause
 from dew.training.display import TrainingDisplay
-from dew.training.evaluation import EvalSuite, Split, Summary
+from dew.training.evaluation import EvalSuite, Split
 from dew.training.profiling import ProfileReport, ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.rollout import Rollout
@@ -775,7 +776,7 @@ class RunConfig:
     val_summaries: Annotated[tuple[Summary, ...], record_argument(tuple[Summary, ...])] = ()
     """Scalars weighed from each evaluation's split scores, a board's weighted index, each formed at a
     step that scored every split it weighs and logged as `evaluation/summary/<name>`, which
-    `--trainer.best evaluation/summary/<name>` ranks by (`dew.training.evaluation.Summary`):
+    `--trainer.best evaluation/summary/<name>` ranks by (`dew.scores.Summary`):
     `--val-summaries '[{"name": "board", "weights": {"val/accuracy": 1, "test/accuracy": 2},
     "better": "higher"}]'`.
     """
