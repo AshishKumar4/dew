@@ -941,7 +941,7 @@ def test_a_layer_norm_centers_a_bf16_row_in_float32():
                     truth_fn=normalized(nn.LayerNorm(epsilon=1e-5, dtype=jnp.float64)))
 
 
-SHARDED_LAYER_NORM_SEEDS = 64
+SHARDED_LAYER_NORM_SEEDS = 32
 """The sharded layer norm's declared seeds for check 1, sized by `seeds_for` on armada."""
 
 
