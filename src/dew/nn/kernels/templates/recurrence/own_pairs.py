@@ -247,7 +247,8 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
                 return stream_tile(slots, name, given).value().astype(jnp.float32)
 
             (d_query, d_keyed), d_key = algebra.key_diagonal_pairs_back(
-                strips, [functools.partial(rows, "queries"), lambda: rows("keys") * betas[:, None]],
+                strips,
+                [functools.partial(rows, "queries"), lambda: algebra.write_gated(rows("keys"), betas)],
                 algebra.separated(*prefix),
                 shifted_keys(call, shifts, key, prefix), functools.partial(shifted_up, call),
                 (zero, zero), zero)

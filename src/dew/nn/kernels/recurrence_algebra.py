@@ -541,7 +541,7 @@ def weighted(name: str, lower, tile, beta, issue: Issue, decay=None):
     `[C, BK]` a key dimension's). The diagonal outside the product leaves it the off-diagonal terms alone,
     where a tensor core's truncating sum (mma.sync's) loses no more than their last bit. Without the delta
     rule (`lower` None) nothing is corrected and there is no product: the gated tile, fp32 (`apply`'s)."""
-    scaled = tile * beta[:, None] if decay is None else tile * beta[:, None] * decay
+    scaled = write_gated(tile, beta) if decay is None else write_gated(tile, beta) * decay
     if lower is None:
         return scaled.astype(jnp.float32)
     return scaled.astype(jnp.float32) + issue(name, lower, scaled.astype(tile.dtype))
@@ -777,6 +777,14 @@ def band_strip(band: jax.Array, offset) -> jax.Array:
     return jnp.sum(jnp.where(lane == offset, band, 0.0), axis=1)[:, None]
 
 
+def write_gated(tile: jax.Array, strengths: jax.Array) -> jax.Array:
+    """A tile `[C, D]` each row scaled by its token's write strength (`strengths` `[C]`, the delta rule's
+    beta): the keys and values the delta rule writes, as their products take them (fla's `k * beta` before
+    its `k k^T`, `v * beta` before its `A v`), gated on the operand, which scaling after the product is not
+    at finite precision (kernel-templates.md §3)."""
+    return tile * strengths[:, None]
+
+
 def pairs_masked(found: jax.Array, *, strict: bool, scale: float) -> jax.Array:
     """An output's pairs `found` `[C, C]` (a key block's factored pairs) as its sum takes them: below the
     diagonal where `strict` (the system), else on and below it and scaled (the scores); the sub-chunks' own
@@ -928,7 +936,7 @@ def key_values_back(value_grads: TileLoad, values: TileLoad, blocks: int, lower:
     # its product stages them: an accumulator a block, summed beside each block's own gradient, an A100's
     # launch spilled 96 bytes a thread (kda-gate6 at 306006c01).
     d_system = summed([("values_merge", value_grads(j), lambda j=j: Transposed(
-        (values(j).value().astype(jnp.float32) * betas[:, None]).astype(dtype))) for j in range(blocks)],
+        write_gated(values(j).value().astype(jnp.float32), betas).astype(dtype))) for j in range(blocks)],
         shape=(lower.shape[0],) * 2)
     return d_system, d_betas
 
@@ -974,7 +982,7 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     d_gated = -(d_weight + issue("weights_merge", lower.T, d_weight.astype(dtype)))
     emit("dk", d_key + d_gated * decays * betas[:, None])
     gated = keys * decays
-    gated_rows = Transposed((gated * betas[:, None]).astype(dtype))
+    gated_rows = Transposed(write_gated(gated, betas).astype(dtype))
     system = system - issue("weights_merge", d_weight.astype(dtype), gated_rows)
     emit("dg", d_decay + gated * d_gated * betas[:, None])
     d_betas = jnp.sum(d_gated * gated, axis=1)

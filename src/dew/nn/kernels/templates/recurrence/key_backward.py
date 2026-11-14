@@ -421,7 +421,8 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
 
             found = {}
             algebra.key_decayed_pairs_back(
-                d_pairs, [lambda c: query, lambda c: key * betas[:, None]], lambda c: key, 1, gated,
+                d_pairs, [lambda c: query, lambda c: algebra.write_gated(key, betas)], lambda c: key, 1,
+                gated,
                 reference, Issuer(call, {"pairs": list(pairs)}).summed, staged, chunk=chunk,
                 emit=lambda kind, p, c, grad: found.__setitem__((kind, p), grad))
             d_query, d_keyed, d_key = found["rows", 0], found["rows", 1], found["keys", 0]

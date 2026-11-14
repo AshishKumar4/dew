@@ -731,10 +731,17 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         tcgen05 pair's, which gathers and scatters no rows, `Transport.gathers_rows`, not for a routed call);
         none where no issuer's does (a CPU interprets a GPU's or a TPU's only where `generation.assumed` names
         it)."""
+        return next(iter(self._groups(ba, target)), ())
+
+    def _groups(self, ba, target) -> tuple[tuple[mosaic.Family, ...], ...]:
+        """Each issuer's bundles that take the call (`_takes`), in `bundles.groups`' preference order, a group
+        whose issuer's bundle takes it: the derivation's, each group's tiles tried before the next's, so a
+        call the most capable issuer takes but derives no tile of (a B200's paired product of three outputs,
+        whose register model holds none on tcgen05) runs on the next issuer's (mma.sync's)."""
         found = bundles.groups(target.generation, ba.arguments['tokens'].dtype, stated=True,
                                tpu=generation.tpu(target))
-        group = next((group for group in found if self._takes(ba, group[0])), ())
-        return tuple(family for family in group if self._takes(ba, family))
+        return tuple(tuple(family for family in group if self._takes(ba, family))
+                     for group in found if self._takes(ba, group[0]))
 
     def _takes(self, ba, family: mosaic.Family) -> bool:
         """Whether `family`'s bundle runs the call: 16-bit operands, or FP8 ones it takes (`_fp8`); gathered
@@ -776,13 +783,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         tiles (`_aligned`'s `whole_tiles`): the tile a launch runs whether its depth and width are padded or
         run partial (`_partial_axes`)."""
         ba = self._aligned(ba, whole_tiles=True)
-        layouts = self._families(ba, target)
-        if not layouts:
-            return None
         rows, depth, width = self._generated_extents(ba)
-        # A pair's layouts first where the rows hold its tile (`mosaic_gpu.paired_first`), each its own
-        # derivation, the first that holds a tile taken.
-        for tried in mosaic_gpu.paired_first(layouts, rows):
+        # Each issuer's group in turn (`_groups`), a pair's layouts first where the rows hold its tile
+        # (`mosaic_gpu.paired_first`), each its own derivation, the first that holds a tile taken.
+        for tried in (tried for layouts in self._groups(ba, target)
+                      for tried in mosaic_gpu.paired_first(layouts, rows)):
             tile = mosaic_gpu.derived(tried, rows=rows, depth=depth, width=width,
                                       dtype=ba.arguments['tokens'].dtype,
                                       multiprocessors=_multiprocessors(target), target=target,
@@ -923,7 +928,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         (`mosaic.Family.cluster`), and a one-dimensional side operand's block, copied untiled, at most one
         copy's extent along its axis (`mosaic.Family.copy_extent`); none a compile of this process found
         spilling (`report.refused`), so the derivation takes the next tile by its own rule."""
-        family = next((bundle for bundle in self._families(ba, target) if bundle.name == config.family), None)
+        family = next((bundle for group in self._groups(ba, target) for bundle in group
+                       if bundle.name == config.family), None)
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
                 or (family.pairs_product and ba.arguments['interpret'])
                 or self._pair_refuses(ba, config, family) or self._pingpong_refuses(config, family)
