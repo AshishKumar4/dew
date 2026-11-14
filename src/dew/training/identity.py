@@ -62,7 +62,7 @@ from jax._src import config as jax_config
 from jax.core import ShapedArray
 from jax.experimental.layout import Format, Layout
 
-from dew import _cache
+from dew import _cache, _hashing
 from dew._records import JSON
 from dew.algebra import terms
 from dew.nn.kernels.generation import TRACED_FACTS
@@ -155,7 +155,7 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) 
     again = functools.partial(_stated, known=known, walking=walking)
     if id(value) in known:
         return known[id(value)]
-    if (plain := _data(value)) is not None:
+    if (plain := _data(value, at)) is not None:
         return plain
     # A value of exactly Python's own type; a subclass (an enumeration's member) is stated as what it is.
     if value is None or type(value) in (bool, int, str):
@@ -220,13 +220,21 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) 
                         "identity can state")
 
 
-def _data(value) -> JSON | None:
-    """A scalar of NumPy's, a float, a complex, bytes, a dtype or an array of NumPy's by its type and
-    bits: a NumPy scalar's type is part of it (a trace makes an array of its dtype), a float is its bits.
-    None for a value that is none of them."""
+def _data(value, at: str) -> JSON | None:
+    """An array or a scalar of NumPy's, a float, a complex, bytes or a dtype by its type and bits: an
+    array or a NumPy scalar (a 0-d array, as a trace makes it) by its fingerprint
+    (`_hashing.array_fingerprint`: its dtype, shape and bytes), a float by its bits. One whose storage holds
+    pointers (an array of objects, a structured scalar with an object field) is refused as that fingerprint
+    refuses it: its bytes stay the same when what it points to changes. None for a value that is none of
+    them."""
     # NumPy's scalars first: several are subclasses of Python's own (a float64 is a float).
-    if isinstance(value, np.generic):
-        return ["scalar", str(value.dtype), value.tobytes().hex()]
+    if isinstance(value, np.generic | np.ndarray):
+        hasher = hashlib.sha256()
+        try:
+            _hashing.array_fingerprint(hasher, np.asarray(value))
+        except TypeError as refusal:
+            raise Unestablished(f"{at}: {refusal}") from None
+        return ["array", hasher.hexdigest()]
     if type(value) is float:
         return ["float", value.hex()]
     if type(value) is complex:
@@ -235,9 +243,6 @@ def _data(value) -> JSON | None:
         return ["bytes", hashlib.sha256(value).hexdigest()]
     if isinstance(value, np.dtype):
         return ["dtype", str(value)]
-    if isinstance(value, np.ndarray):
-        return ["array", str(value.dtype), list(value.shape),
-                hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()]
     return None
 
 
