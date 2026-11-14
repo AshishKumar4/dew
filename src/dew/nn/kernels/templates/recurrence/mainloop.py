@@ -1223,13 +1223,14 @@ def fp32_operand(call: Call) -> Operand:
 
 
 def _weighted_held(call: Call, block: int) -> Held:
-    """`_weighted`'s consumer thread at key block `block`: the inverse beside a value block's product, its
-    decay and its keys or values; under a decay a key dimension the key block's prefix halves, its range
-    decay's two terms (`algebra.range_decay`, as `between`'s) and its decayed write too."""
+    """`_weighted`'s consumer thread at key block `block`: under the delta rule the inverse beside a value
+    block's product; its decay and its keys or values; under a decay a key dimension the key block's prefix
+    halves, its range decay's two terms (`algebra.range_decay`, as `between`'s) and its decayed write too.
+    The decayed keys alone (`recurrence_decayed_keys`, no delta rule) hold no inverse, which no step reads."""
     chunk = call.chunk
     held = dataclasses.replace(call.held, rows=call.rows)
     return Held(phases=(
-        held_tile(held, chunk, chunk) + [f32(chunk, call.block)] * 2
+        held_tile(held, chunk, chunk) * call.delta + [f32(chunk, call.block)] * 2
         + held_tile(call.given, chunk, call.block) + [f32(chunk, block)] * 5 * call.per_key
         # The inverse against the scaled values and keys in turn, the delta rule's alone (`algebra.weighted`).
         + (largest_live_set(
@@ -1349,6 +1350,10 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: Call):
                          stages=(1, 2) if call.per_key else 1, live=chunk_liveness(6),
                          steps=steps, model=model, held=_weighted_held(call, keyed),
                          staging=staging, landing=landing,
+                         # The decayed keys alone a kernel of their own, apart from the delta rule's in a
+                         # training call that forms both: one name, its two modules were read as one, the
+                         # one that spilled (8 bytes at every stage depth on a B200) unseen by the gate.
+                         name=None if call.delta else "recurrence_decayed_keys",
                          # A key block's walk a program a tile; a decay a head's one step a tile, persistent.
                          persistent=not call.per_key,
                          # A key block's streams staged at its row: a tile slices only whole swizzle rows.
