@@ -12,6 +12,7 @@ import weakref
 from uuid import uuid4
 
 import grain.python as grain
+import jax
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -1265,8 +1266,10 @@ def test_authoritative_zero_target_count_is_refused_before_division():
 def test_dependency_change_preserves_global_resume_only_when_derived_order_matches():
     manifest = Manifest({"name": "test"}, revision="before")
     plan = Plan("global", manifest, {"seed": 0}, {"accepted_ids": fingerprint([1, 3, 5])})
+    # Dew's revision is the checkpoint step's, not the position's (row 5862): nothing the position holds
+    # changed.
     changed = dataclasses.replace(plan, manifest=dataclasses.replace(manifest, revision="after"))
-    assert changed.check(plan.record()) == ("revision",)
+    assert changed.check(plan.record()) == ()
     changed = dataclasses.replace(changed, derived={"accepted_ids": fingerprint([1, 3, 7])})
     with pytest.raises(ValueError):
         changed.check(plan.record())
@@ -1370,10 +1373,11 @@ class Given:
 @pytest.mark.parametrize("read", ["indexed", "memory"])
 def test_an_edit_to_a_configured_factorys_module_alone_is_environment(tmp_path, monkeypatch, read):
     """A configured step's factory comes from a module of its own. An edit to
-    that file that leaves the factory alone changes only the environment, so
-    an exact resume reads on, where the plan names the step and where a
-    memory read's rows name the steps that made them; the same factory
-    configured otherwise, to make the same step, is refused."""
+    that file that leaves the factory alone changes nothing the position
+    holds (the code and machine are the checkpoint step's, row 5862), so an
+    exact resume reads on with no change named, where the plan names the
+    step and where a memory read's rows name the steps that made them; the
+    same factory configured otherwise, to make the same step, is refused."""
     shifted = tmp_path / f"shifted_{uuid4().hex}.py"
     shifted.write_text(SHIFTED)
     factory = GIVEN.format(shifted=shifted.stem)
@@ -1398,7 +1402,7 @@ def test_an_edit_to_a_configured_factorys_module_alone_is_environment(tmp_path, 
     edited = reader(1)
     try:
         edited.set_state(state)
-        assert edited.manifest_changes == ("modules",)
+        assert edited.manifest_changes == ()
         assert listed(edited, 2) == expected
     finally:
         edited.close()
@@ -2245,6 +2249,24 @@ def test_a_window_holding_more_documents_than_its_read_declares_is_refused():
     assert Coordinated(("text",), 3).map(window)["text_coordinates"].max_segments == 3
     with pytest.raises(ValueError):
         Coordinated(("text",), 2).map(window)
+
+
+def test_rows_split_from_a_laid_batch_batch_back_to_its_tree():
+    """A laid batch's rows, each a record holding its row of the batch's `Coordinates`, batch back to the
+    batch's own tree, the `Coordinates` stacked leaf by leaf as Grain batches any pytree (`record_batch`):
+    a split pass's rows read so (row 5916)."""
+    from dew.data.dataset import record_batch
+    from dew.data.steps.generic import Coordinated
+
+    window = {"text": np.arange(12, dtype=np.int32).reshape(2, 6),
+              "text_segment_ids": np.asarray([[1, 1, 2, 2, 0, 0], [1, 1, 1, 0, 0, 0]], np.int32),
+              "text_positions": np.asarray([[0, 1, 0, 1, 0, 0], [0, 1, 2, 0, 0, 0]], np.int32)}
+    laid = Coordinated(("text",), 2).map(window)
+    rows = [jax.tree.map(lambda leaf, at=at: leaf[at], laid) for at in range(2)]
+    again = record_batch(rows)
+    assert jax.tree.structure(again) == jax.tree.structure(laid)
+    assert all(np.array_equal(left, right) for left, right in zip(jax.tree.leaves(again),
+                                                                  jax.tree.leaves(laid), strict=True))
 
 
 def test_a_worker_batch_shares_its_large_columns_and_pickles_the_small_ones():

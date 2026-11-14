@@ -298,11 +298,11 @@ def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
 def ahead_of(case: Case, generation: str, capacity: int,
              attention_impl: AttentionImpl = 'auto') -> AheadOfTime:
     """Case `case`'s step planned and compiled ahead of its run for one compile-only GPU of the CUDA
-    `generation` holding `capacity` bytes (`dew.training.ahead.compile_ahead`), on any host: what a GPU
+    `generation` of `capacity` bytes of memory (`dew.training.ahead.compile_ahead`), on any host: what a GPU
     node's prepare hands its run (`build_trainer`'s `ahead`), and what perf_gate's compile rows time."""
     trainer = build_trainer(case, attention_impl)
     trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus(generation, 1, capacity)))
-    return compile_ahead(trainer, global_batch(case), capacity)
+    return compile_ahead(trainer, global_batch(case))
 
 
 def media_row(case: Case, tokens: np.ndarray, rng: np.random.Generator) -> ModelInputs:

@@ -1,0 +1,9 @@
+{
+ "bytes": 2384053,
+ "license": "mit",
+ "path": "recordings/6f5aefe7409b4ec657393a47383ae2014574c9455844f52034a2713712ba323c.npz",
+ "reference": "deepseek-ai/DeepSeek-V4.1-Flash@dba1be0a40aa45a94ad051997016db3960a90277",
+ "repo": "dewml/fixtures",
+ "revision": "4710f3801681f8eff07716cd7b5b02bfd0a627cc",
+ "sha256": "6f5aefe7409b4ec657393a47383ae2014574c9455844f52034a2713712ba323c"
+}

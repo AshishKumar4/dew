@@ -883,26 +883,27 @@ class KVStore:
         return _gather_pages(pool, self._get(TABLE), self.layout.groups)
 
     def case(self, query: jax.Array, *, softcap: float | None, arithmetic: bool, named: str,
-             windowed: bool = False, sinks: bool = False) -> PagedCase:
+             windowed: bool = False, sinks: bool = False, owned: bool = False) -> PagedCase:
         """The `PagedCase` of a decode step's query `[rows, heads, head_dim]` over this pool, its values as
         wide as the pool stores them (`_value_width`), under the layer's `softcap`, its reference-only
         `arithmetic` (`dew.nn.attention.reference_only`) and its `AttentionImpl`, `named`; a `windowed`
-        step reads each row from its window's first key; a layer with `sinks` has attention sinks."""
+        step reads each row from its window's first key; a layer with `sinks` has attention sinks; an
+        `owned` step's products a quantized model's rule owns (`PagedCase.owned`)."""
         return PagedCase(heads=query.shape[-2], kv_heads=self.kv_heads, head_dim=self.head_dim,
                          value_dim=self._value_width(), dtype=jnp.dtype(query.dtype),
                          pool=jnp.dtype(self.dtype),
                          page_size=self.layout.page_size, quantized=self.layout.quantized,
                          groups=self.layout.groups, head_shards=_head_shards(query), softcap=softcap,
                          arithmetic=arithmetic, named=named, rows=query.shape[0], queries=1,
-                         keys=self._slots(), windowed=windowed, sinks=sinks)
+                         keys=self._slots(), windowed=windowed, sinks=sinks, owned=owned)
 
     def paged_kernel(self, query: jax.Array, *, softcap: float | None, arithmetic: bool, named: str,
-                     windowed: bool = False, sinks: bool = False) -> str | None:
+                     windowed: bool = False, sinks: bool = False, owned: bool = False) -> str | None:
         """The paged kernel the selector gives a decode step's query over this pool (`PAGED`, over its one
         `case`), reported as the step's route, which `decode` runs; None where no paged kernel takes it and
         the layer reads the gathered rows itself."""
         kernel = select(PAGED, self.case(query, softcap=softcap, arithmetic=arithmetic, named=named,
-                                         windowed=windowed, sinks=sinks)).kernel
+                                         windowed=windowed, sinks=sinks, owned=owned)).kernel
         return None if kernel == 'gathered' else kernel
 
     def _value_width(self) -> int:
@@ -987,7 +988,9 @@ class PagedCase:
     (`arithmetic`); the `AttentionImpl` it `named`; its `rows`, each one's `queries` and the `keys` each
     reads (its table's slots of pages, or a compact cache's capacity), which a kernel that plans the step
     plans it over (`_template_tiles`); whether it reads each row from its window's first key (`windowed`);
-    and whether the layer has attention sinks (`sinks`)."""
+    whether the layer has attention sinks (`sinks`); and whether a quantized model's rule owns the step's
+    products (`owned`, `dew.nn.attention`'s `AttentionCase.quantized`), which every paged kernel forms
+    inside its launch, past the rule: the gathered rows through the layer's attention take it there."""
 
     heads: int
     kv_heads: int
@@ -1007,6 +1010,15 @@ class PagedCase:
     keys: int
     windowed: bool = False
     sinks: bool = False
+    owned: bool = False
+
+
+_OWNED: Requirement[PagedCase] = Requirement('owned', lambda case: not case.owned,
+                                             "a quantized model's rule owns the step's products, which "
+                                             "this kernel forms inside its launch, past the rule; the "
+                                             "gathered rows through the layer's attention take them",
+                                             row=INHERENT)
+"""The requirement every paged kernel holds (`PagedCase.owned`): the complexity audit's A1 at a paged step."""
 
 
 def _paged_layout(device: str) -> tuple[Requirement[PagedCase], ...]:
@@ -1014,6 +1026,7 @@ def _paged_layout(device: str) -> tuple[Requirement[PagedCase], ...]:
     ungrouped, keys and values of one width, a mesh's query-head split within the pool's key heads,
     and arithmetic other than the reference path's."""
     return (
+        _OWNED,
         Requirement('pages', lambda case: case.page_size is not None, "the cache keeps no pages",
                     row=INHERENT),
         Requirement('quantized', lambda case: not case.quantized,
@@ -1095,6 +1108,7 @@ def _converts(stored: KVDtype) -> bool:
 
 
 TEMPLATE_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
+    _OWNED,
     Requirement('pages', lambda case: case.page_size is not None or case.quantized is not None,
                 "the cache keeps no pages and no codes: the layer's attention reads it", row=INHERENT),
     Requirement('dtype', lambda case: case.dtype in (jnp.bfloat16, jnp.float16)

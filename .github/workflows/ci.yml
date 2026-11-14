@@ -18,19 +18,15 @@ on:
     branches: [ "main", "base/kernels" ]
   pull_request:
     branches: [ "main" ]
-  # A dispatch runs its ref as a push would; with `whole`, it is the daily run's whole suite, which the land queue
-  # dispatches on main after every fifth publish (bible: the whole suite every fifth publish).
+  # A dispatch runs its ref as a push would; with `whole`, the whole suite, which nothing dispatches on its own: the
+  # daily run stopped (owner, 2026-11-13: trains are the only check), and the whole suite's own cells and release
+  # checks wait on his word (bible line 89).
   workflow_dispatch:
     inputs:
       whole:
         description: "the whole suite, as the daily run's: every file on every Python, the whole_suite cells and the release checks, the test cache off"
         type: boolean
         default: false
-  # Daily, main's every test file runs on every Python, the whole_suite cells and the release checks among them,
-  # the test cache aside (tools/armada/ci.py), so nothing it skipped can hide: the whole suite, which the land
-  # queue reads (its daily runs), each red a P1 of its file's owner.
-  schedule:
-    - cron: "17 9 * * *"
   # The release workflow runs all of this on the release's own commit and
   # publishes only if every job passes.
   workflow_call:
@@ -55,8 +51,11 @@ env:
   # failed map task ended and the tail of what it said (armada f6cc2b3; Main, 2026-11-09), and that shares a run's
   # pool so no task job takes containers it cannot use (armada 6c7b581; train 757: a job one long task held took 562
   # and used 122, the other ran out its deadline on 125), and whose map over a commit runs on its .armada.json's CPU
-  # pin, as the lint gates' does (armada d1db76c; 2026-11-10: unpinned maps landed on hosts the pin leaves out).
-  ARMADA: github:AshishKumar4/armada#d1db76c55737a64b80e8a39c1f8b14fb4c9f352a
+  # pin, as the lint gates' does (armada d1db76c; 2026-11-10: unpinned maps landed on hosts the pin leaves out), and
+  # whose judges' and later map tasks' jobs run a task's timeout and ten minutes past the run's deadline, so a judged
+  # run whose first wave ran long still judges (armada 080b5dd; train 795: its judges got 192 s and it went ungraded),
+  # and which shows a local plan's stderr, where Dew's plan states its reuse (armada bc61de0).
+  ARMADA: github:AshishKumar4/armada#bc61de0a56e8864a04b89cd3bef6937c98e11f8e
 
 jobs:
   # A commit this workflow passed on another push, or one the land queue
@@ -128,8 +127,11 @@ jobs:
         # run's after every lane's, as its suite's.
         case "$GITHUB_REF_NAME" in main) priority=--priority=5 ;; *) priority= ;; esac
         if [ -n "$WHOLE" ]; then priority=--priority=-15; fi
+        # Any CPU the region gives: the suite's pin and AMD's 25/1, as a gate reads text and types and its verdict is
+        # one on any host (2026-11-13: small lint maps pinned alone ran out 8 minutes on 25/1 placements).
+        cpus=$(jq -r '[.task.cpu // empty] | flatten | map("\(.vendor)/\(.family)/\(.model)") + ["AuthenticAMD/25/1"] | unique | join(",")' .armada.json)
         grep -v '^#' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
-          $priority --label="lint-$GITHUB_REF_NAME" -- \
+          $priority --cpu="$cpus" --label="lint-$GITHUB_REF_NAME" -- \
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
           sh "$base" '{item}'
 
@@ -250,9 +252,11 @@ jobs:
       cancel-in-progress: false
       queue: max
     # Main's daily whole run, below every lane's, waits for capacity within its suite's and then its release
-    # checks' 6000 s deadlines, one after the other: 210 minutes.
+    # checks' 6000 s deadlines, one after the other: 210 minutes. Any other's suite runs its deadline and then its
+    # judges up to a task's 1,800 s and 600 s more (armada's later waves): a cold one's 5,400 s, 140 minutes; a
+    # warm one's 2,700 s, 90.
     timeout-minutes: ${{ ((github.event_name == 'schedule' || inputs.whole) && 210)
-      || ((github.ref_name == 'base/kernels' || needs.scope.outputs.policy == 'off') && 110) || 60 }}
+      || ((github.ref_name == 'base/kernels' || needs.scope.outputs.policy != 'on') && 140) || 90 }}
     steps:
     - uses: actions/checkout@v4
       with:

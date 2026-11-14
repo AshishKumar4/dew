@@ -409,3 +409,15 @@ def encoded_form(quantization, tensors, names):
     for name in sorted(names):
         out.update(quantization.encode(name, np.asarray(tensors[name])))
     return out
+
+
+def memory_limited_to(limit: int) -> int:
+    """The memory of a GPU whose allocator is limited to `limit` bytes (`dew._devices.allocator_limit`): what
+    a test states of a compile-only GPU (`compile_only_gpus`' `memory`) to plan against `limit`."""
+    import math
+
+    from dew._devices import allocator_limit, pool_share
+
+    memory = math.ceil(limit / pool_share())
+    assert allocator_limit(memory) == limit, (limit, memory)
+    return memory

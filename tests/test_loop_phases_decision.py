@@ -128,12 +128,13 @@ def test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_cou
     """From the same state over the same batch, each phase's step of the phased decision run computes what
     a run whose loop runs that phase's count computes: its loss and its stepped parameters the same bits (the
     ask's invariant 1); and the FLOPs it counts are that run's, so its FLOP count follows the phase's count,
-    two passes counting more than one (invariant 5)."""
+    two passes counting more than one (invariant 5); and its offline view of an update is that run's."""
     from dew.batch import PHASE as READ_IN
     from dew.config import TrainerConfig
     from dew.data.dataset import DataPartition
     from dew.distributed.batches import split_fields
     from dew.training import Layout, MeshSpec
+    from dew.training.inspection import Inspection, inspected
 
     settings = TrainerConfig(checkpoint_dir=str(tmp_path / "runs"), steps=4, log_every=1, eval_every=None,
                              checkpoint_every=None, checkpoint_final=False, multi_host=False,
@@ -172,6 +173,11 @@ def test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_cou
                                          jax.device_get(stepped.variables), jax.device_get(own.variables)))
         assert stepping.step_flops == alone.step_flops is not None
         counted.append(stepping.step_flops)
+        # Its offline view of one update over the phase's batch is that run's view (`inspected`, at the
+        # count of the phase the batch was read in, not the run's last).
+        for trainer in (stepping, alone):
+            trainer.inspection = Inspection(paths=("*",), targets=("updates",))
+        assert inspected(stepping, batches[phase]) == inspected(alone, batch), phase
     assert counted[0] != counted[1]
 
 
@@ -212,15 +218,17 @@ def test_a_phased_runs_later_phase_compiles_ahead_as_the_run_lowers_it_at_its_bo
     host = compile_only_gpus("sm90", 8, 40 * 2**30)
     topology.write_bytes(topologies.TopologyDescription(list(host)).serialize())
     data = phased(tmp_path)
-    phases_target = AheadTarget("sm90", 8, topology=str(topology), capacity_gib=30.0, phases=(1,))
+    phases_target = AheadTarget("sm90", 8, topology=str(topology), phases=(1,))
+    # The topology states its GPUs' memory: a capacity beside it, which nothing would read, is refused.
+    with pytest.raises(ValueError):
+        dataclasses.replace(phases_target, capacity_gib=30.0).compile_only()
     with pytest.raises(CompiledAhead) as later:
         trained(run(tmp_path, STEPS, data), tmp_path, "ahead",
                 trainer={"steps": 4, "compile_ahead": phases_target})
     assert later.value.code == 0 and later.value.path is None
     assert not (tmp_path / "runs" / "ahead").exists()
     trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 3, "checkpoint_every": 1})
-    resumed_target = AheadTarget("sm90", 8, path=str(tmp_path / "resumed.ahead"), topology=str(topology),
-                                 capacity_gib=30.0)
+    resumed_target = AheadTarget("sm90", 8, path=str(tmp_path / "resumed.ahead"), topology=str(topology))
     with pytest.raises(CompiledAhead) as resumed:
         trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 4,
                                                                          "compile_ahead": resumed_target})

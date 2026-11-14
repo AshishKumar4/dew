@@ -397,17 +397,19 @@ def test_phases_of_elastic_reads_resume_on_another_share_count(saved, resumed):
         assert sorted(held) == sorted(whole[step])
 
 
-SAVED_BY_MAIN = Path(__file__).with_name("fixtures") / "positions" / "main-d74347b5a"
-"""Positions main saved at d74347b5a, before phases shared corpora, of the chains
-`saved_positions_support` builds (`tools/positions_saved_by_main.py`): phases on their own streams inside the
-first, and a bounded mixture's read while its layout or its held shuffle holds counts."""
+SAVED_BY_MAIN = Path(__file__).with_name("fixtures") / "positions" / "main-0c8cf2384"
+"""Positions main saved at 0c8cf2384, under plan 14, of the chains `saved_positions_support` builds
+(`tools/positions_saved_by_main.py`): phases on their own streams inside the first, and a bounded mixture's
+read while its layout or its held shuffle holds counts."""
 
 
-@pytest.mark.parametrize("saved", ["step_phases", "bounded_mixture_strided", "bounded_mixture_held"])
-def test_a_position_saved_before_phases_shared_corpora_resumes_as_it_was_read(saved):
-    """A position main saved before draws were stamped and carried (no corpus carried or trained in a
-    phases' position, no draws owed by a counter or held by a layout's documents or a held shuffle's units)
-    resumes, and reads what a read of the same chain stopped where it stopped reads after it."""
+@pytest.mark.parametrize("saved", ["step_phases", "step_phases_later", "bounded_mixture_strided",
+                                   "bounded_mixture_held"])
+def test_a_position_main_saved_under_plan_14_resumes_as_it_was_read(saved):
+    """A position main saved under plan 14, which described its order's stages in place, of phases on their
+    own streams, in the first or past it (its finished phase named by its plan's identity, which held 14's
+    version, `saved_identity`), or of a bounded mixture read while its layout or its held shuffle holds
+    counts, resumes, and reads what a read of the same chain stopped where it stopped reads after it."""
     from saved_positions_support import SAVED
 
     loader, steps = SAVED[saved]
@@ -419,12 +421,3 @@ def test_a_position_saved_before_phases_shared_corpora_resumes_as_it_was_read(sa
     for stream in streams:
         stream.close()
     assert after[1] == after[0] and after[0]
-
-
-def test_phases_sharing_a_corpus_on_their_own_streams_are_refused_at_plan_13():
-    """Phases that share a corpus, each read on its own stream, compiled at plan 13, which no Dew of 13 read
-    by any rule: refused before they read (train 785's F3), where they once read the corpus again from its
-    start and trained it twice; this Dew's plan continues it."""
-    with pytest.raises(ValueError):
-        compile(shared_phases(), read="indexed", loading=READ, plan_version=13)
-    compile(shared_phases(), read="indexed", loading=READ).train(DataPartition()).close()

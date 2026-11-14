@@ -1,0 +1,36 @@
+{
+ "written_at": "b324ef51f4f90a209d90fbdf221af747ea643c7b",
+ "head": [
+  [
+   1,
+   2
+  ],
+  [
+   3,
+   4
+  ],
+  [
+   17,
+   18
+  ]
+ ],
+ "state": "{\"dew_data_plan\": {\"rules\": {\"identity\": \"structured\", \"grain\": \"0.2.18\"}, \"version\": 14, \"lowering\": \"per-share\", \"manifest\": {\"source\": {\"sources\": [{\"store\": \"memory\", \"identity\": null, \"rows\": 48, \"shard_rows\": 4, \"sha256\": \"557425e233a3b14b54d16972c13371988d65b2a39e106e74aa9f4558b359fd2c\"}]}, \"tokenizer\": {}, \"fill\": {}, \"codec\": 1, \"schema\": 1, \"steps\": [{\"name\": \"dew.data.pipeline.BatchStage\", \"config\": \"{\\\"batch_fn\\\": null, \\\"class\\\": \\\"dew.data.pipeline.BatchStage\\\", \\\"drop_remainder\\\": true, \\\"size\\\": 2}\", \"exact\": true, \"declared\": null, \"dependencies\": {}}]}, \"environment\": {\"revision\": \"616698964b8515faa55c1e754f3f91d4cd48c578\", \"lock\": \"01f9248fef8c0ed1a4d225b97a5b7618c586efea6db7fd6f3e60d7cedea9feb8\", \"python\": \"3.12.15\", \"platform\": \"Linux-6.18.56-cloudflare-microvm-2026.10.9-x86_64-with-glibc2.41\", \"clean\": true, \"modules\": [[]]}, \"order\": {\"read\": \"streamed\", \"seed\": 0, \"source\": \"memory:557425e233a3b14b54d16972c13371988d65b2a39e106e74aa9f4558b359fd2c\", \"stages\": [{\"class\": \"dew.data.pipeline.BatchStage\", \"size\": 2, \"drop_remainder\": true, \"batch_fn\": null}]}, \"derived\": {\"0/shards\": \"fc2d0e7a11e3a7bb\"}, \"topology\": {\"shares\": 1, \"share\": 0, \"workers\": 0, \"row_multiple\": 1, \"cycle_lengths\": []}, \"rejections\": \"drop\", \"cache\": [], \"volatile\": false, \"members\": {}, \"exact\": true}, \"counters\": 3, \"iterator\": {\"parent\": {\"place\": 1, \"rows\": {\"parent\": {\"next_index\": 2}, \"yielded\": true}}, \"dew.corpus_counts\": {\"corpus\": \"memory:557425e233a3b14b54d16972c13371988d65b2a39e106e74aa9f4558b359fd2c\", \"label\": \"memory\", \"counts\": {\"attempted\": 6, \"accepted\": 6, \"truncated\": 0, \"delivered_rows\": 6, \"chunks\": 0, \"chunk_records\": 0, \"rejected\": {}, \"cut_examples\": {}, \"cut_rows\": {}, \"cut_removed\": {}, \"left_out\": {}, \"rejected_cut\": {}, \"left_out_cut\": {}, \"declined\": {}, \"tokens\": 0}, \"consecutive\": 0, \"warned\": false, \"consumed\": 0, \"members\": {}}}}",
+ "after": [
+  [
+   19,
+   20
+  ],
+  [
+   41,
+   42
+  ],
+  [
+   43,
+   44
+  ],
+  [
+   45,
+   46
+  ]
+ ]
+}

@@ -84,7 +84,8 @@ its own processes wrote, or where it is a group of a file the record its groups
 are cut by does not wholly name (`record`). The records live in the dew-xla-cache Worker
 under `CACHE_PREFIX`. With DEW_TEST_CACHE=off where the plan runs, which its
 entries carry to their tasks (`--cache`), or without the Worker's URL and
-token, a task runs every file.
+token, a task runs every file; with 'cold', it looks rows up as with 'on',
+its plan weighing every task it runs cold (`policy`).
 
 A row's record also says where its tests read the backend and which are
 marked to run on a GPU (`gpu-tier --evidence` reports it); `gpu-tier` names the
@@ -137,6 +138,7 @@ import threading
 import time
 import tomllib
 import xml.etree.ElementTree as ET
+from collections import Counter
 from collections.abc import Container, Mapping, Sequence
 from pathlib import Path
 
@@ -181,6 +183,7 @@ partition = _loaded(HERE / "partition.py")
 command_line = _loaded(HERE / "arguments.py")
 rows = _loaded(HERE / "rows.py")
 row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_place, rows.key_parts
+grouped_rows = rows.grouped_rows
 # The test cache's records (records.py), by the names this file and its tests read them.
 (store, record_key, green_key, sets_key, set_key, epoch_key, Unread, UNREAD, epoch, begun, standing,
  executed_set, set_digest, remembered, recorded, record_of, written, listed, CACHE_PREFIX, RECORD_TRIES) = (
@@ -338,7 +341,7 @@ def shared(python: str) -> str:
     # (`digests.built`, fetched_fixtures' `manifest`, `digests.contents`), whose names are.
     for root in ("tests", "src"):
         for path in sorted(Path(root).rglob("*")):
-            if (path.is_file() and path.suffix != ".py" and not digests.built(path)
+            if (path.is_file() and path.suffix != ".py" and not digests.built(path) and path != session.CUTS
                     and digests.FIXTURES not in path.parents
                     and not digests.fetched.manifest(path).is_file()):
                 digest.update(b"fixture:" + str(path).encode())
@@ -367,6 +370,7 @@ class Reading:
     parts: dict[str, bytes] = dataclasses.field(default_factory=dict)
     modules: dict[str, dict[str, bytes] | bytes] = dataclasses.field(default_factory=dict)
     durations: dict[str, dict[str, float]] | None = None
+    stored: dict[str, list[str]] | None = None
     cuts: dict[tuple[str, int], list[list[str]]] = dataclasses.field(default_factory=dict)
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
@@ -376,10 +380,11 @@ class Reading:
         # Under the lock: the plan's threads share a reading (train 679: a half-parted record cut empty).
         with self.lock:
             if self.durations is None:
-                self.durations = parted_record(session.cut_record())
+                self.durations, self.stored = parted_record(session.cut_record()), session.stored_cuts()
             if (name, count) not in self.cuts:
                 own = own_tests(name, self.durations.get(name, {}))
-                self.cuts[(name, count)] = session.cut(list(own), list(own.values()), count)
+                self.cuts[(name, count)] = session.planned(name, list(own), list(own.values()), count,
+                                                           self.stored)
             return self.cuts[(name, count)]
 
     def named(self, name: str) -> list[str]:
@@ -504,7 +509,8 @@ def pinned_classes() -> list[str]:
             ([cpu] if isinstance(cpu, dict) else cpu or [])]
 
 
-def reusable(python: str, rows: list[tuple[str, str]], common: str) -> dict[tuple[str, str], str]:
+def reusable(python: str, rows: list[tuple[str, str]], common: str,
+             missed: dict[str, int]) -> dict[tuple[str, str], str]:
     """The rows of `rows` (each a file and its group, "" for the whole file) that ran green on exactly these
     inputs (`common`, and each file's own, `fresh`) on any class the tasks run on (`pinned_classes`), which a
     task of theirs could land on, read at plan time with the cache's read token (`READ_TOKEN`): a task of
@@ -512,28 +518,34 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str) -> dict[tupl
     by its own (2026-10-30: the plan looked up whole files alone, and a docs-only change's 1,034 green groups
     of heavy files each booted a container to read its record). Each with where its green run is kept
     (`green_key`'s class and key, `KEPT_AT`'s token), which the plan hands the task that holds it, so no run
-    of another commit replacing a row's last record between plan and task can hide it (2026-10-30: a kept
-    task found 23 of its 259 files and ran the rest). None where the plan has no token or no class (the
-    maintainer, 2026-10-28: a lane run with most files unchanged booted a container a task; 2026-10-29: the
-    suite pinned to 25/17 and 26/17)."""
+    of another commit replacing a row's last record between plan and task can hide it (2026-10-30: a kept task
+    found 23 of its 259 files and ran the rest). None where the plan has no token or no class (the maintainer,
+    2026-10-28: a lane run with most files unchanged booted a container a task; 2026-10-29: the suite pinned
+    to 25/17 and 26/17). Why each other row was not, counted in `missed` (`green_record`'s word)."""
     token, held = os.environ.get(READ_TOKEN), pinned_classes()
     if not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
         return {}
     # The plan's one reading of the checkout, which every row's key reads its inputs from.
     reading = Reading()
 
+    misses: dict[tuple[str, str], list[str]] = {}
     def hit(each_row: tuple[str, str]) -> str | None:
         name, group = each_row
         for each in held:
-            found = green_record(python, name, group, common, token, [each], reading)
+            found = green_record(python, name, group, common, token, [each], reading,
+                                 misses.setdefault(each_row, []))
             # Kept only where its green run is kept by its key, as the task reads it.
             if found is not None and recorded(
                     green_key(python, row(python, name, group), each, found[0]["key"]), token) is not None:
                 return f"{each}:{found[0]['key']}"
+            if found is not None:
+                misses[each_row].insert(0, records.MISSED["kept"])
         return None
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        return {each: found for each, found in zip(rows, pool.map(hit, rows), strict=True) if found}
+        found = {each: kept for each, kept in zip(rows, pool.map(hit, rows), strict=True) if kept}
+    missed.update(Counter(misses[e][0] for e in rows if e not in found))
+    return found
 
 
 def eager_sites(python: str, sites: Sequence[tuple[str, str]]) -> set[tuple[str, str]]:
@@ -611,8 +623,8 @@ def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[st
     return names, kept
 
 
-def green_record(python: str, name: str, split: str, common: str, token: str,
-                 classes: list[str], reading: Reading | None = None) -> tuple[dict, str] | None:
+def green_record(python: str, name: str, split: str, common: str, token: str, classes: list[str],
+                 reading: Reading | None, why: list[str]) -> tuple[dict, str] | None:
     """The record of test file `name`'s row (in `split`'s group) that ran green on exactly these inputs on one
     of `classes`, the first found, with its class; else None. The plan (`reusable`) and a task (`reused`) read
     it alike, from one reading of the inputs (`Reading`). A row's key hashes the inputs its run executed, so
@@ -622,7 +634,8 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
     here what it held then, so this tree's run would execute the same set; a set naming a unit this tree lacks
     is skipped unread (`matchable`). Keyed by the last run's set alone, a row run green on main was found by
     no plan once a run of another tree came after it (2026-11-12: train 781's CI kept 2 of 4,180 tasks; a
-    reach of a comment's change planned 7,161 rows)."""
+    reach of a comment's change planned 7,161 rows). A miss says why in `why`, a class at a time (records.py's
+    `MISSED`)."""
     reading = Reading() if reading is None else reading
     place = row(python, name, split)
     for each in classes:
@@ -630,14 +643,18 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
         try:
             current = epoch(python, place, each, common, token)[0]
         except Unread:
+            why.append(records.MISSED["unread"])
             continue
         if current is None:
+            why.append(records.MISSED["shared"])
             continue
         found = recorded(record_key(python, place, each, common), token)
-        if found is not None and found["depends"] is not None:
-            # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of
-            # exactly these, kept by that key (`green_key`) whatever ran since.
-            key = cache_key(common, name, split, found["depends"], reading)
+        # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of exactly
+        # these, kept by that key (`green_key`) whatever ran since; why it was not, the class's word.
+        recorded_set = None if found is None else found["depends"]
+        key = None if recorded_set is None else cache_key(common, name, split, recorded_set, reading)
+        why.append(records.missed(found, key, current))
+        if key is not None:
             if found["key"] is not None and found["key"] == key and standing(found, current):
                 return found, each
             kept = recorded(green_key(python, place, each, key), token)
@@ -687,7 +704,7 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
                 found, current):
             remembered(python, place, kept[0], found["depends"], token)
             return found["row"]
-    hit = green_record(python, name, split, common, token, reused_classes(network), reading)
+    hit = green_record(python, name, split, common, token, reused_classes(network), reading, [])
     if hit is None:
         return None
     # Its executed set the first of its row's list: a set reused stays while other trees' runs come and go.
@@ -706,6 +723,14 @@ def recorded_tests() -> dict[str, list[float]]:
     """Each file's tests' times recorded (`own_tests`), one shared setup's one weight (`session.units`)."""
     found = {name: own_tests(name, tests) for name, tests in parted_record().items()}
     return {name: session.unit_seconds(list(own), list(own.values())) for name, own in found.items() if own}
+
+
+def stored_weights() -> dict[str, list[float]]:
+    """Each split file's stored cut (`session.CUTS`) as its groups' recorded seconds (`own_tests`), which the
+    plan keeps while they hold (`cuts.weighed`)."""
+    stored, parted = session.stored_cuts(), parted_record()
+    return {name: [sum(own[node] for node in group) for group in session.cut_by(list(own), bounds)]
+            for name, bounds in stored.items() if (own := own_tests(name, parted.get(name, {})))}
 
 
 def parted_record(path: Path = session.DURATIONS) -> dict[str, dict[str, float]]:
@@ -772,24 +797,6 @@ def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | N
     return cuts.measured_cut(grouped_rows(timings.get("rows", {})).get((python, name), {}))
 
 
-GROUPED: list = [None, {}]
-"""The rows `grouped_rows` last grouped, and their groups: a plan asks of one run's timings for every file."""
-
-
-def grouped_rows(measured: Mapping[str, float]) -> dict[tuple[str, str], dict[str, float]]:
-    """Armada's row timings `measured` by their Python and file, each row's seconds under its group; a map
-    task's seconds are kept under its task's name, no row's. Grouped once for the rows it was last asked
-    of."""
-    if GROUPED[0] is not measured:
-        found: dict[tuple[str, str], dict[str, float]] = {}
-        for row_name, seconds in measured.items():
-            if ":" in row_name:
-                python, name, group = parsed_row(row_name)
-                found.setdefault((python, name), {})[group] = seconds
-        GROUPED[:] = [measured, found]
-    return GROUPED[1]
-
-
 APART = re.compile(r"\bpytest\.mark\.torchax\b")
 """A file marked `torchax` imports torchax, which renames torch's privateuse1 backend to "jax" for
 the whole process, so a torch.compile in a later file of its task fails (test_reference_helpers'
@@ -825,12 +832,15 @@ round (train 149: 30 task-hours, twice)."""
 
 def policy(base: str) -> str:
     """The test cache's policy (DEW_TEST_CACHE) for this checkout's change from `base`: 'off', every file run,
-    for a change to what every test process runs or reads (`SHARED`, a Python module of it by its code, as
-    `shared` keys it; a lock, the environment's files) or to a file the records do not place (`PLACED`); else
-    'on', each file run where its inputs changed. A tool is such an input of each file whose run executed or
-    read it, which its key hashes, so a changed tool runs those files again and no other (train 115 reran its
-    whole suite for five tools no pulled head had touched, under a policy that reran every file that read any
-    tool)."""
+    for a change to a file the records do not place (`PLACED`), which no key covers; 'cold' for a change to
+    what every test process runs or reads (`SHARED`, a Python module of it by its code; a lock, the
+    environment's files), which every key covers (`shared`), so no row of main's is found and every file runs,
+    the plan weighing each task cold, while a train composed again on the same inputs, and the next on them,
+    finds the rows the first ran green (owner, 2026-11-13: train 793's second round reran all 4,113 tasks its
+    first had run under the same inputs); else 'on', each file run where its inputs changed. A tool is such an
+    input of each file whose run executed or read it, which its key hashes, so a changed tool runs those files
+    again and no other (train 115 reran its whole suite for five tools no pulled head had touched, under a
+    policy that reran every file that read any tool)."""
     changed = subprocess.run(["git", "diff", "--name-only", "--no-renames", f"{base}...HEAD"], check=True,
                              capture_output=True, text=True).stdout.split()
     if ".armada.json" in changed:
@@ -846,9 +856,9 @@ def policy(base: str) -> str:
     # train runs ran cold on harness edits).
     changed = [name for name in changed
                if not (name in SHARED and name.endswith(".py") and same_code(base, name))]
-    if any(name in whole or not (name.startswith(PLACED) or name in PLACED_FILES) for name in changed):
+    if any(not (name.startswith(PLACED) or name in PLACED_FILES) for name in changed if name not in whole):
         return "off"
-    return "on"
+    return "cold" if any(name in whole for name in changed) else "on"
 
 
 def same_code(base: str, name: str) -> bool:
@@ -883,9 +893,10 @@ def borrowed(timings: dict, python: str) -> dict:
 
 
 COLD_SECONDS = 360.0
-"""What a task adds to its estimate when it runs cold, the test cache's policy off (a lock, JAX's build or
-the recorder changed): the compiles and imports no warm run paid. Train 254's cold suite ran about 470 s a
-task where its plan estimated about 120 (1,389 tasks in 2,700 s on 242 containers, 2026-10-28)."""
+"""What a task that runs a file adds to its estimate when it runs cold, the test cache's policy off or cold (a
+lock, JAX's build or the recorder changed): the compiles and imports no warm run paid. Train 254's cold suite
+ran about 470 s a task where its plan estimated about 120 (1,389 tasks in 2,700 s on 242 containers,
+2026-10-28)."""
 
 SITE_MARK = re.compile(r"\bmark\.(?:" + "|".join(session.SHARDS) + r")\b")
 """A site's mark as a test file's source spells it (`sites`), which a file that holds none never parses."""
@@ -1120,16 +1131,16 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
 
 
 def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
-    """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
-    timed runs alone, so however long it takes it holds up no other file, and its time is known from
-    then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
-    the test cache's policy, DEW_TEST_CACHE here (`policy`), to its task. Under the policy "on", the files
-    whose rows the cache holds for exactly these inputs (`reusable`) share tasks of the target's lookups each,
-    which look each up again in their containers, so the verdict names every file and containers scale with
-    the change. Under the policy "off" every task's weight carries COLD_SECONDS, so armada sizes the pool by
-    the work, not the longest task, as warm estimates did. A site marked one of `session.SHARDS` runs as
-    armada's map and judge, apart from its file's tasks (`site_entries`). The `census` (check 1's CENSUS) is
-    the whole suite with the cache off, whatever this environment says, each entry carrying it to its task."""
+    """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has timed
+    runs alone, so however long it takes it holds up no other file, and its time is known from then on. Files
+    marked `torchax` (`APART`) share tasks only with one another. Each entry carries the test cache's policy,
+    DEW_TEST_CACHE here (`policy`), to its task. Under the policy "on", the files whose rows the cache holds
+    for exactly these inputs (`reusable`) share tasks of the target's lookups each, which look each up again
+    in their containers, so the verdict names every file and containers scale with the change. Under the
+    policy "off" or "cold" every task that runs a file carries COLD_SECONDS, so armada sizes the pool by the
+    work, not the longest task, as warm estimates did. A site marked one of `session.SHARDS` runs as armada's
+    map and judge, apart from its file's tasks (`site_entries`). The `census` (check 1's CENSUS) is the whole
+    suite with the cache off, whatever this environment says, each entry carrying it to its task."""
     cache = "off" if census else os.environ.get("DEW_TEST_CACHE") or "on"
     # The whole suite's run alone (DEW_WHOLE_SUITE: the daily run's and the whole dispatch's, and the census)
     # runs whole_suite cells (`selected`) and every file on the newest Python.
@@ -1147,6 +1158,7 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
     for name in every:
         session.shared_setups(name)
     recorded = recorded_tests()
+    stored = stored_weights()
     entries = []
     for python in PYTHONS:
         # Every file on every Python daily; on a pushed run, its cache's policy on or off, the newest takes
@@ -1161,7 +1173,7 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
                 cut = cuts.weighed(session, recorded.get(name, []), seconds, target,
-                                   measured_cut(timings, python, name))
+                                   measured_cut(timings, python, name), stored.get(name, ()))
                 groups[name] = [(f"{group}/{len(cut)}" if len(cut) > 1 else "", weight)
                                 for group, weight in enumerate(cut, start=1)]
         # Each check-1 site its file's marks shard is a row of its own, its judge's.
@@ -1169,7 +1181,9 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
         rows_of = [(name, "") for name in timed if name not in groups] + [
             (name, group) for name, cut in groups.items() for group, _ in cut] + [
             (name, test) for name, held in marked.items() for test in held]
-        found = reusable(python, rows_of, shared(python)) if cache == "on" else {}
+        missed: dict[str, int] = {}
+        found = reusable(python, rows_of, shared(python), missed) if cache != "off" else {}
+        print(f"plan: {python}: kept {len(found)} of {len(rows_of)}; not kept: {missed}", file=sys.stderr)
         # A lookup a row, in seconds: a kept task's weight is its container's start and those lookups.
         tasks: list[tuple[list[tuple[str, str]], float]] = [
             (held, float(len(held))) for held in kept_tasks(python, found, target)]
@@ -1192,12 +1206,13 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
                       for name, group in held_rows]
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(tokens),
                             "split": alone, "rows": [row(python, name, group) for name, group in held_rows],
-                            "weight": weight + (COLD_SECONDS if cache == "off" else 0.0), **stamped})
+                            "weight": weight + (COLD_SECONDS if cache != "on" and any(
+                                each not in found for each in held_rows) else 0.0), **stamped})
         # The sites to run whose judge's last run needed its later map tasks draw them at once
         # (`eager_sites`).
         eager = eager_sites(python, [(name, test) for name, held in marked.items() for test in held
                                      if (name, test) not in found])
-        entries += [{**entry, "weight": entry["weight"] + (COLD_SECONDS if cache == "off" else 0.0),
+        entries += [{**entry, "weight": entry["weight"] + (COLD_SECONDS if cache != "on" else 0.0),
                      **stamped}
                     for entry in site_entries(python, marked, found, timings, target, eager)]
     # What the newest Python runs no test of, it imports (`COLLECT`): on a pushed run, every file but its own.
@@ -1244,27 +1259,14 @@ def collect_entries(names: list[str], timings: dict, target: float) -> list[dict
 MARKED = ("whole_suite", "release_env")
 """The marks a file's row names its tests by, as pytest resolved them (executed.py): its whole_suite
 cells, which `slow` reports as the whole suite's alone, and its release checks, which `release_plan`
-plans."""
+plans (rows.py)."""
 RELEASE = "release:"
 """A release check's row, beside its file's own: `row`'s group, its requirement after it."""
 
 
-def release_plan(verdict: dict) -> list[dict]:
-    """The release checks of a whole suite's `verdict` (`armada verdict <sha> --json`), a task each
-    requirement: the files whose rows name checks under it (`release_env`, as pytest resolved each test's
-    mark before any selection: executed.py), which the run's own tasks set aside, as the suite's environment
-    lacks it (`selected`). Its run's second job runs them (.github/workflows/ci.yml, `release`)."""
-    checks: dict[str, set[str]] = {}
-    for found in verdict["rows"]:
-        for requirement in found.get("release_env", {}):
-            checks.setdefault(requirement, set()).add(parsed_row(found["name"])[1])
-    return [{"release": requirement, "python": PYTHONS[0], "tests": " ".join(sorted(names))}
-            for requirement, names in sorted(checks.items())]
-
-
 def release(python: str, tests: list[str], requirement: str, out: Path) -> int:
-    """`requirement`'s release checks in `tests` (`release_plan`), as a whole suite's second job runs each:
-    its rows in `out`, each red one named, exit 1 on any."""
+    """`requirement`'s release checks in `tests` (rows.py's `release_plan`), as a whole suite's second job
+    runs each: its rows in `out`, each red one named, exit 1 on any."""
     task(python, tests, "", out, session.DEADLINE, "off", release=requirement)
     red = [found["name"] for found in json.loads(out.read_text())["rows"] if found["exitCode"]]
     for name in red:
@@ -1534,7 +1536,7 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
     # (`watched`): each is the input of every file the task runs; and every file of the checkout as it stood
     # then, so a file the run wrote is told from one it read alone (`watched.changed`, `record`).
     before = watched.stamps(os.getcwd(), followed.HIDDEN_INPUTS)
-    opens = watched.Opens(os.getcwd(), frozenset({str(session.DURATIONS)}))
+    opens = watched.Opens(os.getcwd(), frozenset({str(session.DURATIONS), str(session.CUTS)}))
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               env=dict(environment))
 
@@ -1577,13 +1579,13 @@ def evidence_name(python: str, tests: list[str], group: str) -> str:
 
 def watched_pytest(command: list[str], environment: dict[str, str], deadline: float, grace: float, pid: Path,
                    python: str, name: str, began: float
-                   ) -> tuple[int, str, bool, str, set[str], set[str], str | None]:
+                   ) -> tuple[int, str, bool, str, set[str], set[str], dict]:
     """pytest run as a task runs it (`ran_pytest`), with the task environment's py-spy reading a stalled run's
     stacks (`stalls.dumped`) and a collector outside it reading those of any process of it a signal ends
     (`natives.Capture`): its exit, output, whether it expired, a stall's stacks, the files it opened and
-    wrote, and the evidence it left among the task's artifacts, named `name`: a stall's record, or a red run's
-    whole output with the native stacks where a signal ended it or a process of it (a worker its test
-    started), as one record (`stalls.kept`)."""
+    wrote, and what a red row of it says of its evidence: its capture's (`Capture.evidence`), and among the
+    task's artifacts, named `name`, a stall's record, or a red run's whole output with the native stacks where
+    a signal ended it or a process of it (a worker its test started), as one record (`stalls.kept`)."""
     spy = Path(f".venv-{python}/bin/py-spy")
     capture = natives.Capture(spy, dict(environment))
     try:
@@ -1591,15 +1593,16 @@ def watched_pytest(command: list[str], environment: dict[str, str], deadline: fl
             command, {**environment, **capture.variables}, deadline, grace, pid, spy)
     finally:
         stacks = capture.stacks()
-    root = armada_dir("ARMADA_ARTIFACTS", ARTIFACTS)
+    root, evidence = armada_dir("ARMADA_ARTIFACTS", ARTIFACTS), capture.evidence(stacks)
     if expired:
         kept = stalls.kept(root, name, dump, time.time() - (time.monotonic() - began))
     elif returncode != 0 and (returncode < 0 or "ended by signal" in stacks):
         kept = stalls.kept(root, f"signalled-{name}", f"{output}\n== native stacks\n{stacks}",
                            time.time() - (time.monotonic() - began))
     else:
-        return returncode, output, expired, dump, opened, wrote, None
-    return returncode, output, expired, dump, opened, wrote, str(kept.relative_to(root))
+        return returncode, output, expired, dump, opened, wrote, evidence
+    return returncode, output, expired, dump, opened, wrote, {**evidence,
+                                                              "artifacts": [str(kept.relative_to(root))]}
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
@@ -1649,7 +1652,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                               **({progress.SET_ASIDE: str(aside)} if resumes else {})})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
-    returncode, output, expired, dump, opened, wrote, stall = watched_pytest(
+    returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
         command, environment, deadline, grace, pid, python, evidence_name(python, tests, group), began)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     # How collection found each file: a file with no row is green only where every test it holds was set aside
@@ -1678,11 +1681,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart; a check-1 site's judge apart from its file, its pooling no part of the file's tasks.
         ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
-                     # A stall's stacks whole, then the end of what pytest wrote; a red's stall's whole record
-                     # among its evidence (`stalls.kept`).
+                     # A stall's stacks whole, then the end of what pytest wrote; a red's capture and its
+                     # stall's or signal's record among its artifacts (`watched_pytest`).
                      "output": "\n".join(red + ([dump[:12000]] if dump else [])
                                          + ([output[-12000:]] if red else [])),
-                     **({"artifacts": [stall]} if stall is not None and red else {}),
+                     **(evidence if red else {}),
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ...").
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      # Where the task ran out of time, a file that never started: no seconds to time it by.
@@ -2213,6 +2216,23 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     return 0
 
 
+def verdict_rows(verdict: dict) -> dict[str, list[dict]]:
+    """Main's CI `verdict`'s rows by test file, as its floor Python ran each file's groups or whole: no
+    collection's, site's or variant's row, and none of a file the checkout no longer has or has changed since
+    the verdict's commit, whose rows observed tests it may no longer hold (`folded`, `cuts.ran`)."""
+    changed = set(subprocess.run(["git", "diff", "--name-only", verdict["sha"], "--", "tests"], check=True,
+                                 capture_output=True, text=True).stdout.split())
+    rows: dict[str, list[dict]] = {}
+    for row_ in verdict["rows"]:
+        if ":" not in row_["name"]:
+            continue
+        python, name, split_ = parsed_row(row_["name"])
+        if (python == PYTHONS[0] and split_ != COLLECT and not session.SITE.fullmatch(split_)
+                and VARIED not in split_ and Path(name).is_file() and name not in changed):
+            rows.setdefault(name, []).append(row_)
+    return rows
+
+
 def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, float]:
     """The durations `record` with main's CI `verdict` (`armada verdict <sha> --json`) folded in, one test
     file at a time, each whole, as its floor Python's rows ran it. A file whose rows are all green and
@@ -2231,16 +2251,7 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     by the record (`site_entries`), and a judge armada did not run is a row of its task's name. A
     whole_suite cell a row set aside (its `whole_suite` names it, its `tests` do not: a train's batch)
     keeps its entry too."""
-    changed = set(subprocess.run(["git", "diff", "--name-only", verdict["sha"], "--", "tests"], check=True,
-                                 capture_output=True, text=True).stdout.split())
-    rows: dict[str, list[dict]] = {}
-    for row_ in verdict["rows"]:
-        if ":" not in row_["name"]:
-            continue
-        python, name, split_ = parsed_row(row_["name"])
-        if (python == PYTHONS[0] and split_ != COLLECT and not session.SITE.fullmatch(split_)
-                and VARIED not in split_ and Path(name).is_file() and name not in changed):
-            rows.setdefault(name, []).append(row_)
+    rows = verdict_rows(verdict)
     kept = {node: seconds for node, seconds in record.items() if Path(node.split("::")[0]).is_file()}
     for name, held in rows.items():
         splits = {parsed_row(row_["name"])[2] for row_ in held}
@@ -2262,35 +2273,11 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
         aside = {node for row_ in held for node in row_.get("whole_suite", [])} - observed.keys()
         own = {node: seconds for node, seconds in kept.items() if node.split("::")[0] == name
                and session.site_name(node, marked) not in marked and node not in aside}
-        if stale(own, observed, sum(row_["seconds"] for row_ in held), max(counts, default=1), target):
+        took = sum(row_["seconds"] for row_ in held)
+        if cuts.stale(session, own, observed, took, max(counts, default=1), target):
             kept = {node: seconds for node, seconds in kept.items() if node not in own}
             kept.update({node: round(seconds, 3) for node, seconds in observed.items()})
     return dict(sorted(kept.items()))
-
-
-def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut: int, target: float) -> bool:
-    """Whether a file's record `own` no longer cuts it as it runs: its tests differ from those its rows
-    `observed` (one added, removed or renamed); a file within `target` (it took `seconds`), or one with no
-    tests to cut, is recorded past it, so the plan would split what runs whole; or, for a file past it (as
-    `cut` groups), the groups the plan cuts from the record (`cuts.split`) run a group past `cuts.KEPT` of
-    the target as its tests ran, setup included, and those it would cut from what they took run their
-    heaviest shorter. A cut that fits is kept whatever its tests' times drift, as the plan keeps it, and so
-    is one whose heaviest group no cut shortens (a test heavier than the budget, which runs alone either
-    way): a fold rewrites a file only where its plan changes for the better."""
-    if own.keys() != observed.keys():
-        return True
-    if seconds <= target or not own:
-        return sum(own.values()) > target
-    nodes = sorted(own)
-    recorded = session.unit_seconds(nodes, [own[node] for node in nodes])
-    ran = session.unit_seconds(nodes, [observed[node] for node in nodes])
-    setup = max(seconds - sum(ran), 0.0) / cut
-
-    def heaviest(weights: list[float]) -> float:
-        count = len(cuts.split(session, weights, seconds, target, cut))
-        return max(sum(ran[run.start:run.stop]) + setup for run in session.groups(weights, count) if run)
-
-    return heaviest(recorded) > cuts.KEPT * target and heaviest(ran) < heaviest(recorded)
 
 
 ARTIFACTS = "/armada/task/artifacts"
@@ -2383,9 +2370,9 @@ def flagged(verdict: Path, new: Path | None) -> int:
 
 
 def releasing(args: argparse.Namespace) -> int:
-    """`release-plan`'s tasks printed, or `release`'s checks run (`release_plan`, `release`)."""
+    """`release-plan`'s tasks printed, or `release`'s checks run (rows.py's `release_plan`, `release`)."""
     if args.operation == "release-plan":
-        print(json.dumps(release_plan(json.loads(args.verdict.read_text()))))
+        print(json.dumps(rows.release_plan(json.loads(args.verdict.read_text()), PYTHONS[0])))
         return 0
     return release(args.python, args.tests.split(), args.requirement, args.out)
 
@@ -2429,10 +2416,17 @@ def main() -> int:
         return 1 if wrong or not nodes else 0
     if args.operation == "durations":
         target = json.loads(Path(".armada.json").read_text())["target"]
-        before = durations_record()
-        recorded = folded(before, json.loads(args.verdict.read_text()), target)
+        before, verdict = durations_record(), json.loads(args.verdict.read_text())
+        # The record main's CI cut its files by, read before its times change it (`cuts.refolded`).
+        cut_by = {name: own_tests(name, tests) for name, tests in parted_record().items()}
+        recorded = folded(before, verdict, target)
         if recorded != before:
             session.DURATIONS.write_text(json.dumps(recorded, indent=0) + "\n")
+        after = {name: own_tests(name, tests) for name, tests in parted_record().items()}
+        runs = cuts.ran(verdict_rows(verdict))
+        stored = cuts.refolded(session, session.stored_cuts(), runs, target, cut_by, after)
+        if stored != session.stored_cuts():
+            session.CUTS.write_text(json.dumps(stored, indent=0, sort_keys=True) + "\n")
         changed = sorted({node.split("::")[0] for node in before.keys() ^ recorded.keys()}
                          | {node.split("::")[0] for node in before.keys() & recorded.keys()
                             if before[node] != recorded[node]})

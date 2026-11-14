@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.batch import unboxed
+from dew.newton_schulz import NEWTON_SCHULZ
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels.generation import run_precision
 from dew.nn.precision import Dtypes, Numerics
@@ -61,3 +62,18 @@ def drawn_tree(params, seed):
         return lambda leaf: np.asarray(scale * jax.random.normal(next(keys), leaf.shape, leaf.dtype))
 
     return jax.tree.map(normal(1.0), params), jax.tree.map(normal(1e-2), params)
+
+
+def optax_orthogonalized(update, steps: int, dimension_numbers=None, *, coeffs=NEWTON_SCHULZ,
+                         eps: float = 1e-8, preconditioning: str = "frobenius"):
+    """optax's own Newton-Schulz of `update` (`orthogonalize_via_newton_schulz`, optax 0.2.8, which it does
+    not export), the oracle Dew's iteration (`dew.newton_schulz.newton_schulz`) is held to: `steps`
+    iterations at `coeffs`, one triple or a schedule, after `preconditioning`, in the update's dtype; a leaf
+    with no `dimension_numbers` one matrix, its rows the reduction axis (a Linen kernel's)."""
+    import jax.numpy as jnp
+    import optax
+    from optax.contrib import _muon
+
+    numbers = optax.contrib.MuonDimensionNumbers() if dimension_numbers is None else dimension_numbers
+    return _muon.orthogonalize_via_newton_schulz(update, jnp.asarray(coeffs), steps, preconditioning, eps,
+                                                 numbers)

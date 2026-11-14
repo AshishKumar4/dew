@@ -434,7 +434,21 @@ def redundant_embeddings(seed: int) -> tuple[np.ndarray]:
 
 def health_of(z):
     health = representation_health(jnp.asarray(z))
-    return jnp.stack([health["repr_std"], health["repr_cov_offdiag"]])
+    return jnp.stack([health["repr_std"].mean()[0], health["repr_cov_offdiag"].mean()[0]])
+
+
+def test_representation_health_pooled_over_microbatches_is_the_whole_batchs():
+    """Each statistic's moments, made over two halves of a batch and pooled as a step read in two
+    microbatches pools them (`Moments.pooled`), read as the whole batch's do, to float32's rounding."""
+    from dew.objectives.base import Moments
+
+    def pooled(z):
+        halves = [representation_health(part) for part in (z[:12], z[12:])]
+        return jnp.stack([Moments.pooled([half[name] for half in halves]).mean()[0]
+                          for name in ("repr_std", "repr_cov_offdiag")])
+
+    assert_as_exact(jax.jit(pooled), as_given(lambda z: health_in(z, z.dtype)), redundant_embeddings,
+                    "pooled representation health", seeds=HEALTH_SEEDS)
 
 
 def test_representation_health_is_the_float64_statistics():
@@ -444,7 +458,7 @@ def test_representation_health_is_the_float64_statistics():
                     "representation health", seeds=HEALTH_SEEDS)
     (z,) = redundant_embeddings(0)
     collapsed = representation_health(jnp.tile(jnp.asarray(z[:1]), (32, 1)))
-    assert float(collapsed["repr_std"]) < 1e-6 and float(collapsed["repr_cov_offdiag"]) < 1e-6
+    assert collapsed["repr_std"].held() < 1e-6 and collapsed["repr_cov_offdiag"].held() < 1e-6
 
 
 # --- EMA target encoder ----------------------------------------------------

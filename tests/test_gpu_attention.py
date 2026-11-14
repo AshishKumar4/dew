@@ -250,6 +250,7 @@ def mosaic_cells() -> list[Cell]:
 KERNEL_CELLS = (kernels.flash_through_dews_attention_refuses_rows_it_would_misread,
                 kernels.a_fused_kernel_takes_forward_mode_through_the_reference,
                 kernels.cudnn_trains_odd_lengths_and_agrees_with_xla,
+                kernels.cudnn_runs_a_calls_packed_documents_on_par,
                 kernels.triton_trains_and_agrees_with_xla,
                 kernels.triton_trains_at_large_logits_on_par_with_xla,
                 kernels.triton_at_saturated_large_logits_is_finite_where_xla_is,
