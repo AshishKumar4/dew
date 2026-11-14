@@ -1597,10 +1597,13 @@ def gpu_placed() -> bool:
 
 
 @traced_fact
+@functools.cache
 def host_memory_share() -> int:
     """A CPU device's share of the memory this process can hold, in bytes: the least of its host's physical
     memory, its control groups' limits (`cgroup_memory_limits`: a container's, a service's) and its address
-    space's (`RLIMIT_AS`), over the process's CPU devices, which share it (a forced count of them)."""
+    space's (`RLIMIT_AS`), over the process's CPU devices, which share it (a forced count of them). Read once
+    a process, which none of them changes in, where every attention call a trace sized read the files again
+    (a U-Net layout cell's draws, 15 s of 178)."""
     import resource
 
     import jax
