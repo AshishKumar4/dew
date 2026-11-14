@@ -395,14 +395,21 @@ class _Shifted(nn.LayerNorm):
     statistics read rows centered near zero, a corrected two-pass mean, so a row whose mean dwarfs its
     spread rounds as a row near zero does (half torch's distance from float64 at rows a hundred from zero,
     where flax's one centering sat 1.6 times it at a width of 64). The shift is a constant to the
-    gradient, whose own term a layer norm's invariance makes zero."""
+    gradient, whose own term a layer norm's invariance makes zero; one shift over every shard its
+    statistics read (`axis_name`), and taken in float32 at least, as flax's statistics read a narrower
+    input, its output in the dtype flax gives that input."""
 
     @nn.compact
     def __call__(self, x, *, mask=None):
         axes = (self.reduction_axes,) if isinstance(self.reduction_axes, int) else tuple(self.reduction_axes)
         wide = jnp.promote_types(x.dtype, jnp.float32)
-        shift = jnp.mean(x, axis=axes, keepdims=True, dtype=wide, where=mask).astype(x.dtype)
-        return super().__call__(x - jax.lax.stop_gradient(shift), mask=mask)
+        shift = jnp.mean(x, axis=axes, keepdims=True, dtype=wide, where=mask)
+        if self.axis_name is not None:
+            shift = jax.lax.pmean(shift, self.axis_name, axis_index_groups=self.axis_index_groups)
+        normed = super().__call__(x.astype(wide) - jax.lax.stop_gradient(shift), mask=mask)
+        held = [self.get_variable("params", name) for name in ("scale", "bias")
+                if self.has_variable("params", name)]
+        return normed.astype(canonicalize_dtype(x, *held, dtype=self.dtype))
 
 
 class LayerNorm(nn.remat(_Shifted, policy=jax.checkpoint_policies.nothing_saveable)):
