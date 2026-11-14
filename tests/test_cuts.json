@@ -17,6 +17,9 @@
 "tests/test_algebra_fusion.py::test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes[a causal window]",
 "tests/test_algebra_fusion.py::test_a_plain_programs_product_runs_the_template_its_call_names[grouped-fast]"
 ],
+"tests/test_algebra_fuzz.py": [
+"tests/test_algebra_fuzz.py::test_a_rewritten_program_is_on_par_with_the_program"
+],
 "tests/test_algebra_scan.py": [
 "tests/test_algebra_scan.py::test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient[kimi_delta]",
 "tests/test_algebra_scan.py::test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient[kimi_delta_float16]",
@@ -1117,7 +1120,7 @@
 "tests/test_distribution.py::test_a_share_whose_calls_recorded_nothing_holds_the_records_its_peer_packed",
 "tests/test_distribution.py::test_a_slurm_step_that_leaves_gpus_idle_is_refused_before_it_joins",
 "tests/test_distribution.py::test_context_parallelism_trains_like_whole_sequences_across_hosts",
-"tests/test_distribution.py::test_every_process_of_a_pool_takes_the_same_link_bandwidth",
+"tests/test_distribution.py::test_eight_cpu_devices_on_four_cores_run_collectives_ahead_of_the_host",
 "tests/test_distribution.py::test_every_process_schedules_its_own_rollouts_and_the_pool_trains_on_all_of_them",
 "tests/test_distribution.py::test_hybrid_sharding_groups_hosts_into_replicas_and_trains_like_fsdp",
 "tests/test_distribution.py::test_more_replicas_than_hosts_are_refused",
@@ -1194,7 +1197,7 @@
 "tests/test_env_runs.py::test_a_runs_episodes_score_its_flights_from_the_evaluations_key[dreamer in a simulator-greedy]",
 "tests/test_env_runs.py::test_a_runs_episodes_score_its_flights_from_the_evaluations_key[dreamer-drawn]",
 "tests/test_env_runs.py::test_a_runs_episodes_score_its_flights_from_the_evaluations_key[dreamer-greedy]",
-"tests/test_env_runs.py::test_a_runs_episodes_score_its_flights_from_the_evaluations_key[ppo-greedy]",
+"tests/test_env_runs.py::test_a_runs_episodes_score_its_flights_from_the_evaluations_key[ppo-drawn]",
 "tests/test_env_runs.py::test_a_student_resumed_by_its_command_keeps_the_teacher_step_it_pinned",
 "tests/test_env_runs.py::test_an_environment_run_refuses_a_setup_it_cannot_train[a model beside the run it starts from]"
 ],
@@ -1222,8 +1225,8 @@
 "tests/test_fla_gdn.py::test_a_remat_policy_changes_no_gradient[None]",
 "tests/test_fla_gdn.py::test_a_remat_policy_changes_no_gradient[policy1]",
 "tests/test_fla_gdn.py::test_a_remat_policy_changes_no_gradient[policy2]",
-"tests/test_fla_gdn.py::test_a_sequences_first_decay_gradient_is_exactly_zero_from_no_memory[True]",
-"tests/test_fla_gdn.py::test_the_output_kernel_computes_flas_expression[shape1-tiles1-bfloat16]",
+"tests/test_fla_gdn.py::test_both_routes_return_the_operands_common_dtype[forward mode]",
+"tests/test_fla_gdn.py::test_dews_fla_rule_takes_wide_keys_up_to_fla_s_256_in_bf16[256]",
 "tests/test_fla_gdn.py::test_the_port_keeps_the_kernel_contract_on_a_mesh[tensor-split1-per head]",
 "tests/test_fla_gdn.py::test_the_ported_rule_and_its_gradients_follow_the_recurrence[bfloat16-0.05]",
 "tests/test_fla_gdn.py::test_the_rule_runs_at_every_geometry[forward mode]"
@@ -1297,14 +1300,14 @@
 "tests/test_fresh_rate.py::test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one",
 "tests/test_fresh_rate.py::test_under_muon_a_fresh_groups_rate_reaches_its_vector_and_its_matrix"
 ],
+"tests/test_gemm_formed.py": [
+"tests/test_gemm_formed.py::test_a_composed_mlps_training_step_compiles_within_its_resources[sm90]"
+],
 "tests/test_gemm_gather.py": [
 "tests/test_gemm_gather.py::test_a_gathered_grouped_product_reads_each_row_where_its_table_says"
 ],
 "tests/test_gemm_nvfp4.py": [
 "tests/test_gemm_nvfp4.py::test_an_nvfp4_banks_grouped_product_is_its_values_product[sm90-packed]"
-],
-"tests/test_gemm_paired.py": [
-"tests/test_gemm_paired.py::test_the_templates_paired_product_holds_check_1[dense-sm90]"
 ],
 "tests/test_gemm_tcgen05.py": [
 "tests/test_gemm_tcgen05.py::test_tcgen05s_epilogues_hold_check_1[row scale-128x2]"
@@ -1339,6 +1342,9 @@
 "tests/test_generate.py::test_copy_task_trains_and_generate_reads_the_sequence_back",
 "tests/test_generate.py::test_each_continuation_stops_at_its_own_eos",
 "tests/test_generate.py::test_the_sampled_rows_keep_their_sharding_and_host_reads_them_back"
+],
+"tests/test_generate_reference.py": [
+"tests/test_generate_reference.py::test_greedy_generation_emits_transformers_tokens[mixtral-tiny]"
 ],
 "tests/test_gpu_lane.py": [
 "tests/test_gpu_lane.py::test_a_gpu_lanes_groups_run_each_test_of_the_tips_file_once_their_rows_their_own"
@@ -1883,7 +1889,7 @@
 "tests/test_model_flops.py::test_decision_heads_match_every_forward_product_including_pooling[joint]"
 ],
 "tests/test_model_flops_families.py": [
-"tests/test_model_flops_families.py::test_each_family_matches_every_traced_forward_product[udit]",
+"tests/test_model_flops_families.py::test_each_family_matches_every_traced_forward_product[flux2]",
 "tests/test_model_flops_families.py::test_multistream_projection_and_mixing_counts_match_the_forward[fields0]",
 "tests/test_model_flops_families.py::test_unmasked_denoisers_count_the_conditioners_physical_padded_span[flux2]"
 ],
@@ -2090,7 +2096,11 @@
 "tests/test_multiprocess.py::test_two_processes_run_the_pipeline_one_process_runs"
 ],
 "tests/test_narrow.py": [
-"tests/test_narrow.py::test_a_scan_copies_its_stacked_layers_not_its_constants"
+"tests/test_narrow.py::test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them",
+"tests/test_narrow.py::test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits_it_in_two",
+"tests/test_narrow.py::test_a_fresh_plan_its_placed_devices_refuse_records_no_rung",
+"tests/test_narrow.py::test_a_plan_a_rung_above_its_dropped_copies_keeps_them_dropped",
+"tests/test_narrow.py::test_a_step_that_fits_only_without_its_copies_drops_them_before_it_recomputes"
 ],
 "tests/test_native_diffusion.py": [
 "tests/test_native_diffusion.py::test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid[lms]",
@@ -2308,137 +2318,14 @@
 ],
 "tests/test_recurrence.py": [
 "tests/test_recurrence.py::test_a_bf16_state_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=scalar,gates=Gates(),skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)-sm80]",
+"tests/test_recurrence.py::test_a_decode_step_holds_its_registers_at_the_residency_it_plans[sm100-one row]",
 "tests/test_recurrence.py::test_a_decode_token_over_three_warpgroups_of_keys_reads_its_last_keys",
 "tests/test_recurrence.py::test_a_write_gate_without_the_delta_rule_scales_what_the_token_writes",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=none,delta=False,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=none,delta=False,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=none,delta=False,write_gate=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=none,delta=False,write_gate=True,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=none,delta=False,write_gate=True,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=none,delta=False,write_gate=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=none,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=none,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=none,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=none,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=none,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=none]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,delta=False,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,delta=False,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,delta=False,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,delta=False,write_gate=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,delta=False,write_gate=True,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,delta=False,write_gate=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,delta=False]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,gates=Gates(),output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,gates=Gates(),output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,gates=Gates(),skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,gates=Gates(),skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,gates=Gates(),skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,gates=Gates()]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=scalar]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),delta=False,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),delta=False,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),delta=False,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),delta=False,write_gate=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),delta=False,write_gate=True,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),delta=False,write_gate=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),delta=False]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=none,delta=False,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=none,delta=False,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=none,delta=False,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=none,delta=False,write_gate=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=none,delta=False,write_gate=True,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=none,delta=False,write_gate=True,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=none,delta=False,write_gate=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=none,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=none,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=none,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=none]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=scalar,delta=False,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=scalar,delta=False,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=scalar,delta=False,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=scalar,delta=False,write_gate=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=scalar,delta=False,write_gate=True,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=scalar,delta=False,write_gate=True,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=scalar,delta=False,write_gate=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=scalar,gates=Gates(),skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=scalar,gates=Gates(),skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=scalar,gates=Gates()]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=scalar,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=scalar,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,decay=scalar]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,delta=False,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,delta=False,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,delta=False,write_gate=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,delta=False,write_gate=True,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,delta=False,write_gate=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv(),skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[conv=Conv()]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[decay=none,delta=False,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[decay=none,delta=False,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[decay=none,delta=False,write_gate=True,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[decay=none,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[decay=none,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[decay=scalar,delta=False,rated=True,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[decay=scalar,delta=False,write_gate=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[decay=scalar,delta=False,write_gate=True,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[decay=scalar,gates=Gates(),output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[decay=scalar,gates=Gates(),skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[decay=scalar,gates=Gates()]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[decay=scalar,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[decay=scalar,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[decay=scalar,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[delta=False,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[delta=False,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[delta=False,write_gate=True,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=none,delta=False,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=none,delta=False,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=none,delta=False,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=none,delta=False,write_gate=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=none,delta=False,write_gate=True,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=none,delta=False,write_gate=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=none,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=none,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=none]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=scalar,delta=False,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=scalar,delta=False,write_gate=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=scalar,delta=False,write_gate=True,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=scalar,delta=False,write_gate=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=scalar,gates=Gates(),output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=scalar,gates=Gates(),skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=scalar,gates=Gates(),skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=scalar,gates=Gates(),skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=scalar,gates=Gates()]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=scalar,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=scalar,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=scalar,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=scalar,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,decay=scalar]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,delta=False,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,delta=False,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,delta=False,write_gate=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,delta=False,write_gate=True,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,delta=False,write_gate=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,skip=True,output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True,skip=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[l2norm=True]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[output=OutputNorm(epsilon=1e-06)]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[scale=0.25,decay=scalar]",
-"tests/test_recurrence.py::test_every_hook_combination_steps_as_its_float64_form[skip=True]"
+"tests/test_recurrence.py::test_each_covering_hook_combination_steps_as_its_float64_form[conv=Conv(),decay=none,delta=False,write_gate=True,skip=True]",
+"tests/test_recurrence.py::test_each_covering_hook_combination_steps_as_its_float64_form[conv=Conv(),l2norm=True,delta=False,write_gate=True,skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
+"tests/test_recurrence.py::test_each_covering_hook_combination_steps_as_its_float64_form[decay=scalar,delta=False,rated=True,skip=True,output=OutputNorm(epsilon=1e-06)]",
+"tests/test_recurrence.py::test_each_covering_hook_combination_steps_as_its_float64_form[decay=scalar,gates=Gates(),skip=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]",
+"tests/test_recurrence.py::test_each_covering_hook_combination_steps_as_its_float64_form[l2norm=True,decay=none,delta=False,write_gate=True,output=OutputNorm(epsilon=1e-06,activation=sigmoid)]"
 ],
 "tests/test_recurrence_chunk.py": [
 "tests/test_recurrence_chunk.py::test_a_ragged_last_chunk_keeps_its_tokens_and_document_resets[scalar decay-delta-one sequence-9-16]",
@@ -2661,9 +2548,6 @@
 "tests/test_remote_code_releases.py::test_a_decoder_computes_its_releases_outputs_at_each_recorded_site[lfm3-vl-tiny-logits]",
 "tests/test_remote_code_releases.py::test_a_decoder_computes_its_releases_outputs_at_each_recorded_site[mimo-v2-vl-tiny-frames]"
 ],
-"tests/test_rl_contracts.py": [
-"tests/test_rl_contracts.py::test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima[GRPOObjective]"
-],
 "tests/test_router_statistics.py": [
 "tests/test_router_statistics.py::test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains",
 "tests/test_router_statistics.py::test_all_padding_has_no_router_support_or_bias_effect[mtp-attention_mask-False]",
@@ -2824,8 +2708,8 @@
 "tests/test_served_episodes.py::test_a_served_row_whose_context_does_not_continue_its_last_turn_is_prefilled_whole"
 ],
 "tests/test_serving.py": [
-"tests/test_serving.py::test_a_decoder_reading_each_tokens_place_or_id_serves_in_the_mixed_step[hash-routing]",
-"tests/test_serving.py::test_a_finished_requests_history_is_read_by_a_prompt_that_continues_it[hybrid]",
+"tests/test_serving.py::test_a_banked_servers_host_tier_reads_back_the_prefix_pages_its_pool_reclaimed",
+"tests/test_serving.py::test_a_decoder_reading_each_tokens_place_or_id_serves_in_the_mixed_step[learned-positions]",
 "tests/test_serving.py::test_a_hybrid_stack_keeps_or_loses_a_prefixs_state_to_the_bit_of_a_sized_sites_server[a-state-from-the-host]",
 "tests/test_serving.py::test_a_hybrid_stack_keeps_or_loses_a_prefixs_state_to_the_bit_of_a_sized_sites_server[evicted]",
 "tests/test_serving.py::test_a_hybrid_stack_keeps_or_loses_a_prefixs_state_to_the_bit_of_a_sized_sites_server[from-one-host-slot]",
@@ -2851,8 +2735,8 @@
 "tests/test_serving.py::test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter[dense]",
 "tests/test_serving.py::test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter[paged]",
 "tests/test_serving.py::test_a_server_over_loaded_weights_places_them_once",
-"tests/test_serving.py::test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic[sampled]",
-"tests/test_serving.py::test_a_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_mesh_draws[one]",
+"tests/test_serving.py::test_a_server_scores_its_draws_over_a_quantized_cache_as_its_rounding_does[float8-over-pages]",
+"tests/test_serving.py::test_a_server_scores_its_draws_over_a_quantized_cache_as_its_rounding_does[int8]",
 "tests/test_serving.py::test_a_sources_offloaded_cache_generates_what_a_resident_one_does",
 "tests/test_serving.py::test_a_text_prompt_through_the_hf_processor_serves_what_the_task_draws",
 "tests/test_serving.py::test_a_user_decoder_module_is_packed_where_it_names_its_groups",
@@ -2917,6 +2801,9 @@
 "tests/test_ssd_kernel.py": [
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[default-chunk]",
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[fixture-one-chunk-resets]"
+],
+"tests/test_stage_blocks.py": [
+"tests/test_stage_blocks.py::test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes[hybrid_dit-fsdp2_stage2]"
 ],
 "tests/test_stage_local.py": [
 "tests/test_stage_local.py::test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own",
