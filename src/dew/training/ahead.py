@@ -1396,7 +1396,6 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     evaluations' warming pass over its first state, compiled where the run's own code calls them over
     shapes (`collecting`), by digest: `started`'s last part."""
     from dew.distributed.placement import placed_shapes
-    from dew.objectives.base import Pooled
     from dew.state import apart, together
     from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest
     from dew.training.planning import whole_step_program
@@ -1412,8 +1411,8 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
             trainer._window_of(dataclasses.replace(placed, compute=None), candidate, window)
         for step in steps:
             moving, loss, aux, finite, accepted, committed = shapes_of(step.out_info)
-            # As the step runs it: its whole where it is split or states a statistic (`StepCompiler.runner`).
-            if split > 1 or any(isinstance(value, Pooled) for value in (aux or {}).values()):
+            # As the step runs it: its whole where it is split (`StepCompiler.runner`).
+            if split > 1:
                 loss, aux, finite, accepted, committed = whole_step_program(trainer.objective)(
                     [(loss, aux, finite, accepted, committed)] * split)
             book = book_shapes(loss)

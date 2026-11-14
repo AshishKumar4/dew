@@ -289,6 +289,12 @@ class Forwarding:
             source.request_stop()
 
     @property
+    def in_process(self) -> bool:
+        """Whether the stream it reads now reads in the training process (`ReadsInProcess`)."""
+        source = self._forwarded()
+        return isinstance(source, ReadsInProcess) and source.in_process
+
+    @property
     def stop_seconds(self) -> float | None:
         source = self._forwarded()
         seconds = source.stop_seconds if isinstance(source, Budgeted) else None
@@ -1854,6 +1860,12 @@ class StepPhases(Forwarding):
 
     def __iter__(self) -> Iterator[Batch]:
         return self
+
+    @property
+    def in_process(self) -> bool:
+        """Whether the phase it reads, or reads first, reads in the training process (`ReadsInProcess`)."""
+        source = self._source if self._source is not None else self._reader(phase_at(self._ends, self._steps))
+        return isinstance(source, ReadsInProcess) and source.in_process
 
     def _reader(self, phase: int) -> Iterator[Batch]:
         if phase not in self._readers:

@@ -240,6 +240,24 @@ DOCUMENTS_SEEDS = 8
 """Check 1's declared seeds for the loss at a read's declared documents against the objective's bound."""
 
 
+def test_a_training_read_of_rows_past_half_a_window_declares_one_document_a_window():
+    """A decision run's training read in memory, its rows drawn by its layout's encoding after it holds them,
+    declares from the fewest tokens that encoding lays each row out to (`LayoutRows.shortest`) the most
+    documents a window holds: one, for rows longer than half a window, where it declared the objective's cap
+    and the step read its windows packed (row 5916); its windows hold no more."""
+    layout = replace(LAYOUT, max_len=192)
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout)
+    long = [replace(example, state=f"{example.state} " + "x" * 120) for example in EXAMPLES]
+    opened = decision_rows(long, 4, objective=objective.data()).train(DataPartition())
+    try:
+        laid = [batch["tokens_coordinates"] for batch in itertools.islice(opened, 2)]
+    finally:
+        opened.close()
+    assert objective.bounds.segments > 1 and {coordinates.max_segments for coordinates in laid} == {1}
+    assert all(int(np.asarray(coordinates.segments).max()) == 1 for coordinates in laid)
+
+
 def test_a_step_reads_its_windows_at_the_documents_its_read_declares():
     """A window's rows are its read's packer documents: a memory read measures the most a window holds and
     declares it (`tokens_coordinates`, `dew.data.steps.generic.Coordinated`), and the step lays its

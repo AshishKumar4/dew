@@ -48,7 +48,7 @@ def test_the_irepa_loss_is_the_official_one():
     """iREPA's 3x3 convolution projector against spatially z-scored targets."""
     alignment = Alignment("block", projector="conv", spatial_norm=SETTINGS["gamma"])
     targets = spatial_zscore(jnp.asarray(CASES["features"]), SETTINGS["gamma"])
-    loss = alignment.loss(projector("conv"), jnp.asarray(CASES["hidden"]), targets, {})
+    loss = alignment.statistics(projector("conv"), jnp.asarray(CASES["hidden"]), targets, {}).mean()[0]
     np.testing.assert_allclose(float(loss), float(CASES["irepa"]), rtol=0, atol=LOSS_ATOL)
 
 
