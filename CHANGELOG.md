@@ -7,6 +7,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Layering: `dew.inference.projections` is `dew.nn.projections`; a run's score names, `Summary` and
+  `recorded_name`, are `dew.scores`'s (were `dew.training.evaluation`'s); the token count a state holds is
+  `dew.state.TokenCount`; the adapted-class mark a reader below the adapters asks is
+  `dew.nn.protocols.Adapted` (`dew.lora.AdaptedClass` its typed reading); a saved run's migration that
+  reads its checkpoints is its run class's `earlier_checkpointed`. A state, an objective, the
+  configuration and a checkpoint's metrics import no trainer, inference or front end through them.
+
 - A host's CPU devices stand in for the GPUs a run is checked for where JAX's CUDA plugin does not install
   (`dew.training.ahead.stand_in_gpus`, a block): `validate` holds the run's state to the allocator limits
   their stated GPU memory gives, as over compile-only GPUs. `dew.newton_schulz.spread_matrices` is removed:
