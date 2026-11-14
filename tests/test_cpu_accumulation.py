@@ -413,6 +413,22 @@ def test_a_users_process_spreads_a_bias_as_the_gate_measures_it(monkeypatch):
     np.testing.assert_array_equal(np.asarray(users), np.asarray(measured))
 
 
+def test_a_users_spread_keeps_its_float32_values_whatever_dot_algorithm_its_process_states(monkeypatch):
+    """A bias spread in a user's process (`precision.spread`'s blocked outer products of ones) keeps its
+    float32 values and their gradient's sum under a process's narrower dot algorithm (JAX's
+    F16_F16_F16, which casts a product's operands through float16): 1 + 2**-12 and 65536, which float16
+    rounds to 1 and overflows, spread as a broadcast spreads them, its products pinned to float32's."""
+    from dew.nn.precision import spread
+
+    monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    value = jnp.asarray([[1 + 2.0 ** -12, 65536.0, -3.0, 0.5]], jnp.float32)
+    with jax.default_matmul_precision("F16_F16_F16"):
+        spread_value = jax.jit(lambda value: spread(value, (6, 4)))(value)
+        gradient = jax.jit(jax.grad(lambda value: jnp.sum(spread(value, (6, 4)))))(value)
+    np.testing.assert_array_equal(np.asarray(spread_value), np.broadcast_to(np.asarray(value), (6, 4)))
+    np.testing.assert_array_equal(np.asarray(gradient), np.full((1, 4), 6.0, np.float32))
+
+
 def test_a_narrow_bias_beside_a_wide_product_sums_its_wide_cotangent_before_it_rounds():
     """A bf16 bias added to fp32 products takes the fp32 cotangents' sum rounded once into its dtype
     (`biased`, `broadcast_summed`, review of ledger 3038): cotangents 1 + 1/256 and -1, which bf16 holds
