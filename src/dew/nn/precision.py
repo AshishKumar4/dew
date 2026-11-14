@@ -292,7 +292,10 @@ def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
         return jnp.broadcast_to(value, shape)
     kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
 
-    outer_product = functools.partial(jax.lax.dot_general, dimension_numbers=(((), ()), ((), ())))
+    # Products by ones at float32's own precision, whatever dot algorithm the process states: a narrower
+    # one would round the spread values themselves, where a broadcast moves them exactly.
+    outer_product = functools.partial(jax.lax.dot_general, dimension_numbers=(((), ()), ((), ())),
+                                      precision=jax.lax.Precision.HIGHEST)
     sizes = tuple(shape[axis] for axis in axes)
 
     def outer(value: jax.Array) -> jax.Array:
