@@ -640,7 +640,10 @@ def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch,
     above: dict[str, JSON] = {} if frontier is None else {"frontier": [probe.record() for probe in frontier]}
     return {**planned.record(), "kernels": planned.candidate.kernels.record(),
             "probes": [probe.record() for probe in probes], **search.kernels,
-            "pool": pool_record(local_devices(search.mesh)), **above}
+            "pool": pool_record(local_devices(search.mesh)),
+            # Read at autotune 0 where compiled offline for a GPU kind (`report.autotuned`): its memory
+            # XLA's default choices', which a tuned one on the device may exceed.
+            "autotuned": report.autotuned(local_devices(search.mesh)), **above}
 
 
 def pool_record(devices: Sequence) -> dict[str, JSON]:
