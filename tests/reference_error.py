@@ -1329,9 +1329,18 @@ def _cancelling_terms(draw, truth, program=None):
     inputs = widened(draw(0))
     with jax.enable_x64(new_val=True):
         leaves = [*map(np.asarray, jax.tree.leaves(run(*inputs)))]
-        if not np.any(_LaidTruths.of(leaves).sizes == 0):
+        zero_leaves = [index for index, leaf in enumerate(leaves)
+                       if np.any(_LaidTruths.of([leaf]).sizes == 0)]
+        if not zero_leaves:
             return None
-        truths, terms = float64_terms(truth, *inputs)
+        # Only these leaves can change the decision below: a terms program of every output compiled each
+        # leaf's sums too (the SSD mesh contract's data mesh 205 s, 78 s on its zero leaf alone; rows 5770,
+        # 5961).
+        def selected(*args):
+            outputs = jax.tree.leaves(truth(*args))
+            return [outputs[index] for index in zero_leaves]
+
+        truths, terms = float64_terms(selected, *inputs)
     plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
         jax.tree.leaves(truths), _term_leaves(terms, truths))
     return truth if bool(np.any((plain.sizes == 0) & (termed.sizes > 0))) else None

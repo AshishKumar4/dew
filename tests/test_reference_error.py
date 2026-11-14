@@ -269,6 +269,24 @@ def test_check_1_sizes_a_cancelling_row_by_its_terms_and_admits_nothing_else():
                         terms=True, truth_fn=as_given(lambda x, w: {"rows": np.zeros((64, 4))}))
 
 
+@pytest.mark.parametrize("cancels", [False, True])
+def test_a_sites_terms_decide_by_its_zero_leaves_beside_others(cancels):
+    """A truth whose zero rows sit in one leaf beside a leaf of none (`_cancelling_terms`, which traces the
+    terms of the leaves holding zero rows alone): a zero row that cancels sizes the site by its terms, and
+    an empty sum leaves it the reference's residue rule, whatever the other leaves hold."""
+    from reference_error import _cancelling_terms
+
+    def truth(x):
+        total = jnp.sum(x, axis=-1, keepdims=True)
+        zero = total - total if cancels else jnp.sum(jnp.zeros_like(x), axis=-1, keepdims=True)
+        return {"nonzero": total + 100, "zero": jnp.concatenate([zero, total + 100])}
+
+    def draw(seed):
+        return (jnp.arange(32, dtype=jnp.float32).reshape(4, 8),)
+
+    assert (_cancelling_terms(draw, truth) is truth) == cancels
+
+
 def found(failure: GateFailure) -> list[tuple[str, str, float]]:
     """A gate failure's findings as data: each one's leaf, rule and measure (`Finding`), not its wording."""
     return [(finding.leaf, finding.rule, finding.measure) for finding in failure.findings]
