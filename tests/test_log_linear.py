@@ -83,19 +83,25 @@ def test_the_masked_form_is_as_exact_as_flas_level_by_level(packed):
 
 
 def test_a_blocks_pairs_keep_a_decay_past_a_vanished_one_and_no_future_overflow():
-    """Within a block (`log_linear.WITHIN`), a pair's decay after a vanishing one is its own (a running sum
-    of -2**70 rounds a later -1 away, its pair decayed by one), and a future pair's overflowing score reaches
-    neither the output nor a gradient (an infinity times its zero decay is a NaN)."""
+    """Within a block (`log_linear.WITHIN`), a pair's decay after a vanishing one is its own, as after any
+    (a running sum of -2**70 rounds a later -1 away, its pair decayed by one), and an overflowing score of a
+    pair whose decay is zero, a future pair's or a past one's through a vanished decay, reaches neither the
+    output nor a gradient (an infinity times its zero decay is a NaN)."""
     ones = jnp.ones((1, 2, 1, 1), jnp.float32)
     weights = jnp.ones((1, 2, 1, levels(2)), jnp.float32)
-    vanished = jnp.asarray([[[-2.0 ** 70], [-1.0]]], jnp.float32)
-    out = log_linear_attention(ones, ones, ones, vanished, weights, scale=1.0)
-    np.testing.assert_allclose(np.asarray(out)[0, :, 0, 0], [1.0, 1.0 + math.exp(-1.0)], rtol=1e-6)
-    query, key = (jnp.asarray(x, jnp.float32).reshape(1, 2, 1, 1) for x in ([1e20, 0.0], [0.0, 1e20]))
+    vanished, kept = (log_linear_attention(ones, ones, ones, jnp.asarray([[[first], [-1.0]]], jnp.float32),
+                                           weights, scale=1.0) for first in (-2.0 ** 70, 0.0))
+    # Token 1's pair with token 0 decays by token 1's own -1 alone, whatever token 0's decay.
+    np.testing.assert_array_equal(np.asarray(vanished), np.asarray(kept))
+    big = [([1e20, 0.0], [0.0, 1e20], 0.0), ([0.0, 1e20], [1e20, 0.0], -1000.0)]
 
     def summed(query, key, g):
         return log_linear_attention(query, key, ones, g, weights, scale=1.0).sum()
 
-    value, grads = jax.value_and_grad(summed, argnums=(0, 1, 2))(query, key, jnp.zeros((1, 2, 1), jnp.float32))
-    assert value == 0.0
-    assert all(np.isfinite(np.asarray(grad)).all() for grad in grads)
+    # A future pair's score overflowing, and a past one's through a vanished decay.
+    for query, key, decay in big:
+        query, key = (jnp.asarray(x, jnp.float32).reshape(1, 2, 1, 1) for x in (query, key))
+        g = jnp.asarray([[[0.0], [decay]]], jnp.float32)
+        value, grads = jax.value_and_grad(summed, argnums=(0, 1, 2))(query, key, g)
+        assert value == 0.0
+        assert all(np.isfinite(np.asarray(grad)).all() for grad in grads)

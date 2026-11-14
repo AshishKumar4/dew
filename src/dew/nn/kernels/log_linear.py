@@ -97,7 +97,6 @@ def _within(q, k, v, g, weights, positions, *, scale: float, documents: int):
     # Each block's decays as the recurrence's derivation forms them (`scan.between`: compensated, a
     # vanished decay ending a segment), `[B, n, H, l, c]`.
     decay = jax.vmap(jax.vmap(scan.between))(g).transpose(0, 1, 4, 2, 3)
-    causal = np.tril(np.ones((WITHIN, WITHIN), bool))
     # A pair's level: zero for a token's own key, else the bit length of their offsets' XOR; past the
     # sequence's levels, a pair of slots no token takes.
     offsets = np.arange(WITHIN)
@@ -105,8 +104,10 @@ def _within(q, k, v, g, weights, positions, *, scale: float, documents: int):
     level = np.minimum(np.frexp(np.bitwise_xor.outer(offsets, offsets))[1], weights.shape[-1] - 1)
     weighed = weights.transpose(0, 1, 3, 2, 4)[..., offsets[:, None], level]
     scores = jnp.repeat(portable_einsum('bxign,bxjgn->bxgij', q, k), heads // groups, axis=2)
-    # The scores past a token selected away before they meet their zero decay: one that overflows there
-    # times zero is a NaN, in the output and, as the product's factor, in every gradient through it.
-    pairs = decay * weighed * jnp.where(causal, scores, 0.0)
+    # The scores of every pair whose decay is zero (past a token, or through a vanished decay) selected
+    # away before they meet it: one that overflows there times zero is a NaN, in the output and, as the
+    # product's factor, in every gradient through it; the recurrence decays the memory before the query
+    # reads it, so no such product forms.
+    pairs = decay * weighed * jnp.where(decay != 0, scores, 0.0)
     out = scale * portable_einsum('bxhij,bxjhp->bxihp', pairs, v)
     return out.reshape(rows, count * WITHIN, heads, -1)[each, slot]
