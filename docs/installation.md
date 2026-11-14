@@ -202,6 +202,9 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - A call primitive's batching (`eval_jaxpr_p`, a registered call primitive, `cond`, `scan`, `while_loop`, a custom VJP's optimized remat) keeps its body's staged custom-JVP outputs marked, so `vmap(out_axes=None)` refuses one as shared, as through a direct `jit`, where `sum_match=True` summed its conservative broadcast.
 - The functional GPU interpreter reads zeros before a TMA window's buffer and drops what a store would write there, keeps a `while_loop` condition's writes and out-of-bounds reads, and honours a copy's predicate and a copy with no barrier; its race detection checks a block-scaled MMA's scale reads.
 - Every TMEM load honours `max_registers` and issues transfers of a power of two; a deviceless capture keeps a scalar operand at rank 0 and refuses a sub-byte one.
+- Mosaic GPU issues tcgen05's products of float32 shared-memory operands as TF32 (`.kind::tf32`), and a compile ahead that requires its autotune results (`xla_gpu_require_complete_aot_autotune_results`) keys its programs as its device's compile does.
+- A compile for compile-only GPUs reads and writes the persistent compilation cache only where its options or `XLA_FLAGS` state how it is tuned (autotune level 0, or complete stored autotune results required), so a program XLA compiled untuned is never stored under the key a device's tuned compile reads.
+- The Pallas lowering cache keys no caller's metadata of a kernel (`CompilerParams.metadata`), which no lowering reads, so kernels that differ in it alone share one lowering, each call carrying its own.
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
 ## Optional extras
