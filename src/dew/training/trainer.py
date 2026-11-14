@@ -321,8 +321,9 @@ class Trainer(Generic[Loss, Effects]):
             diloco.admits(self.layout.host, record)
         # Where the fit ladder stands and the links its traces read (`StepCompiler`), and what the last
         # compile found (`Compiled`), which `plan`, `memory`, `executable`, `step_flops` and `links` read.
-        self._compiler = StepCompiler(objective, links, None if ahead is None else ahead.runnable(),
-                                      self.phase_passes)
+        self._compiler = StepCompiler(
+            objective, links, None if ahead is None else ahead.runnable(list(self.device_mesh.devices.flat)),
+            self.phase_passes)
         self._compiled: Compiled | None = None
         # Whether a step has run since the last compile proved its plan fits (`memory`).
         self._unproven = False

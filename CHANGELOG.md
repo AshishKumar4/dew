@@ -11,8 +11,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compiled on compile-only GPUs outside a prepare) no longer runs it: it compiles its step on its own
   devices as a run without a file does, keeps their tuned choices beside its compilation cache, and says
   once why (`dew.training.ahead.UNTUNED`). On a GH200 such a file's 4096x4096 bf16 product ran at 8.32 ms
-  a call against 0.174 ms compiled on the device (UB-4792-AHEAD-TIME). Such a file still writes, for its
-  plan and its kernels; a tuned file loads as before.
+  a call against 0.174 ms compiled on the device (UB-4792-AHEAD-TIME). A run whose own compile tunes
+  nothing either (its XLA_FLAGS setting the autotuner's level 0) takes it, and a file of another target is
+  refused, tuned or not, as before. Such a file still writes, for its plan and its kernels; a file compiled
+  over the GPU host's own topology (`--trainer.compile-ahead.topology`) is compiled with every tuned choice
+  that host's runs left beside its compilation cache, or refused, and a run takes it.
 
 - A compile-ahead target with no path (`--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY`, its generation
   and devices) compiles the run's first step and every later data phase's step into the run's persistent
@@ -119,9 +122,6 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   issues tcgen05's products of fp32 shared-memory operands as TF32 (`.kind::tf32`), which Dew's Blackwell kernels
   do not select yet, and a compile ahead that requires its autotune results keys its programs as its device's
   compile does.
-- Dew requires its JAX build 0.12.0.1.post90 (Python alone; the CUDA and PJRT plugins stay post81's): a Blackwell
-  kernel's fp32 products take TF32 on its tensor cores (tcgen05's `.kind::tf32`), and a compile ahead that requires
-  its autotune results keys its programs as its device's compile does.
 - Dew requires its JAX build 0.12.0.1.post87 (Python alone; the CUDA and PJRT plugins stay post81's): a run under
   a profiler or dumping XLA's programs reads the Mosaic GPU lowerings and kernel certifications an unprofiled run
   stored, where it lowered and certified them afresh.

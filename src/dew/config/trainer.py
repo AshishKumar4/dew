@@ -406,13 +406,20 @@ class TrainerConfig:
     planning took. A run with its remat set compiles at that remat alone, and is told of no other;
     this is how to ask what fits beside it: compile it ahead once at each remat policy its model
     takes (the model's `remat` field) and compare the plans.
+
+    Such a file is XLA's untuned program for those GPUs, which a run handed it does not run: it compiles
+    its own step (`AheadOfTime.runnable`). A file a run takes is compiled over the GPU host's own
+    topology, `--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY`, with that host's compilation cache
+    once a run there has tuned the step: it takes each tuned choice the run left there, or is refused.
     """
     ahead: str | None = None
     """Run the step `compile_ahead` saved at this path as the run's first step, in place of compiling it.
 
     The run lowers its first step as it would and runs the saved executable where that is the same
     program, on a host of the topology it was compiled for; another program, from another config,
-    data shape, Dew or a plan recorded for another rung, is refused before the run trains.
+    data shape, Dew or a plan recorded for another rung, is refused before the run trains. A file
+    compiled without its GPU kind's tuned choices (one compiled for a generation's canonical GPUs) is
+    not run: the run compiles its own step, said once (`compile_ahead`).
     """
     inspection: Annotated[Inspection, tyro.conf.subcommand("inspect")] | None = None
     """What the run watches at its sampled steps (`dew.training.inspection.Inspection`): parameter paths by

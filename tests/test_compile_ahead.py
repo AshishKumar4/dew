@@ -605,13 +605,22 @@ def admitted(tmp_path_factory):
     return records, trainer, ahead
 
 
+def cache_key_of(lowered: jax.stages.Lowered, device, overrides: dict | None = None) -> str:
+    """The key JAX's persistent cache keeps `lowered`'s compile for one `device` under, with the compile
+    options `overrides` given (`jax._src.cache_key.get`)."""
+    from jax._src import cache_key, compiler
+
+    options = compiler.get_compile_options(num_replicas=1, num_partitions=1, device_assignment=[[device]],
+                                           backend=device.client, env_options_overrides=overrides)
+    return cache_key.get(lowered.compiler_ir("stablehlo"), np.array([device]), options, device.client)
+
+
 def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_over_its_own_gpus(tmp_path):
     """A host's GPUs, serialized as their topology (`get_attached_topology(...).serialize()`, here of
     compile-only H100s at a stated 40 GiB) and read back elsewhere (`host_gpus`), are the GPUs XLA compiles
     for: a program compiled over them keys the persistent cache with the host's own platform version and
     topology fingerprint, as over the devices serialized, where a canonical target of the generation
     (`compile_only_gpus`, its memory unstated) keys another entry."""
-    from jax._src import cache_key, compiler
     from jax.experimental import topologies
 
     from dew.nn.kernels.generation import compile_only_gpus
@@ -624,10 +633,7 @@ def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_o
     def key(devices) -> str:
         lowered = jax.jit(lambda x: x * 2 + 1).trace(jax.ShapeDtypeStruct(
             (8, 128), jnp.float32, sharding=jax.sharding.SingleDeviceSharding(devices[0]))).lower()
-        backend = devices[0].client
-        options = compiler.get_compile_options(num_replicas=1, num_partitions=1,
-                                               device_assignment=[[devices[0]]], backend=backend)
-        return cache_key.get(lowered.compiler_ir("stablehlo"), np.array(devices[:1]), options, backend)
+        return cache_key_of(lowered, devices[0])
 
     read = host_gpus("sm90", serialized, 2)
     assert [device.device_kind for device in read] == [device.device_kind for device in host]
@@ -642,23 +648,16 @@ def test_a_step_prepared_for_a_hosts_gpus_keys_the_cache_as_the_hosts_run_compil
     from the autotune cache and every one required, keys the persistent cache as the host's run's compile
     of it does, under that run's own options (`report.targeted` on a GPU that runs: a CUB sort's choice
     kept off its key), so the run reads the step the prepare compiled (row 6046)."""
-    from jax._src import cache_key, compiler
-
     from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.kernels.templates.report import CUB_NO_FALLBACK, for_devices, targeted
 
     (device,) = compile_only_gpus("sm90", 1, 40 * 2**30)
     lowered = jax.jit(lambda x: x @ x).trace(jax.ShapeDtypeStruct(
         (64, 64), jnp.float32, sharding=jax.sharding.SingleDeviceSharding(device))).lower()
-
-    def key(overrides) -> str:
-        options = compiler.get_compile_options(num_replicas=1, num_partitions=1, device_assignment=[[device]],
-                                               backend=device.client, env_options_overrides=overrides)
-        return cache_key.get(lowered.compiler_ir("stablehlo"), np.array([device]), options, device.client)
-
     with for_devices():
         prepared = targeted(lowered, None)
-    assert key(prepared) == key({"xla_gpu_deviceless_cub_mode": CUB_NO_FALLBACK})
+    assert cache_key_of(lowered, device, prepared) == cache_key_of(
+        lowered, device, {"xla_gpu_deviceless_cub_mode": CUB_NO_FALLBACK})
 
 
 def test_a_prepares_compiles_on_dews_compile_threads_take_its_target(monkeypatch):
@@ -1230,13 +1229,11 @@ def test_compiling_ahead_takes_a_mesh_of_compile_only_gpus():
         compile_ahead(fine_tune(MeshSpec(fsdp=8).build()), token_rows(VOCAB, BATCH, SEQ_LEN + 1))
 
 
-def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tmp_path):
+def test_a_step_compiled_ahead_is_one_program_and_a_wider_models_another():
     """Two trainers of one config compile ahead one program, the digest a run lowers its first step
-    to (`AheadOfTime.program`); a wider model's is another. A run handed another program's step
-    refuses it before it trains, and refuses it again on its next fit, rather than compiling its own
-    (row 1915)."""
-    from dew.nn.kernels.generation import assumed
-    from dew.training.ahead import AheadOfTime, compile_ahead
+    to (`AheadOfTime.program`); a wider model's is another, which a run handed it refuses (its GPU flow's
+    cell, `a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu`; row 1915)."""
+    from dew.training.ahead import compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
 
@@ -1245,14 +1242,6 @@ def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tm
 
     first, again, wide = ahead(), ahead(), ahead(width=48)
     assert first.program == again.program != wide.program
-    # Stated tuned, as a prepare's file is (`report.for_devices`): an untuned one no run takes at all.
-    dataclasses.replace(wide, tuned=True).save(tmp_path / "wide.dew-aot")
-    run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(tmp_path / "wide.dew-aot"))
-    # On the GPU it was compiled for, which a CPU is not, its program is what refuses it (train 332's review).
-    with assumed(wide.target):
-        for _ in range(2):
-            with pytest.raises(ValueError):
-                run.fit(batch, steps=1, log_every=1)
 
 
 def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_nothing(tmp_path):
@@ -1643,11 +1632,10 @@ def a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path)
 
 def a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
     """A step compiled ahead for one compile-only GPU of this GPU's own target (`this_gpus`), saved and
-    handed to the run (`Trainer(ahead=...)`), is XLA's untuned program there (`AheadOfTime.tuned`), whose
-    products ran up to 48 times slower on a GH200 (UB-4792-AHEAD-TIME): the run compiles its step on its GPU
-    as a run without a file does, its plan's first compile its own, and trains, its steps advancing and its
-    parameters moving (row 1915). A wider model's step is dropped alike. The model's attention takes XLA's
-    path, which a step compiled with no GPU attached traces too."""
+    handed to the run (`Trainer(ahead=...)`), is the program the run lowers its first step to, and the run
+    trains from it, its plan's first compile the step compiled ahead: its steps advance and its
+    parameters move (row 1915). A wider model's step for this GPU is another program, refused. The
+    model's attention takes XLA's path, which a step compiled with no GPU attached traces too."""
     from dew.nn.kernels.generation import chosen
     from dew.training.ahead import AheadOfTime, compile_ahead
 
@@ -1661,33 +1649,41 @@ def a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
         initial = jax.tree.leaves(run.initial_state().variables["params"])
         state = run.fit(batch, steps=2, log_every=1)
         other = fine_tune(here, ahead=AheadOfTime.load(tmp_path / "wide.dew-aot"), xla=True)
-        assert int(other.fit(batch, steps=1, log_every=1).step) == 1
+        with pytest.raises(ValueError):
+            other.fit(batch, steps=1, log_every=1)
     first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
-    assert int(state.step) == 2 and first["ahead"] is False
+    assert int(state.step) == 2 and first["ahead"] is True
     assert any(not np.array_equal(np.asarray(new), np.asarray(old))
                for new, old in zip(jax.tree.leaves(state.variables["params"]), initial, strict=True))
 
 
-def test_a_run_handed_an_untuned_step_compiles_its_own(tmp_path, caplog):
-    """A run handed a step compiled ahead without its GPU kind's tuned choices (`AheadOfTime.tuned`: compiled
-    on compile-only GPUs outside a prepare) does not run that file's programs, whose XLA products ran up to
-    48 times slower on a GH200 (UB-4792-AHEAD-TIME): it compiles its step on its own devices as a run
-    without a file does, its first compile its own, and says so once (`AheadOfTime.runnable`); here a
-    CPU, handed an H100's file, trains."""
-    from dew.training.ahead import AheadOfTime, compile_ahead
+def test_a_run_takes_an_untuned_step_only_where_its_own_compile_tunes_nothing(tmp_path, caplog, monkeypatch):
+    """A run takes a step compiled ahead (`AheadOfTime.runnable`) only for its own target, refused for any
+    other, tuned or not; for its own, a step compiled without its GPU kind's tuned choices (`tuned`, read
+    off its plan: compiled on compile-only GPUs outside a prepare), whose XLA products ran up to 48 times
+    slower on a GH200 (UB-4792-AHEAD-TIME), is not taken where the run's own compile tunes (its step
+    compiled on its devices as without a file, said once), and is where it tunes nothing either (XLA_FLAGS
+    setting the autotuner's level 0, as a repeatable lane's do), its products then the run's own. A step
+    of this host's own target stands for the GPU host's here: a CPU is no target a step compiles ahead
+    for."""
+    from dew.training.ahead import AheadOfTime, BuildTarget, compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     compile_ahead(fine_tune(MeshSpec().build(gpus("sm90"))), batch).save(tmp_path / "step.dew-aot")
     handed = AheadOfTime.load(tmp_path / "step.dew-aot")
+    here = jax.devices()[:1]
     assert not handed.tuned
+    with pytest.raises(ValueError):
+        handed.runnable(here)
+    own = dataclasses.replace(handed, built=BuildTarget.of(here))
     caplog.clear()
     with caplog.at_level("WARNING", logger="dew.training.ahead"):
-        run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=handed)
-        with Compiles("step") as compiles:
-            state = run.fit(batch, steps=1, log_every=1)
-    first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
-    assert int(state.step) == 1 and first["ahead"] is False and compiles.count >= 1
+        assert own.runnable(here) is None
     assert len([entry for entry in caplog.records if entry.name == "dew.training.ahead"]) == 1
+    tuned = dataclasses.replace(own, plan={**record(own.plan, "plan"), "autotuned": True})
+    assert tuned.tuned and tuned.runnable(here) is tuned
+    monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
+    assert own.runnable(here) is own
 
 
 def test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step():
@@ -1707,8 +1703,9 @@ def test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step():
 
 def a_watched_run_handed_its_steps_compiled_ahead_compiles_neither(tmp_path):
     """A GPU flow's cell (tests/test_gpu_training.py): a run that inspects, handed its step and sampled step
-    compiled ahead for this host's own GPU, untuned there (`AheadOfTime.tuned`), runs neither: it compiles
-    both on its GPU (`Compiles`), as a run without a file does, and trains (train 332's review; UB-4792)."""
+    compiled ahead for this host's own GPU, takes both (`taken`) and compiles no step program on its GPU
+    (`Compiles`): its first plan's compile is the step compiled ahead, and it trains from it (train 332's
+    review)."""
     from dew.nn.kernels.generation import chosen
     from dew.telemetry.compiles import Compiles
     from dew.training import Inspection
@@ -1723,7 +1720,7 @@ def a_watched_run_handed_its_steps_compiled_ahead_compiles_neither(tmp_path):
         with Compiles("step") as compiles:
             state = run.fit(batch, steps=1, log_every=1)
     first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
-    assert int(state.step) == 1 and first["ahead"] is False and compiles.count >= 2
+    assert int(state.step) == 1 and first["ahead"] is True and compiles.count == 0
 
 
 @pytest.mark.tpu(reason="runs a step compiled ahead for this host's TPU topology as a run's first step")
@@ -1834,8 +1831,7 @@ def a_run_handed_a_step_compiled_ahead_traces_with_the_links_it_was_compiled_wit
     here = spec.build(jax.devices()[:2])
     with chosen(narrow_copies="off"):
         target = spec.build(this_gpus(2))
-        # Stated tuned, as a prepare's file is (`report.for_devices`): an untuned one no run takes at all.
-        dataclasses.replace(compile_ahead(latent(target), batch), tuned=True).save(path)
+        compile_ahead(latent(target), batch).save(path)
         saved = str(tmp_path / "run")
         run = latent(here, ahead=AheadOfTime.load(path), links=FAST, checkpoints=Checkpoints(saved))
         state = run.fit(batch, steps=2, log_every=1)
@@ -1856,8 +1852,7 @@ def a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     with chosen(narrow_copies="off"):
         target = MeshSpec().build(this_gpus())
-        # Stated tuned, as a prepare's file is (`report.for_devices`): an untuned one no run takes at all.
-        saved = dataclasses.replace(compile_ahead(fine_tune(target, xla=True, split=2), batch), tuned=True)
+        saved = compile_ahead(fine_tune(target, xla=True, split=2), batch)
         path = tmp_path / "split.dew-aot"
         saved.save(path)
         here = MeshSpec().build(jax.devices()[:1])
