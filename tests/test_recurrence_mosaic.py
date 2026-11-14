@@ -1656,8 +1656,8 @@ def test_a_kernel_named_alike_at_every_rung_is_one_module(target):
     unchanged = raised = 0
     for name in [name for name in RESOURCE_SHAPES if name != 'a 192-wide value head']:
         operands = resource_operands(name, jnp.bfloat16, 1, 4096)[:5]
-        form = {**_form(name, jnp.bfloat16), **_skipped(name, jnp.bfloat16)}
-        bound = template.MOSAIC.bind(*operands, None, bound=1.0, **form)
+        form, skipped = _form(name, jnp.bfloat16), _skipped(name, jnp.bfloat16)
+        bound = template.MOSAIC.bind(*operands, None, bound=1.0, **form, **skipped)
         with generation.assumed(facts), report.refusals():
             tiles = template.MOSAIC.derived(bound, facts)
             if tiles is None:
@@ -1671,13 +1671,15 @@ def test_a_kernel_named_alike_at_every_rung_is_one_module(target):
                     ladders.append(rung)
             modules: dict[tuple[str, str], set[bytes]] = collections.defaultdict(set)
             for config in ladders:
-                def loss(*given, config=config, form=form):
-                    out, final = mosaic_rule(*given, tiles=config, bound=1.0, **form)
+                # A rated scan's skip an operand beside the call's, traced as its route hands it.
+                def loss(*given, config=config, form=form, named=tuple(skipped)):
+                    out, final = mosaic_rule(*given[:5], tiles=config, bound=1.0, **form,
+                                             **dict(zip(named, given[5:], strict=True)))
                     return out.astype(jnp.float32).sum() + final.sum()
 
                 # A lowering cache's hit is the module its lowering gives: its key is all the lowering reads.
-                program = jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(*operands).lower(
-                    lowering_platforms=('cuda',))
+                program = jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(
+                    *operands, *skipped.values()).lower(lowering_platforms=('cuda',))
                 for call in kernel_calls(program, unrun=True):
                     if call.kind == 'mosaic_gpu':
                         modules[call.name, repr(template.MOSAIC.emitted(config, call.name))].add(call.ir)
