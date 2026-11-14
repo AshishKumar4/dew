@@ -26,6 +26,7 @@ import pytest
 import tool_support
 from interop_support import (
     assert_transformer_exports,
+    dtype_arms,
     extract_fixture,
     fixture_arrays,
     source_transformer,
@@ -180,14 +181,6 @@ def nhwc(array):
 PIPELINE_SEEDS = 8
 """The autoencoder's, encoders' and pipeline's declared seeds for check 1, sized by `seeds_for` paired as
 each check confirmed them."""
-
-
-def dtype_arms(run):
-    """`run(dtype, *inputs)` in float32, and in float64 inside `float64` (`torch_arms`)."""
-    import torch
-
-    return torch_arms(lambda *inputs: run(torch.float32, *inputs),
-                      lambda *inputs: run(torch.float64, *inputs))
 
 
 def vae_walk(model, dtype, inputs):

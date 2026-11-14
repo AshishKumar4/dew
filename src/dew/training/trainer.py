@@ -152,7 +152,7 @@ from dew.training._fit import (
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau
 from dew.training.cadence import Counted
-from dew.training.compiler import Compiled, CompiledStep, StepCompiler, freshly_held, released
+from dew.training.compiler import Compiled, CompiledStep, StepCompiler, freshly_held
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -177,7 +177,7 @@ from dew.training.memory import first_run, local_devices, recompute_record, refu
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, model_batch, prepare_counts, uncounted
 from dew.training.observe import Observe
 from dew.training.phase_passes import PhasePasses
-from dew.training.planning import Candidate, Planned, Trials, read_whole, splits
+from dew.training.planning import Candidate, Planned, Trials, read_whole, released, splits
 from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, waited_export
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process, signal_wake
@@ -1856,8 +1856,7 @@ class Trainer(Generic[Loss, Effects]):
                 cooled=True)
         if checkpoints is not None and not cut:
             checkpoints.cooling(None)
-        for leaf in (leaf for leaf in jax.tree.leaves(apart(cooled)[0]) if not leaf.is_deleted()):
-            leaf.delete()
+        released(apart(cooled)[0])
         restored = together(restore(), frozen)
         if reading:
             run.train = self._prefetched(plan, run, plan.dataset.train(run.partition), position)

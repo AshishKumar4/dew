@@ -15,7 +15,18 @@ narrow dtype such as bf16 where the program rounds them. On CUDA,
 GPU pool in one piece for a step's temporaries, and
 `--xla_backend_extra_options=-nvptx-prec-divf32=2` divides fp32 to the nearest
 float, as a CPU and the references Dew is held to do (`dew._devices`). If you
-set any of them yourself in XLA_FLAGS, your value is kept. Where jax was
+set any of them yourself in XLA_FLAGS, your value is kept.
+
+With JAX's CUDA plugin installed, `import dew` also holds XLA's GPU pool to 95%
+of each GPU (`XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`, `dew._devices.preallocate_gpu_pool`)
+where JAX would take 75%: a training step's plan is made against the pool's
+limit, and at 75% plans split and recompute where the GPU holds the step (a
+GH200's were made against 70.88 GiB of its 94.5). Your own fraction, in either
+of JAX's names, is kept, and the platform's allocator, which holds no pool, gets
+none. A process whose JAX backend opened before `import dew` keeps 75%; its plans
+record that limit as JAX's, and its run says once how to get Dew's. A process that
+shares its GPU with another program (an inference server beside it) names its own
+fraction; Dew places no other engine on a GPU it trains on. Where jax was
 imported before Dew, XLA may have parsed its flags already and Dew's are
 unproven; where the JAX backend has already opened, they cannot take effect,
 and Dew logs a warning.
@@ -46,6 +57,7 @@ from dew._devices import (
     connect_at_creation as _connect_at_creation,
     divide_exactly as _divide_exactly,
     keep_roundings as _keep_roundings,
+    preallocate_gpu_pool as _preallocate_gpu_pool,
     unpartition_gpu_pool as _unpartition_gpu_pool,
 )
 from dew._exports import lookup as _lookup
@@ -53,6 +65,7 @@ from dew._exports import lookup as _lookup
 _keep_roundings()
 _divide_exactly()
 _unpartition_gpu_pool()
+_preallocate_gpu_pool()
 _connect_at_creation()
 
 

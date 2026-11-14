@@ -173,18 +173,39 @@ def test_the_real_qwen35_rotary_rotates_the_dims_the_reference_rotates():
                            np.cos(positions[:, None] * inv_freq[None]), atol=1e-2)
 
 
-def test_qwen35_logits_match_the_reference_implementation():
-    """Full-model parity on the tiny hybrid: the delta net layers, the gated
-    attention with its sliced quarter-head rope (the reference applies its
-    interleaved mRoPE to text-only positions, which is this rope exactly),
-    the (1 + w) norms and the tied head. Largest observed max |logit
-    difference| 9.1e-05 on logits of magnitude 6.8, tolerance 5e-4, every
-    argmax equal. Translating the rope as Gemma 4's proportional convention
-    instead moves the logits by 7.8e-01."""
-    directory = FIXTURES / "qwen35-tiny"
-    model, variables = fp32_decoder(directory)
-    difference = recorded_logit_difference(model, variables, directory)
-    assert difference < 5e-4, f"max |logit difference| {difference:.3e}"
+QWEN35_CERTIFIED_SEEDS = 2
+"""The draws Qwen3.5's step is certified on (check 2): each a whole step, one primitive at a time."""
+
+
+def test_qwen35s_step_certifies_element_by_element(monkeypatch):
+    """Qwen3.5's training step on the tiny hybrid, its next-token loss and every weight's gradient over
+    drawn ids, run one primitive at a time, every element of every operation within its own operation's
+    certified bound (check 2, ledger 5975): its forward logits hold check 1 against the source over drawn
+    sources (tests/test_hf_family_sources.py's YaRN case), but over the fixture's own weights a gated delta
+    net's norm amplifies its rounding at a token unevenly (ledger 5238), and check 1 resolved them within
+    no count of 512 seeds even at 4 rows of 48 tokens (armada, 11-14). The program certified is the
+    library's own, which every platform runs, without the test lane's wide CPU arithmetic."""
+    import optax
+    from certified import assert_certified
+
+    from dew.nn import precision
+
+    monkeypatch.setenv(precision.WIDE_CPU_ARITHMETIC, "0")
+    loaded = Pretrained.load(FIXTURES / "qwen35-tiny", dtype="float32")
+    model, variables = loaded.model, loaded.variables
+    vocab = fixture_config("qwen35-tiny")["vocab_size"]
+
+    def step(params, ids):
+        def loss(params):
+            logits = model.apply({**variables, "params": params}, ids[:, :-1])
+            return optax.softmax_cross_entropy_with_integer_labels(logits, ids[:, 1:]).mean()
+        return jax.value_and_grad(loss)(params)
+
+    def draw(seed):
+        return variables["params"], np.random.default_rng([0x5975, seed]).integers(0, vocab, (2, 12),
+                                                                                   np.int32)
+
+    assert_certified(step, draw, "Qwen3.5's step", seeds=QWEN35_CERTIFIED_SEEDS)
 
 
 @pytest.mark.parametrize("fixture", ["qwen35-tiny", "qwen35-moe-native-tiny", "qwen3-next-tiny"])

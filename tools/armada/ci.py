@@ -185,13 +185,12 @@ rows = _loaded(HERE / "rows.py")
 row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_place, rows.key_parts
 grouped_rows = rows.grouped_rows
 # The test cache's records (records.py), by the names this file and its tests read them.
-(store, record_key, green_key, sets_key, set_key, epoch_key, Unread, UNREAD, epoch, begun, standing,
- executed_set, set_digest, remembered, recorded, record_of, written, listed, CACHE_PREFIX, RECORD_TRIES) = (
-    records.store, records.record_key, records.green_key, records.sets_key, records.set_key,
-    records.epoch_key,
-    records.Unread, records.UNREAD, records.epoch, records.begun, records.standing, records.executed_set,
-    records.set_digest, records.remembered, records.recorded, records.record_of, records.written,
-    records.listed, records.CACHE_PREFIX, records.RECORD_TRIES)
+(store, record_key, green_key, main_key, epoch_key, Unread, UNREAD, epoch, begun, standing,
+ recorded, record_of, written, listed, CACHE_PREFIX, RECORD_TRIES) = (
+    records.store, records.record_key, records.green_key, records.main_key,
+    records.epoch_key, records.Unread, records.UNREAD, records.epoch, records.begun, records.standing,
+    records.recorded, records.record_of, records.written, records.listed, records.CACHE_PREFIX,
+    records.RECORD_TRIES)
 VARIED, varied, cut_of, place_variant = rows.VARIED, rows.varied, rows.cut_of, rows.place_variant
 shares = _loaded(HERE / "shares.py")
 collection = _loaded(HERE / "collection.py")
@@ -483,12 +482,28 @@ def gpu_query(field: str) -> list[str]:
                           check=True).stdout.split("\n")[:-1]
 
 
-def matchable(depends: Sequence[str], reading: Reading) -> bool:
-    """Whether an executed set can be this checkout's: a set naming a unit a module here lacks
-    (`digests.MISSING`) was run by a tree that held it, so no key of it can be this one's, and no green run is
-    looked up for it."""
-    return not any(followed.CODE in path and path.partition(followed.CODE)[2] not in ("", followed.WHOLE)
-                   and reading.part(path) == digests.MISSING for path in depends)
+@functools.cache
+def head_commit() -> str | None:
+    """The commit this checkout is at, which a task's records of it name (`main_key`), or None outside git."""
+    found = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
+    return (found.stdout.strip() or None) if found.returncode == 0 else None
+
+
+@functools.cache
+def mainline() -> str | None:
+    """The commit of main this checkout descends from (its merge-base with origin/main: a train's base, a
+    lane's branch point), whose own runs' records a lookup finds behind a later run of another tree
+    (`green_record`), or None where the checkout has no origin/main."""
+    found = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], capture_output=True, text=True)
+    return (found.stdout.strip() or None) if found.returncode == 0 else None
+
+
+def named_at_commit(python: str, place: str, held: str, key: str, token: str) -> None:
+    """Row `place`'s green run of `key` on class `held` named this commit's own (`main_key`), tried once: a
+    name lost costs a later lookup that row's rerun, never this task its deadline (review: a kept task of 120
+    rows retrying each write against an unavailable Worker would wait past its 1,800 s)."""
+    if (commit := head_commit()) is not None:
+        written(main_key(commit, python, place, held), token, json.dumps({"key": key}).encode(), tries=1)
 
 
 READ_TOKEN = "DEW_XLA_CACHE_READ_TOKEN"
@@ -626,18 +641,17 @@ def green_record(python: str, name: str, split: str, common: str, token: str, cl
     """The record of test file `name`'s row (in `split`'s group) that ran green on exactly these inputs on one
     of `classes`, the first found, with its class; else None. The plan (`reusable`) and a task (`reused`) read
     it alike, from one reading of the inputs (`Reading`). A row's key hashes the inputs its run executed, so
-    these inputs are keyed with each executed set a green run of the row recorded: the last run's on these
-    shared inputs first, then each set of the row's list (`sets_key`), most recently used first. A hit is
-    sound: its key equals a green run's only where every input that run executed, its units among them, holds
-    here what it held then, so this tree's run would execute the same set; a set naming a unit this tree lacks
-    is skipped unread (`matchable`). Keyed by the last run's set alone, a row run green on main was found by
-    no plan once a run of another tree came after it (2026-11-12: train 781's CI kept 2 of 4,180 tasks; a
-    reach of a comment's change planned 7,161 rows). A miss says why in `why`, a class at a time (records.py's
-    `MISSED`)."""
+    these inputs are keyed with the executed set of the last run on these shared inputs: its own record where
+    its key holds here, else the green run of exactly that key (`green_key`), whatever ran since; and where
+    neither holds, with the set of main's own run of it at this checkout's main (`mainline`, `main_key`),
+    which a lane's later run on its branch re-recording the row hides from the last record (Main,
+    2026-11-14: a walk over each row's earlier sets found it, at about seven reads a row, 139 s of a plan;
+    two reads now). A hit is sound: its key equals a green run's only where every input that run executed,
+    its units among them, holds here what it held then. A miss says why in `why`, a class at a time
+    (records.py's `MISSED`)."""
     reading = Reading() if reading is None else reading
     place = row(python, name, split)
     for each in classes:
-        tried: set[str] = set()
         try:
             current = epoch(python, place, each, common, token)[0]
         except Unread:
@@ -658,18 +672,13 @@ def green_record(python: str, name: str, split: str, common: str, token: str, cl
             kept = recorded(green_key(python, place, each, key), token)
             if kept is not None and kept["key"] == key and standing(kept, current):
                 return kept, each
-            tried.add(set_digest(found["depends"]))
-        for digest in (recorded(sets_key(python, place, each), token) or {}).get("sets", []):
-            if digest in tried:
-                continue
-            tried.add(digest)
-            depends = executed_set(digest, token)
-            if depends is None or not matchable(depends, reading):
-                continue
-            key = cache_key(common, name, split, list(depends), reading)
-            kept = recorded(green_key(python, place, each, key), token)
-            if kept is not None and kept["key"] == key and standing(kept, current):
-                return kept, each
+        base = mainline()
+        named = None if base is None else recorded(main_key(base, python, place, each), token)
+        main_run = None if not named else recorded(green_key(python, place, each, named["key"]), token)
+        if (main_run is not None and main_run["depends"] is not None and main_run["key"] == named["key"]
+                and cache_key(common, name, split, main_run["depends"], reading) == named["key"]
+                and standing(main_run, current)):
+            return main_run, each
     return None
 
 
@@ -700,13 +709,12 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
             found = None
         if found is not None and found["key"] == kept[1] and fresh(found, name, common, reading) and standing(
                 found, current):
-            remembered(python, place, kept[0], found["depends"], token)
+            named_at_commit(python, place, kept[0], kept[1], token)
             return found["row"]
     hit = green_record(python, name, split, common, token, reused_classes(network), reading, [])
     if hit is None:
         return None
-    # Its executed set the first of its row's list: a set reused stays while other trees' runs come and go.
-    remembered(python, place, hit[1], hit[0]["depends"], token)
+    named_at_commit(python, place, hit[1], hit[0]["key"], token)
     return hit[0]["row"]
 
 
@@ -1862,7 +1870,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             if ran_on is not None:
                 written(green_key(python, row_["name"], held, ran_on), token, body)
             if key is not None:
-                remembered(python, row_["name"], held, ran["depends"], token, ran=True)
+                named_at_commit(python, row_["name"], held, key, token)
 
 
 def gpu_tier(python: str) -> dict[str, list[str]]:

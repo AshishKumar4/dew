@@ -803,6 +803,12 @@ def test_a_step_handed_a_state_another_split_left_at_an_updates_end_reads_it_in_
         lm(split=4, accumulation=2).compile(pooled, BATCH)(pooled, BATCH)
 
 
+RESUMED_SEEDS = 128
+"""Check 1's declared seeds for a run resumed at a finer split against the uninterrupted run, sized paired
+(`seeds_for` with the resumed run as `dew_fn`, the float64 truth) on armada at main 2aa25af4e (probe
+slow-theme, 2026-11-14): 128, where sizing them live at every run cost 418 s of 522 fits (row 5673)."""
+
+
 def test_a_run_resumed_at_a_finer_split_lands_where_the_uninterrupted_run_does(tmp_path):
     """A run saved at an update's end in two microbatches a step and resumed in four, a memory setting
     alone, lands where the run nobody stopped lands: its weights as exact as that run's (check 1), from
@@ -825,8 +831,7 @@ def test_a_run_resumed_at_a_finer_split_lands_where_the_uninterrupted_run_does(t
         return {"params": truthful(x)["params"]}
 
     label = "a run resumed at a finer split"
-    assert_as_exact(resumed, uninterrupted, regression_rows, label, truth_fn=truth,
-                    seeds=seeds_for(uninterrupted, regression_rows, label, dew_fn=resumed, truth_fn=truth))
+    assert_as_exact(resumed, uninterrupted, regression_rows, label, truth_fn=truth, seeds=RESUMED_SEEDS)
 
 
 def regression_truth() -> Callable:
