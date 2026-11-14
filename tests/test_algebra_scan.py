@@ -40,12 +40,13 @@ OPERANDS = {"x": ("time", "width"), "dt": ("time",), "B": ("time", "state"), "C"
 DECLARED = scan.Scan(update, readout, OPERANDS, walked="time", state=((STATE, WIDTH), jnp.float32))
 
 
-def tokenwise(x, dt, B, C):
-    """The recurrence token by token (`lax.scan`), its outputs and final state."""
+def tokenwise(x, dt, B, C, reads: str = "after"):
+    """The recurrence token by token (`lax.scan`), its outputs and final state, each token reading the state
+    after it or entering it (`reads`, `Scan.reads`: RWKV-6's, before its decay and its write)."""
     def one(h, token):
         x_t, dt_t, B_t, C_t = token
-        h = update(h, x_t, dt_t, B_t, C_t, RATE, SKIP)
-        return h, readout(h, x_t, dt_t, B_t, C_t, RATE, SKIP)
+        after = update(h, x_t, dt_t, B_t, C_t, RATE, SKIP)
+        return after, readout(h if reads == "before" else after, x_t, dt_t, B_t, C_t, RATE, SKIP)
 
     final, outputs = jax.lax.scan(one, jnp.zeros((STATE, WIDTH), x.dtype), (x, dt, B, C))
     return outputs, final
@@ -69,21 +70,6 @@ def deep_draw(seed):
     that much of every decay."""
     x, _, B, C = draw(seed)
     return x, jnp.asarray(np.random.default_rng(seed + 1).uniform(1, 2, TOKENS), jnp.float32), B, C
-
-
-def tokenwise_reading(x, dt, B, C):
-    """`tokenwise` with each token reading the state entering it (`Scan.reads`, RWKV-6's), before its decay
-    and its write."""
-    def one(h, token):
-        x_t, dt_t, B_t, C_t = token
-        return update(h, x_t, dt_t, B_t, C_t, RATE, SKIP), readout(h, x_t, dt_t, B_t, C_t, RATE, SKIP)
-
-    final, outputs = jax.lax.scan(one, jnp.zeros((STATE, WIDTH), x.dtype), (x, dt, B, C))
-    return outputs, final
-
-
-TOKENWISE = {"after": tokenwise, "before": tokenwise_reading}
-"""The token scan each token reading the state after it or entering it (`Scan.reads`)."""
 
 
 def vanishing_draw(seed):
@@ -133,7 +119,8 @@ def test_the_derived_chunks_compute_the_token_scan(reads, draw_fn):
         return jnp.concatenate(outputs), forms.finish(state, values)
 
     label = f"ssd chunks{READING[reads]}{', vanishing decays' if draw_fn is vanishing_draw else ''}"
-    assert_as_exact(jax.jit(derived), jax.jit(TOKENWISE[reads]), draw_fn, label, seeds=16)
+    scanned = functools.partial(tokenwise, reads=reads)
+    assert_as_exact(jax.jit(derived), jax.jit(scanned), draw_fn, label, seeds=16)
 
 
 def test_two_walks_merged_give_the_final_state():
@@ -774,7 +761,8 @@ def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient(reads, draw_fn):
         return tuple(grads[name] for name in names)
 
     def as_tokens(x, dt, B, C, d_out, d_final):
-        grads = gradient_of(TOKENWISE[reads], names)({"x": x, "dt": dt, "B": B, "C": C}, (d_out, d_final))
+        scanned = functools.partial(tokenwise, reads=reads)
+        grads = gradient_of(scanned, names)({"x": x, "dt": dt, "B": B, "C": C}, (d_out, d_final))
         return tuple(grads[name] for name in names)
 
     label = f"ssd adjoint{READING[reads]}"
