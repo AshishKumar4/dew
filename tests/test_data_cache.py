@@ -20,7 +20,7 @@ from storage_support import moto_bucket
 
 from dew.data.cache import Cache
 from dew.data.pipeline import Rejected
-from dew.data.plan import Manifest, StepIdentity
+from dew.data.plan import Environment, Manifest, StepIdentity
 from dew.data.sources import Memory
 from dew.data.storage import Store
 
@@ -30,7 +30,7 @@ def _key(source: object = "memory", *, revision: str = "test", clean: bool = Tru
     """A dependency manifest of fixed fields, keying a cache of `source`'s rows at `revision`: a
     dirty checkout's (`clean=False`), or one whose step has no stable identity (`exact=False`)."""
     steps = () if exact else (StepIdentity("tests.unstable", "<lambda>", exact=False),)
-    return Manifest({"store": source}, steps, revision=revision, clean=clean)
+    return Manifest({"store": source}, steps, environment=Environment(revision=revision, clean=clean))
 
 
 def _cache(**kwargs):

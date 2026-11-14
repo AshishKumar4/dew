@@ -10,7 +10,8 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew import algebra
-from dew.algebra.error import choose
+from dew.algebra.error import choose, product_precision
+from dew.nn import programs
 from dew.parity import GateFailure
 
 SHAPE = (8, 16)
@@ -122,3 +123,42 @@ def test_a_form_an_equation_outside_the_language_reads_is_the_one_its_candidate_
     admits = gate(sliced, small)
     choice = choose(sliced, OPERANDS, accurate=True, saturation=algebra.SATURATION, admits=admits)
     assert not admits(sliced, choice.chosen.function)
+
+
+
+def test_a_products_precision_is_a_stated_algorithm_its_sites_gate_admits():
+    """A product's dot algorithm chosen for an accuracy asked (`product_precision`, row 5473), by a site
+    whose gate is check 1 itself: an algorithm is admitted where this backend runs the product in it and
+    the product is as exact as the IEEE fp32 one from the float64 truth. The choice is an algorithm that
+    gate admits, and the product computed in it holds the accuracy asked; a gate that admits none is
+    refused, never answered with a cheaper algorithm; and FP8 operands, whose algorithms name no operand
+    types of their own, are given one JAX lowers for them."""
+    shape = (64, 32, 16)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (rng.standard_normal(shape[:2]).astype(np.float32),
+                rng.standard_normal(shape[1:]).astype(np.float32))
+
+    def product(preset):
+        return jax.jit(lambda x, y: jnp.dot(x, y, precision=preset))
+
+    def admits(preset):
+        try:
+            product(preset)(*draw(0))
+        except ValueError:  # this backend's dot_general refuses the algorithm
+            return False
+        try:
+            assert_as_exact(product(preset), product(jax.lax.DotAlgorithmPreset.F32_F32_F32), draw,
+                            f"a product in {preset.name}", seeds=8)
+        except GateFailure:
+            return False
+        return True
+
+    chosen = product_precision(*shape, jnp.float32, admits=admits)
+    assert_as_exact(product(chosen), product(jax.lax.DotAlgorithmPreset.F32_F32_F32), draw,
+                    "the product in the algorithm chosen", seeds=8)
+    with pytest.raises(ValueError):
+        product_precision(*shape, jnp.float32, admits=lambda preset: False)
+    eight = product_precision(*shape, jnp.float8_e4m3fn, admits=lambda preset: True)
+    assert programs.dot_arithmetic(eight, jnp.float8_e4m3fn, jnp.float8_e4m3fn).operand_bits == (8, 8)

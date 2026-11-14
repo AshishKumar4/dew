@@ -102,3 +102,8 @@ def interpreting() -> bool:
 RESIDENT: contextvars.ContextVar[int] = contextvars.ContextVar("resident", default=1)
 """The programs a multiprocessor holds at once of the launch being traced (`kernel`'s `resident`): its roles
 raise their registers to that residency's share (`roles`)."""
+
+MOVES: contextvars.ContextVar[bool] = contextvars.ContextVar("moves", default=True)
+"""Whether the launch being traced moves registers between its roles (`resources.RegisterModel.moves`): its
+schedule raises and lowers them (`handoffs.Schedule.run`) where its consumers' need passes the program's
+entry share, and leaves every warpgroup at that share otherwise."""

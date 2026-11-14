@@ -13,7 +13,7 @@ import numpy as np
 
 from dew.algebra import bits
 from dew.nn.kernels.templates import product as formats_of
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import packed
 from dew.nn.precision import at_least_fp32
 
 
@@ -103,21 +103,21 @@ class NvFp4:
         by owing 2^8."""
         return jnp.float32(bits.NVFP4_OWED) * jax.lax.stop_gradient(jnp.asarray(self.scale, jnp.float32))
 
-NVFP4_STAGE = mosaic_gpu.NVFP4_STEP
+NVFP4_STAGE = packed.NVFP4_STEP
 """The depths a stage of the mainloop's NVFP4 decode reads: two groups, so each column's scales are a
 16-byte row (a TMA copy's least)."""
 
 
 def staged_rows(depth: int) -> np.ndarray:
     """The depth each code of the staged order holds (`NvFp4`): packed row `8w + j` of a group (word `w`'s
-    code `j`) holds the depth `mosaic_gpu.nvfp4_staged_depth` gives it, so a stage's word rows decode, code by
+    code `j`) holds the depth `packed.nvfp4_staged_depth` gives it, so a stage's word rows decode, code by
     code, into its sixteen-row depth slices, the block of one scale each (the mainloop's stage decode)."""
-    group = mosaic_gpu.NVFP4_GROUP
+    group = packed.NVFP4_GROUP
     if depth % group:
         raise ValueError(f"an NVFP4 matrix's depth is whole {group}-deep groups, not {depth}")
     groups, within = np.divmod(np.arange(depth), group)
     word, code = np.divmod(within, 32 // bits.E2M1.width)
-    return mosaic_gpu.nvfp4_staged_depth(groups, word, code)
+    return packed.nvfp4_staged_depth(groups, word, code)
 
 
 def _e2m1_values(codes: jax.Array) -> jax.Array:

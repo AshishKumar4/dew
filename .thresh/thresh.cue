@@ -128,7 +128,13 @@ seams: "port-cells": {
 	purpose: "each cell routes the delta rule to the fla port on a receipt that shows the port faster"
 	paths:   ["src/dew/nn/kernels/recurrence_chunk.py"]
 	entries: "PORT_CELLS"
-	declared: "(wgmma, forward, a decay a key dimension)": "Kimi delta attention's forward on an H100 80GB HBM3, the port's 1.406 ms against the template's 1.624"
+	declared: {
+		"(tcgen05, forward at 16x128 keys, 48x128 values)":                           "Qwen3.5-27B's gated delta net's forward on a B200, the port's 0.394 ms against the template's 0.725 (js106c)"
+		"(tcgen05, forward at 16x128 keys, 32x128 values)":                           "Qwen3-Next's gated delta net's forward on a B200, the port's 0.276 ms against the template's 0.399 (js106)"
+		"(tcgen05, forward, a decay a key dimension at 32x128 keys, 32x128 values)":  "Kimi delta attention's forward on a B200, the port's 1.118 ms against the template's 2.510 (js106c)"
+		"(tcgen05, training at 16x128 keys, 48x128 values)":                          "Qwen3.5-27B's gated delta net's training on a B200, the port's 1.747 ms against the template's 1.889 (js106c)"
+		"(tcgen05, training, a decay a key dimension at 32x128 keys, 32x128 values)": "Kimi delta attention's training on a B200, the port's 4.317 ms against the template's 6.642 (js106c)"
+	}
 }
 
 seams: "scan-cells": {
@@ -137,14 +143,13 @@ seams: "scan-cells": {
 	paths:   ["src/dew/nn/kernels/recurrence_chunk.py"]
 	entries: "SCAN_CELLS"
 	declared: {
-		"(wgmma, training)":    "Nemotron-H's SSD training on an H100"
 		"(mma.sync, training)": "the SSD's training on an A100"
 	}
 }
 
 seams: "grouped-cells": {
 	kind:    "declared-set"
-	purpose: "each cell routes the grouped GEMM to an old route on a receipt that shows it faster than the template; the list only shrinks"
+	purpose: "each cell routes the grouped GEMM to the route its receipt timed fastest, a timed product a cell of its own; a cell leaves once the template catches up"
 	paths:   ["src/dew/nn/kernels/grouped_matmul.py"]
 	entries: "DECLARED"
 	declared: {
@@ -153,9 +158,25 @@ seams: "grouped-cells": {
 		"(mma.sync, Kind(dense=True, made=Made.KERNEL_GRADIENT))":  "XLA's dense kernel gradient on an A100 (DENSE1)"
 		"(wgmma, Kind(dense=False, made=Made.FORWARD))":           "CUTLASS's grouped forward on an H100 (PAIR1-h100)"
 		"(wgmma, Kind(dense=False, made=Made.INPUT_GRADIENT))":    "CUTLASS's grouped input gradient on an H100 (PAIR1-h100)"
-		"(wgmma, Kind(dense=True, made=Made.FORWARD))":             "XLA's dense forward on an H100 (DENSE1)"
-		"(wgmma, Kind(dense=True, made=Made.INPUT_GRADIENT))":      "XLA's dense input gradient on an H100 (DENSE1)"
-		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT))":     "XLA's dense kernel gradient on an H100 (DENSE1)"
+		"(wgmma, Kind(dense=True, made=Made.FORWARD))": "XLA's dense forward on an H100 (DENSE1)"
+		"(wgmma, Kind(dense=True, made=Made.INPUT_GRADIENT))": "XLA's dense input gradient on an H100 (DENSE1)"
+		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT))": "XLA's dense kernel gradient on an H100 (DENSE1)"
+		"(wgmma, Kind(dense=True, made=Made.FORWARD, matrix=(2560, 9216)))": "the template's forward of the 4B's 2560 x 9216 on a GH200 (M-EM-36-gh200, 0.866x)"
+		"(wgmma, Kind(dense=True, made=Made.FORWARD, matrix=(9216, 2560)))": "XLA's forward of the 4B's 9216 x 2560 on a GH200 (M-EM-36-gh200, 1.01x)"
+		"(wgmma, Kind(dense=True, made=Made.FORWARD, matrix=(2560, 1024)))": "the template's forward of the 4B's 2560 x 1024 on a GH200 (M-EM-36-gh200, 0.96x)"
+		"(wgmma, Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64)))": "XLA's forward of the 4B's 2560 x 64 on a GH200 (M-EM-36-gh200, 1.294x)"
+		"(wgmma, Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 9216)))": "the template's input gradient of the 4B's 2560 x 9216 on a GH200 (M-EM-36-gh200, 0.943x)"
+		"(wgmma, Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(9216, 2560)))": "the template's input gradient of the 4B's 9216 x 2560 on a GH200 (M-EM-36-gh200, 0.912x)"
+		"(wgmma, Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 1024)))": "the template's input gradient of the 4B's 2560 x 1024 on a GH200 (M-EM-36-gh200, 0.949x)"
+		"(wgmma, Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 64)))": "the template's input gradient of the 4B's 2560 x 64 on a GH200 (M-EM-36-gh200, 0.93x)"
+		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216)))": "XLA's kernel gradient of the 4B's 2560 x 9216 on a GH200 (M-EM-36-gh200, 1.095x)"
+		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(9216, 2560)))": "the template's kernel gradient of the 4B's 9216 x 2560 on a GH200 (M-EM-36-gh200, 0.975x)"
+		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024)))": "the template's kernel gradient of the 4B's 2560 x 1024 on a GH200 (M-EM-36-gh200, 0.973x)"
+		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 64)))": "the template's kernel gradient of the 4B's 2560 x 64 on a GH200 (M-EM-36-gh200, 0.376x)"
+		"(tcgen05, Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64)))": "XLA's forward of the 4B's 2560 x 64 on a B200 (lab-b200-20261113-grid, 1.216x)"
+		"(tcgen05, Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 9216)))": "XLA's input gradient of the 4B's 2560 x 9216 on a B200 (em35d, 1.009x)"
+		"(tcgen05, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216)))": "XLA's kernel gradient of the 4B's 2560 x 9216 on a B200 (lab-b200-20261113-grid, 1.355x)"
+		"(tcgen05, Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024)))": "XLA's kernel gradient of the 4B's 2560 x 1024 on a B200 (lab-b200-20261113-grid, 1.148x)"
 	}
 }
 
@@ -192,6 +213,7 @@ seams: "norm-cells": {
 		"(sm90, NormRows(jnp.dtype(jnp.bfloat16), narrow=True))": "the fused norm in bf16 on an H100 (FUSED_FASTER, 14a0df682)"
 		"(sm80, NormRows(jnp.dtype(jnp.float16), narrow=True))":  "the fused norm in fp16 on an A100 (FP16_NORM_FASTER, FSNORM16)"
 		"(sm90, NormRows(jnp.dtype(jnp.float16), narrow=True))":  "the fused norm in fp16 on an H100 (FP16_NORM_FASTER, FSNORM16)"
+		"(sm100, NormRows(jnp.dtype(jnp.bfloat16), narrow=True))": "the fused norm in bf16 on a B200 (B200_FUSED, M-EM-40)"
 	}
 }
 
@@ -203,6 +225,7 @@ seams: "swiglu-cells": {
 	declared: {
 		"(sm80, jnp.dtype(jnp.bfloat16))": "the fused SiLU product in bf16 on an A100 (FUSED_FASTER, 14a0df682)"
 		"(sm90, jnp.dtype(jnp.bfloat16))": "the fused SiLU product in bf16 on an H100 (FUSED_FASTER, 14a0df682)"
+		"(sm100, jnp.dtype(jnp.bfloat16))": "the fused SiLU product in bf16 on a B200 (B200_FUSED, M-EM-40)"
 	}
 }
 

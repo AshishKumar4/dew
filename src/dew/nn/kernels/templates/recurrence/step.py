@@ -20,8 +20,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import recurrence, short_conv, tuning
-from dew.nn.kernels.templates import mosaic, scan
+from dew.nn.kernels import generation, recurrence, short_conv, tuning
+from dew.nn.kernels.templates import mosaic, resources, scan
 from dew.nn.precision import L2NORM_EPS, rms_weighted
 
 
@@ -57,14 +57,46 @@ def fits(shape: tuple[int, ...], whole: bool) -> bool:
     return key_width % scan.THREADS == 0 and tiles and (not whole or value_width == scan.THREADS)
 
 
-def _halves(key_width: int) -> int:
-    """The warpgroups a program's keys split between: two halves where the keys are a power of two of whole
-    turns (`UNROLLED`) each, each half's sums a subtree of XLA's pairwise order, the two joined at its top
-    (`_Halves.joined_sums`), so the sums are the one warpgroup's bit for bit; else one. One warpgroup
-    walking a head's 128 keys alone, a row's token held one program a head, a gated delta net's step took an
-    A100's 28 us against the Triton step's 17 at one row (M-JS-20)."""
+STEP_SCALARS = 16
+"""The registers a step's thread holds at its key loop's peak beside a turn's `UNROLLED` state rows and
+their keys' three staged entries (query, key, decay): each sum's pairwise partials, the token's value,
+write and correction, and its addresses. With them a thread's 80 bound ptxas's least spill-free cap at one
+and two warpgroups over the gated delta net's, Kimi delta attention's, Mamba-2's and the fused step's hooks
+on sm80, sm90 and sm100 (48 to 72 at one, 48 to 80 at two; jsf-stepcaps at base 59b96a9b4c2); uncapped,
+an A100's one-warpgroup step took all 255, two programs a multiprocessor."""
+
+
+def step_registers() -> int:
+    """The registers a step's thread holds (`STEP_SCALARS`), at one warpgroup or two."""
+    return UNROLLED * (1 + 3) + STEP_SCALARS
+
+
+def _resident(halves: int, target: generation.GpuTarget) -> int:
+    """The programs of `halves` warpgroups a multiprocessor of `target` holds at once at the step's
+    registers (`step_registers`, the shared planner's `resources.RegisterModel`), which its compile caps a
+    thread's registers at (`mosaic.compiler_params`' `resident`)."""
+    held, registers = target.multiprocessor, step_registers()
+    most = min(held.resident_blocks, held.resident_threads // (halves * scan.THREADS))
+    model = resources.RegisterModel(registers, held.thread_registers, halves, most, held.register_step, 0,
+                                    file=held.registers)
+    return model.resident(registers)
+
+
+def _plan(key_width: int, programs: int, target: generation.GpuTarget) -> tuple[int, int]:
+    """The warpgroups a program's keys split between and the programs a multiprocessor holds of it, for a
+    grid of `programs` on `target`. Two halves where the keys are a power of two of whole turns
+    (`UNROLLED`) each and the grid of two-warpgroup programs is one wave of the device (`_resident` at two
+    on each multiprocessor): each half walks half the keys, its sums a subtree of XLA's pairwise order, the
+    two joined at its top (`_Halves.joined_sums`), so the sums are the one warpgroup's bit for bit. Past a
+    wave the multiprocessors are full at one warpgroup a program and a split only adds its join: at 128
+    rows, Mamba-2's step took 365 us split against 325 whole on an H100 (M-JS-25, row 4864). One
+    warpgroup walking a head's 128 keys alone, a gated delta net's step took an A100's 28 us against the
+    Triton step's 17 at one row (M-JS-20)."""
     whole = key_width & (key_width - 1) == 0 and key_width >= 2 * UNROLLED
-    return 2 if whole else 1
+    # A GPU whose multiprocessors no fact states is held one wave of its residency.
+    wave = (target.multiprocessors or 1) * _resident(2, target)
+    halves = 2 if whole and programs <= wave else 1
+    return halves, _resident(halves, target)
 
 
 def _joining(halves: int, block: "_Block") -> tuple:
@@ -76,12 +108,24 @@ def _joining(halves: int, block: "_Block") -> tuple:
             plgpu.Barrier(num_arrivals=halves, num_barriers=3))
 
 
-@tuning.lowered_once(("hooks", "dtype", "family", "interpret"))
 def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: mosaic.Family,
          interpret: bool = False):
     """`recurrence.step`'s launch on Mosaic GPU: `(output [rows, Hv, Dv], the moved history or None,
-    state')`, the state as it is held, an idle row's (`Step.active`) as it came and its output zeros. Lowered
-    once a configuration (`tuning.lowered_once`), as a model's layers' identical steps share it."""
+    state')`, the state as it is held, an idle row's (`Step.active`) as it came and its output zeros, its
+    program's warpgroups and residency planned for its grid on the target (`_plan`)."""
+    rows, value_heads, key_width, value_width = operands.state.shape
+    block = _block(value_width)
+    programs = rows * (value_heads // block.heads) * (value_width // block.columns)
+    target = generation.interpreted_target() if interpret else generation.gpu_target()
+    return _launched(hooks, operands, dtype=dtype, family=family, plan=_plan(key_width, programs, target),
+                     interpret=interpret)
+
+
+@tuning.lowered_once(("hooks", "dtype", "family", "plan", "interpret"))
+def _launched(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: mosaic.Family,
+              plan: tuple[int, int], interpret: bool):
+    """`step`'s launch at `plan`, its warpgroups and residency (`_plan`). Lowered once a configuration
+    (`tuning.lowered_once`), as a model's layers' identical steps share it."""
     given = recurrence.read(hooks, operands)
     state = given['state']
     # A row's entry a head, `[rows, Hv]`, as the token's step takes its write gate and scalar decay.
@@ -102,7 +146,7 @@ def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: m
     active = (jnp.ones((rows,), jnp.int32) if operands.active is None
               else jnp.asarray(operands.active).astype(jnp.int32))
     names = tuple(given)
-    block, halves = _block(value_width), _halves(key_width)
+    block, (halves, resident) = _block(value_width), plan
 
     def entry(active_ref, *refs):
         inputs = dict(zip(names, refs[:len(names)], strict=True))
@@ -122,7 +166,7 @@ def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: m
                 jax.ShapeDtypeStruct((rows, value_heads, value_width), out_dtype))
     launched = mosaic.kernel(entry, out_type=out_type,
                              grid=(rows, value_heads // block.heads, value_width // block.columns),
-                             grid_names=("rows", "heads", "columns"), warpgroups=halves,
+                             grid_names=("rows", "heads", "columns"), warpgroups=halves, resident=resident,
                              interpret=interpret, family=family.name, name="recurrence_step",
                              scratch=(plgpu.SMEM((block.heads, 3, key_width), jnp.float32),
                                       plgpu.SMEM((halves, 2, scan.THREADS // scan.WARP), jnp.float32),
@@ -134,7 +178,7 @@ def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: m
 @dataclasses.dataclass(frozen=True)
 class _Halves:
     """A program's warpgroups each walking `count`'s share of the keys, this one the `index`-th
-    (`_halves`): the sums over its keys joined through `partials` `[3, halves, heads, columns]`, each a slot
+    (`_plan`): the sums over its keys joined through `partials` `[3, halves, heads, columns]`, each a slot
     and a barrier of `joined` of its own (`_stepped`'s three: the query's and key's reads before the update,
     the query's read of the write in it)."""
 
@@ -330,7 +374,7 @@ class _Conv:
                     else None)
             pre = short_conv.preactivation(window, weights, bias)
             # SiLU as the reference's, the input times its sigmoid.
-            streams.append(pre if self.conv.activation is None else pre * _sigmoid(pre))
+            streams.append(pre if self.conv.activation is None else pre * jax.nn.sigmoid(pre))
         return tuple(streams)
 
     def held(self):
@@ -391,7 +435,7 @@ def _gates(hooks, inputs, row, head, layout):
         if hooks.gates.limit is not None:
             rate = jnp.clip(rate, *hooks.gates.limit)
         decay = jnp.exp(-jnp.exp(headed('log_a')) * rate)
-        return decay, rate if hooks.gates.write == 'step' else _sigmoid(scalar('beta'))
+        return decay, rate if hooks.gates.write == 'step' else jax.nn.sigmoid(scalar('beta'))
     if hooks.rated:
         write = scalar('beta')
         return jnp.exp(headed('rate') * write), write
@@ -402,11 +446,6 @@ def _gates(hooks, inputs, row, head, layout):
         decay = plgpu.load(inputs['log_decay'].at[row, head], layout=layout, optimized=False)
         return jnp.exp(decay.astype(jnp.float32)), write
     return jnp.exp(scalar('log_decay')), write
-
-
-def _sigmoid(x):
-    """The sigmoid, one quotient (`short_conv._sigmoid`'s): Mosaic GPU lowers no logistic."""
-    return 1.0 / (1.0 + jnp.exp(-x))
 
 
 def _softplus(x):

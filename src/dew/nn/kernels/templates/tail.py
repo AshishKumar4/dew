@@ -12,8 +12,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
-from dew.nn.programs import on_host
-
 
 @dataclasses.dataclass(frozen=True)
 class Tail:
@@ -98,13 +96,23 @@ def balanced(tiles: int, steps: int, programs: int, traffic: Traffic, *,
         return None
     iterations = tail * steps
     candidate = Tail(waves, iterations, min(programs, iterations), steps)
-    # The tail's tiles walked on this host (`programs.on_host`), whatever mesh a step's trace holds: a
-    # compile-only GPU's devices run nothing here.
-    with on_host():
-        rows, columns = (np.asarray(axis) for axis in planar_snake(
-            jnp.arange(waves * programs, tiles, dtype=jnp.int32), traffic.grid, 1, traffic.band))
+    rows, columns = snaked(np.arange(waves * programs, tiles), traffic.grid, 1, traffic.band)
     shared = _rounds(candidate, rows, columns, traffic) + handoff_steps * traffic.step_seconds
     return candidate if shared < _walked(steps, rows, columns, traffic) else None
+
+
+def snaked(index: np.ndarray, shape: tuple[int, int], minor_dim: int,
+           width: int) -> tuple[np.ndarray, np.ndarray]:
+    """`planar_snake`'s walk on the host, in NumPy: the same tiles in the same order, which a plan prices
+    (`balanced`) with no program compiled for each walk's length (an sm90 row's derivation ran 102 XLA
+    compiles, 2.9 of its 8 seconds, walking its tails through JAX)."""
+    major_size, minor_size = shape[1 - minor_dim], shape[minor_dim]
+    full_bands, last_width = divmod(minor_size, width)
+    band, within = np.divmod(index, width * major_size)
+    major, minor_within = np.divmod(within, np.where(band < full_bands, width, max(last_width, 1)))
+    major = np.where(band % 2 == 0, major, major_size - 1 - major)
+    minor = band * width + minor_within
+    return (minor, major) if minor_dim == 0 else (major, minor)
 
 
 def _walked(steps: int, rows: np.ndarray, columns: np.ndarray, traffic: Traffic) -> float:

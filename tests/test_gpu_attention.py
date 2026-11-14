@@ -22,9 +22,8 @@ interpreted and through the compile gate:
 - The Mosaic template on an H100, each test its own cells: its forward and backward over every call form,
   head width and hook it declares, its natural forward, a call over runs, a chunked prefill's backward, its
   one launch backward and a span call's (test_attention_mosaic, attention_inplace_operands); an fp16 call
-  through the route, and a long sequence on par with the reference path (test_attention_route); the fast
-  form's default route not on par with IEEE fp32, the accurate form's control
-  (test_attention_accurate_form). Its causal forward and backward at a flow's widths are the flows'.
+  through the route, and a long sequence on par with the reference path (test_attention_route). Its causal
+  forward and backward at a flow's widths are the flows'.
 - The check-1 matrices of attention, its kernels and decode (tests/kernel_matrix.py), each at the cases a
   red found on a GPU (`kernel_matrix.seeded_cells`); their other pairs are the CPU's, interpreted.
 """
@@ -39,7 +38,6 @@ import jax.numpy as jnp
 import kernel_matrix
 import numpy as np
 import pytest
-import test_attention_accurate_form as accurate_form
 import test_attention_decode_template as decode_template
 import test_attention_dropout as dropout
 import test_attention_masked_rows as masked_rows
@@ -132,10 +130,10 @@ def test_the_attention_kernels_run_on_this_gpu(part):
           for edge in contracts.EDGES),
         *(Cell(f"the Mosaic mainloop's default is finite at fp32's edges: {family}",
                functools.partial(stability.default_is_finite, family, "mosaic"), "sm90")
-          for family in stability.MOSAIC_FAMILIES),
+          for family in stability.mosaic_families()),
         *(Cell(f"the Mosaic backward in two launches is finite at fp32's edges: {family}",
                functools.partial(stability.default_is_finite, family, "mosaic two launches"), "sm90")
-          for family in stability.HOOKLESS_FAMILIES),
+          for family in stability.hookless_families()),
         *(Cell(f"a step with a bias every row shares repeats bit for bit: {name}",
                functools.partial(a_shared_bias_step_repeats_bit_for_bit, shape, kv_heads))
           for name, shape, kv_heads in (("a tile of the logits", (2048, 2048), 8),
@@ -237,13 +235,14 @@ def mosaic_cells() -> list[Cell]:
         *cells_of(route.a_long_sequence_is_on_par_with_the_reference_path,
                   native=lambda length, dtype: {"pass": "backward", "launch": "route", "dtype": _dtype(dtype),
                                                 "logits": "fold", "length": str(length)}),
-        *cells_of(accurate_form.the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32, "sm90",
-                  fault=lambda case: "the fast form's control"),
         *cells_of(inplace.a_routes_one_launch_backward_is_on_par_on_an_h100, "sm90",
                   fault=lambda name, causal: "red at 475913063 (its float64 truth's float32 product)"),
         *cells_of(inplace.a_span_calls_one_launch_is_on_par_on_an_h100, "sm90",
                   fault=lambda name: "row 3171's packed windowed call, its dK and dV wrong and unrepeatable "
                                      "on an H100 before row 3180"),
+        *cells_of(mosaic.the_forward_runs_back_to_back_at_128_key_tiles_on_a_b200, "sm100",
+                  fault=lambda: "row 5671's wedge: a consumer's tensor-core barrier committed again before "
+                                "a lagging warp saw its phase"),
     ]
 
 

@@ -465,12 +465,12 @@ def facts() -> JSON:
 def call_identity(program: OuterProgram, key: Hashable) -> JSON:
     """What a call of `program` under `key` (`OuterProgram.key_of`) is, stated without tracing it
     (`stated`), for a call outside every other context of Dew's (`_outside`): the function with what its
-    body reads outside its arguments (`_read`), how it is jitted and which arguments it holds settled,
-    the key (its static arguments by value, the others' structure, shapes, dtypes and placements, JAX's
-    trace context with Dew's own user contexts in it, the mesh), JAX's other settings, Dew's environment
-    and the declared facts (`settings`, `environment`, `facts`). With its process's code (`Process`) it is
-    what the call's trace reads, so two calls of one identity in two processes of one record trace one
-    program. Refused where any of it has no stated form (`Unestablished`)."""
+    body reads outside its arguments (`_read`), how it is jitted, the key (its static arguments by value,
+    the others' structure, shapes, dtypes and placements, JAX's trace context with Dew's own user contexts
+    in it, the mesh), JAX's other settings, Dew's environment and the declared facts (`settings`,
+    `environment`, `facts`). With its process's code (`Process`) it is what the call's trace reads, so two
+    calls of one identity in two processes of one record trace one program. Refused where any of it has no
+    stated form (`Unestablished`)."""
     # A context a trace records into is no part of its program (`dew._cache.RECORDING`): the collection
     # it holds while one is open, never its empty default, which is a value like any other. A setting
     # whose value is a bare object is unset: the mark every process holds of its own, where it is the one
@@ -490,7 +490,6 @@ def call_identity(program: OuterProgram, key: Hashable) -> JSON:
             "reads": (_read(body, "the program's function", known)
                       if isinstance(body, types.FunctionType) else None),
             "jitted": stated(program.arguments, f"{named}'s jit arguments", known),
-            "settled": stated(program.settled, f"{named}'s settled arguments", known),
             "call": stated(key, f"{named}'s call", known),
             "settings": settings(), "environment": environment(), "facts": facts()}
 

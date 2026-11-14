@@ -232,6 +232,7 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
     acc = jax.ShapeDtypeStruct((lhs.shape[0], width), out_dtype)
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
+    consumer = _rewritten_consumer(consumer, values, acc)
     leaves, treedef = jax.tree.flatten(values)
     if (collected := _PRICED.get()) is not None:
         depth = lhs.shape[-1]
@@ -315,6 +316,21 @@ def _prologue(fusion) -> tuple[jax.Array, dict]:
     base, function, sides, axes, jvp = stage
     return base, {'prologue': function, 'prologue_operands': tuple(zip(sides, axes, strict=True)),
                   'prologue_jvp': jvp}
+
+
+def _rewritten_consumer(consumer, values, acc):
+    """The consumer as the algebra pass rewrites it (docs/design/algebra.md §2), traced once at the whole
+    product `acc` beside its captured `values`: the one program the analysis tiles (`_axes`), the epilogue
+    runs on each tile (`_tiled`, pulled at the whole product) and XLA runs whole where the kernels refuse
+    it, as the producer's stage is (`_split`). Its derivative is the launch's glue (`gemm`'s `KernelGlue`),
+    which the outer program's pass rewrites; a launch's own body it never sees."""
+    closed, shapes = jax.make_jaxpr(algebra.rewritten(consumer), return_shape=True)(values, acc)
+    structure = jax.tree.structure(shapes)
+
+    def rewritten(values, acc):
+        return jax.tree.unflatten(structure, jax_core.jaxpr_as_fun(closed)(*jax.tree.leaves((values, acc))))
+
+    return rewritten
 
 
 def _split(producer, values):

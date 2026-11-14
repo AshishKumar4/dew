@@ -27,15 +27,10 @@ from dew.nn.kernels.templates.gemm import rows_padded, sides_padded
 
 def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes: tuple, interpret: bool,
         prologue=None, prologue_operands: tuple = (), prologue_axes: tuple = (), epilogue=None,
-        epilogue_operands: tuple = (), epilogue_axes: tuple = (), exact_sums: bool = False,
-        paired: jax.Array | None = None) -> tuple:
+        epilogue_operands: tuple = (), epilogue_axes: tuple = (), exact_sums: bool = False) -> tuple:
     """`lhs` times `rhs` in each of `out_dtypes` (the epilogue's outputs, or the accumulator rounded), a
     `tile` (`grouped_matmul.Tile`) an output tile and its depth step; `exact_sums` adds each step's product
-    into the fp32 sum by an IEEE add (`_summed`). With `paired`, a second matrix of `rhs`'s shape (an up
-    projection beside a gate's), each program multiplies its `lhs` tile by both at the same columns into
-    two accumulators, which the epilogue takes together (`epilogue(acc, paired_acc, *sides)`)."""
-    if paired is not None and epilogue is None:
-        raise ValueError("a paired product needs an epilogue to combine its two accumulators")
+    into the fp32 sum by an IEEE add (`_summed`)."""
     (rows, depth), width = lhs.shape, rhs.shape[0] if transpose_rhs else rhs.shape[1]
     block_m, block_n, block_k = tile.block_m, tile.block_n, tile.block_k
     # A tile that does not divide the rows, depth or width takes them padded with zeros, which add nothing
@@ -44,8 +39,6 @@ def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes
     depth_axis, width_axis = (1, 0) if transpose_rhs else (0, 1)
     lhs = rows_padded(rows_padded(lhs, 1, block_k), 0, block_m)
     rhs = rows_padded(rows_padded(rhs, depth_axis, block_k), width_axis, block_n)
-    matrices = (rhs,) if paired is None else (
-        rhs, rows_padded(rows_padded(paired, depth_axis, block_k), width_axis, block_n))
     (padded, padded_depth), padded_width = lhs.shape, rhs.shape[width_axis]
     prologue_operands = sides_padded(sides_padded(prologue_operands, prologue_axes, block_k, along='depth'),
                                      prologue_axes, block_m)
@@ -58,14 +51,12 @@ def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes
 
     matrix_spec = (pl.BlockSpec((block_n, padded_depth), lambda i, j: (j, 0)) if transpose_rhs
                    else pl.BlockSpec((padded_depth, block_n), lambda i, j: (0, j)))
-    in_specs = [_LIVE_SPEC, pl.BlockSpec((block_m, padded_depth), lambda i, j: (i, 0)),
-                *(matrix_spec for _ in matrices),
+    in_specs = [_LIVE_SPEC, pl.BlockSpec((block_m, padded_depth), lambda i, j: (i, 0)), matrix_spec,
                 *(spec(axes) for axes in prologue_axes), *(spec(axes) for axes in epilogue_axes)]
     kernel = functools.partial(
         _gmm_kernel, depth=depth, block_k=block_k, transpose_rhs=transpose_rhs, prologue=prologue,
         prologue_axes=prologue_axes, epilogue=epilogue, epilogue_axes=epilogue_axes,
-        sides=(len(prologue_operands), len(epilogue_operands)), exact_sums=exact_sums,
-        matrices=len(matrices))
+        sides=(len(prologue_operands), len(epilogue_operands)), exact_sums=exact_sums)
     outs = launches.pallas_call(
         kernel,
         out_shape=tuple(jax.ShapeDtypeStruct((padded, padded_width), dtype) for dtype in out_dtypes),
@@ -75,34 +66,29 @@ def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes
         compiler_params=plgpu.CompilerParams(num_warps=tile.warps, num_stages=tile.stages),
         interpret=interpret,
         name="pallas_triton_dense_dot",
-    )(_live(rows), lhs, *matrices, *prologue_operands, *epilogue_operands)
+    )(_live(rows), lhs, rhs, *prologue_operands, *epilogue_operands)
     return tuple(out[:rows, :width] for out in outs)
 
 
-def _gmm_kernel(live_ref, lhs_ref, *refs, depth: int, block_k: int, transpose_rhs: bool, prologue,
-                prologue_axes: tuple, epilogue, epilogue_axes: tuple, sides: tuple, exact_sums: bool,
-                matrices: int):
-    matrix_refs, refs = refs[:matrices], refs[matrices:]
+def _gmm_kernel(live_ref, lhs_ref, rhs_ref, *refs, depth: int, block_k: int, transpose_rhs: bool, prologue,
+                prologue_axes: tuple, epilogue, epilogue_axes: tuple, sides: tuple, exact_sums: bool):
     prologue_refs, epilogue_refs, out_refs = refs[:sides[0]], refs[sides[0]:sum(sides)], refs[sum(sides):]
     live = live_ref[0] > 0
 
-    def step(k, accs):
+    def step(k, acc):
         span = pl.ds(k * block_k, block_k)
         x = lhs_ref[:, span]
         if prologue is not None:
             x = prologue(x, *_cut(prologue_refs, prologue_axes, 'depth', span, x.shape[0])).astype(x.dtype)
             if depth % block_k:
                 x = _kept(x, k * block_k, depth, axis=1)
-        # A paired product's two matrices multiply the one loaded (and transformed) tile of `lhs`.
-        return tuple(
-            _summed(acc, jnp.dot(x, ref[:, span].T if transpose_rhs else ref[span, :],
-                                 precision=lax.Precision.DEFAULT, preferred_element_type=jnp.float32),
-                    live, exact_sums=exact_sums)
-            for acc, ref in zip(accs, matrix_refs, strict=True))
+        return _summed(acc, jnp.dot(x, rhs_ref[:, span].T if transpose_rhs else rhs_ref[span, :],
+                                    precision=lax.Precision.DEFAULT, preferred_element_type=jnp.float32),
+                       live, exact_sums=exact_sums)
 
     zeros = jnp.zeros(out_refs[0].shape, jnp.float32)
-    accs = lax.fori_loop(0, lhs_ref.shape[1] // block_k, step, (zeros,) * matrices)
-    outs = accs if epilogue is None else epilogue(*accs, *(by_rows(ref[...], axes, zeros.shape[0])
+    acc = lax.fori_loop(0, lhs_ref.shape[1] // block_k, step, zeros)
+    outs = acc if epilogue is None else epilogue(acc, *(by_rows(ref[...], axes, zeros.shape[0])
                                                           for ref, axes in zip(epilogue_refs, epilogue_axes,
                                                                                strict=True)))
     for ref, out in zip(out_refs, outs if isinstance(outs, tuple) else (outs,), strict=True):

@@ -38,9 +38,10 @@ def canonical(closed: jcore.Jaxpr) -> jcore.Jaxpr:
     flat = jax.make_jaxpr(functools.partial(_evaluated, closed.jaxpr, closed.consts))(
         *(jax.ShapeDtypeStruct(aval(var).shape, aval(var).dtype) for var in closed.jaxpr.invars))
     jaxpr = flat.jaxpr
+    # A typed PRNG key stays the key it is: NumPy holds none (`terms.typed_key`).
     local: dict[jcore.Var, jcore.Var | jcore.Literal] = {
-        var: jcore.Literal(np.asarray(value), var.aval) for var, value in zip(jaxpr.constvars, flat.consts,
-                                                                             strict=True)}
+        var: jcore.Literal(value if terms.typed_key(value) else np.asarray(value), var.aval)
+        for var, value in zip(jaxpr.constvars, flat.consts, strict=True)}
 
     def read(atom):
         return local.get(atom, atom) if isinstance(atom, jcore.Var) else atom
@@ -354,8 +355,8 @@ def _squeeze(value, squeezed: _Made):
     if value in squeezed:
         return squeezed[value]
     target = tuple(size for size in shape if size != 1)
-    made = (np.reshape(np.asarray(value), target) if not isinstance(value, jax_core.Tracer)
-            else jax.lax.reshape(value, target))
+    made = (jax.lax.reshape(value, target) if isinstance(value, jax_core.Tracer) or terms.typed_key(value)
+            else np.reshape(np.asarray(value), target))
     squeezed[value] = made
     return made
 
@@ -397,18 +398,25 @@ def _scalar(value) -> np.ndarray:
 
 
 def _one(value) -> bool:
-    """Whether `value` is a constant (computed, `_evaluated`) of ones alone: `x / 1` and `x * 1` are `x` for
-    every `x`, its sign, infinities and NaNs among them."""
-    return not isinstance(value, jax_core.Tracer) and bool(np.all(np.asarray(value) == 1))
+    """Whether `value` is a real constant (computed, `_evaluated`) of ones alone: `x / 1` and `x * 1` are
+    `x` for every real `x`, its sign and infinities among them, and a NaN stays one. A complex one is none:
+    a complex product and quotient mix their operands' two parts, so `(-0 - 0j) * 1` is `0 - 0j` and
+    `(inf + 2j) * 1` has a NaN part."""
+    if isinstance(value, jax_core.Tracer):
+        return False
+    held = np.asarray(value)
+    return not np.iscomplexobj(held) and bool(np.all(held == 1))
 
 
 def _zero(value) -> bool:
     """Whether `value` is a constant (computed, `_evaluated`) of positive zeros alone: `x - 0` is `x` for
-    every `x`, where `x - (-0)` makes a negative zero positive."""
+    every `x` (a NaN stays one), where `x - (-0)` makes a negative zero positive; a complex zero in each of
+    its two parts, which a complex difference subtracts apart."""
     if isinstance(value, jax_core.Tracer):
         return False
     held = np.asarray(value)
-    return not np.any(held) and not np.any(np.signbit(held))
+    parts = (held.real, held.imag) if np.iscomplexobj(held) else (held,)
+    return not np.any(held) and not any(np.any(np.signbit(part)) for part in parts)
 
 
 def _laid(equation: jcore.JaxprEqn, value, laid: _Made):

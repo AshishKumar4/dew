@@ -368,7 +368,24 @@ def _described(value) -> tuple[JSON, bool]:
     return {"text": re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))}, False
 
 
-_ENVIRONMENT = ("revision", "lock", "python", "platform", "clean")
+@dataclasses.dataclass(frozen=True)
+class Environment:
+    """The code and machine a manifest was made under, as it and a checkpoint step record them field by
+    field (`running_environment`, `Manifest.of`): this process's (`now`), or, unstated, none read."""
+
+    revision: str = "unversioned"
+    lock: str = ""
+    python: str = ""
+    platform: str = ""
+    clean: bool = True
+
+    @classmethod
+    def now(cls) -> Environment:
+        (revision, clean), lock = checkout_now(), _locked()
+        return cls(revision, lock, platform.python_version(), platform.platform(), clean)
+
+
+_ENVIRONMENT = tuple(field.name for field in dataclasses.fields(Environment))
 
 
 def _changed(saved: Mapping[str, object], current: Mapping[str, object]) -> tuple[str, ...]:
@@ -426,9 +443,7 @@ def running_environment() -> dict[str, JSON]:
     its checkout is clean, its lock, the interpreter and the platform. A checkpoint step records it beside
     its data position (`dew.checkpoints`), which holds what decides the rows alone, and a resume warns where
     it changed (row 5862)."""
-    (revision, clean), lock = checkout_now(), _locked()
-    return {"revision": revision, "lock": lock, "python": platform.python_version(),
-            "platform": platform.platform(), "clean": clean}
+    return dataclasses.asdict(Environment.now())
 
 
 @functools.cache
@@ -464,15 +479,17 @@ class Manifest:
     source: Mapping[str, object]
     steps: tuple[StepIdentity, ...] = ()
     ran: tuple[StepIdentity, ...] = ()
-    revision: str = "unversioned"
-    lock: str = ""
-    python: str = platform.python_version()
-    platform: str = platform.platform()
     tokenizer: Mapping[str, object] = dataclasses.field(default_factory=dict)
     fill: Mapping[str, object] = dataclasses.field(default_factory=dict)
     codec: int = 1
     schema: int = 1
-    clean: bool = True
+    environment: Environment = dataclasses.field(default_factory=Environment)
+    """The code and machine it was made under, which its record holds field by field beside its own."""
+
+    @property
+    def clean(self) -> bool:
+        """Whether the checkout it was made under was clean (`DependencyManifest`)."""
+        return self.environment.clean
 
     @classmethod
     def of(
@@ -483,32 +500,33 @@ class Manifest:
         ran: Sequence[StepIdentity] = (),
         fill: Mapping[str, object] | None = None,
     ) -> Manifest:
-        (revision, clean), lock = checkout_now(), _locked()
+        """The manifest of `source` through `steps`, under this process's code and machine
+        (`running_environment`)."""
         return cls(
             source,
             tuple(steps),
             tuple(ran),
-            revision=revision,
-            lock=lock,
             fill={} if fill is None else fill,
             tokenizer={
                 f"{index}/{step.name}": step.dependencies
                 for index, step in enumerate(steps)
                 if step.dependencies
             },
-            clean=clean,
+            environment=Environment.now(),
         )
 
     def record(self) -> dict[str, JSON]:
         """The manifest as a plan or a cache's key records it, each step's identity as `StepIdentity.record`
-        does."""
+        does, and its environment's fields beside its own."""
         recorded: dict[str, JSON] = {
             field.name: json_value(getattr(self, field.name), field.name)
             for field in dataclasses.fields(self)
-            if field.name not in ("steps", "ran")
+            if field.name not in ("steps", "ran", "environment")
         }
         recorded["steps"] = [step.record() for step in self.steps]
         recorded["ran"] = [step.record() for step in self.ran]
+        for name, value in dataclasses.asdict(self.environment).items():
+            recorded[name] = json_value(value, name)
         return recorded
 
     def semantic(self) -> dict[str, JSON]:
@@ -746,9 +764,9 @@ def saved_identity(identity: str) -> str:
 
 
 def read_by(version: int) -> int:
-    """The version a read of a run saved under `version` reads by, this Dew's, refused where this Dew reads
-    none of it (`PLAN_VERSIONS`): what every read (`dew.data.compile`'s `compile`, `iterate` and `publish`)
-    asks before it prepares anything."""
+    """The version a run saved under `version` reads by, this Dew's, refused where this Dew reads none of it
+    (`PLAN_VERSIONS`): what a run asks before its data compiles (`dew.config.RunConfig.compiled`), the one
+    place a version is refused."""
     if version not in PLAN_VERSIONS:
         raise PlanChanged(("version",), f"this Dew reads data plans by version "
                                         f"{', '.join(map(str, PLAN_VERSIONS))}, not {version}: {_RESUMED}")

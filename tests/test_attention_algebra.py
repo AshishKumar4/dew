@@ -962,3 +962,24 @@ def test_finished_slices_merged_at_a_large_maximum_keep_each_ones_mass(totals, o
     out = algebra.finish(spec, merged, initial=True, normalized=True)[0]
     # The heaviest slice's share of the mass rounded once: the output fp32's `share` exactly.
     assert out.item() == np.float32(share), out.item()
+
+
+@pytest.mark.parametrize("form", ["causal", "full"])
+def test_a_padded_query_walks_nothing_again_where_a_real_row_past_fp32_does(form):
+    """The fold guard's rewalk (`algebra.rewalks`) over a call of 6 queries padded to 8: a real row whose
+    maximum is -inf (its products all passed fp32 below zero, as every row of a causal or full call sees a
+    key) walks again, and so does one whose maximum is past every reach, at the call's rows as a whole call
+    states them, at a block's rows from its first query and at each slice's of a split launch; the padded
+    rows' -inf maxima, which see no key, never."""
+    spec = algebra.Forward(form, keys=8, ids=False, scale=1.0, queries=6)
+    maxima = jnp.asarray([0.0, -jnp.inf, 1e6, 2.0, 0.5, 1.0, -jnp.inf, -jnp.inf], jnp.float32)
+    expected = [False, True, True, False, False, False, False, False]
+    walked, _ = algebra.rewalks(spec, maxima)
+    np.testing.assert_array_equal(np.asarray(walked), expected)
+    block, _ = algebra.rewalks(spec, maxima[4:], jnp.arange(4, 8))
+    np.testing.assert_array_equal(np.asarray(block), expected[4:])
+    # A split launch's maxima a slice at a time (`[..., S, Qp]`, as the Mosaic forward hands them over): the
+    # second slice's real rows walk again as the first's, its padding never.
+    later = jnp.asarray([0.0, 3.0, 1.0, 0.5, 2.0, 1e6, -jnp.inf, -jnp.inf], jnp.float32)
+    sliced, _ = algebra.rewalks(spec, jnp.stack([maxima, later]))
+    np.testing.assert_array_equal(np.asarray(sliced), [expected, [False] * 5 + [True, False, False]])

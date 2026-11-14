@@ -7,7 +7,8 @@ measures (`_get_autotuning_configs`), the rule it takes without a measurement
 (`_get_heuristics_config`) and the arguments whose leading axis counts tokens
 (`ROWS`), bucketed to a power of two in its key, as fla keys `triton.autotune`
 on its heads and widths. The kernel's own `custom_vjp`, shard placement and
-remat names stay around it; the op is never differentiated.
+remat names stay around it; the op is never differentiated, but where its call
+carries its derivative (`KernelOp.CARRIES_DERIVATIVE`).
 
 A launch's space, heuristic and measurement are read at its key's shapes
 (`KernelOp.keyed`), so one pick serves every shape the key covers. At trace
@@ -545,6 +546,10 @@ class KernelOp(tokamax.Op):
 
     ROWS: ClassVar[tuple[str, ...]] = ()
     HOOKS: ClassVar[tuple[str, ...]] = ()
+    CARRIES_DERIVATIVE: ClassVar[bool] = False
+    """Whether a call of the op carries its own derivative, launches its config decides (the recurrence
+    template's fast backward): a gradient's product certifies it as reverse mode runs it (`report.pulled`).
+    Every other op's derivative is its caller's custom VJP, of launches of their own."""
     revision: int = 1
 
     def __call__(self, *args, **kwargs):
@@ -580,8 +585,22 @@ class KernelOp(tokamax.Op):
         pick = _pick(self.keyed(ba)) if _READING.get() else None
         # A pick measured at another shape of its key the launch's own shapes cannot take is not taken.
         if pick is None or not self.pinnable(ba, pick.fastest_config):
-            return ba.heuristics_config
+            return self._certified(ba, ba.heuristics_config)
         return pick.fastest_config
+
+    def _certified(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
+        """The derived `config`, or, where its kernels spill as the GPU assembles them alone
+        (`report.certified`), each refused, its misses recorded (`report.refuse_spilling`, so its legality
+        refuses it), and the next derived in turn: the first whose kernels hold. A derivation that offers a
+        refused config again (its legality reads no refusal) has it kept, its program's compile left to read
+        it (`report.settled`). A pinned or a tuned pick is a measured choice, not certified here: its
+        program's compile reads it."""
+        seen = set()
+        while config not in seen and (spilling := report.certified(self, ba, config)):
+            seen.add(config)
+            report.refuse_spilling(self, ba, config, spilling)
+            config = self._get_heuristics_config(ba)
+        return config
 
     def variants(self, ba: tokamax.BoundArguments) -> tuple[Hashable, ...]:
         """The configs an opt-in tuning run (`tune`) times for `ba`: the launch's heuristic alone, or, where
@@ -1084,6 +1103,50 @@ def _store(device_kind: str, picks) -> None:
         merged = {**stored, **_keyed(picks)}
         written = json.loads(dumps_picks(device_kind, merged.values()))
         write_atomically(path, json.dumps({**written, "data": [*written["data"], *foreign]}))
+
+
+_VERDICTS: dict[str, dict[str, _records.JSON]] = {}
+"""Each GPU model's certification verdicts this process read from its picks' store or stored there
+(`stored_verdict`), by launch key, as the store holds them (`encoded`)."""
+
+
+def stored_verdict(device_kind: str, key: str) -> Rebuilt | None:
+    """Certification's verdict of the launch `key` names on GPUs of `device_kind` (`report.certified`), an
+    accepted config's or a refused one's, as stored in the picks' store (`_store`'s file,
+    `kernel_picks_path`) and rebuilt (`decoded`), read once a process; none where the process keeps no picks,
+    none is stored, or this checkout cannot rebuild it (`Unreadable`: it certifies again)."""
+    if not _cache.keeps_picks():
+        return None
+    with _LOADING:
+        if device_kind not in _VERDICTS:
+            _VERDICTS[device_kind] = {entry["certified"]: entry["verdict"]
+                                      for entry in _stored(_cache.kernel_picks_path(device_kind))
+                                      if isinstance(entry, dict) and "certified" in entry}
+        found = _VERDICTS[device_kind].get(key)
+    try:
+        return None if found is None else decoded(found)
+    except Unreadable as unread:
+        _log.warning("a certification verdict stored for %s is not this checkout's, so its launch certifies "
+                     "again: %s", device_kind, unread)
+        return None
+
+
+def store_verdict(device_kind: str, key: str, verdict: dict[str, tuple[str, report.Binary]]) -> None:
+    """`verdict` stored for the launch `key` names on GPUs of `device_kind` in the picks' store, as the picks
+    are (`encoded`), one writer at a time, the file replaced whole (`_store`, whose picks keep a verdict as an
+    entry they do not read), where the process keeps picks."""
+    if not _cache.keeps_picks():
+        return
+    written = encoded(verdict)
+    path = _cache.kernel_picks_path(device_kind)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with filelock.FileLock(path + '.lock'):
+        kept = [entry for entry in _stored(path)
+                if not (isinstance(entry, dict) and entry.get("certified") == key)]
+        write_atomically(path, json.dumps({"device_kind": device_kind,
+                                           "data": [*kept, {"certified": key, "verdict": written}]}))
+    with _LOADING:
+        _VERDICTS.setdefault(device_kind, {})[key] = written
 
 
 class Seen(list[Launch]):

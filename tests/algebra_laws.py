@@ -416,23 +416,34 @@ def _dot(x, y, dimension_numbers) -> np.ndarray:
                         *(y.shape[a] for a in free_y)))
 
 
+_PROVEN: set = set()
+"""The pairs of elements `_equal` has proven equal over the reals. A proof is of its two expressions alone,
+whichever law, form or dtype they came by, so a pair met again is proven: a declaration's forms at another
+operand dtype compute the same reals (a cast is the identity over them), and their certificates are these
+proofs again."""
+
+
 def _equal(law: str, mine, theirs) -> None:
     """Two structures of the same arrays, each of one shape, each element equal over the reals in every case
-    of their comparisons (`_cases`) and every order of their maxima (`_orderings`); `Unlawful` with the first
-    that differs: a value's shape is its contract, so the same elements laid out otherwise break the law."""
+    of their comparisons (`_cases`) and every order of their maxima (`_orderings`), a pair proven once a
+    process (`_PROVEN`); `Unlawful` with the first that differs: a value's shape is its contract, so the same
+    elements laid out otherwise break the law."""
     left = [np.asarray(leaf, object) for leaf in jax.tree.leaves(mine)]
     right = [np.asarray(leaf, object) for leaf in jax.tree.leaves(theirs)]
     shapes = [part.shape for part in left], [part.shape for part in right]
     if shapes[0] != shapes[1]:
         raise Unlawful(law, f"its sides' shapes differ: {shapes[0]} and {shapes[1]}")
     for one, other in zip(left, right, strict=True):
-        for a, b in zip(one.ravel(), other.ravel(), strict=True):
-            for decided, mine_case, theirs_case in _cases(sympy.sympify(a), sympy.sympify(b)):
+        for pair in zip(map(sympy.sympify, one.ravel()), map(sympy.sympify, other.ravel()), strict=True):
+            if pair in _PROVEN:
+                continue
+            for decided, mine_case, theirs_case in _cases(*pair):
                 for ordered in _orderings(mine_case - theirs_case):
                     if not _zero(ordered):
                         residue = sympy.expand(ordered, power_exp=True)
                         raise Unlawful(law, f"where {decided}, {mine_case} against {theirs_case}, their "
                                             f"difference {residue} at an order of their maxima")
+            _PROVEN.add(pair)
 
 
 def _cases(mine, theirs):

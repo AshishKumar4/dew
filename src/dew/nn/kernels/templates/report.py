@@ -8,11 +8,13 @@ a kernel and the PTX Mosaic prints as it compiles one, whose registers and spill
 own compile (tests/kernel_compile.py). Each kernel's name carries the launch that traced it (`named`), so a
 binary names its launch and its config."""
 
+import collections
 import contextlib
 import contextvars
 import dataclasses
 import hashlib
 import importlib.util
+import json
 import logging
 import re
 import shutil
@@ -20,16 +22,19 @@ import struct
 import subprocess
 import tempfile
 import threading
-from collections.abc import Callable, Hashable, Iterator, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, overload
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 import tokamax
 from google.protobuf import empty_pb2
 from google.protobuf.message import DecodeError
 from google.protobuf.unknown_fields import UnknownFieldSet
+from jax._src.thunky import thunky
 from jax.extend.mlir import ir
 
 from dew import communicators
@@ -116,17 +121,38 @@ class _Pending:
 _TRACING: contextvars.ContextVar[_Pending | None] = contextvars.ContextVar("tracing_launch", default=None)
 """The pending launch whose Mosaic kernels acquire their digest through `named`."""
 _LAUNCHES: dict[str, Launch] = {}
-"""Each launch this process traced, by its digest."""
+"""Each launch this process traced, by its digest, for the process's life: a program's compile reads its
+launches whenever it comes (`compiled`), a pullback's trace whenever JAX makes it (`relaunched`), and JAX
+hands a cached trace back without tracing it again, so no trace states when its launches are read last."""
+RECORDS_HELD = 4096
+"""The misses, rewrites and pass timings a registry keeps (`_Registry`), the latest; a reader of one
+search's own takes them in a `recording` scope."""
 @dataclasses.dataclass
 class _Registry:
     """Each (launch identity, config) a compile refused (`compiled`: its kernel spilled), by the names of its
     kernels that spilled, and each miss."""
     refused: dict[tuple[str, Hashable], frozenset[str]] = dataclasses.field(default_factory=dict)
+    missed: collections.deque["Miss"] = dataclasses.field(
+        default_factory=lambda: collections.deque(maxlen=RECORDS_HELD))
+    rewritten: collections.deque = dataclasses.field(
+        default_factory=lambda: collections.deque(maxlen=RECORDS_HELD))
+    """Each region the algebra pass rewrote, its report (`dew.algebra.program.AlgebraReport`)."""
+    passes: collections.deque[float] = dataclasses.field(
+        default_factory=lambda: collections.deque(maxlen=RECORDS_HELD))
+    """Each program's whole pass, in seconds: its walks of its bodies and windows beside its regions'."""
+
+
+@dataclasses.dataclass
+class Recorded:
+    """The misses, rewrites and pass timings recorded within a `recording` scope, every one: one search's
+    own, which its plan reports."""
     missed: list["Miss"] = dataclasses.field(default_factory=list)
     rewritten: list = dataclasses.field(default_factory=list)
-    """Each region the algebra pass rewrote, its report (`dew.algebra.program.AlgebraReport`)."""
     passes: list[float] = dataclasses.field(default_factory=list)
-    """Each program's whole pass, in seconds: its walks of its bodies and windows beside its regions'."""
+
+
+_RECORDING: contextvars.ContextVar[tuple[Recorded, ...]] = contextvars.ContextVar("recording", default=())
+"""The `recording` scopes open in this context, innermost last."""
 
 
 _PROCESS = _Registry()
@@ -144,7 +170,7 @@ def _registry() -> _Registry:
 
 class Exhausted(ValueError):
     """A derivation that finds no config left for a launch (`base.Unfitted`): a relowering after a spill
-    that ends so keeps the first program (`compiled`)."""
+    that ends so refuses the program (`compiled`), which no compile keeps spilling."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -304,6 +330,215 @@ def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kerne
     _record((_identity(op, arguments), config), None, frozenset(kernels))
 
 
+_CERTIFYING: contextvars.ContextVar = contextvars.ContextVar("certifying_device", default=None)
+"""The device a launch's derived config is certified on (`certified`) where a block names one
+(`certifying`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Certification:
+    """A launch's config certified (`certified`): its op's name and config, whether as reverse mode runs it
+    (`pulled`), each Mosaic GPU kernel it compiled alone, by its name and launch (`launch_name`): its module
+    (the kernel hash a lowered call states, `KernelCall.config`, by which the program's compile reuses it,
+    Mosaic compiling a module once a process) and its binary, and whether its verdict was read back from the
+    picks' store (`stored`), compiled by an earlier process, rather than compiled here."""
+    op: str
+    config: Hashable
+    pulled: bool
+    kernels: dict[str, tuple[str, "Binary"]]
+    stored: bool
+
+    @property
+    def spilling(self) -> tuple["Binary", ...]:
+        """Its kernels that spill as the GPU assembles them."""
+        return tuple(binary for _, binary in self.kernels.values() if binary.frame)
+
+
+_CERTIFIED: dict[tuple, Certification] = {}
+"""Each launch certified (`certified`), by its identity, config, device and product."""
+
+_UNCERTIFIED: dict[tuple, str] = {}
+"""Each launch certification could not compile alone (`certified`), by its identity, config, device and
+product: why."""
+
+
+_PULLED: contextvars.ContextVar = contextvars.ContextVar("certified_pulled", default=False)
+"""Whether a launch traced here runs as reverse mode runs it (`pulled`)."""
+
+
+@contextlib.contextmanager
+def pulled() -> Iterator[None]:
+    """Within the block, a gradient's product is traced: a launch whose call carries its own derivative
+    (`tuning.KernelOp.CARRIES_DERIVATIVE`, the recurrence template's) is certified as reverse mode runs it,
+    its forward and its pullback (`certified`), the kernels a gradient runs where they are not its call's
+    without one (`recurrence_chunk._per_product`). A launch whose derivative is its caller's (a port's raw
+    launch inside its rule's custom VJP) is certified as it is called."""
+    token = _PULLED.set(True)
+    try:
+        yield
+    finally:
+        _PULLED.reset(token)
+
+
+@contextlib.contextmanager
+def certifying(device) -> Iterator[None]:
+    """Within the block, launches' derived configs are certified on `device` (`certified`): a compile-only
+    GPU's, which a process attached to no GPU names for the target it compiles for."""
+    token = _CERTIFYING.set(device)
+    try:
+        yield
+    finally:
+        _CERTIFYING.reset(token)
+
+
+def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple["Binary", ...]:
+    """`op`'s kernels at `config` for `arguments` that spill as the GPU assembles them, each launch compiled
+    alone before its program is: its kernels' binaries (`binaries`) as the plugin's own compiler makes them
+    for the device the process compiles for (`_certifying_device`: its own GPU, or a compile-only one a
+    block names), which the program's compile then reuses (Mosaic compiles a module once a process). A
+    launch's derivation refuses a config that spills and takes its next (`tuning`'s `_chosen`), with no
+    program retraced, where a compile's refusal retraces the whole program (`settled`): a B200's 4B step
+    stepped its attention forward 19 times that way, 42 minutes, every rewalk a step's trace. None on a
+    process compiling for no GPU or an interpreted launch; none for a launch XLA does not compile alone (a
+    collective's, a block past its shared memory), which its program's compile reads as before (`settled`)
+    and `uncertified` names. Once a process, by launch (`certifications`), and once a GPU model a machine:
+    each verdict, an accepted config's and a refused one's, is stored with the kernel picks
+    (`_verdict_key`), so a warm start traces and compiles nothing to certify."""
+    device = _certifying_device()
+    if device is None or arguments.arguments.get("interpret"):
+        return ()
+    from dew.nn.kernels import tuning
+
+    reverse = _PULLED.get() and op.CARRIES_DERIVATIVE
+    key = (_identity(op, arguments), config, device.id, device.device_kind, reverse)
+    with _GUARD:
+        if key in _CERTIFIED:
+            return _CERTIFIED[key].spilling
+    stored = _verdict_key(op, arguments, config, reverse)
+    verdict = None if stored is None else tuning.stored_verdict(device.device_kind, stored)
+    if isinstance(verdict, dict):
+        kernels = verdict
+    else:
+        try:
+            kernels = _compiled_launch(op, arguments, config, device, reverse)
+        except jax.errors.JaxRuntimeError as error:
+            # XLA refuses the launch alone (its block's shared memory, a collective's devices): its program's
+            # compile refuses it as it did before certification (`settled`), and the gate names it
+            # (`uncertified`).
+            _log.warning("launch %s at %s is not certified: XLA does not compile it alone (%s)",
+                         type(op).__name__, config, str(error)[:200])
+            with _GUARD:
+                _UNCERTIFIED[key] = str(error)[:400]
+            return ()
+        if stored is not None:
+            tuning.store_verdict(device.device_kind, stored, kernels)
+    found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None)
+    with _GUARD:
+        _CERTIFIED[key] = found
+    return found.spilling
+
+
+def _verdict_key(op, arguments: tokamax.BoundArguments, config: Hashable, reverse: bool) -> str | None:
+    """What decides a launch's certification on a GPU model before it traces, as its stored verdict's key
+    (`tuning.stored_verdict`): the launch's identity (`_identity`, the same in every process), its config,
+    whether reverse mode runs it, Dew's code (`package_digest`: a Dew edit certifies again), the installed
+    JAX, jaxlib and CUDA plugins, whose compiler assembles it (the Pallas lowering cache's seal of them), and
+    the environment a kernel's lowering and compile read (that cache's policy); the store's file names the
+    GPU model. None where the installation has no seal (an edited or a source install of JAX), whose code
+    no key states: its verdicts are not stored."""
+    from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
+    from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
+
+    from dew._cache import package_digest
+    from dew.nn.kernels.tuning import encoded
+
+    installed = seal().digest
+    if installed is None:
+        return None
+    stated = [package_digest(), installed.hex(), _identity(op, arguments), encoded(config), reverse,
+              _keyed_environment()]
+    return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
+
+
+def certifications() -> tuple[Certification, ...]:
+    """Each launch certified in this process (`certified`)."""
+    with _GUARD:
+        return tuple(_CERTIFIED.values())
+
+
+def uncertified() -> dict[tuple, str]:
+    """Each launch certification did not compile alone in this process (`certified`), and why."""
+    with _GUARD:
+        return dict(_UNCERTIFIED)
+
+
+def refuse_spilling(op, arguments: tokamax.BoundArguments, config: Hashable,
+                    spilling: Sequence["Binary"]) -> None:
+    """`op`'s launch of `arguments` at `config` refused as certification found `spilling` (`certified`):
+    refused as a compile's spill refuses it (`refuse_launch`), each kernel's miss recorded, its launch
+    stepped down (`misses`), as `settled` records a compile's."""
+    refuse_launch(op, arguments, config, {binary.kernel for binary in spilling})
+    launch = Launch(_identity(op, arguments), type(op).__name__, config)
+    _recorded([(None, binary, launch) for binary in spilling], stepped=True)
+
+
+def _certifying_device():
+    """The device a launch is certified on (`certified`): a block's (`certifying`), else this process's GPU
+    where it compiles for that GPU's generation, else none."""
+    named = _CERTIFYING.get()
+    if named is not None:
+        return named
+    if jax.default_backend() != "gpu":
+        return None
+    if generation.device_generation() != generation.gpu_target().generation:
+        return None
+    return jax.local_devices()[0]
+
+
+def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, device,
+                     reverse: bool) -> dict[str, tuple[str, "Binary"]]:
+    """`op`'s launch of `arguments` at `config` as a resource derivation lowers it (`KernelOp.lowering`),
+    compiled alone on `device`, as a call without a gradient runs it or, `reverse`, as reverse mode does (its
+    forward and its pullback of a unit cotangent): its Mosaic GPU kernels' modules and binaries, by name and
+    launch, none for a launch of none. A launch that does not trace alone raises: certification is no
+    optional pass."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.lowered import kernel_calls
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.programs import meshless
+
+    mesh = Mesh([device], ("launch",))
+    placed = NamedSharding(mesh, PartitionSpec())
+    # A program of its own on one device (`meshless`): none of the enclosing trace's mesh nor its axes (a
+    # checked shard_map's body, whose abstract values the launch's own must not vary over), its operands' too.
+    with meshless(), jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+        launch, shapes = op.lowering(arguments, config)
+        specs = [jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=placed) for shape in shapes]
+
+        def pulled_back(*operands):
+            out, pullback = jax.vjp(launch, *operands)
+            return pullback(jax.tree.map(_unit_cotangent, out))
+
+        lowered = owned_program(pulled_back if reverse else launch).trace(*specs).lower()
+    # A Mosaic GPU kernel compiled alone is the one its program loads (Mosaic compiles a module once a
+    # process); a Triton kernel compiles again with each executable, so its program's compile reads it.
+    modules = {launch_name(call.name, call.launch): call.config
+               for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"}
+    if not modules:
+        return {}
+    return {name: (modules[name], binary)
+            for binary in binaries(lowered.compile(targeted(lowered, None)))
+            if (name := launch_name(binary.kernel, binary.launch)) in modules}
+
+
+def _unit_cotangent(out: jax.Array) -> jax.Array | np.ndarray:
+    """A cotangent of ones for `out`, float0's zeros for an integer output."""
+    if jnp.issubdtype(out.dtype, jnp.inexact):
+        return jnp.ones_like(out)
+    return np.zeros(out.shape, jax.dtypes.float0)
+
+
 @generation.traced_fact
 def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
     """Every (launch identity, config, spilled kernel names) refused in this context (a `refusals` scope's or
@@ -325,8 +560,8 @@ def refuse(entries) -> None:
 
 
 def misses() -> tuple[Miss, ...]:
-    """The kernels this process's compiles found spilling (`compiled`), for a run's telemetry: a `refusals`
-    scope's own within it."""
+    """The kernels this process's compiles found spilling (`compiled`), the latest `RECORDS_HELD`, for a run's
+    telemetry: a `refusals` scope's own within it."""
     with _GUARD:
         return tuple(_registry().missed)
 
@@ -334,28 +569,39 @@ def misses() -> tuple[Miss, ...]:
 def record_rewrite(made) -> None:
     """Record one region the algebra pass rewrote (`dew.algebra.program.AlgebraReport`) beside the kernels'
     misses, as each program traces."""
-    with _GUARD:
-        _registry().rewritten.append(made)
+    _add(rewritten=(made,))
 
 
 def record_pass(seconds: float) -> None:
     """Record one program's whole algebra pass, its seconds (`dew.algebra.program._passed`)."""
-    with _GUARD:
-        _registry().passes.append(seconds)
+    _add(passes=(seconds,))
 
 
 def passes() -> tuple[float, ...]:
-    """Each program's whole algebra pass, in seconds, as this process's programs traced (`record_pass`): its
-    regions' (`rewrites`) and its walks of the program around them."""
+    """Each program's whole algebra pass, in seconds, as this process's programs traced (`record_pass`), the
+    latest `RECORDS_HELD`: its regions' (`rewrites`) and its walks of the program around them."""
     with _GUARD:
         return tuple(_registry().passes)
 
 
 def rewrites() -> tuple:
-    """The regions the algebra pass rewrote as this process's programs traced (`record_rewrite`), for a
-    run's telemetry: a `refusals` scope's own within it."""
+    """The regions the algebra pass rewrote as this process's programs traced (`record_rewrite`), the latest
+    `RECORDS_HELD`, for a run's telemetry: a `refusals` scope's own within it."""
     with _GUARD:
         return tuple(_registry().rewritten)
+
+
+@contextlib.contextmanager
+def recording() -> Iterator[Recorded]:
+    """Within the block, every miss, rewrite and pass timing this context records (`Recorded`), as well as
+    its registry's: a search's own, whatever the registry holds besides. A replacement's are recorded once
+    it is kept (`_commit`)."""
+    recorded = Recorded()
+    token = _RECORDING.set((*_RECORDING.get(), recorded))
+    try:
+        yield recorded
+    finally:
+        _RECORDING.reset(token)
 
 
 @contextlib.contextmanager
@@ -371,30 +617,38 @@ def refusals() -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def _proposing(entries: list[tuple[tuple[str, Hashable], str]]) -> Iterator[_Registry]:
+def _proposing(entries: list[tuple[tuple[str, Hashable], str]]) -> Iterator[Recorded]:
     """Refusals visible while deriving and compiling a replacement, without changing the kept program's
-    registry or its file; the scope's registry, whose rewrites and passes the replacement's trace recorded. A
-    successful replacement commits them after this scope ends (`_commit`)."""
+    registry or its file; every rewrite and pass the replacement's trace records, which a successful
+    replacement commits after this scope ends (`_commit`)."""
     registry = _registry()
     with _GUARD:
         proposed = dict(registry.refused)
     for identity, kernel in entries:
         proposed[identity] = proposed.get(identity, frozenset()) | {kernel}
-    scope = _Registry(refused=proposed)
-    token = _SCOPE.set(scope)
+    # A replacement's records reach the registry and a `recording` only once it is kept (`_commit`).
+    proposal = Recorded()
+    token, held = _SCOPE.set(_Registry(refused=proposed)), _RECORDING.set((proposal,))
     try:
-        yield scope
+        yield proposal
     finally:
+        _RECORDING.reset(held)
         _SCOPE.reset(token)
 
 
-def _commit(proposal: _Registry) -> None:
-    """A successful replacement's rewrites and its passes' seconds (`_proposing`'s scope) recorded as the
-    kept program's."""
+def _commit(proposal: Recorded) -> None:
+    """A successful replacement's rewrites and its passes' seconds (`_proposing`'s) recorded as the kept
+    program's."""
+    _add(rewritten=proposal.rewritten, passes=proposal.passes)
+
+
+def _add(**records: Iterable) -> None:
+    """Each of `records`, a `Recorded` field's entries, added to this context's registry and to every
+    `recording` open in it."""
     with _GUARD:
-        registry = _registry()
-        registry.rewritten.extend(proposal.rewritten)
-        registry.passes.extend(proposal.passes)
+        for held in (_registry(), *_RECORDING.get()):
+            for name, entries in records.items():
+                getattr(held, name).extend(entries)
 
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
@@ -404,7 +658,7 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
         if refusal is not None:
             registry.refused[refusal] = registry.refused.get(refusal, frozenset()) | kernels
         if miss is not None:
-            registry.missed.append(miss)
+            _add(missed=(miss,))
 
 
 def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
@@ -519,27 +773,35 @@ def reads_binaries(lowered: jax.stages.Lowered) -> bool:
 
 
 def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
-         relower: Callable[[], jax.stages.Lowered], first: Attempt | None = None) -> jax.stages.Compiled:
+         relower: Callable[[], jax.stages.Lowered], first: Attempt | None = None,
+         read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None) -> jax.stages.Compiled:
     """`lowered` compiled and kept (`settled`), its first compile `first` or one in this thread."""
-    return settled(lowered, options, relower, attempted(lowered, options) if first is None else first)
+    return settled(lowered, options, relower, attempted(lowered, options) if first is None else first,
+                   read=read)
 
 
 def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
-            relower: Callable[[], jax.stages.Lowered], first: Attempt) -> jax.stages.Compiled:
+            relower: Callable[[], jax.stages.Lowered], first: Attempt, *,
+            read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None
+            ) -> jax.stages.Compiled:
     """The program kept of `lowered`'s first compile (`first`), read through its kernels' binaries
-    (`binaries`): where a kernel of a template's launch spills, that launch's config is refused (`refused`),
-    the miss recorded (`misses`, logged), and the program `relower`ed and compiled, again for as long as a
+    (`read`, `binaries` where None): where a kernel of a template's launch spills, that launch's config is
+    refused (`refused`), the miss recorded (`misses`, logged), and the program `relower`ed and compiled,
+    again for as long as a
     launch spills at a config not yet refused; `relower` traces afresh, so each refused launch's derivation
     takes the next config by its own rule, through every composition its device has (`bundles.groups`), and
     a launch whose every legal config spilled derives none, its call taking the next route (it leaves the
-    template only so). The last compile's own spills are recorded,
-    neither refused nor stepped, so every process derives the program this compile keeps; a relowering whose
-    derivations find no config left (`Exhausted`: a launch a call pins) keeps the program before it, its
-    misses recorded as not stepped. Each relowering's refused launches compile alone until none spills
-    (`_stepped_alone`), the whole program once after them. Refusals commit only as a replacement compiles,
+    template only so). The last compile's own spills are recorded, neither refused nor stepped, so every
+    process derives the program this compile keeps; a relowering whose derivations find no config left
+    (`Exhausted`: a launch a call pins) raises, its misses recorded as not stepped: a derived kernel never
+    spills and a pin is legal (docs/design/kernel-templates.md), so no program found spilling is kept. Each
+    relowering's refused launches compile alone until none spills (`_stepped_alone`), the whole program once
+    after them. Refusals commit only as a replacement compiles,
     so a later process derives the program kept here. A program loaded from the persistent compilation
     cache carries its kernels' binaries as one compiled here does. A program whose block XLA refuses steps
-    its asking Triton launches down (`_unblocked`)."""
+    its asking Triton launches down (`_unblocked`). A relowering that launches every refused config again
+    is the program just compiled: it is kept as compiled, its spills misses not stepped, each refusal that
+    did not take named (`_untaken`)."""
     if first.error is not None:
         asked = shared_asked(first.error)
         if asked is None:
@@ -547,7 +809,7 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
         return _unblocked(lowered, options, relower, asked, first.error)
     executable = first.executable
     assert executable is not None
-    found = _misses_of(_spilling(lowered, executable))
+    found = _misses_of(_spilling(lowered, executable, read))
     while True:
         # Each step refuses a config no step refused before, of the finitely many its launches derive.
         held = _registry().refused
@@ -558,9 +820,17 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
         try:
             with _proposing(refusals) as proposal:
                 program, alone = _stepped_alone(relower, options, {identity for (identity, _), _ in refusals})
-                replacement, spilling = _compiled_reported(program, options)
+                # A relowering that launches every refused config again is the program just compiled: it is
+                # kept, not compiled again (a B200's 4B step compiled the same jit_step twice, 150 s, PF03).
+                untaken = _untaken(program, refusals)
+                replacement, spilling = ((None, []) if len(untaken) == len(refusals)
+                                         else _compiled_reported(program, options, read))
         except Exhausted as failed:
-            _log.warning("relowering after a spill found no config: %s; the program before it runs", failed)
+            _recorded(found, stepped=False)
+            kernels = ", ".join(sorted({report.kernel for _, report, _ in found}))
+            raise Exhausted(f"kernels {kernels} spill and their launches have no config left: {failed}"
+                            ) from failed
+        if replacement is None:
             break
         _commit(proposal)
         for refusal, kernel in [*refusals, *((refusal, report.kernel) for refusal, report, _ in alone)]:
@@ -709,6 +979,23 @@ def _stepped_alone(relower: Callable[[], jax.stages.Lowered], options: jax.stage
         missed += found
 
 
+def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashable], str]]
+             ) -> list[tuple[tuple[str, Hashable], str]]:
+    """Each of `refusals` (a launch's identity and config, and its spilling kernel's name) that `program`,
+    relowered under them, launches again: its launch's derivation did not read the refusal. Each is logged,
+    so the launch whose rule ignores its refusals is named."""
+    from dew.nn.kernels.lowered import kernel_calls
+
+    # Every call JAX compiles, a branch's no run takes among them (a forward's scaled op's).
+    launched = {(launch.identity, launch.config) for call in kernel_calls(program, unrun=True)
+                if (launch := traced(call.launch or kernel_of(call.name)[1] or "")) is not None}
+    untaken = [(refusal, kernel) for refusal, kernel in refusals if refusal in launched]
+    for (_, config), kernel in untaken:
+        _log.warning("kernel %s's refusal at %s did not take: the program relowered under it launches it "
+                     "again, its launch's derivation not reading it", kernel, config)
+    return untaken
+
+
 def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
                relower: Callable[[], jax.stages.Lowered], asked: int,
                error: Exception) -> jax.stages.Compiled:
@@ -779,18 +1066,20 @@ def _recorded(found: list, *, stepped: bool) -> None:
                      "its launch steps down" if miss.stepped else "no step-down")
 
 
-def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
+def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
+                       read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None
                        ) -> tuple[jax.stages.Compiled, list["Binary"]]:
     executable = lowered.compile(targeted(lowered, options))
-    return executable, _spilling(lowered, executable)
+    return executable, _spilling(lowered, executable, read)
 
 
-def _spilling(lowered: jax.stages.Lowered, executable: jax.stages.Compiled) -> list["Binary"]:
-    """The kernels of `executable`, `lowered` compiled, that spill, where it runs a template's
-    (`reads_binaries`)."""
+def _spilling(lowered: jax.stages.Lowered, executable: jax.stages.Compiled,
+              read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None) -> list["Binary"]:
+    """The kernels of `executable`, `lowered` compiled, that spill, read by `read` (`binaries` where None),
+    where it runs a template's (`reads_binaries`)."""
     if not reads_binaries(lowered):
         return []
-    return [found for found in binaries(executable) if found.frame]
+    return [found for found in (read or binaries)(executable) if found.frame]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -858,8 +1147,10 @@ def _thunk_protos(serialized: bytes) -> list[tuple[str, bytes]]:
     reader of the serialized form, which its public `jax_executable_to_mlir` reads from a
     `jax.stages.Compiled`, where a kernel's compiled alone is a backend's `LoadedExecutable`), by its
     kernel's name, with its serialized proto."""
-    from jax._src.thunky import thunky
-
+    # thunky is imported with this module, not at a first reading: its import registers a discharge rule
+    # (`call_thunky_nested`) the Pallas lowering cache keys every lowering after it by, so a process that
+    # certified a launch before its step lowered keyed the step's lowerings apart from a warm start's, which
+    # reads none (FS-CERTREG: a warm start's first process lowered 26 kernels afresh).
     found: list[tuple[str, bytes]] = []
     thunky._check_thunky_available()
     context = thunky.make_ir_context()
@@ -922,7 +1213,11 @@ def _kernels(message: bytes, decoded: bool = False) -> tuple[list[Binary], int]:
     """The kernels of each `MosaicGpuKernelProto` within a thunk's serialized proto (a message of jaxlib's
     version, field 1, whose binary, 8, is an ELF, whose kernel name, 9, its function's, and whose
     `SHARED_BYTES` its launch's dynamic shared memory), and how many Mosaic GPU custom calls it names
-    (`MOSAIC_TARGET`, a custom call thunk's target)."""
+    (`MOSAIC_TARGET`, a custom call thunk's target). A message holding neither the target's bytes nor an ELF's
+    holds neither, and is not parsed: most of a program's thunks and their messages (a 4B decoder's step read
+    223,561 messages, 1.8 of its compile point's 3.5 seconds)."""
+    if MOSAIC_TARGET not in message and ELF not in message:
+        return [], 0
     fields = proto_fields(message)
     binary, name, shared = fields.get(8, []), fields.get(9, []), fields.get(SHARED_BYTES, [])
     if (fields.get(1) == [KERNEL_PROTO_VERSION] and len(binary) == len(name) == 1
@@ -1040,12 +1335,20 @@ def _written(opcode: str, operands: list[str]) -> set[int]:
     return set(range(int(target.group(1)), int(target.group(1)) + count))
 
 
+def _predicated(instruction: str) -> bool:
+    """Whether a SASS instruction runs under a predicate other than the always-true one (`@P0`, `@!P1`;
+    not `@PT`)."""
+    first = instruction.split(maxsplit=1)[0] if instruction.strip() else ""
+    return first.startswith("@") and first.lstrip("@!") != "PT"
+
+
 def _reused_register_a(instructions: list[str], labels: dict[str, int]) -> int:
     """The writes in a loop (a backward branch's body, walked over two trips) to the registers of a warpgroup
     MMA's register operand A whose group is still pending: PTX leaves an operand A read until a
     `wgmma.wait_group` retires its group (PTX ISA, "wgmma.mma_async"), so a write before it is undefined
     behaviour, the product reading whichever value its warp reached (row 5416: a prologue's next step
-    rewrote A under `wait_group 1`, its forward differing run to run on a GH200)."""
+    rewrote A under `wait_group 1`, its forward differing run to run on a GH200). A predicated wait
+    (`@P0 WARPGROUP.DEPBAR.LE`) retires nothing on the walk, which takes no predicate as known."""
     reused = 0
     for at, text in enumerate(instructions):
         head = labels.get(branch.group(1)) if (branch := _BRANCH.search(text)) else None
@@ -1063,7 +1366,7 @@ def _reused_register_a(instructions: list[str], labels: dict[str, int]) -> int:
                         issuing |= set(range(int(left.group(1)), int(left.group(1)) + REGISTER_A))
                     if "gsb0" in instruction:
                         committed, issuing = [*committed, issuing], set()
-                elif opcode == "WARPGROUP.DEPBAR.LE":
+                elif opcode == "WARPGROUP.DEPBAR.LE" and not _predicated(instruction):
                     pending = int(operands[-1], 0)
                     committed = committed[len(committed) - pending:] if pending else []
                 else:

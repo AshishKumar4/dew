@@ -28,6 +28,7 @@ import pytest
 import sympy
 from egglog import EGraph, Vec, declarations as decl, i64, set_
 from jax import lax
+from reference_error import assert_as_exact
 
 from dew.algebra import carry, cost, rules, terms
 
@@ -43,13 +44,18 @@ contracted (`x^T @ y`), and a batched one."""
 PLAIN = DOTS[0]["dimension_numbers"]
 
 
-def _broadcasts() -> list[dict]:
-    """Every broadcast of a lower rank into a shape of the universe."""
-    return [{"shape": target, "broadcast_dimensions": dims} for target in SHAPES
+def _broadcasts(shapes) -> list[dict]:
+    """Every broadcast of a lower rank into a shape of the universe `shapes`."""
+    return [{"shape": target, "broadcast_dimensions": dims} for target in shapes
             for rank in range(len(target)) for dims in itertools.combinations(range(len(target)), rank)]
 
 
-BROADCASTS = _broadcasts()
+BROADCASTS = _broadcasts(SHAPES)
+WIDE = tuple(sorted((tuple({2: 16, 3: 24}[extent] for extent in shape) for shape in SHAPES),
+                    key=math.prod, reverse=True))
+"""The universe a rule is qualified numerically over: `SHAPES`' with rows enough to pool an error over, the
+shapes of most elements first, so the first instantiation a rule's conditions admit takes each term's
+largest shape they admit, in the terms' order."""
 ELEMENTWISE = ({},)
 """An elementwise equation's parameters: none a real identity reads (its dtype's)."""
 
@@ -58,7 +64,7 @@ class Inadmissible(Exception):
     """An instantiation a rule's conditions or its terms' shapes do not admit."""
 
 
-RANGE_FACTS = frozenset({"log2_bound", "reach", "log2_of", "sum_length", "contracted_length"})
+RANGE_FACTS = frozenset({"log2_bound", "reach", "log2_of", "sum_length", "contracted_length", "mode_power"})
 """The facts a magnitude condition reads: rounding's, which a real identity reads nothing of."""
 ROUNDING_FACTS = frozenset({"plain", "exact_scale"})
 """The facts a dtype or power-of-two condition reads: rounding's too."""
@@ -394,17 +400,23 @@ def _names(expr, found: list) -> None:
             _names(arg, found)
 
 
-CANDIDATES = {"dot": DOTS, "broadcast": BROADCASTS, "transpose": ({"permutation": (1, 0)},),
-              "elementwise": ELEMENTWISE, "axes": ((0,), (1,), (2,)), "axis": (0, 1, 2),
-              "binary name": ("add", "sub", "mul", "max", "min"), "compare name": ("lt", "eq"),
-              "unary name": ("exp", "neg", "tanh"), "reduce name": ("sum", "max", "min"),
-              "shaped name": ("broadcast_in_dim", "transpose"),
-              "layout": (*BROADCASTS, {"permutation": (1, 0)})}
+def _candidates(broadcasts) -> dict:
+    """Each parameter's values by its role, its broadcasts those of one universe of shapes."""
+    return {"dot": DOTS, "broadcast": broadcasts, "transpose": ({"permutation": (1, 0)},),
+            "elementwise": ELEMENTWISE, "axes": ((0,), (1,), (2,)), "axis": (0, 1, 2),
+            "binary name": ("add", "sub", "mul", "max", "min"), "compare name": ("lt", "eq"),
+            "unary name": ("exp", "neg", "tanh"), "reduce name": ("sum", "max", "min"),
+            "shaped name": ("broadcast_in_dim", "transpose"),
+            "layout": (*broadcasts, {"permutation": (1, 0)})}
 
 
-def _instantiations(matched, conditions, symbolic: bool):
-    """Every instantiation of a rule's variables over the universe its conditions admit, its matched term
-    evaluated: `(evaluated, value)`. A term a condition asks be the literal 1 (`unit`) is 1."""
+CANDIDATES = _candidates(BROADCASTS)
+
+
+def _instantiations(matched, conditions, symbolic: bool, shapes=SHAPES, candidates=CANDIDATES):
+    """Every instantiation of a rule's variables over the universe its conditions admit (`shapes`, and the
+    parameters `candidates` holds over them), its matched term evaluated: `(evaluated, value)`. A term a
+    condition asks be the literal 1 (`unit`) is 1."""
     name, pattern = matched
     roles = _variables(pattern, {})
     roles.update(dict.fromkeys(_free(conditions, roles, name), "axis"))
@@ -412,10 +424,10 @@ def _instantiations(matched, conditions, symbolic: bool):
     positive = _named(conditions, "positive_scale") | POSITIVE
     term_names = sorted(n for n, role in roles.items() if role == "term" and n not in units)
     param_names = sorted(n for n, role in roles.items() if role != "term")
-    for shapes in itertools.product(SHAPES, repeat=len(term_names)):
-        for chosen in itertools.product(*(CANDIDATES[roles[n]] for n in param_names)):
+    for taken in itertools.product(shapes, repeat=len(term_names)):
+        for chosen in itertools.product(*(candidates[roles[n]] for n in param_names)):
             arrays = {n: _operand(n, shape, symbolic, positive=n in positive)
-                      for n, shape in zip(term_names, shapes, strict=True)}
+                      for n, shape in zip(term_names, taken, strict=True)}
             arrays.update({n: np.asarray(1 if symbolic else 1.0, dtype=object if symbolic else float)
                            for n in units})
             evaluated = Evaluated(arrays, dict(zip(param_names, chosen, strict=True)), symbolic)
@@ -480,6 +492,72 @@ def test_every_rewrite_is_an_identity_over_the_reals(name, index, rule):
     assert proven, f"{name}[{index}]: no instantiation over the universe admits it"
 
 
+WIDE_CANDIDATES = _candidates(_broadcasts(WIDE))
+
+
+def _logged(expr, found: list, inside: bool = False) -> None:
+    """The variables `expr` reads inside a logarithm's operand, appended to `found`."""
+    inner = _inner(expr)
+    if isinstance(inner, decl.UnboundVarDecl):
+        if inside:
+            found.append(inner.name)
+    elif isinstance(inner, decl.CallDecl):
+        args = [_inner(arg) for arg in inner.args]
+        logs = (isinstance(inner.callable, decl.MethodRef) and inner.callable.method_name == "unary"
+                and isinstance(args[1], decl.LitDecl) and args[1].value == "log")
+        for place, arg in enumerate(inner.args):
+            _logged(arg, found, inside or (logs and place == 0))
+
+
+@pytest.mark.parametrize(("name", "index", "rule"), REWRITES,
+                         ids=[f"{name}[{index}]" for name, index, _ in REWRITES])
+def test_every_rewrites_right_side_is_on_par_with_its_left_side(name, index, rule):
+    """Check 1 of the gate, rule by rule (docs/design/algebra.md §3), each layout and direction a rule of
+    its own: at the first instantiation the rule's conditions admit over `WIDE`, its largest shapes first,
+    its right side as JAX computes it in float32 is on par with its left side against the float64 truth,
+    over drawn operands (a term a condition asks be positive, or a logarithm reads, drawn positive, a scale
+    a condition asks be exact a power of two, a unit 1); a rewrite that runs both ways is held both ways."""
+    matched, conditions, actions = _parts(rule)
+    both = isinstance(rule, decl.BiRewriteDecl)
+    if isinstance(rule, (decl.RewriteDecl, decl.BiRewriteDecl)):
+        matched = ("t", matched)
+    admitted = next((evaluated for evaluated, _ in _instantiations(
+        matched, conditions, symbolic=False, shapes=WIDE, candidates=WIDE_CANDIDATES)), None)
+    assert admitted is not None, f"{name}[{index}]: no instantiation over the wide universe admits it"
+    named = {matched[0]: matched[1], **_bound(conditions)}
+    units = _named(conditions, "unit")
+    # A logarithm's operand is drawn in its domain: every term it reads positive.
+    logged: list[str] = []
+    _logged(matched[1], logged)
+    positive, exact = _named(conditions, "positive_scale") | set(logged), _named(conditions, "exact_scale")
+    drawn = sorted(operand for operand in admitted.arrays if operand not in units)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        operands = []
+        for operand in drawn:
+            shape = np.shape(admitted.arrays[operand])
+            value = 2.0 ** rng.integers(-3, 4, shape) if operand in exact else rng.standard_normal(shape)
+            operands.append(jnp.asarray(np.abs(value) + 0.5 if operand in positive else value, jnp.float32))
+        return tuple(operands)
+
+    def side(expr):
+        def computed(*operands):
+            # A unit is 1 at the operands' dtype, the arm's and the float64 truth's alike.
+            arrays = {**{unit: jnp.ones((), operands[0].dtype) for unit in units},
+                      **dict(zip(drawn, operands, strict=True))}
+            return Traced(admitted, arrays, named).value(expr)
+        return jax.jit(computed)
+
+    left = side(matched[1])
+    for kind, rhs in actions:
+        if kind != "union":
+            continue
+        assert_as_exact(side(rhs), left, draw, f"{name}[{index}]", seeds=16)
+        if both:
+            assert_as_exact(left, side(rhs), draw, f"{name}[{index}] back", seeds=16)
+
+
 def _extreme(x: np.ndarray, axes, monoid: str, *, symbolic: bool) -> np.ndarray:
     """The maximum or minimum of `x` over `axes`, each axis folded in turn (SymPy's `Max`/`Min` over
     symbols)."""
@@ -522,44 +600,66 @@ POWERS = (3, 5, 0)
 """The powers of two each term's stated magnitude takes in turn (`log2_bound`)."""
 
 
-def _jax_value(expr, arrays: dict, params: dict, bound: dict, matched: tuple):
-    """A term's value as JAX computes it over `arrays`, for the magnitude table to bound: the matched term
-    (`matched`, its name and pattern) by its pattern."""
-    inner = _inner(expr)
-    if isinstance(inner, decl.UnboundVarDecl):
-        if inner.name == matched[0]:
-            return _jax_value(matched[1], arrays, params, bound, matched)
-        return arrays[inner.name] if inner.name in arrays else bound[inner.name]
-    method, args = inner.callable.method_name, inner.args
-
-    def value(arg):
-        return _jax_value(arg, arrays, params, bound, matched)
-
-    def param(arg):
-        found = arg.expr
-        return params[found.name] if found.name in params else bound[found.name]
-
-    if method == "binary":
-        op = args[1].expr.value
-        return {"add": jnp.add, "sub": jnp.subtract, "mul": jnp.multiply}[op](value(args[0]), value(args[2]))
-    if method == "dot":
-        return lax.dot_general(value(args[0]), value(args[1]), param(args[2])["dimension_numbers"])
-    if method == "reduce":
-        reduced = {"sum": jnp.sum, "max": jnp.max, "min": jnp.min}[args[1].expr.value]
-        return reduced(value(args[0]), axis=tuple(_axes(args[2], params, bound)))
-    if method == "shaped":
-        kind, laid = args[1].expr.value, param(args[2])
-        if kind == "transpose":
-            return jnp.transpose(value(args[0]), laid["permutation"])
-        return lax.broadcast_in_dim(value(args[0]), laid["shape"], laid["broadcast_dimensions"])
-    raise TypeError(method)
+def _bound(conditions) -> dict:
+    """Each variable a rule's conditions bind, by the expression they bind it to (`Evaluated.holds`)."""
+    found: dict = {}
+    for fact in conditions:
+        if isinstance(fact, decl.ExprFactDecl):
+            continue
+        left, right = (fact.left, fact.right) if hasattr(fact, "left") else fact.exprs
+        for side, other in ((left, right), (right, left)):
+            if isinstance(_inner(side), decl.UnboundVarDecl):
+                found.setdefault(_inner(side).name, other)
+                break
+    return found
 
 
-def _axes(arg, params: dict, bound: dict) -> tuple:
-    inner = _inner(arg)
-    if isinstance(inner, decl.UnboundVarDecl):
-        return params[inner.name] if inner.name in params else bound[inner.name]
-    return tuple(_inner(part).value for part in inner.args)
+class Traced(Evaluated):
+    """A rule's terms' values as JAX computes them over `arrays`, at an instantiation its conditions admitted
+    (`admitted`: its parameters, and the shapes and axes its conditions bound): each term's arithmetic JAX's
+    own at its operands' dtype, and a term its conditions name (`named`: the matched one by its pattern,
+    another by the expression that binds it) computed from that expression over these operands."""
+
+    def __init__(self, admitted: Evaluated, arrays: dict, named: dict):
+        super().__init__(arrays, admitted.params, symbolic=False)
+        self.bound = {name: value for name, value in admitted.bound.items()
+                      if not isinstance(value, np.ndarray)}
+        self.named = named
+
+    def value(self, expr):
+        inner = _inner(expr)
+        if isinstance(inner, decl.UnboundVarDecl) and not any(
+                inner.name in held for held in (self.arrays, self.params, self.bound)):
+            return self.value(self.named[inner.name])
+        return super().value(expr)
+
+    def _method(self, name: str, values: list):
+        if name == "binary":
+            x, op, y, _ = values
+            # A fused multiply-add's names (`rules.CONTRACTED`) are their primitives', which XLA contracts.
+            return {"add": jnp.add, "sub": jnp.subtract, "mul": jnp.multiply, "div": jnp.divide,
+                    "max": jnp.maximum, "min": jnp.minimum}[cost.PRIMITIVES.get(op, op)](x, y)
+        if name == "compare":
+            x, op, y, _ = values
+            return {"lt": jnp.less, "gt": jnp.greater, "eq": jnp.equal}[op](x, y)
+        if name == "unary":
+            x, op, _ = values
+            return {"exp": jnp.exp, "log": jnp.log, "log1p": jnp.log1p, "expm1": jnp.expm1,
+                    "neg": jnp.negative, "tanh": jnp.tanh, "abs": jnp.abs}[op](x)
+        if name == "dot":
+            return lax.dot_general(values[0], values[1], values[2]["dimension_numbers"])
+        if name == "shaped":
+            x, kind, params = values
+            if kind == "transpose":
+                return jnp.transpose(x, params["permutation"])
+            return lax.broadcast_in_dim(x, params["shape"], params["broadcast_dimensions"])
+        if name == "reduce":
+            x, monoid, axes, _ = values
+            return {"sum": jnp.sum, "max": jnp.max, "min": jnp.min}[monoid](x, axis=tuple(axes))
+        if name == "select":
+            predicate, false, true = values
+            return jnp.where(predicate, true, false)
+        return super()._method(name, values)
 
 
 @pytest.mark.parametrize(("name", "index", "rule"), MADE,
@@ -571,7 +671,7 @@ def test_every_stated_magnitude_is_at_least_the_tables(name, index, rule):
     checked = 0
     for evaluated, _ in itertools.islice(_instantiations(matched, conditions, symbolic=False), 64):
         names = sorted(evaluated.arrays)
-        for powers in itertools.permutations(POWERS * 2, len(names)):
+        for powers in itertools.product(POWERS, repeat=len(names)):
             stated_powers = dict(zip(names, powers, strict=True))
             for kind, action in actions:
                 if kind != "set" or _set_name(action) != "log2_bound":
@@ -581,8 +681,8 @@ def test_every_stated_magnitude_is_at_least_the_tables(name, index, rule):
                 operands = [jnp.asarray(evaluated.arrays[n], jnp.float32) for n in names]
 
                 def computed(*values, made=made, names=names, evaluated=evaluated):
-                    return _jax_value(made, dict(zip(names, values, strict=True)), evaluated.params,
-                                      evaluated.bound, matched)
+                    return Traced(evaluated, dict(zip(names, values, strict=True)),
+                                  {matched[0]: matched[1], **_bound(conditions)}).value(made)
 
                 closed = jax.make_jaxpr(computed)(*operands)
                 region = terms.region(closed, {i: 2.0 ** stated_powers[n] for i, n in enumerate(names)})
@@ -617,8 +717,19 @@ def _power(expr, rule, powers: dict, evaluated: Evaluated) -> int:
         product = _inner(args[0])
         (contracting, _), _ = evaluated.value(product.args[2])["dimension_numbers"]
         length = math.prod(np.shape(evaluated.value(product.args[0]))[axis] for axis in contracting)
-        return max(length - 1, 0).bit_length()
+        return max(length - 1, 0).bit_length() + _mode_power(evaluated.value(product.args[2]))
+    if ref.ident.name == "mode_power":
+        return _mode_power(evaluated.value(args[0]))
     raise TypeError(ref.ident.name)
+
+
+def _mode_power(params) -> int:
+    """The powers a product of `params` adds for its mode, as the engine reads it
+    (`terms.contraction_slack`) of fp32 operands; a mode whose rounding nothing states admits no rule."""
+    slack = terms.contraction_slack(params.get("precision"), jnp.float32, jnp.float32)
+    if slack is None:
+        raise Inadmissible("a product of a mode whose rounding nothing states")
+    return slack
 
 
 def _binding(rule, name: str):

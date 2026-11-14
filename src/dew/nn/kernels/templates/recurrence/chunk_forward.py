@@ -269,7 +269,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     per_key = g.ndim == 4
     if dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16), jnp.dtype(jnp.float32)):
         raise NotImplementedError(f"the mainloop takes 16-bit and fp32 operands, not {dtype}")
-    if per_key and (refused := per_key_refusal(dtype)):
+    if per_key and (refused := per_key_refusal(dtype, rounded=rounded)):
         raise NotImplementedError(refused)
     scale = key_width ** -0.5 if scale is None else scale
     width, columns = padded_widths(family, key_width, value_width, kept=keeps, per_key=per_key, tiles=tiles)

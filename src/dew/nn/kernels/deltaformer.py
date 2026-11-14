@@ -17,15 +17,15 @@ from jax.scipy.linalg import solve_triangular
 from dew.nn.documents import with_documents
 from dew.nn.precision import at_least_fp32
 
-MASKED = -1e30
-"""A score no allowed position reaches, so its exponential is zero and its gradient finite (no `inf`)."""
-
 
 def masked_softmax(scores, allowed):
     """A row-wise softmax over the `allowed` positions, zero elsewhere and on a row with none (fla's
-    `tril_softmax`, its denominator clamped at 1e-20)."""
-    masked = jnp.where(allowed, scores, MASKED)
-    weights = jnp.where(allowed, jnp.exp(masked - jnp.max(masked, axis=-1, keepdims=True)), 0.0)
+    `tril_softmax`, its denominator clamped at 1e-20). A position not allowed takes no part in the row's
+    maximum, whatever the allowed scores (an allowed score of -2e30 beside none is the row's whole weight),
+    and its exponential is of -inf, zero with a zero slope; a row with none takes its maximum as zero."""
+    peak = jnp.max(jnp.where(allowed, scores, -jnp.inf), axis=-1, keepdims=True)
+    peak = jax.lax.stop_gradient(jnp.where(jnp.isneginf(peak), 0.0, peak))
+    weights = jnp.exp(jnp.where(allowed, scores - peak, -jnp.inf))
     return weights / jnp.maximum(jnp.sum(weights, axis=-1, keepdims=True), 1e-20)
 
 

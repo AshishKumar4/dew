@@ -4,6 +4,7 @@ fold of the old Blackwell GEMM mainloop into it, template push piece 7, and its 
 a B300 itself (tests/test_gpu_gemm.py's cells)."""
 
 import dataclasses
+import functools
 
 import fla_gdn_support as support
 import jax
@@ -14,7 +15,7 @@ from generation_support import INTERPRETS
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
-from dew.nn.kernels.templates.gemm import mosaic_gpu
+from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
 
 TILE = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
 """A legal tcgen05 tile of every product `_on_tcgen05` pins (`tuning.pinned`): a CTA's 128 rows by 128
@@ -270,13 +271,68 @@ def test_an_eight_slot_kernel_gradient_compiles_within_its_predicates():
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
+def _pair_gradient(out_dtype, *, k_major: bool = False, rows: int = 4096, depth: int = 1024,
+                   width: int = 1024):
+    """The dense kernel gradient (`mosaic_gpu.tgmm`, x^T dy over `rows`) on a pair's tile (`PAIRED`): each
+    CTA its 128 of the pair's 256 depth rows by the pair's 256 columns, loading its share of both
+    operands' blocks along their features (`rings.Paired`), as cuBLASLt runs a B200's (cta_group::2);
+    `k_major`, its operands rows-contiguous (`[depth, rows]`, `[width, rows]`), as blockwise FP8's lie."""
+    def product(lhs, rhs):
+        return mosaic_gpu.tgmm(lhs, rhs, jnp.asarray([rows], jnp.int32), tiles=PAIRED, out_dtype=out_dtype,
+                               multiprocessors=generation.gpu_target("sm100").multiprocessors, dense=True,
+                               k_major=k_major)[0]
+
+    shapes = tuple(jax.ShapeDtypeStruct((extent, rows) if k_major else (rows, extent), jnp.bfloat16)
+                   for extent in (depth, width))
+    return product, shapes
+
+
+def test_a_pairs_dense_kernel_gradient_compiles_for_a_b200_within_its_resources():
+    """The dense kernel gradient on a pair (`_pair_gradient`), into fp32 and bf16, its operands laid
+    rows-major and rows-contiguous, compiled by Mosaic for a
+    compile-only B200 through ptxas: within the multiprocessor's shared memory and tensor memory, no
+    register spilled, where `tgmm` took no pair (its tiles one CTA's, row 5671's 1.12-1.25x cuBLASLt's time
+    on the 4B's kernel gradients, M-EM-42)."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    def case(out_dtype, k_major):
+        return support.KernelCase(f"tcgen05 pair tgmm {jnp.dtype(out_dtype).name} k_major={k_major}",
+                                  lambda: _pair_gradient(out_dtype, k_major=k_major))
+
+    cases = [case(dtype, k_major) for dtype in (jnp.float32, jnp.bfloat16) for k_major in (False, True)]
+    found = compile_mosaic_kernels(cases, "sm100")
+    assert len(found) == len(cases) and all(record.get("kernels") for record in found), found
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def pairs_dense_kernel_gradient_holds_check_1_on_blackwell(out_dtype, k_major):
+    """The dense kernel gradient on a pair (`_pair_gradient`, a 4096-row step, its operands rows-major or
+    rows-contiguous), run on a B200 or a B300: as exact as XLA's x^T dy from float64 truth (check 1;
+    tests/test_gpu_gemm.py's cell)."""
+    product, shapes = _pair_gradient(out_dtype, k_major=k_major)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 2)
+        return tuple(jax.random.normal(key, shape.shape).astype(shape.dtype)
+                     for key, shape in zip(keys, shapes, strict=True))
+
+    def plain(lhs, rhs, wide=jnp.float32):
+        lhs, rhs = (lhs.T, rhs.T) if k_major else (lhs, rhs)
+        return jnp.dot(lhs.T.astype(wide), rhs.astype(wide),
+                       precision=jax.lax.Precision.HIGHEST).astype(wide if wide == jnp.float64 else out_dtype)
+
+    assert_as_exact(jax.jit(product), jax.jit(plain), draw, f"a pair's dense kernel gradient into "
+                    f"{jnp.dtype(out_dtype).name} on Blackwell", seeds=SEEDS,
+                    truth_fn=functools.partial(plain, wide=jnp.float64))
+
+
 def test_a_pairs_tile_is_twice_a_ctas_and_takes_only_what_its_views_read():
     """A pair's tile (`PAIRED`, `mosaic.Transport.pairs_product`): its accumulators hold both CTAs' columns
-    (`mosaic_gpu.tile_columns`); a tile of 256 columns a CTA, past its half of one product, or of one CTA is
+    (`pricing.tile_columns`); a tile of 256 columns a CTA, past its half of one product, or of one CTA is
     none of the pair's (`mosaic_gpu.pair_takes`); and its product takes no prologue (its step views are its
     rows' and matrix's alone)."""
-    family = mosaic_gpu.family_of(PAIRED, jnp.bfloat16)
-    assert mosaic_gpu.tile_columns(PAIRED, family) == 2 * PAIRED.block_n
+    family = pricing.family_of(PAIRED, jnp.bfloat16)
+    assert pricing.tile_columns(PAIRED, family) == 2 * PAIRED.block_n
     assert mosaic_gpu.pair_takes(PAIRED, family)
     for refused in (dataclasses.replace(PAIRED, block_n=256), dataclasses.replace(PAIRED, cluster=1)):
         assert not mosaic_gpu.pair_takes(refused, family), refused
@@ -285,3 +341,55 @@ def test_a_pairs_tile_is_twice_a_ctas_and_takes_only_what_its_views_read():
         mosaic_gpu.gmm(x, w, jnp.asarray([256], jnp.int32), tiles=PAIRED, transpose_rhs=False,
                        out_dtype=jnp.bfloat16, multiprocessors=2, dense=True, prologue=lambda rows: rows)
 
+
+def test_a_pairs_tile_is_legal_for_a_dense_product_on_a_b200():
+    """A pair's tile is a dense product's legal tile on a B200, its streams planned as its kernel loads them
+    (`mosaic_gpu.multicast`: each CTA its half of the pair's block, no multicast ring), at Qwen3.5-4B's up
+    projection over a step's 24,576 tokens; a pair's tile was never legal while the planner multicast its
+    matrix, which the pair's streams refuse."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    launch = grouped_matmul.MosaicGmm()
+    with generation.assumed("sm100"):
+        target = generation.gpu_target()
+        ba = launch.bind(bf16((24576, 2560)), bf16((1, 2560, 9216)), jax.ShapeDtypeStruct((1,), jnp.int32),
+                         out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+        assert launch.legal(ba, dataclasses.replace(PAIRED, stages=5), target)
+
+
+def test_a_b200s_products_lower_at_the_tiles_their_launch_derives():
+    """On a B200, where the derivation tries a pair's bundle first (`mosaic_gpu.paired_first`), a dense
+    product over a step's rows and a routed one, its outputs scattered to their slots (which a pair's
+    bundle does not take, `Transport.gathers_rows`), each lower through Mosaic for sm100 at the tile their
+    launch derives, which it holds legal."""
+    from kernel_compile import lowered_for
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
+    slots = jax.ShapeDtypeStruct((4096,), jnp.int32)
+    calls = {"dense": (lambda x, w: gemm.gemm(x, w, None, out_dtype=jnp.bfloat16),
+                       (bf16((4096, 1024)), bf16((1024, 2048)))),
+             "scattered": (lambda x, w, sizes, slots: gemm.gemm(x, w, sizes, scatter=slots,
+                                                                out_dtype=jnp.bfloat16),
+                           (bf16((4096, 1024)), bf16((4, 1024, 2048)), sizes, slots))}
+    for name, (call, specs) in calls.items():
+        with generation.assumed("sm100"), generation.chosen(grouped_matmul="mosaic"), tuning.seen() as seen:
+            lowered_for(call, specs, "sm100")
+        taken = [(op, config, ba) for (op, _), (config, ba) in zip(seen, seen.taken, strict=True)
+                 if isinstance(op, grouped_matmul.MosaicGmm)]
+        assert taken, name
+        with generation.assumed("sm100"):
+            assert all(op.legal(ba, config, generation.gpu_target()) for op, config, ba in taken), name
+
+
+def test_an_exactly_summed_tile_holds_the_registers_its_promotes_hold():
+    """A B200's exactly summed grouped product (bf16 operands, 128 rows a group, depth and width 128) holds
+    its 128 x 128 tile legal: its windows' partials and running sums stay in tensor memory, promoted a chunk
+    at a time (`Tcgen05Rings._promoted`), whose two chunks the register model charges, not two register
+    accumulators (B6, where 272 registers charged past the 248 budget refused the tile)."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    launch = grouped_matmul.MosaicGmm()
+    with generation.assumed("sm100"):
+        target = generation.gpu_target()
+        ba = launch.bind(bf16((512, 128)), bf16((4, 128, 128)), jax.ShapeDtypeStruct((4,), jnp.int32),
+                         out_dtype="float32", trans_rhs=False, interpret=False, exact_sums=True)
+        assert launch.legal(ba, mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=1, family="tcgen05"), target)

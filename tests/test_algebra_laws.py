@@ -156,13 +156,15 @@ def _certify_every_structure(declaration, shapes, tiles, walked: tuple[int, ...]
 KERNEL_TILES = tuple(itertools.product(ROWS, KEYS, WIDTHS))
 
 
-FORWARD_CASES = tuple(itertools.product((False, True), (False, True), DTYPES, FACTORS))
+FORWARD_CASES = tuple(itertools.product((False, True), (False, True), FACTORS, DTYPES))
 """The forward's cases (`test_every_structure_of_the_forward_is_certified`): its base, its order, its
-operands' dtype and its logits' factor."""
+logits' factor and its operands' dtype, the dtypes of one declaration together: their forms compute the same
+reals, so a map task of them proves each law once (`algebra_laws._PROVEN`)."""
 
-BACKWARD_CASES = tuple(itertools.product(("keys", "rows"), (False, True), (False, True), DTYPES, WIDTHS))
+BACKWARD_CASES = tuple(itertools.product(("keys", "rows"), (False, True), (False, True), WIDTHS, DTYPES))
 """The backward's cases (`test_every_structure_of_the_backward_is_certified`): its walked axis, whether it
-is hooked and dropping, its operands' dtype and its head width."""
+is hooked and dropping, its head width and its operands' dtype, the dtypes of one declaration together, as
+the forward's are."""
 
 
 def _certified_in_shards(label: str, cases: tuple, units: int, certify) -> None:
@@ -180,25 +182,24 @@ def _certified_in_shards(label: str, cases: tuple, units: int, certify) -> None:
     sharded(label, certified, units)
 
 
-@pytest.mark.shards(units=120, per_task=1)
+@pytest.mark.shards(units=60, per_task=3)
 def test_every_structure_of_the_forward_is_certified():
     """The forward's softmax walk (`attention_algebra.declaration`), in either base, queries or keys first,
-    over its formed logits or its raw products and each regime of their factor, at every dtype, each case's
-    structures at each walked extent (`WALKED`) a unit of its own: a case 40 s to 55 s at two keys and two
-    to three times that at three (armada, laws-extent2), one unit a map task."""
-    def certify(base2, keys_first, dtype, factor, keys):
-        _certify_every_structure(*_forward(base2, keys_first, dtype, factor), KERNEL_TILES, (keys,))
+    over its formed logits or its raw products and each regime of their factor, at every dtype, each case a
+    unit: its structures over the kernel tiles found once, each certified at every walked extent (`WALKED`),
+    a declaration's three dtypes a map task, which proves their shared laws once."""
+    def certify(base2, keys_first, factor, dtype):
+        _certify_every_structure(*_forward(base2, keys_first, dtype, factor), KERNEL_TILES)
 
-    _certified_in_shards("the forward's structures", tuple((*case, keys) for case in FORWARD_CASES
-                                                           for keys in WALKED), 120, certify)
+    _certified_in_shards("the forward's structures", FORWARD_CASES, 60, certify)
 
 
-@pytest.mark.shards(units=120, per_task=4)
+@pytest.mark.shards(units=120, per_task=6)
 def test_every_structure_of_the_backward_is_certified():
     """The backward (`attention_backward_algebra.backward_declaration`) at the scale of each head width,
-    walked over keys or queries, hooked and dropping or not, at every dtype: each case 14 s or so, 25 at the
-    most, four a map task (armada, 3bfbdfc842)."""
-    def certify(walked, hooked, dropped, dtype, width):
+    walked over keys or queries, hooked and dropping or not, at every dtype: two widths' three dtypes a map
+    task."""
+    def certify(walked, hooked, dropped, width, dtype):
         declaration, shapes = _backward(walked, hooked, dropped, dtype, width)
         tiles = tuple((rows, keys, width) for rows, keys in itertools.product(ROWS, KEYS))
         _certify_every_structure(declaration, shapes, tiles)

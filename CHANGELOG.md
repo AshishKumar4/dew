@@ -27,6 +27,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   memory. `AheadTarget.capacity_gib` is that memory, and `AheadOfTime.capacity` the limit the plan held to.
 
 
+- Dew requires its JAX build 0.12.0.1.post87 (Python alone; the CUDA and PJRT plugins stay post81's): a run under
+  a profiler or dumping XLA's programs reads the Mosaic GPU lowerings and kernel certifications an unprofiled run
+  stored, where it lowered and certified them afresh.
+- Dew requires its JAX build 0.12.0.1.post86 (Python alone; the CUDA and PJRT plugins stay post81's): a Mosaic
+  GPU kernel's identity reads its operations, not its source locations, so a kernel traced alone and again in a
+  step's gradient compiles once; cuDNN's attention gates read the capability of the GPU a program is traced
+  for, so compiling ahead for a compile-only GPU takes head dims past 128; the Mosaic GPU pipeline takes a
+  prefetch of a step's first values under the step before's last products; the TPU pipeline carries a value
+  across its steps.
 - Dew requires its JAX build 0.12.0.1.post85 (Python alone; the CUDA and PJRT plugins stay post81's): the
   GPU interpreter checks a barrier wait that names its phase at its waits alone, so consumers that take
   alternate tiles of one ring over several rotations, warps among them, are checked rather than refused.
@@ -69,8 +78,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   its own, and refuses 8 to 13, naming both ways on: resume with the Dew that wrote it, or go on from its
   weights as a new run that reads its data afresh; a relaxed resume of one starts its data again.
   `Objective.bind_plan`, `dew.data.pipeline.earlier`, `Pipeline.at` and `ObjectiveData.earlier` are gone,
-  `Source.manifest` takes no version, and a run handed a compiled loader records the version the run it
-  resumes saved, or this Dew's.
+  `Source.manifest` takes no version, and the data layer reads by this Dew's alone: `compile`, `iterate`,
+  `validation`, `publish`, `fitted`, `held` and `text.export_tokens` take no `plan_version`, nor `dew data
+  export` and `dew data publish` a `--plan-version`. A run resolves its version once
+  (`RunConfig.data_plan_version`): one it reads it reads as its own and records as this Dew's, the version
+  its positions are saved under; one it reads none of is refused resumed exactly and started again relaxed.
 
 - A schedule's step horizons (its warmup's and decay's lengths in steps) are operands of its solver's state
   (`RateState.horizons`) where a run builds it stated (`OptimConfig.build(stated=True)`), so a rehearsed run

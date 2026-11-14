@@ -20,8 +20,11 @@ import jax.numpy as jnp
 
 from dew.nn.precision import at_least_fp32
 
-EMPTY = -1e38
-"""An empty past's running maximum: a span that holds no token (`exp` of it against any token's is zero)."""
+EMPTY = -jnp.inf
+"""An empty past's running maximum: a span that holds no token, so it never stands for a token's (a finite
+one, -1e38, outweighed a first token's key of -2e38 and read it as 0 / 0). Its `exp` against any token's is
+zero, its slope zero: every span joined after the entering one holds a token, and a token reads its own key
+beside it (`tau`), so no maximum is two empty ones'."""
 
 
 class SpanCarry(NamedTuple):
