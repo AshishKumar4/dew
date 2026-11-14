@@ -126,6 +126,23 @@ print(json.dumps(sorted(training)))
     assert json.loads(run.stdout.splitlines()[-1]) == []
 
 
+def test_the_conditioning_inputs_import_no_weight_interop():
+    """The conditioning inputs (a spec, the checkpoint-free encoders, an image's conditions) import nothing
+    of dew.interop: the encoders that bind a released checkpoint are interop's, with their loaders (row
+    5996), and a model's inputs read no release's storage."""
+    script = r'''
+import json
+import sys
+import dew.inputs.condition, dew.inputs.diffusion, dew.inputs.encoders, dew.inputs.spec
+interop = [name for name in sys.modules if name == "dew.interop" or name.startswith("dew.interop.")]
+print(json.dumps(sorted(interop)))
+'''
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout.splitlines()[-1]) == []
+
+
 @pytest.mark.parametrize("module", ["dew.config", "dew.training.budget"])
 def test_a_config_or_a_package_imports_no_trainer_until_a_run_trains(module):
     """A run's configuration reads its dataclasses' types and none of the trainer, which a run reads
