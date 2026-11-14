@@ -22,7 +22,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -33,6 +33,7 @@ from dew.inference.engine import Timed, Waiting, normalized, reloaded, settled
 from dew.inference.tasks import held
 from dew.nn.inputs import mesh_of
 from dew.nn.protocols import StagedStacks
+from dew.nn.sharding import FORWARD, placing
 
 
 @dataclass(frozen=True)
@@ -166,7 +167,9 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         task kept its programs in (`dew.training.ahead.keeping`), it loads each program the file holds
         for a pass in place of tracing and compiling it."""
         server = cls(task, variables, rows=rows)
-        server.programs = tuple(task.compile(server.variables))
+        # Under the context its passes run in (`_context`), so the programs compiled are the ones they run.
+        with server._context():
+            server.programs = tuple(task.compile(server.variables))
         return server
 
     @property
@@ -289,9 +292,13 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
             variables = stored_layers(task.model, variables)
         self._served = (task, reloaded(normalized(variables, self._source_shapes), self.variables))
 
-    def _context(self) -> contextlib.AbstractContextManager[None]:
-        """The mesh the task's pass traces under."""
-        return contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh)
+    @contextlib.contextmanager
+    def _context(self) -> Iterator[None]:
+        """The mesh the task's pass traces under, and its projections' weights each whole (`placing`,
+        `dew.nn.sharding.FORWARD`), so a projection mapped per shard takes a launch on each device's rows."""
+        with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh),
+              placing(None if self.mesh is None else FORWARD)):
+            yield
 
     def fail(self, failure: BaseException, taken: Sequence[_Request[Row, Payload, Output, Answer]] = ()
              ) -> None:

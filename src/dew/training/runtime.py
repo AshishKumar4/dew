@@ -29,11 +29,13 @@ from dew._coordination import broadcast_from_process_zero, end_pool_on_failure, 
 from dew._devices import (
     DEW_SHARE,
     FRACTIONS,
+    WRITTEN,
     apply_xla_flags,
     backend_open,
     cuda_plugin,
     flags_hold,
     flags_set,
+    fraction_name,
     pool_statement,
     preallocate_gpu_pool,
     refuse_cpu_only_jax,
@@ -138,6 +140,20 @@ def unprepared(multi_host: bool | None, xla_flags: str | None,
 
 _POOLED: list[bool] = []
 """Whether this process's pool was decided (`pooled`), by its preparation or its first run."""
+
+
+def share_pool(share: float) -> None:
+    """Hold this process's GPU pool to `share` of each GPU, before its backend opens: a run that leaves the
+    rest to another engine on its GPUs (vLLM or SGLang beside the trainer, examples/train_rlvr.py), in
+    place of Dew's 95% (`preallocate_gpu_pool`), stated as the run's own (`pool_statement`: `named`). A
+    backend already open keeps the pool it took, and is refused here."""
+    if not 0 < share <= 1:
+        raise ValueError(f"a pool's share of each GPU is in (0, 1], not {share}")
+    if backend_open():
+        raise RuntimeError("JAX's backend has opened, and its pool is fixed: share the GPU before the "
+                           "process's first JAX computation")
+    os.environ[fraction_name()] = str(share)
+    os.environ.pop(WRITTEN, None)
 
 
 def pooled(*, joins: bool) -> None:

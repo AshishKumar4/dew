@@ -34,7 +34,7 @@ from dew.nn.kernels.templates import report
 from dew.nn.protocols import OffloadsResiduals, Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
-from dew.telemetry.instrumentation import compiled_memory
+from dew.telemetry.instrumentation import CompiledMemory, compiled_memory
 
 if TYPE_CHECKING:
     from dew.training.footprint import Footprint
@@ -341,8 +341,14 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     stats = compiled_memory(executable)
     if stats is None:
         return None
-    return admitted(devices, stats.argument - built, stats.output - stats.alias + held, stats.temp,
-                    placed=placed)
+    return admitted(devices, stats.argument - built, placed_beside(stats, held), stats.temp, placed=placed)
+
+
+def placed_beside(stats: CompiledMemory, held: int) -> int:
+    """The bytes a step's fit check places beside its temporaries (`step_headroom`): its outputs that write
+    over no donated argument, and the `held` bytes the loop keeps outside the step (copies, accumulators, a
+    state the devices hold none of yet), what a refusal states beside them (`Probe.beside`)."""
+    return stats.output - stats.alias + held
 
 
 MEMORY_STATS = ('bytes_limit', 'bytes_in_use', 'pool_bytes', 'largest_free_block_bytes', 'peak_bytes_in_use')

@@ -565,6 +565,8 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
         run.fit(stream, steps=2)
     assert [(probe["narrow"], probe["fits"]) for probe in run.plan["probes"]] == [(True, True)]
     assert steps.count == 1
+    # What it placed beside the step's temporaries counts the state it was planned before placing.
+    assert run.plan["probes"][0]["beside"] >= state
 
 
 def test_a_fresh_plan_its_placed_devices_refuse_records_no_rung(monkeypatch, tmp_path):

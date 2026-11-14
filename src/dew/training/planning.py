@@ -60,6 +60,7 @@ from dew.training.memory import (
     local_devices,
     offloads,
     placeable,
+    placed_beside,
     pooled_headroom,
     recompute_more,
     recompute_record,
@@ -418,16 +419,17 @@ class Probe:
     """The headroom the derivation judged the candidate would leave (`derived_headroom`), None where it
     judged none: beside `headroom`, which the compile measured, its error."""
     beside: int | None = None
-    """The bytes the fit check placed beside the step's temporaries (`step_headroom`): its outputs that
-    write over no donated argument and what the loop holds outside the step (copies, accumulators), less
-    those of them its first call builds among its arguments. None where none were read."""
+    """The bytes the fit check placed beside the step's temporaries (`placed_beside`): its outputs that
+    write over no donated argument and what the loop holds outside the step (copies, accumulators, a state
+    not placed yet). None where none were read."""
 
     @classmethod
     def read(cls, split: int, candidate: Candidate, rung: Mapping[str, JSON], fit: bool,
-             headroom: int | None, executable: jax.stages.Compiled | None) -> Probe:
-        """The compile of `candidate` at `rung`, its memory as XLA reads it where it compiled."""
+             headroom: int | None, executable: jax.stages.Compiled | None, held: int) -> Probe:
+        """The compile of `candidate` at `rung`, its memory as XLA reads it where it compiled, `held` the
+        bytes its fit check held beside it (`FitSearch.fitting`)."""
         stats = None if executable is None else compiled_memory(executable)
-        beside = None if stats is None else stats.output - stats.alias + candidate.held
+        beside = None if stats is None else placed_beside(stats, held)
         return cls(split, rows_of(candidate.micro), rung, fit, headroom,
                    None if stats is None else stats.temp, None if stats is None else stats.argument,
                    candidate.footprint, beside=beside)
@@ -1140,8 +1142,13 @@ class FitSearch[LossT, EffectsT]:
         """`step_fits` of `executable`, `candidate`'s compiled step or its sampled twin, with the state's
         `unplaced` bytes beside it where the devices hold none of it yet."""
         unplaced = self.unplaced or 0
-        return step_fits(executable, self.mesh, candidate.held + unplaced, candidate.built + unplaced,
+        return step_fits(executable, self.mesh, self.held(candidate), candidate.built + unplaced,
                          placed=self.unplaced is None)
+
+    def held(self, candidate: Candidate) -> int:
+        """The bytes the fit check holds beside `candidate`'s step: its own (`Candidate.held`), and the
+        state's `unplaced` bytes where the devices hold none of it yet."""
+        return candidate.held + (self.unplaced or 0)
 
     def lowering(self, split: int) -> Candidate:
         """The step at `split` at the objective's rung and the search's `narrow`, lowered: from the
@@ -1386,7 +1393,7 @@ class FitSearch[LossT, EffectsT]:
                 fit, headroom = self.fitting(None if self.sampled is None else self.sampled.executable,
                                              candidate)
         seconds = time.perf_counter() - began
-        probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
+        probe = Probe.read(split, candidate, self.current(), fit, headroom, executable, self.held(candidate))
         foreseen = _judged_headroom(self.headroom_bounds(candidate))
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen,
                                     spent=spent)

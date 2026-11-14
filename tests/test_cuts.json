@@ -231,8 +231,8 @@
 "tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm100-128-int8-decode]",
 "tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm100-32-bfloat16-decode]",
 "tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm100-32-int8-decode]",
-"tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm100-64-float32-decode]",
-"tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm103-256-bfloat16-decode]",
+"tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm103-128-float32-decode]",
+"tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm103-32-bfloat16-decode]",
 "tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm120-128-bfloat16-decode]",
 "tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm120-256-bfloat16-decode]",
 "tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm120-64-bfloat16-prefill]",
@@ -963,21 +963,21 @@
 "tests/test_decoder_remat.py::test_remat_prefills_and_appends_the_same_cache[False-dense]"
 ],
 "tests/test_deepest_rings.py": [
-"tests/test_deepest_rings.py::test_a_blackwell_attention_at_its_deepest_ring_compiles_within_its_resources[sm100-64]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention backward 64-sm120]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention backward 64-sm86]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention backward 64-sm90]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 128-sm120]",
-"tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 128-sm80]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 128-sm86]",
-"tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 128-sm89]",
-"tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 64-sm100]",
+"tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 128-sm90]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 64-sm120]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 64-sm86]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention forward 64-sm90]",
-"tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[recurrence kimi-linear-kda-sm80]",
+"tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[recurrence kimi-linear-kda-sm120]",
+"tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[recurrence kimi-linear-kda-sm86]",
+"tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[recurrence kimi-linear-kda-sm90]",
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[recurrence qwen3.5-27b-gdn-sm120]",
-"tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[recurrence qwen3.5-27b-gdn-sm89]"
+"tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[recurrence qwen3.5-27b-gdn-sm86]",
+"tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[recurrence qwen3.5-27b-gdn-sm90]"
 ],
 "tests/test_deepseek_v41.py": [
 "tests/test_deepseek_v41.py::test_a_paged_drafting_cache_drafts_what_the_compact_cache_drafts[None]",
@@ -1254,14 +1254,8 @@
 "tests/test_fresh_rate.py::test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one",
 "tests/test_fresh_rate.py::test_under_muon_a_fresh_groups_rate_reaches_its_vector_and_its_matrix"
 ],
-"tests/test_gemm_formed.py": [
-"tests/test_gemm_formed.py::test_a_composed_mlps_training_step_compiles_within_its_resources[sm90]"
-],
 "tests/test_gemm_gather.py": [
 "tests/test_gemm_gather.py::test_a_gathered_grouped_product_reads_each_row_where_its_table_says"
-],
-"tests/test_gemm_nvfp4.py": [
-"tests/test_gemm_nvfp4.py::test_a_stack_of_nvfp4_banks_is_read_at_its_layer_as_that_layers_bank[xla-gathered-rows]"
 ],
 "tests/test_gemm_tcgen05.py": [
 "tests/test_gemm_tcgen05.py::test_tcgen05s_epilogues_hold_check_1[row scale-128x2]"
@@ -1629,6 +1623,9 @@
 ],
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp4]"
+],
+"tests/test_level_stacking.py": [
+"tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[slower-first-layers]"
 ],
 "tests/test_linear_attention.py": [
 "tests/test_linear_attention.py::test_a_cached_layer_traced_for_a_jvp_decodes_its_token[plain]",
@@ -2386,6 +2383,16 @@
 "tests/test_recurrence_stability.py::test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences[scalar write-resets on chunk edges]",
 "tests/test_recurrence_stability.py::test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences[scalar write-the decay bound]",
 "tests/test_recurrence_stability.py::test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences[vector delta-resets on chunk edges]"
+],
+"tests/test_recurrence_template_stability.py": [
+"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[gated-saturated gates-accurate]",
+"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[rated-resets on chunk edges-accurate]",
+"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[rated-resets on chunk edges-fast]",
+"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[rated-steep then mild-accurate]",
+"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[scalar delta-resets on chunk edges-None]",
+"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[scalar write-decays near one-None]",
+"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[vector delta-saturated gates-None]",
+"tests/test_recurrence_template_stability.py::test_the_narrow_gated_delta_gradient_compiles_for_an_h100"
 ],
 "tests/test_recurrence_witness.py": [
 "tests/test_recurrence_witness.py::test_a_grouped_backwards_records_lie_in_their_key_heads_enclosures[keys gated-sm80]",
