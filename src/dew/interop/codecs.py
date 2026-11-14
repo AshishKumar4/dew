@@ -75,7 +75,7 @@ from dew.interop import unread
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.unread import Stored, Unread
 from dew.interop.weights import checkpoint_array, checkpoint_dtype
-from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, Block, block_sides, fp8_blocks_on_host
+from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, E4M3_MAX, Block, block_sides, fp8_blocks_on_host
 
 # --------------------------------------------------------------------------
 # E2M1 codes under E8M0 exponents, shared by every FP4 format
@@ -1380,7 +1380,7 @@ def _block_structure(weights: Mapping[str, object]) -> tuple[int, int] | None:
 
 
 def _code_range(scheme: _WeightScheme) -> tuple[float, float]:
-    return ((-448.0, 448.0) if scheme.kind == 'float'
+    return ((-E4M3_MAX, E4M3_MAX) if scheme.kind == 'float'
             else (-(1 << (scheme.bits - 1)), (1 << (scheme.bits - 1)) - 1))
 
 

@@ -75,7 +75,14 @@ from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.fake_quant import fp4_codes, fp8_block_cast, fp8_blocks_on_host, fp8_codes, straight_through
+from dew.nn.fake_quant import (
+    E4M3_MAX,
+    fp4_codes,
+    fp8_block_cast,
+    fp8_blocks_on_host,
+    fp8_codes,
+    straight_through,
+)
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import accumulated, at_least_fp32, correctly_rounded_divide, float32_einsum
@@ -422,14 +429,14 @@ def rounding_growth(module: nn.Module, name: str | None, contraction: int, dtype
     if not math.isfinite(clip) or clip <= 0:
         raise ValueError(f"a weight calibration's clip is finite and positive, not {policy.calibration!r}")
     group = contraction if policy.tile_size is None else min(policy.tile_size, contraction)
-    bound, step = (127.5, 0.5) if policy.dtype == "int8" else (448.0, 2.0 ** -10)
+    bound, step = (127.5, 0.5) if policy.dtype == "int8" else (E4M3_MAX, 2.0 ** -10)
     tiny = math.sqrt(float(jnp.finfo(dtype).tiny))
 
     def growth(scale: float) -> float:
         if policy.dtype == "int8":
             grown = 1 + math.sqrt(group) * scale / 255
         else:
-            grown = 1 + 2 ** -4 + math.sqrt(group) * scale * 2 ** -10 / 448
+            grown = 1 + 2 ** -4 + math.sqrt(group) * scale * 2 ** -10 / E4M3_MAX
         # A scale Qwix takes as 1 (the docstring) can meet a value it rounds to nonzero.
         return max(grown, 2.0) if bound * tiny / scale > step else grown
 
