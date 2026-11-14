@@ -17,6 +17,7 @@ from xml.etree import ElementTree
 
 import jax
 import pytest
+import run_kinds
 import test_codec_checkpoints
 import test_host_placement
 import test_run_options
@@ -35,7 +36,19 @@ FLOWS = (
     # A pool of two processes, whose ranks' output a user's arithmetic makes long (row 5434).
     test_host_placement.test_a_pool_reads_its_own_shards_of_a_host_resident_bank,
 )
-"""The flows, each another file's test function: every case of it runs."""
+"""The flows, each another file's test function: every case of it runs, each in a child of its own where the
+flow states its cases (`CASES`)."""
+
+CASES = {test_run_options.test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set:
+         tuple(run_kinds.KINDS)}
+"""The cases a flow runs one to a child, by their ids: a command-line run of each kind took 141 s together,
+past a group's 120 s (row 5541)."""
+
+TARGETS = [(flow, case) for flow in FLOWS for case in CASES.get(flow, (None,))]
+"""Each flow, or each of its cases (`CASES`), as one test."""
+
+NAMES = [flow.__name__ + ("" if case is None else f"[{case}]") for flow, case in TARGETS]
+"""Each target's name: its flow's, its case's id after it."""
 
 FLOW_SECONDS = 1200.0
 """What a flow's child process has before it is aborted for its stacks (`process_support.relayed`): below
@@ -44,8 +57,8 @@ wrote, not as a task cut short."""
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="a user's CPU path, which the CPU lane runs")
-@pytest.mark.parametrize("flow", FLOWS, ids=lambda flow: flow.__name__)
-def test_a_flow_holds_in_a_process_that_computes_as_a_users_does(flow, tmp_path):
+@pytest.mark.parametrize(("flow", "case"), TARGETS, ids=NAMES)
+def test_a_flow_holds_in_a_process_that_computes_as_a_users_does(flow, case, tmp_path):
     """`flow`, a test of the suite, run by pytest in a child process on the CPU with a user's arithmetic:
     every case of it ran and passed, none skipped, each in a process that reports no wide CPU arithmetic, no
     matmul precision of the suite's and the suite's devices (the JUnit property `users_arithmetic`,
@@ -55,7 +68,7 @@ def test_a_flow_holds_in_a_process_that_computes_as_a_users_does(flow, tmp_path)
     # The flow whole: what a supervisor's environment would have pytest select or load is no part of it.
     environment = {name: value for name, value in users_process(os.environ).items()
                    if name not in session.UNKEYED}
-    target = f"{tests.name}/{flow.__module__}.py::{flow.__name__}"
+    target = f"{tests.name}/{flow.__module__}.py::{NAMES[TARGETS.index((flow, case))]}"
     ran = relayed([sys.executable, "-m", "pytest", target, "-q", "--no-header", "-p", "no:cacheprovider",
                    f"--junitxml={report}"], environment, timeout=FLOW_SECONDS)
     cases = list(ElementTree.parse(report).iter("testcase"))
