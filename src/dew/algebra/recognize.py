@@ -488,12 +488,10 @@ def _extras(index: fusion.Index, row: jcore.Var | Sequence[jcore.Var], output: j
     where it reads more than `most`, which no caller takes. Made from a row is read as far as a candidate's
     operands lie from its results (twice `REACH`).
 
-    The walk back from `output` crosses every value made from a row on the way, and a family walks it for
-    every pair of an anchor's operands and results (`_swiglus`): where the result lies a layer past the
-    operand (a convolution is one equation), that is most of the layer's program. It stops at the first
-    extra past `most`: such a pair is no candidate, and its walk is refuted within a few values of its
-    result (a layer's weight, its bias), where walking it whole made the capability matrix's rcm-unet cell
-    spend 804 of its 902 s in 69,824 such walks, 1,250 values each (row 5524)."""
+    The walk back from `output` stops when it finds more than `most` extras: a caller refuses such a pair,
+    so the values the walk has not yet reached need no visit. A family walks every pair of an anchor's
+    operands and results (`_swiglus`), and where a result lies a layer past its operand (a convolution is
+    one equation), walking the pair whole crosses most of the layer (row 5524)."""
     rows = (row,) if isinstance(row, jcore.Var) else tuple(row)
     reached = [_forward(index, source, 2 * REACH) for source in rows]
     if not all(output in found for found in reached):
