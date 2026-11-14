@@ -2687,8 +2687,8 @@ jaraco-functools==4.6.0 \
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post92 \
-    --hash=sha256:1fb4537e5a9e72a218e661587bc172a944c138c2ff14c9d95ed8f7bbffa84310
+jax==0.12.0.1.post93 \
+    --hash=sha256:f2d3cd98ce2418f822add96aa86a660f515768e3768815264506bc2b72dbfe56
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
