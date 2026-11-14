@@ -774,15 +774,17 @@ def test_a_b200s_dense_kernel_gradient_runs_no_rewriting_role():
         # At the default precision, a step's: no promoted sums (`templates.product.promoted`).
         return gemm.gemm_t(x, dy, None, out_dtype=jnp.float32, precision=jax.lax.Precision.DEFAULT)
 
-    with generation.chosen(grouped_matmul="mosaic"), tuning.seen() as seen:
-        kc.PTX.clear()
-        found = kc.compile_mosaic_kernels([support.KernelCase("up kernel gradient",
-                                                              lambda: (kernel_gradient, operands))], "sm100")
-    with generation.assumed("sm100"):
+    # The launch's tile as this process traces it (its selection's), its kernel's threads as its compile's
+    # records state them, wherever the compile ran (`kernel_compile.compiled_apart`).
+    with generation.chosen(grouped_matmul="mosaic"), generation.assumed("sm100"), tuning.seen() as seen:
+        jax.jit(kernel_gradient).trace(*operands)
         target = generation.gpu_target()
         assert seen.taken and all(op.legal(ba, config, target) for (op, _), (config, ba)
                                   in zip(seen, seen.taken, strict=True)), seen.taken
-    threads = {int(each) for ptx in kc.PTX.values() for each in re.findall(r"\.maxntid (\d+),", ptx)}
+    with generation.chosen(grouped_matmul="mosaic"):
+        found = kc.compile_mosaic_kernels([support.KernelCase("up kernel gradient",
+                                                              lambda: (kernel_gradient, operands))], "sm100")
+    threads = {kernel["threads"] for record in found for kernel in record.get("kernels", [])}
     assert threads == {256}, threads
     failed = kc.mosaic_failures(found)
     assert not failed, "\n".join(failed)
