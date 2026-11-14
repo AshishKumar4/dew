@@ -642,39 +642,39 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
                     sub: int = SUB) -> Iterator[jax.Array]:
     """A chunk's pairs' products under a decay a key dimension, one key block's for each of `rows` (each
     forming its row when called: the queries, the write-gated keys; fp32) against the same `keys` (fp32), its
-    prefix halves `prefix`, unmasked `[C, C]` fp32 each, formed as they are taken, one output's row and
-    products at a time (a mainloop adds each to its sum before the next is formed), their factors formed once
-    for all of them: `sum_k r_ik k_jk exp2(g_ik - g_jk)` for row `i` in sub-chunk `s` and key `j` in an
-    earlier sub-chunk `t < s`, zero for `t >= s` (a sub-chunk's own pairs are `key_diagonal_bands`', each its
-    own decay, as fla's token-parallel diagonal). The pair's decay splits at `s`'s first token `G_s` and `t`'s
-    last `E_t`, `exp2(g_i - G_s) exp2(G_s - E_t) exp2(E_t - g_j)`: the rows gated down to their own
-    sub-chunk's start and the keys up to their own's end, each one tile's exponentials whatever the outputs;
-    the middle factor a key's vector a pair of sub-chunks (`between` of `at(token)`, the prefix halves at a
-    token as a column's vectors), laid over the rows of `s`; one product a key sub-chunk `t` and output, the
-    keys of `t` against every row into the columns of `t` alone ('pairs', `summed`, an iterable of `(name,
-    lhs, rhs)` into an accumulator of a `shape`), the keys gated up staged once for every output's
+    separated prefix `prefix` (`separated` of its halves), unmasked `[C, C]` fp32 each, formed as they are
+    taken, one output's row and products at a time (a mainloop adds each to its sum before the next is
+    formed), their factors formed once for all of them: `sum_k r_ik k_jk exp2(g_ik - g_jk)` for row `i` in
+    sub-chunk `s` and key `j` in an earlier sub-chunk `t < s`, zero for `t >= s` (a sub-chunk's own pairs are
+    `key_diagonal_bands`', each its own decay, as fla's token-parallel diagonal). The pair's decay splits at
+    `s`'s first token `G_s` and `t`'s last `E_t`, `exp2(g_i - G_s) exp2(G_s - E_t) exp2(E_t - g_j)`: the rows
+    gated down to their own sub-chunk's start and the keys up to their own's end, each one tile's exponentials
+    whatever the outputs; the middle factor a key's vector a pair of sub-chunks (`between` of `at(token)`, the
+    separated prefix at a token as a column's vectors, separated once a key block where the caller stages it:
+    separated at each read, the range reductions of a B200's intra walk were a third of its instructions, Kimi
+    Linear's forward modelled at 875bcf02017), laid over the rows of `s`; one product a key sub-chunk `t` and
+    output, the keys of `t` against every row into the columns of `t` alone ('pairs', `summed`, an iterable of
+    `(name, lhs, rhs)` into an accumulator of a `shape`), the keys gated up staged once for every output's
     (`staged(up).rows(start, count)`, the keys `start` to `start + count`, read transposed): masked to their
     sub-chunk, each product's right operand a whole chunk of keys, four products a chunk's width each and the
     keys staged again for each. Every exponent is at most zero. The references, factors and products are
-    rolled loops, a sub-chunk's references read where it needs them and each product's columns put into a
-    tile (`placed`, `(put(t, value), read())`) read whole once: unrolled, an sm100's 32-column key block held
-    248 words a thread and spilled (row 5298, jsf-sm100-redgreen). A product takes `right` keys, a
-    whole number of sub-chunks (the narrowest columns a family's product takes, tcgen05's 32), the columns
-    of its own sub-chunk kept. A sub-chunk's own pairs factored too, the
-    queries and keys decay-scaled around its first token and taken on the tensor cores, put a packed
-    document's first token's output, a row of 2.5e-5 where `q . k` cancels, at 0.83 of its size from
-    float64 on an A100 against 7e-3 taken each its own decay (row 5194, M-JS-48w). Kimi delta attention's two
-    intra launches gated their keys up once a sub-chunk, ten tile exponentials a key block, 72% of their
-    instructions fp32 (kda-stalls-h100 at 11704365b)."""
-    whole = separated(*prefix)
+    rolled loops, a sub-chunk's references read where it needs them and each product's columns put into a tile
+    (`placed`, `(put(t, value), read())`) read whole once: unrolled, an sm100's 32-column key block held 248
+    words a thread and spilled (row 5298, jsf-sm100-redgreen). A product takes `right` keys, a whole number of
+    sub-chunks (the narrowest columns a family's product takes, tcgen05's 32), the columns of its own
+    sub-chunk kept. A sub-chunk's own pairs factored too, the queries and keys decay-scaled around its first
+    token and taken on the tensor cores, put a packed document's first token's output, a row of 2.5e-5 where
+    `q . k` cancels, at 0.83 of its size from float64 on an A100 against 7e-3 taken each its own decay (row
+    5194, M-JS-48w). Kimi delta attention's two intra launches gated their keys up once a sub-chunk, ten tile
+    exponentials a key block, 72% of their instructions fp32 (kda-stalls-h100 at 11704365b)."""
     index, _ = _grid(prefix[0].shape)
     blocks, per = chunk // sub, right // sub
 
     def start(s):
-        return separated(*at(s * sub))
+        return at(s * sub)
 
     def end(s):
-        return separated(*at(s * sub + sub - 1))
+        return at(s * sub + sub - 1)
 
     def laid(halves: Callable[[jax.Array], tuple]) -> tuple:
         """`halves(s)` laid over the rows of each sub-chunk `s`."""
@@ -684,8 +684,8 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
 
         return jax.lax.fori_loop(0, blocks, lay, (jnp.zeros(index.shape, jnp.float32),) * 2)
 
-    down = between(whole, laid(start))
-    up = staged(keys * between(laid(end), whole))
+    down = between(prefix, laid(start))
+    up = staged(keys * between(laid(end), prefix))
 
     def middle(t) -> jax.Array:
         """`exp2(G_s - E_t)` on the rows of each sub-chunk `s` past `t`, zero above."""

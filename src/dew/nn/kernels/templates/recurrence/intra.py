@@ -187,6 +187,16 @@ def _intra_prefix(call: Call, scanned, decays: jax.Array, keys: int) -> tuple:
     return tuple(call.family.tile_of(half_at(half, pl.ds(chunk, chunk))) for half in (0, 1))
 
 
+def _staged_rows(call: Call, scanned, pair: tuple) -> None:
+    """`pair`'s two `[C, keys]` tiles stored over the scan's rows (`scanned`'s rows `C` on,
+    `_intra_prefix`'s), once the scan is read, and made visible before other threads read their rows."""
+    chunk = call.chunk
+    mosaic.synced(call.interpret)
+    for half, value in enumerate(pair):
+        plgpu.store(scanned.at[half, pl.ds(chunk, chunk)], value, optimized=False)
+    mosaic.synced(call.interpret)
+
+
 def _rows_of(ref, keys: int) -> jax.Array:
     """A `[C, keys]` tile `ref` of plain shared rows read in a row-major layout (`plgpu.Layout.WG_STRIDED`):
     each thread its consecutive words, a warp's transfer a contiguous run."""
@@ -267,8 +277,13 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                 gates.store(ref, half, row, chunk, h * width + index * keys, keys, family=family,
                             smem=landing["prefix"])
 
+            # The prefix separated once (`algebra.separated`) and staged where the scan left it, each
+            # sub-chunk boundary's vectors read from it (`at_token`), not separated again at every read.
+            whole = algebra.separated(*prefix)
+            _staged_rows(call, scanned, whole)
+
             def at_token(token):
-                """The prefix halves at the chunk's `token`, a column's vectors, from the staged scan."""
+                """The separated prefix at the chunk's `token`, a column's vectors, from its staged rows."""
                 return tuple(family.columns_of(scanned.at[half, chunk + token]) for half in (0, 1))
 
             def operand(name):
@@ -279,7 +294,7 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
 
             keyed, *gated = pairing
             pairs = algebra.key_block_pairs([functools.partial(rows, name) for name in products],
-                                            operand("keys"), prefix, at_token,
+                                            operand("keys"), whole, at_token,
                                             Issuer(call, {"pairs": gated}).summed,
                                             lambda up: operands.staged(family, up.astype(jnp.float32),
                                                                        keyed),
