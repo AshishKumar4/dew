@@ -581,6 +581,23 @@ def test_a_context_its_cross_attention_cannot_hold_is_refused_never_cut():
         fit.map({"example": Example("one two", QUESTION, {"pick": "a"}, context=over)})
 
 
+def test_a_backbone_without_cross_attention_refuses_a_requests_context():
+    """A task over a backbone with no cross-attention refuses a request that brings a context, by a call
+    and over the wire (its own refusal, ValueError), rather than answering it without the context; the
+    same request without one is answered (docs/design/training.md, context)."""
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    objective = DecisionObjective(source, tokenizer=ByteTokenizer(), specials=SPECIALS)
+    task = Decide(objective.model, objective.init(jax.random.key(0)), objective.layout, objective.tokenizer,
+                  objective.specials)
+    assert isinstance(task("one two", QUESTION)["pick"], ChoiceAnswer)
+    with pytest.raises(ValueError):
+        task("one two", QUESTION, context="a first note")
+    wire = {"pick": {"type": "choice", "instructions": "Which one?", "criteria": ["a", "b", "c"]}}
+    refused, answered = task.systemone([{"state": "one two", "questions": wire, "context": "a first note"},
+                                        {"state": "one two", "questions": wire}])
+    assert isinstance(refused, ValueError) and not isinstance(answered, Exception)
+
+
 def test_the_batched_engine_reads_a_requests_context():
     """The batched engine (`WireScoring`) reads a request's context, as `Decide` does: each answer's
     probabilities those of the task's own call with that context, to the bit, the one program; under
