@@ -140,8 +140,9 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
     valid = np.asarray(inputs.token_fields["attention_mask"])
     expected = np.load(FIXTURE / "updated_logits.npy")
     np.testing.assert_allclose(np.asarray(output)[valid], expected[valid], atol=1e-4, rtol=0)
-    # The step moved the logits: an update is a structural change, exact inequality says enough.
-    assert not np.array_equal(np.asarray(output)[valid], np.load(FIXTURE / "logits.npy")[valid])
+    # The step moved Dew's own logits: an update is a structural change, exact inequality says enough.
+    untrained = loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs())
+    assert not np.array_equal(np.asarray(output)[valid], np.asarray(untrained)[valid])
     loaded.save(tmp_path, variables=state.variables)
     reloaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     for actual, wanted in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(state.variables),
