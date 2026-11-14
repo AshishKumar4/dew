@@ -49,12 +49,12 @@ def _gated(heads: int, kv_heads: int):
     return draw
 
 
-def _forgetting(segment_ids=None):
-    """FoX's attention on the template, and its logits written out as a dense bias on the reference path: each
-    plus its query's cumulative log forget gate and minus its key's."""
+def _forgetting(segment_ids=None, implementation="template"):
+    """FoX's attention on the route `implementation` names, and its logits written out as a dense bias on the
+    reference path: each plus its query's cumulative log forget gate and minus its key's."""
     def ours(query, key, value, gates):
         return forgetting_attention(query, key, value, gates, segment_ids=segment_ids,
-                                    implementation="template")
+                                    implementation=implementation)
 
     def reference(query, key, value, gates):
         prefix = jnp.cumsum(jax.nn.log_sigmoid(gates), axis=1).transpose(0, 2, 1)
@@ -65,16 +65,19 @@ def _forgetting(segment_ids=None):
     return ours, reference
 
 
+@pytest.mark.parametrize("implementation", ["template", "auto"])
 @pytest.mark.parametrize("packed", [False, True], ids=["one-document", "packed"])
-def test_forgetting_attention_holds_check_1_against_its_logits_written_out(packed):
-    """FoX's causal attention on the template (`forgetting_attention`, its gates' prefixes a separable bias):
-    each logit plus its query's cumulative log forget gate and minus its key's, written out here as a dense
-    bias over the reference path (row 52), packed documents apart where `packed`: the output and the
-    queries', keys', values' and forget logits' gradients on par (check 1)."""
+def test_forgetting_attention_holds_check_1_against_its_logits_written_out(packed, implementation):
+    """FoX's causal attention (`forgetting_attention`, its gates' prefixes a separable bias) on the template
+    and as the selector routes it by default ('auto'): each logit plus its query's cumulative log forget gate
+    and minus its key's, written out here as a dense bias over the reference path (row 52), packed documents
+    apart where `packed`: the output and the queries', keys', values' and forget logits' gradients on par
+    (check 1)."""
     segment_ids = (jnp.repeat(jnp.asarray([[1] * 40 + [2] * 56]), ROWS, axis=0) if packed else None)
-    ours, reference = _forgetting(segment_ids)
+    ours, reference = _forgetting(segment_ids, implementation)
     assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(reference)),
-                    _gated(HEADS, KV_HEADS), f"forgetting attention {'packed' if packed else 'one document'}",
+                    _gated(HEADS, KV_HEADS),
+                    f"forgetting attention {'packed' if packed else 'one document'} {implementation}",
                     seeds=SEEDS)
 
 
