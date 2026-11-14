@@ -17,6 +17,7 @@ import optax
 from optax.contrib import _muon
 
 from dew.mesh import STAGE_AXIS
+from dew.nn.kernels.gemm import batched_product
 from dew.nn.precision import configured_precision, iteration_dtype
 
 Preconditioning = Literal["frobenius", "spectral", "aol", "schatten"]
@@ -202,23 +203,19 @@ def newton_schulz(x: jax.Array, coeffs, steps: int, eps: float,
     row 5669's step)."""
     rows, columns = x.shape[-2:]
     tall = rows > columns
-    batch = tuple(range(x.ndim - 2))
     last = x.ndim - 1
-
-    def product(a: jax.Array, b: jax.Array, contract: tuple[int, int]) -> jax.Array:
-        return jax.lax.dot_general(a, b, (((contract[0],), (contract[1],)), (batch, batch)))
 
     def gram(matrices: jax.Array, conjugate: bool = True) -> jax.Array:
         held = matrices.conj() if conjugate else matrices
-        return (product(held, matrices, (last - 1, last - 1)) if tall
-                else product(matrices, held, (last, last)))
+        return (batched_product(held, matrices, (last - 1, last - 1)) if tall
+                else batched_product(matrices, held, (last, last)))
 
     def applied(polynomial: jax.Array, matrices: jax.Array) -> jax.Array:
-        return product(matrices, polynomial, (last, last - 1)) if tall else product(
+        return batched_product(matrices, polynomial, (last, last - 1)) if tall else batched_product(
             polynomial, matrices, (last, last - 1))
 
     def stepped(matrices: jax.Array, a: jax.Array, triple: jax.Array) -> jax.Array:
-        polynomial = triple[1] * a + triple[2] * product(a, a, (last, last - 1))
+        polynomial = triple[1] * a + triple[2] * batched_product(a, a, (last, last - 1))
         return triple[0] * matrices + applied(polynomial, matrices)
 
     def base(matrices: jax.Array, triple: jax.Array) -> jax.Array:
