@@ -221,9 +221,9 @@ def test_a_sites_map_tasks_are_cut_by_their_setup_and_draws_apart_never_task_sec
         return [(entry["split"], entry["weight"]) for entry in ci.plan(256.0, {"rows": measured})
                 if entry["python"] == "3.12" and ".draws-" in entry["split"]]
 
-    # 480 s of setup and 5 s a draw: 500 s for 4 draws, 520 s for 8.
-    assert maps({task((0, 4)): 500.0, task((4, 12)): 520.0}) == [
-        ("test_site.draws-0-4", 500.0), ("test_site.draws-4-12", 520.0), ("test_site.draws-12-20", 520.0)]
+    # 480 s of setup and 2 s a draw: 488 s for 4 draws, 496 s for 8, within two targets.
+    assert maps({task((0, 4)): 488.0, task((4, 12)): 496.0}) == [
+        ("test_site.draws-0-4", 488.0), ("test_site.draws-4-12", 496.0), ("test_site.draws-12-20", 496.0)]
     # 480 s of setup and 60 s a draw: draws alone would fill the target at 4, but each task pays its setup.
     assert maps({task((0, 4)): 720.0, task((4, 12)): 960.0}) == [
         ("test_site.draws-0-4", 720.0), ("test_site.draws-4-12", 960.0), ("test_site.draws-12-20", 960.0)]
@@ -740,15 +740,15 @@ def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
 
 def test_a_judge_after_a_cut_finer_than_declared_is_kept_on_what_its_map_tasks_drew(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A site cut finer than its mark declares (its measured rate past four targets, `cut_draws`) is judged
+    """A site cut finer than its mark declares (its measured rate past two targets, `cut_draws`) is judged
     over the map tasks that ran, and its judge keys on their inputs whatever their spans, so it is kept whole
     as a judge after its declared cut is, and a module only its draws ran, changed, plans it again (the review
     of row 4376: a judge read its declared cut's map tasks alone, found none, and kept no key)."""
     first = ci.site_task("3.12", "tests/test_site.py", "test_site", (0, 4))
     run_cached(ci, tmp_path, monkeypatch, cache_worker, SITE, later=True, target=30.0,
                timings={"rows": {first: 160.0}})
-    # 40 s a seed: 3 a task within four targets' 120 s, 8 map tasks where the declared cut makes 3.
-    assert runs(tmp_path) == [1, 8, 1]
+    # 40 s a seed: 1 a task within two targets' 60 s, 20 map tasks where the declared cut makes 3.
+    assert runs(tmp_path) == [1, 20, 1]
     ran = replanned_once_its_draws_change(ci, tmp_path)
     assert {ci.session.SITE.fullmatch(entry["split"])["test"] for entry in ran} == {"test_site"}
 
@@ -797,7 +797,7 @@ def test_a_sites_judge_and_map_tasks_leave_its_files_cut_and_recorded_times_as_t
 
 
 def test_a_sites_map_task_past_the_target_is_reported_though_its_test_is_recorded(ci):
-    """A check-1 site's map task that runs past the plan's bound on one (four targets, `cut_draws`) is a slow
+    """A check-1 site's map task that runs past the plan's bound on one (two targets, `cut_draws`) is a slow
     test to report, though main's record holds the site's test (its whole run's time): it names its map task
     and the fix, fewer units a task, where a map task within the bound, the site's judge and a recorded test
     of a file's own row pass unreported (row 3729: a map task ran 1,366 s, and nothing said so)."""
@@ -808,6 +808,6 @@ def test_a_sites_map_task_past_the_target_is_reported_though_its_test_is_recorde
             {"name": "3.12:tests/test_other.py", "tests": {"tests/test_other.py::test_old": 240.0}}]
     base = {test: 700.0, "tests/test_other.py::test_old": 240.0}
     assert ci.slow({"rows": rows}, 120.0, base) == [
-        {"test": test, "file": "tests/test_site.py", "seconds": 600.0, "target": 480.0,
+        {"test": test, "file": "tests/test_site.py", "seconds": 600.0, "target": 240.0,
          "map_task": "3.12:tests/test_site.py#test_site.draws-0-512",
          "fix": "fewer units a task (per_task, conditioning_per_task)"}]
