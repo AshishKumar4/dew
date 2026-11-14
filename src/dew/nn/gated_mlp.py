@@ -17,6 +17,7 @@ otherwise, as `GatedMLP` ran them.
 
 import dataclasses
 from collections.abc import Callable, Sequence
+from typing import TypeGuard
 
 import jax
 import jax.numpy as jnp
@@ -27,6 +28,7 @@ from flax.typing import PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn import activations
+from dew.nn.dense import Dense, _promoted
 from dew.nn.joined import Projections, projection_requirements, projections_of
 from dew.nn.kernels import gemm, grouped_matmul, projections
 from dew.nn.kernels.generation import INHERENT, Choice, device_generation, gpu_target
@@ -141,25 +143,27 @@ def gated_case(x: jax.Array, projections_: Sequence[nn.Module], activation: str,
         precision=gate.precision, hook=activations.gated_hook(activation, limit))
 
 
-def fuses(rows: jax.Array, projections_: Sequence[nn.Module], activation: str,
-          limit: float | None = None) -> bool:
+def fuses(projections_: Sequence[nn.Module], rows: jax.Array, activation: str,
+          limit: float | None = None) -> TypeGuard[Sequence[Dense]]:
     """Whether a gated MLP's projections (gate, up, down) of `rows`, its gated product `activation`'s clamped
-    at `limit`, run fused (`gated_mlp`), as the fused MLP's selector reports it (`GATED_MLP`). Initialization
+    at `limit`, run fused (`gated_mlp`), as the fused MLP's selector reports it (`GATED_MLP`), so each a
+    bare `Dense` (its `dense` requirement), which the answer states of them for `gated_mlp`. Initialization
     creates each projection's parameters through its own call."""
     if projections_[0].is_initializing():
         return False
     return select(GATED_MLP, gated_case(rows, projections_, activation, limit)).kernel == 'fused'
 
 
-def gated_mlp(x: jax.Array, projections_: Sequence[nn.Module], activation: str, *,
+def gated_mlp(x: jax.Array, projections_: Sequence[nn.Dense], activation: str, *,
               limit: float | None = None, names: tuple[str, str, str] | None = None) -> jax.Array:
     """A gated MLP's output of `x` through its projections (gate, up, down), fused (`fused_products`), each
     kernel read and cast as its projection's call casts it."""
-    promoted = [projection.promote_dtype(x, meta.unbox(projection.get_variable('params', 'kernel')), None,
-                                         dtype=projection.dtype) for projection in projections_]
+    promoted = [_promoted(projection, x, meta.unbox(projection.get_variable('params', 'kernel')), None)
+                for projection in projections_]
     inputs = promoted[0][0]
-    out = fused_products(inputs.reshape(-1, inputs.shape[-1]), tuple(kernel for _, kernel, _ in promoted),
-                         activation, limit=limit, precision=projections_[0].precision, names=names)
+    gate, up, down = (kernel for _, kernel, _ in promoted)
+    out = fused_products(inputs.reshape(-1, inputs.shape[-1]), (gate, up, down), activation, limit=limit,
+                         precision=projections_[0].precision, names=names)
     return out.reshape(*inputs.shape[:-1], out.shape[-1])
 
 
