@@ -351,7 +351,7 @@ class InContextMemory(LinearProducts):
         log_kept = jnp.logaddexp(jnp.log1p(-gate.scale), -logit) - jax.nn.softplus(-logit)
         return 1 - gate.scale * jax.nn.sigmoid(logit), log_kept
 
-    def _heads(self, features: int | None) -> tuple[_Head, ...]:
+    def _heads(self, features: int) -> tuple[_Head, ...]:
         """Each head's network as this call computes it (`_Head`).
 
         A head's network is its own child, so its parameters are its network's own (`head_0/...`): a
@@ -367,28 +367,30 @@ class InContextMemory(LinearProducts):
         to the float its values and scales hold (`decoded_stored`), the W_0 the steps move from."""
         networks = [getattr(self, f"head_{head}") for head in range(self.heads)]
         if self.is_initializing():
-            assert features is not None, "an initialization draws each network over the view's width"
             for network in networks:
                 network(jnp.zeros((features,), jnp.float32))
+        return tuple(_Head(network, *self._split(dict(nn.meta.unbox(network.variables))))
+                     for network in networks)
+
+    @nn.nowrap
+    def _split(self, variables: dict) -> tuple[dict, dict, dict]:
+        """A head's network's `variables` as a call computes with them (`_Head`): its held weights (its slow
+        ones and its adapters' A factors), its other variables, and its moving weights, every weight in at
+        least float32 and decoded (frozen FP8 codes, stored quantized kernels). A function of the
+        variables alone, which `cache_spec` reads the moving weights' shapes through."""
         wide = at_least_fp32(self.dtype)
-        heads = []
-        for network in networks:
-            variables = dict(decoded_stored(decoded_frozen_fp8(dict(nn.meta.unbox(network.variables)))))
-            # Every inner weight is an array now: frozen FP8 codes and stored quantized kernels decoded.
-            weights = {path: jnp.asarray(leaf) for path, leaf
-                       in traverse_util.flatten_dict(dict(variables.pop("params", {}))).items()}
-            unknown = sorted(set(self.slow) - {path[0] for path in weights})
-            if unknown:
-                raise ValueError(f"slow names {unknown}, which are none of the network's parameters "
-                                 f"{sorted({path[0] for path in weights})}")
-            held = {path for path in weights if path[0] in self.slow or path[-1] == ADAPTER_A}
-            heads.append(_Head(
-                network,
-                traverse_util.unflatten_dict({path: weights[path].astype(wide) for path in held}),
-                variables,
+        variables = dict(decoded_stored(decoded_frozen_fp8(variables)))
+        # Every inner weight is an array now: frozen FP8 codes and stored quantized kernels decoded.
+        weights = {path: jnp.asarray(leaf) for path, leaf
+                   in traverse_util.flatten_dict(dict(variables.pop("params", {}))).items()}
+        unknown = sorted(set(self.slow) - {path[0] for path in weights})
+        if unknown:
+            raise ValueError(f"slow names {unknown}, which are none of the network's parameters "
+                             f"{sorted({path[0] for path in weights})}")
+        held = {path for path in weights if path[0] in self.slow or path[-1] == ADAPTER_A}
+        return (traverse_util.unflatten_dict({path: weights[path].astype(wide) for path in held}), variables,
                 traverse_util.unflatten_dict({path: leaf.astype(wide) for path, leaf in weights.items()
-                                              if path not in held})))
-        return tuple(heads)
+                                              if path not in held}))
 
     @nn.compact
     def __call__(self, x: jax.Array, call: MixerCall = PLAIN_CALL) -> jax.Array:
@@ -769,16 +771,24 @@ class InContextMemory(LinearProducts):
         the shared recurrence (`_recurrence`), its state `[rows, heads, F, F]` and W_0's kept share
         `[rows, heads]`, F its linear network's width; else each head's moving weights, a row's each, as
         the steps' start, now and momentum, zeros at first (`_decoded`). `heads` are the call's own
-        (`_heads`), its networks' weights read where None."""
+        (`_heads`), its networks' weights read for their shapes alone where None (`_split`), whatever holds
+        them: a banked store's layer is bound to their shapes."""
         wide = at_least_fp32(self.dtype)
         spec: dict[str, object] = dict(self._counts(rows))
-        heads = self._heads(None) if heads is None else heads
+        if heads is None:
+            trees = tuple(dict(nn.meta.unbox(getattr(self, f"head_{head}").variables))
+                          for head in range(self.heads))
+            moving = jax.eval_shape(lambda trees: tuple(self._split(tree)[2] for tree in trees), trees)
+        else:
+            moving = tuple(head.initial for head in heads)
         if self._recurrence() is not None:
-            features = _kernel(heads[0].initial).shape[0]
+            kernel = traverse_util.flatten_dict(moving[0])[LINEAR_KERNEL]
+            assert isinstance(kernel, jax.Array | jax.ShapeDtypeStruct), "a linear memory's kernel"
+            features = kernel.shape[0]
             return {**spec, STATE: Opened((rows, self.heads, features, features), wide),
                     KEPT: Opened((rows, self.heads), wide)}
-        weights = tuple(jax.tree.map(lambda leaf: Opened((rows, *leaf.shape), wide), head.initial)
-                        for head in heads)
+        weights = tuple(jax.tree.map(lambda leaf: Opened((rows, *leaf.shape), wide), initial)
+                        for initial in moving)
         return {**spec, START: weights, STATE: weights, MOMENTUM: weights}
 
     def _cached(self, steps: _Steps) -> tuple[_Steps, Callable[[], None]]:

@@ -91,15 +91,24 @@ def test_each_familys_cache_opens_as_its_decode_opens_and_writes_it(family):
     assert_opens_as_it_decodes(held.model, variables)
 
 
-@pytest.mark.parametrize("loop", [None, Loop(steps=2), Loop(steps=2, shared_cache=True)],
-                         ids=["unlooped", "looped", "looped-shared"])
-def test_a_banked_stores_cache_opens_banked_as_its_decode_opens_and_writes_it(loop):
+BANKED = {"attention": ("attention", None), "looped": ("attention", Loop(steps=2)),
+          "looped-shared": ("attention", Loop(steps=2, shared_cache=True)),
+          "gated_delta_net": ("gated_delta_net", None), "memory": ("memory", None)}
+"""A banked store's cases: a stack of attention, looped whole over its own caches or one shared, and of a
+recurrent and a memory mixer, whose specs read their weights' shapes off the bank."""
+
+
+@pytest.mark.parametrize("case", sorted(BANKED))
+def test_a_banked_stores_cache_opens_banked_as_its_decode_opens_and_writes_it(case):
     """A scanned stack over a store banked by run opens its cache banked, each run's layers one array
     under the run's name, as its decode over none opens it and as its prefill and step leave it; looped
     whole, each later pass's runs under their pass's names, but where the passes share one cache."""
-    plain = tiny(num_layers=4, max_seq_len=16, loop=loop)
+    kind, loop = BANKED[case]
+    fields, overrides = KINDS[kind]
+    mixer = mixers.build(kind, **fields)
+    plain = tiny(num_layers=4, max_seq_len=16, loop=loop, mixer=mixer, **overrides)
     variables = plain.init(jax.random.key(0), jnp.ones((1, PROMPT), jnp.int32))
-    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, loop=loop)
+    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, loop=loop, mixer=mixer, **overrides)
     banked = HeldBanks(variables).place(scanned)
     cache = jax.eval_shape(lambda store: scanned.apply(store, ROWS, method="init_cache", mutable=["cache"]),
                            banked)[1]["cache"]
