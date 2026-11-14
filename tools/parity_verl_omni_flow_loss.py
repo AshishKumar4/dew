@@ -25,9 +25,8 @@ REPO, COMMIT = "verl-project/verl-omni", "beab6b764b0b666c6de8468bf84b2e7762f434
 SOURCE = "verl_omni/trainer/diffusion/diffusion_algos.py"
 SHA256 = "0cd321e17f50fa624ff682048d9c7ef25ea9ad8d097acc6cf1d6cb938e3c0bee"
 RECORDED = Path(__file__).resolve().parents[1] / "tests/fixtures/rl/recorded_verl_omni_flow_loss.npz"
-ROWS = 1024
-"""A transition's samples a draw holds: enough that each seed's gradient, exactly zero wherever the clip holds
-a sample's ratio and one or two roundings elsewhere, resolves its error."""
+ROWS = 64
+"""A transition's samples a draw holds."""
 CLIP_RANGE = 1e-4
 """The ratio's clip, Flow-GRPO's (`FlowGRPOObjective.clip_range`'s default)."""
 ADV_CLIP_MAX = 5.0
@@ -37,11 +36,15 @@ ADV_CLIP_MAX = 5.0
 def loss_inputs(seed: int) -> dict[str, np.ndarray]:
     """A seed's transition, the same on every run: each sample's mean log density under the rollout's
     policy (`previous`) and under the policy (`current`), the two a log ratio apart on the clip's own
-    scale, so some ratios the clip moves and some it leaves, and advantages some of which the advantage
-    clip moves; and the loss's cotangent, which both arms pull back."""
+    scale, half of them inside the clip and half beyond it, each at least a tenth of the clip from its
+    edge, where whether the clip holds a ratio is a decision the arithmetic's last bit makes (a ratio's
+    float32 rounding, 1.2e-7, against a margin of 1e-5), not the loss's numerics; advantages some of
+    which the advantage clip moves; and the loss's cotangent, which both arms pull back."""
     rng = np.random.default_rng([6122, seed])
     previous = rng.normal(-1.0, 0.5, ROWS).astype(np.float32)
-    current = (previous + rng.normal(0.0, 2 * CLIP_RANGE, ROWS)).astype(np.float32)
+    beyond = rng.random(ROWS) < 0.5
+    magnitude = np.where(beyond, rng.uniform(1.1, 3.0, ROWS), rng.uniform(0.0, 0.9, ROWS)) * CLIP_RANGE
+    current = (previous + rng.choice((-1.0, 1.0), ROWS) * magnitude).astype(np.float32)
     advantage = rng.normal(0.0, 3.0, ROWS).astype(np.float32)
     return {"current": current, "previous": previous, "advantage": advantage,
             "loss_cotangent": np.ones((), np.float32)}
