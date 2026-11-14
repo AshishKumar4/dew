@@ -9,6 +9,7 @@ from placement_parity import layouts_agree, x64
 
 from dew.checkpoints import _filled
 from dew.nn.kernels.generation import chosen
+from dew.optim import OptimConfig
 from dew.training.narrow import narrowed, narrowed_paths
 
 
@@ -135,6 +136,24 @@ def _keeping_gradients(optimizer):
     kept = optax.GradientTransformation(lambda params: jax.tree.map(jnp.zeros_like, params),
                                         lambda gradient, state, params=None: (gradient, gradient))
     return optax.chain(kept, optimizer)
+
+
+def keeping_sgd(learning_rate) -> optax.GradientTransformation:
+    """SGD at `learning_rate` keeping the last gradient as its state (`_keeping_gradients`): the optimizer
+    `KEEPING_SGD` states by its import path."""
+    return _keeping_gradients(optax.sgd(learning_rate))
+
+
+ADAM_2, ADAM_3 = (OptimConfig(optimizer="optax:adam", learning_rate=rate) for rate in (1e-2, 1e-3))
+"""Optax's Adam at 1e-2 and 1e-3, as configs, which key the step."""
+
+SGD = OptimConfig(optimizer="optax:sgd", learning_rate=0.5)
+"""Optax's SGD at 0.5, as a config, which keys the step."""
+
+KEEPING_SGD = OptimConfig(optimizer="test_narrow:keeping_sgd", learning_rate=0.5)
+"""SGD at 0.5 keeping its last gradient, stated as a config, which keys the step (`Trainer._step_key`): every
+draw's fits of one shape read the step the first traced and planned, where each built its own (row 5774:
+61 plans and compiles, 542 s of a profiled 605)."""
 
 
 def _decoder(*, scanned=False, remat=None, mixture=False, rows=8, dex=False, seed=0, dtype=jnp.bfloat16):
@@ -288,9 +307,9 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
     from dew.training import MeshSpec
 
     mesh = MeshSpec(fsdp=fsdp)
-    _on_par_with_the_plain_update(lambda: _keeping_gradients(optax.sgd(0.5)), "a tied decoder's copies",
+    _on_par_with_the_plain_update(lambda: KEEPING_SGD, "a tied decoder's copies",
                                   mesh=mesh)
-    narrow, _, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, mesh=mesh)
+    narrow, _, _ = _trained(KEEPING_SGD, copies=True, mesh=mesh)
     names = {"/".join(path) for path in _copies_of(narrow)}
     assert names and all(name.endswith("kernel") and "proj" in name for name in names), names
 
@@ -301,9 +320,9 @@ def test_a_scanned_decoder_reads_every_layers_kernels_through_copies_with_the_sa
     kernels through bf16 copies, stacked as the scan reads them, as an unscanned decoder does: under
     plain SGD the parameters, the last gradient and the losses are on par with the in-forward cast's
     (check 1)."""
-    _on_par_with_the_plain_update(lambda: _keeping_gradients(optax.sgd(0.5)), "a scanned decoder's copies",
+    _on_par_with_the_plain_update(lambda: KEEPING_SGD, "a scanned decoder's copies",
                                   scanned=True)
-    narrow, _, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, scanned=True)
+    narrow, _, _ = _trained(KEEPING_SGD, copies=True, scanned=True)
     names = {"/".join(path) for path in _copies_of(narrow)}
     layers = {name.split("/")[0] for name in names}
     assert {f"layers_{index}" for index in range(4)} <= layers, names
@@ -335,8 +354,8 @@ def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
     # Each microbatch keeps a row for every row shard of the lane's devices.
     run = {"steps": 2 * accumulation, "accumulation": accumulation, "split": split, "mixture": mixture,
            "rows": split * max(8, jax.device_count()), "ragged": True, "mesh": MeshSpec(fsdp=fsdp)}
-    _on_par_with_the_plain_update(lambda: _keeping_gradients(optax.sgd(0.5)), "a window's copies", **run)
-    narrow, _, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, **run)
+    _on_par_with_the_plain_update(lambda: KEEPING_SGD, "a window's copies", **run)
+    narrow, _, _ = _trained(KEEPING_SGD, copies=True, **run)
     assert int(narrow.updates) == 2
     assert _copies_of(narrow)
 
@@ -348,9 +367,9 @@ def test_a_dex_decoder_through_its_copies_trains_as_it_does_without_them():
     casts at once: the copies, chosen off the loss the step runs, its committed updates among its
     inputs, leave lambda out, so through them every parameter, the last gradient and every loss over
     three updates are on par with a plain run's (check 1)."""
-    _on_par_with_the_plain_update(lambda: _keeping_gradients(optax.sgd(0.5)), "a dex decoder's copies",
+    _on_par_with_the_plain_update(lambda: KEEPING_SGD, "a dex decoder's copies",
                                   steps=3, dex=True)
-    narrow, _, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, steps=3, dex=True)
+    narrow, _, _ = _trained(KEEPING_SGD, copies=True, steps=3, dex=True)
     assert int(narrow.updates) == 3
     assert _copies_of(narrow)
 
@@ -361,8 +380,8 @@ def test_a_skipped_update_keeps_the_copies_of_the_parameters_it_kept():
     their copies. Adam's moments would have moved every parameter had the
     update been taken, so copies cast from the update the step discarded
     would differ from the parameters it kept."""
-    trained, *_ = _trained(optax.adam(1e-2), copies=True, steps=2)
-    skipped, *_ = _trained(optax.adam(1e-2), copies=True, steps=2, padded=1)
+    trained, *_ = _trained(ADAM_2, copies=True, steps=2)
+    skipped, *_ = _trained(ADAM_2, copies=True, steps=2, padded=1)
     assert int(skipped.updates) == int(trained.updates) == 2
     for a, b in zip(jax.tree.leaves(trained.variables), jax.tree.leaves(skipped.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
@@ -388,7 +407,7 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     held = []
 
     def trained(*, copies):
-        state, _, trainer = _trained(optax.adam(1e-3), copies=copies, steps=1)
+        state, _, trainer = _trained(ADAM_3, copies=copies, steps=1)
         devices = [device for device in trainer.device_mesh.devices.flat
                    if device.process_index == jax.process_index()]
         held.append(step_headroom(trainer.executable, devices) - trainer.plan["probes"][0]["headroom"])
@@ -412,7 +431,7 @@ def test_a_step_that_fits_only_without_its_copies_drops_them_before_it_recompute
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
 
     def trained(*, copies):
-        return _trained(optax.adam(1e-3), copies=copies, steps=1, accumulation=2, split=1, remat="full")
+        return _trained(ADAM_3, copies=copies, steps=1, accumulation=2, split=1, remat="full")
 
     def used(*, copies):
         return free - trained(copies=copies)[2].plan["probes"][0]["headroom"]
@@ -445,9 +464,9 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
     geometry = {"steps": 1, "accumulation": 2, "split": 1, "remat": "full"}
-    narrow, _, trainer = _trained(optax.adam(1e-3), copies=True, **geometry)
+    narrow, _, trainer = _trained(ADAM_3, copies=True, **geometry)
     with_copies = free - trainer.plan["probes"][0]["headroom"]
-    without = free - _trained(optax.adam(1e-3), copies=False, **geometry)[2].plan["probes"][0]["headroom"]
+    without = free - _trained(ADAM_3, copies=False, **geometry)[2].plan["probes"][0]["headroom"]
     copies = placed_bytes(jax.tree.map(
         lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), narrow.compute))
 
@@ -529,7 +548,7 @@ def test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
     # One device, whose batch of 8 rows splits in two.
     device = MeshSpec().build(jax.devices()[:1])
-    one, two = (free - _trained(optax.adam(1e-3), copies=False, steps=1, split=split, remat="full",
+    one, two = (free - _trained(ADAM_3, copies=False, steps=1, split=split, remat="full",
                                 mesh=device)[2].plan["probes"][0]["headroom"] for split in (1, 2))
     assert two < one, (one, two)
     objective, batch = _decoder(remat="full")
@@ -559,7 +578,7 @@ def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_dropped(monkeypatch):
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
 
     def trained(*, copies):
-        return _trained(optax.adam(1e-3), copies=copies, steps=1, split=1, rows=64)
+        return _trained(ADAM_3, copies=copies, steps=1, split=1, rows=64)
 
     base = trained(copies=True)[2].plan["probes"][0]
     free -= max(base["headroom"], trained(copies=False)[2].plan["probes"][0]["headroom"]) + 1
@@ -593,7 +612,7 @@ def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads
         # Sized under the arithmetic check 1 runs its arms in (`summed_as_run`), whose float32 dots compile
         # to other footprints than the default precision's.
         with summed_as_run():
-            return _trained(optax.sgd(0.5), copies=copies, steps=steps, accumulation=2, split=1,
+            return _trained(SGD, copies=copies, steps=steps, accumulation=2, split=1,
                             remat="full", rows=rows, longer=longer)
 
     def used(rows, *, copies):
@@ -605,7 +624,7 @@ def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads
     narrow, _, trainer = trained(copies=True, longer=64, steps=3)
     assert not trainer.plan["narrow"] and narrow.compute is not None
     assert _copies_of(narrow)
-    _on_par_with_the_plain_update(lambda: optax.sgd(0.5), "a run whose shapes plan their copies apart",
+    _on_par_with_the_plain_update(lambda: SGD, "a run whose shapes plan their copies apart",
                                   steps=3, accumulation=2, split=1, remat="full", rows=8, longer=64)
 
 
