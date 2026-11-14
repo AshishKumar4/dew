@@ -82,7 +82,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 from dew import _records
 from dew._cleanup import attempted
 from dew._coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
-from dew._files import write_atomically
+from dew._files import is_uri, write_atomically
 from dew._records import JSON, duration, json_value, record, share, text
 from dew.batch import PARAMETER_ROOTS, Variables, under_roots
 from dew.checkpoints._integrity import _digest
@@ -184,11 +184,6 @@ PYTHON_RUN: dict[str, JSON] = {
 }
 """The root record of a run defined in Python (`RUN_FILE`), beside which the trainer's checkpoints say
 why its record cannot rebuild it (`Checkpoints.python_run`)."""
-
-
-def is_uri(path: str) -> bool:
-    """Return whether a path names a `<scheme>://` location, such as a gs:// bucket."""
-    return '://' in path
 
 
 REPLICA_SLICE_BYTES = 1 << 20
