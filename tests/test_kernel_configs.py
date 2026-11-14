@@ -762,9 +762,9 @@ def test_a_b200s_dense_kernel_gradient_runs_no_rewriting_role():
     """The 4B's up projection's dense kernel gradient (24,576 rows of 2560 by 9216, fp32) on a compile-only
     B200 derives a tile legal for its call (a pair's among its candidates, `mosaic_sm100.PAIR`), and its
     kernel runs the threads its planning prices for a stage read as loaded
-    (`grouped_matmul._Mosaic.unstaged`): its producer's and its consumers' warpgroups (`.maxntid` 256), no
-    third warpgroup rewriting each step (em35d: 384 threads, 6.7x cuBLAS's instructions in that role's
-    predicated LDSM, PRMT and SEL), compiled within its resources."""
+    (`grouped_matmul._Mosaic.unstaged`): its producer's and its derived tile's consumers' warpgroups
+    (`.maxntid`), no further warpgroup rewriting each step (em35d: a third, 384 threads, 6.7x cuBLAS's
+    instructions in that role's predicated LDSM, PRMT and SEL), compiled within its resources."""
     import kernel_compile as kc
 
     from dew.nn.kernels import gemm
@@ -783,11 +783,13 @@ def test_a_b200s_dense_kernel_gradient_runs_no_rewriting_role():
         target = generation.gpu_target()
         assert seen.taken and all(op.legal(ba, config, target) for (op, _), (config, ba)
                                   in zip(seen, seen.taken, strict=True)), seen.taken
+    # A warpgroup's 128 threads for each consumer the derivation chose and the producer's, none rewriting.
+    planned = {128 * (config.warpgroups + 1) for config, _ in seen.taken}
     with generation.chosen(grouped_matmul="mosaic"):
         found = kc.compile_mosaic_kernels([support.KernelCase("up kernel gradient",
                                                               lambda: (kernel_gradient, operands))], "sm100")
     threads = {kernel["threads"] for record in found for kernel in record.get("kernels", [])}
-    assert threads == {256}, threads
+    assert threads == planned, (threads, planned)
     failed = kc.mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
