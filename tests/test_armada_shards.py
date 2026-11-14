@@ -224,9 +224,10 @@ def test_a_sites_map_tasks_are_cut_by_their_setup_and_draws_apart_never_task_sec
     # 480 s of setup and 2 s a draw: 488 s for 4 draws, 496 s for 8, within two targets.
     assert maps({task((0, 4)): 488.0, task((4, 12)): 496.0}) == [
         ("test_site.draws-0-4", 488.0), ("test_site.draws-4-12", 496.0), ("test_site.draws-12-20", 496.0)]
-    # 480 s of setup and 60 s a draw: draws alone would fill the target at 4, but each task pays its setup.
-    assert maps({task((0, 4)): 720.0, task((4, 12)): 960.0}) == [
-        ("test_site.draws-0-4", 720.0), ("test_site.draws-4-12", 960.0), ("test_site.draws-12-20", 960.0)]
+    # 600 s of setup, past two targets alone, and 60 s a draw: a finer cut would pay its setup again for
+    # nothing, so the declared one stands.
+    assert maps({task((0, 4)): 840.0, task((4, 12)): 1080.0}) == [
+        ("test_site.draws-0-4", 840.0), ("test_site.draws-4-12", 1080.0), ("test_site.draws-12-20", 1080.0)]
 
 
 def test_a_sites_map_tasks_are_cut_by_what_their_records_say_they_paid_whatever_their_sizes(ci, tmp_path):
