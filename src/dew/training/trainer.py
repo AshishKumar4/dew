@@ -266,7 +266,9 @@ class Trainer(Generic[Loss, Effects]):
         rules name (`Layout.data_axes` its rows'). `microbatches` is how many a pipelined step feeds through
         the mesh's stage axis, a multiple of its size; None feeds one a stage. `lower_for`, a CUDA generation,
         lowers the first step for it in place of compiling it (`dew.training._lowering.Lowered`); `ahead`, a
-        step compiled ahead (`dew.training.ahead`), runs as the first step where it is that program.
+        step compiled ahead (`dew.training.ahead`), runs as the first step where it is that program, and
+        one compiled without its GPU kind's tuned choices (`AheadOfTime.tuned`) is not run: the run compiles
+        its step as without it, said once (`AheadOfTime.runnable`).
         `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its derived
         config. It measures each of Dew's own launches that declares variants to time (`KernelOp`: the
         kernel templates, `attention_impl="template"`, the norms, SwiGLU and decode attention); tokamax's
@@ -319,7 +321,9 @@ class Trainer(Generic[Loss, Effects]):
             diloco.admits(self.layout.host, record)
         # Where the fit ladder stands and the links its traces read (`StepCompiler`), and what the last
         # compile found (`Compiled`), which `plan`, `memory`, `executable`, `step_flops` and `links` read.
-        self._compiler = StepCompiler(objective, links, ahead, self.phase_passes)
+        self._compiler = StepCompiler(
+            objective, links, None if ahead is None else ahead.runnable(list(self.device_mesh.devices.flat)),
+            self.phase_passes)
         self._compiled: Compiled | None = None
         # Whether a step has run since the last compile proved its plan fits (`memory`).
         self._unproven = False
