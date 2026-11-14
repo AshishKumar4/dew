@@ -26,7 +26,7 @@ import pytest
 from jax.sharding import PartitionSpec
 from model_support import two_documents
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
-from sharded import assert_runs_per_shard
+from sharded import MOVES, assert_runs_per_shard
 from token_support import token_rows
 
 from dew.nn.attention import attention_kernel, scaled_dot_product_attention
@@ -127,24 +127,21 @@ def test_the_seam_agrees_with_whole_sequences(name, implementation, exchange):
     call = dict(CALLS[name], implementation=implementation)
     assert_exchanged_on_par(lambda q, k, v: through(exchange, q, k, v, **call),
                             lambda q, k, v: scaled_dot_product_attention(q, k, v, **call), SPLIT,
-                            lambda seed: heads(jax.random.key(seed), kv_heads=2), exchange,
+                            lambda seed: heads(jax.random.key(seed), kv_heads=2),
                             f"{exchange} exchange, {name}, {implementation}")
 
 
-EXCHANGED = {"all_to_all": ("all-to-all",), "all_gather": ("all-gather",)}
-"""The collectives each exchange moves rows by (`sharded.MOVES`), which its split runs."""
-
-
-def assert_exchanged_on_par(split, whole, mesh_spec, draw, exchange: str, label: str) -> None:
-    """`split`, a call through `exchange` over `mesh_spec`'s sequence axis, held as the gate holds a
-    kernel per shard (`sharded.assert_runs_per_shard`): compiled once in the scope the gate runs its arms,
-    moving rows by the exchange's collectives alone, and on par with `whole`, the same call on one device
-    over whole sequences, over `draw`'s seeds (check 1, its truth `whole` on the inputs widened). Every
-    site of this file is sized by `seeds_for` on armada's CPUs at the fewest (2026-11-14). The operands
-    are placed whole, the exchange's own shard_map splitting them."""
+def assert_exchanged_on_par(split, whole, mesh_spec, draw, label: str) -> None:
+    """`split`, a call through an exchange over `mesh_spec`'s sequence axis, held as the gate holds a
+    split arm (`sharded.assert_runs_per_shard`): compiled once in the scope the gate runs its arms, and on
+    par with `whole`, the same call on one device over whole sequences, over `draw`'s seeds (check 1, its
+    truth `whole` on the inputs widened). An exchange moves rows by whichever collectives XLA lowers it to
+    (an all-to-all, its collective-permutes on a CPU, the gather of whole operands), so every one of
+    `sharded.MOVES` is the call's own. Every site of this file is sized by `seeds_for` on armada's CPUs at
+    the fewest (2026-11-14). The operands are placed whole, the exchange's own shard_map splitting them."""
     specs = [PartitionSpec()] * len(draw(0))
     assert_runs_per_shard(split, draw, specs, mesh_spec.build(), label, seeds=FEWEST_SEEDS, truth_fn=whole,
-                          moves=EXCHANGED[exchange], arm=jax.jit(whole))
+                          moves=MOVES, arm=jax.jit(whole))
 
 
 # Heads split over tensor then sequence (2x2), and four sequence shards over
@@ -214,8 +211,8 @@ def test_the_exchange_agrees_forward_and_backward_where_heads_split_further(spec
 
     assert_exchanged_on_par(with_gradients(lambda q, k, v: through("all_to_all", q, k, v, **call)),
                             with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call)),
-                            spec, draw, "all_to_all", f"all_to_all exchange, {name}, heads over tensor "
-                                                      f"{spec.tensor} and sequence {spec.sequence}")
+                            spec, draw, f"all_to_all exchange, {name}, heads over tensor {spec.tensor} and "
+                                        f"sequence {spec.sequence}")
 
 
 def _dropping_draw(seed):
@@ -294,8 +291,7 @@ def test_splash_runs_inside_the_exchange():
 
     assert_exchanged_on_par(lambda q, k, v: through("all_to_all", q, k, v, causal=True, implementation="tpu"),
                             lambda q, k, v: scaled_dot_product_attention(q, k, v, causal=True),
-                            MeshSpec(fsdp=2, sequence=2), draw, "all_to_all",
-                            "splash inside the all-to-all exchange")
+                            MeshSpec(fsdp=2, sequence=2), draw, "splash inside the all-to-all exchange")
 
 
 def cudnn_runs_inside_either_exchange(exchange, causal):
@@ -371,11 +367,10 @@ def test_rotary_positions_survive_the_exchange():
         return lambda variables, x: module.apply(
             variables, x, freqs_cis=rotary_freqs(jnp.arange(SEQ_LEN), 8, 10000.0, dtype=dtype))
 
-    # The module's own exchange: whatever the mesh's sequence axis asks, all-to-all by default.
+    # The module's own exchange, its rows moved by whichever collectives XLA lowers it to.
     assert_runs_per_shard(applied(module, np.float32), draw, [PartitionSpec()] * 2, SPLIT.build(),
                           "rotary positions through the exchange", seeds=FEWEST_SEEDS,
-                          truth_fn=applied(module.clone(dtype=jnp.float64), np.float64),
-                          moves=EXCHANGED["all_to_all"])
+                          truth_fn=applied(module.clone(dtype=jnp.float64), np.float64), moves=MOVES)
 
 
 # --------------------------------------------------------------------------
