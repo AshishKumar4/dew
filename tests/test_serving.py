@@ -1185,22 +1185,28 @@ def test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic(cell):
 
 
 QUANTIZED_CACHES = {
-    "int8": {"slots": 2, "capacity": 64, "kv_cache": KVCache(quantized="int8")},
-    "float8-over-pages": {"slots": 2, "capacity": 64, "decode_steps": 3, "prefix_cache": False,
-                          "kv_cache": KVCache(quantized="float8_e4m3fn", page_size=4, pages=12)},
+    "int8": ({"slots": 2, "capacity": 64, "kv_cache": KVCache(quantized="int8")},
+             (Served(7), Served(5), Served(9)), None),
+    "float8-over-pages": ({"slots": 2, "capacity": 64, "decode_steps": 3, "prefix_cache": False,
+                           "kv_cache": KVCache(quantized="float8_e4m3fn", page_size=4, pages=12)},
+                          (Served(7), Served(5), Served(9)), None),
+    "int8-over-a-shared-prefix": ({"slots": 2, "capacity": 64, "prefix_cache": True,
+                                   "kv_cache": KVCache(quantized="int8", page_size=4, pages=24)},
+                                  (Served(7), Served(5), Served(9, flipped=(4,))), (0, 4, 4)),
 }
 """The cells of a server over a quantized cache (`assert_served_through_its_cache_as_exact`), by name: its
-serving options. Each format's own arithmetic: int8 codes of keys in the Hadamard rotation, which every query
-takes, in a dense cache, a decode step a call; float8 codes of the keys as given, in pages of four whose
-scales a read gathers through each row's table, three decode steps a call. No cell reads a prefix's quantized
-pages: a later prompt would read codes an earlier request's round wrote, which its own round's roundings do
-not hold (`Written.started`; ledger 6007)."""
-QUANTIZED_CACHE_LENGTHS = (7, 5, 9)
+serving options, its requests, served one a round, and where it keeps a prefix cache, the prompt tokens each
+round reads from earlier rounds' pages. Each format's own arithmetic: int8 codes of keys in the Hadamard
+rotation, which every query takes, in a dense cache, a decode step a call; float8 codes of the keys as given,
+in pages of four whose scales a read gathers through each row's table, three decode steps a call; int8 pages
+of four a later prompt reads where an earlier request wrote them, its first page's codes the first request's
+(ledger 6007): each prompt a prefix of the draw's row but the last's fifth token, so each later prompt shares
+the first page and no other, whatever the earlier requests drew."""
 QUANTIZED_CACHE_BUDGET = 8
-"""Each quantized-cache cell's prompts, served one a round, and the tokens each draws."""
-QUANTIZED_CACHE_SEEDS = {"int8": 128, "float8-over-pages": 64}
+"""Each quantized-cache cell's tokens each request draws."""
+QUANTIZED_CACHE_SEEDS = {"int8": 128, "float8-over-pages": 64, "int8-over-a-shared-prefix": 128}
 """Each quantized-cache cell's declared seeds, sized paired by `seeds_for` on armada's CPUs (2026-11-14,
-kvq-size-1 at 021c8ff5a4c)."""
+kvq-size-1 at 021c8ff5a4c; the shared prefix's prefix-size-1 at bfe8c21f164)."""
 
 
 @pytest.mark.parametrize("cell", list(QUANTIZED_CACHES))
@@ -1208,10 +1214,11 @@ def test_a_server_scores_its_draws_over_a_quantized_cache_as_its_rounding_does(c
     """Each cell of `QUANTIZED_CACHES`: the server's draws score on par with the decoder's own cached decode
     of them through a cache of the same format, each held to the float64 forward that reads the codes and
     scales its cache held (check 1, followed)."""
-    assert_served_through_its_cache_as_exact(measured_task(measured_decoder()), QUANTIZED_CACHE_LENGTHS,
-                                             f"served arithmetic: a quantized cache, {cell}",
-                                             serving=QUANTIZED_CACHES[cell], budget=QUANTIZED_CACHE_BUDGET,
-                                             seeds=QUANTIZED_CACHE_SEEDS[cell])
+    serving, requests, hits = QUANTIZED_CACHES[cell]
+    assert_served_through_its_cache_as_exact(measured_task(measured_decoder()), requests,
+                                             f"served arithmetic: a quantized cache, {cell}", serving=serving,
+                                             budget=QUANTIZED_CACHE_BUDGET, seeds=QUANTIZED_CACHE_SEEDS[cell],
+                                             hits=hits)
 
 
 @pytest.mark.distributed

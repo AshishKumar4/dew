@@ -14,6 +14,7 @@ other value itself."""
 
 import contextlib
 import functools
+from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -52,25 +53,33 @@ class Written:
             writes.setdefault((int(rows[index]), int(positions[index])), []).append(
                 (values[index], codes[index], scales[index]))
 
-    def started(self) -> int:
-        """The one row a request started in: the row whose first slot was written."""
-        rows = {row for writes in self.tokens.values() for row, slot in writes if slot == 0}
+    def row(self) -> int:
+        """The one row a run of one request wrote."""
+        rows = {row for writes in self.tokens.values() for row, _ in writes}
         if len(rows) != 1:
-            raise AssertionError(f"rows {sorted(rows)} wrote their first slot: one request starts one row")
+            raise AssertionError(f"rows {sorted(rows)} were written: a run of one request writes one row")
         return rows.pop()
 
-    def held(self, row: int, length: int) -> tuple[dict, dict]:
-        """`row`'s first `length` slots of every layer's payload, each written once: the values its
-        roundings rounded, and their decisions, codes and scales, by name."""
-        rounded, decided = {}, {}
-        for name, writes in self.tokens.items():
-            once = [writes.get((row, slot), []) for slot in range(length)]
-            if any(len(written) != 1 for written in once):
-                raise AssertionError(f"{name}: row {row}'s slots were written {[len(w) for w in once]} times")
-            values, codes, scales = (np.stack(part) for part in zip(*(written[0] for written in once),
-                                                                   strict=True))
-            rounded[name], decided[name] = values, (codes, scales)
-        return rounded, decided
+
+def held(rounds: Sequence[Written], length: int) -> tuple[dict, dict]:
+    """The last of `rounds`' request's first `length` slots of every layer's payload, each one write: its own
+    round's in its row (`Written.row`), or, a slot its round read from a shared prefix's pages (a prefix
+    cache's, `Server.from_task`'s `prefix_cache`), the earliest earlier round's in that round's row, which
+    wrote the pages the prefix cache kept. The values its roundings rounded, and their decisions, codes and
+    scales, by name."""
+    order = [(written, written.row()) for written in (rounds[-1], *rounds[:-1])]
+    rounded, decided = {}, {}
+    for name in rounds[-1].tokens:
+        taken = []
+        for slot in range(length):
+            written = next((written.tokens[name][row, slot] for written, row in order
+                            if (row, slot) in written.tokens.get(name, {})), [])
+            if len(written) != 1:
+                raise AssertionError(f"{name}: slot {slot} of the request's row written {len(written)} times")
+            taken.append(written[0])
+        values, codes, scales = (np.stack(part) for part in zip(*taken, strict=True))
+        rounded[name], decided[name] = values, (codes, scales)
+    return rounded, decided
 
 
 def _reported(name: str, rows_held: int, *arrays) -> None:
@@ -95,7 +104,7 @@ def collected():
 @contextlib.contextmanager
 def traced(decided: dict | None = None):
     """Each cache rounding a store writes while tracing inside reports itself to `collected` as its program
-    runs; with `decided` (one row's decisions by name, `Written.held`'s), each takes its codes and scales
+    runs; with `decided` (one row's decisions by name, `held`'s), each takes its codes and scales
     from it at its tokens' slots, so a run of one row reads them. A program compiled inside, and so a
     server constructed inside, runs inside: its traces are keyed apart (`CAPTURED`)."""
     writing: list[tuple[KVStore, jax.Array, jax.Array, list[str]]] = []
