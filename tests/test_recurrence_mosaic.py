@@ -146,7 +146,9 @@ def covering(routes: tuple) -> dict[tuple, frozenset]:
               for case, dtype, passed in sites for route in routes]
     seeded = [site for site in SEEDED_SITES if site['route'] in routes]
     covered = {site: frozenset(routes) for site in INTERPRETED_GRADIENT if site[1] == 'fp32'}
-    for cell in kernel_matrix.pairwise(served, seeded, cost=recorded_seeds):
+    # The recording's seeds read once: the covering prices every combination each choice.
+    seeds = declared_seeds(RECORDED)
+    for cell in kernel_matrix.pairwise(served, seeded, cost=lambda site: recorded_seeds(site, seeds)):
         key = (cell['case'], cell['dtype'], cell['pass'])
         covered[key] = covered.get(key, frozenset()) | {cell['route']}
     return covered
@@ -158,10 +160,11 @@ def recorded_site(case: str, dtype) -> str:
     return f"mosaic/{case}/{label}/{'cpu' if mainloop.family_of() is None else 'gpu'}"
 
 
-def recorded_seeds(site: dict) -> int:
+def recorded_seeds(site: dict, seeds: dict[str, int]) -> int:
     """The seeds a served site draws (`covering`'s price of it): its case's recorded fla-core seeds in its
-    dtype (`recorded_site`), which its forward and its gradient each hold Dew to."""
-    return declared_seeds(RECORDED)[recorded_site(site['case'], DTYPES[site['dtype']])]
+    dtype (`recorded_site`) of the recording's `seeds` (`declared_seeds`), which its forward and its gradient
+    each hold Dew to."""
+    return seeds[recorded_site(site['case'], DTYPES[site['dtype']])]
 
 
 COVERED = covering(ROUTES)
