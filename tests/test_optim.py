@@ -67,6 +67,7 @@ from dew.optim import (
     laprop,
     muon_partition,
     muon_weight_dimension_numbers,
+    post_step_order,
     scale_by_qk_clip,
     stepped,
     weight_decay_mask,
@@ -776,7 +777,7 @@ def test_muonclip_without_stats_steps_like_muon():
     expected, _ = muon.update(grads, muon.init(params), params)
     initial = clipped.init(params)
     updates, state = clipped.update(grads, initial, params)
-    moved = stepped(params, updates, initial, state)
+    moved = stepped(params, updates, initial, state, post_step_order(clipped, params))
     assert largest_difference(moved, optax.apply_updates(params, expected)) == 0.0
     assert clips_qk(initial) and not clips_qk(muon.init(params))
 
@@ -791,7 +792,7 @@ def test_a_quiet_clip_steps_like_muon():
     updates, state = clipped.update(
         grads, initial, params,
         qk_stats=qk_stats(values=[[10.0] * 4] * 3))
-    moved = stepped(params, updates, initial, state)
+    moved = stepped(params, updates, initial, state, post_step_order(clipped, params))
     assert largest_difference(moved, optax.apply_updates(params, expected)) == 0.0
 
 
@@ -801,7 +802,7 @@ def clip_step(solver, stats):
     def step(params, grads):
         initial = solver.init(params)
         updates, state = solver.update(grads, initial, params, qk_stats=stats)
-        return stepped(params, updates, initial, state)
+        return stepped(params, updates, initial, state, post_step_order(solver, params))
     return step
 
 
@@ -816,7 +817,7 @@ def test_a_clip_rescales_the_weights_only_after_the_updates_it_takes_part_in():
     state = solver.init(params)
     for update in range(3):
         updates, after = solver.update(grads, state, params, qk_stats=stats)
-        moved = stepped(params, updates, state, after)
+        moved = stepped(params, updates, state, after, post_step_order(solver, params))
         unclipped = optax.apply_updates(params, updates)
         if update == 1:
             assert largest_difference(moved, unclipped) > 0
@@ -837,7 +838,7 @@ def test_a_bounded_clipped_group_clamps_after_the_clip():
         ParamGroup('all', ('*',), bounds=(lower, upper)),)).build(10)
     initial = solver.init(params)
     updates, state = solver.update(grads, initial, params, qk_stats=stats)
-    moved = stepped(params, updates, initial, state)
+    moved = stepped(params, updates, initial, state, post_step_order(solver, params))
     for leaf in jax.tree.leaves(moved):
         assert np.all((np.asarray(leaf) >= lower) & (np.asarray(leaf) <= upper))
     clamped = jax.tree.map(lambda leaf: jnp.clip(leaf, lower, upper), optax.apply_updates(params, updates))
@@ -933,7 +934,7 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
     params = variables["params"]
     initial = tx.init(params)
     updates, state = tx.update(jax.tree.map(jnp.zeros_like, params), initial, params, qk_stats=stats)
-    clipped = stepped(params, updates, initial, state)
+    clipped = stepped(params, updates, initial, state, post_step_order(tx, params))
     query, query_after = (np.asarray(tree["layers_0"]["self_attn"]["q_proj"]["kernel"]).reshape(16, 4, 2, -1)
                           for tree in (params, clipped))
     np.testing.assert_array_equal(query_after[:, :, 1], query[:, :, 1])
@@ -963,7 +964,8 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
         initial = tx.init(params)
         updates, state = tx.update(jax.tree.map(jnp.zeros_like, params), initial, params,
                                    qk_stats=stats)
-        return maxima(model, {**variables, "params": stepped(params, updates, initial, state)}, ids)[1]
+        moved = stepped(params, updates, initial, state, post_step_order(tx, params))
+        return maxima(model, {**variables, "params": moved}, ids)[1]
 
     def paper(of):
         def clipped_then_read(variables, ids, tau):
@@ -1007,7 +1009,7 @@ def test_a_biased_projection_clips_its_bias_with_its_kernel_and_bounds_the_logit
     tx = scale_by_qk_clip(tau)
     initial = tx.init(params)
     updates, state = tx.update(jax.tree.map(jnp.zeros_like, params), initial, params, qk_stats=stats)
-    clipped = stepped(params, updates, initial, state)
+    clipped = stepped(params, updates, initial, state, post_step_order(tx, params))
     _, resown = model.apply({**variables, "params": clipped}, ids, mutable=["qk"])
     firing = (before.reshape(2, 2).max(axis=1) > tau).repeat(2)
     assert 0 < np.sum(firing) < 4
@@ -1067,7 +1069,7 @@ def test_the_threshold_rides_optimizer_opts():
     plain, _ = muon.update(grads, muon.init(params), params)
     initial = default.init(params)
     updates, state = default.update(grads, initial, params, qk_stats=stats)
-    moved = stepped(params, updates, initial, state)
+    moved = stepped(params, updates, initial, state, post_step_order(default, params))
     assert largest_difference(moved, optax.apply_updates(params, plain)) == 0.0
     clipped = clip_step(muon_solver(optimizer="muonclip", optimizer_opts={'qk_clip_threshold': 5.0}), stats)
 
@@ -1676,6 +1678,28 @@ def test_a_resumed_rate_reaches_a_solver_inside_an_injected_wrapper(name):
         assert learning_rate(state) is not None
         np.testing.assert_array_equal(learning_rate(state), learning_rate(want))
     np.testing.assert_array_equal(state.hyperparams["gain"], 2.0)
+
+
+def test_a_solver_set_to_another_end_value_decays_to_it():
+    """A cosine's floor, its end value's share of its peak, is formed from the rate operands its solver
+    holds, so a solver set to another end value (`with_rates`) decays to it as a solver built at it does,
+    bit for bit (docs/design/training.md: the solver holds the schedule's rate-valued fields as operands),
+    where the configured ratio, a constant of its program, held the decay to the end value it was built
+    at."""
+    schedule = Cosine(peak_value=1e-2, warmup_steps=1, end_value=1e-3, decay_steps=4)
+    def configured(end):
+        config = OptimConfig(optimizer="adam", learning_rate=dataclasses.replace(schedule, end_value=end),
+                             clip_grads=0)
+        return config, config.build(6)
+
+    params, grads = {"w": jnp.ones(3)}, {"w": jnp.ones(3)}
+    _, built = configured(1e-3)
+    other, fresh = configured(4e-3)
+    state, want = with_rates(built.init(params), other.rates()), fresh.init(params)
+    for _ in range(6):
+        _, state = built.update(grads, state, params)
+        _, want = fresh.update(grads, want, params)
+        np.testing.assert_array_equal(learning_rate(state), learning_rate(want))
 
 
 def test_stated_horizons_reach_a_solver_inside_an_injected_wrapper_and_its_reported_rate():

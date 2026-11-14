@@ -558,9 +558,13 @@ root's operand and a negative power's base by their floor, which an infinite one
 `2**(a - l)`, `sqrt` at most `2**ceil(a / 2)`, `rsqrt` at most `2**(1 - l // 2)`, a logarithm of
 `2**l <= x <= 2**a` at most `max(|l|, |a|)` and a power more, a power `x**y` at most
 `2**(2**b max(|l|, |a|) + 1)`, and an integer power of a negative exponent `2**(y l)` where the positive power
-is a float: a normalization's `x * rsqrt(mean(x**2) + eps)` is bounded by its `eps`. The bounds that read no
-floor are stated over the reals, every value taken as finite: a product of a value that overflowed its dtype
-reads the bound its real factors have.
+is a float: a normalization's `x * rsqrt(mean(x**2) + eps)` is bounded by its `eps`. A bound is stated of a
+value proven finite alone (`terms.Apart.finite`), whatever its rule composes over the reals: a rewrite's side
+condition may not read a bound of a value that may be a NaN or an infinity (owner, 2026-11-14, of algebra
+bounds against float finiteness, row 5780: "yes"). A quotient by a value nothing holds away from zero may be a
+NaN, so its tanh states no bound, and a product of a value that overflowed its dtype states none, its real
+factors' bound notwithstanding; a program that leans on such a bound states what makes the value finite (a
+declared range away from zero).
 
 An exponential of an operand with neither a bound nor a sign, and a quotient by a value nothing holds apart
 from zero, has no bound; an exponential of an operand at most 0 is at most 2, its native implementation's rounding given one

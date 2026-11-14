@@ -727,8 +727,9 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], prefix
     `shifted(e)` its keys and separated prefix `(keys, whole, fraction)`, each row `i` holding token `i -
     e`'s, any value where `i < e` (masked). A rolled loop over the offsets, each offset's keys and decay read
     and formed once for every product, each term the row times the key, then times the decay. Summed over a
-    chunk's key blocks, `banded` places them once: placed a key block and an offset at a time, the `[C, C]`
-    selects took an H100's Kimi Linear intra launch from 492 to 1982 us (M-JS-50d)."""
+    chunk's key blocks, a launch's bands are placed by its caller (`placed_bands`): placed a key block and an
+    offset at a time, the `[C, C]` selects took an H100's Kimi Linear intra launch from 492 to 1982 us
+    (M-JS-50d)."""
     index, _ = _grid(prefix[0].shape)
     lane = jax.lax.broadcasted_iota(jnp.int32, (index.shape[0], sub), 1)
 
@@ -743,18 +744,52 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], prefix
     return list(jax.lax.fori_loop(0, sub, offset, (zero,) * len(rows)))
 
 
-def banded(band: jax.Array, *, sub: int = SUB) -> jax.Array:
-    """A band of own pairs (`key_diagonal_bands`') placed `[C, C]` fp32: its row `i`'s column `e` at `(i, i -
-    e)` within `i`'s sub-chunk, zero elsewhere."""
-    rows_index, columns_index = _grid((band.shape[0],) * 2)
+def placed_bands(bands: jax.Array, *, chunk: int, sub: int = SUB) -> jax.Array:
+    """Bands of own pairs (`key_diagonal_bands`'), a call's rows `[R, H * sub]` each row `i`'s column `e`
+    the pair `(i, i - e)`, placed `[R, H * chunk]`: each at its column within its chunk and sub-chunk, zero
+    elsewhere, every chunk and head at once."""
+    rows, heads = bands.shape[0], bands.shape[1] // sub
+    token = jnp.arange(rows)[:, None] % chunk
+    lag = token - jnp.arange(chunk)[None, :]
+    within = (lag >= 0) & (lag <= token % sub)
+    found = jnp.take_along_axis(bands.reshape(rows, heads, sub), jnp.clip(lag, 0, sub - 1)[:, None, :],
+                                axis=2)
+    return jnp.where(within[:, None, :], found, jnp.zeros((), bands.dtype)).reshape(rows, heads * chunk)
+
+
+def own_bands(pairs: jax.Array, *, chunk: int, sub: int = SUB) -> jax.Array:
+    """`placed_bands`' transpose: a call's pairs `[R, H * chunk]` (each chunk's square of a head's pairs) as
+    their own pairs' bands `[R, H * sub]`, each row `i`'s column `e` its pair `(i, i - e)` within `i`'s
+    sub-chunk, zero past it."""
+    rows, heads = pairs.shape[0], pairs.shape[1] // chunk
+    token = jnp.arange(rows)[:, None] % chunk
+    offset = jnp.arange(sub)[None, :]
+    found = jnp.take_along_axis(pairs.reshape(rows, heads, chunk),
+                                jnp.clip(token - offset, 0, chunk - 1)[:, None, :], axis=2)
+    return jnp.where((offset <= token % sub)[:, None, :], found,
+                     jnp.zeros((), pairs.dtype)).reshape(rows, heads * sub)
+
+
+def band_strip(band: jax.Array, offset) -> jax.Array:
+    """A band's column `offset` (`[C, sub]`, `key_diagonal_bands`' form) as a column `[C, 1]`: each row's
+    pair `offset` tokens back."""
     lane = jax.lax.broadcasted_iota(jnp.int32, band.shape, 1)
+    return jnp.sum(jnp.where(lane == offset, band, 0.0), axis=1)[:, None]
 
-    def offset(e, total):
-        column = jnp.sum(jnp.where(lane == e, band, 0.0), axis=1)
-        placed = (columns_index == rows_index - e) & (rows_index % sub >= e)
-        return total + jnp.where(placed, column[:, None], 0.0)
 
-    return jax.lax.fori_loop(0, sub, offset, jnp.zeros(rows_index.shape, jnp.float32))
+def pairs_masked(found: jax.Array, *, strict: bool, scale: float) -> jax.Array:
+    """An output's pairs `found` `[C, C]` (a key block's factored pairs) as its sum takes them: below the
+    diagonal where `strict` (the system), else on and below it and scaled (the scores); the sub-chunks' own
+    pairs' bands alike, in their form (`band_masked`)."""
+    lag = _lags(found.shape)
+    return jnp.where(lag > 0, found, 0.0) if strict else jnp.where(lag >= 0, found, 0.0) * scale
+
+
+def band_masked(band: jax.Array, *, strict: bool, scale: float) -> jax.Array:
+    """A band of own pairs as its output's sum takes it (`pairs_masked`'s rule in the band's form): its
+    column 0, a token's pair with itself, dropped where `strict` (the system), else kept and `scale`d."""
+    lane = jax.lax.broadcasted_iota(jnp.int32, band.shape, 1)
+    return jnp.where(lane > 0, band, 0.0) if strict else band * scale
 
 
 def key_decayed_write(key, gate, low, last, last_low):
@@ -1009,21 +1044,21 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
         emit("keys", 0, c, d_keys)
 
 
-def key_diagonal_pairs_back(d_loads: list, own: list, prefix: tuple, behind: Callable[[jax.Array], tuple],
+def key_diagonal_pairs_back(strips: list, own: list, prefix: tuple, behind: Callable[[jax.Array], tuple],
                             lower: Callable[[jax.Array, jax.Array], jax.Array], d_rows: tuple, d_keys,
                             *, sub: int = SUB) -> tuple:
     """`key_diagonal_bands`' transpose on one key block, added onto its gradients so far `d_rows` (one a
     pairs' gradient) and `d_keys`: for each offset `e` the band `dP[i, i - e]` of each pairs' gradient
-    `d_loads[p]()` within `i`'s sub-chunk (a load each offset reads afresh: held across the offsets, the
-    pairs' two [C, C] gradients spilled 88 bytes a thread on an H100 and an A100, kda-gate at dab20ca57), a
-    row's vector, and each pair's own decay `exp2(g_i - g_{i - e})` (`behind(e)`: the keys and separated
+    `strips[p](e)` within `i`'s sub-chunk, a row's vector `[C, 1]` (`band_strip` of the pairs' gradients'
+    own bands, `own_bands`, read once a launch: read from each chunk's `[C, C]` square at every offset and
+    key block, an sm100's own pairs' backward took 0.844 ms of Kimi Linear's training, M-JS-119), and each
+    pair's own decay `exp2(g_i - g_{i - e})` (`behind(e)`: the keys and separated
     prefix each row holding the token `e` before its own's, as `key_diagonal_bands` reads them); the rows'
     `dP[i, i - e] k_{i - e}` decayed, and the keys' `sum_p dP[i, i - e] r_i` decayed (`own[p]()` the rows,
     read where weighed), formed on the rows `i`
     and moved up to the keys `i - e` (`lower(e, x)`: row `i` of `x` at row `i - e`, any value past the tile's
     end, masked). Each exponent at most zero at any decay (fla_kda's token-parallel diagonal's gradient,
     chunk_kda_bwd_intra's diagonal blocks)."""
-    rows_index, columns_index = _grid((prefix[0].shape[0],) * 2)
     index, _ = _grid(prefix[0].shape)
 
     def offset(e, carried):
@@ -1033,8 +1068,7 @@ def key_diagonal_pairs_back(d_loads: list, own: list, prefix: tuple, behind: Cal
         # value (an interpreter's NaN in shared memory left unwritten).
         within = index % sub >= e
         decay = jnp.where(within, between(prefix, tuple(earlier)), 0.0)
-        band = (columns_index == rows_index - e) & (rows_index % sub >= e)
-        bands = [jnp.sum(jnp.where(band, load(), 0.0), axis=1)[:, None] for load in d_loads]
+        bands = [strip(e) for strip in strips]
         d_rows = tuple(total + jnp.where(within, strip * keys * decay, 0.0)
                        for total, strip in zip(d_rows, bands, strict=True))
         # The rows read where they are weighed, not held across the offsets: held, an sm100's own pairs'

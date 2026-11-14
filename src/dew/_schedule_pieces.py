@@ -100,7 +100,7 @@ def ramp(init: jax.typing.ArrayLike, end: jax.typing.ArrayLike,
     return schedule
 
 
-def cosine(init: jax.typing.ArrayLike, span: Horizon, alpha: float) -> optax.Schedule:
+def cosine(init: jax.typing.ArrayLike, span: Horizon, alpha: jax.typing.ArrayLike) -> optax.Schedule:
     """`optax.cosine_decay_schedule(init, span, alpha)`, its arithmetic Optax's, with `span` a count of
     steps or an operand (`ScheduleBase.horizons`), positive."""
     def schedule(count):

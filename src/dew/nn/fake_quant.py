@@ -15,7 +15,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.precision import at_least_fp32, divided
+from dew.nn.precision import at_least_fp32, correctly_rounded_divide, divided
 
 E2M1 = np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32)
 """Each E2M1 code's value in code order (ml_dtypes' float4_e2m1fn): 0 to 6
@@ -29,7 +29,16 @@ E2M1_TIES_UP = np.arange(7) % 2 == 1
 """Whether a magnitude exactly on each midpoint rounds up, to even: where the
 lower neighbour's mantissa bit, its code's bit 0, is 1 (0.5, 1.5, 3)."""
 
-_E4M3_MAX = float(jnp.finfo(jnp.float8_e4m3fn).max)
+E4M3_MAX = float(jnp.finfo(jnp.float8_e4m3fn).max)
+"""E4M3FN's largest finite value, 448, which a block's amax is scaled to."""
+
+AMAX_FLOOR = 1e-4
+"""`per_block_cast_to_fp8`'s `clamp(1e-4)` on a block's amax (DeepGEMM, deep_gemm/utils/math.py at
+057ca596)."""
+
+type Block = int | tuple[int, int]
+"""The rows and columns one FP8 scale covers: DeepSeek's square `block`, or `(rows, cols)`, such as
+`(1, cols)` for one scale a row of a `cols`-wide matrix (a frozen FP8 matrix's rows, `dew.quantization`)."""
 _E2M1_MAX = float(jnp.finfo(jnp.float4_e2m1fn).max)
 
 
@@ -107,13 +116,13 @@ def fp8_scaled_blocks(x, block: int):
     ue8m0, kernel.py:40-124): amax floored at 1e-4, the scale the ceiling power of two of amax / 448."""
     blocks = x.astype(at_least_fp32(x.dtype)).reshape(*x.shape[:-1], -1, block)
     amax = jnp.maximum(jnp.max(jnp.abs(blocks), -1, keepdims=True), 1e-4)
-    return blocks, _power_of_two_ceil(amax * jnp.float32(1 / _E4M3_MAX))
+    return blocks, _power_of_two_ceil(amax * jnp.float32(1 / E4M3_MAX))
 
 
 def fp8_codes(values):
     """`values` (fp32, a block over its scale) rounded to E4M3FN, ties to even, clamped to +-448: an FP8
     block's codes (`fp8_rounded`'s, before its scale)."""
-    return _round_e4m3fn(jnp.clip(values, -_E4M3_MAX, _E4M3_MAX))
+    return _round_e4m3fn(jnp.clip(values, -E4M3_MAX, E4M3_MAX))
 
 
 def fp4_codes(values):
@@ -151,7 +160,7 @@ def fp4_scaled_blocks(x, block: int, e4m3_scale: bool):
         # (ledger 1402). At a float64 truth's width, the float64 quotient rounded once to fp32, IEEE's
         # (53 >= 2 x 24 + 2), then rounded to E4M3 at that width, exactly.
         quotient = divided(floored, jnp.asarray(_E2M1_MAX, wide)).astype(jnp.float32).astype(wide)
-        return blocks, _round_e4m3fn(jnp.minimum(quotient, _E4M3_MAX))
+        return blocks, _round_e4m3fn(jnp.minimum(quotient, E4M3_MAX))
     return blocks, _power_of_two_ceil(jnp.maximum(amax, _E2M1_MAX * 2 ** -126) * jnp.float32(1 / _E2M1_MAX))
 
 
@@ -190,3 +199,61 @@ class FakeQuantizing(nn.Module):
 
     def fp4(self, x, block: int, e4m3_scale: bool):
         return fp4_rounded(x, *self.fp4_scaled_blocks(x, block, e4m3_scale), e4m3_scale)
+
+
+def block_sides(block: Block) -> tuple[int, int]:
+    """`block` as its rows and columns, refused unless both are positive ints."""
+    rows, cols = (block, block) if isinstance(block, int) else block
+    if type(rows) is not int or type(cols) is not int or rows < 1 or cols < 1:
+        raise ValueError(f"a block covers a positive number of rows and columns, got {block!r}")
+    return rows, cols
+
+
+def fp8_blocks_on_host(weight, block: Block, *, rounded=np.asarray) -> tuple[np.ndarray, np.ndarray]:
+    """DeepGEMM's `per_block_cast_to_fp8` on the host: `weight`, a finite [rows, cols] matrix in any float
+    dtype on any device (a host float32 copy of it, exact), cast to float8_e4m3fn blocks of `block` and the
+    float32 scales that invert them, each block's scale rounded by `rounded` (a ue8m0 checkpoint's rounds
+    it up to a power of two, `dew.interop.codecs.quantize_fp8_blocks`). A matrix that is not finite is
+    refused by name: E4M3FN encodes no infinity, and one carries its whole block's scale away with it."""
+    values = np.asarray(weight, np.float32)
+    if values.ndim != 2:
+        raise ValueError(f"block-scaled quantization takes a [rows, cols] weight, got shape {values.shape}")
+    if not np.isfinite(values).all():
+        raise ValueError(
+            f"a {values.shape} weight holds {int(np.count_nonzero(~np.isfinite(values)))} value(s) that are "
+            f"not finite; E4M3FN encodes no infinity, and one of them carries its whole block's scale away "
+            f"with it")
+    rows, cols = block_sides(block)
+    codes, scale_inv = _cast_blocks(values, rows, cols, xp=np, divide=np.divide, rounded=rounded,
+                                    coded=np.asarray)
+    # A contiguous copy: sliced off the padding, the codes are a view whose buffer a writer taking it would
+    # read as the padded rows.
+    return np.ascontiguousarray(codes), scale_inv
+
+
+def fp8_block_cast(x, block: Block) -> tuple[jax.Array, jax.Array]:
+    """`fp8_blocks_on_host`' cast in a traced program, on a matrix where it computes, to the same bytes: a
+    frozen FP8 product's activation rows (`dew.quantization`). No value is refused and no scale rounded to
+    ue8m0 here."""
+    rows, cols = block_sides(block)
+    # XLA divides through a reciprocal; the cast's two divisions round as IEEE's do. The codes round to
+    # E4M3 in Dew's arithmetic (`fp8_codes`), which the cast then holds exactly: XLA GPU's default excess
+    # precision deletes an f32 -> E4M3 -> f32 convert pair, and XLA:CPU converts a hoisted small loop's
+    # narrow floats through float16, rounding twice.
+    return _cast_blocks(jnp.asarray(x, jnp.float32), rows, cols, xp=jnp, divide=correctly_rounded_divide,
+                        rounded=jnp.asarray, coded=fp8_codes)
+
+
+def _cast_blocks(values, rows: int, cols: int, *, xp, divide, rounded, coded):
+    """The FP8 block cast of a float32 `values` matrix under `xp`, NumPy or jax.numpy, dividing by `divide`,
+    rounding each block's scale by `rounded` and each value over it to E4M3 by `coded` before the cast:
+    `per_block_cast_to_fp8`'s rule, its 1e-4 amax floor `AMAX_FLOOR`."""
+    height, width = values.shape
+    padded = xp.pad(values, ((0, -height % rows), (0, -width % cols)))
+    tiles = padded.reshape(padded.shape[0] // rows, rows, padded.shape[1] // cols, cols)
+    amax = xp.maximum(xp.max(xp.abs(tiles), axis=(1, 3)), xp.float32(AMAX_FLOOR))
+    scale_inv = rounded(divide(amax, xp.float32(E4M3_MAX)))
+    # One reciprocal per block, as the reference takes it.
+    codes = coded(tiles * divide(xp.float32(1.0), scale_inv)[:, None, :, None]).astype(
+        ml_dtypes.float8_e4m3fn)
+    return codes.reshape(padded.shape)[:height, :width], scale_inv

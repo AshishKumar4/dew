@@ -79,12 +79,15 @@ def cheapest[Root: BaseExpr, Price: Linear](graph: EGraph, root: Root, model: Da
     an infinite level, no form, compares no further."""
     if exact:
         return extracted(graph, root, model)
-    form, price = graph.extract(root, include_cost=True, cost_model=model, extractor="greedy-dag")
-    if checked:
-        _, optimum = extracted(graph, root, model)
-        if _dearer(price, optimum):
-            raise Dearer(f"greedy extraction prices {root} at {price}, above the exact optimum {optimum}: "
-                         "extract it exactly (derive.Reduction.exact)")
+    if not checked:
+        return graph.extract(root, include_cost=True, cost_model=model, extractor="greedy-dag")
+    # The oracle reads the greedy choice's own extraction (`recorded`): its form, its price and every node
+    # it priced, which the exact optimum is solved over, so a checked choice extracts once.
+    form, nodes, owner, price = recorded(graph, root, model)
+    optimum = _priced(solved(nodes, owner, price, model.identity), model.identity)
+    if _dearer(price, optimum):
+        raise Dearer(f"greedy extraction prices {root} at {price}, above the exact optimum {optimum}: "
+                     "extract it exactly (derive.Reduction.exact)")
     return form, price
 
 
@@ -109,7 +112,7 @@ def _dearer(price: Linear, optimum: Linear) -> bool:
 def extracted[Root: BaseExpr, Price: Linear](graph: EGraph, root: Root,
                                           model: DagCostModel[Price]) -> tuple[Root, Price]:
     """`root`'s cheapest form under `model` and its price, each shared node once (the module's account)."""
-    nodes, owner, greedy = recorded(graph, root, model)
+    _, nodes, owner, greedy = recorded(graph, root, model)
     chosen = solved(nodes, owner, greedy, model.identity)
     keys = {node.key for node in chosen}
     forced = DagCostModel(marginal_cost=lambda _, node: _Outside(int(terms.key(node) not in keys)),
@@ -127,11 +130,10 @@ class _Outside:
         return _Outside(self.count + other.count)
 
 
-def recorded[Price: Linear](graph: EGraph, root: BaseExpr,
-                            model: DagCostModel[Price]
-                            ) -> tuple[dict[Hashable, Node[Price]], Hashable, Price]:
-    """Every node a `greedy-dag` extraction of `root` prices under `model`, by its key, `root`'s class and
-    the price that extraction reports:
+def recorded[Price: Linear, Root: BaseExpr](graph: EGraph, root: Root, model: DagCostModel[Price]
+                                         ) -> tuple[Root, dict[Hashable, Node[Price]], Hashable, Price]:
+    """A `greedy-dag` extraction of `root` under `model`: the form it chose, every node it priced, by its
+    key, `root`'s class and the price it reports:
     the extraction prices the nodes `root` reaches alone, so its class is the one no node reads (a bundle
     of roots), or the class of its row where the DAG reads it back. A node of a table (a constructor's row)
     is in the class its row holds; a value (a literal, a container) is a class of its own."""
@@ -150,18 +152,18 @@ def recorded[Price: Linear](graph: EGraph, root: BaseExpr,
                           tuple(terms.key(argument) for argument in get_callable_args(node) or ()), price)
         return price
 
-    _, greedy = graph.extract(root, include_cost=True, extractor="greedy-dag",
-                              cost_model=DagCostModel(marginal_cost=marginal, identity=model.identity))
+    form, greedy = graph.extract(root, include_cost=True, extractor="greedy-dag",
+                                 cost_model=DagCostModel(marginal_cost=marginal, identity=model.identity))
     read = {child for node in nodes.values() for child in node.children}
     unread = {node.owner for node in nodes.values()} - read
     if len(unread) == 1:
-        return nodes, unread.pop(), greedy
+        return form, nodes, unread.pop(), greedy
     # A root its own DAG reads back (a pair its projections read) is found by its row; a wrapper is not
     # looked up, as egglog cannot register a container of none (a bundle of no roots) alone.
     found = graph.lookup_function_value(root)
     if found is None:
         raise ValueError(f"the e-graph holds no row of the extracted root {root}")
-    return nodes, terms.key(found), greedy
+    return form, nodes, terms.key(found), greedy
 
 
 def solved[Price: Linear](nodes: Mapping[Hashable, Node[Price]], root: Hashable, near: Price,

@@ -5,6 +5,7 @@ prices from them: a contraction's split (`split_count`, `split_walk`) and a dens
 wave (`balanced_tail`, `handoff_steps`, `fixes_up`)."""
 
 import dataclasses
+import math
 from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
@@ -19,7 +20,7 @@ def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
     """The bundle a tile runs on: the one it names (`Tiles.family`, `bundles.named`), for a consumer's share
     of the tile's rows and the columns its accumulators hold (`tile_columns`, `mosaic.Issuer.specialized`)."""
     family = bundles.named(tiles.family, dtype)
-    return family.specialized(tiles.block_m // tiles.warpgroups, tile_columns(tiles, family))
+    return family.specialized(tiles.share, tile_columns(tiles, family))
 
 
 def tile_columns(tiles: "Tiles", family: mosaic.Family) -> int:
@@ -35,46 +36,62 @@ def tile_rows(tiles: "Tiles", family: mosaic.Family) -> int:
     return tiles.block_m * (tiles.cluster if family.pairs_product else 1)
 
 
-def step_seconds(tiles: "Tiles", target, itemsizes: tuple[int, int]) -> float | None:
+def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
+                 decoded: tuple = (None, None)) -> float | None:
     """One step of `tiles` on one multiprocessor, in seconds, the unit the kernel gradient's split
     (`split_count`) and a balanced tail (`handoff_steps`) price their walks in: the longer of its products'
     FLOPs at the multiprocessor's 16-bit tensor rate and its operands' bytes through its shared memory at
     that memory's rate (`templates.cost.rates`, each the architecture's a clock at the part's clock; their
     units overlapped, `cost.units`), a step's `step_shared_bytes` of operands of `itemsizes` (the left's
-    and the right's); None where the target states no tensor rate. A pair's step is a CTA's: its rows by
-    the pair's columns (`tile_columns`)."""
+    and the right's) in their `decoded` forms; None where the target states no tensor rate. A pair's step is
+    a CTA's: its rows by the pair's columns (`tile_columns`)."""
     rates = unit_cost.rates(target, device=False)
     tensor, shared = rates[0], rates[5]
     if tensor is None:
         return None
     family = family_of(tiles, jnp.bfloat16)
     products = 2 * tiles.block_m * tile_columns(tiles, family) * tiles.block_k / tensor
-    return products if shared is None else max(products, step_shared_bytes(tiles, family, itemsizes) / shared)
+    moved = step_shared_bytes(tiles, family, itemsizes, decoded)
+    return products if shared is None else max(products, moved / shared)
 
 
-def step_shared_bytes(tiles: "Tiles", family: mosaic.Family, itemsizes: tuple[int, int]) -> int:
+def step_shared_bytes(tiles: "Tiles", family: mosaic.Family, itemsizes: tuple[float, float],
+                      decoded: tuple = (None, None)) -> float:
     """The bytes a step of `tiles` passes through one multiprocessor's shared memory: its rows' and its
     matrix's blocks staged once (each CTA its own: a pair's CTA half the pair's columns), then read by its
     products as its issuer reads them (`Issuer.shared_reads`: a fragment's warps' loads, or a descriptor's
     reads an instruction), each consumer its share of the rows and the matrix's block. A pair's CTA's half of
     the matrix is counted read by both CTAs' products (`Transport.pairs_product`): an assumption of this
     model, not a measured fact, which M-EM-35's pinned one-CTA arm against the derived pair tests (rows
-    5671, 5363)."""
-    rows = tiles.block_m * tiles.block_k * itemsizes[0]
-    matrix = tiles.block_n * tiles.block_k * itemsizes[1]
+    5671, 5363). An operand whose stage is decoded (`decoded`, each operand's `(itemsize, copies)`, its
+    decode `packed.lanes`) is read from its stage by its decoders, `copies` times whole (`packed.decoding`:
+    once where its consumers share the decode, `shared_decode`, each its columns; each consumer the whole
+    stage where not), then written as `copies` stages of the decoded `itemsize` the products read (an NVFP4
+    matrix's bf16 stage, `gmm`'s `scales`), or, at itemsize 0, decoded in registers into the products,
+    which read it from shared memory never (`gmm`'s `packed_rows`); None, read as staged."""
     share = tiles.block_m // tiles.warpgroups
     lhs_reads, rhs_reads = family.specialized(share, tile_columns(tiles, family)).shared_reads(share)
     readers = tiles.warpgroups * (2 if family.pairs_product else 1)
-    return rows + matrix + rows * lhs_reads + matrix * rhs_reads * readers
+    elements = (tiles.block_m * tiles.block_k, tiles.block_n * tiles.block_k)
+    moved = 0.0
+    for count, staged, form, reads in zip(elements, itemsizes, decoded, (lhs_reads, rhs_reads * readers),
+                                          strict=True):
+        if form is None:
+            moved += count * staged * (1 + reads)
+            continue
+        itemsize, copies = form
+        moved += count * (staged + copies * (staged + itemsize) + itemsize * reads)
+    return moved
 
 
 def fixes_up(tiles: "Tiles", dtype) -> bool:
     """Whether a tile's steps may be walked by several programs at `tiles`, each leaving its partial and the
     last to arrive adding them (`mosaic.Family.fixed_up`): its family's, where its consumers hold the tile's
     accumulator in registers, which `fixed_up` leaves and adds whole; not tcgen05's, whose accumulator stays
-    in tensor memory (`Issuer.tensor_columns`), read out a chunk of columns at a time."""
+    in tensor memory (`Issuer.tensor_columns`), read out a chunk of columns at a time; nor a ping-pong tile's,
+    whose consumers each finish their own tiles, which no last wave's partials share."""
     family = family_of(tiles, dtype)
-    return family.fixes_up and not family.tensor_columns(tiles.block_n, 1)
+    return family.fixes_up and not family.tensor_columns(tiles.block_n, 1) and not tiles.pingpong
 
 
 def balanced_tail(tiles: "Tiles", grid: tuple[int, int], steps: int, itemsizes: tuple[int, int], target,
@@ -202,3 +219,31 @@ def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int
                      rows * (depth * itemsizes[0] + width * itemsizes[1]), bandwidth, step_seconds,
                      held * width * 4 / bandwidth / step_seconds,
                      0.0 if launch_seconds is None else launch_seconds / step_seconds)
+
+
+def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth: int, width: int,
+                       columns: int | None, held: int, operands: tuple, multiprocessors: int) -> dict:
+    """A decode-sized product's walk at `tiles` as `split_walk` and `split_count` price it (their keywords):
+    swapped (`Tiles.swapped`), its matrix the rows, `width` of them, over its `depth`, the call's `rows` its
+    `columns` padded to whole column units; else each active group's (at most `rows` of `groups`) one row
+    tile over the depth, its partials `held` rows. `operands`, the bytes an element of the
+    products' left and right move from device memory and their decoded forms (`step_shared_bytes`)."""
+    itemsizes, decoded = operands
+    if tiles.swapped:
+        assert columns is not None, "a swapped walk's columns are the call's rows, padded"
+        shape = {'groups': 1, 'rows': depth, 'depth': width, 'width': columns}
+    else:
+        active = min(groups, rows)
+        shape = {'groups': active, 'rows': depth * active, 'depth': tiles.block_m, 'width': width,
+                 'partial_rows': held}
+    unswapped = dataclasses.replace(tiles, swapped=False)
+    return {**shape, 'itemsizes': itemsizes, 'multiprocessors': multiprocessors,
+            'step_seconds': step_seconds(unswapped, target, itemsizes, decoded),
+            'bandwidth': target.memory_rate, 'launch_seconds': target.launch_seconds}
+
+
+def walk_seconds(tiles: "Tiles", contraction: dict) -> float:
+    """The seconds `tiles`' walk of a `contraction` (`decode_contraction`) takes at its split, past every
+    other walk's where the device states no rate (`split_walk`)."""
+    walk = split_walk(dataclasses.replace(tiles, swapped=False), **contraction)
+    return math.inf if walk is None else walk.seconds(tiles.splits)

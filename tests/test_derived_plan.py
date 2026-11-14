@@ -3,6 +3,7 @@ derivation walks the ladder from the base rung before anything compiles, and the
 climbs on as a correction. A run that starts from a plan, recorded or resumed, tries that plan first."""
 
 import cProfile
+import json
 import logging
 import pstats
 
@@ -201,7 +202,7 @@ def bare_search(objective):
 
     from model_support import memory_limited_to
 
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     # A GPU whose stated memory limits its allocator to `LIMIT`, so the search judges its derivations.
     mesh = MeshSpec().build(compile_only_gpus("sm90", 1, memory_limited_to(LIMIT)))
@@ -531,6 +532,26 @@ def test_a_run_that_sets_its_remat_derives_its_own_rung_alone_and_compiles_there
         assert trainer.plan["derived"] and {entry["remat"] for entry in trainer.plan["derived"]} == {remat}
 
 
+def test_a_run_that_sets_its_remat_keeps_it_through_a_compile_that_misses(monkeypatch, tmp_path):
+    """A run that sets its remat keeps it where its compile misses (docs/design/training.md: every choice
+    the plan makes can be overridden): with room for the step under full recomputation and an eighth of
+    what 'minimal' needs past it, the run that sets 'minimal' is refused, every compile at 'minimal' (its
+    head's rungs among them), where a miss climbed it to recompute more than it asked."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    stated, recomputed = deep(REMAT_POLICIES["minimal"]), deep(REMAT_POLICIES["full"])
+    own = needs(monkeypatch, stated, lambda: compiled(stated))
+    full = needs(monkeypatch, recomputed, lambda: compiled(recomputed))
+    assert full < own, (full, own)
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, full + (own - full) // 8)
+    trainer = deep(REMAT_POLICIES["minimal"])
+    with pytest.raises(PlanRefused) as refused:
+        compiled(trainer)
+    assert refused.value.probes
+    assert {json.dumps(probe.rung["remat"]) for probe in refused.value.probes} == {
+        json.dumps(stated.plan["remat"])}
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_run_over_two_devices_that_sets_its_remat_derives_its_share_and_compiles_once(
         monkeypatch, tmp_path):
@@ -637,8 +658,9 @@ def gated(layers: str, generation: str, remat: str, capacity: int, records, prec
     refused or not."""
     from model_support import memory_limited_to
 
+    from dew.nn.kernels.generation import compile_only_gpus
     from dew.registry import models
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead
 
     model = models.build("causal_transformer", vocab_size=128, emb_features=64, num_layers=2, num_heads=4,
                          num_kv_heads=2, mlp_features=128, max_seq_len=128,
@@ -664,18 +686,17 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
                                                                    tmp_path):
     """The derivation judges a step's fit as its compile does at 0.6 and 1.6 times what the compile needs,
     over decoders dense, hybrid and of experts, Ampere and Hopper, no recomputation and full, JAX's
-    default and highest matmul precision (row 2113's gate, in the kernel gate's evidence shape,
-    `compile_evidence`). The need is the program's as XLA lays it out on a roomy GPU, and the
-    derivation's, read off that compile, admits it at 1.6 times and refuses it at 0.6. A gate decoder's
-    peak is the program's own (`Footprint.exact`), an expert decoder's at both precisions too: its ragged
-    products run on CUDA as the grouped selector's native kernels (`grouped_matmul.GROUPED`: Triton's at
-    JAX's default precision, Mosaic GPU's at highest), custom calls that hold their outputs alone
-    (`dew.nn.programs.opaque`). On a GPU stating 1.6
+    default and highest matmul precision (row 2113's gate, its evidence `compile_evidence`'s). The need is
+    the program's as XLA lays it out on a roomy GPU, and the derivation's, read off that compile, admits
+    it at 1.6 times and refuses it at 0.6. A gate decoder's peak is the program's own (`Footprint.exact`),
+    an expert decoder's at both precisions too: its ragged products run on CUDA as the grouped selector's
+    native kernels (`grouped_matmul.GROUPED`: Triton's at JAX's default precision, Mosaic GPU's at
+    highest), custom calls that hold their outputs alone (`dew.nn.programs.opaque`). On a GPU stating 1.6
     times the compile is the roomy one, whose need it holds, XLA's rematerialization changing nothing in a
     module already within its limit (`RematerializeComputation`,
     xla/hlo/transforms/simplifiers/hlo_rematerialization.cc), so its fit is read off that compile, at 0.6
     times as at 1.6."""
-    from compile_evidence import Evidence, Facts, Measurement, Prediction
+    from compile_evidence import Evidence, Measurement, Prediction
 
     (roomy,) = gated(layers, generation, remat, 1 << 34, tmp_path / "roomy", precision)
     need, derived = (1 << 34) - roomy["headroom"], (1 << 34) - roomy["derived_headroom"]
@@ -683,12 +704,11 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
     for margin, admits in ((1.6, True), (0.6, False)):
         budget = int(need * margin)
         evidence = Evidence(
-            f"{layers} {generation} remat {remat} {precision} at {margin} of its need", "",
-            Facts((layers, remat), generation),
+            f"{layers} {generation} remat {remat} {precision} at {margin} of its need",
             Prediction({"peak": roomy["derived"]["peak"]}, derived, budget, derived <= budget, "bytes"),
-            Measurement({"temp": roomy["temp"]}, need <= budget, "xla", jax.__version__))
-        assert evidence.compiled.admits == admits, evidence.describe()
-        assert evidence.agrees, evidence.describe()
+            Measurement({"temp": roomy["temp"]}, need <= budget, "xla"))
+        assert evidence.compiled.admits == admits, evidence
+        assert evidence.agrees, evidence
 
 
 def wide(head_tile=None):

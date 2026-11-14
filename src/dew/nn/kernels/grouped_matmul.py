@@ -578,10 +578,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             return None
         hooks = ba.arguments['hooks']
         stored = hooks.out_dtypes or (ba.arguments['out_dtype'],)
-        plain = resources.tile_registers(family, config.warpgroups, block, dtype, stored=stored,
+        plain = resources.tile_registers(family, config.sharing, block, dtype, stored=stored,
                                         rhs_transposed=self._matrix_transposed(ba),
                                         lhs_retained=ba.arguments.get('paired') is not None)
-        accumulator = -(-config.block_m * columns // config.warpgroups // resources.THREADS)
+        # A consumer's accumulators: its share of the tile's rows (the whole tile's under ping-pong).
+        accumulator = -(-config.share * columns // resources.THREADS)
         # A kernel gradient's consumer prepares its depth half of each step's rows stage in registers (the
         # neighbouring groups' rows zeroed: `mosaic_gpu._staged_halves`), apart from the products, which
         # read shared memory on such a family; mma.sync's products hold that stage in registers already.
@@ -609,8 +610,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # A paired product's second accumulator, carried beside the first (`mosaic_gpu.gmm`'s `paired`): in
         # registers its whole share, in tensor memory the epilogue chunk read beside the first's
         # (`Issuer.chunk_columns`).
-        held_second = -(-config.block_m * family.chunk_columns(config.block_n) // config.warpgroups
-                        // resources.THREADS)
+        held_second = -(-config.share * family.chunk_columns(config.block_n) // resources.THREADS)
         second = held_second if ba.arguments.get('paired') is not None else 0
         plain += second
         if ba.arguments.get('exact_sums') and family.sums_in_persist:
@@ -619,8 +619,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             # beside it a promote at a time (`_promoted`, each product's in turn), not two register
             # accumulators: a 128 x 128 tile 2 x 64 words and the walk's control (B6, where two whole
             # accumulators charged 272 refused it past 248).
-            chunk = -(-config.block_m * family.chunk_columns(columns) // config.warpgroups
-                      // resources.THREADS)
+            chunk = -(-config.share * family.chunk_columns(columns) // resources.THREADS)
             return max(2 * chunk + resources.CONTROL_REGISTERS, plain + max(phases))
         if ba.arguments.get('exact_sums'):
             # Each product's running sum, a second fp32 accumulator (`mosaic_gpu.tgmm`'s exact sums), is
@@ -647,7 +646,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if hooks.prologue is None:
             return 0
         tiles = sum(len(held_axes(axes)) > 1 for axes in hooks.prologue_axes)
-        share = config.block_m * config.block_k // config.warpgroups
+        share = config.share * config.block_k
         stored = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
         in_flight = 0 if self.STAGED_ROWS else family.in_flight
@@ -667,7 +666,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         words)."""
         hooks = ba.arguments['hooks']
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
-        share, columns = config.block_m // config.warpgroups, pricing.tile_columns(config, family)
+        share, columns = config.share, pricing.tile_columns(config, family)
         staging = 0
         if not family.stores_through_registers:
             chunk, _ = mosaic.output_staging(columns, stored)
@@ -686,8 +685,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         vectors += family.column_registers(columns, jnp.float32) if hooks.accumulators > 1 else 0
         # A side tile and an output held beside the next are an epilogue chunk's (`Issuer.chunk_columns`: the
         # whole accumulator's where its registers hold it, tensor memory's chunk on tcgen05).
-        accumulator = -(-config.block_m * family.chunk_columns(columns) // config.warpgroups
-                        // resources.THREADS)
+        accumulator = -(-config.share * family.chunk_columns(columns) // resources.THREADS)
         tiles = sum(len(held_axes(axes)) > 1 for axes in hooks.epilogue_axes) * accumulator
         held = sum(-(-accumulator * jnp.dtype(dtype).itemsize // 4)
                    for dtype in (hooks.out_dtypes or ())[:-1])
@@ -702,23 +700,15 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def _granular(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> bool:
         """Whether `config` is in `family`'s granularity (`candidate`): at most its consumers, at most the
-        programs its registers hold, a ring of two stages at least, whole roles of rows for each consumer,
-        whole column units, one of its depths, and each streamed block's rows in its consumers' equal
-        shares (`Family.shares_rows`)."""
+        programs its registers hold, a ring of two stages at least, whole roles of rows for each consumer
+        that shares a tile's rows (`Tiles.sharing`: one under ping-pong, whose consumers take whole tiles),
+        whole column units, and one of its depths."""
         dtype = ba.arguments['tokens'].dtype
         return not (config.warpgroups > min(family.consumers, mosaic_gpu.CONSUMERS)
                     or config.programs > family.programs(config.warpgroups) or config.stages < 2
-                    or config.block_m % (family.role_rows * config.warpgroups)
+                    or config.block_m % (family.role_rows * config.sharing)
                     or config.block_n % family.column_unit(dtype)
-                    or config.block_k not in (self.STEPS or family.depths(dtype))
-                    or not all(family.shares_rows(rows, config.warpgroups)
-                               for rows in self._streamed_rows(ba, config)))
-
-    def _streamed_rows(self, ba, config: mosaic_gpu.Tiles) -> tuple[int, ...]:
-        """The rows of each block a step streams, each its leading axis as it lies (its consumers' shares
-        of them, `Family.shares_rows`): the rows' tile's (`block_m`, or `block_k` read transposed) and the
-        matrix's (`block_k`, or `block_n` read transposed)."""
-        return config.block_m, config.block_k, *((config.block_n,) if self._matrix_transposed(ba) else ())
+                    or config.block_k not in (self.STEPS or family.depths(dtype)))
 
     def _matrix_transposed(self, ba) -> bool:
         """Whether the matrix's blocks lie transposed, `[width, depth]` (`trans_rhs`), as its stream reads
@@ -833,7 +823,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # role of rows).
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
         unit = family.column_unit(ba.arguments['tokens'].dtype)
-        role = family.role_rows * config.warpgroups
+        role = family.role_rows * config.sharing
         band = config.grid_block_n
         moves = [{'stages': config.stages - 1}, {'stages': config.stages + 1},
                  {'grid_block_n': max(1, band // 2)}, {'grid_block_n': band * 2},
@@ -874,8 +864,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         depth (`_allocations`), its consumers, its registers a consumer thread (`registers`), and at most
         the stages its program's share of the GPU's block (`generation.shared_budget`) holds of a step's
         two operand blocks at an element a byte and its contraction has steps, at least two: the call's a
-        launch at `config` runs (`_ran`), the launch naming `config`."""
-        launched = config
+        launch at `config` runs (`_ran`)."""
         ba, config = self._ran(ba, config)
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
         depth = self._generated_extents(ba)[1]
@@ -902,8 +891,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # gathering rows, `mosaic_gpu.gmm_producer`), as its kernel lowers it.
         gathers = self.PRODUCER_GATHERS and ba.arguments.get('gather') is not None
         producer = mosaic_gpu.gmm_producer(family, gathers)
-        return resources.Launch(scope, roles, self.registers(ba, config), most=most, tile=launched,
-                                producer=producer)
+        return resources.Launch(scope, roles, self.registers(ba, config), most=most, producer=producer)
 
     def rewritten(self, ba, family: mosaic.Family) -> bool:
         """Whether the launch's staged rows are rewritten by `family`'s own role (`rewrites_in_persist`): its
@@ -938,7 +926,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         family = next((bundle for bundle in self._families(ba, target) if bundle.name == config.family), None)
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
                 or (family.pairs_product and ba.arguments['interpret'])
-                or self._pair_refuses(ba, config, family)
+                or self._pair_refuses(ba, config, family) or self._pingpong_refuses(config, family)
                 or not self._divides(ba, config) or report.refused(self, ba, config)):
             return False
         # A family fixing its accumulator's rows takes a tile of exactly them a consumer, and one holding its
@@ -952,8 +940,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if tensor:
             blocks = self._allocations(ba, config, family).blocks
             tensor += family.stream_tensor_columns(blocks, config.stages)
-        if (family.accumulator_rows not in (None, config.block_m // config.warpgroups)
-                or tensor > (target.tmem_columns or 0)):
+        if family.accumulator_rows not in (None, config.share) or tensor > (target.tmem_columns or 0):
             return False
         if not self._granular(ba, config, family):
             return False
@@ -974,6 +961,14 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         """Whether the launch's call carries scales beside its matrix (a packed matrix's, step or block
         scales), its layout its own: none of `_Mosaic`'s."""
         return False
+
+    def _pingpong_refuses(self, config: mosaic_gpu.Tiles, family: mosaic.Family) -> bool:
+        """Whether a ping-pong tile (`Tiles.pingpong`) is one the launch does not run: on a family that takes
+        none (`Family.takes_pingpong`: a producer of its own loads every tile), a kernel gradient's (its
+        consumers prepare their halves of each step's rows stage, `STAGED_ROWS`), a scaled or swapped call
+        (a packed decode's buffers and a swapped tile's rows are each consumer's half)."""
+        return config.pingpong and (not family.takes_pingpong or self.STAGED_ROWS or self._scaled
+                                    or config.swapped)
 
     def _pair_refuses(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> bool:
         """Whether a pair's product refuses the call at `config` (`mosaic_gpu.pair_refuses`, the statement
@@ -1292,30 +1287,50 @@ class MosaicGmm(_Mosaic):
 
 
     def derived(self, ba, target) -> mosaic_gpu.Tiles | None:
-        # A dense product of fewer rows than a role's (a decode step's) runs swapped: its matrix takes the
+        # A dense product of fewer rows than a role's (a decode step's) may run swapped: its matrix takes the
         # MMA's rows and its rows the columns, whose unit is narrower, so its tile multiplies no padding rows
         # (CUTLASS's and cuBLAS's swap of A and B; megabake's 4 x 2048 x 2048 product went from 10.0 to
-        # 4.7 us swapped, cuBLAS's time, row 1762). It is derived as the swapped call's own tile.
+        # 4.7 us swapped, cuBLAS's time, row 1762), derived as the swapped call's own tile, and taken where
+        # its walk prices below the unswapped tile's (row 5874: an NVFP4 decode's swap won on wide outputs
+        # and lost 25-31% on square and narrow ones, M-EM-26-gh200).
+        plain = self._decode_split(ba, super().derived(ba, target), target)
         swapped = self._swapped(ba, target)
-        if swapped is None:
-            return self._decode_split(ba, super().derived(ba, target), target)
-        tile = self._derived(swapped, target, admits=lambda tile: (self._left_fits(ba, tile)
-                                                                    and tile.block_m <= SWAPPED_ROWS))
+        tile = None if swapped is None else self._derived(swapped, target, admits=lambda tile: (
+            self._left_fits(ba, tile) and tile.block_m <= SWAPPED_ROWS))
         if tile is None:
-            return None
+            return plain
         # Its few output tiles leave a wave's programs idle: its depth splits where the busiest program then
         # walks shorter, its fp32 partials' passes and their sum's launch counted (`pricing.split_count`,
         # the kernel gradient's rule; rows 1762 and 483), every run in the one launch (`mosaic_gpu.gmm`).
-        weight, padded = swapped.arguments['tokens'], swapped.arguments['kernel']
-        itemsizes = (weight.dtype.itemsize, padded.dtype.itemsize)
+        tile = dataclasses.replace(tile, swapped=True)
         splits = 1 if ba.arguments['exact_sums'] else pricing.split_count(
-            tile, groups=1, rows=weight.shape[1], depth=weight.shape[0], width=padded.shape[1],
-            itemsizes=itemsizes, multiprocessors=_multiprocessors(target),
-            step_seconds=pricing.step_seconds(tile, target, itemsizes),
-            bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
-        swapped_tile = dataclasses.replace(tile, swapped=True)
-        split = dataclasses.replace(swapped_tile, splits=splits)
-        return split if splits > 1 and self.legal(ba, split, target) else swapped_tile
+            dataclasses.replace(tile, swapped=False), **self._contraction(ba, tile, target))
+        split = dataclasses.replace(tile, splits=splits)
+        tile = split if splits > 1 and self.legal(ba, split, target) else tile
+        walked = {each: pricing.walk_seconds(each, self._contraction(ba, each, target))
+                  for each in (tile, plain) if each is not None}
+        return plain if plain is not None and walked[plain] <= walked[tile] else tile
+
+    def _contraction(self, ba, tile: mosaic_gpu.Tiles, target) -> dict:
+        """A decode-sized dense call's walk at `tile` (`pricing.decode_contraction`): swapped, its matrix
+        the rows (`_swapped`), its operands' bytes and decoded forms the launch's (`_operand_bytes`)."""
+        _, depth, width = self._generated_extents(ba)
+        assert depth is not None, "a product's steps run over its depth"
+        rows = ba.arguments['tokens'].shape[0]
+        swapped = self._swapped(ba, target) if tile.swapped else None
+        return pricing.decode_contraction(
+            tile, target, rows=rows, groups=ba.arguments['sizes'].shape[0], depth=depth, width=width,
+            columns=None if swapped is None else swapped.arguments['kernel'].shape[1],
+            # A decode step's partials hold its rows, a TMA descriptor's whole 8s of them.
+            held=-(-rows // mosaic_gpu.TMA_ROWS) * mosaic_gpu.TMA_ROWS,
+            operands=self._operand_bytes(ba, tile), multiprocessors=_multiprocessors(target))
+
+    def _operand_bytes(self, ba, tile: mosaic_gpu.Tiles) -> tuple[tuple[float, float], tuple]:
+        """The bytes an element of the products' left and right operands moves from device memory at `tile`
+        (swapped, the matrix the left) and each one's decode (`pricing.step_shared_bytes`): none."""
+        tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
+        rows, matrix = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(kernel.dtype).itemsize
+        return ((matrix, rows) if tile.swapped else (rows, matrix)), (None, None)
 
     def _decode_split(self, ba, tile: mosaic_gpu.Tiles | None, target) -> mosaic_gpu.Tiles | None:
         """`tile`, a call's of decode-sized groups (each group's rows within one row tile: a MoE decode
@@ -1330,21 +1345,9 @@ class MosaicGmm(_Mosaic):
         if (tile is None or ba.arguments['exact_sums'] or ba.arguments.get('paired') is not None
                 or hooks.prologue is not None or hooks.epilogue is not None):
             return tile
-        tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
-        groups = ba.arguments['sizes'].shape[0]
-        if tokens.shape[0] > groups * tile.block_m:
+        if ba.arguments['tokens'].shape[0] > ba.arguments['sizes'].shape[0] * tile.block_m:
             return tile
-        _, depth, width = self._generated_extents(ba)
-        assert depth is not None, "a product's steps run over its depth"
-        # A decode step's rows bound its active experts, each one row tile, and its partials hold its rows.
-        active = min(groups, tokens.shape[0])
-        itemsizes = (tokens.dtype.itemsize, kernel.dtype.itemsize)
-        splits = pricing.split_count(
-            tile, groups=active, rows=depth * active, depth=tile.block_m, width=width,
-            partial_rows=-(-tokens.shape[0] // mosaic_gpu.TMA_ROWS) * mosaic_gpu.TMA_ROWS,
-            itemsizes=itemsizes, multiprocessors=_multiprocessors(target),
-            step_seconds=pricing.step_seconds(tile, target, itemsizes),
-            bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
+        splits = pricing.split_count(tile, **self._contraction(ba, tile, target))
         split = dataclasses.replace(tile, splits=splits)
         return split if splits > 1 and self.legal(ba, split, target) else tile
 
@@ -1563,6 +1566,19 @@ class MosaicPackedGmm(MosaicGmm):
 
     SWAPPED_OPTIONS: ClassVar[dict] = {'packed_rows': True}
 
+    def _operand_bytes(self, ba, tile: mosaic_gpu.Tiles) -> tuple[tuple[float, float], tuple]:
+        # Its matrix moves its words and block scales (`formats.NvFp4`): decoded into the stage the products
+        # read (`gmm`'s `scales`, its decoded dtype's: one its consumers share or each one's own,
+        # `packed.decoding`), or swapped, in registers into them, each consumer its rows (`packed_rows`).
+        tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
+        stored = sum(leaf.size * jnp.dtype(leaf.dtype).itemsize
+                     for leaf in (kernel.words, kernel.scales)) / math.prod(kernel.shape)
+        rows, stage = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(kernel.dtype).itemsize
+        if tile.swapped:
+            return (stored, rows), ((0, 1), None)
+        copies = 1 if packed.shared_decode(tile, interpret=False) else tile.warpgroups
+        return (rows, stored), (None, (stage, copies))
+
     def _swaps_on(self, family: mosaic.Family, dtype) -> bool:
         # Swapped, its matrix's stages decode in registers into the products' left operand
         # (`mosaic_gpu.gmm`'s `packed_rows`, row 5387), so no decoded stage passes through shared memory:
@@ -1758,11 +1774,6 @@ class MosaicTgmm(_Mosaic):
         prologue = ba.arguments['hooks'].prologue
         return (family.bounded_loads and rows % cooperative != 0
                 and mosaic_gpu.ragged_rows(rows, prologue=prologue, k_major=self.K_MAJOR))
-
-    def _streamed_rows(self, ba, config: mosaic_gpu.Tiles) -> tuple[int, ...]:
-        # Both operands stream a step's rows (the tokens): `block_k` of them each.
-        del ba
-        return (config.block_k,)
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """`_Mosaic.candidate` on one multiprocessor a tile or a pair (`tgmm` multicasts nothing), a family

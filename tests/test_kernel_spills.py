@@ -93,7 +93,8 @@ import json, sys
 from test_kernel_spills import BATCH, experts
 from dew.nn.kernels.templates import report
 from dew.training import MeshSpec
-from dew.training.ahead import compile_ahead, compile_only_gpus
+from dew.nn.kernels.generation import compile_only_gpus
+from dew.training.ahead import compile_ahead
 
 nonce, refused = float(sys.argv[1]), sys.argv[3] == "refused"
 with report.refusals():
@@ -528,7 +529,7 @@ def test_a_programs_spilling_triton_launch_is_recorded_with_no_mosaic_kernel_bes
     from jax.experimental.pallas import triton as pltriton
     from jax.sharding import NamedSharding, PartitionSpec
 
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     def softmax(x_ref, o_ref):
         x = x_ref[...]
@@ -558,7 +559,7 @@ def _paired_step(launch):
     afresh at each call (a compile's `relower`)."""
     from jax.sharding import NamedSharding, PartitionSpec
 
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
     operands = [jax.ShapeDtypeStruct(shape, jnp.bfloat16, sharding=NamedSharding(devices, PartitionSpec()))
@@ -640,7 +641,7 @@ def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once(consta
     from kernel_compile import staged_copy
 
     from dew.nn.kernels import generation
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     def added(x_ref, y_ref, o_ref):
         o_ref[...] = x_ref[...] + y_ref[...]

@@ -445,3 +445,21 @@ def test_a_constants_and_a_declared_intervals_powers_are_exact(value):
             assert (claimed is not None) == bounded
             if bounded:
                 assert float(np.max(np.abs(np.asarray(fn(*operands))))) <= 2.0 ** claimed, claimed
+
+
+@pytest.mark.parametrize(("fn", "declared"), [
+    (lambda x, t: jnp.tanh(x / t), {}),
+    (lambda x, t: jnp.sign(x / t), {}),
+    (lambda x, t: jnp.square(x * 256.0).astype(jnp.float16) * 2.0 ** -16, {0: (1.0, 1.0), 1: (1.0, 1.0)}),
+], ids=["a tanh of a quotient by an undeclared value", "a sign of one", "a product of an overflowed value"])
+def test_a_bound_over_the_reals_is_stated_of_operands_proven_finite_alone(fn, declared):
+    """A bound over the reals is stated of a value its operands are proven finite numbers of alone (row 5780;
+    owner, 2026-11-14): a quotient by a value nothing holds away from zero may be a NaN, whose tanh and
+    sign are NaNs, and a square that overflowed float16 times a small scale is an infinity whatever its real
+    factors bound; and a declared interval away from zero proves the quotient finite, which bounds them."""
+    operands = (jnp.ones((4,), jnp.float32), jnp.zeros((4,), jnp.float32))
+    region = terms.region(jax.make_jaxpr(fn)(*operands), declared)
+    assert region.magnitudes.get(terms.key(region.outputs[0])) is None
+    if not declared:
+        bounded = terms.region(jax.make_jaxpr(fn)(*operands), {0: (-1.0, 1.0), 1: (1.0, 2.0)})
+        assert bounded.magnitudes.get(terms.key(bounded.outputs[0])) is not None

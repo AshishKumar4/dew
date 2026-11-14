@@ -724,21 +724,32 @@ POST_STEP = (QKClipState, BoundsState)
 """The optimizer states whose effect acts on the weights an update moved (`stepped`)."""
 
 
-def stepped(params, updates, before, after):
+def post_step_order(optimizer: optax.GradientTransformation, params) -> tuple[tuple, ...]:
+    """The paths of `optimizer`'s post-step effects' states (`POST_STEP`) in its state over `params` (arrays
+    or shapes), in the order its chain declares them: read from the state its init builds, as it builds it,
+    before any flattening (a step's argument, `optax.MultiSteps`' `lax.cond`) sorts a named chain's names.
+    The order `stepped` acts in."""
+    order: list[tuple] = []
+
+    def init(held) -> None:
+        order.extend(path for path, _ in _post_step_effects(optimizer.init(held)))
+
+    jax.eval_shape(init, params)
+    return tuple(order)
+
+
+def stepped(params, updates, before, after, order: Sequence[tuple]):
     """`params` moved by `updates`, then each post-step effect of the update that took the optimizer's
-    state from `before` to `after`, in the chain's order: QK-Clip's rescale (`QKClipState`), one
-    rounding of `gamma * (W + update)`, and a bounded group's clamp (`BoundsState`), exact. The
-    weights a step stores, and the only way to form them (the trainer's transaction,
-    `power_profiles`' averages). An effect whose transform the update did not run, a group a mask
-    left out or an update a wrapper deferred or rejected (`optax.MultiSteps`, `optax.apply_if_finite`),
-    whose state comes back as it was, leaves the weights as the update moved them."""
+    state from `before` to `after`, in the chain's `order` (`post_step_order`): QK-Clip's rescale
+    (`QKClipState`), one rounding of `gamma * (W + update)`, and a bounded group's clamp (`BoundsState`),
+    exact. The weights a step stores, and the only way to form them (the trainer's transaction,
+    `power_profiles`' averages). An effect whose transform the update did not run, a group a mask left out
+    or an update a wrapper deferred or rejected (`optax.MultiSteps`, `optax.apply_if_finite`), whose state
+    comes back as it was, leaves the weights as the update moved them."""
     moved = optax.apply_updates(params, updates)
-
-    def effects(state):
-        held = jax.tree_util.tree_leaves(state, is_leaf=lambda node: isinstance(node, POST_STEP))
-        return [node for node in held if isinstance(node, POST_STEP)]
-
-    pairs = list(zip(effects(before), effects(after), strict=True))
+    # Either state may hold a named chain sorted by name: effects pair by their paths, in the chain's order.
+    previous, current = dict(_post_step_effects(before)), dict(_post_step_effects(after))
+    pairs = [(previous[path], current[path]) for path in order]
     if not pairs:
         return moved
     paths, leaves = zip(*jax.tree_util.tree_leaves_with_path(moved), strict=True)
@@ -765,6 +776,17 @@ def stepped(params, updates, before, after):
             done = (_rescaled(leaf, operand) if isinstance(current, QKClipState) else _clamped(leaf, operand))
             held[path] = jnp.where(taken, done, leaf)
     return jax.tree_util.tree_unflatten(jax.tree_util.tree_structure(moved), list(held.values()))
+
+
+def _post_step_effects(state, path: tuple = ()) -> list[tuple[tuple, QKClipState | BoundsState]]:
+    """Each post-step effect's state (`POST_STEP`) in an optimizer's `state`, by its path, in the order the
+    state holds them: a named chain's (a dict by name) as it holds its names, which JAX's flattening sorts."""
+    if isinstance(state, POST_STEP):
+        return [(path, state)]
+    children = (state.items() if isinstance(state, dict) else
+                enumerate(jax.tree_util.tree_leaves(state, is_leaf=lambda node: node is not state)))
+    return [found for key, child in children if child is not state
+            for found in _post_step_effects(child, (*path, key))]
 
 
 def _clamped(leaf: jax.Array, bounds: jax.Array) -> jax.Array:
@@ -1015,7 +1037,7 @@ def power_profiles(solver: optax.GradientTransformation,
         if params is None:
             raise ValueError("power_profiles averages the parameters, so its update needs them")
         updates, inner = solver.update(updates, state.inner, params, **extra_args)
-        produced = stepped(params, updates, state.inner, inner)
+        produced = stepped(params, updates, state.inner, inner, post_step_order(solver, params))
         # An update `solver` holds back moves no average and no count (`update_applied`).
         done = update_applied(state.inner, inner)
         averages = tuple(jax.tree.map(lambda new, old: jnp.where(done, new, old), ema_update(
@@ -1275,6 +1297,16 @@ def _after(progress: jax.Array, start: jax.Array) -> jax.Array:
     return jnp.clip((progress - start) / jnp.maximum(1.0 - start, jnp.finfo(progress.dtype).tiny), 0.0, 1.0)
 
 
+def _floor(rates: Rates) -> jax.typing.ArrayLike:
+    """A cosine's floor, its end value's share of its peak (none at a zero peak, as Optax forms it), from
+    `rates` as they stand, a solver's operands or the configured fields: a solver set to other rates decays
+    to their end value, where the configured ratio held it to the one its program was built at."""
+    peak, end = rates['peak_value'], rates['end_value']
+    if isinstance(peak, int | float) and isinstance(end, int | float):
+        return 0.0 if peak == 0.0 else end / peak
+    return jnp.where(peak == 0, 0.0, end / jnp.where(peak == 0, 1, peak))
+
+
 @dataclasses.dataclass(frozen=True)
 class Cosine(ScheduleBase):
     """A linear warmup from `init_value` to `peak_value`, then a cosine decay to `end_value` at
@@ -1311,10 +1343,9 @@ class Cosine(ScheduleBase):
         if isinstance(self.warmup_steps, str) and share(self.warmup_steps) >= 1:
             raise ValueError(f"Cosine's warmup of {self.warmup_steps} leaves its run no decay")
         through, over, start = self._warm(self.warmup_steps, progress, updates, marks)
-        alpha = 0.0 if self.peak_value == 0.0 else self.end_value / self.peak_value
         # `values`' optax pieces, each read at the fraction of its own span the run stands through.
         warm = optax.linear_schedule(rates['init_value'], rates['peak_value'], 1)(through)
-        decayed = optax.cosine_decay_schedule(rates['peak_value'], 1, alpha)(_after(progress, start))
+        decayed = optax.cosine_decay_schedule(rates['peak_value'], 1, _floor(rates))(_after(progress, start))
         return jnp.where(over, decayed, warm)
 
     def horizons(self, steps: int | None) -> dict[str, int | float]:
@@ -1330,12 +1361,11 @@ class Cosine(ScheduleBase):
                ) -> optax.Schedule:
         rates = self.rates() if rates is None else rates
         warmup, decay_steps = horizons["warmup"], horizons["decay_steps"]
-        # `optax.warmup_cosine_decay_schedule`'s own pieces, joined as it joins them; it forms the
-        # floor's ratio by branching on the peak, so the ratio is the configured fields' (`values`).
-        alpha = 0.0 if self.peak_value == 0.0 else self.end_value / self.peak_value
+        # `optax.warmup_cosine_decay_schedule`'s own pieces, joined as it joins them, its floor's ratio the
+        # rates' own (`_floor`).
         return joined([
             ramp(rates['init_value'], rates['peak_value'], warmup),
-            cosine(rates['peak_value'], decay_steps - warmup, alpha),
+            cosine(rates['peak_value'], decay_steps - warmup, _floor(rates)),
         ], [warmup])
 
 
@@ -1629,15 +1659,14 @@ class Exponential(ScheduleBase):
         span, ratio = horizons["decay_steps"], self.end_value / self.init_value
         init, end = rates['init_value'], rates['end_value']
         # `optax.exponential_decay(init, span, ratio, end_value=end)`, its arithmetic Optax's, with `span`
-        # an operand; Optax branches on the decay rate, so it is the configured fields' ratio (`values`).
+        # an operand, its ratio the configured fields' rounded once as Optax's is (formed from the rounded
+        # rate operands it ran past the scheduled-rate gate): set to other rates, it holds at their end.
         bound = jnp.maximum if ratio < 1.0 else jnp.minimum
 
         def decay(count):
             decayed = jnp.where(count <= 0, init, init * jnp.power(ratio, count / jnp.maximum(span, 1)))
             return bound(decayed, end)
 
-        if not self.offset:
-            return decay
         return lambda count: rates['offset'] + decay(count)
 
 
