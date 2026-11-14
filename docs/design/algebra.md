@@ -661,9 +661,9 @@ def admits(sets: Rules) -> bool: ...         # whether the pass runs it: none an
   out (`passes(without=...)`, §6.7), any of `nameable()`: a registered set but a dev-time one, which runs at
   dev time alone, and a derivation's own set where the derivation still makes a program without it
   (`ARMS`: the carry split's, which then extracts its traced forms). A derivation's defining set (the
-  attention derivation's `decoupled`, a scan's identities) makes its program, which no arm has without it,
-  so no arm names it. Every set's saturation, a derivation's own among them, reads `admits`, and every
-  derivation keys on the sets left out (`derive.context`), so arms share no derivation.
+  attention derivation's `decoupled`, a scan's own identities, `linear_scan`'s, which no `Rules` holds)
+  makes its program, which no arm has without it, so no arm names it. Every nameable set's saturation reads
+  `admits`, and every derivation keys on the sets left out (`derive.context`), so arms share no derivation.
 
 ### 6.5 Cost and extraction
 

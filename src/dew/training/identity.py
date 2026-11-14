@@ -59,7 +59,6 @@ from pathlib import Path
 import jax
 import numpy as np
 from jax._src import config as jax_config
-from jax.core import ShapedArray
 from jax.experimental.layout import Format, Layout
 
 from dew import _cache, _hashing
@@ -248,12 +247,10 @@ def _data(value, at: str) -> JSON | None:
 
 def _parts(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     """One of JAX's values that a call's key holds and the algebra's key does not state, by its parts
-    (each through `again`, `stated` as its caller walks): an abstract value, a tree's structure, a format,
+    (each through `again`, `stated` as its caller walks): a tree's structure, a format,
     one device's sharding, a device, and any other of JAX's by its attributes where it holds them plainly
     (an axis environment's sizes and names), the layout XLA chooses (`Layout.AUTO`). None for a value that
     is none of them."""
-    if isinstance(value, ShapedArray):
-        return ["abstract", list(value.shape), str(value.dtype), bool(value.weak_type)]
     if isinstance(value, type(jax.tree.structure(()))):
         return _tree(value, at, again)
     if isinstance(value, Format):
