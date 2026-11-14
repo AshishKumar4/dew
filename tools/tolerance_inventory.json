@@ -661,10 +661,6 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tools/deepseek_v4_dspark_reference.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tools/diffusers_flux_reference.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL"

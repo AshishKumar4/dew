@@ -1,26 +1,19 @@
-"""DeepSeek-V4-Flash-0731: V4's trunk with DSpark's stages under `mtp.*`.
+"""DeepSeek-V4-Flash-0731: V4's trunk with DSpark's stages under `mtp.*`, held to the release's own runs.
 
-deepseek-v4-dspark-tiny comes from tools/deepseek_v4_dspark_reference.py:
-the release's inference/model.py at 7872f01b (DeepSeek-V4-Flash-0731) run in
-fp32 over the V4.1 tool's torch stand-ins for its kernels, with the
-quantizers off, for DSpark's drafts, and transformers 5.16.1's DeepseekV4
-over the same checkpoint for the trunk's logits. reference_f64.npz is both
-run in float64, the truth tests/reference_error.py's rule measures Dew and
-each reference from. As in tests/test_deepseek_v41.py, each run here takes
-its expert and indexer picks from its own float64 twin (`decided`), which
-the tool checks both references make as their float64 runs do, so the rule
-measures fp32 rounding alone.
+deepseek-v4-dspark-tiny comes from tools/deepseek_v4_dspark_reference.py: the release's inference/model.py
+at 7872f01b (DeepSeek-V4-Flash-0731) over the V4.1 tool's kernels (tools/deepseek_v41_kernels.py, each
+TileLang kernel's arithmetic) with its quantizers off, as Dew's V4 mixer runs, and transformers' DeepseekV4
+over the same checkpoint for the trunk. recording.npz (`--record`) holds their outputs over drawn rows whose
+every selection clears the gate's margin (tests/selection_margins.py), summarized over seeds with their
+float64 truth, for check 1 (tests/deepseek_recorded.py): the trunk's logits, the release's and
+transformers', and the release's cached run with DSpark's drafts; recording_rows.npz the rows each seed drew
+and the cached run's prompt. With its quantizers off the indexer's Hadamard rotation of its queries and
+keys alike leaves the scores it ranks unchanged in exact arithmetic, so the recording runs it as the
+identity, as Dew's mixer does: the release's rotation runs only in bfloat16 on a GPU
+(`fast_hadamard_transform`, model.py:253-257).
 
-Beyond the quantizers, the tie order is the one documented difference from
-the release: both references' indexers break equal scores toward the lower
-entry, as jax.lax.top_k does, where torch.topk leaves the order unspecified
-(`lower_index_ties`). The seed is the first tried, and the indexer's ReLU
-leaves exact-zero ties in eight of the release's selections (source.json),
-so the order decides picks here.
-
-The drafter is V4.1's but for two things: each target layer's context is
-the stream mean of its output (0731 model.py:918-921) where V4.1 averages
-its attention's input, and the stages run V4's plain mHC, the last one
+The drafter is V4.1's but for two things: each target layer's context is the stream mean of its output (0731
+model.py:918-921) where V4.1 averages its attention's input, and the stages run V4's plain mHC, the last one
 collapsing through a learned head of its own (:838-841, :862).
 """
 
@@ -30,7 +23,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from deepseek_recorded import assert_cached_run_as_recorded, cleared_rows, held_to_the_release
 from flax.traverse_util import flatten_dict
+from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
@@ -40,7 +35,13 @@ from dew.sampling import Sample, Sampling, Speculative, generate
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "deepseek-v4-dspark-tiny"
-REFERENCE = np.load(TINY / "reference.npz")
+RECORDING = TINY / "recording.npz"
+"""The release's and transformers' runs over drawn rows, summarized over seeds (the module doc)."""
+with np.load(TINY / "recording_rows.npz") as _stored:
+    ROWS = dict(_stored)
+"""The rows the recording drew, by site (`rows`, `cached_rows`), and its cached run's `prompt`."""
+
+
 @pytest.fixture(scope="module", autouse=True)
 def fp32_matmuls():
     """The references multiply in fp32, where a GPU's default is TF32."""
@@ -53,11 +54,40 @@ def source():
     return Pretrained.load(TINY, dtype="float32", attention_impl="reference")
 
 
+@pytest.fixture(scope="module")
+def recorded_rows(source):
+    """The trunk's recorded rows, each of whose selections Dew's forward clears too (`cleared_rows`)."""
+    return cleared_rows(source.model, source.variables, source.model_config, ROWS["rows"], "recorded row")
+
+
+@pytest.mark.shared_setup("recorded_rows")
+@pytest.mark.parametrize("site", ["deepseek v4 dspark trunk", "deepseek v4 dspark transformers trunk"])
+def test_the_trunks_logits_are_on_par_with_each_references(source, recorded_rows, site):
+    """Dew's forward over drawn rows its selections clear (`recorded_rows`): its logits on par with the
+    release's, and with transformers' DeepseekV4's, each from its own float64 run's (check 1, the
+    recording's), Dew's float64 forward their truth."""
+    draw, recorded, truth, seeds = held_to_the_release(RECORDING, source.model, source.variables,
+                                                       recorded_rows, site)
+    forward = jax.jit(source.model.apply)
+    assert_as_exact(as_given(lambda index, inputs: {"logits": forward(source.variables,
+                                                                      jnp.asarray(inputs["input_ids"]))}),
+                    recorded, draw, site, seeds=seeds, truth_fn=truth)
+
+
+def test_a_cached_run_and_its_drafts_are_on_par_with_the_releases(source):
+    """The release's driver through Dew's cache: the prefill of the prompt, each teacher-forced step's
+    logits after it and DSpark's draft after each, fed the step's argmax, its logits and confidence, over
+    drawn rows whose every selection and fed argmax clears, on par with the release's from its float64
+    run's (check 1, the recording's; `assert_cached_run_as_recorded`)."""
+    assert_cached_run_as_recorded(RECORDING, source, source.model, ROWS["cached_rows"], int(ROWS["prompt"]),
+                                  "deepseek v4 dspark cached")
+
+
 def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(source):
     """At zero temperature every rejected draft is replaced by the target's
     own token, so Speculative decoding with the stages' blocks emits the
     greedy walk, a left-padded row included."""
-    ids = jnp.asarray(REFERENCE["input_ids"])[:, :int(REFERENCE["decode_prompt"])]
+    ids = jnp.asarray(ROWS["cached_rows"][0])[:, :int(ROWS["prompt"])]
     valid = jnp.ones(ids.shape, bool).at[1, :3].set(False)
     inputs = ModelInputs(jnp.where(valid, ids, 0), {"attention_mask": valid})
     walked, speculated = (generate(source.model, source.variables, inputs, 6, key=jax.random.key(0),
@@ -93,7 +123,7 @@ def test_a_stack_in_host_memory_writes_what_its_caller_opens_as_a_resident_one_d
     router's choices, the logits, the state and the drafted context are the
     resident stack's, on a first call and on a second reading the first's state."""
     model = source.model.clone(scan_layers=scan_layers)
-    ids = jnp.asarray(REFERENCE["input_ids"])[:, :6]
+    ids = jnp.asarray(ROWS["rows"][0])[:, :6]
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
 
     def hosted(path, leaf):
