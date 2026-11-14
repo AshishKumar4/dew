@@ -2054,11 +2054,13 @@ def test_a_proven_push_runs_no_suite_though_its_stored_verdict_is_red(tmp_path):
     assert ran("main", "", "off", 0) and ran("fix/lane", "", "on", 1)
 
 
-def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path):
+def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base_and_shows_a_red_ones_findings(
+        tmp_path):
     """CI's lint job runs each gate of tools/check_gates on an armada container of its own, given the commit's
     merge-base with main as BASE, so the job lasts as long as its slowest gate rather than their sum on the
     runner (the maintainer, 2026-10-28: the lint job set trains' wall at 35-41 min); a train's gates start at
-    its priority."""
+    its priority. A red gate's last lines are in the job's log under its name, and the job fails (Main,
+    2026-11-14: base's duplicate-text red named no copy in its log)."""
     import yaml
 
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
@@ -2070,6 +2072,8 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
     checkout = tmp_path / "checkout"
     (checkout / "tools").mkdir(parents=True)
     (checkout / "tools/check_gates").write_text((ROOT / "tools/check_gates").read_text())
+    (checkout / "tools/armada").mkdir()
+    (checkout / "tools/armada/gates_told.py").write_text((ROOT / "tools/armada/gates_told.py").read_text())
     git(checkout, "init", "-q", "-b", "main")
     git(checkout, "add", "-A")
     git(checkout, "commit", "-qm", "base")
@@ -2082,14 +2086,26 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
     git(checkout, "checkout", "-q", "head")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n')
+    # Each gate green but the one `RED` names, whose task printed its finding.
+    (bin_dir / "armada").write_text(
+        f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n'
+        f'python3 -c "import json, os, sys\n'
+        f'for i, g in enumerate(open(sys.argv[1]).read().split()):\n'
+        f'    red = g == os.environ.get(\'RED\')\n'
+        f'    print(json.dumps({{\'index\': i, \'exitCode\': int(red), \'seconds\': 1.0,'
+        f' \'tail\': \'==src/a.py:[1:8]\\\\n==src/b.py:[3:10]\' if red else \'\'}}))" {tmp_path}/items\n')
     (bin_dir / "armada").chmod(0o755)
-    for ref, priority in (("fix/lane", []), ("main", ["--priority=5"])):
+    for ref, priority, red in (("fix/lane", [], ""), ("main", ["--priority=5"], gates[-1])):
         script = step["run"].replace("${{ github.sha }}", "a" * 40).replace("${{ github.ref_name }}", ref)
-        environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref}
+        environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref,
+                       "RUNNER_TEMP": str(tmp_path), "RED": red}
         ran = subprocess.run(["bash", "-c", script], cwd=checkout, capture_output=True, text=True, timeout=60,
                              env=environment)
-        assert ran.returncode == 0, ran.stderr
+        assert ran.returncode == (1 if red else 0), ran.stdout + ran.stderr
+        # The last gate's line, and under it, when red, what it printed.
+        assert ran.stdout.splitlines()[-3 if red else -1:] == (
+            [f"{red}: exit 1 in 1 s", "  | ==src/a.py:[1:8]", "  | ==src/b.py:[3:10]"] if red
+            else [f"{gates[-1]}: exit 0 in 1 s"]), ran.stdout
         assert (tmp_path / "items").read_text().split() == gates
         words = (tmp_path / "words").read_text().split()
         assert words[:2] == ["map", f"--commit={'a' * 40}"] and words[-2:] == [base, "{item}"]

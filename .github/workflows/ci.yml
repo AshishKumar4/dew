@@ -117,10 +117,16 @@ jobs:
         # Any CPU the region gives: the suite's pin and AMD's 25/1, as a gate reads text and types and its verdict is
         # one on any host (2026-11-13: small lint maps pinned alone ran out 8 minutes on 25/1 placements).
         cpus=$(jq -r '[.task.cpu // empty] | flatten | map("\(.vendor)/\(.family)/\(.model)") + ["AuthenticAMD/25/1"] | unique | join(",")' .armada.json)
+        # Each gate's outcome as JSON, and a red gate's last lines printed under it, so what a gate found is in this
+        # log, where the land queue's page quotes it (Main, 2026-11-14: base e42ddc2bd's duplicate-text red named no
+        # copy here; its locations were only in armada's task log).
+        status=0
         grep -v '^#' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
-          $priority --cpu="$cpus" --label="lint-$GITHUB_REF_NAME" -- \
+          $priority --cpu="$cpus" --label="lint-$GITHUB_REF_NAME" --json -- \
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
-          sh "$base" '{item}'
+          sh "$base" '{item}' > "$RUNNER_TEMP/lint.jsonl" || status=$?
+        python3 tools/armada/gates_told.py "$RUNNER_TEMP/lint.jsonl" || status=1
+        exit "$status"
 
   # What a release attaches and Dew's index serves, installed the way a user installs it (tools/ci/package.sh).
   package:
