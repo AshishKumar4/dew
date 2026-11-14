@@ -9,7 +9,7 @@ estimates (`report`)."""
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Hashable, Sequence
+from collections.abc import Callable, Hashable, Iterable, Sequence
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
@@ -41,15 +41,40 @@ def facts() -> generation.Multiprocessor:
 def producer_floor() -> int:
     """The registers a thread of a cooperative block's producer warpgroup lowers to (`set_max_registers`):
     setmaxnreg's least (`Multiprocessor.register_raises`, 24), beside two consumers' raise 240 (FlashAttention
-    3's). A producer's rule is the least of setmaxnreg's steps that holds its issue loop's live set, and every
-    family's holds at the least: ptxas spills nothing at 24 in the attention forward's 154 kernels and
-    backward's 17 and the recurrence's 75 under 12.9, and in the D128 forward's 144, the training and natural
-    forms among them, under 13.4 (row 3639's scans, each kernel's decrease rewritten to 24 through 96). Not
-    every one: sm100's recurrence states launch's tcgen05 producer spills 44 to 60 bytes at 24 and none at 40
-    to 48 (its PTX's producer decrease rewritten, the r08 theme's debugging), so a launch whose producer
-    holds more states its own (`Family.roles`' and `register_model`'s `producer`). A producer that outgrew
-    it would spill, which the CPU compile gate refuses (tests/kernel_compile.py's `mosaic_failures`)."""
+    3's). A producer's rule is the least of setmaxnreg's steps that holds its issue loop's live set, which the
+    assembler alone knows: what a jaxpr holds live is alike where ptxas's need is not (the B200's natural d256
+    forward's producer holds 39 words at 4,096 and 12,288 tokens, and spills at 40 at the first alone,
+    FS-LIVE1, row 6010). So a launch's producer starts at the least and its derivation raises it where a
+    compile found it spilling there (`Producers`)."""
     return facts().raises().lowest
+
+
+@dataclasses.dataclass(frozen=True)
+class Producers:
+    """The registers a config's launches lower their producers to, by launch (a kernel's name, `report.Binary
+    .kernel`), where a compile found one spilling at fewer (its derivation's raise, the recurrence's
+    `Mosaic._raised`): every other launch's at the least (`producer_floor`). A dimension of the config its
+    launches derive, refused and raised as a compile or its certification refuses a spilling config, so the
+    assembler derives a producer's registers, a step at a time (the B200's natural d256 forward over 4,096
+    tokens and sm100's recurrence states, scan and reverse launches each spilled at the least, rows 6010
+    and 5357)."""
+
+    raised_to: tuple[tuple[str, int], ...] = ()
+
+    def of(self, launch: str) -> int | None:
+        """The registers `launch`'s producer lowers to, None at the least (`producer_floor`)."""
+        return dict(self.raised_to).get(launch)
+
+    def raised(self, launches: Iterable[str]) -> "Producers | None":
+        """These, with each of `launches`' producers a setmaxnreg step higher; None where one is at
+        setmaxnreg's most."""
+        steps, held = facts().raises(), dict(self.raised_to)
+        for launch in launches:
+            higher = (held.get(launch) or steps.lowest) + steps.step
+            if higher > steps.highest:
+                return None
+            held[launch] = higher
+        return Producers(tuple(sorted(held.items())))
 
 
 THREADS = 128

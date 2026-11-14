@@ -584,8 +584,19 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     assert saved.plan == ahead.plan and saved.program == ahead.program
 
 
-NEEDING_MICROBATCHES = 700_000
-"""Bytes a compile-only GPU states for `fine_tune`'s step to need several microbatches."""
+def at_its_plan(plan, probes) -> None:
+    """What a user gets of a plan: the fewest microbatches that fit at its rung, which fits. Its rung's
+    probes at that split fit and at fewer were refused, whatever order the search compiled them in."""
+    rung = ("remat", "head_tile", "head_fused", "xla_defaults", "narrow")
+    own = [probe for probe in probes if all(probe[name] == plan[name] for name in rung)]
+    assert any(probe["split"] == plan["split"] and probe["fits"] is True for probe in own), own
+    assert not any(probe["split"] < plan["split"] and probe["fits"] is True for probe in own), own
+
+
+NEEDING_MICROBATCHES = 600_000
+"""Bytes a compile-only GPU states for `fine_tune`'s step to need several microbatches: four, with a rung
+above it at two (a sweep at base/kernels e4d702a55 with the split computed from the compile that missed,
+2cb8d0bb4: from 500 kB to 600 kB the plan takes four or eight, at 650 kB and 700 kB two, at 800 kB one)."""
 
 
 @pytest.fixture(scope="module")
@@ -664,16 +675,18 @@ def test_a_hosts_serialized_topology_states_its_gpus_memory_and_their_allocators
 @pytest.mark.shared_setup("admitted")
 def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admitted):
     """A step compiled ahead on GPUs whose memory its plan needs several microbatches for searches for its
-    plan, at several microbatches, and saves it, the run left at its plan, its rung its last probe's; the
-    plan states the limit it was made against, its GPUs' stated memory at the share their loading run takes
-    (`pool_record`)."""
+    plan, the fewest microbatches that fit, which fits (`at_its_plan`), and saves it, the run left at its
+    plan; the plan states the limit it was made against, its GPUs' stated memory at the share their loading
+    run takes (`pool_record`)."""
     from dew._devices import pool_share
+    from dew.training.memory import recompute_record
 
     _, trainer, ahead = admitted
     plan = record(ahead.plan, "plan")
     probes = listed(plan["probes"], "probes", read=record, what="probes")
-    assert plan["split"] > 1 and len(probes) > 1 and probes[-1]["fits"] is True
-    assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
+    assert plan["split"] > 1
+    at_its_plan(plan, probes)
+    assert trainer.plan == ahead.plan and recompute_record(trainer.objective) == plan["remat"]
     pool = record(plan["pool"], "pool")
     assert pool["source"] == "compile_only" and pool["share"] == pool_share()
     assert pool["limit"] == NEEDING_MICROBATCHES
@@ -690,6 +703,7 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
     search starts at the plan admitted before it (`admitted`), kept beside the compilation cache, as a run
     after another starts at its recorded plan: that plan's compile alone, the frontier read above it."""
     from dew.training.ahead import compile_ahead
+    from dew.training.memory import recompute_record
 
     records, _, earlier = admitted
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
@@ -708,16 +722,16 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
     assert {name: plan[name] for name in rung} == {name: admitted_plan[name] for name in rung}
     assert len(probes) == 1
     splits = [plan["split"], *(entry["split"] for entry in frontier)]
-    assert len(frontier) >= 2 and all(entry["fits"] is True for entry in frontier)
+    assert frontier and all(entry["fits"] is True for entry in frontier)
     assert all(isinstance(more, int) and isinstance(fewer, int) and fewer < more
                for more, fewer in itertools.pairwise(splits))
     rungs = [json.dumps({name: entry[name] for name in ("remat", "head_tile", "head_fused")}, sort_keys=True)
              for entry in (plan, *frontier)]
     assert len(set(rungs)) == len(rungs)
-    assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
+    assert trainer.plan == ahead.plan and recompute_record(trainer.objective) == plan["remat"]
 
 
-@pytest.mark.parametrize("capacity", [2**30, 520_000], ids=["one microbatch", "several"])
+@pytest.mark.parametrize("capacity", [2**30, 650_000], ids=["one microbatch", "several"])
 def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_fit(tmp_path, monkeypatch,
                                                                                     capacity):
     """A step whose plan is the remat ladder's top ('full') lists, past it, the sibling that keeps what
@@ -725,9 +739,9 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
     bytes as 'full', so no fit rung, but another speed, which the GPUs' timing chooses (row 1932). It is
     compiled at the last configuration at 'full' that fit, its head policy put back, whatever head policies
     the frontier then tried at fewer microbatches; and the run, which times nothing, is left at its plan.
-    At 520 kB the plan at 'full' takes four microbatches and the head policies tried past it fit at no fewer
-    (a sweep at 83bc7370bc: from 600 kB to 700 kB the sibling fits at no plan's split on a device with no
-    host memory of its own, and past 850 kB the plan takes one)."""
+    At 650 kB the plan at 'full' takes two microbatches and the sibling fits there (a sweep at base/kernels
+    e4d702a55 with 2cb8d0bb4: from 500 kB to 600 kB the sibling fits at no plan's split on a device with no
+    host memory of its own, and from 700 kB the plan takes one)."""
     from dew.nn.backbones.decoder_block import REMAT_POLICIES, remat_record
     from dew.training.ahead import compile_ahead
     from dew.training.memory import head_fused_of, head_tile_of, recompute_record

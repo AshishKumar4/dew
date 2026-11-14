@@ -20,7 +20,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import short_conv, tuning
+from dew.nn.kernels import generation, short_conv, tuning
 from dew.nn.kernels.templates import mosaic, scan
 from dew.nn.precision import compensated_add
 
@@ -224,16 +224,44 @@ def forward(x, taps, bias, valid, documents, *, parts: tuple, activation: bool, 
     return tuple(launched(*(operand for operand in operands if operand is not None)))
 
 
-@tuning.lowered_once(("parts", "activation", "eps", "family", "interpret"))
 def backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation: bool, eps: float,
              family: mosaic.Family, interpret: bool = False):
     """Every piece's gradients in one launch: the input's gradient `[B, T, C]` in `x`'s dtype, each program's
     channels its piece's (`parts`, each `(width, head)` in channel order, `dys` their output gradients), and
-    the tap and bias gradients `[K, C]` and `[C]` fp32 (the bias's zero without one). A launch a piece wrote
-    its piece's input gradient apart, which XLA joined: 0.66 of an A100's 2.65 ms conv training step at
-    Qwen3.5-0.8B's widths (M-JS-18)."""
+    the tap and bias gradients `[K, C]` and `[C]` fp32 (the bias's zero without one), each program walking its
+    row's span of tokens (`span`) on the device the launch runs (the interpreted one's facts where
+    `interpret`). A launch a piece wrote its piece's input gradient apart, which XLA joined: 0.66 of an A100's
+    2.65 ms conv training step at Qwen3.5-0.8B's widths (M-JS-18)."""
+    rows, length, _ = x.shape
+    target = generation.interpreted_target() if interpret else generation.gpu_target()
+    return _backward(x, taps, bias, valid, documents, dys, parts=parts, activation=activation, eps=eps,
+                     family=family, interpret=interpret,
+                     tokens=span(length, rows, x.shape[-1] // lanes(parts, x.dtype), target))
+
+
+def span(length: int, rows: int, programs: int, target: generation.GpuTarget) -> int:
+    """The tokens a backward program of a call of `rows` rows of `length` tokens walks, `programs` a row's
+    channels taking: whole walks of the forward's (`_tokens`), as many a program as leave the fewest programs
+    that fill the device's multiprocessors once, at the most each holds of one warpgroup at a thread's most
+    registers (its file over a warpgroup of them; one where no fact states its multiprocessors). Each program
+    writes its row's and span's tap and bias partials, which a sum joins after the launch: a program to every
+    64 tokens, Qwen3.5-4B's conv's partials at four rows of 12,288 tokens were 100 MB a layer, which XLA held
+    to the step's end (row 6027's residual, 2.22 GB of a compile-only GH200's step)."""
+    tokens = _tokens(length)
+    blocks = -(-length // tokens)
+    held = target.multiprocessor
+    wave = (target.multiprocessors or 1) * (held.registers // (scan.THREADS * held.thread_registers))
+    spans = min(blocks, -(-wave // (rows * programs)))
+    return -(-blocks // spans) * tokens
+
+
+@tuning.lowered_once(("parts", "activation", "eps", "family", "interpret", "tokens"))
+def _backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation: bool, eps: float,
+              family: mosaic.Family, interpret: bool, tokens: int):
+    """`backward`'s launch, each program walking `tokens` of its row. Lowered once a configuration
+    (`tuning.lowered_once`), as a model's layers' identical convs share it."""
     rows, length, channels = x.shape
-    count, tokens, lanes_ = taps.shape[1], _tokens(length), lanes(parts, x.dtype)
+    count, lanes_ = taps.shape[1], lanes(parts, x.dtype)
     blocks = pl.cdiv(length, tokens)
     operands = [x, taps.T, bias, valid, documents]
     bounds = [(first // lanes_, (first + width) // lanes_, first, head)
