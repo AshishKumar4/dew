@@ -39,8 +39,8 @@ back and not one table for the model. Qwen3-Next ships its prediction layer
 as mtp.* tensors transformers ignores on load
 (modeling_qwen3_next.py:877), so like GLM's depth it is held to account
 through the dew reload and the MTP loss term of the training step; its
-larger residue is the delta net layers' fp32 rounding, the same residue
-tests/test_hf_decoders.py records for qwen35-tiny.
+larger residue is the delta net layers' fp32 rounding, as Qwen3.5's is
+(tests/test_hf_decoder_hybrids.py certifies that step element by element).
 
 glm_moe_dsa and kimi_k25 are also held to the reference's gradients: dew's
 gradient of the next-token cross entropy, written into the source layout

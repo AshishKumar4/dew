@@ -262,7 +262,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoder_hybrids.py": {
-   "comparisons": 9,
+   "comparisons": 8,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoder_moe.py": {
