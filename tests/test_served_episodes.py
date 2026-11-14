@@ -92,16 +92,24 @@ def scored(model, sampling: Sampling):
     """The likelihoods a policy draws a turn's action with, teacher-forced in `model` (the float64 twin, the
     truth): each action token's raw log-probability, and its log-probability under the sampling's
     temperature and top-k where the sampling draws (none where it is greedy)."""
+    # Every turn's context and action in one batch, padded at the end: a causal model's logits at a place
+    # read no later one, so a row's are its own whole sequence's.
+    logits_of = jax.jit(lambda variables, sequences: model.apply(variables, sequences, method="logits"))
+
     def score(variables, contexts, tokens) -> dict[str, np.ndarray]:
         raw = np.zeros(tokens.shape, np.float64)
         behavior = np.zeros(tokens.shape, np.float64)
+        sequences = np.zeros((tokens.shape[0], contexts.shape[1] + tokens.shape[1]), np.int32)
+        for row in range(tokens.shape[0]):
+            whole = np.concatenate([contexts[row][contexts[row] >= 0], tokens[row][tokens[row] >= 0]])
+            sequences[row, :len(whole)] = whole
+        every = logits_of(variables, jnp.asarray(sequences))
         for row in range(tokens.shape[0]):
             context = contexts[row][contexts[row] >= 0]
             action = tokens[row][tokens[row] >= 0]
             if not len(action):
                 continue
-            sequence = jnp.asarray(np.concatenate([context, action])[None], jnp.int32)
-            logits = model.apply(variables, sequence, method="logits")[0, len(context) - 1:-1]
+            logits = every[row, len(context) - 1:len(context) + len(action) - 1]
             picked = jnp.asarray(action)[:, None]
 
             def chosen(scores, picked=picked):
