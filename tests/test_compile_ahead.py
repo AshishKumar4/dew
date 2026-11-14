@@ -595,8 +595,8 @@ def at_its_plan(plan, probes) -> None:
 
 NEEDING_MICROBATCHES = 600_000
 """Bytes a compile-only GPU states for `fine_tune`'s step to need several microbatches: four, with a rung
-above it at two (a sweep at base/kernels e4d702a55 with the split computed from the compile that missed (2cb8d0bb4): from
-500 kB to 600 kB the plan takes four or eight, at 650 kB and 700 kB two, at 800 kB one)."""
+above it at two (a sweep at base/kernels e4d702a55 with the split computed from the compile that missed,
+2cb8d0bb4: from 500 kB to 600 kB the plan takes four or eight, at 650 kB and 700 kB two, at 800 kB one)."""
 
 
 @pytest.fixture(scope="module")
@@ -740,8 +740,8 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
     compiled at the last configuration at 'full' that fit, its head policy put back, whatever head policies
     the frontier then tried at fewer microbatches; and the run, which times nothing, is left at its plan.
     At 650 kB the plan at 'full' takes two microbatches and the sibling fits there (a sweep at base/kernels
-    e4d702a55 with 2cb8d0bb4: from 500 kB to 600 kB the sibling fits at no plan's split on a device with no host memory of
-    its own, and from 700 kB the plan takes one)."""
+    e4d702a55 with 2cb8d0bb4: from 500 kB to 600 kB the sibling fits at no plan's split on a device with no
+    host memory of its own, and from 700 kB the plan takes one)."""
     from dew.nn.backbones.decoder_block import REMAT_POLICIES, remat_record
     from dew.training.ahead import compile_ahead
     from dew.training.memory import head_fused_of, head_tile_of, recompute_record
