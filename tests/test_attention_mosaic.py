@@ -142,9 +142,11 @@ def _form_tiles(generation_name: str | None = None) -> attention_mosaic.Tiles:
     H100's pair two consumers' blocks, an A100's one consumer's each (mma.sync's one warpgroup)."""
     family = INTERPRETED_ON[generation_name or _INTERPRETED.get()]
     return attention_mosaic.Tiles(64, 64, 2, 2 if family == WGMMA else 1, family=family)
-HEAD_WIDTHS = ((64, 128), (128, 64), (80, 48))
-"""The (query, value) head widths the forward and the backward are checked at: a value wider than its
-query, a narrower one, and both off a power of two (80 and 48 pad to 128 and 64, `attention.padded_call`)."""
+HEAD_WIDTHS = ((64, 128), (128, 64), (80, 48), (32, 32), (192, 160))
+"""The (query, value) head widths the forward and the backward are checked at (kernel-templates.md §A row
+23's 32 to 256): a value wider than its query, a narrower one, both off a power of two (80 and 48 pad to 128
+and 64, `attention.padded_call`), the narrowest, and both past 128 off a power of two (192 and 160 pad to
+256); 256 itself the wide backward's site below."""
 
 
 def _drawn(shape: tuple[int, int, int, int], dtype, width: int = 128, keys: int | None = None,
@@ -722,9 +724,11 @@ def test_the_forward_is_on_par_over_every_call_form_interpreted(form):
 @pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
 def test_the_forward_is_on_par_at_head_widths_interpreted(width, value_width):
     """The forward of query heads `width` wide and value heads `value_width` over a causal call at
-    `_form_tiles`, under the interpreter."""
+    `_form_tiles`, heads past 128 at their derived tiles (an A100 refuses that pin at heads padded to 256,
+    `tuning.Unpinnable`), under the interpreter."""
+    tiles = _form_tiles() if max(width, value_width) <= 128 else None
     _check_forward("causal", jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=width,
-                   value_width=value_width, tiles=_form_tiles())
+                   value_width=value_width, tiles=tiles)
 
 
 @ON_EACH_FAMILY
