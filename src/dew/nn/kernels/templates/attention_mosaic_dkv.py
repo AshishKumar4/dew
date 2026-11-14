@@ -625,4 +625,4 @@ def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind], 
     copies = walk.consumers if walk.interpret else 1
     dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))
     dk, dv = launch(*operands, dq, *grads)
-    return jax.freeze(dq).sum(axis=0), dk, dv
+    return mosaic.added_copies(dq), dk, dv

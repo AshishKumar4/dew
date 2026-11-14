@@ -403,6 +403,36 @@ def test_a_rewrite_is_recorded_in_the_kernel_report():
     assert made.spliced == 1
 
 
+def test_a_pass_without_a_rule_set_leaves_its_rewrites_untaken():
+    """A pass that leaves sets out (`algebra.program.passes`' `without`, a rule set's receipt's arm) admits
+    them nowhere and takes none of their rewrites: the sums the `linear` set joins (as the test above
+    records) are rewritten without it by `joined`, the other set that joins them, and by no `linear` match,
+    and without both by none at all, their program computing what the program with no pass computes. A
+    derivation's own set an arm may name (`carry`'s) is taken; a dev-time set, a derivation's defining set
+    and a name no set registers are refused, as an arm without them would measure nothing."""
+    from dew.algebra.program import passes
+
+    def joined(x, y, a):
+        return two_sums(x, y, a)
+
+    x, y, a = rows(3, (8, 64), (8, 64), (8, 64))
+    with report.refusals(), passes(without=("linear",)):
+        options.program(joined).compiled(x, y, a)
+        [made] = report.rewrites()
+    assert "linear" not in made.admitted and "linear" not in made.fired and made.fired.get("joined", 0) > 0
+    with report.refusals(), passes(without=("linear", "joined")):
+        computed = options.program(joined).compiled(x, y, a)(x, y, a)
+        assert not report.rewrites()
+    with passes(on=False):
+        traced = options.program(joined).compiled(x, y, a)(x, y, a)
+    np.testing.assert_array_equal(np.asarray(computed), np.asarray(traced))
+    with passes(without=("carried",)):
+        pass
+    for unnamed in ("stable", "decoupled", "lineal"):
+        with pytest.raises(ValueError), passes(without=(unnamed,)):
+            pass
+
+
 def test_a_programs_whole_pass_is_recorded_by_either_entry():
     """Each program's whole pass is recorded in seconds whichever entry runs it (`report.passes`, row 5339):
     the compile point's rewrite of a jit's trace (`options.program`) and a function's own
@@ -900,9 +930,10 @@ def _parameter_pairs():
     """Equation parameters the algebra pass and the kernel tuner key (`terms.parameter_key`), as pairs of
     values each (equal, unequal) and the value as JAX holds it: two that print alike or key alike but differ
     (a mesh over the same devices in another order, a sharding of one mesh over its devices in another order;
-    two long arrays apart in an element their printed forms elide), and
+    two long arrays apart in an element their printed forms elide; two abstract values apart in a layout,
+    which their printed forms leave out), and
     two that are one parameter however they were built (an integer and NumPy's, a dtype and its scalar
-    type, two shardings, dimension numbers and precisions built apart)."""
+    type, two shardings, dimension numbers, precisions and abstract values built apart)."""
     from jax.sharding import AbstractMesh, AxisType, NamedSharding, PartitionSpec as P
 
     devices = jax.devices()[:4]
@@ -915,13 +946,20 @@ def _parameter_pairs():
                                              start_index_map=(0,))
     placed = NamedSharding(ordered, P("data"))
     permuted = NamedSharding(ordered, P("data"), _logical_device_ids=(3, 2, 1, 0))
-    unequal = [(ordered, reordered), (long, changed), (placed, permuted)]
+    from jax.core import ShapedArray
+    from jax.experimental.layout import Layout
+
+    laid = (ShapedArray((4, 8), jnp.float32), ShapedArray((4, 8), jnp.float32, layout=Layout((0, 1))))
+    unequal = [(ordered, reordered), (long, changed), (placed, permuted), laid]
     equal = [((1, 2), (np.int64(1), np.int64(2))), (np.dtype(jnp.bfloat16), jnp.dtype("bfloat16")),
              (NamedSharding(abstract, P("data", None)), NamedSharding(abstract, P("data", None))),
              (numbers, jax.lax.GatherDimensionNumbers(offset_dims=(1,), collapsed_slice_dims=(0,),
                                                       start_index_map=(0,))),
              (jax.lax.Precision.HIGHEST, jax.lax.Precision("highest")),
-             (jax.lax.DotAlgorithmPreset.BF16_BF16_F32, jax.lax.DotAlgorithmPreset.BF16_BF16_F32)]
+             (jax.lax.DotAlgorithmPreset.BF16_BF16_F32, jax.lax.DotAlgorithmPreset.BF16_BF16_F32),
+             (ShapedArray((4, 8), jnp.float32, sharding=NamedSharding(abstract, P("data", None))),
+              ShapedArray((4, 8), np.dtype("float32"), sharding=NamedSharding(abstract, P("data", None)))),
+             (jax.typeof(jax.random.key(0)), jax.typeof(jax.random.key(1)))]
     return equal, unequal
 
 

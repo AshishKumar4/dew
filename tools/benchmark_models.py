@@ -58,7 +58,7 @@ from dew.registry import models, projectors, read_arguments, resolve_dtype, towe
 from dew.state import TrainState
 from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.ahead import AheadOfTime, compile_ahead, host_gpus, step_batch
+from dew.training.ahead import AheadOfTime, compile_ahead, step_batch
 from dew.training.planning import Trials
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
@@ -296,16 +296,13 @@ def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
     return trainer
 
 
-def ahead_of(case: Case, generation: str, capacity: int | None,
-             attention_impl: AttentionImpl = 'auto', topology: str | None = None) -> AheadOfTime:
-    """Case `case`'s step planned and compiled ahead of its run (`dew.training.ahead.compile_ahead`) for one
-    GPU of the CUDA `generation`: of a host's own serialized `topology` (`host_gpus`: what a GPU node's
-    prepare hands its run, `build_trainer`'s `ahead`, a step of the run's own target), else a canonical one of
-    `capacity` bytes, on any host (what perf_gate's compile rows time)."""
+def ahead_of(case: Case, generation: str, capacity: int,
+             attention_impl: AttentionImpl = 'auto') -> AheadOfTime:
+    """Case `case`'s step planned and compiled ahead of its run for one compile-only GPU of the CUDA
+    `generation` of `capacity` bytes of memory (`dew.training.ahead.compile_ahead`), on any host: what a GPU
+    node's prepare hands its run (`build_trainer`'s `ahead`), and what perf_gate's compile rows time."""
     trainer = build_trainer(case, attention_impl)
-    devices = (host_gpus(generation, topology, 1) if topology is not None
-               else compile_only_gpus(generation, 1, capacity))
-    trainer.device_mesh = trainer.mesh.build(list(devices))
+    trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus(generation, 1, capacity)))
     return compile_ahead(trainer, global_batch(case))
 
 
@@ -445,6 +442,21 @@ class CompiledStep:
     state: TrainState
     step: Step
     compile_seconds: float
+    # Each step's loss and finiteness as it ran, kept on the device (no wait inside a timed window), read by
+    # `nonfinite` after it.
+    taken: list = dataclasses.field(default_factory=list)
+
+    def nonfinite(self) -> int:
+        """How many of the steps run since the last read went non-finite (the step's own finiteness, or its
+        loss not finite): read once a window is over, so a timing is never kept from a window any of whose
+        steps was invalid, whichever step it was (audit, 2026-11-14: only the last step's was read)."""
+        taken = list(self.taken)
+        self.taken.clear()
+        if not taken:
+            return 0
+        losses, finite = zip(*taken, strict=True)
+        valid = jnp.logical_and(jnp.stack(finite), jnp.isfinite(jnp.stack(losses)))
+        return int(jnp.sum(~valid))
 
 
 @contextlib.contextmanager
@@ -471,9 +483,11 @@ def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) ->
 
         def step(state: TrainState) -> tuple[TrainState, jax.Array, jax.Array]:
             state, loss, _, finite, _, _ = compiled(state, first if fixed_batch else next(source))
+            found.taken.append((loss, finite))
             return state, loss, finite
 
-        yield CompiledStep(state, step, compile_seconds)
+        found = CompiledStep(state, step, compile_seconds)
+        yield found
 
 
 def timed_steps(step: Step, state: TrainState, steps: int

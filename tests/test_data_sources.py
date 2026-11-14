@@ -9,8 +9,10 @@ import io
 import itertools
 import json
 import math
+import os
 import pickle
 import shutil
+import subprocess
 import sys
 import tarfile
 import threading
@@ -2257,3 +2259,54 @@ def test_a_committed_export_of_no_rows_reads_as_empty_and_an_empty_directory_as_
     (tmp_path / "bare").mkdir()
     with pytest.raises(FileNotFoundError):
         Files(str(tmp_path / "bare"), format=format).records("indexed")
+
+
+def test_cli_exports_a_remote_json_file_as_the_records_its_store_reads(tmp_path, monkeypatch):
+    """`dew data export s3://…/records.json` reads the remote file as the records a store of it holds
+    (`dew.data.sources.source`), as data.md's URLs are read, not as a chain's record on this disk (row
+    6278)."""
+    from storage_support import moto_bucket
+
+    from dew._cli.main import main
+    from dew.data.sources import source
+
+    with moto_bucket("records") as (bucket, options):
+        for variable, value in (("AWS_ACCESS_KEY_ID", "testing"), ("AWS_SECRET_ACCESS_KEY", "testing"),
+                                ("AWS_ENDPOINT_URL", str(options["endpoint_url"]))):
+            monkeypatch.setenv(variable, value)
+        import fsspec
+
+        with fsspec.filesystem("s3", **options).open(f"{bucket}/records.json", "w") as written:
+            written.write(json.dumps([{"text": "first"}, {"text": "next"}]))
+        exported = tmp_path / "exported"
+        assert main(["data", "export", f"s3://{bucket}/records.json", str(exported)]) == 0
+    assert [row["text"] for row in source(str(exported)).records("indexed")] == ["first", "next"]
+
+
+def test_cli_exports_a_recorded_chain_whose_step_its_trust_names_in_a_fresh_process(tmp_path):
+    """A chain's record naming a step of a package outside Dew exports from a fresh CLI that trusts that
+    package (`--trust`), as a run's command does; without it the record's import is refused (row 6280)."""
+    (tmp_path / "steps_of_mine.py").write_text(
+        "from dataclasses import dataclass\nimport grain.python as grain\n\n\n@dataclass(frozen=True)\n"
+        "class Shouted(grain.MapTransform):\n    identity = 'shouted@1'\n\n"
+        "    def map(self, row):\n        return {**row, 'text': row['text'].upper()}\n")
+    recorded = tmp_path / "chain.json"
+    write = ("import json, sys\nsys.path.insert(0, sys.argv[1])\nfrom steps_of_mine import Shouted\n"
+             "from dew.data import Memory, records\n"
+             "chain = Memory([{'text': 'quiet'}]).map(Shouted())\n"
+             "open(sys.argv[2], 'w').write(json.dumps(records.encode(chain, trust=('steps_of_mine',))))\n")
+    paths = [str(tmp_path), os.environ.get("PYTHONPATH", "")]
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join(paths)}
+    subprocess.run([sys.executable, "-c", write, str(tmp_path), str(recorded)], check=True, env=environment)
+
+    def exported(*trust: str) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, "-m", "dew._cli.main", "data", "export", str(recorded),
+                               str(tmp_path / f"out{len(trust)}"), *trust], capture_output=True, text=True,
+                              env=environment)
+
+    assert exported().returncode != 0
+    assert exported("--trust", "steps_of_mine").returncode == 0
+    from dew.data.sources import source
+
+    assert source(str(tmp_path / "out2")).records("indexed")[0] == {"text": "QUIET"}
+

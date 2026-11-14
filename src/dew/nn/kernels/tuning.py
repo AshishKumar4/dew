@@ -839,14 +839,14 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
 
         def atom(value) -> Hashable:
             if isinstance(value, jax_core.Literal):
-                return "literal", str(value.aval), read(value.val)
+                return "literal", read(value.aval), read(value.val)
             return bound(value)
 
-        update("inputs", *((bound(var), str(var.aval)) for var in (*jaxpr.constvars, *jaxpr.invars)))
+        update("inputs", *((bound(var), read(var.aval)) for var in (*jaxpr.constvars, *jaxpr.invars)))
         for equation in jaxpr.eqns:
             context = equation.ctx
             update(equation.primitive.name, tuple(atom(value) for value in equation.invars),
-                   tuple((bound(var), str(var.aval)) for var in equation.outvars),
+                   tuple((bound(var), read(var.aval)) for var in equation.outvars),
                    # The configuration an equation evaluates and lowers under (a key's bits' construction).
                    read((context.compute_type, context.threefry_partitionable, context.xla_metadata)),
                    read(context.cur_abstract_mesh),

@@ -56,12 +56,18 @@ Usage:
 
 import contextlib
 import dataclasses
+import datetime
 import hashlib
 import importlib
 import io
 import json
 import os
+import queue
+import signal
+import subprocess
 import sys
+import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -79,6 +85,7 @@ from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.selection import Unlowerable
 from dew.registry import models
 from dew.telemetry.benchmark import carried
+from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
 from dew.telemetry.profile import Profiler
 from dew.telemetry.trace import communication_totals, device_events, window_split
 from dew.training import Trainer
@@ -227,13 +234,7 @@ class BenchmarkConfig:
     generation: str | None = None
     """The CUDA generation `compile_ahead` compiles for (sm80, sm90)."""
     capacity_gib: int | None = None
-    """The GPU memory `compile_ahead` plans for, in GiB, a canonical GPU of `generation`'s: on any host."""
-    topology: str | None = None
-    """The serialized topology of the GPUs the run will see (a GPU node's $DEW_NODE_TOPOLOGY), which
-    `compile_ahead` compiles over in place of `capacity_gib`'s canonical GPU: its memory and
-    multiprocessors are the run's own, so the run takes the step as its own target
-    (`BuildTarget.held`; 2026-11-14: a canonical 96 GiB step was refused by every GH200 run's
-    96.4 GB, and the perf gate's head arms all broke)."""
+    """The GPU memory `compile_ahead` plans for, in GiB."""
 
 
 def build_cases(config: BenchmarkConfig) -> list[Case]:
@@ -405,6 +406,169 @@ def ahead_name(case: Case) -> str:
     return f"{hashlib.sha256(cases_to_json([case]).encode()).hexdigest()[:16]}.dew-aot"
 
 
+WINDOW_PARTS = 6
+"""How many parts a timed window is cut into, each closed by one wait (`window_parts`)."""
+
+
+def window_parts(steps: int) -> list[int]:
+    """`steps` cut into at most `WINDOW_PARTS` parts of as near equal sizes, the larger first, none empty."""
+    count = min(WINDOW_PARTS, steps)
+    return [steps // count + (index < steps % count) for index in range(count)]
+
+
+GPU_IDLE = 0x1
+"""nvidia-smi's clocks_event_reasons bit for a GPU with nothing to run (`DeviceSampler.summary` masks it)."""
+
+
+class DeviceSampler:
+    """Each GPU sampled by nvidia-smi every `PERIOD_MS` while the context is open (its SM clock, power
+    draw, temperature and active clock event reasons), so a window's GPU is read under its load and not at
+    the idle moments before or after it; nothing sampled on a host without nvidia-smi. Its process runs on
+    the host's CPU and touches no timed work."""
+
+    PERIOD_MS = 250
+    FIELDS = ("sm_mhz", "power_w", "temperature_c", "event_reasons")
+
+    def __enter__(self) -> "DeviceSampler":
+        try:
+            self.process = subprocess.Popen(
+                ["nvidia-smi",
+                 "--query-gpu=timestamp,index,clocks.sm,power.draw,temperature.gpu,clocks_event_reasons.active",
+                 "--format=csv,noheader,nounits", f"-lms={self.PERIOD_MS}"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            self.process = None
+        self.lines = ""
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self.process is not None:
+            # SIGINT, as a user's Ctrl-C ends nvidia-smi's loop: it flushes what it sampled before it exits.
+            self.process.send_signal(signal.SIGINT)
+            self.lines, _ = self.process.communicate(timeout=30)
+
+    def summary(self, window: tuple[datetime.datetime, datetime.datetime] | None = None
+                ) -> dict[str, dict[str, object]] | None:
+        """Each GPU's samples taken within `window` (host-clock times, nvidia-smi stamping each sample in
+        local time; every sample where none is given): their count, the least and greatest of each reading,
+        and every clock event reason any sample held (nvidia-smi's bitmask, or'd); None where nothing was
+        sampled in it."""
+        gpus: dict[str, list[list[str]]] = {}
+        for line in self.lines.splitlines():
+            stamp, index, *values = (value.strip() for value in line.split(",")) if line.count(",") > 1 \
+                else ("", "", "")
+            if len(values) != len(self.FIELDS):
+                continue
+            try:
+                taken = datetime.datetime.strptime(stamp, "%Y/%m/%d %H:%M:%S.%f")
+            except ValueError:
+                continue
+            if window is None or window[0] <= taken <= window[1]:
+                gpus.setdefault(index, []).append(values)
+        if not gpus:
+            return None
+
+        def span(rows: list[list[str]], column: int) -> list[float] | None:
+            numbers = [float(row[column]) for row in rows if row[column].replace(".", "", 1).isdigit()]
+            return [min(numbers), max(numbers)] if numbers else None
+
+        # GpuIdle (0x1) said by a sample taken between steps is no reason the clock was held down.
+        def reasons(rows: list[list[str]]) -> str:
+            held = 0
+            for row in rows:
+                held |= int(row[3], 16) & ~GPU_IDLE if row[3].startswith("0x") else 0
+            return hex(held)
+
+        return {index: {"samples": len(rows),
+                        **{name: span(rows, column) for column, name in enumerate(self.FIELDS[:3])},
+                        "event_reasons": reasons(rows)}
+                for index, rows in gpus.items()}
+
+
+def timed_parts(step, state, parts: list[int]):
+    """`sum(parts)` steps dispatched back to back from `state`, each part's last loss handed as it is
+    dispatched to a thread that awaits each in turn and stamps the seconds since the first dispatch as it
+    becomes ready: no wait inside the window, and a part's stamp its readiness whether the host's dispatch or
+    the device is the slower (a host-bound step's parts all ready before a wait after the whole dispatch
+    could read them). Returns the last state, loss and finiteness, and each part's (steps, seconds, the
+    host's seconds dispatching it): a part slow in both was the host's, one slow only to be ready the
+    device's."""
+    ready: queue.Queue = queue.Queue()
+    ends: list[float] = []
+
+    def waited() -> None:
+        while (loss := ready.get()) is not None:
+            jax.block_until_ready(loss)
+            ends.append(time.perf_counter() - started)
+
+    waiter = threading.Thread(target=waited, name="timed-parts")
+    started = time.perf_counter()
+    waiter.start()
+    carry, dispatched = (state, None, None), []
+    try:
+        for size in parts:
+            for _ in range(size):
+                carry = step(carry[0])
+            dispatched.append(time.perf_counter() - started)
+            ready.put(carry[1])
+    finally:
+        ready.put(None)
+        waiter.join()
+    jax.block_until_ready(carry)
+    begins, sent = [0.0, *ends[:-1]], [0.0, *dispatched[:-1]]
+    return (*carry, [(size, end - begun, out - went) for size, end, begun, out, went
+                     in zip(parts, ends, begins, dispatched, sent, strict=True)])
+
+
+def tuning_digest() -> dict[str, object] | None:
+    """The XLA per-fusion autotuning results' directory XLA_FLAGS names
+    (--xla_gpu_per_fusion_autotune_cache_dir) as it stands at the row: its result files' count and the
+    sha256 of their names and contents. The directory is a node's, shared by its jobs, so the digest names
+    what it held then, not the picks this step alone used; None where no such directory is named."""
+    flags = os.environ.get("XLA_FLAGS", "").split()
+    option = "--xla_gpu_per_fusion_autotune_cache_dir="
+    named = [flag.removeprefix(option) for flag in flags if flag.startswith(option)]
+    if not named or not named[-1]:
+        return None
+    directory = Path(named[-1])
+    files = sorted(path for path in directory.rglob("*.textproto")
+                   if path.is_file()) if directory.is_dir() else []
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(directory)).encode() + b"\0" + path.read_bytes() + b"\0")
+    return {"directory": str(directory), "results": len(files), "sha256": digest.hexdigest()}
+
+
+def timed_window(step, state, config: BenchmarkConfig):
+    """`config.steps` steps of `step` from `state` timed as a run dispatches them, after at least one warm
+    step: dispatched whole and read in parts (`WINDOW_PARTS`, `timed_parts`), each part's last loss
+    awaited in turn, so no wait drains the device inside the window, and a window that runs slow where it
+    starts (the device or its allocator warming) shows as a series that falls, where one running another
+    program stays slow throughout. The GPUs sampled from before the warm step, so nvidia-smi's start
+    (NVML's, up to half a second) is behind it, and summarized over the window alone (`DeviceSampler`).
+    Returns the last state, loss and finiteness, each part's (steps, seconds, dispatch seconds) and the
+    GPUs' summary."""
+    with DeviceSampler() as sampler:
+        state, _, _, _ = timed_steps(step, state, max(config.warmup, 1))
+        began = datetime.datetime.now()
+        state, loss, is_finite, parts = timed_parts(step, state, window_parts(config.steps))
+        ended = datetime.datetime.now()
+    return state, loss, is_finite, parts, sampler.summary((began, ended))
+
+
+def window_record(parts, synced: list[float], device, hits: float) -> dict:
+    """A row's diagnostics of its timed window, beside its step's time (the window's whole elapsed time):
+    each part's ms a step in order and its host dispatch's (a part slow in both was the host's, one slow
+    only to be ready the device's), every synced step's ms in order (2026-11-14: a perf gate round's first
+    arm read 40% slow on the very tree its others read), the GPUs under the window's load (`DeviceSampler`),
+    JAX's persistent-cache hits while the step was compiled (its state's and other programs' among them),
+    and the XLA autotuning results' directory as it stood at the row (`tuning_digest`)."""
+    return {"window_ms_series": [round(seconds / size * 1e3, 3) for size, seconds, _ in parts],
+            "window_dispatch_ms_series": [round(sent / size * 1e3, 3) for size, _, sent in parts],
+            "synced_ms_series": [round(seconds * 1e3, 3) for seconds in synced],
+            "device_window": device, "compile_cache_hits": hits, "tuning": tuning_digest()}
+
+
 def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None) -> Row:
     """Warm up, then time the compiled step over a fixed number of steps. `peaks` is each device's
     measured high-water (`measured_peak`), None in a pool."""
@@ -416,12 +580,13 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
     handed = ahead if ahead is not None and ahead.devices == jax.device_count() else None
     trainer = build_trainer(case, config.attention_impl, ahead=handed)
 
+    count_compilation_cache()
+    hits = compilation_cache_counts().get("train/cache_hits", 0.0)
     with compiled_step(case, trainer, fixed_batch=config.fixed_batch) as compiled:
         state, step, compile_seconds = compiled.state, compiled.step, compiled.compile_seconds
-        # At least one warm step, so the first dispatch of the executable is
-        # outside the timed window.
-        state, loss, is_finite, _ = timed_steps(step, state, max(config.warmup, 1))
-        state, loss, is_finite, elapsed = timed_steps(step, state, config.steps)
+        hits = compilation_cache_counts().get("train/cache_hits", 0.0) - hits
+        state, loss, is_finite, parts, device = timed_window(step, state, config)
+        elapsed = sum(seconds for _, seconds, _ in parts)
 
         # A second window of the same length, waiting on every step, for the
         # spread. The loop above dispatches asynchronously on purpose, as a run
@@ -431,6 +596,9 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
         (state, loss, is_finite), synced = carried(lambda carry: step(carry[0]), (state, loss, is_finite),
                                                    config.steps, each=True)
         p10, p50, p90 = np.percentile(np.asarray(synced) * 1e3, [10, 50, 90])
+        # Every step of the warm, timed and synced windows valid, read once they are over (`nonfinite`): a
+        # timing from a window any step of which went non-finite is no measurement.
+        nonfinite = compiled.nonfinite()
 
         timeline = {}
         if config.profile_dir:
@@ -483,6 +651,7 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
             # or a stronger one where the step did not fit.
             "remat": recompute_record(trainer.objective),
             "ms_per_step": round(step_time * 1e3, 3),
+            **window_record(parts, synced, device, hits),
             "p10_ms": round(float(p10), 3),
             "p50_ms": round(float(p50), 3),
             "p90_ms": round(float(p90), 3),
@@ -499,7 +668,8 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
             "mfu": mfu,
             "planned_device_bytes": planned,
             "loss": float(loss),
-            "finite": bool(is_finite),
+            "finite": nonfinite == 0 and bool(is_finite),
+            "nonfinite_steps": nonfinite,
             **timeline,
         }
     measured = None if peaks is None or None in peaks else max(peaks)
@@ -601,15 +771,12 @@ def entered(within: str | None) -> contextlib.AbstractContextManager:
 
 def main(config: BenchmarkConfig) -> list[Row]:
     if config.compile_ahead is not None:
-        if config.generation is None or (config.capacity_gib is None) == (config.topology is None):
-            raise SystemExit("--compile-ahead names the GPU it compiles for: --generation and one of "
-                             "--topology (the run's own GPUs) or --capacity-gib (a canonical one)")
+        if config.generation is None or config.capacity_gib is None:
+            raise SystemExit("--compile-ahead names the GPU it compiles for: --generation and --capacity-gib")
         Path(config.compile_ahead).mkdir(parents=True, exist_ok=True)
         for case in build_cases(config):
             try:
-                ahead = ahead_of(case, config.generation,
-                                 None if config.capacity_gib is None else config.capacity_gib << 30,
-                                 config.attention_impl, topology=config.topology)
+                ahead = ahead_of(case, config.generation, config.capacity_gib << 30, config.attention_impl)
             except Unlowerable as refused:
                 print(f"{ahead_name(case)} ({case.architecture}): not compiled ahead: {refused}", flush=True)
                 continue
@@ -647,4 +814,6 @@ def main(config: BenchmarkConfig) -> list[Row]:
 
 
 if __name__ == "__main__":
-    main(tyro.cli(BenchmarkConfig))
+    # A row any of whose steps went non-finite fails the run, its rows written first.
+    if invalid := [row["architecture"] for row in main(tyro.cli(BenchmarkConfig)) if not row["finite"]]:
+        sys.exit(f"steps went non-finite in {', '.join(invalid)}: no timing of theirs is a measurement")

@@ -221,6 +221,10 @@ def packed_forward(model, tokens, *, documents=DOCUMENTS):
 
 
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
+               # MoBA's blocks of eight places, a query's own and the one earlier its gate picks: the second
+               # document's 70 tokens nine blocks (blocks of two left its float64 truth picking other blocks
+               # than its fp32 run on near-tied gates, unresolved within 512 seeds).
+               "block_sparse_attention": ({"block": 8, "top_k": 2}, {}),
                "deepseek_v4": ({"rope_head_dim": 8}, {"kinds": {"full_attention": LayerKind(window=8)}}),
                "kimi_delta_attention": ({"linear_num_heads": 2, "linear_head_dim": 32}, {}),
                "lightning_attention": ({"block_size": 64}, {"num_heads": 8, "head_dim": 16}),
@@ -252,7 +256,7 @@ SEEDS = {"attention": 64, "deepseek_v4": 256, "deepseek_v4 csa": 256, "deepseek_
          "kpool_sparse_attention": 16, "kpool_sparse_attention notail": 16, "lightning_attention": 64,
          "llama4": 128, "mamba": 32, "mamba2": 256, "mamba3": 512, "memory": 256,
          "mla": 64,
-         "mlp": 64, "parallel": 64, "qsa_attention": 128, "short_conv": 64}
+         "block_sparse_attention": 128, "mlp": 64, "parallel": 64, "qsa_attention": 128, "short_conv": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` per kind (on armada): the
 fewest for which documents run alone compared with themselves resolve PARITY in every logit and parameter
 gradient, or for a kind so stated, paired with the packed row (ledger 2889). Mamba2's 8 heads of 32 over a

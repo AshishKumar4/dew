@@ -58,7 +58,7 @@ source .venv/bin/activate
 uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple
 ```
 
-To install the current revision of the repository instead of the release, name it: `uv pip install "dewml @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`, and pin a commit, `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`, to reproduce a run later. Dew installs its JAX build and the Flax release pyproject.toml's dependencies allow.
+To install the current revision of the repository instead of the release, name it: `uv pip install "dewml @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`, and pin a commit, `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`, to reproduce a run later. An install that names dewml resolves its dependencies afresh, unpinned and unhashed; one whose every file is verified installs a lock from a checkout instead, `sh tools/install_environment.sh cpu` (or `cuda12`, `cuda13`), which requires every hash and installs the checkout itself last, the one part no hash holds. Dew installs its JAX build and the Flax release pyproject.toml's dependencies allow.
 
 The CPU install is enough for the [Quickstart](getting-started.md).
 
@@ -101,7 +101,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post90,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post93,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. They are post81's on x86_64 and aarch64 (a GH200's Grace) alike, which add XLA's cuDNN fixes below (a cached graph's backend configuration, the deviceless description's memory bus width, a default convolution's engine) and its GEMM fusion under deterministic ops to post73's, and the `kernel-compile` extra's (x86_64 only) are post81's too. They pair with the stock `jaxlib==0.12.0.1`, and each GPU lock (`locks/cuda12.txt`, `locks/cuda13.txt`) carries each machine's pins under its markers, so a GH200 installs the same file. Every other package, jaxlib included, comes from PyPI. The fixes:
@@ -202,6 +202,9 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - A call primitive's batching (`eval_jaxpr_p`, a registered call primitive, `cond`, `scan`, `while_loop`, a custom VJP's optimized remat) keeps its body's staged custom-JVP outputs marked, so `vmap(out_axes=None)` refuses one as shared, as through a direct `jit`, where `sum_match=True` summed its conservative broadcast.
 - The functional GPU interpreter reads zeros before a TMA window's buffer and drops what a store would write there, keeps a `while_loop` condition's writes and out-of-bounds reads, and honours a copy's predicate and a copy with no barrier; its race detection checks a block-scaled MMA's scale reads.
 - Every TMEM load honours `max_registers` and issues transfers of a power of two; a deviceless capture keeps a scalar operand at rank 0 and refuses a sub-byte one.
+- Mosaic GPU issues tcgen05's products of float32 shared-memory operands as TF32 (`.kind::tf32`), and a compile ahead that requires its autotune results (`xla_gpu_require_complete_aot_autotune_results`) keys its programs as its device's compile does.
+- A compile for compile-only GPUs reads and writes the persistent compilation cache only where its options or `XLA_FLAGS` state how it is tuned (autotune level 0, or complete stored autotune results required), so a program XLA compiled untuned is never stored under the key a device's tuned compile reads.
+- The Pallas lowering cache keys no caller's metadata of a kernel (`CompilerParams.metadata`), which no lowering reads, so kernels that differ in it alone share one lowering, each call carrying its own.
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
 ## Optional extras
@@ -282,7 +285,7 @@ source .venv/bin/activate
 sh tools/install_environment.sh cpu   # cuda12 or cuda13 on a GPU host
 ```
 
-The `ci` extra is the test suite's environment, every package a test file imports. `tools/lock_environment.sh` locks it in `locks/`, and CI, the GPU nodes and the kernel lab's GPU jobs all install the lock for their host, with the same JAX build CI uses: `constraints.txt` names Dew's JAX build, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
+The `ci` extra is the test suite's environment, every package a test file imports. `tools/lock_environment.sh` locks it in `locks/`, every file with its sha256, and CI, the GPU nodes and the kernel lab's GPU jobs all install the lock for their host (`tools/install_environment.sh`, which requires each hash, so a file whose bytes changed under its name and version fails to install by name), with the same JAX build CI uses: `constraints.txt` names Dew's JAX build, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
 
 ## Bumping JAX
 

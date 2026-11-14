@@ -217,6 +217,10 @@ class AttentionCase:
     0.4961). jax.nn's xla attention forms its products through dot_general, which the rule quantizes as it
     does the reference path's, so it takes them where a call or a run names it. None where no rule owns
     them."""
+    separable_bias: bool = False
+    """Whether the call's bias is a query's term plus a key's (`attention.SeparableBias`, FoX's), which the
+    template reads as its two terms in O(S) and every other route writes out, `[B, H, S, S]`: not a dense
+    bias (`dense_bias`), the selector keeping it on the template (`_attention_preferred`)."""
 
     @property
     def cell(self) -> tuple[str | None, "CallKind"]:
@@ -693,7 +697,11 @@ class Timed:
     documents: "bool | Timed" = True
 
     def holds(self, case: AttentionCase) -> bool:
-        """Whether `case` lies within these calls."""
+        """Whether `case` lies within these calls: none holds a separable bias
+        (`AttentionCase.separable_bias`), which no receipt timed and every declared route would write out
+        whole."""
+        if case.separable_bias:
+            return False
         if case.documents is not None and not isinstance(self.documents, bool):
             return self.documents.holds(case)
         return (self.shortest <= min(case.queries, case.keys) and max(case.queries, case.keys) <= self.longest
@@ -830,11 +838,12 @@ def _attention_preferred(case: AttentionCase) -> str:
     mainloop, and a run recorded fast its accurate route, once its forks' runs reached the call). A call
     whose products a quantized model's rule owns runs the kernel that computes the rule's arithmetic
     (`AttentionCase.quantized`), which every kernel forming its products whole refuses, a declared cell's
-    included."""
+    included. A separable bias (`AttentionCase.separable_bias`, FoX's) runs the template on every backend,
+    which alone holds its two terms, not the `[B, H, S, S]` bias every other route writes out."""
     backend = generation.backend()
     if case.quantized is not None:
         return case.quantized
-    if case.spans_only and backend in ('gpu', 'tpu'):
+    if case.separable_bias or (case.spans_only and backend in ('gpu', 'tpu')):
         return 'template'
     if (backend == 'gpu' and case.dense_bias and case.form == "fast"
             and not (case.causal and generation.gpu_target().architecture.wgmma)):

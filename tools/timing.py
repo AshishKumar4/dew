@@ -167,7 +167,7 @@ def worker_env(env: dict, clock: str) -> dict:
     """An arm's `env` as its worker on `clock` runs: a worker reading device time runs no command buffers,
     which CUPTI does not read whole (`benchmark.Ungraphed`), unless the arm's own env names them; the flag
     goes after the XLA flags the worker would inherit, whose last occurrence holds."""
-    if clock != "device" or "--xla_gpu_enable_command_buffer" in env.get("XLA_FLAGS", ""):
+    if clock != "device" or instrument().UNGRAPHED_FLAG.removesuffix("=") in env.get("XLA_FLAGS", ""):
         return env
     flags = env.get("XLA_FLAGS", os.environ.get("XLA_FLAGS", ""))
     return {**env, "XLA_FLAGS": f"{flags} {instrument().UNGRAPHED_FLAG}".strip()}

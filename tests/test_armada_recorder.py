@@ -3,9 +3,9 @@ record keys the file's row in the test cache (tools/armada/ci.py's `cache_key`):
 read, imported and started, for the process's whole life, and its children's."""
 
 import json
-import zipfile
 
 import pytest
+import wheels
 from armada_support import ON_SRC, PASSING, cached, interpreter, lifetime_task, loaded, reusable_now, written
 from tool_support import REPO_ROOT, load
 
@@ -73,14 +73,7 @@ def test_a_python_child_uv_runs_over_this_environment_joins_its_files_record(ci,
     """
     url, _, _ = cache_worker
     cached(monkeypatch, url)
-    wheel = tmp_path / "layered-1.0-py3-none-any.whl"
-    info = "layered-1.0.dist-info"
-    with zipfile.ZipFile(wheel, "w") as archive:
-        archive.writestr("layered/__init__.py", "")
-        archive.writestr(f"{info}/METADATA", "Metadata-Version: 2.1\nName: layered\nVersion: 1.0\n")
-        archive.writestr(f"{info}/WHEEL", "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\n"
-                                          "Tag: py3-none-any\n")
-        archive.writestr(f"{info}/RECORD", "")
+    wheel = wheels.wheel(tmp_path, "layered", "1.0")
     launched = ["uv", "run", "--offline", "--no-project", "--python", "{python}", "--with", str(wheel),
                 "python", "-c", "import layered, plain"]
     written(tmp_path, {

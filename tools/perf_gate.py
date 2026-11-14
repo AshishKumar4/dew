@@ -199,8 +199,36 @@ def _stepped(out: Path) -> tuple:
     shows unmeasured. Its compile, which an arm's cache holds from its first round on, is judged ahead of
     the run on any host (`compile`)."""
     [step] = json.loads(out.read_text())
+    # A timing from a window whose steps went non-finite (its loss, or its step's own finiteness) is no
+    # measurement: refused, as the probe's failure, never a sample (audit, 2026-11-14).
+    if step.get("finite") is False or not math.isfinite(float(step.get("loss", 0.0))):
+        raise ValueError(f"its step went non-finite ({step.get('nonfinite_steps', 'some')} steps; loss "
+                         f"{step.get('loss')}): no timing of it is a measurement")
     mfu = step.get("mfu")
+    # The window's whole elapsed time a step: a pause a head adds is a regression, never averaged past; a
+    # part that stalled is said beside it (`stalled`), its row's diagnostics.
     return step["ms_per_step"], peak(step), None if mfu is None else 100.0 * mfu
+
+
+STALL = 1.5
+"""How many times its window's median a part of a step's timed window takes to be said stalled (`stalled`)."""
+
+
+def stalled(out: Path) -> dict | None:
+    """A step's timed window's worst part where it took `STALL` times its parts' median or more: its ms a
+    step, the median's, and whose time it was (`host` where its dispatch was as slow, `device` where only
+    its readiness was); None where no part stalled, or its tool times no parts. A diagnostic beside the
+    step's time, which stays the window's whole elapsed time."""
+    [step] = json.loads(out.read_text())
+    series, sent = step.get("window_ms_series"), step.get("window_dispatch_ms_series")
+    if not series:
+        return None
+    middle = statistics.median(series)
+    worst = max(range(len(series)), key=series.__getitem__)
+    if series[worst] < STALL * middle:
+        return None
+    by = None if not sent else "host" if sent[worst] >= STALL * statistics.median(sent) else "device"
+    return {"part_ms": series[worst], "median_ms": round(middle, 3), "by": by}
 
 
 def _forwarded(out: Path, name: str) -> tuple:
@@ -410,6 +438,9 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
                 sample.update({row.name: {**value, "exit_code": done.returncode} if external
                                else None if value is None else float(value)
                                for row, value in zip(probe.rows, values, strict=True)})
+                # A step whose window stalled in one part, said beside its rows (`stalled`).
+                if probe.rows[0].name.startswith("step ") and out.is_file() and (stall := stalled(out)):
+                    sample.update({f"stalled {row.name}": stall for row in probe.rows})
             except Exception as error:  # a row that cannot run in this tree is reported, not gated
                 failure = ({"error": str(error)[-400:],
                             "exit_code": None if done is None else done.returncode}
@@ -520,27 +551,30 @@ case = Case(**json.loads(sys.argv[1]))
 generation, capacity, attention = sys.argv[2], int(sys.argv[3]), sys.argv[4]
 ahead = ahead_of(case, generation, capacity, attention)
 print(json.dumps({"seconds": ahead.planned_seconds,
+                  "parts": dict(getattr(ahead, "planned_parts", None) or {}) or None,
                   "plan": {key: (ahead.plan or {}).get(key) for key in sys.argv[5].split(",")}}))
 """
 """A step's planning and compile ahead of its run, for compile-only GPUs of a generation (`compile`): the
-seconds the planner took, its derivations and every compile (`AheadOfTime.planned_seconds`), and the
-configuration it selected (`SELECTED`), a diagnostic beside the row."""
+seconds the planner took, its derivations and every compile (`AheadOfTime.planned_seconds`), those seconds by
+their parts (`AheadOfTime.planned_parts`: JAX's traces, lowerings and compiles, and the algebra's passes; None
+in a tree before them), and the configuration it selected (`SELECTED`), the last two diagnostics beside the
+row."""
 SELECTED = ("split", "rows", "remat", "head_tile", "head_fused", "xla_defaults", "narrow")
 """The fields of a compiled plan that name the configuration its planner selected (dew.training.planning's
 admitted record), kept with their own values beside each compile's seconds: a head that plans otherwise shows
 it."""
 
 
-def compiled_sample(printed: str) -> tuple[float, dict]:
-    """A compile ahead's printed result (`COMPILED`) as a row's sample and its plan: the planner's seconds."""
+def compiled_sample(printed: str) -> tuple[float, dict, dict | None]:
+    """A compile ahead's printed result (`COMPILED`) as a row's sample, the planner's seconds, its plan and
+    its seconds by their parts."""
     compiled = json.loads(printed.strip().splitlines()[-1])
-    return float(compiled["seconds"]), compiled["plan"]
+    return float(compiled["seconds"]), compiled["plan"], compiled.get("parts")
 
 
 def ahead_battery(args: argparse.Namespace) -> int:
-    """Each step of `--kind`'s compiled ahead of its run (benchmark_step --compile-ahead, over the run's
-    own GPUs where `--topology` names them, else one compile-only GPU of the kind, `COMPILE_TARGETS`),
-    in each tree's environment of `--lock`, into
+    """Each step of `--kind`'s compiled ahead of its run (benchmark_step --compile-ahead, for one
+    compile-only GPU of the kind, `COMPILE_TARGETS`), in each tree's environment of `--lock`, into
     `--out`/<the tree's directory name>: what `run --ahead` hands each arm's step rows, so the GPU compiles
     none of a step that is the program compiled ahead (dew-ops' perf jobs, in their GPU-free prepare). A
     tree whose own benchmark_step has no `--compile-ahead` (one older than the handoff), asked of the tool
@@ -566,15 +600,12 @@ def ahead_battery(args: argparse.Namespace) -> int:
             print(f"{name}: its benchmark_step could not say what it takes: {taken[name].stderr[-400:]}",
                   flush=True)
         return 1
-    needs = ["--compile-ahead", *(["--topology"] if args.topology else [])]
-    if lacking := [name for name, done in taken.items()
-                   if any(word not in done.stdout for word in needs)]:
-        # A tree before the handoff, or one that cannot compile over the node's own GPUs (a step compiled
-        # for a canonical GPU is refused by a run whose pool is smaller, `BuildTarget.held`).
-        print(f"{', '.join(lacking)}: its benchmark_step takes no {' or '.join(needs)}: no tree's steps are "
+    if lacking := [name for name, done in taken.items() if "--compile-ahead" not in done.stdout]:
+        # A tree before the handoff.
+        print(f"{', '.join(lacking)}: its benchmark_step takes no --compile-ahead: no tree's steps are "
               "compiled ahead, every arm compiling its own on the GPU", flush=True)
         return 0
-    target = ["--topology", args.topology] if args.topology else ["--capacity-gib", str(gib)]
+    target = ["--capacity-gib", str(gib)]
     for name, path in built.items():
         done = _run(Path(path), pythons[name], "benchmark_step.py",
                     ["--cases", json.dumps(cases), "--compile-ahead", str(Path(args.out) / Path(path).name),
@@ -611,7 +642,8 @@ def compile_battery(args: argparse.Namespace) -> int:
     arms = arms_of(base, head, base_path, head_path)
     results = {"base": base, "head": head, "alone": f"{base}{ALONE}", "rounds": args.rounds,
                "rows": [row.__dict__ for row in rows], "samples": {arm: [] for arm in ARMS}, "orders": [],
-               "plans": {arm: [] for arm in ARMS}, "target": {"kind": args.kind, "generation": generation,
+               "plans": {arm: [] for arm in ARMS}, "parts": {arm: [] for arm in ARMS},
+               "target": {"kind": args.kind, "generation": generation,
                                                               "capacity_gib": gib, "lock": args.lock},
                "seconds": {"first round": 0.0, "later rounds": 0.0}}
     beside = Path(args.out).resolve().parent
@@ -621,7 +653,7 @@ def compile_battery(args: argparse.Namespace) -> int:
 
         def sample(arm: str, round_: int) -> dict:
             tree, path = arms[arm]
-            taken, plans = {}, {}
+            taken, plans, parts = {}, {}, {}
             for name, case in cases.items():
                 if tree in unbuilt:
                     taken[name] = unbuilt[tree]
@@ -634,8 +666,9 @@ def compile_battery(args: argparse.Namespace) -> int:
                 if done.returncode != 0:
                     taken[name] = f"not run: {done.stderr[-400:]}"
                     continue
-                taken[name], plans[name] = compiled_sample(done.stdout)
+                taken[name], plans[name], parts[name] = compiled_sample(done.stdout)
             results["plans"][arm].append(plans)
+            results["parts"][arm].append(parts)
             return taken
 
         rounds(args, results, sample)
@@ -748,8 +781,13 @@ def report(args: argparse.Namespace) -> int:
         # A compile's plans, each arm's selected configurations, beside its verdict: why its planning moved.
         selected = {arm: [plans[row.name] for plans in results.get("plans", {}).get(arm, [])
                           if row.name in plans] for arm in ARMS}
+        # Its planning's seconds by their parts, each arm's every round, beside its verdict (row 6108): which
+        # part moved, where a compile's whole did.
+        spent = {arm: [parts[row.name] for parts in results.get("parts", {}).get(arm, [])
+                       if parts.get(row.name)] for arm in ARMS}
         verdicts[row.name] = {"state": state, "unit": row.unit, "gated": row.gated, **numbers,
-                              **({"plans": selected} if any(selected.values()) else {})}
+                              **({"plans": selected} if any(selected.values()) else {}),
+                              **({"parts": spent} if any(spent.values()) else {})}
         if (state in (*UNQUALIFIED, "broken", "failed") or (state == "regressed" and row.gated)
                 or (claiming and claimed(row) and state in
                     ("not measured on this hardware", "not compared"))):
@@ -759,6 +797,20 @@ def report(args: argparse.Namespace) -> int:
         if selected["base"] and any(plan != selected["base"][0] for plans in selected.values()
                                     for plan in plans):
             state += " (its arms planned otherwise: the verdicts' plans)"
+        if spent["base"] and spent["head"]:
+            shared = [part for part in spent["head"][0]
+                      if all(part in each for each in (*spent["base"], *spent["head"]))]
+            state += " (parts, median s base/head: " + ", ".join(
+                f"{part} {statistics.median(each[part] for each in spent['base']):.2f}/"
+                f"{statistics.median(each[part] for each in spent['head']):.2f}" for part in shared) + ")"
+        stalls = [found[f"stalled {row.name}"] for arm in ARMS for found in samples[arm]
+                  if isinstance(found, dict) and f"stalled {row.name}" in found]
+        if stalls:
+            worst = max(stalls, key=lambda stall: stall["part_ms"])
+            verdicts[row.name]["stalled"] = stalls
+            by = worst["by"] or "unknown"
+            state += (f" (stalled in {len(stalls)} samples, in its time: worst part "
+                      f"{worst['part_ms']:.2f} ms against {worst['median_ms']:.2f}, the {by}'s)")
         if state.startswith("partial"):
             state += " (" + ", ".join(f"{arm} {count} of {rounds} rounds unmeasured"
                                       for arm, count in numbers["unmeasured rounds"].items()) + ")"
@@ -844,9 +896,6 @@ def main() -> int:
                                                        else {}))
     aheading.add_argument("--environments", default="")
     aheading.add_argument("--only", nargs="*", default=[])
-    aheading.add_argument("--topology", default="",
-                          help="the run's GPUs' serialized topology (a GPU node's $DEW_NODE_TOPOLOGY), "
-                               "each step compiled over them; else over a canonical GPU of --kind")
     args = parser.parse_args()
     with contextlib.suppress(BrokenPipeError):
         return {"run": run, "compile": compile_battery, "ahead": ahead_battery,

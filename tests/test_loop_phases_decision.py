@@ -207,11 +207,14 @@ def test_a_phased_runs_later_phase_compiles_ahead_as_the_run_lowers_it_at_its_bo
     training nothing. Into the run's persistent cache, which a device's run reads as tuned, a step compiles
     only with every choice the GPU kind's runs tuned (`report.for_devices`): a host none ran on prepares
     none, its run compiling them on the device (row 6046), each said by its program (`CompiledAhead.untuned`).
-    Into a file, the step its resume would take compiles as XLA compiles it untuned, its record saying so
-    (`AheadOfTime.tuned`): the program the prepare compiled for its phase."""
+    Into a file over the host's own topology, which a run takes, the step its resume would take is refused
+    alike, not preparable until such a run has tuned it (`report.Untuned`): the program the prepare compiled
+    for its phase."""
     from jax.experimental import topologies
 
     from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.options import program_digest
+    from dew.nn.kernels.templates import report
     from dew.training.ahead import AheadTarget, CompiledAhead
 
     topology = tmp_path / "topology.bin"
@@ -236,8 +239,10 @@ def test_a_phased_runs_later_phase_compiles_ahead_as_the_run_lowers_it_at_its_bo
     assert len(untuned["ahead"]) == 1 and len(set(untuned["prepared"])) == 2
     trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 3, "checkpoint_every": 1})
     resumed_target = AheadTarget("sm90", 8, path=str(tmp_path / "resumed.ahead"), topology=str(topology))
-    with pytest.raises(CompiledAhead) as resumed:
+    with pytest.raises(ValueError) as resumed:
         trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 4,
                                                                          "compile_ahead": resumed_target})
-    assert resumed.value.code == 0 and not resumed.value.ahead.tuned
-    assert untuned["ahead"] == (resumed.value.ahead.program,) and untuned["ahead"][0] in untuned["prepared"]
+    refused = resumed.value.__cause__
+    assert isinstance(refused, report.Untuned)
+    assert untuned["ahead"] == (program_digest(refused.lowered),)
+    assert untuned["ahead"][0] in untuned["prepared"]

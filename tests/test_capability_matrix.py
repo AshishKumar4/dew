@@ -342,6 +342,11 @@ FAMILIES: Mapping[str, tuple[Family, ...]] = registered(models, {
                                                             "n_groups": 1, "chunk_size": 8}}},
                    {"name": "attention", "input_multiplier": 0.8, "output_multiplier": 0.6,
                     "mixer": {"class": "attention", "fields": {}}}]}})),
+        # Block-selected attention (`dew.nn.block_sparse`, MoBA's selection): each query its own block of two
+        # places and the one earlier block its gate picks, of up to three.
+        Family("causal_transformer+block_sparse", "causal_transformer", DECODER_LM, 256,
+               built("causal_transformer", **DECODER, mixer={"class": "block_sparse_attention",
+                                                            "fields": {"block": 2, "top_k": 2}})),
         Family("causal_transformer+mamba", "causal_transformer", DECODER_LM, 64, released("mamba-tiny")),
         Family("causal_transformer+mimo_v2_flash", "causal_transformer", DECODER_LM, 64,
                released("mimo-v2-flash-tiny")),
