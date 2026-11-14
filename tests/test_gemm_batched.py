@@ -21,11 +21,10 @@ rows or its columns (Newton-Schulz's `B X` and `X Xᵀ`), two batch axes, and no
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32, jnp.complex64])
 @pytest.mark.parametrize(("batch", "contract"), BATCHED_CONTRACTIONS)
-def test_a_batched_product_no_receipt_routes_is_xlas_dot_bit_for_bit(batch, contract, dtype):
-    """A batched product the template takes from no receipt (`gemm.BATCHED`'s measured requirement), real or
-    complex, over one batch axis, two or none, is bitwise `jax.lax.dot_general` of the same dimensions (row
-    5972: Muon's Newton-Schulz iteration routed through the GEMM selector keeps its numbers until a receipt
-    moves it)."""
+def test_a_batched_product_on_xlas_route_is_xlas_dot_bit_for_bit(batch, contract, dtype):
+    """A batched product named onto XLA's route (`generation.chosen(grouped_matmul='xla')`), real or complex,
+    over one batch axis, two or none, is bitwise `jax.lax.dot_general` of the same dimensions (row 5972:
+    Muon's Newton-Schulz iteration through the GEMM selector, its numbers XLA's wherever XLA serves it)."""
     rng = np.random.default_rng(0)
     last = len(batch) + 1
     a_shape = (*batch, 24, 40) if contract[0] == -1 else (*batch, 40, 24)
@@ -40,7 +39,9 @@ def test_a_batched_product_no_receipt_routes_is_xlas_dot_bit_for_bit(batch, cont
     contracted = (last + 1 + contract[0], last + 1 + contract[1])
     batch_axes = tuple(range(len(batch)))
     expected = jax.lax.dot_general(a, b, ((contracted[:1], contracted[1:]), (batch_axes, batch_axes)))
-    np.testing.assert_array_equal(np.asarray(gemm.batched_product(a, b, contracted)), np.asarray(expected))
+    with generation.chosen(grouped_matmul="xla"):
+        out = gemm.batched_product(a, b, contracted)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
 
 
 @runs("sm90")
