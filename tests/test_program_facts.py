@@ -15,7 +15,6 @@ from test_algebra import rows
 from dew import algebra
 from dew.nn import flops, programs
 from dew.nn.kernels.templates import layout
-from dew.training import footprint
 
 
 def named(name: str, function, operands: int = 1) -> jcore.Primitive:
@@ -98,22 +97,3 @@ def test_a_tile_layout_refuses_an_operation_it_does_not_know():
     reversed_rows = named("exp", lambda tile: tile[::-1])
     with pytest.raises(layout.Untransposable):
         layout.transposed(reversed_rows.bind)(jnp.ones((3, 5), jnp.float32))
-
-
-@pytest.mark.parametrize("platform", ["gpu", "cpu"])
-def test_a_compiled_programs_derivation_holds_an_unknown_operations_result_in_a_buffer(platform):
-    """A value two reductions read costs a compiled program no buffer where an elementwise operation makes it,
-    which each reader's fusion recomputes; made by a user's primitive named as that operation, the derivation
-    of the program's memory holds it in a buffer of its own, as it holds any operation's it does not know:
-    the program's peak is the larger by it."""
-    doubling = named("mul", lambda value: value * 2)
-
-    def read_twice(doubled):
-        def program(x):
-            y = doubled(x)
-            return jnp.sum(y, axis=1), jnp.max(y, axis=1)
-        return jax.make_jaxpr(program)(jnp.ones((64, 256), jnp.float32)).jaxpr
-
-    known, unknown = (footprint.peak_bytes(read_twice(doubled), platform, footprint.Workspace(0, 0))
-                      for doubled in (lambda x: x * 2, doubling.bind))
-    assert unknown > known

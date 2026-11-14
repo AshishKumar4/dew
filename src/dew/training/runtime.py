@@ -29,17 +29,16 @@ from dew._coordination import broadcast_from_process_zero, end_pool_on_failure, 
 from dew._devices import (
     DEW_SHARE,
     FRACTIONS,
-    WRITTEN,
     apply_xla_flags,
     backend_open,
     cuda_plugin,
     flags_hold,
     flags_set,
-    fraction_name,
     pool_statement,
     preallocate_gpu_pool,
     refuse_cpu_only_jax,
     refuse_unsafe_cublas,
+    write_share,
     xla_flag,
 )
 from dew._logging import configure as configure_logging
@@ -152,8 +151,7 @@ def share_pool(share: float) -> None:
     if backend_open():
         raise RuntimeError("JAX's backend has opened, and its pool is fixed: share the GPU before the "
                            "process's first JAX computation")
-    os.environ[fraction_name()] = str(share)
-    os.environ.pop(WRITTEN, None)
+    write_share(share, "named")
 
 
 def pooled(*, joins: bool) -> None:
@@ -166,7 +164,7 @@ def pooled(*, joins: bool) -> None:
         return
     _POOLED.append(True)
     if backend_open():
-        if pool_statement()["source"] == "jax" and cuda_plugin():
+        if pool_statement()["source"] == "jax":
             _log.warning("JAX's backend opened before Dew sized its GPU pool, so this run's plans are held "
                          "to JAX's 75%% of each GPU; import dew before any JAX computation, or set %s=%s "
                          "before the process starts, for Dew's", FRACTIONS[1], DEW_SHARE)

@@ -37,6 +37,7 @@ from dew.nn.kernels.templates.attention import (
     KeySpans,
     Kind,
     PaddedCall,
+    Param,
     block_map,
     differentiable,
     floating_params,
@@ -574,7 +575,7 @@ def hook_reduces(hooks: Hooks | None) -> bool:
         return False
     if not callable(hooks.score_mod):
         return True
-    params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
+    params = param_types(hooks.score_params)
     return _hook_reduces(hooks.score_mod, params)
 
 
@@ -660,7 +661,7 @@ def score_places(hooks: Hooks | None) -> tuple[bool, bool]:
     run, on a tile."""
     if hooks is None or not callable(hooks.score_mod):
         return False, False
-    params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
+    params = param_types(hooks.score_params)
     return _score_places(hooks.score_mod, params)
 
 
@@ -706,7 +707,7 @@ def varying_slopes(hooks: Hooks | None, graded: tuple[Kind, ...]) -> int:
     where the hook takes no forward derivative (a `jax.custom_vjp`'s) counted varying. None without a hook."""
     if hooks is None or not callable(hooks.score_mod):
         return 0
-    params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
+    params = param_types(hooks.score_params)
     return _varying_slopes(hooks.score_mod, params, graded)
 
 
@@ -792,7 +793,7 @@ def transposable(hooks: Hooks) -> bool:
     (`attention_gradient.scored`)."""
     if not callable(hooks.score_mod):
         return True
-    params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
+    params = param_types(hooks.score_params)
     return _transposable(hooks.score_mod, params)
 
 
@@ -903,25 +904,81 @@ def placed_draws(drop: Dropout | None, queries: int, keys: int) -> Dropout | Non
     return dataclasses.replace(drop, queries=padded(drop.queries, queries), keys=padded(drop.keys, keys))
 
 
-def held_params(family: mosaic.Family, refs: tuple, params: tuple, row, head, first, queries: int) -> tuple:
-    """A query tile's score-hook parameters its walk holds across its steps, read once before it (the spec's
-    hook operands, a query tile's once: kernel-templates.md's hooks' section), each step taking them
-    (`_param`'s `held`): a HEAD's scalar and a QUERY's vector of the tile's `queries` from `first` in the
-    accumulator's row layout; None for a KEY's and a TILE's, which each step reads at its keys."""
+def param_types(params: Iterable[Param]) -> tuple:
+    """Score-hook parameters as a launch's kernels load them: each its `Kind` and dtype (`kept_dtype`)."""
+    return tuple((param.kind, kept_dtype(param.value.dtype)) for param in params)
+
+
+def streams_operands(family: mosaic.Family) -> bool:
+    """Whether a launch on `family` loads its score hook's operands on its streams (the spec's load contract,
+    kernel-templates.md's hooks: a KEY's and a TILE's blocks ride the stream of keys, row 5741): where a
+    producer role loads the streams (`Family.roles`: sm90's and sm100's rings). A family whose consumer
+    issues every load (mma.sync's pipeline, a TPU core's, consumer-fed rings) reads them where its step
+    does."""
+    return any(role.name == "producer" for role in family.roles(1).roles)
+
+
+def score_stream(index: int) -> str:
+    """The stream score-hook parameter `index` rides (`score_streams`)."""
+    return f"score{index}"
+
+
+def riding(family: mosaic.Family, kinds: Iterable[Kind], along: str) -> tuple[int, ...]:
+    """The score-hook parameters, by index among `kinds`, that ride a launch's stream along its axis `along`
+    (the keys of the forward's and dQ's walks, the queries of dK/dV's): each whose kind lays that axis
+    (`Kind.axes`), where `family` loads its operands so (`streams_operands`)."""
+    if not streams_operands(family):
+        return ()
+    return tuple(index for index, kind in enumerate(kinds) if along in kind.axes)
+
+
+def score_streams(family: mosaic.Family, params: tuple, along: str, held: int, step: int) -> dict:
+    """The blocks the riding parameters of `params` (each its `Kind` and dtype, `riding`) stream, as
+    `Family.streams` takes them: a step's `step` entries along the walk's axis, of a tile the program's
+    `held` rows of the axis it holds (its queries, keys first its keys), of a vector one row."""
+    kinds = tuple(kind for kind, _ in params)
+    return {score_stream(index): ((held if kinds[index] is Kind.TILE else 1, step), params[index][1])
+            for index in riding(family, kinds, along)}
+
+
+def score_views(family: mosaic.Family, refs: tuple, kinds: tuple, along: str, row, head, held) -> dict:
+    """The views the riding parameters' streams load a step's block from (`score_streams`, `rings.viewed`),
+    at the shared batch row and head of each (`shared_place`): a tile's `[Qp, Kp]` (keys first `[Kp, Qp]`)
+    at the program's `held` tile and the step's, a vector's `[H, N]` at its head and the step's."""
+    views = {}
+    for index in riding(family, kinds, along):
+        ref = refs[index]
+        shared_row, shared_head = shared_place(ref.shape, row, head)
+        if kinds[index] is Kind.TILE:
+            views[score_stream(index)] = (ref.at[shared_row, shared_head], lambda step: (held, step))
+        else:
+            views[score_stream(index)] = (ref.at[shared_row], lambda step, at=shared_head: (at, step))
+    return views
+
+
+def held_params(family: mosaic.Family, refs: tuple, kinds: tuple, row, head, first, count: int, *,
+                along: str = "keys") -> tuple:
+    """A walk's score-hook parameters it holds across its steps, read once before it (the spec's load
+    contract, kernel-templates.md's hooks: a query tile's once), each step taking them (`_param`'s `held`),
+    by their `kinds`: a HEAD's scalar and the vector of the tile's held axis (a QUERY's, or where the walk
+    is `along` the queries a KEY's) of its `count` entries from `first`, in the accumulator's row layout;
+    None for a parameter along the walk's own axis, which each step reads at its own entries."""
+    vector = Kind.QUERY if along == "keys" else Kind.KEY
+
     def held(ref, kind):
         if kind is Kind.HEAD:
             return ref[head]
-        if kind is not Kind.QUERY:
+        if kind is not vector:
             return None
         shared_row, shared_head = shared_place(ref.shape, row, head)
-        places = {"batch": shared_row, "heads": shared_head, "queries": pl.ds(first, queries)}
+        places = {"batch": shared_row, "heads": shared_head, kind.axes[-1]: pl.ds(first, count)}
         return family.rows_of(ref.at[axes.placed(kind.axes, places)])
 
-    return tuple(held(ref, param.kind) for ref, param in zip(refs, params, strict=True))
+    return tuple(held(ref, kind) for ref, kind in zip(refs, kinds, strict=True))
 
 
 def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_first=None, *,
-           keys_first: bool = False, held=None):
+           keys_first: bool = False, held=None, slot=None, at: tuple = (0, 0)):
     """A hook parameter's values for a tile `like` of queries from `first` (and keys from `k_first`, a score
     tile's), as `kind` lays them out: the head's scalar, else the tile's entries (a score tile's `[bq, bk]`,
     an output tile's `[bq, Dv]`) in the accumulator's layout, its queries' and keys' broadcast. A score hook
@@ -931,10 +988,18 @@ def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_fir
     compare, a lowering probe for an H100), so a hook that reshapes or indexes an axis fails to lower here,
     never silently; a pointwise hook is the same function of either. A score tile whose rows are its keys
     (`keys_first`, `[bk, bq]`) reads a tile parameter's entries from its keys-first copy `[B, H, Kp, Qp]`. A
-    walk's `held` value of it (`held_params`), where it holds one, is the tile's, a QUERY's broadcast."""
+    walk's `held` value of it (`held_params`), where it holds one, is the tile's, its vector broadcast along
+    the tile's rows; a step's `slot` of it where it rides the walk's stream (`score_streams`), the tile's
+    share of the slot from `at` (its rows' first and its columns'), a vector's along the tile's columns, the
+    stream's axis."""
     queries, keys = like.shape[::-1] if keys_first else like.shape
     if held is not None:
         return held if kind is Kind.HEAD else algebra.expand(held, like)
+    if slot is not None:
+        rows, columns = like.shape
+        if kind is Kind.TILE:
+            return family.tile_of(slot.at[pl.ds(at[0], rows), pl.ds(at[1], columns)])
+        return algebra.across(family.columns_of(slot.at[0, pl.ds(at[1], columns)]), like)
     if kind is Kind.HEAD:
         return ref[head]
     if kind is not Kind.OUTPUT:

@@ -79,11 +79,16 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     issued_into,
     issued_pairs,
     modelled,
+    param_types,
     query_swizzle,
     reducing,
     refused,
+    riding,
     scopes_products,
     score_places,
+    score_stream,
+    score_streams,
+    score_views,
     staged_after,
     stages_after_walks,
     stated,
@@ -187,7 +192,7 @@ def logits_ahead(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, *
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
                          residuals: bool, stages: int, *, peaks: bool = False, out_dtype=None,
                          page: int | None = None, certified: bool = False, codes=None, parts: int = 1,
-                         interpret: bool = False) -> tuple[list, dict, list]:
+                         interpret: bool = False, params: tuple = ()) -> tuple[list, dict, list]:
     """The forward program's allocations as `Family.scoped` takes them, in `_launch`'s order, and those it
     scopes after its walks (`after_walks`): its consumers' query stages and their rows' status; each one's
     output stage where the value is not as wide as the query and as narrow, `out_dtype`, the query's by
@@ -202,7 +207,10 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     query's stage at its swizzle (`query_swizzle`); a certify form's fp32 stage of a step's sums last
     (`certified_walk`). An fp32 call's `parts` (`MosaicForward.parts`) stage each tile's parts one above the
     other, the query's and each slot's rows `parts` times theirs, a part a copy of its own, its query loads a
-    barrier each."""
+    barrier each. The score hook's parameters (`params`, each its `Kind` and dtype) that ride the keys'
+    stream take one each (`score_streams`: a tile's every consumer's rows of a key tile, a key vector's
+    tile), staged plain, a step's block one copy, read where the keys' pages are not (no table gathers
+    them)."""
     consumers, block_q, block_k = tiles.consumers, tiles.block_q, tiles.block_k
     scoped = [family.staged_memory((consumers, parts * block_q, width), dtype, query_swizzle(family)),
               family.staged_memory((consumers, block_q), jnp.float32)]
@@ -240,18 +248,21 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     blocks = {"keys": ((parts * block_k, width), stored)}
     if not peaks:
         blocks["values"] = ((parts * block_k, value_width), stored)
+    keyed = tuple(blocks)
+    hooked = score_streams(family, params, "keys", consumers * block_q, block_k)
+    blocks.update(hooked)
     # The logits' product reads the keys transposed.
-    swizzles = transposed_swizzles(tiles, "keys")
+    swizzles = {**transposed_swizzles(tiles, "keys"), **dict.fromkeys(hooked, swizzling.UNSWIZZLED)}
     if page is None or page >= tiles.block_k:
         streams = family.streams(blocks, stages, consumers, swizzles=swizzles,
-                                 copies=dict.fromkeys(blocks, parts))
+                                 copies=dict.fromkeys(keyed, parts))
     elif not interpret or family.gathers_interpreted:
-        streams = family.streams(blocks, stages, consumers, swizzles=swizzles, gathered=tuple(blocks))
+        streams = family.streams(blocks, stages, consumers, swizzles=swizzles, gathered=keyed)
     else:
         # A copy a row of each swizzled tile's columns (`rings.Ring.parts`), where no lane-level copy runs.
         unit = {name: swizzling.swizzle_columns(stored, swizzles.get(name, swizzling.SWIZZLE_BYTES))
-                for name in blocks}
-        copies = {name: shape[0] * max(1, shape[1] // unit[name]) for name, (shape, _) in blocks.items()}
+                for name in keyed}
+        copies = {name: blocks[name][0][0] * max(1, blocks[name][0][1] // unit[name]) for name in keyed}
         streams = family.streams(blocks, stages, consumers, swizzles=swizzles, copies=copies)
     return scoped, streams, after
 
@@ -900,7 +911,7 @@ class _Codes(NamedTuple):
 
 def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, spans: _Spans | None,
             hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool, params_held: tuple,
-            held: tuple | None = None, product: Callable[[], jax.Array] | None = None,
+            share: int = 0, held: tuple | None = None, product: Callable[[], jax.Array] | None = None,
             interpret: bool = False, codes: _Codes | None = None, training: bool = False,
             first_at: Callable | None = None) -> tuple:
     """A key tile's first key, coordinates and logits under the score hook (batch row and head `place`, its
@@ -913,7 +924,9 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     walks' query places (`training`: its peak walk's and its anchored one's), where its hook reads them, are
     in the accumulator's layout (`Family.as_tile`): a hook's term of a slice of them (a row-indexed one's
     `q_pos[:, :1]`) found no layout on mma.sync, whose reductions' inference offers no accumulator layout (row
-    5279). The hook's parameters the walk holds (`params_held`, `held_params`) are the tile's as they are."""
+    5279). The hook's parameters the walk holds (`params_held`, `held_params`) are the tile's as they are; one
+    that rides the keys' stream (`score_streams`) is the step's slot's, a tile's from the consumer's rows'
+    `share` of it."""
     row, head = place
     family, tiles = program.family, program.tiles
     shape = (tiles.block_q, tiles.block_k)
@@ -953,8 +966,11 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
                      draw=None if hooked.drop is None else hooked.drop.draw(row, head), held=held)
     if training and score_places(hooks)[0]:
         coords = coords._replace(q_pos=family.as_tile(coords.q_pos))
-    params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first, held=kept)
-                   for ref, param, kept in zip(hooked.score, hooks.score_params, params_held, strict=True))
+    streamed = riding(family, tuple(param.kind for param in hooks.score_params), "keys")
+    laid = zip(hooked.score, hooks.score_params, params_held, strict=True)
+    params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first, held=kept,
+                          slot=slots[score_stream(index)] if index in streamed else None, at=(share, 0))
+                   for index, (ref, param, kept) in enumerate(laid))
     logits, products = algebra.logits_of(spec, s, coords, params, masked=jnp.logical_not(whole(index)))
     return k_first, coords, logits, products
 
@@ -1116,12 +1132,13 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # The queries' intervals and ids, and the score hook's parameters of the query tile, read once, before
     # the walk (`_query_bounds`, `held_params`).
     held = None if spans is None else program.bounds(first, spans, row)
-    params_held = held_params(family, hooked.score, hooks.score_params, row, head, first, tiles.block_q)
+    kinds = tuple(param.kind for param in hooks.score_params)
+    params_held = held_params(family, hooked.score, kinds, row, head, first, tiles.block_q)
 
     def scored(index, slots, product=None):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
                        hooks=hooks, drawn=hooked.drop is not None, held=held, params_held=params_held,
-                       product=product,
+                       share=consumer * tiles.block_q, product=product,
                        interpret=interpret, codes=codes, training=training,
                        first_at=(first_at if family.in_flight and family.retires_register_products
                                  else None))
@@ -1495,13 +1512,14 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, s
     pl.when(consumer > 0)(turn)
     held = None if spans is None else program.bounds(first, spans, place[0])
     row, head = place[:2]
-    params_held = held_params(family, hooked.score, hooks.score_params, row, head, first, tiles.block_q)
+    kinds = tuple(param.kind for param in hooks.score_params)
+    params_held = held_params(family, hooked.score, kinds, row, head, first, tiles.block_q)
 
     def step(index, slots, arg, accumulators):
         # The peak walk's logits draw no dropout.
         _, coords, logits, _ = _scored(program, spec, q, index, slots, first, spans, hooked, place[:2], whole,
                                        turn, hooks=hooks, drawn=False, held=held, params_held=params_held,
-                                       interpret=interpret, training=True)
+                                       share=consumer * tiles.block_q, interpret=interpret, training=True)
         # The partner's turn, as a training step's value product would take it.
         turn(wait=False)
         turn(arrive=False)
@@ -1752,10 +1770,12 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
     reuse = _stores_through_query(family, width, value_width, query.dtype, out_dtype)
     # A paged call's key tile of several pages loaded as its table reads it (`paged_reads`, `_paged_views`).
+    params = param_types(hooks.score_params)
+    kinds = tuple(kind for kind, _ in params)
     scoped, rings, after = _forward_allocations(family, tiles, width, value_width, query.dtype, training,
                                          program.stages, peaks=peaks, out_dtype=out_dtype, page=page,
                                          certified=certified, codes=_codes_of(key, read.hooked.scales),
-                                         parts=parts, interpret=bool(interpret))
+                                         parts=parts, interpret=bool(interpret), params=params)
     out_type = _out_types(batch, queries, heads, value_width, out_dtype, splits=splits,
                           peaks=peaks, training=training, finishes=finishes,
                           certified=steps if certified else 0, flags=flags,
@@ -1768,8 +1788,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     def body(*refs, streams, after=None):
         refs = layout.unpacked(*refs)
         read = refs.read
-        located = functools.partial(_program_views, family, refs, read, peaks=peaks, group=group, page=page,
-                                    block_k=block_k, batch=batch, parts=parts)
+        located = functools.partial(_program_views, program, refs, read, peaks=peaks, group=group, page=page,
+                                    batch=batch, parts=parts, queries=queries, kinds=kinds)
         # The rings opened once, before the roles' split (a gathered ring's barriers set once).
         streams = family.opened(streams, located()[3])
         turn = functools.partial(family.turn, refs.schedule, 1 if program.ahead else consumers)
@@ -1891,19 +1911,24 @@ def _placed(program: _Program, located: Callable, spans: _Spans | None, *, queri
     return row, head, column, views, pair_first, streamed
 
 
-def _program_views(family: mosaic.Family, refs, read: _Read, *, peaks: bool, group: int, page: int | None,
-                   block_k: int, batch: int, parts: int, fresh: bool = False) -> tuple:
+def _program_views(program: _Program, refs, read: _Read, *, peaks: bool, group: int, page: int | None,
+                   batch: int, parts: int, queries: int, kinds: tuple, fresh: bool = False) -> tuple:
     """A forward program's place and the key views it streams (`_launched`'s): its batch row, the query head
     and column block of the values it walks (the block `read` names), and its key and value views
-    (`_key_views`; a peak walk's keys alone, an fp32 call's its parts', `_parted_views`); its grid
-    coordinates read where they are used where `fresh` (`Family.program_index`)."""
+    (`_key_views`; a peak walk's keys alone, an fp32 call's its parts', `_parted_views`) beside its score
+    hook's parameters' that ride them (`score_views`, of `kinds`: a tile's at the program's query tile); its
+    grid coordinates read where they are used where `fresh` (`Family.program_index`)."""
+    family, tiles = program.family, program.tiles
     row, head = family.program_index("batch", fresh=fresh), family.program_index("heads", fresh=fresh)
     column = None if read.block is None else family.scalar_of(read.block)
     named = {"keys": refs.k} if peaks else {"keys": refs.k, "values": refs.v}
-    views = _key_views(named, row, lax.div(head, group), read.sources, read.table, page=page, block_k=block_k,
-                       column_block=column)
+    views = _key_views(named, row, lax.div(head, group), read.sources, read.table, page=page,
+                       block_k=tiles.block_k, column_block=column)
     if parts > 1:
         views = _parted_views(views, named, row, lax.div(head, group), batch=batch, parts=parts)
+    if riding(family, kinds, "keys"):
+        tile = program.query_tile(queries // (tiles.consumers * tiles.block_q), fresh=fresh)
+        views = {**views, **score_views(family, read.hooked.score, kinds, "keys", row, head, tile)}
     return row, head, column, views
 
 

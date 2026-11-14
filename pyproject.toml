@@ -258,7 +258,7 @@ torch = ["torch"]
 # diffusers' own key maps, which are written in torch, convert them once.
 diffusers = ["diffusers>=0.34.0", "torch"]
 # Wan 2.1's pipelines clean every prompt with ftfy before UMT5 reads it, and so
-# does dew.inputs.diffusion.WanConditioner.
+# does dew.interop.conditioners.WanConditioner.
 wan = ["ftfy"]
 # dew.rl.playground: MuJoCo Playground's MJX environments as Envs, its JAX implementation on any backend.
 playground = ["playground==0.2.0"]

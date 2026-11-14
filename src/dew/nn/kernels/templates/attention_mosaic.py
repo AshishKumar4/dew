@@ -238,6 +238,11 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     per_span: int = 1
     """The queries each of the spans' intervals holds (`KeySpans.per_span`)."""
 
+    @property
+    def score_types(self) -> tuple:
+        """The score hook's parameters as its kernels load them: each its `Kind` and dtype."""
+        return tuple(zip(self.score_kinds, self.score_dtypes, strict=True))
+
     def spans(self, start, end, query_ids, key_ids) -> KeySpans:
         """The call's spans from its arrays and the op's static form, key count and queries an interval."""
         return KeySpans(start, end, query_ids, key_ids, self.keys, self.form, self.per_span)
@@ -566,18 +571,45 @@ class MosaicForward(_Mainloop[Tiles]):
         for family in layouts(target.generation, query.dtype, query.shape[1]):
             if family is skip or self.refusal(ba, family) is not None:
                 continue
-            for columns in _column_blocks_of(family, query.dtype, ba.arguments["value"].shape[3]):
-                def tiles(rows: int, walked: int, consumers: int, family=family, columns=columns) -> Tiles:
-                    return Tiles(rows, walked, 2, consumers, family=family.name, columns=columns)
 
-                def fits(config: Tiles) -> bool:
-                    return self._launchable(ba, config, target) not in (None, *refused)
+            def fits(config: Tiles) -> bool:
+                return self._launchable(ba, config, target) not in (None, *refused)
 
-                config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles, fits,
-                                  overlapped=True, walks=walked_extents,
-                                  least_walked=functools.partial(_least_keys, family))
-                if config is not None:
-                    return self._launchable(ba, config, target)
+            config = self._searched(ba, family, fits)
+            if config is not None:
+                return self._launchable(ba, config, target)
+        return None
+
+    def offered(self, ba: tokamax.BoundArguments, family: mosaic.Family, target: generation.GpuTarget
+                ) -> tuple[Tiles, ...]:
+        """Every config of `family` its derivation searches for the call of `ba` (`_searched`) that is legal,
+        as it launches (`_launchable`), in the derivation's order; none where the family takes no such
+        call (`refusal`)."""
+        if self.refusal(ba, family) is not None:
+            return ()
+        found: dict[Tiles, None] = {}
+
+        def fits(config: Tiles) -> bool:
+            if (launched := self._launchable(ba, config, target)) is not None:
+                found[launched] = None
+            return False
+
+        self._searched(ba, family, fits)
+        return tuple(found)
+
+    def _searched(self, ba: tokamax.BoundArguments, family: mosaic.Family, fits: Callable[[Tiles], bool]
+                  ) -> Tiles | None:
+        """The derivation's search of `family`'s configs for the call of `ba` (`_derived`, over the value
+        columns whole and then in blocks, `_column_blocks_of`): the first `fits` takes, or None."""
+        query = ba.arguments["query"]
+        for columns in _column_blocks_of(family, query.dtype, ba.arguments["value"].shape[3]):
+            def tiles(rows: int, walked: int, consumers: int, columns=columns) -> Tiles:
+                return Tiles(rows, walked, 2, consumers, family=family.name, columns=columns)
+
+            config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles, fits, overlapped=True,
+                              walks=walked_extents, least_walked=functools.partial(_least_keys, family))
+            if config is not None:
+                return config
         return None
 
     def _launchable(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
@@ -765,7 +797,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                            ba.arguments.get("residuals") is Kept.SPLIT,
                                            min(config.stages, steps), out_dtype=out_dtype, page=page,
                                            codes=_codes_of(ba.arguments["key"], ba.arguments.get("scales")),
-                                           parts=self.parts)
+                                           parts=self.parts, params=self.score_types)
         # An inference launch may flag its rows for the fold's rewalk, and a cache's scaled walk reads its
         # keys' value magnitudes from its value slots (`algebra.SCALED_WALK`; another scaled walk the call's,
         # `attention_mosaic_forward._largest`), each a reduction across warps (`reducing`).
@@ -1060,8 +1092,12 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     `MosaicForward.bounded`), so a plan of it derives that launch's config and reads that launch's
     refusals (`attention_decode.plan`). A query prologue its consumers take where they load the query
     (`MosaicForward.query_mod`) where the launch keeping `residuals` holds it at its own config
-    (`_holds_prologue`), else XLA's program before the launch takes it."""
+    (`_holds_prologue`), else XLA's program before the launch takes it. Score parameters no score hook reads
+    are none of the launch's: no operand, stream or load of them (an unread key bias's stream on tcgen05's
+    rows, whose issuer streams the keys and values alone, was never released and hung the launch)."""
     hooks = Hooks() if hooks is None else hooks
+    if hooks.score_mod is None and hooks.score_params:
+        hooks = dataclasses.replace(hooks, score_params=())
     fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
     parts = product.EXACT_PARTS if fp32 else 1
     if hooks.query_mod is not None and (parts > 1 or power_of_two(query.shape[3]) != query.shape[3]):
@@ -1423,10 +1459,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         else:
             launches = [(dkv_family, config.dkv, _dkv_allocations(
                 dkv_family, config.dkv, width, value_width, dtype, stages=q_stages, columns=config.columns,
-                tiled=Kind.TILE in self.score_kinds), True)]
+                tiled=Kind.TILE in self.score_kinds, params=self.score_types), True)]
         if not config.fused:
             launches.append((family, config, _dq_allocations(family, config, width, value_width, dtype,
-                                                             min(config.stages, padded_k // config.block_k)),
+                                                             min(config.stages, padded_k // config.block_k),
+                                                             params=self.score_types),
                              True))
         # The fused launch's warpgroups reserve fp16's running scale's reduction scratch too, as it launches
         # (`reducing`'s `scaled`: `_fused_launch`'s and `_coop_launch`'s).
