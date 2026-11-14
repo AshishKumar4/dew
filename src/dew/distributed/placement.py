@@ -20,7 +20,7 @@ from flax import linen as nn
 from jax.experimental import mesh_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
-from dew._devices import device_limit
+from dew._devices import device_memory
 from dew.batch import FROZEN, Variables, unboxed
 from dew.mesh import (
     DATA_AXIS,
@@ -388,7 +388,7 @@ class Validation:
     by the device's id."""
     capacity: dict[int, int]
     """The bytes each device has, by its id, as its allocator or its stated memory gives them
-    (`dew._devices.device_limit`); a device that states none, such as a CPU, is absent."""
+    (`dew._devices.device_memory`); a device that states none, such as a CPU, is absent."""
     batch_axes: tuple[str, ...]
     """The mesh axes a batch's rows split over (`batch_axes`)."""
     collectives: dict[str, tuple[str, ...]]
@@ -705,7 +705,7 @@ class Layout:
         none of a device's memory. Rules naming an axis `mesh` lacks raise ValueError here, as
         `shardings` refuses them.
 
-        Each device of `mesh` gives the bytes an allocation fails against (`dew._devices.device_limit`):
+        Each device of `mesh` gives the bytes an allocation fails against (`dew._devices.device_memory`):
         its allocator's limit where it is this process's own, under whatever memory fraction the process
         set, and a compile-only GPU's derived from the memory stated for it, so a state is checked for
         GPUs on a host that holds none (`dew.training.ahead.compile_only_gpus`). A CPU device states
@@ -747,7 +747,7 @@ class Layout:
             for device in ids:
                 device_bytes[device] += size
         limits = {device.id: limit for device in mesh.local_devices
-                  if (limit := device_limit(device)) is not None}
+                  if (limit := device_memory(device).get("bytes_limit")) is not None}
         _refuse_overfull(held, device_bytes, limits)
         with nn.logical_axis_rules(self.axis_rules):
             rows = batch_axes(mesh)

@@ -205,6 +205,24 @@ def holding(spec: MeshSpec, limit: int):
     return spec.build(compile_only_gpus("sm90", 8, memory_limited_to(limit)))
 
 
+def test_cpu_devices_standing_in_for_gpus_hold_a_layout_to_the_memory_stated_for_them():
+    """Where JAX's CUDA plugin does not install, a host's CPU devices stand in for the GPUs a run is checked
+    for (`stand_in_gpus`): `validate` holds the state each keeps between steps to the allocator limit their
+    stated memory gives, refusing one byte under it and passing at it, and the CPU devices state nothing
+    once the block ends."""
+    from dew._devices import device_memory
+    from dew.training.ahead import stand_in_gpus
+
+    cpus = jax.devices("cpu")[:2]
+    layout = Layout(min_shard=1, tolerance=1.0)
+    whole = max(fine_tune(MeshSpec(fsdp=2).build(cpus), layout).validate(step_batch()).device_bytes.values())
+    with stand_in_gpus(cpus, memory_limited_to(whole - 1)) as gpus, pytest.raises(LayoutRefused):
+        fine_tune(MeshSpec(fsdp=2).build(gpus), layout).validate(step_batch())
+    with stand_in_gpus(cpus, memory_limited_to(whole)) as gpus:
+        fine_tune(MeshSpec(fsdp=2).build(gpus), layout).validate(step_batch())
+    assert device_memory(cpus[0]) == {}
+
+
 def test_a_gpu_step_over_fsdp_combines_its_parameter_gathers_a_layer_at_a_time():
     """A step over fsdp 2 on compile-only H100s, three decoder layers of 3.5M parameters computed in bf16
     over fp32 ones, under the step's options (`step_compiler_options`, its gathers combined up to its
