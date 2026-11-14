@@ -198,8 +198,10 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
 
 
 @lowers("sm90")
-@pytest.mark.parametrize(("block_m", "block_n"), [(128, 128), (64, 128)])
-def test_a_pingpong_tile_compiles_within_its_resources_as_its_register_model_prices_it(block_m, block_n):
+@pytest.mark.parametrize(("block_m", "block_n", "cluster"), [(128, 128, 1), (64, 128, 1), (128, 128, 2),
+                                                          (64, 256, 2)])
+def test_a_pingpong_tile_compiles_within_its_resources_as_its_register_model_prices_it(block_m, block_n,
+                                                                                       cluster):
     """A Hopper GEMM pinned to a ping-pong tile (`Tiles.pingpong`: two consumers each holding a whole
     tile's accumulators, their products in turn), legal at a consumer's 64 rows (its granularity whole roles
     of the rows one consumer holds, `Tiles.sharing`), its forward and its input gradient, grouped and dense,
@@ -210,7 +212,8 @@ def test_a_pingpong_tile_compiles_within_its_resources_as_its_register_model_pri
     from dew.nn.kernels.templates.gemm import mosaic_gpu
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    tile = mosaic_gpu.Tiles(block_m, block_n, 64, 3, 1, warpgroups=2, family='wgmma', pingpong=True)
+    tile = mosaic_gpu.Tiles(block_m, block_n, 64, 3, 1, warpgroups=2, cluster=cluster, family='wgmma',
+                            pingpong=True)
     launch = grouped_matmul.MosaicGmm()
     sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
     one = jax.ShapeDtypeStruct((1,), jnp.int32)
