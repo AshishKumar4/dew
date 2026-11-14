@@ -352,14 +352,22 @@ def held_seconds() -> float:
 def planned(name: str, nodes: list[str], seconds: list[float], count: int,
             stored: Mapping[str, list[str]] | None = None) -> list[list[str]]:
     """Test file `name`'s recorded `nodes` as the plan's `count` groups: its stored cut where it holds them
-    (`stored_bounds`) and each group's recorded `seconds` stay within `held_seconds`, else cut by their
-    `seconds` (`cut`), as cuts.py's `weighed` weighs it."""
+    (`stored_bounds`) and its groups hold by their recorded `seconds` (`holds`, within `held_seconds`), else
+    cut by their `seconds` (`cut`), as cuts.py's `weighed` weighs it."""
     bounds = stored_bounds(name, count, stored)
     if bounds is not None:
-        groups, weight = cut_by(nodes, bounds), dict(zip(nodes, seconds, strict=True))
-        if max(sum(weight[node] for node in group) for group in groups) <= held_seconds():
+        groups = cut_by(nodes, bounds)
+        if holds(groups, dict(zip(nodes, seconds, strict=True)), held_seconds()):
             return groups
     return cut(nodes, seconds, count)
+
+
+def holds(groups: list[list[str]], weight: Mapping[str, float], limit: float) -> bool:
+    """Whether a cut's `groups` (node ids, each test's `weight` in seconds) each weigh within `limit` or are
+    one unit (`units`): a test heavier than the bound runs alone however its file is cut, so the group that
+    holds it alone keeps its cut (the plan's `planned`, ci.py's `stored_weights`, the fold's cuts.py
+    `rebalanced` alike)."""
+    return all(sum(weight[node] for node in group) <= limit or len(units(group)) == 1 for group in groups)
 
 
 @functools.cache

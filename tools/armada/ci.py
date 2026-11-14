@@ -726,11 +726,14 @@ def recorded_tests() -> dict[str, list[float]]:
 
 
 def stored_weights() -> dict[str, list[float]]:
-    """Each split file's stored cut (`session.CUTS`) as its groups' recorded seconds (`own_tests`), which the
-    plan keeps while they hold (`cuts.weighed`)."""
-    stored, parted = session.stored_cuts(), parted_record()
-    return {name: [sum(own[node] for node in group) for group in session.cut_by(list(own), bounds)]
-            for name, bounds in stored.items() if (own := own_tests(name, parted.get(name, {})))}
+    """Each split file's stored cut (`session.CUTS`) that still holds its recorded tests (`own_tests`,
+    `session.holds`) as its groups' recorded seconds, which the plan runs it as (`cuts.weighed`)."""
+    stored, parted, held = session.stored_cuts(), parted_record(), {}
+    for name, bounds in stored.items():
+        if (own := own_tests(name, parted.get(name, {}))) and session.holds(
+                groups := session.cut_by(list(own), bounds), own, session.held_seconds()):
+            held[name] = [sum(own[node] for node in group) for group in groups]
+    return held
 
 
 def parted_record(path: Path = session.DURATIONS) -> dict[str, dict[str, float]]:
