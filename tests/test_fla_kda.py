@@ -14,7 +14,7 @@ import fla_gdn_support as support
 import jax
 import jax.numpy as jnp
 import pytest
-from delta_rule_support import math, plain_prefix, recurrence, through
+from delta_rule_support import fla_math, math, recurrence, through
 from reference_error import assert_as_exact
 
 from dew.nn.kernels.recurrence_chunk import fla_rule
@@ -27,12 +27,6 @@ ON_A_GPU = pytest.mark.skipif(
     reason="on a GPU the port's fp32 products are BF16x6 (fla's own one TF32), held to fla's own distance "
            "from float64 (test_fla_gdn.the_port_is_as_exact_as_fla, a cell of tests/test_gpu_recurrence.py); "
            "interpreted, they are exact")
-
-
-def fla_math(q, k, v, g, beta, h0):
-    """The portable rule on fla's plain prefix (`plain_prefix`): a float32 sample of the formula the
-    port runs, which it is held to on the host, where fla does not run."""
-    return math(q, k, v, plain_prefix(g), beta, h0)
 
 
 SEEDS = {(1, 2, 64, 64, 128): 8, (2, 2, 64, 64, 100): 8, (1, 1, 32, 96, 70): 32,

@@ -205,10 +205,6 @@
    "comparisons": 9,
    "lane": "Training"
   },
-  "tests/test_fla_gdn.py": {
-   "comparisons": 19,
-   "lane": "Recurrence & Dory"
-  },
   "tests/test_flaxdiff.py": {
    "comparisons": 6,
    "lane": "Models, Serving & RL"
