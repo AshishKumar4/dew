@@ -2102,8 +2102,10 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base_and_shows
         ran = subprocess.run(["bash", "-c", script], cwd=checkout, capture_output=True, text=True, timeout=60,
                              env=environment)
         assert ran.returncode == (1 if red else 0), ran.stdout + ran.stderr
-        if red:
-            assert f"{red}: exit 1" in ran.stdout and "  | ==src/a.py:[1:8]" in ran.stdout, ran.stdout
+        # The last gate's line, and under it, when red, what it printed.
+        assert ran.stdout.splitlines()[-3 if red else -1:] == (
+            [f"{red}: exit 1 in 1 s", "  | ==src/a.py:[1:8]", "  | ==src/b.py:[3:10]"] if red
+            else [f"{gates[-1]}: exit 0 in 1 s"]), ran.stdout
         assert (tmp_path / "items").read_text().split() == gates
         words = (tmp_path / "words").read_text().split()
         assert words[:2] == ["map", f"--commit={'a' * 40}"] and words[-2:] == [base, "{item}"]
