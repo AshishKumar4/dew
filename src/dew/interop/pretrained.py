@@ -1313,12 +1313,14 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
         sources.SourceReference(checkpoint, None if os.path.isdir(checkpoint) else directory.name),
         directory, None, None,
         lambda values: place(values, mesh, layout) if streaming else values, dtype=dtype,
-        attention_impl=attention_impl, param_dtype=param_dtype, streaming=streaming, size=size,
+        attention_impl=attention_impl, param_dtype=param_dtype, streaming=streaming or not weights, size=size,
         variables=variables, text=text, weights=weights)
     if loaded is None:
         raise ValueError(f"{checkpoint} is not a diffusion pipeline: it has no model_index.json, or its "
                          "config.json names the model it is")
-    return _published(loaded, checkpoint, selected=False)
+    # Without its weights, their shapes alone, as `Pretrained.load`'s (`_resident`).
+    return _published(loaded if weights else _resident(loaded, weights=False, streaming=False, on_host=False),
+                      checkpoint, selected=False)
 
 
 def _published[K: Pretrained](loaded: K, name_or_dir: str | Path, *, selected: bool) -> K:
