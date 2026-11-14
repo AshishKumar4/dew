@@ -114,11 +114,12 @@ def refolded(session, stored: Mapping[str, list[str]], runs: Mapping[str, list[f
     """The stored cuts (session.CUTS) after main's CI ran each file as `runs` says (`ran`), every group within
     `KEPT` of `target`, setup and all: a file it ran as its stored cut keeps it; one it ran as another cut
     stores that cut, made from the record it was cut by (`before`: each file's own tests, node id to seconds).
-    A group past that cuts the file anew from the folded record (`after`), as `split` cuts a file it has no
-    cut for. Each group's first test is its boundary; a file run whole within its bound, or cut into a group
-    that holds none of its recorded tests, stores none; a file it did not run keeps its own. The fold is the
-    one place a cut changes (Main, 2026-11-13: a group's name means the same tests from run to run, so its
-    record is found again)."""
+    A group past that, in a file that ran as its stored cut, cuts its nearest groups again alone
+    (`rebalanced`); where none fit, or the file ran as another cut, the file is cut anew from the folded
+    record (`after`), as `split` cuts a file it has no cut for. Each group's first test is its boundary; a
+    file run whole within its bound, or cut into a group that holds none of its recorded tests, stores none; a
+    file it did not run keeps its own. The fold is the one place a cut changes (Main, 2026-11-13: a group's
+    name means the same tests from run to run, so its record is found again)."""
     kept = dict(stored)
     for name, seconds in runs.items():
         bounds = stored.get(name)
@@ -128,6 +129,12 @@ def refolded(session, stored: Mapping[str, list[str]], runs: Mapping[str, list[f
             own, count = before.get(name, {}), len(seconds)
         else:
             own = after.get(name, {})
+            # Its stored cut ran: only the outgrown groups' neighbourhoods are cut again (`rebalanced`).
+            local = (rebalanced(session, own, bounds, seconds, session.KEPT * target)
+                     if own and bounds is not None and len(bounds) + 1 == len(seconds) else None)
+            if local is not None:
+                kept[name] = local
+                continue
             units = session.unit_seconds(list(own), list(own.values()))
             count = len(split(session, units, sum(seconds), target, len(seconds))) if own else 1
         kept.pop(name, None)
@@ -136,6 +143,40 @@ def refolded(session, stored: Mapping[str, list[str]], runs: Mapping[str, list[f
             if all(groups):
                 kept[name] = [group[0] for group in groups[1:]]
     return kept
+
+
+def rebalanced(session, own: Mapping[str, float], bounds: list[str], measured: list[float],
+               limit: float) -> list[str] | None:
+    """Stored cut `bounds` of a file whose groups ran as `measured` (seconds, setup included), its record
+    `own` (node id to seconds), with each group past `limit` cut again together with its nearest groups alone,
+    as few as bring every group of them within it, its tests' seconds and their groups' setup shared: the
+    other groups keep their tests and so their names' records and compiled programs (2026-11-14: one group
+    past its bound re-cut test_recurrence_stability.py whole, 9 of 11 bounds moved, every group run cold).
+    None where no neighbourhood short of the whole file fits, which is then cut anew whole."""
+    nodes = sorted(own)
+    groups = session.cut_by(nodes, bounds)
+    weight = {node: own[node] for node in nodes}
+    setup = [max(ran - sum(weight[node] for node in group), 0.0)
+             for ran, group in zip(measured, groups, strict=True)]
+    for outgrown in [index for index, ran in enumerate(measured) if ran > limit]:
+        if (sum(weight[node] for node in groups[outgrown]) + setup[outgrown] <= limit
+                or len(session.units(groups[outgrown])) == 1):
+            continue  # an earlier neighbourhood's cut took it within its bound
+        for reach in range(1, len(groups)):
+            low, high = max(0, outgrown - reach), min(len(groups), outgrown + reach + 1)
+            if (low, high) == (0, len(groups)):
+                return None
+            tests = [node for group in groups[low:high] for node in group]
+            cut = session.cut(tests, [weight[node] for node in tests], high - low)
+            shared = sum(setup[low:high]) / (high - low)
+            # A group of one unit past the bound (a test heavier than it) runs alone however it is cut.
+            if all(cut) and all(sum(weight[node] for node in group) + shared <= limit
+                                or len(session.units(group)) == 1 for group in cut):
+                groups[low:high], setup[low:high] = cut, [shared] * (high - low)
+                break
+        else:
+            return None
+    return [group[0] for group in groups[1:]]
 
 
 def stale(session, own: dict[str, float], observed: dict[str, float], seconds: float, cut: int,
