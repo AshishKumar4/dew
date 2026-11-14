@@ -40,6 +40,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     stream_blocks,
     stream_tile,
     stream_views,
+    walk_stores,
 )
 
 
@@ -140,11 +141,20 @@ def _intra_merges(call: Call) -> bool:
     return any(resident(block) for block in _key_blocks(call, contracted=True))
 
 
+def _scan_zeroed(call: Call, scanned, keys: int) -> None:
+    """`scanned`'s `C` zero rows of each half, below the rows the scan writes (`_intra_prefix`), which its
+    shifts read and nothing writes again: once a program, before its walk. Stored every key block, they took
+    7% of a B200's Kimi Linear intra walk's cycles (an emulated B200's line map at 3fd15d5978b)."""
+    for half in (0, 1):
+        plgpu.store(scanned.at[half, pl.ds(0, call.chunk)], call.family.zeros((call.chunk, keys)),
+                    optimized=False)
+
+
 def _intra_prefix(call: Call, scanned, decays: jax.Array, keys: int) -> tuple:
-    """A key block's prefix halves (`algebra.scanned_prefix`) of its `decays` `[C, keys]`, staged in
-    `scanned` (each half's `C` zero rows, then its running pair, which the shifts read), left there at
-    rows `C` on and returned in the accumulator's layout. The scan's steps run in a row-major layout,
-    each thread's columns consecutive, whose transfers at any row offset touch every bank once: in the
+    """A key block's prefix halves (`algebra.scanned_prefix`) of its `decays` `[C, keys]`, staged in `scanned`
+    (each half's `C` zero rows, `_scan_zeroed`'s, then its running pair, which the shifts read), left there at
+    rows `C` on and returned in the accumulator's layout. The scan's steps run in a row-major layout, each
+    thread's columns consecutive, whose transfers at any row offset touch every bank once: in the
     accumulator's, a fragment's 8 rows `keys` words apart shared 8 banks (19.0M bank conflicts on loads in a
     GH200's Kimi Linear intra launch, M-JS-17); the decay laid in and the prefix out once each."""
     chunk = call.chunk
@@ -157,8 +167,6 @@ def _intra_prefix(call: Call, scanned, decays: jax.Array, keys: int) -> tuple:
                                    for half in (0, 1))
 
     mosaic.synced(call.interpret)
-    for half in (0, 1):
-        plgpu.store(half_at(half, pl.ds(0, chunk)), call.family.zeros((chunk, keys)), optimized=False)
     plgpu.store(half_at(0, pl.ds(chunk, chunk)), decays, optimized=False)
     mosaic.synced(call.interpret)
     stage(algebra.scanned_prefix(_rows_of(half_at(0, pl.ds(chunk, chunk)), keys), stage, chunk=chunk))
@@ -232,13 +240,18 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                                 else {}))
         lefts, raised, scanned = staging
         sums, prefixes = outs[:outputs], outs[outputs:]
+        # The prefix halves' stores left in flight through their own landings, each waited for by the next
+        # step's store of its half (`walk_stores`): stored and waited out each step, the stores' waits took
+        # 9% of a B200's Kimi Linear intra walk (an emulated B200's line map at 3fd15d5978b).
+        before_store = walk_stores(family, 2)
 
         def step(index, slots, carry, accumulators):
             slots.acquire_all()
             prefix = _intra_prefix(call, scanned, stream_tile(slots, "decays", gates).value(), keys)
-            for half, ref in zip(prefix if scored else (), prefixes, strict=True):
+            for i, (half, ref) in enumerate(zip(prefix if scored else (), prefixes, strict=True)):
+                before_store()
                 gates.store(ref, half, row, chunk, h * width + index * keys, keys, family=family,
-                            smem=landing["prefix"])
+                            smem=landing[f"prefix{i}"], wait=False)
 
             # The prefix separated once (`algebra.separated`) and staged where the scan left it, each
             # sub-chunk boundary's vectors read from it (`at_token`), not separated again at every read.
@@ -276,7 +289,8 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                            for name, total in zip(products, totals, strict=True))
             intra_sums_stored(call, products, masked, sums, landing, row=row, head=h)
 
-        return mosaic.Walk(views, step, steps=steps, sums=((chunk, chunk),) * outputs, read=read)
+        return mosaic.Walk(views, step, steps=steps, prologue=lambda: _scan_zeroed(call, scanned, keys),
+                           sums=((chunk, chunk),) * outputs, read=read)
 
     blocks = _intra_streamed(call, keys, queries=scored)
     formed = [dataclasses.replace(call.held, rows=call.rows) if name == "scores" else systems(call)
@@ -321,10 +335,12 @@ def _intra_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
     the first's operands of its products (`algebra.key_block_pairs`), every row set's rows gated down and the
     keys gated up, a `[C, keys]` tile a part each (`_pairing_operand`); the prefix scan's halves below as
     many zero rows (`algebra.scanned_prefix`'s shifts); and the stores' landings: the scores' square and a
-    block of the prefix halves where it forms the scores, the system's where it forms the system."""
+    block of each prefix half where it forms the scores (`walk_stores`), the system's where it forms the
+    system."""
     chunk = call.chunk
     landing = {**({"square": dataclasses.replace(call.held, rows=call.rows).landing(chunk, chunk),
-                   "prefix": call.gates.landing(chunk, keys)} if "scores" in products else {}),
+                   **{f"prefix{i}": call.gates.landing(chunk, keys) for i in (0, 1)}}
+                  if "scores" in products else {}),
                **({"system": systems(call).landing(chunk, chunk)} if "system" in products else {})}
     later = chunk // algebra.SUB - 1
     lefts = tuple(staging_tiles(_pairing_operand(call), *((chunk, keys),) * later) for _ in products)
