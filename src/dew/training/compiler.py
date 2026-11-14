@@ -387,6 +387,13 @@ class StepCompiler[L, E]:
         return dataclasses.replace(compiled, step=self.runner(stepping, planned.released(),
                                                               settings.device_mesh))
 
+    def taken_executables(self, executables: dict | None) -> None:
+        """The executables a plan elsewhere compiled (`FitSearch.compiled`: a later phase's off the loop,
+        `dew.training.ahead.LaterPlans`), which the next compile's search takes in place of compiling them
+        again; nothing where none."""
+        if executables:
+            self._executables = {**(self._executables or {}), **executables}
+
     def planned_unplaced(self, stepping: Stepping, state: TrainState, batch: Batch,
                          unplaced: int) -> None:
         """A fresh run's first step planned and compiled over `state`, its shapes, before the `unplaced`

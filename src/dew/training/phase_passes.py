@@ -132,6 +132,14 @@ class PhasePasses[L, E]:
             for holder in holders:
                 holder.objective = self.base
 
+    def apart(self, passes: int) -> PhasePasses[L, E]:
+        """These counts with their step at `passes` over an objective of its own: `base`'s copy at that
+        count, kept by no one else (`built` holds none of it), which a compile off the loop builds and
+        climbs its step's rungs on (`dew.training.ahead.LaterPlans`) while the loop's objectives stay as
+        they are."""
+        objective = self.base.substituted(_counted(self.base, passes))
+        return PhasePasses(objective, self.counts, passes, dict.fromkeys(self.counts, objective))
+
     def objective_for(self, passes: int | None) -> Objective[L, E]:
         """The run's objective (`base`, at the last phase's count) at `passes` (a phase's `count`, the
         step's `current`): a copy of it whose looped modules run that many passes, kept for every step of

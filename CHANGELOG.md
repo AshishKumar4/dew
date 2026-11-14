@@ -7,6 +7,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A run whose data phases run other steps (`phase_passes`) plans and compiles each later phase's step on a
+  thread of its own once its first step is dispatched, so the phase's boundary takes the executable
+  compiled off the loop and the GPUs no longer idle while it compiles. Its plan is still made at the
+  boundary, against the devices as they stand. The separate `dew train` process a configured run started
+  for this is removed, and so is `dew.registry.trusted_packages`, which only it read.
+
 - On a CPU every process sums a bias's gradient, a broadcast's transpose (`dew.nn.precision.spread`), in
   blocks of about the square root of its positions, each an fp32 product sum: about N / B + B roundings
   where XLA:CPU's reduction took N in order, and what check 1 measures; it was the suite's alone.
