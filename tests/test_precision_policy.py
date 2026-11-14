@@ -591,8 +591,9 @@ def division_edges() -> tuple[np.ndarray, np.ndarray]:
 def divides_as_ieee_division_at_its_edges():
     """`correctly_rounded_divide` over `division_edges`, compiled for this backend: each quotient of normal
     operands IEEE division's, bit for bit (NumPy's float64 quotient rounded once to float32, which rounds as
-    once: 53 >= 2 x 24 + 2), its overflows infinite and its subnormal quotients on their grid, ties to even;
-    and each quotient of a zero, subnormal, infinite or NaN operand the backend's own division."""
+    once: 53 >= 2 x 24 + 2), its overflows infinite and its subnormal quotients on their grid, ties to even,
+    over divisors given as arrays and as constants (which the backend's division approximates); and each
+    quotient of a zero, subnormal, infinite or NaN operand the backend's own division."""
     from dew.nn.precision import correctly_rounded_divide
 
     numerator, denominator = division_edges()
@@ -604,6 +605,46 @@ def divides_as_ieee_division_at_its_edges():
     np.testing.assert_array_equal(actual[normal].view(np.uint32), expected[normal].view(np.uint32))
     plain = np.asarray(jax.jit(jnp.divide)(numerator[~normal], denominator[~normal]))
     np.testing.assert_array_equal(actual[~normal], plain)
+    # A constant divisor, which XLA takes as a product by its rounded reciprocal (on a CPU and a GPU alike),
+    # so the first quotient is off and the correction and the last move decide: the edges' normal numerators
+    # over divisors just below a power of two, odd ones and the ones the callers divide by.
+    held = numerator[(np.abs(numerator) >= np.finfo(np.float32).tiny) & np.isfinite(numerator)]
+    for bits in (0x3FFFFFFF, 0x3F7FFFFF, 0x40400000, 0x42FE0000, 0x43E00000, 0x3F400000, 0x7F000000,
+                 0x00800000):
+        divisor = np.array(bits, np.uint32).view(np.float32)
+        divide = jax.jit(lambda values, divisor=divisor: correctly_rounded_divide(values, divisor))
+        quotient = np.asarray(divide(held))
+        with np.errstate(over="ignore", under="ignore"):
+            wanted = (held.astype(np.float64) / np.float64(divisor)).astype(np.float32)
+        np.testing.assert_array_equal(quotient.view(np.uint32), wanted.view(np.uint32), err_msg=hex(bits))
+
+
+APPROXIMATE = "--xla_backend_extra_options=-nvptx-prec-divf32=1"
+"""XLA:GPU's own fp32 division, approximate (`div.full`), which a run naming its backend options keeps
+(`dew._devices.divide_exactly`)."""
+
+
+def divides_as_ieee_division_on_an_approximate_divider():
+    """`divides_as_ieee_division_at_its_edges` in a process whose GPU divides fp32 approximately
+    (`APPROXIMATE`), so each first quotient is off and the correction and its last move decide every
+    result: there its plain division is off IEEE's somewhere, which the check would otherwise not show."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    flags = " ".join(filter(None, (os.environ.get("XLA_FLAGS"), APPROXIMATE)))
+    program = (
+        "import sys; sys.path.insert(0, sys.argv[1]); import jax, jax.numpy as jnp, numpy as np\n"
+        "import test_precision_policy as checks\n"
+        "rng = np.random.default_rng(0)\n"
+        "n, d = (rng.uniform(1e-4, 10, 1 << 20).astype(np.float32) for _ in range(2))\n"
+        "plain = np.asarray(jax.jit(jnp.divide)(n, d))\n"
+        "nearest = (n.astype(np.float64) / d.astype(np.float64)).astype(np.float32)\n"
+        "assert (plain != nearest).any(), 'this process divides as IEEE does'\n"
+        "checks.divides_as_ieee_division_at_its_edges()\n")
+    subprocess.run([sys.executable, "-c", program, str(Path(__file__).parent)],
+                   env={**os.environ, "XLA_FLAGS": flags}, check=True)
 
 
 def test_a_correctly_rounded_division_is_ieee_divisions_at_its_edges():
