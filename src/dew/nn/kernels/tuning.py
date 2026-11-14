@@ -820,6 +820,11 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
         # another of its target share no name of.
         if isinstance(parameter, jax.sharding.AbstractMesh):
             parameter = parameter.update(abstract_device=None)
+        if isinstance(parameter, jax.core.ShapedArray) and isinstance(parameter.sharding.mesh,
+                                                                      jax.sharding.AbstractMesh):
+            # An abstract value's mesh alike: its axes, which its sharding names, not its device's kind.
+            mesh = parameter.sharding.mesh.update(abstract_device=None)
+            parameter = parameter.update(sharding=parameter.sharding.update(mesh=mesh))
         return opaque(parameter_key(parameter))
 
     def constants(values) -> None:
@@ -839,14 +844,14 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
 
         def atom(value) -> Hashable:
             if isinstance(value, jax_core.Literal):
-                return "literal", str(value.aval), read(value.val)
+                return "literal", read(value.aval), read(value.val)
             return bound(value)
 
-        update("inputs", *((bound(var), str(var.aval)) for var in (*jaxpr.constvars, *jaxpr.invars)))
+        update("inputs", *((bound(var), read(var.aval)) for var in (*jaxpr.constvars, *jaxpr.invars)))
         for equation in jaxpr.eqns:
             context = equation.ctx
             update(equation.primitive.name, tuple(atom(value) for value in equation.invars),
-                   tuple((bound(var), str(var.aval)) for var in equation.outvars),
+                   tuple((bound(var), read(var.aval)) for var in equation.outvars),
                    # The configuration an equation evaluates and lowers under (a key's bits' construction).
                    read((context.compute_type, context.threefry_partitionable, context.xla_metadata)),
                    read(context.cur_abstract_mesh),

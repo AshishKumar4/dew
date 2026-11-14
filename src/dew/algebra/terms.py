@@ -40,6 +40,7 @@ from egglog.runtime import RuntimeExpr
 from jax._src import core as jax_core
 from jax._src.literals import TypedNdArray
 from jax.core import ShapedArray
+from jax.experimental.layout import Layout
 from jax.extend import core as jcore
 from jax.typing import DTypeLike
 
@@ -380,16 +381,17 @@ def parameter_key(value) -> Hashable:
     `program.structure`) and the kernel tuner (`dew.nn.kernels.tuning.program`) read: plain data, the same in
     every process, tagged with its kind. A number by its value whatever its Python or NumPy type (a float by
     its bits, so a NaN is one key and -0.0 another than 0.0); a sequence's parts, a named tuple's with its
-    type; a set's and a mapping's parts, ordered by their keys' printed forms (an order, never an identity);
-    a dtype by its name; an enumeration by its type and member; a dataclass by its type and fields; a mesh by
+    type; a set's and a mapping's parts, ordered by their keys' printed forms (an order, never an identity); a
+    dtype by its name; an enumeration by its type and member; a dataclass by its type and fields; a mesh by
     its devices, axes and axis types, an abstract one by its sizes, axes, axis types and device; a sharding by
-    its mesh, partitions, memory and logical device order; an array by its dtype, shape and bytes' digest; a
-    function by its module and name, a partial one with its bound arguments. Any other object is its type's
+    its mesh, partitions, memory and logical device order; an abstract value by its shape, dtype, weak type,
+    sharding, memory space, layout and the manual axes it varies over, reduces or leaves unreduced; a layout
+    by its dimension order, tiling and sub-byte element size; an array by its dtype, shape and bytes' digest;
+    a function by its module and name, a partial one with its bound arguments. Any other object is its type's
     name and the object itself, compared by its own equality, never by its printed form, which a key kept in
     another process cannot read (`opaque`); an object that cannot be hashed (JAX's `WrappedFun` of a
-    derivative rule, hashing an `Unhashable` tree) by its identity, held alive by the key (`_Identity`), so
-    it is equal to itself alone. `value` is any parameter JAX's primitives take, which share no
-    type."""
+    derivative rule, hashing an `Unhashable` tree) by its identity, held alive by the key (`_Identity`), so it
+    is equal to itself alone. `value` is any parameter JAX's primitives take, which share no type."""
     if value is None or isinstance(value, (bool, str)):
         return type(value).__name__, value
     if isinstance(value, (int, np.integer)):
@@ -407,6 +409,17 @@ def parameter_key(value) -> Hashable:
         _, array = held_bits(value)
         return ("array", str(value.dtype), array.shape, str(array.dtype),
                 hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
+    if isinstance(value, ShapedArray):
+        manual = value.manual_axis_type
+        return ("abstract", parameter_key(value.shape), parameter_key(value.dtype), value.weak_type,
+                parameter_key(value.sharding), parameter_key(value.memory_space), parameter_key(value.layout),
+                parameter_key((manual.varying, manual.unreduced, manual.reduced, manual.unreduced_kind)))
+    if value is Layout.AUTO:
+        # The layout XLA chooses, one singleton.
+        return "layout", "auto"
+    if isinstance(value, Layout):
+        return ("layout", parameter_key(value.major_to_minor), parameter_key(value.tiling),
+                value.sub_byte_element_size_in_bits)
     if isinstance(value, jax.sharding.Mesh):
         # An empty mesh (a jit's context outside any) holds no devices.
         devices = () if value.empty else value.device_ids

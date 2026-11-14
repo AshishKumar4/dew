@@ -929,9 +929,10 @@ def _parameter_pairs():
     """Equation parameters the algebra pass and the kernel tuner key (`terms.parameter_key`), as pairs of
     values each (equal, unequal) and the value as JAX holds it: two that print alike or key alike but differ
     (a mesh over the same devices in another order, a sharding of one mesh over its devices in another order;
-    two long arrays apart in an element their printed forms elide), and
+    two long arrays apart in an element their printed forms elide; two abstract values apart in a layout,
+    which their printed forms leave out), and
     two that are one parameter however they were built (an integer and NumPy's, a dtype and its scalar
-    type, two shardings, dimension numbers and precisions built apart)."""
+    type, two shardings, dimension numbers, precisions and abstract values built apart)."""
     from jax.sharding import AbstractMesh, AxisType, NamedSharding, PartitionSpec as P
 
     devices = jax.devices()[:4]
@@ -944,13 +945,19 @@ def _parameter_pairs():
                                              start_index_map=(0,))
     placed = NamedSharding(ordered, P("data"))
     permuted = NamedSharding(ordered, P("data"), _logical_device_ids=(3, 2, 1, 0))
-    unequal = [(ordered, reordered), (long, changed), (placed, permuted)]
+    from jax.core import ShapedArray
+    from jax.experimental.layout import Layout
+
+    laid = (ShapedArray((4, 8), jnp.float32), ShapedArray((4, 8), jnp.float32, layout=Layout((0, 1))))
+    unequal = [(ordered, reordered), (long, changed), (placed, permuted), laid]
     equal = [((1, 2), (np.int64(1), np.int64(2))), (np.dtype(jnp.bfloat16), jnp.dtype("bfloat16")),
              (NamedSharding(abstract, P("data", None)), NamedSharding(abstract, P("data", None))),
              (numbers, jax.lax.GatherDimensionNumbers(offset_dims=(1,), collapsed_slice_dims=(0,),
                                                       start_index_map=(0,))),
              (jax.lax.Precision.HIGHEST, jax.lax.Precision("highest")),
-             (jax.lax.DotAlgorithmPreset.BF16_BF16_F32, jax.lax.DotAlgorithmPreset.BF16_BF16_F32)]
+             (jax.lax.DotAlgorithmPreset.BF16_BF16_F32, jax.lax.DotAlgorithmPreset.BF16_BF16_F32),
+             (ShapedArray((4, 8), jnp.float32, sharding=NamedSharding(abstract, P("data", None))),
+              ShapedArray((4, 8), np.dtype("float32"), sharding=NamedSharding(abstract, P("data", None))))]
     return equal, unequal
 
 
