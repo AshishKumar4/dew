@@ -227,7 +227,13 @@ class BenchmarkConfig:
     generation: str | None = None
     """The CUDA generation `compile_ahead` compiles for (sm80, sm90)."""
     capacity_gib: int | None = None
-    """The GPU memory `compile_ahead` plans for, in GiB."""
+    """The GPU memory `compile_ahead` plans for, in GiB, a canonical GPU of `generation`'s: on any host."""
+    topology: str | None = None
+    """The serialized topology of the GPUs the run will see (a GPU node's $DEW_NODE_TOPOLOGY), which
+    `compile_ahead` compiles over in place of `capacity_gib`'s canonical GPU: its memory and
+    multiprocessors are the run's own, so the run takes the step as its own target
+    (`BuildTarget.held`; 2026-11-14: a canonical 96 GiB step was refused by every GH200 run's
+    96.4 GB, and the perf gate's head arms all broke)."""
 
 
 def build_cases(config: BenchmarkConfig) -> list[Case]:
@@ -595,12 +601,15 @@ def entered(within: str | None) -> contextlib.AbstractContextManager:
 
 def main(config: BenchmarkConfig) -> list[Row]:
     if config.compile_ahead is not None:
-        if config.generation is None or config.capacity_gib is None:
-            raise SystemExit("--compile-ahead names the GPU it compiles for: --generation and --capacity-gib")
+        if config.generation is None or (config.capacity_gib is None) == (config.topology is None):
+            raise SystemExit("--compile-ahead names the GPU it compiles for: --generation and one of "
+                             "--topology (the run's own GPUs) or --capacity-gib (a canonical one)")
         Path(config.compile_ahead).mkdir(parents=True, exist_ok=True)
         for case in build_cases(config):
             try:
-                ahead = ahead_of(case, config.generation, config.capacity_gib << 30, config.attention_impl)
+                ahead = ahead_of(case, config.generation,
+                                 None if config.capacity_gib is None else config.capacity_gib << 30,
+                                 config.attention_impl, topology=config.topology)
             except Unlowerable as refused:
                 print(f"{ahead_name(case)} ({case.architecture}): not compiled ahead: {refused}", flush=True)
                 continue
