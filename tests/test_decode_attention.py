@@ -16,6 +16,7 @@ from attention_oracle import attention_on_par, exact_attention, float64_weights
 from contract_support import normal_drawn
 from model_support import as_stepped
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_fp32_reduction_bound
+from sharded import assert_runs_per_shard
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_masks import with_key_lengths
@@ -598,21 +599,28 @@ def test_a_lone_query_whose_heads_do_not_group_is_refused_by_name():
                                      key_value_seq_lengths=jnp.asarray([4], jnp.int32))
 
 
+TENSOR_SPLIT_SEEDS = {2: 16, 1: FEWEST_SEEDS}
+"""The tensor-split lone query's declared seeds for check 1 by its key heads, sized by `seeds_for` on
+armada's CPUs (2026-11-14, size-da-split at 71ff803fca9)."""
+
+
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("kv_heads", [2, 1])
 def test_a_grouped_query_keeps_the_tensor_axis_split(kv_heads):
     """Over a tensor axis of two, a lone query of 8 heads over 2 key heads, or over 1 that the core
     repeats to the axis's 2 as each shard would hold it, is grouped per shard: each device's program
     does half the work of the call off the mesh, by XLA's own count on the reference path (no Pallas
-    call, whose work XLA does not count), and attends as that call does."""
-    from jax.sharding import NamedSharding, PartitionSpec
+    call, whose work XLA does not count), and attends on par with that call (check 1)."""
+    from jax.sharding import PartitionSpec
 
     from dew.training import MeshSpec
 
-    rng = np.random.default_rng(4)
     lengths = jnp.asarray([5, 32], jnp.int32)
-    query, key, value = (jnp.asarray(rng.normal(size=shape), jnp.float32)
-                         for shape in ((2, 1, 8, 32), (2, 32, kv_heads, 32), (2, 32, kv_heads, 32)))
+
+    def draw(seed):
+        rng = np.random.default_rng([4, seed])
+        return tuple(jnp.asarray(rng.normal(size=shape), jnp.float32)
+                     for shape in ((2, 1, 8, 32), (2, 32, kv_heads, 32), (2, 32, kv_heads, 32)))
 
     def attend(query, key, value):
         return scaled_dot_product_attention(query, key, value, implementation="reference",
@@ -622,16 +630,13 @@ def test_a_grouped_query_keeps_the_tensor_axis_split(kv_heads):
         analysis = compiled.cost_analysis()
         return (analysis[0] if isinstance(analysis, list) else analysis)["flops"]
 
-    whole = jax.jit(attend).lower(query, key, value).compile()
     mesh = MeshSpec(tensor=2).build(jax.devices()[:2])
-    with jax.set_mesh(mesh):
-        heads = NamedSharding(mesh, PartitionSpec(None, None, "tensor"))
-        placed = [jax.device_put(x, heads if x.shape[2] % 2 == 0 else NamedSharding(mesh, PartitionSpec()))
-                  for x in (query, key, value)]
-        compiled = jax.jit(attend).lower(*placed).compile()
-        split = compiled(*placed)
-    np.testing.assert_allclose(np.asarray(split), np.asarray(whole(query, key, value)), atol=1e-6, rtol=1e-6)
-    assert flops(compiled) <= 0.6 * flops(whole), (flops(compiled), flops(whole))
+    specs = [PartitionSpec(None, None, "tensor") if operand.shape[2] % 2 == 0 else PartitionSpec()
+             for operand in draw(0)]
+    split = assert_runs_per_shard(attend, draw, specs, mesh,
+                                  f"a lone query of 8 heads over {kv_heads} split over tensor",
+                                  seeds=TENSOR_SPLIT_SEEDS[kv_heads], truth_fn=attend)
+    assert flops(split) <= 0.6 * flops(jax.jit(attend).lower(*draw(0)).compile())
 
 
 @pytest.mark.mesh(devices=2)

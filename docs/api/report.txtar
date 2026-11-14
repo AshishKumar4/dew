@@ -111,6 +111,7 @@ class Keep(latest: int = 2, every: int | None = None, interval: datetime.timedel
 class Layout(rules: LogicalAxisRules | Mapping[str, MeshAxes] = (('vocab', ('fsdp', 'tensor')), ('mlp', 'tensor'), ('mlp', 'fsdp'), ('modulation', 'fsdp'), ('attention', 'tensor'), ('attention', 'fsdp'), ('linear', 'fsdp'), ('embed', 'fsdp'), ('head_dim', 'fsdp'), ('heads', ('fsdp', 'tensor')), ('kv', ('fsdp', 'tensor')), ('index', 'fsdp'), ('kvlora', 'fsdp'), ('qlora', 'fsdp'), ('output', 'fsdp'), ('exp', 'expert'), ('heads', 'tensor'), ('kv', 'tensor'), ('activation_batch', ('data', 'expert', 'fsdp')), ('activation_length', 'sequence'), ('activation_spread', ('sequence', 'tensor')), ('activation_spread', 'sequence'), ('activation_heads', 'tensor'), ('activation_kv', 'tensor'), ('activation_mlp', 'tensor'), ('activation_vocab', 'tensor'), ('pages', ('data', 'expert', 'fsdp')), ('activation_batch', ('data', 'expert')), ('activation_batch', 'data')), min_shard: int = 65536, tolerance: float = 0.02, host: tuple[str, ...] = (), host_parameters: tuple[str, ...] = (), frozen_whole: bool = False, stage_local: bool = True, data_axes: tuple[str, ...] = ()) -> None  [dew.distributed.placement]
   .axis_rules: property -> LogicalAxisRules
   .check(self, params: Variables, shardings: Placement[Variables], mesh: Mesh) -> None
+  .leaf_spec(self, mesh: Mesh | AbstractMesh, path, value) -> P
   .offloaded(self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]
   .shardings(self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]
   .validate(self, mesh: Mesh, state) -> Validation
@@ -196,7 +197,6 @@ class Objective()  [dew.objectives.base]
   .unfuse_head(self) -> str | None
   .validation_loss(self, variables: Variables, batch: Batch, step: Step) -> Loss | tuple[Loss, Aux[Effects]]
   .validation_loss_refusal: property -> str | None
-  .whole_head_table(self, variables: Variables) -> tuple[int, int] | None
   .with_gradients(stats: Loss, gradients, params: Variables) -> Loss  [staticmethod]
 class Observe(every: int, call: Callable[[TrainState], Any], values: list[tuple[int, Any]] = <factory>) -> None  [dew.training.observe]
   .at(self, step: int, state: TrainState) -> None
@@ -298,7 +298,6 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .unfuse_head(self) -> str | None
   .validation_loss(self, variables: Variables, batch: Batch, step: Step) -> Loss | tuple[Loss, Aux[Effects]]
   .validation_loss_refusal: property -> str | None
-  .whole_head_table(self, variables: Variables) -> tuple[int, int] | None
   .with_gradients(stats: Loss, gradients, params: Variables) -> Loss  [staticmethod]
 class TensorBoardTracker(directory: str | Path)  [dew.training.tracker]
   .artifact(self, value: Reported, step: int) -> None

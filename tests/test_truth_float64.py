@@ -8,7 +8,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from arm_arithmetic import float64_held, stored_as
-from reference_error import STAGES_LOG, NarrowTruth, as_given, assert_as_exact
+from check1_judge import STAGES_LOG
+from reference_error import NarrowTruth, as_given, assert_as_exact
 
 WEIGHT = np.random.default_rng(5430).normal(size=(64, 8)).astype(np.float32)
 """A parameter the arms close over, as a model's variables are."""

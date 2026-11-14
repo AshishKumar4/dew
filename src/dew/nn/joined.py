@@ -17,12 +17,13 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.core import meta
 
-from dew.nn.dense import Dense, _biased, _plain_dense, _promoted, intercepted
+from dew.nn.dense import Dense, _biased, _plain_dense, _promoted, _rounds_once, intercepted
 from dew.nn.precision import float32_dot_general
 
 from .kernels.generation import INHERENT, Choice, device_generation
-from .kernels.projections import per_shard, rows_split
+from .kernels.projections import kernel_path, mapped_shards
 from .kernels.selection import Kernel, Op, Requirement, select
+from .sharding import on_shards
 
 
 @dataclasses.dataclass(frozen=True)
@@ -171,19 +172,27 @@ def joined_dense(x: jax.Array, projections: Sequence[Dense], *, axis: int) -> ja
     dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
     kernels = tuple(kernel for _, kernel, _ in promoted)
 
+    biases = [bias for _, _, bias in promoted]
+    # Where a launch takes a device's rows' product (`projections.mapped_shards`), each device's rows are
+    # their own product, the kernels entering apart, each placed by the layout, and joined there, so each
+    # one's gradient is summed at its own shape; the bias is added past it, its gradient summed as a
+    # Dense's. A product its layer rounds once with an fp32 bias (`_rounds_once`) is XLA's widened one, as
+    # a Dense's is, and stays with the partitioner.
+    widened = first.use_bias and _rounds_once(first, inputs, kernels[0], flat(biases), flat(stored))
+    shards = None if widened else mapped_shards(inputs, kernels, tuple(map(kernel_path, projections)),
+                                                inputs.dtype, first.precision)
+
     def taken(product):
-        # One matrix product of the kernels side by side, as a Dense takes its own (`dense._biased`). On a
-        # mesh whose automatic axes split the rows alone, each device's rows are their own product, the
-        # kernels entering apart and joined there, so each one's gradient is summed at its own shape
-        # (`projections.per_shard`); the bias is added past it, its gradient summed as a Dense's.
+        # One matrix product of the kernels side by side, as a Dense takes its own (`dense._biased`).
         def joined(inputs, *held):
             return product(inputs, jnp.stack(held, axis=axis + 3).reshape(inputs.shape[-1], -1))
 
-        if rows_split(inputs) is not None:
-            return per_shard(joined, inputs, kernels)
-        return joined(inputs, *kernels)
+        if shards is None:
+            return joined(inputs, *kernels)
+        split, gathered = shards
+        return on_shards(joined, split, (inputs, *kernels), gathered=gathered)
 
-    y = _biased(first, inputs, kernels[0], dimensions, flat([bias for _, _, bias in promoted]),
-                lambda bias: bias, flat(stored), taken=taken)
+    y = _biased(first, inputs, kernels[0], dimensions, flat(biases), lambda bias: bias, flat(stored),
+                taken=taken)
     stacked = (len(kernels), kernels[0].shape[1]) if axis == -2 else (kernels[0].shape[1], len(kernels))
     return y.reshape(*y.shape[:-1], *stacked)

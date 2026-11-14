@@ -5,10 +5,12 @@ all its units in one process. Check 1 (tests/reference_error.py's `assert_as_exa
 witness of run options its outcomes; each reads and writes through `record_units` and `pooled_units` alone.
 """
 
+import functools
 import hashlib
 import json
 import os
 import pickle
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -25,6 +27,22 @@ class PoolRefused(AssertionError):
     def __init__(self, message: str, held: int = 0):
         super().__init__(message)
         self.held = held
+
+
+REACHED: list[tuple[str, object]] = []
+"""The sites the running test has reached as a map task, in order: each its label and what its verdict reads
+(`check1_judge.Verdict`), None for a site whose test judges its own units (`sharded`) or decides its verdict
+itself (`judged_in_its_body`). Written beside their records as the test's manifest once its call is done
+(`manifested`)."""
+
+
+@functools.cache
+def commit() -> str:
+    """The commit this checkout holds, read once a process: every record and manifest carries it, a judge
+    pooling a map task's records only where they are its own commit's, and a model flow's stored truths
+    are read only at it (`model_flows.stamp`)."""
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent, capture_output=True,
+                          text=True, check=True).stdout.strip()
 
 
 def drawing() -> bool:
@@ -58,7 +76,7 @@ def _file(site: str) -> str:
 
 
 def record_units(label: str, payload: Callable[[int, int], object], upto: int | None = None,
-                 phases: Callable[[], dict] | None = None, offset: int = 0) -> bool:
+                 phases: Callable[[], dict] | None = None, offset: int = 0, verdict: object = None) -> bool:
     """Where DRAWS names a range `start:stop`, `payload(start, stop)` written to RECORDS as the site's record
     of those units (pickled whole, then moved into place), and True; else False. With `upto`, the units
     the site takes at most (a check's own, reference_error's `conditioning`): the range is cut there, and a
@@ -71,10 +89,14 @@ def record_units(label: str, payload: Callable[[int, int], object], upto: int | 
     before any draw (Main, 2026-11-02: the map task's fixed cost measured before it is cut), and the
     seconds of each named phase within its units' (`phases`, read once they are done): what a task pays
     once inside its draws, whatever it draws, which the plan counts with its setup (a check-1 site's
-    `first` draw with the compiles within it, and its `weighing`; tools/armada/costs.py's `timed`)."""
+    `first` draw with the compiles within it, and its `weighing`; tools/armada/costs.py's `timed`). Each
+    record carries the commit it was drawn at (`commit`). The site is noted in the test's manifest
+    (REACHED) with `verdict`, what its judgement reads beside these units (a check-1 site's), whether or not
+    this task's range holds any of them."""
     span = os.environ.get(DRAWS)
     if not span:
         return False
+    REACHED.append((label, verdict))
     # The site's units sit at `offset` in the plan's (a weighed check's past its unweighted one's).
     start, stop = (max(int(part) - offset, 0) for part in span.split(":"))
     stop = stop if upto is None else min(stop, upto)
@@ -96,7 +118,8 @@ def record_units(label: str, payload: Callable[[int, int], object], upto: int | 
     path = Path(records) / f"{_file(site)}.{start}-{stop}.pkl"
     path.parent.mkdir(parents=True, exist_ok=True)
     _published(path.with_suffix(".seconds.json"), json.dumps(seconds).encode())
-    _published(path, pickle.dumps({"site": site, "start": start, "stop": stop, "payload": found}))
+    _published(path, pickle.dumps({"site": site, "start": start, "stop": stop, "commit": commit(),
+                                   "payload": found}))
     return True
 
 
@@ -126,15 +149,20 @@ def _published(path: Path, data: bytes) -> None:
 def pooled_units(label: str, units: int | None = None) -> list[tuple[int, int, object]] | None:
     """Where POOL names a directory, the site's records under it (`record_units`) as (start, stop, payload),
     in order, a range recorded twice read once: refused (PoolRefused) unless they hold every unit from 0
-    on, once, without a gap, to `units` where it is given. None where POOL is unset."""
+    on, once, without a gap, to `units` where it is given, each drawn at this judge's commit. None where POOL
+    is unset."""
     root = os.environ.get(POOL)
     if not root:
         return None
     site, found = site_id(label), {}
     for path in sorted(Path(root).rglob(f"{_file(site)}.*.pkl")):
         record = pickle.loads(path.read_bytes())
-        if record["site"] == site:
-            found.setdefault((record["start"], record["stop"]), record["payload"])
+        if record["site"] != site:
+            continue
+        if record["commit"] != commit():
+            raise PoolRefused(f"{label}: {path}, units {record['start']} to {record['stop']}, was drawn at "
+                              f"commit {record['commit']}; this judge runs {commit()}")
+        found.setdefault((record["start"], record["stop"]), record["payload"])
     held, pieces = 0, []
     for (start, stop), payload in sorted(found.items()):
         if start != held:
@@ -148,6 +176,55 @@ def pooled_units(label: str, units: int | None = None) -> list[tuple[int, int, o
         raise PoolRefused(f"{label}: the map tasks' records under {root} hold units 0 to {held} of {units}",
                           held)
     return pieces
+
+
+def judged_in_its_body(label: str) -> None:
+    """In a map task, the running test's note that its body decides site `label`'s verdict itself (a site
+    it expects to fail, under `pytest.raises`): the site is noted in its manifest as one whose test judges
+    it (REACHED, no verdict), so its judge runs the body (`check1_judge.judged_from_records`)."""
+    if drawing():
+        REACHED.append((label, None))
+
+
+def manifested(test: str) -> None:
+    """Where DRAWS names a range, the sites `test` reached as a map task (REACHED), written to RECORDS as its
+    manifest beside their records and then forgotten: its judge judges the test from them (`manifests`). A
+    test that reached none writes none."""
+    reached, REACHED[:] = list(REACHED), []
+    span = os.environ.get(DRAWS)
+    if not span or not reached:
+        return
+    named = f"{python()}::{test}"
+    path = Path(os.environ[RECORDS]) / f"{_file(named)}.manifest.{span.replace(':', '-')}.pkl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _published(path, pickle.dumps({"test": named, "commit": commit(), "sites": reached}))
+
+
+def manifests(test: str) -> list[tuple[str, object]] | None:
+    """Where POOL names a directory, the sites `test`'s map tasks reached, each its label and verdict
+    (`manifested`): the one list every map task's manifest holds, refused (PoolRefused) where two tasks
+    reached different sites or a manifest is another commit's. None where POOL is unset or no map task wrote
+    one."""
+    root = os.environ.get(POOL)
+    if not root:
+        return None
+    named, found = f"{python()}::{test}", []
+    for path in sorted(Path(root).rglob(f"{_file(named)}.manifest.*.pkl")):
+        held = pickle.loads(path.read_bytes())
+        if held["test"] != named:
+            continue
+        if held["commit"] != commit():
+            raise PoolRefused(f"{test}: its manifest {path} was written at commit {held['commit']}; this "
+                              f"judge runs {commit()}")
+        found.append((path, held["sites"]))
+    if not found:
+        return None
+    first, sites = found[0]
+    for path, other in found[1:]:
+        if other != sites:
+            raise PoolRefused(f"{test}: its map tasks reached different sites, {first} "
+                              f"{[label for label, _ in sites]} and {path} {[label for label, _ in other]}")
+    return sites
 
 
 class LaterUnits(AssertionError):

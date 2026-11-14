@@ -75,7 +75,15 @@ from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.fake_quant import fp4_codes, fp8_block_cast, fp8_blocks_on_host, fp8_codes, straight_through
+from dew.nn.fake_quant import (
+    E2M1_MAX,
+    E4M3_MAX,
+    fp4_codes,
+    fp8_block_cast,
+    fp8_blocks_on_host,
+    fp8_codes,
+    straight_through,
+)
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import accumulated, at_least_fp32, correctly_rounded_divide, float32_einsum
@@ -422,14 +430,14 @@ def rounding_growth(module: nn.Module, name: str | None, contraction: int, dtype
     if not math.isfinite(clip) or clip <= 0:
         raise ValueError(f"a weight calibration's clip is finite and positive, not {policy.calibration!r}")
     group = contraction if policy.tile_size is None else min(policy.tile_size, contraction)
-    bound, step = (127.5, 0.5) if policy.dtype == "int8" else (448.0, 2.0 ** -10)
+    bound, step = (127.5, 0.5) if policy.dtype == "int8" else (E4M3_MAX, 2.0 ** -10)
     tiny = math.sqrt(float(jnp.finfo(dtype).tiny))
 
     def growth(scale: float) -> float:
         if policy.dtype == "int8":
             grown = 1 + math.sqrt(group) * scale / 255
         else:
-            grown = 1 + 2 ** -4 + math.sqrt(group) * scale * 2 ** -10 / 448
+            grown = 1 + 2 ** -4 + math.sqrt(group) * scale * 2 ** -10 / E4M3_MAX
         # A scale Qwix takes as 1 (the docstring) can meet a value it rounds to nonzero.
         return max(grown, 2.0) if bound * tiny / scale > step else grown
 
@@ -749,10 +757,10 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
                 else declared(jnp.asarray(1, wide) / value))
 
     values = jax.lax.stop_gradient(x).astype(wide)
-    amax = declared(jnp.asarray(spec.scale, jnp.float32).astype(wide) * 448)
+    amax = declared(jnp.asarray(spec.scale, jnp.float32).astype(wide) * E4M3_MAX)
     safe = jnp.where(amax <= 2 ** -24, jnp.asarray(1, wide), amax)
     # torch's scalar/tensor reverse divide is reciprocal then multiply.
-    multiplier = declared(reciprocal(safe) * 448)
+    multiplier = declared(reciprocal(safe) * E4M3_MAX)
     scale = reciprocal(multiplier)
     # The composed GPU forward must round this product before the FP8 cast.
     quotients = jax.lax.optimization_barrier(values * multiplier)
@@ -775,9 +783,9 @@ def _cast(qwix: ModuleType, quotients: jax.Array, qtype: jax.typing.DTypeLike):
     along the last axis, which Qwix requires of it and a fixed range, always per tensor, leaves
     unread."""
     if qtype == jnp.float8_e4m3fn:
-        return qwix.quantize(fp8_codes(quotients), qtype, calibration_method="fixed,448")
+        return qwix.quantize(fp8_codes(quotients), qtype, calibration_method=f"fixed,{E4M3_MAX:g}")
     return qwix.quantize(fp4_codes(quotients), qtype, tiled_axes={quotients.ndim - 1: 16},
-                         calibration_method="fixed,6")
+                         calibration_method=f"fixed,{E2M1_MAX:g}")
 
 
 def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
@@ -810,7 +818,7 @@ def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     if spec.format == 'modelopt':
         return _modelopt_input_qdq(x, spec, qwix)
     largest = jnp.max(jnp.abs(groups), -1)
-    divisor = jnp.full(largest.shape, 6, jnp.float32)
+    divisor = jnp.full(largest.shape, E2M1_MAX, jnp.float32)
     # CT's local division must round before global scaling, including its bf16 cast.
     scale = jnp.asarray(
         rounded_operand(correctly_rounded_divide(largest.astype(jnp.float32), divisor), x.dtype), jnp.float32)
@@ -851,9 +859,9 @@ def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qwix: ModuleType) ->
     # At g=0 every effective scale falls below the 1e-5 guard and becomes 1;
     # a tiny positive stand-in keeps that result while avoiding 0/0 NaNs.
     global_scale = jnp.where(spec.scale > 0, spec.scale, 1e-12).astype(jnp.float32)
-    denominator = jnp.full(largest.shape, 6, jnp.float32) * global_scale
+    denominator = jnp.full(largest.shape, E2M1_MAX, jnp.float32) * global_scale
     normalized = largest * correctly_rounded_divide(jnp.ones_like(largest), denominator)
-    saturated = jnp.minimum(normalized, 448)
+    saturated = jnp.minimum(normalized, E4M3_MAX)
     scales = fp8_codes(saturated) * global_scale
     scales = jnp.where(scales >= 1e-5, scales, 1)
     spread = jnp.broadcast_to(scales[..., None], groups.shape).reshape(x.shape)

@@ -42,7 +42,7 @@ import dataclasses
 import math
 import types
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -305,6 +305,53 @@ def measured_links(links: Mapping[str, Link]) -> Iterator[Mapping[str, Link]]:
         _LINKS.reset(token)
 
 
+class Placing(Protocol):
+    """What a traced program's parameters are placed by (`dew.distributed.placement.Layout`), as a projection
+    mapped per shard reads it (`placing`): a leaf's spec on a mesh by its variables path, hashable by value,
+    so a program cached by what it traced under keys on it (`trace_context`)."""
+
+    def leaf_spec(self, mesh, path, value) -> jax.sharding.PartitionSpec: ...
+
+    def __hash__(self) -> int: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class Forward:
+    """The placement a forward-only trace's projections take their weights by (`Placing`): each whole,
+    gathered by the partitioner from wherever it lies as the map begins. A served or scored model
+    (`dew.inference`) traces under it (`FORWARD`): no gradient leaves its map, so where a weight came from
+    needs no reduce-scatter back to it, and no stored tree's path is read (a scanned stack's view, a
+    component applied to its own part, each sees other paths than the tree a loader placed)."""
+
+    def leaf_spec(self, mesh, path, value) -> jax.sharding.PartitionSpec:
+        """Every weight whole."""
+        del mesh, path, value
+        return jax.sharding.PartitionSpec()
+
+
+FORWARD = Forward()
+"""The one forward-only placement (`Forward`)."""
+
+
+@contextlib.contextmanager
+def placing(layout: Placing | None) -> Iterator[None]:
+    """Trace with `layout`, which a projection mapped per shard reads (`placed_layout`) to take its weight in
+    the map: a `dew.distributed.placement.Layout`, the one that places a trainer's parameters, each weight
+    taken where it places it, so its gradient leaves the map to that placement; or `FORWARD`, a served or
+    scored model's forward-only trace, each weight taken whole. None, as outside both, none: such a
+    projection stays with the partitioner (a reference arm traced inside a step opts out so). The trainer's
+    step and its evaluations trace under their layout (`Trainer._traced_on`, `Evaluator.scoring`), a server
+    and a scoring server under `FORWARD`; a program cached by what it traced under keys on it
+    (`trace_context`), and a call's identity states it (`dew._cache.PLACING`, a JAX user context)."""
+    with _cache.PLACING(new_value=layout):
+        yield
+
+
+def placed_layout() -> Placing | None:
+    """The layout traced under (`placing`), None outside one."""
+    return _cache.PLACING.value
+
+
 def spread_axes() -> tuple[str, ...]:
     """The axes of the links traced under (`measured_links`) that a projection spread over so far."""
     return tuple(sorted(axis for axis, link in _LINKS.get().items() if link.spread))
@@ -321,12 +368,13 @@ def spread_over(axes: Iterable[str]) -> None:
 
 def trace_context() -> tuple:
     """What a model reads from context as it traces, beside the mesh (which jax keys on itself): the
-    pipeline's microbatch count, the logical-axis rules and the measured links. A program cached by
-    its arguments' shapes is reused only under the same (`Objective.program`)."""
+    pipeline's microbatch count, the logical-axis rules, the measured links and the layout placing its
+    parameters (`placing`). A program cached by its arguments' shapes is reused only under the same
+    (`Objective.program`)."""
     schedule = _SCHEDULE.get()
     links = tuple(sorted((axis, link.bytes_per_second, link.flops_per_second)
                          for axis, link in _LINKS.get().items()))
-    return (None if schedule is None else schedule.count, axis_rules(), links)
+    return (None if schedule is None else schedule.count, axis_rules(), links, _cache.PLACING.value)
 
 
 def _spreads(axis: str, x: jax.Array, latent: int, tokens: float, *, padding: float = 0.0) -> bool:
@@ -459,16 +507,34 @@ def manual_map[**Arguments, Result](local: Callable[Arguments, Result], in_specs
 
 
 def on_shards(local: Callable, spec: jax.sharding.PartitionSpec, operands: Sequence[jax.Array | None],
-              whole: Collection[int] = (), out_specs=None):
+              whole: Collection[int] = (), out_specs=None, gathered: Mapping[int, jax.sharding.PartitionSpec]
+              = types.MappingProxyType({})):
     """`local(*operands)` on each shard (`manual_map`), each operand placed by its role: as `spec` along its
     leading dimensions (a token mask `[B, S]` beside activations `[B, S, D]`), whole on every shard where
     its index is in `whole` (a weight or a conv's taps, whose gradient the transpose sums over the
-    shards), or absent (None); the outputs placed as `out_specs`, `spec` unless given (row 1923: one
+    shards), where its parameter is placed (`gathered`, by index: a projection's weight where its layout
+    puts it, `dew.distributed.placement.Layout.leaf_spec`) and gathered whole in the map, so its gradient
+    leaves it summed over the shards and scattered back to that placement (the gather's transpose, a
+    reduce-scatter), or absent (None); the outputs placed as `out_specs`, `spec` unless given (row 1923: one
     builder of a kernel's per-shard specs from its operands' roles)."""
-    specs = tuple(None if operand is None else jax.sharding.PartitionSpec() if index in whole
+    specs = tuple(None if operand is None else gathered[index] if index in gathered
+                  else jax.sharding.PartitionSpec() if index in whole
                   else jax.sharding.PartitionSpec(*spec[:operand.ndim])
                   for index, operand in enumerate(operands))
-    return manual_map(local, specs, spec if out_specs is None else out_specs)(*operands)
+
+    def held(*operands):
+        return local(*(_gathered_whole(operand, gathered[index]) if index in gathered else operand
+                       for index, operand in enumerate(operands)))
+
+    return manual_map(held if gathered else local, specs, spec if out_specs is None else out_specs)(*operands)
+
+
+def _gathered_whole(operand: jax.Array, spec: jax.sharding.PartitionSpec) -> jax.Array:
+    """A shard of `operand`, placed by `spec`, gathered whole along each dimension `spec` splits."""
+    for axis, entry in enumerate(spec):
+        if names := mesh_axes(entry):
+            operand = jax.lax.all_gather(operand, names, axis=axis, tiled=True)
+    return operand
 
 
 def grouped_heads(shape: tuple[int, ...], groups: int) -> tuple[MeshAxes, MeshAxes]:

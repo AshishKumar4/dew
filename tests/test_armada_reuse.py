@@ -514,18 +514,22 @@ def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 2]
 
 
-def test_a_row_green_on_a_tree_is_reused_there_after_another_tree_ran_it_executing_another_set(
+def test_mains_own_run_of_a_row_is_found_behind_a_lanes_later_run_on_its_branch(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A row run green on a tree is reused when that tree is planned again, though a run of another tree came
-    after it and executed another set of inputs (a helper its test called there): the row's list keeps each
-    green run's executed set, and the plan keys this tree's inputs with its own set (2026-11-12: keyed with
-    the last run's set alone, train 781's CI kept 2 of 4,180 tasks, and a reach of a comment's change planned
-    7,161 rows)."""
+    """A row main's commit ran green, then a lane's branch ran executing another set of inputs (a helper its
+    test called there), which re-records the row: a tree on main again finds main's own run of it, named at
+    main's commit (`main_key`), and runs nothing (Main, 2026-11-14: a lane's later run hid main's record, and
+    a walk over each row's earlier sets dug it out at about seven reads a row). Off main, with no such name,
+    the row runs again."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    commit = {"head": "a" * 40}
+    monkeypatch.setattr(ci, "head_commit", lambda: commit["head"])
+    monkeypatch.setattr(ci, "mainline", lambda: "a" * 40)
     armada_task(ci, monkeypatch, verdict)
     test_a = tmp_path / "tests/test_a.py"
     main = test_a.read_text()
-    # Another tree: test_a calls a helper of its own, so its run executes a set this tree's never did.
+    # The lane's branch: test_a calls a helper of its own, so its run executes a set main's never did.
+    commit["head"] = "b" * 40
     helper = tmp_path / "tests/helper_other.py"
     helper.write_text("def value():\n    return 1\n")
     test_a.write_text("from helper_other import value\n"
@@ -533,18 +537,23 @@ def test_a_row_green_on_a_tree_is_reused_there_after_another_tree_ran_it_executi
     armada_task(ci, monkeypatch, verdict)
     helper.unlink()
     test_a.write_text(main)
+    commit["head"] = "c" * 40
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
     rows = armada_task(ci, monkeypatch, verdict)
     assert sorted((row["name"], row["exitCode"]) for row in rows) == [
         (f"3.12:tests/test_{name}.py", 0) for name in "abc"]
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [2, 1, 1]
+    # A tree off main (no main of its own to read): the lane's record alone, which it does not match.
+    monkeypatch.setattr(ci, "mainline", lambda: None)
+    assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
 
 
-def test_two_trees_alternating_each_reuse_their_rows_and_a_changed_unit_of_a_set_runs_its_row(
+def test_of_two_trees_the_one_that_ran_a_row_last_reuses_it_and_a_changed_unit_of_its_set_runs_it(
         ci, tmp_path, monkeypatch, cache_worker):
-    """Two trees whose runs of a row execute different sets, planned in turn, each reuse their own green rows
-    (main's and base's, a train's and a lane's); a unit of a recorded set changed in the tree runs the row
-    again: a set is a hit only where every input it names holds what it held."""
+    """Two trees whose runs of a row execute different sets, planned in turn: the tree that ran it last reuses
+    its row, the other runs it (no earlier set is looked up: Main, 2026-11-14), and a unit of the recorded set
+    changed in the tree runs the row again: a set is a hit only where every input it names holds what it
+    held."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     test_a = tmp_path / "tests/test_a.py"
     plain = test_a.read_text()
@@ -565,7 +574,8 @@ def test_two_trees_alternating_each_reuse_their_rows_and_a_changed_unit_of_a_set
         armada_task(ci, monkeypatch, verdict)
     for other in (False, True, False, True):
         tree(other=other)
-        assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"], other
+        assert planned() == (["tests/test_a.py tests/test_b.py tests/test_c.py"] if other
+                             else ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]), other
     # The other tree's helper changed in the unit test_a ran: its row runs, the rest reused.
     tree(other=True, body="def value():\n    return 2 - 1\n")
     assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]

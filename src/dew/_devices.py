@@ -27,6 +27,7 @@ from dew._builds import (
     runs_on,
 )
 from dew._pool import answered, cuda_driver, runs_on_gpu
+from dew._records import JSON
 
 _log = logging.getLogger(__name__)
 _late_policy_warned = False
@@ -222,13 +223,49 @@ FRACTIONS = ("XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION")
 """The environment variables JAX reads a GPU pool's share from, its current name first; it refuses a run
 that sets both (jaxlib's `xla_client.generate_pjrt_gpu_plugin_options`)."""
 
-POOL_NAMES = (*FRACTIONS, "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR")
-"""The environment variables a run names its GPU pool by."""
-
 DEW_SHARE, JAX_SHARE = 0.95, 0.75
 """The share of each GPU XLA's pool takes as Dew prepares a process (`preallocate_gpu_pool`), and as JAX
-takes it where a run names preallocation or the allocator without a fraction (docs.jax.dev,
-gpu_memory_allocation)."""
+takes it where nothing writes a fraction (docs.jax.dev, gpu_memory_allocation): a process whose backend
+opened before Dew prepared it."""
+
+WRITTEN = "DEW_POOL_WRITTEN"
+"""The environment variable naming the fraction Dew wrote and what wrote it (`write_share`), as `share:by`:
+`dew`, its own share, `sized`, lowered to leave the host's communicators room
+(`dew.communicators.sized_pool`), or `named`, the run's own (`dew.training.share_pool`). In the
+environment, so a process started from one Dew prepared (a data worker, a launcher's child) inherits it
+beside the fraction, which it states as what wrote it (`pool_statement`)."""
+
+
+def allocator() -> str:
+    """The GPU allocator this process's backend will take, as JAX reads it (`XLA_PYTHON_CLIENT_ALLOCATOR`):
+    `default` or `bfc`, XLA's own pool, or `platform`, which holds none."""
+    return os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "default").lower()
+
+
+def write_share(share: float, by: str) -> None:
+    """Write `share` as the pool's fraction this process's backend will read, and what wrote it
+    (`WRITTEN`)."""
+    os.environ[fraction_name()] = str(share)
+    os.environ[WRITTEN] = f"{share}:{by}"
+
+
+def pool_statement() -> dict[str, JSON]:
+    """The pool's share this process planned against and its source, which a plan records: `named`, a
+    fraction the run named; `dew` or `sized`, Dew's share written as Dew prepared the process
+    (`write_share`); `jax`, JAX's default, where the backend opened before anything wrote one; `platform`,
+    the platform's allocator, which holds no pool and no share; and a process without JAX's CUDA plugin
+    (a TPU's, a CPU's, ROCm's), whose devices hold no such share, its platform's name."""
+    if not cuda_plugin():
+        import jax
+
+        return {"share": None, "source": jax.default_backend()}
+    if allocator() == "platform":
+        return {"share": None, "source": "platform"}
+    named = next((os.environ[name] for name in FRACTIONS if name in os.environ), None)
+    if named is None:
+        return {"share": JAX_SHARE, "source": "jax"}
+    share, _, by = os.environ.get(WRITTEN, "").partition(":")
+    return {"share": float(named), "source": by if share == named else "named"}
 
 
 def fraction_name() -> str:
@@ -240,15 +277,19 @@ def fraction_name() -> str:
 def pool_share() -> float:
     """The share of each GPU XLA's allocator is limited to as this run names it, the limit a GPU's
     `bytes_limit` states (its memory times this, `CreateBFCAllocator`'s memory fraction): its fraction
-    where it names one (`fraction_name`); Dew's own where it names nothing, as a prepared training process
-    takes it (`preallocate_gpu_pool`); JAX's where it names preallocation or the allocator without one. A
-    compile for absent GPUs reads it for the prepared run that loads its program (`allocator_limit`): one
-    loaded where Dew did not prepare the process (a notebook's, at JAX's 75%) holds less, and its loader
-    refuses the program naming both limits (`dew.training.ahead.BuildTarget.differences`)."""
+    where it names one (`fraction_name`); Dew's own where it names none, as a prepared training process
+    takes it (`preallocate_gpu_pool`), its preallocation or allocator named or not. The platform's
+    allocator holds no pool, so no share, and is refused (`pool_statement` says so). A compile for absent
+    GPUs reads it for the prepared run that loads its program (`allocator_limit`): one loaded where Dew did
+    not prepare the process (a notebook's, at JAX's 75%) holds less, and its loader refuses the program
+    naming both limits (`dew.training.ahead.BuildTarget.differences`)."""
     named = os.environ.get(fraction_name())
     if named is not None:
         return float(named)
-    return JAX_SHARE if any(name in os.environ for name in POOL_NAMES) else DEW_SHARE
+    if allocator() == "platform":
+        raise ValueError("XLA_PYTHON_CLIENT_ALLOCATOR=platform holds no pool, so no plan has a limit to be "
+                         "made against: name XLA's own allocator, or a fraction")
+    return DEW_SHARE
 
 
 COMPILE_ONLY_MEMORY: dict = {}
@@ -287,19 +328,20 @@ def device_memory(device, arguments: int = 0) -> Mapping[str, int]:
 
 def pool_bound(*, cuda: bool) -> float | None:
     """The share of each GPU XLA's pool takes as this run names it (`pool_share`), which Dew may size it
-    below and never above (`dew.communicators`). None where the pool holds no fixed share: a process off
-    CUDA, a pool that grows (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) or another allocator than XLA's own
-    BFC pool."""
-    allocator = os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "default").lower()
-    growing = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "true").lower() in ("false", "0")
-    if not cuda or growing or allocator not in ("default", "bfc"):
+    below and never above (`dew.communicators`): a pool that grows (`XLA_PYTHON_CLIENT_PREALLOCATE=false`)
+    among them, which grows to that share, the room outside it its communicators and code take beside it as
+    a preallocated pool's. None where the pool holds no share: a process off CUDA, or another allocator than
+    XLA's own BFC pool."""
+    if not cuda or allocator() not in ("default", "bfc"):
         return None
     return pool_share()
 
 
 def preallocate_gpu_pool() -> None:
-    """Preallocate 95% of each GPU (`DEW_SHARE`) as XLA's pool for a training process,
-    unless the run named its pool (fraction, preallocation or allocator, `POOL_NAMES`).
+    """Hold XLA's pool to 95% of each GPU (`DEW_SHARE`) for a training process, preallocated, unless the
+    run named its fraction (`FRACTIONS`): a run that names its preallocation or its allocator alone keeps
+    them and is held to Dew's share, where JAX held a pool that grows to 75% (a GH200's plans were made
+    against 70.88 GiB of its 94.5, M-MC-4); under the platform's allocator, which holds no pool, nothing.
 
     A pool that grows takes a step's temporaries only in a new region from
     the part of its limit it has not taken (`dew.training.memory.placeable`),
@@ -310,13 +352,16 @@ def preallocate_gpu_pool() -> None:
     against 444 ms; gdn-one-path 99397ff40, runs/parity-*-gdn).
     JAX's default 75% holds less than that step's 71.8 GiB peak.
 
-    It is a training process's (`dew.training.prepare_process`, `dew train`), which owns its GPUs; a
-    Trainer fit in a process Dew did not prepare (a notebook, another program's) keeps JAX's 75%,
-    which its backend has already taken, and shares its GPU as that program chose."""
+    `import dew` writes it, the earliest point Dew runs and the only one before a notebook's first JAX
+    computation opens the backend (a key, a model's init): every process Dew is imported into first, a
+    notebook's and a training process's alike (`dew.training.prepare_process` and a Trainer's first run
+    ask again, idempotent). A process whose backend opened before `import dew` keeps the pool it took, JAX's
+    75%, its plans stating it (`pool_statement`) and its run saying once how to get Dew's
+    (`dew.training.runtime.pooled`)."""
     if backend_open():
         return
-    if cuda_plugin() and not any(name in os.environ for name in POOL_NAMES):
-        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(DEW_SHARE)
+    if cuda_plugin() and allocator() != "platform" and not any(name in os.environ for name in FRACTIONS):
+        write_share(DEW_SHARE, "dew")
 
 
 def cuda_builds() -> list[str]:

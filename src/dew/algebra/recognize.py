@@ -480,17 +480,23 @@ def _walked_back(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jcore.
     return found
 
 
-def _extras(index: fusion.Index, row: jcore.Var | Sequence[jcore.Var],
-            output: jcore.Var) -> list[jcore.Var] | None:
+def _extras(index: fusion.Index, row: jcore.Var | Sequence[jcore.Var], output: jcore.Var,
+            most: int) -> list[jcore.Var] | None:
     """The values beside `row` (one value, or several: attention's query, keys and values) the equations
     from it to `output` read: each a value of the body made from neither it nor constants alone (a weight,
-    a gate, a branch, a bias), in the order first read; None where `output` is not made from every one.
-    Made from a row is read as far as a candidate's operands lie from its results (twice `REACH`)."""
+    a gate, a branch, a bias), in the order first read; None where `output` is not made from every one, or
+    where it reads more than `most`, which no caller takes. Made from a row is read as far as a candidate's
+    operands lie from its results (twice `REACH`).
+
+    The walk back from `output` stops when it finds more than `most` extras: a caller refuses such a pair,
+    so the values the walk has not yet reached need no visit. A family walks every pair of an anchor's
+    operands and results (`_swiglus`), and where a result lies a layer past its operand (a convolution is
+    one equation), walking the pair whole crosses most of the layer (row 5524)."""
     rows = (row,) if isinstance(row, jcore.Var) else tuple(row)
     reached = [_forward(index, source, 2 * REACH) for source in rows]
     if not all(output in found for found in reached):
         return None
-    descendants = set().union(*reached)
+    descendants = reached[0] if len(reached) == 1 else set().union(*reached)
     extras: dict[jcore.Var, None] = {}
     seen, frontier = set(), [output]
     while frontier:
@@ -500,6 +506,8 @@ def _extras(index: fusion.Index, row: jcore.Var | Sequence[jcore.Var],
         seen.add(var)
         if var not in descendants and not _constant(index, var):
             extras[var] = None
+            if len(extras) > most:
+                return None
             continue
         place = index.producer.get(var)
         if place is not None:
@@ -567,8 +575,8 @@ def _norms(index: fusion.Index, place: int) -> Iterator[Candidate]:
         made = aval(output)
         if aval(row).shape != made.shape or not jnp.issubdtype(made.dtype, jnp.floating):
             continue
-        found = _extras(index, row, output)
-        if found is None or len(found) > 2:
+        found = _extras(index, row, output, most=2)
+        if found is None:
             continue
         width = aval(row).shape[-1]
         for extras in itertools.product(*(_chain(index, var) for var in found)):
@@ -645,7 +653,7 @@ def _swiglus(index: fusion.Index, place: int) -> Iterator[Candidate]:
     for (_, gate), (_, output) in itertools.product(gates, outputs):
         if aval(gate).shape != aval(output).shape:
             continue
-        extras = _extras(index, gate, output)
+        extras = _extras(index, gate, output, most=1)
         if extras is None or len(extras) != 1:
             continue
         ups = [var for var in _chain(index, extras[0]) if aval(var).shape == aval(gate).shape]
@@ -756,8 +764,8 @@ def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
         for _, output in farthest_first:
             if aval(output).shape != (*aval(q).shape[:-1], aval(v).shape[-1]):
                 continue
-            extras = _extras(index, (q, k, v), output)
-            if extras is None or len(extras) > 1:
+            extras = _extras(index, (q, k, v), output, most=1)
+            if extras is None:
                 continue
             logits_shape = (aval(q).shape[0], aval(q).shape[2], aval(q).shape[1], aval(k).shape[1])
             # A mask or bias beside them reads the logits as the call does, broadcast to their shape.

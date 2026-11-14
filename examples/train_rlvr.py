@@ -93,7 +93,7 @@ from dew.objectives.rl import (
 from dew.optim import OptimConfig
 from dew.rl.sandbox import ContainerRunner, ProcessRunner, Program, SandboxFleet, SandboxLimits, outputs_match
 from dew.sampling import Sampling
-from dew.training import Trainer
+from dew.training import Trainer, share_pool
 
 FEEDBACK_TOKENS = 32
 """The longest test report a failed attempt gets back, in ids."""
@@ -319,6 +319,9 @@ class Config:
     """vLLM's --gpu-memory-utilization, a fraction of the whole GPU; the trainer takes the rest."""
     sglang_memory: float = 0.8
     """SGLang's --mem-fraction-static, a fraction of the memory the trainer left free."""
+    trainer_memory: float = 0.75
+    """The trainer's pool, a fraction of the whole GPU, where vLLM or SGLang shares it (`share_pool`): Dew
+    holds 95% where it trains alone, which leaves an engine beside it no room."""
     seed: int = 0
     smoke: bool = False
     """Two updates of the committed tiny Qwen2 on CPU, native backend."""
@@ -535,6 +538,9 @@ def main(config: Config) -> dict:
     if config.smoke:
         config = replace(config, model=str(SMOKE_MODEL), backend="native", steps=2, prompts=2, groups=2,
                          prompt_tokens=56, new_tokens=8, tasks=8, window=1)
+    if config.backend in ("vllm", "sglang"):
+        # Before the first JAX computation opens the backend, which fixes the pool.
+        share_pool(config.trainer_memory)
     config.out.mkdir(parents=True, exist_ok=True)
     tokenizer = str(SMOKE_MODEL.parents[0] / "diffusion-gemma-workflow") if config.smoke else config.model
     width = rollout_width(config)

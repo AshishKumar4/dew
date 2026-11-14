@@ -19,7 +19,7 @@ import pytest
 
 from dew import communicators
 from dew._cache import package_digest
-from dew._devices import POOL_NAMES, pool_bound
+from dew._devices import FRACTIONS, WRITTEN, pool_bound
 from dew.communicators import Collectives, CommunicatorRoom, Needs
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
@@ -71,19 +71,87 @@ def test_the_pool_takes_at_most_the_runs_share_and_leaves_the_communicators_room
 @pytest.mark.parametrize(("named", "bound"), [
     ({}, 0.95), ({"XLA_PYTHON_CLIENT_MEM_FRACTION": "0.97"}, 0.97),
     ({"XLA_CLIENT_MEM_FRACTION": "0.5", "XLA_PYTHON_CLIENT_PREALLOCATE": "true"}, 0.5),
-    ({"XLA_PYTHON_CLIENT_PREALLOCATE": "true"}, 0.75), ({"XLA_PYTHON_CLIENT_ALLOCATOR": "bfc"}, 0.75),
-    ({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}, None), ({"XLA_PYTHON_CLIENT_ALLOCATOR": "platform"}, None)])
+    ({"XLA_PYTHON_CLIENT_PREALLOCATE": "true"}, 0.95), ({"XLA_PYTHON_CLIENT_ALLOCATOR": "bfc"}, 0.95),
+    ({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}, 0.95), ({"XLA_PYTHON_CLIENT_ALLOCATOR": "platform"}, None)])
 def test_one_owner_reads_the_pools_bound_from_how_the_run_named_it(named, bound, monkeypatch):
-    """The pool's upper bound, as the run names it: Dew's 95% where it names nothing, its fraction where it
-    names one under either of JAX's names, JAX's own 75% where it names preallocation or the allocator
-    without one, and none where it holds no fixed pool (a pool that grows, the platform's allocator), which
-    Dew neither sizes nor admits programs against."""
-    for name in POOL_NAMES:
+    """The pool's upper bound, as the run names it: its fraction where it names one under either of JAX's
+    names, Dew's 95% where it names none, its preallocation (a pool that grows to it among them) or its
+    allocator named or not, and none under the platform's allocator, which holds no pool, which Dew neither
+    sizes nor admits programs against."""
+    for name in (*FRACTIONS, "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR"):
         monkeypatch.delenv(name, raising=False)
     for name, value in named.items():
         monkeypatch.setenv(name, value)
     assert pool_bound(cuda=True) == bound
     assert pool_bound(cuda=False) is None
+
+
+POOL_SETTINGS = (*FRACTIONS, "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR", WRITTEN)
+"""The environment variables that name or record a process's pool, which each fresh process starts without."""
+
+POOLED = """
+import json, os, sys
+first = sys.argv[1]
+if first == "jax":
+    # JAX's backend opened before Dew is imported: a computation of its own.
+    import jax
+    jax.numpy.zeros(1).block_until_ready()
+import dew
+if first == "share":
+    # A run sharing its GPUs with another engine names the trainer's share before its first computation.
+    from dew.training import share_pool
+    share_pool(0.75)
+import jax
+from dew._devices import cuda_plugin
+from dew.training.planning import pool_record
+from dew.training.runtime import ready_process
+# A notebook's flow: a key made, which opens the backend, before any Trainer readies the process.
+jax.random.key(0)
+ready_process()
+print(json.dumps({"plugin": cuda_plugin(), "fraction": os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION"),
+                  "record": pool_record(jax.devices())}))
+"""
+
+
+@pytest.mark.parametrize(("named", "first", "fraction", "source"), [
+    ({}, "dew", "0.95", "dew"), ({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}, "dew", "0.95", "dew"),
+    ({"XLA_PYTHON_CLIENT_ALLOCATOR": "bfc"}, "dew", "0.95", "dew"),
+    ({"XLA_PYTHON_CLIENT_MEM_FRACTION": "0.6", "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}, "dew", "0.6",
+     "named"),
+    ({"XLA_PYTHON_CLIENT_ALLOCATOR": "platform"}, "dew", None, "platform"),
+    ({}, "share", "0.75", "named"), ({}, "jax", None, "jax")])
+def test_a_process_dew_is_imported_into_holds_its_pool_to_dews_share_unless_the_run_names_a_fraction(
+        named, first, fraction, source):
+    """A fresh process that imports Dew before its first JAX computation (a notebook's: a key made, which
+    opens the backend, before any Trainer) is held to Dew's 95%, its preallocation or its allocator named
+    or not, where JAX held a pool that grows to 75% (a GH200's plans against 70.88 GiB of its 94.5); a
+    fraction the run names is its own, in its environment or by `share_pool` before its first computation
+    (a GPU shared with an inference engine), and the platform's allocator holds none; one whose backend
+    opened before `import dew` keeps JAX's 75%, its plans recording it as JAX's. The plan records the share
+    and its source (`pool_record`)."""
+    env = {name: value for name, value in os.environ.items() if name not in POOL_SETTINGS}
+    done = subprocess.run([sys.executable, "-c", POOLED, first], capture_output=True, text=True, timeout=300,
+                          env={**env, **named, "JAX_PLATFORMS": "cpu"}, check=False)
+    assert done.returncode == 0, done.stderr[-2000:]
+    held = json.loads(done.stdout.strip().splitlines()[-1])
+    assert held["plugin"], "the CUDA plugin, which a fraction is written for, is installed"
+    assert held["fraction"] == (named.get("XLA_PYTHON_CLIENT_MEM_FRACTION") or fraction)
+    assert held["record"]["source"] == source
+    unwritten = {"jax": 0.75, "platform": None}
+    assert held["record"]["share"] == (float(fraction) if fraction else unwritten[source])
+
+
+def test_a_process_started_from_one_dew_prepared_states_its_inherited_share_as_dews():
+    """A process started from one whose pool Dew wrote (a data worker, a launcher's child) inherits the
+    fraction and what wrote it (`WRITTEN`), and records the share as Dew's, not as one its run named."""
+    env = {name: value for name, value in os.environ.items() if name not in POOL_SETTINGS}
+    parent = ("import subprocess, sys; import dew; print(subprocess.run([sys.executable, '-c', sys.argv[1], "
+              "'dew'], capture_output=True, text=True, check=True).stdout)")
+    done = subprocess.run([sys.executable, "-c", parent, POOLED], capture_output=True, text=True,
+                          timeout=300, env={**env, "JAX_PLATFORMS": "cpu"}, check=False)
+    assert done.returncode == 0, done.stderr[-2000:]
+    held = json.loads(done.stdout.strip().splitlines()[-1])
+    assert held["record"] == {"limit": None, "share": 0.95, "source": "dew"}
 
 
 def test_a_programs_communicators_are_charged_by_their_groups_exchanges_and_permute_pairs():

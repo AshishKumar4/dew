@@ -1850,8 +1850,7 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
     taken away runs no other file again (train 668: a module added to nn/backbones re-keyed 589 rows).
     A module of a name an import the file's run tried and failed looks for runs it again, as the import
     now finds it, and only it; so does a package of the name of a module it executed, which shadows it, and an
-    __init__.py added to a namespace package on the way to one; each taken away again returns the file to
-    inputs it ran green on, whose run is reused (the row keeps each green run's executed set); a top-level
+    __init__.py added to a namespace package on the way to one, and each taken away again; a top-level
     package added under src/, which may shadow any import, runs every file."""
     # src/pkg/space is a namespace package on the way to pkg.space.sub.used: its import executes no file.
     for name, source in {"src/pkg/__init__.py": "", "src/pkg/space/sub/__init__.py": "",
@@ -1886,15 +1885,15 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
                ("src/idle/new.py", "def value(): return 3\n", [1, 1]),
                ("src/other/extra.py", "def value(): return 4\n", [1, 1]),
                ("src/other/extra.py", None, [1, 1]),
-               # Taken away again, the tree is one the file ran green on: that run is reused.
-               ("src/other/optional.py", "VALUE = 1\n", [1, 2]), ("src/other/optional.py", None, [1, 2]),
-               ("src/other/lone/__init__.py", "def value(): return 5\n", [1, 3]),
-               ("src/other/lone/__init__.py", None, [1, 3]), ("tests/test_added.py", None, [1, 3]),
-               # test_lone's green run kept since its first, which ran in one process with test_uses,
-               # holds the package lookups that process made: they changed, it runs too, as a key reads
-               # what its run read.
-               ("src/pkg/space/__init__.py", "", [2, 4]), ("src/pkg/space/__init__.py", None, [2, 4]),
-               ("src/top/__init__.py", "", [3, 5])]
+               # Taken away again, the file runs again: a lookup keys these inputs with its last run's set
+               # alone, and no main of this checkout names an earlier run (`green_record`).
+               ("src/other/optional.py", "VALUE = 1\n", [1, 2]), ("src/other/optional.py", None, [1, 3]),
+               ("src/other/lone/__init__.py", "def value(): return 5\n", [1, 4]),
+               ("src/other/lone/__init__.py", None, [1, 5]), ("tests/test_added.py", None, [1, 5]),
+               # test_lone's last run was alone in its process, so its record holds none of test_uses'
+               # package lookups: only test_uses runs.
+               ("src/pkg/space/__init__.py", "", [2, 5]), ("src/pkg/space/__init__.py", None, [3, 5]),
+               ("src/top/__init__.py", "", [4, 6])]
     for path, source, runs in changes:
         if path and source is None:
             (tmp_path / path).unlink()
@@ -1912,10 +1911,10 @@ def test_a_tools_init_added_or_a_helper_of_a_shadowing_name_reruns_the_rows_whos
         ci, tmp_path, monkeypatch, cache_worker):
     """tools/ is a namespace package, which a test imports from (`from tools import x`): an __init__.py added
     to it, which runs on every such import and makes it a regular package, reruns each row that imported
-    from it (train 672's review: no row's key held tools' own lookup), and its removal returns the row to
-    inputs it ran green on, whose run is reused (the row keeps each green run's executed set); a helper
-    under tests/ of a module's name, which shadows it as tests/ leads sys.path, reruns each row that imported
-    that name, and one of another name reruns none."""
+    from it (train 672's review: no row's key held tools' own lookup), and so does its removal, as the row's
+    last run executed it and no main of this checkout names the run before (`green_record`); a helper under
+    tests/ of a module's name, which shadows it as tests/ leads sys.path, reruns each row that imported that
+    name, and one of another name reruns none."""
     (tmp_path / "tools").mkdir(exist_ok=True)
     (tmp_path / "tools/helper.py").write_text("def value(): return 1\n")
     written(tmp_path, {
@@ -1936,9 +1935,9 @@ def test_a_tools_init_added_or_a_helper_of_a_shadowing_name_reruns_the_rows_whos
         return len((tmp_path / "runs").read_text())
 
     assert run() == 1
-    for path, source, runs in (("tools/__init__.py", "", 2), ("tools/__init__.py", None, 2),
-                               ("tests/unrelated_helper.py", "VALUE = 1\n", 2),
-                               ("tests/json.py", "def dumps(value): return str(value)\n", 3)):
+    for path, source, runs in (("tools/__init__.py", "", 2), ("tools/__init__.py", None, 3),
+                               ("tests/unrelated_helper.py", "VALUE = 1\n", 3),
+                               ("tests/json.py", "def dumps(value): return str(value)\n", 4)):
         if source is None:
             (tmp_path / path).unlink()
         else:
@@ -2054,11 +2053,13 @@ def test_a_proven_push_runs_no_suite_though_its_stored_verdict_is_red(tmp_path):
     assert ran("main", "", "off", 0) and ran("fix/lane", "", "on", 1)
 
 
-def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path):
+def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base_and_shows_a_red_ones_findings(
+        tmp_path):
     """CI's lint job runs each gate of tools/check_gates on an armada container of its own, given the commit's
     merge-base with main as BASE, so the job lasts as long as its slowest gate rather than their sum on the
     runner (the maintainer, 2026-10-28: the lint job set trains' wall at 35-41 min); a train's gates start at
-    its priority."""
+    its priority. A red gate's last lines are in the job's log under its name, and the job fails (Main,
+    2026-11-14: base's duplicate-text red named no copy in its log)."""
     import yaml
 
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
@@ -2069,7 +2070,11 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
     # A checkout whose main moved on past its merge-base, as CI's (fetch-depth 0) holds it.
     checkout = tmp_path / "checkout"
     (checkout / "tools").mkdir(parents=True)
-    (checkout / "tools/check_gates").write_text((ROOT / "tools/check_gates").read_text())
+    # A blank line among the gates, as check_gates may hold: no item of armada's, and no gate's name moves.
+    gates_text = (ROOT / "tools/check_gates").read_text().replace("\n", "\n\n", 1)
+    (checkout / "tools/check_gates").write_text(gates_text)
+    (checkout / "tools/armada").mkdir()
+    (checkout / "tools/armada/gates_told.py").write_text((ROOT / "tools/armada/gates_told.py").read_text())
     git(checkout, "init", "-q", "-b", "main")
     git(checkout, "add", "-A")
     git(checkout, "commit", "-qm", "base")
@@ -2082,15 +2087,27 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
     git(checkout, "checkout", "-q", "head")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n')
+    # Each gate green but the one `RED` names, whose task printed its finding.
+    (bin_dir / "armada").write_text(
+        f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n'
+        f'python3 -c "import json, os, sys\n'
+        f'for i, g in enumerate(open(sys.argv[1]).read().splitlines()):\n'
+        f'    red = g == os.environ.get(\'RED\')\n'
+        f'    print(json.dumps({{\'index\': i, \'item\': g, \'exitCode\': int(red), \'seconds\': 1.0,'
+        f' \'tail\': \'==src/a.py:[1:8]\\\\n==src/b.py:[3:10]\' if red else \'\'}}))" {tmp_path}/items\n')
     (bin_dir / "armada").chmod(0o755)
-    for ref, priority in (("fix/lane", []), ("main", ["--priority=5"])):
+    for ref, priority, red in (("fix/lane", [], ""), ("main", ["--priority=5"], gates[-1])):
         script = step["run"].replace("${{ github.sha }}", "a" * 40).replace("${{ github.ref_name }}", ref)
-        environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref}
+        environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref,
+                       "RUNNER_TEMP": str(tmp_path), "RED": red}
         ran = subprocess.run(["bash", "-c", script], cwd=checkout, capture_output=True, text=True, timeout=60,
                              env=environment)
-        assert ran.returncode == 0, ran.stderr
-        assert (tmp_path / "items").read_text().split() == gates
+        assert ran.returncode == (1 if red else 0), ran.stdout + ran.stderr
+        # The last gate's line, and under it, when red, what it printed.
+        assert ran.stdout.splitlines()[-3 if red else -1:] == (
+            [f"{red}: exit 1 in 1 s", "  | ==src/a.py:[1:8]", "  | ==src/b.py:[3:10]"] if red
+            else [f"{gates[-1]}: exit 0 in 1 s"]), ran.stdout
+        assert (tmp_path / "items").read_text().splitlines() == gates
         words = (tmp_path / "words").read_text().split()
         assert words[:2] == ["map", f"--commit={'a' * 40}"] and words[-2:] == [base, "{item}"]
         assert [word for word in words if word.startswith("--priority")] == priority

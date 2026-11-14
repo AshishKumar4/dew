@@ -16,10 +16,8 @@ The timed operation is a donated AdamW update on next-token cross entropy.
 Compiler temporary bytes include activation and gradient workspaces. Device
 peak bytes are the allocator high-water mark for this fresh process, including
 initialization; they are not a pure activation-memory counter. The activation
-bytes are the residuals the loss's pullback keeps, each stored once, inputs and
-constants left out (`dew.training.footprint.residual_bytes`, what a run's fit
-search derives), before XLA scheduling and buffer reuse; the table's column
-counted each residual slot of `print_saved_residuals` on its own.
+bytes are the residuals the loss's pullback keeps, its arguments left out
+(`jax.ad_checkpoint.saved_residuals`), before XLA scheduling and buffer reuse.
 
 RTX 4080 16 GiB, driver 595.84, JAX/jaxlib 0.11.1, Flax 0.12.9, Optax
 0.2.8: default dimensions with --dtype bfloat16 (FP32 master weights),
@@ -49,6 +47,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from jax.ad_checkpoint import saved_residuals
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, Mixture
@@ -56,7 +55,6 @@ from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import mixers
 from dew.telemetry.benchmark import carried
-from dew.training.footprint import residual_bytes
 
 
 def main():
@@ -98,8 +96,9 @@ def main():
     def loss(variables, tokens):
         return objective.scalar_loss({"params": variables}, tokens, info)
 
-    activation_bytes = residual_bytes(loss, shapes, (jax.tree.map(
-        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), tokens),))
+    kept = saved_residuals(lambda variables: loss(variables, tokens)[0], shapes)
+    activation_bytes = sum(aval.size * aval.dtype.itemsize for aval, source in kept
+                           if not source.startswith("from the argument"))
 
     def step(params, opt_state, tokens):
         (value, _), grads = jax.value_and_grad(loss, has_aux=True)(params, tokens)

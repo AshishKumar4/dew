@@ -109,23 +109,6 @@ reader.close()
     assert reported == {"refused": "TOMLDecodeError", "cached": "cached bytes", "ids": list(range(8))}
 
 
-def test_a_models_quantization_imports_no_training():
-    """The model's quantization, which loading, adapters and serving read, imports nothing of
-    training: a checkpoint's input quantizer is the model's, and reading it starts no trainer,
-    runtime or checkpointer."""
-    script = r'''
-import json
-import sys
-from dew.quantization import InputQuantization, Quantization
-training = [name for name in sys.modules if name == "dew.training" or name.startswith("dew.training.")]
-print(json.dumps(sorted(training)))
-'''
-    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
-                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
-    assert run.returncode == 0, run.stderr
-    assert json.loads(run.stdout.splitlines()[-1]) == []
-
-
 @pytest.mark.parametrize("module", ["dew.config", "dew.training.budget"])
 def test_a_config_or_a_package_imports_no_trainer_until_a_run_trains(module):
     """A run's configuration reads its dataclasses' types and none of the trainer, which a run reads
@@ -181,6 +164,11 @@ FOREIGN |= {"dew.registry": (
     "dew.rl", "dew.decision", "dew._cli", "dew.config", "dew.checkpoints", "dew.diffusion", "dew.sampling",
     "dew.eval", "dew.lora", "dew.quantization", "dew.telemetry", "dew.io", "dew._cleanup", "dew.figures",
     "dew.optim")}
+# A model's quantization, which loading, adapters and serving read, starts no trainer; the conditioning inputs
+# read no release's storage, the encoders that bind a released checkpoint dew.interop's (row 5996).
+FOREIGN |= {"dew.quantization": ("dew.training",),
+            **dict.fromkeys(("dew.inputs.condition", "dew.inputs.diffusion", "dew.inputs.encoders",
+                             "dew.inputs.spec"), ("dew.interop",))}
 
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))

@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from fla_gdn_support import fla_prefix
 from float64_terms import float64_terms
 from reference_error import widened, with_gradients
 
@@ -485,17 +486,26 @@ def _per_document(block, cuts) -> list[np.ndarray]:
 
 
 def plain_prefix(g, chunk: int = CHUNKED):
-    """`g` re-cut from the port's plain fp32 prefix (`recurrence.cumulated`, fla's): each chunk
+    """`g` re-cut from the port's plain fp32 prefix (`recurrence.cumulated`, fla's, `fla_prefix`): each chunk
     of `chunk` tokens from the row's start summed, then scaled to base 2 (`fla_gdn.RCP_LN2`), each
     token's decay the difference of its prefix and the one before carried back to natural log. The
     portable rule, rebuilding the prefixes, then takes every range as the port does, the difference
     of two rounded base-2 prefixes. Its gradient passes to `g` unchanged."""
     batch, length = g.shape[:2]
     padded = jnp.pad(g, ((0, 0), (0, -length % chunk), *((0, 0),) * (g.ndim - 2)))
-    prefix = jnp.cumsum(padded.reshape(batch, -1, chunk, *g.shape[2:]), axis=2) * fla_gdn.RCP_LN2
+    prefix = fla_prefix(padded, chunk).reshape(batch, -1, chunk, *g.shape[2:])
     earlier = jnp.pad(prefix[:, :, :-1], ((0, 0), (0, 0), (1, 0), *((0, 0),) * (g.ndim - 2)))
     recut = ((prefix - earlier) / fla_gdn.RCP_LN2).reshape(padded.shape)[:, :length]
     return g + jax.lax.stop_gradient(recut - g)
+
+
+def fla_math(q, k, v, g, beta, h0, starts=None):
+    """The portable rule (`math`) on fla's plain prefix (`plain_prefix`): a float32 sample of the formula the
+    port runs, fla's arithmetic (its decay cumulated in base 2 in fp32 within each chunk), which check 1 holds
+    the port to on the host, where fla does not run. Its prefix chunks each row from the row's start, where
+    fla chunks a packed row's documents each from its own (`starts`): the same rounding, at most a chunk's
+    terms a sum, at other places."""
+    return math(q, k, v, plain_prefix(g), beta, h0, starts)
 
 
 def fused_step(token, held, taps, gate, beta, log_a, bias, z, weight, state, *, epsilon: float,

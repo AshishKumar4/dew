@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.fake_quant import E2M1_MAX, E4M3_MAX
 from dew.nn.kernels.templates.product import NVFP4
 from dew.nn.precision import correctly_rounded_divide
 
@@ -901,10 +902,11 @@ def nvfp4_coded(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     magnitude = jnp.abs(x)
     largest = jnp.max(magnitude)
     least_normal = np.float32(np.finfo(np.float32).tiny)
-    tensor = jnp.where(largest > 0, jnp.maximum(quotient(largest, np.float32(6 * 448)), least_normal),
+    tensor = jnp.where(largest > 0,
+                       jnp.maximum(quotient(largest, np.float32(E2M1_MAX * E4M3_MAX)), least_normal),
                        np.float32(1))
     blocks = jnp.max(magnitude.reshape(-1, NVFP4.depth, x.shape[-1]), axis=1)
-    ratio = quotient(quotient(blocks, tensor), np.float32(6))
+    ratio = quotient(quotient(blocks, tensor), np.float32(E2M1_MAX))
     nearest = encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3)
 
     def value(codes: jax.Array) -> jax.Array:

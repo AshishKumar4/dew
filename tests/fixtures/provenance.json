@@ -743,7 +743,7 @@
      "runs": "torch"
     }
    ],
-   "note": "torch's bf16 activation, product and backward; the gated product itself is act(gate) * up."
+   "note": "torch's bf16 activation, product and backward; the gated product itself is act(gate) * up, over drawn elements whose bf16 roundings clear the gate's MARGIN (selection_margins.rounding_margin), recorded in an isolated environment of torch 2.14.0's CPU build."
   },
   "gemma3n/blocks.npz": {
    "tool": "tools/hf_reference_b.py",
@@ -2420,16 +2420,6 @@
     }
    ],
    "note": "Actual wrapper on pre-merged inputs_embeds, not native image-grid positions."
-  },
-  "hf/qwen35-tiny/logits.npy": {
-   "tool": "tools/qwen_linear_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ]
   },
   "hf/mimo-audio-tiny": {
    "tool": "tools/mimo_reference.py",

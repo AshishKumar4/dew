@@ -200,20 +200,17 @@ def test_a_phased_runs_later_phases_are_named_from_the_first_batch_its_loop_read
 
 
 def test_a_phased_runs_later_phase_compiles_ahead_as_the_run_lowers_it_at_its_boundary(tmp_path):
-    """A run's later phases compile ahead (`LaterPhases`) through its record, trained again by `dew train`
-    with its target the phases after the first (`AheadTarget.phases`, `later_phases`, by the trainer's own
+    """A run's later phases compile ahead through its record, trained by `dew train` with its target the
+    phases after the first (`AheadTarget.phases`, `later_phases`, by the trainer's own
     key of each phase's batch), over its host's GPUs (here a serialized topology of eight compile-only
     H100s, as many as the run's row shards, so each reads its phases' rows as the run reads them),
     ending with status 0 and training nothing; and the step it compiles for the second phase is the
     program the run lowers at that phase's boundary: the run stopped inside its second phase, compiled
     ahead as its resume would step, lowers the same program, digest for digest."""
     from jax.experimental import topologies
-    from run_kinds import decision
 
-    from dew.config import RunConfig
     from dew.nn.kernels.generation import compile_only_gpus
-    from dew.nn.sharding import Link
-    from dew.training.ahead import AheadTarget, CompiledAhead, LaterPhases
+    from dew.training.ahead import AheadTarget, CompiledAhead
 
     topology = tmp_path / "topology.bin"
     host = compile_only_gpus("sm90", 8, 40 * 2**30)
@@ -234,16 +231,3 @@ def test_a_phased_runs_later_phase_compiles_ahead_as_the_run_lowers_it_at_its_bo
         trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 4,
                                                                          "compile_ahead": resumed_target})
     assert resumed.value.ahead.program == later.value.ahead.program
-
-    # A run whose data its record cannot rebuild (a stage built in Python) starts no process: the record
-    # would refuse to train (`RunConfig.unrecorded`). One its record rebuilds hands the process its own
-    # record, its target and its links stated, which `dew train` reads back (`LaterPhases.command`).
-    assert run(tmp_path, STEPS, data).unrecorded()
-    recordable = decision(tmp_path, drawn=False)
-    assert not recordable.unrecorded()
-    later = LaterPhases(recordable, ("run_kinds",))
-    links = {"tensor": Link(4.5e11, 9.9e14)}
-    record = later.recorded(phases_target, links, tmp_path / "later")
-    read = RunConfig.load(record, trust=later.trust)
-    assert read.trainer.compile_ahead == phases_target and read.trainer.links == links
-    assert later.command(record)[1:] == ("-m", "dew._cli.main", "train", record, "--trust", "run_kinds")
