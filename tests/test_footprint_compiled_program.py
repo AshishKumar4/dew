@@ -202,7 +202,7 @@ def test_a_pallas_kernel_holds_what_its_lowering_holds():
     whose workspace is live beside it, within what XLA's compile of it on a compile-only Hopper holds."""
     from jax.experimental import pallas as pl
 
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     (gpu,) = compile_only_gpus("sm90", 1, 1 << 30)
     workspace = gemm_workspace(gpu)
@@ -304,7 +304,7 @@ def test_a_compile_only_gpus_gemm_holds_the_workspace_its_deviceless_compile_giv
     xla/backends/gpu/autotuner/cublaslt.cc, resize the workspace), replacing the 32 MiB at Hopper that
     `GemmWorkspaceRewriteVisitor` (gemm_rewriter.cc) handed it: a compile-only GPU's matmul holds 4 MiB on
     either generation."""
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     (gpu,) = compile_only_gpus(generation, 1, 1 << 30)
     # A gradient larger than the product its operand is computed from, which that operand's fusion frees
@@ -329,7 +329,7 @@ def test_a_matmul_fused_with_its_loops_slice_keeps_the_workspace_its_rewrite_gav
     or a scan's turn of its stacked inputs, is fused with the slice, and the config assigner, which
     visits no fusion's computation, leaves it the workspace `GemmWorkspaceRewriteVisitor` gave it: 32 MiB
     at Hopper, 4 MiB before, where other matmuls hold the default config's 4 MiB."""
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     (gpu,) = compile_only_gpus(generation, 1, 1 << 30)
     table, rows = jax.ShapeDtypeStruct((256, 64), jnp.float32), jax.ShapeDtypeStruct((512, 64), jnp.float32)
@@ -359,7 +359,7 @@ def test_a_matmul_fused_with_its_loops_slice_keeps_the_workspace_its_rewrite_gav
 def test_a_compile_only_target_is_deviceless_and_lowers_for_cuda():
     """A compile-only GPU is no device of a running backend (`deviceless`) and JAX lowers for it as CUDA;
     a CPU of this process is a running backend's, lowered for as a CPU."""
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     (gpu,) = compile_only_gpus("sm90", 1, 1 << 30)
     cpu = jax.devices("cpu")[0]
@@ -466,7 +466,7 @@ def test_a_deviceless_matmul_holds_the_workspace_its_slice_fusion_decides(progra
     result's update (`DynamicSliceFusionRewriterV2`) keeps the rewriter's 32 MiB, and any other the
     default config's 4 MiB: the derivation charges each matmul of a program the workspace XLA's own
     compile gives it, slices fused and slices not alike."""
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     (gpu,) = compile_only_gpus("sm90", 1, 1 << 30)
     workspace = gemm_workspace(gpu)
@@ -579,7 +579,7 @@ def test_a_loops_carry_is_one_buffer_from_its_start_to_its_result(carried):
     a buffer of the loop's where that is an input, or another carry's start (copy insertion,
     xla/service/copy_insertion.cc): each loop holds its carries' buffers, the least it can, and no more
     than XLA's compile of it on a compile-only Hopper holds."""
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     (gpu,) = compile_only_gpus("sm90", 1, 1 << 30)
     program, least = CARRIES[carried]

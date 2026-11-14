@@ -708,7 +708,7 @@ class Layout:
         Each device of `mesh` gives the bytes an allocation fails against (`dew._devices.device_memory`):
         its allocator's limit where it is this process's own, under whatever memory fraction the process
         set, and a compile-only GPU's derived from the memory stated for it, so a state is checked for
-        GPUs on a host that holds none (`dew.training.ahead.compile_only_gpus`). A CPU device states
+        GPUs on a host that holds none (`dew.nn.kernels.generation.compile_only_gpus`). A CPU device states
         none, and is not checked.
 
         Raises `LayoutRefused`, naming the device and what it holds by field, when a device

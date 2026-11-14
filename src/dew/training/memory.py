@@ -414,8 +414,8 @@ def stated(memory: Sequence[Mapping[str, int]]) -> bool:
 def judged(device) -> bool:
     """Whether a step's footprint derived for `device` is judged against its memory (`derived_headroom`):
     where it states its memory (`device_memory`), which a CPU does not, and a device with none attached (a
-    compile-only GPU, `dew.training.ahead.compile_only_gpus`) where its memory was stated. The plan's walk
-    and the footprint's trace read this one answer (`FitSearch.walked`)."""
+    compile-only GPU, `dew.nn.kernels.generation.compile_only_gpus`) where its memory was stated. The plan's
+    walk and the footprint's trace read this one answer (`FitSearch.walked`)."""
     return stated([device_memory(device)])
 
 

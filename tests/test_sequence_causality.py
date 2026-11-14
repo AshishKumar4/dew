@@ -222,7 +222,7 @@ def test_a_walk_under_a_compile_only_mesh_evaluates_its_indices_on_this_host(nam
     (`programs.on_host`) and proves what it proves outside it."""
     import numpy as np
 
-    from dew.training.ahead import compile_only_gpus
+    from dew.nn.kernels.generation import compile_only_gpus
 
     function = {**ADMITTED, **REFUSED}[name]
     program = jax.make_jaxpr(function)(jnp.zeros((1, LENGTHS[0]), jnp.int32))

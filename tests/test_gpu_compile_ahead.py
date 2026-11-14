@@ -89,7 +89,8 @@ from token_support import token_rows
 
 from dew.data import Memory
 from dew.training import Inspection, MeshSpec
-from dew.training.ahead import compile_ahead, compile_only_gpus
+from dew.nn.kernels.generation import compile_only_gpus
+from dew.training.ahead import compile_ahead
 
 generation, path, multiprocessors, memory = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 target = MeshSpec().build(compile_only_gpus(generation, 1, memory, multiprocessors=multiprocessors))

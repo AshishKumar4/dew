@@ -131,7 +131,7 @@ import jax, jax.numpy as jnp
 from jax._src import monitoring
 from jax.sharding import NamedSharding, PartitionSpec
 from dew.nn.kernels import gemm, generation
-from dew.training.ahead import compile_only_gpus
+from dew.nn.kernels.generation import compile_only_gpus
 from dew.training.runtime import ready_process
 
 served = []

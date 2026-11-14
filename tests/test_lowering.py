@@ -1421,8 +1421,8 @@ def test_a_batchs_token_layout_split_over_its_tokens_compiles_no_loop_a_token():
     from dew.batch import coordinates, real_places
     from dew.decision.model import key_runs
     from dew.nn.inputs import counted_places, numbered_blocks
+    from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.visibility import block_ends
-    from dew.training.ahead import compile_only_gpus
 
     def layout(segments, valid):
         tokens = coordinates(segments=segments, valid=valid, max_segments=4)
