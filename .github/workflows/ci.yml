@@ -121,7 +121,7 @@ jobs:
         # log, where the land queue's page quotes it (Main, 2026-11-14: base e42ddc2bd's duplicate-text red named no
         # copy here; its locations were only in armada's task log).
         status=0
-        grep -v '^#' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
+        grep -v -e '^#' -e '^$' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
           $priority --cpu="$cpus" --label="lint-$GITHUB_REF_NAME" --json -- \
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
           sh "$base" '{item}' > "$RUNNER_TEMP/lint.jsonl" || status=$?

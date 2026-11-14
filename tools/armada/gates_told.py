@@ -1,8 +1,8 @@
-"""gates_told.py OUTCOMES: CI's lint job's gates (tools/check_gates' names, in order, which `armada map
---json` ran one a task and wrote OUTCOMES of, indexed by that order) said one a line, each with its exit and
-seconds, and under a red one the last `SHOWN` lines of what it printed, so a gate's findings are in the job's
-log, where the land queue quotes them. Exits 1 where a gate is red or has no outcome, 0 where every one is
-green."""
+"""gates_told.py OUTCOMES: CI's lint job's gates (tools/check_gates' names, which `armada map --json` ran one
+a task and wrote OUTCOMES of, each naming its item) said one a line in check_gates' order, each with its exit
+and seconds, and under a red one the last `SHOWN` lines of what it printed, so a gate's findings are in the
+job's log, where the land queue quotes them. Exits 1 where a gate is red or has no outcome, 0 where every one
+is green."""
 
 import json
 import sys
@@ -15,17 +15,18 @@ error's file, line and message."""
 
 def told(path: str) -> int:
     gates = [line.split("\t")[0] for line in Path("tools/check_gates").read_text().splitlines()
-             if line and not line.startswith("#")]
+             if line.strip() and not line.startswith("#")]
     found = {}
     with open(path, errors="replace") as lines:
         for line in lines:
             if line.startswith("{") and "index" in (outcome := json.loads(line)):
-                found[outcome["index"]] = outcome
+                # Each outcome named by the item armada ran (its stdin's line), never by its place among them.
+                found[str(outcome.get("item", "")).strip()] = outcome
             elif not line.startswith("{"):
                 print(line, end="")
     red = 0
-    for index, gate in enumerate(gates):
-        outcome = found.get(index)
+    for gate in gates:
+        outcome = found.get(gate)
         if outcome is None:
             print(f"{gate}: no outcome")
             red = 1

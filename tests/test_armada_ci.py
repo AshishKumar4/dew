@@ -2070,7 +2070,9 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base_and_shows
     # A checkout whose main moved on past its merge-base, as CI's (fetch-depth 0) holds it.
     checkout = tmp_path / "checkout"
     (checkout / "tools").mkdir(parents=True)
-    (checkout / "tools/check_gates").write_text((ROOT / "tools/check_gates").read_text())
+    # A blank line among the gates, as check_gates may hold: no item of armada's, and no gate's name moves.
+    gates_text = (ROOT / "tools/check_gates").read_text().replace("\n", "\n\n", 1)
+    (checkout / "tools/check_gates").write_text(gates_text)
     (checkout / "tools/armada").mkdir()
     (checkout / "tools/armada/gates_told.py").write_text((ROOT / "tools/armada/gates_told.py").read_text())
     git(checkout, "init", "-q", "-b", "main")
@@ -2089,9 +2091,9 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base_and_shows
     (bin_dir / "armada").write_text(
         f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n'
         f'python3 -c "import json, os, sys\n'
-        f'for i, g in enumerate(open(sys.argv[1]).read().split()):\n'
+        f'for i, g in enumerate(open(sys.argv[1]).read().splitlines()):\n'
         f'    red = g == os.environ.get(\'RED\')\n'
-        f'    print(json.dumps({{\'index\': i, \'exitCode\': int(red), \'seconds\': 1.0,'
+        f'    print(json.dumps({{\'index\': i, \'item\': g, \'exitCode\': int(red), \'seconds\': 1.0,'
         f' \'tail\': \'==src/a.py:[1:8]\\\\n==src/b.py:[3:10]\' if red else \'\'}}))" {tmp_path}/items\n')
     (bin_dir / "armada").chmod(0o755)
     for ref, priority, red in (("fix/lane", [], ""), ("main", ["--priority=5"], gates[-1])):
@@ -2105,7 +2107,7 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base_and_shows
         assert ran.stdout.splitlines()[-3 if red else -1:] == (
             [f"{red}: exit 1 in 1 s", "  | ==src/a.py:[1:8]", "  | ==src/b.py:[3:10]"] if red
             else [f"{gates[-1]}: exit 0 in 1 s"]), ran.stdout
-        assert (tmp_path / "items").read_text().split() == gates
+        assert (tmp_path / "items").read_text().splitlines() == gates
         words = (tmp_path / "words").read_text().split()
         assert words[:2] == ["map", f"--commit={'a' * 40}"] and words[-2:] == [base, "{item}"]
         assert [word for word in words if word.startswith("--priority")] == priority
