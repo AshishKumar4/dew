@@ -772,7 +772,7 @@ class InContextMemory(LinearProducts):
         spec: dict[str, object] = dict(self._counts(rows))
         heads = self._heads(None) if heads is None else heads
         if self._recurrence() is not None:
-            features = jax.tree.leaves(heads[0].initial)[0].shape[0]
+            features = _kernel(heads[0].initial).shape[0]
             return {**spec, STATE: Opened((rows, self.heads, features, features), wide),
                     KEPT: Opened((rows, self.heads), wide)}
         weights = tuple(jax.tree.map(lambda leaf: Opened((rows, *leaf.shape), wide), head.initial)

@@ -510,10 +510,15 @@ class MultiHeadLatentAttention(LinearProducts):
         """The layer's attention cache for `rows` rows (`KVSpec`): under the sparse layout the expanded
         keys and values, as DeepSeek V3.2 stores them, else the latent and its rotary part as one head's
         keys and values, in the dtype its projections give them (`compute_dtype`)."""
-        dtype = compute_dtype(self, self.dtype)
+        latent = (self.kv_a_proj_with_mqa, self.kv_a_layernorm)
         if self.sparse:
+            # The keys and values the latent expands into (`_expand`): the latent's modules' and the
+            # expansion's.
+            producers = (*latent, self.kv_b_proj)
+            expanded = jnp.result_type(*(compute_dtype(module, self.dtype) for module in producers))
             return KVSpec(self.kv_cache, rows, self.max_seq_len, self.num_heads,
-                          self.qk_nope_head_dim + self.qk_rope_head_dim, dtype, value_dim=self.v_head_dim)
+                          self.qk_nope_head_dim + self.qk_rope_head_dim, expanded, value_dim=self.v_head_dim)
+        dtype = jnp.result_type(*(compute_dtype(module, self.dtype) for module in latent))
         return KVSpec(self.kv_cache, rows, self.max_seq_len, 1, self.kv_lora_rank, dtype,
                       value_dim=self.qk_rope_head_dim)
 
@@ -529,7 +534,7 @@ class MultiHeadLatentAttention(LinearProducts):
         layer with an indexer of its own; None for one reading another layer's selection."""
         if not (self.sparse and self.indexed):
             return None
-        return Opened((rows, self.max_seq_len, self._index_width()), compute_dtype(self, self.dtype))
+        return Opened((rows, self.max_seq_len, self._index_width()), compute_dtype(self.indexer, self.dtype))
 
     @nn.nowrap
     def cache_spec(self, rows: int) -> dict[str, Opened]:

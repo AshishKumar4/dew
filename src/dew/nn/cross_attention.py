@@ -590,11 +590,16 @@ class SharedGatedCrossAttention(nn.Module):
     @nn.nowrap
     def cache_spec(self, rows: int) -> dict[str, Opened]:
         """A cached call's leaves for `rows` rows: the context's bookkeeping (`documents_cache`) and its
-        keys and values at the layer's key heads (`heads`), in the block's compute dtype."""
+        keys and values (`_context_spec`)."""
+        return {**documents_cache(rows, self.context_length), **self._context_spec(rows)}
+
+    @nn.nowrap
+    def _context_spec(self, rows: int) -> dict[str, Opened]:
+        """The context's keys and values a cached call keeps for `rows` rows, at the layer's key heads
+        (`heads`), in the block's compute dtype (`context_cache`)."""
         key_heads, key_width, value_width = self.heads
-        return {**documents_cache(rows, self.context_length),
-                **context_cache(rows, self.context_length, ((key_heads, key_width), (key_heads, value_width)),
-                                compute_dtype(self, self.dtype))}
+        return context_cache(rows, self.context_length, ((key_heads, key_width), (key_heads, value_width)),
+                             compute_dtype(self, self.dtype))
 
     @nn.compact
     def __call__(self, stream: jax.Array, context: CrossContext | None, *, layer: LayerReads,
@@ -621,7 +626,8 @@ class SharedGatedCrossAttention(nn.Module):
         query, gate = attention.context_query(layer.normed(x))
         embeddings = None if context is None else context.embeddings
         if decode:
-            key, value = kept_context(self, self.cache_spec(x.shape[0]), embeddings, attention.context_keys)
+            key, value = kept_context(self, self._context_spec(x.shape[0]), embeddings,
+                                      attention.context_keys)
         else:
             assert embeddings is not None
             key, value = attention.context_keys(embeddings)

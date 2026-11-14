@@ -353,7 +353,13 @@ class CompressedEntries(FakeQuantizing):
 
     @nn.nowrap
     def entries_spec(self, rows: int, capacity: int) -> CacheSpec:
-        """The entry cache for `rows` rows of `capacity` tokens (`cached_entries`): the rotated entries
+        """The entry cache for `rows` rows of `capacity` tokens, as a model opens it (`init_cache`): its own
+        leaves (`_entries`), a subclass's children's beside them."""
+        return self._entries(rows, capacity)
+
+    @nn.nowrap
+    def _entries(self, rows: int, capacity: int) -> dict[str, Opened]:
+        """The leaves its `cached_entries` keeps for `rows` rows of `capacity` tokens: the rotated entries
         of the closed windows in the entries' dtype, and, where windows pool several tokens, the open
         window's projections and gates in the pooling's dtype, its origin, and under `overlap` the last
         closed window's, its gates -inf where none has closed."""
@@ -374,7 +380,7 @@ class CompressedEntries(FakeQuantizing):
 
     @nn.compact
     def cached_entries(self, x, slots, capacity: int, places):
-        """Append closed windows to the rotated-entry cache (`entries_spec`).
+        """Append closed windows to the rotated-entry cache (`_entries`).
 
         Returns the cache, the latents this call closed, the window each one
         is (-1 for none) and its origin, its first token's place among
@@ -383,7 +389,7 @@ class CompressedEntries(FakeQuantizing):
         token is an entry at once, at its own place, with no buffer and no
         scan.
         """
-        held = cache_variables(self, self.entries_spec(x.shape[0], capacity))
+        held = cache_variables(self, self._entries(x.shape[0], capacity))
         kv, gate = self._projections(x)
         if gate is None:
             latents, emitted, origins = self.kv_norm(kv), slots, jnp.broadcast_to(places, slots.shape)
@@ -498,7 +504,7 @@ class Compressor(CompressedEntries):
     def entries_spec(self, rows: int, capacity: int) -> CacheSpec:
         """Its entry cache (`CompressedEntries.entries_spec`), and on a CSA layer its lightning indexer's
         beside it, under the indexer's name."""
-        own = super().entries_spec(rows, capacity)
+        own = self._entries(rows, capacity)
         if self.index_topk is None:
             return own
         return {**own, "indexer": self.indexer.entries_spec(rows, capacity)}
