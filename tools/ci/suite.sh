@@ -19,6 +19,7 @@
 #   DEW_TEST_CACHE   the test cache's policy (tools/armada/ci.py policy; `off` runs every file, `cold` every file
 #                    no record holds, as cold)
 #   GANGLESS         1 to run no gangs (a base/kernels push and a base/<producer> promote: main's trains run them)
+#   POOL             the suite's pool (none: .armada.json's): a staged train's containers (the land queue's gates)
 #   PROVEN           non-empty where the commit was proven green already: nothing runs
 #   OUT              where the clients' logs, the jobs' ids (jobs.txt) and the gangs' outcome (gangs.outcome,
 #                    success or failure, absent where no gang ran) are kept (default: a new directory)
@@ -58,6 +59,7 @@ fi
 # (train 254's cold suite left 780 tasks unstarted at 2,698 s).
 if [ "${DEW_TEST_CACHE:-on}" != on ]; then bound="--deadline=5400"
 else bound="--deadline=2700"; fi
+[ -z "${POOL:-}" ] || bound="$bound --pool=$POOL"
 # A commit PROVEN runs no suite again, whatever its stored verdict or the cache's policy.
 if [ -z "${PROVEN:-}" ] && { [ "${DEW_TEST_CACHE:-}" = off ] || ! $armada verdict "$sha"; }; then
   setsid $armada run "$sha" $bound $priority --label="${LABEL:-$sha}" \

@@ -797,7 +797,7 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
                                                                                   cache_worker):
     """A file that ran green is reused by a later task on the same CPU class while its inputs are
     unchanged; a task on another class, after its inputs change, or planned with DEW_TEST_CACHE=off
-    (the daily full run) runs it again, and once it has run red on those inputs, so does every task
+    (a cold run's) runs it again, and once it has run red on those inputs, so does every task
     after, though the red run died before it wrote a report. A commit's retry reuses its green rows,
     and none after a red run on its inputs, though a run of another commit recorded the file since.
     Each task runs as armada starts it: .armada.json's command filled from its plan entry."""
