@@ -39,7 +39,9 @@ AMAX_FLOOR = 1e-4
 type Block = int | tuple[int, int]
 """The rows and columns one FP8 scale covers: DeepSeek's square `block`, or `(rows, cols)`, such as
 `(1, cols)` for one scale a row of a `cols`-wide matrix (a frozen FP8 matrix's rows, `dew.quantization`)."""
-_E2M1_MAX = float(jnp.finfo(jnp.float4_e2m1fn).max)
+
+E2M1_MAX = float(jnp.finfo(jnp.float4_e2m1fn).max)
+"""E2M1's largest finite value, 6, which an FP4 block's amax is scaled to."""
 
 
 def _power_of_two_ceil(value):
@@ -128,7 +130,7 @@ def fp8_codes(values):
 def fp4_codes(values):
     """`values` (fp32, a block over its scale) rounded to E2M1, ties to even, clamped to +-6: an FP4
     block's codes (`fp4_rounded`'s under a power-of-two scale, before its scale)."""
-    return _e2m1(jnp.clip(values, -_E2M1_MAX, _E2M1_MAX))
+    return _e2m1(jnp.clip(values, -E2M1_MAX, E2M1_MAX))
 
 
 def fp8_rounded(x, blocks, scale):
@@ -154,14 +156,14 @@ def fp4_scaled_blocks(x, block: int, e4m3_scale: bool):
     amax = jnp.max(jnp.abs(blocks), -1, keepdims=True)
     if e4m3_scale:
         # the kernel's cast saturates at E4M3's 448 (cvt.rn.satfinite)
-        floored = jnp.maximum(amax, _E2M1_MAX * 2 ** -9)
+        floored = jnp.maximum(amax, E2M1_MAX * 2 ** -9)
         # amax / 6 as fp32's correctly rounded quotient, as the kernel's division is: a plain `/` by the
         # constant compiles on the CPU to a multiply by RN(1/6), off by an ulp in a quarter of blocks
         # (ledger 1402). At a float64 truth's width, the float64 quotient rounded once to fp32, IEEE's
         # (53 >= 2 x 24 + 2), then rounded to E4M3 at that width, exactly.
-        quotient = divided(floored, jnp.asarray(_E2M1_MAX, wide)).astype(jnp.float32).astype(wide)
+        quotient = divided(floored, jnp.asarray(E2M1_MAX, wide)).astype(jnp.float32).astype(wide)
         return blocks, _round_e4m3fn(jnp.minimum(quotient, E4M3_MAX))
-    return blocks, _power_of_two_ceil(jnp.maximum(amax, _E2M1_MAX * 2 ** -126) * jnp.float32(1 / _E2M1_MAX))
+    return blocks, _power_of_two_ceil(jnp.maximum(amax, E2M1_MAX * 2 ** -126) * jnp.float32(1 / E2M1_MAX))
 
 
 def fp4_rounded(x, blocks, scale, e4m3_scale: bool):
