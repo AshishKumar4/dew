@@ -12,6 +12,7 @@ from test_capability_matrix import ALL, CACHE, CAUSAL, SEQ, loaded
 from test_mixers import COMPRESSED, KIND_FIELDS, tiny
 
 from dew.inference.banks import HeldBanks
+from dew.nn.backbones.causal_transformer import LayerKind
 from dew.nn.backbones.decoder_stack import Loop, stacked_rows
 from dew.registry import mixers
 
@@ -117,15 +118,23 @@ def test_a_banked_stores_cache_opens_banked_as_its_decode_opens_and_writes_it(ca
     assert_opens_as_it_decodes(scanned, banked)
 
 
-@pytest.mark.parametrize("kind", ["attention", "gated_delta_net", "memory"])
-def test_a_stage_local_stores_cache_opens_a_layer_at_a_time_as_its_decode_opens_and_writes_it(kind):
+STAGED = ("attention", "gated_delta_net", "memory", "hybrid")
+"""A one-stage state's stacks: alike layers of attention, of a delta net and of a memory, and a hybrid
+period of attention and a delta net, which the stage's run holds by position of its period."""
+
+
+@pytest.mark.parametrize("case", STAGED)
+def test_a_stage_local_stores_cache_opens_a_layer_at_a_time_as_its_decode_opens_and_writes_it(case):
     """A scanned stack's one-stage state (`stage_sites`, `StackView.stage_form`), its runs stacked by stage
     under `stages` and its layers' own scopes empty, opens its cache a layer at a time as its decode over
     none opens it (the stack reads the store off its stages, `off_stages`) and as its prefill and step
-    leave it: each layer's spec read through its run's first layer as the store holds it."""
+    leave it: each layer's spec read where its stage's run holds it, a periodic run's at its position."""
+    kind = "gated_delta_net" if case == "hybrid" else case
     fields, overrides = KINDS[kind]
-    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, mixer=mixers.build(kind, **fields),
-                   **overrides)
+    layer = {"mixer": mixers.build(kind, **fields), **overrides}
+    layout = (layer if case != "hybrid" else
+              {"layer_types": ("full_attention", "linear") * 2, "kinds": {"linear": LayerKind(**layer)}})
+    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, **layout)
     params = nn.unbox(scanned.init(jax.random.key(0), jnp.ones((1, PROMPT), jnp.int32)))["params"]
     (site,) = scanned.stage_sites({"params": params}, 1)
     staged = {"params": site.view.stage_form("params", dict(params), stacked_rows)}

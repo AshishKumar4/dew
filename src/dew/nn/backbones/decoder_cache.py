@@ -14,11 +14,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+import jax
 from flax import linen as nn
 
 from ..kv_cache import CacheSpec, stacked_spec
 from ..sharding import pipeline_stages
 from .decoder_stack import StackView, stored_by_stage
+from .layer_names import stored_layers
 from .looping import pass_entries
 
 if TYPE_CHECKING:
@@ -30,14 +32,20 @@ def trunk_cache(model: CausalTransformer, rows: int) -> CacheSpec:
     holders' (the module doc)."""
     banked = _banked_runs(model)
     runs = banked or tuple((index, 1) for index in range(model.num_layers))
-    if banked is None and not stored_by_stage(model.variables):
-        layers = [layer.cache_spec(rows) for layer in model.layers]
+    if banked is not None:
+        # A banked store's layers' specs read each run's first layer where its bank holds it, every layer
+        # of a run alike.
+        layers = [_banked_layer(model, run).cache_spec(rows)
+                  for run, (_, count) in enumerate(banked) for _ in range(count)]
+    elif stored_by_stage(model.variables):
+        # A stage-local store's layers' specs read each layer where its stage's run holds it, a periodic
+        # run's at its position.
+        held = _layered(model)
+        layers = [model.layers[index].clone(parent=None).bind(
+            {collection: tree[f'layers_{index}'] for collection, tree in held.items()
+             if f'layers_{index}' in tree}).cache_spec(rows) for index in range(model.num_layers)]
     else:
-        # A store that keeps its weights off the layers' own scopes, banked by run or by stage: each layer's
-        # spec read through its run's first layer, as the store holds it (`layer_shapes`), every layer of a
-        # run alike.
-        layers = [_stored_layer(model, run).cache_spec(rows)
-                  for run, (_, count) in enumerate(model.groups) for _ in range(count)]
+        layers = [layer.cache_spec(rows) for layer in model.layers]
     entries = [(first, first, count) for first, count in runs]
     entries += [] if model.loop is None else pass_entries(model.loop, model.num_layers, runs)
     names = StackView(tuple((stored, count) for stored, _, count in entries)).bank_names()
@@ -59,12 +67,19 @@ def named_caches(holders: Sequence[nn.Module], rows: int) -> CacheSpec:
     return {name: held for holder in holders if (name := holder.name) and (held := holder.cache_spec(rows))}
 
 
-def _stored_layer(model: CausalTransformer, run: int):
-    """The first layer of `model`'s run `run`, bound to its variables as the store holds them, a row of its
-    bank or of its stage's (`CausalTransformer.layer_shapes`): a layer whose own scope the store leaves
-    empty."""
+def _banked_layer(model: CausalTransformer, run: int):
+    """The first layer of `model`'s run `run`, bound to its variables as the store's bank holds them, a row
+    of it (`CausalTransformer.layer_shapes`): a layer whose own scope the bank leaves empty."""
     first = model.groups[run][0]
     return model.layers[first].clone(parent=None).bind(model.layer_shapes(run))
+
+
+def _layered(model: CausalTransformer) -> dict:
+    """`model`'s stage-local store a layer at a time, each run's rows cut back onto its layers as an export
+    reads them (`stored_layers`), for their shapes alone."""
+    free = model.clone(parent=None)
+    variables = {collection: dict(tree) for collection, tree in model.variables.items()}
+    return jax.eval_shape(lambda variables: stored_layers(free, variables), variables)
 
 
 def _banked_runs(model: CausalTransformer) -> tuple[tuple[int, int], ...] | None:
