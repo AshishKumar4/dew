@@ -10,6 +10,7 @@ import pytest
 from attention_oracle import qkv
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec
+from kernel_compile import lowered_for
 from reference_error import assert_as_exact, with_gradients
 from sharded import assert_runs_per_shard
 
@@ -17,6 +18,9 @@ from dew.mesh import DEFAULT_RULES
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.differential_attention import differential_attention
 from dew.nn.forgetting_attention import forgetting_attention
+from dew.nn.kernels import generation
+from dew.nn.kernels.lowered import kernel_calls
+from dew.nn.programs import equations
 
 SEEDS = 8
 """The draws each forgetting site takes (`reference_error.seeds_for`, sized: 8 each)."""
@@ -79,6 +83,32 @@ def test_forgetting_attention_holds_check_1_against_its_logits_written_out(packe
                     _gated(HEADS, KV_HEADS),
                     f"forgetting attention {'packed' if packed else 'one document'} {implementation}",
                     seeds=SEEDS)
+
+
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_forgetting_attention_by_default_runs_the_template_holding_no_written_out_bias(generation_name):
+    """FoX by default ('auto') lowered for a GPU without warpgroup MMA (an A100's) and with it (an H100's):
+    its training step runs the template's Mosaic GPU launches and holds no `[B, H, S, S]` array, the bias
+    every other route writes out (`SeparableBias`, which the selector keeps on the template:
+    `AttentionCase.separable_bias`)."""
+    rows, length, heads, kv_heads, width = 2, 512, 4, 2, 64
+    query = jax.ShapeDtypeStruct((rows, length, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, length, kv_heads, width), jnp.bfloat16)
+    gates = jax.ShapeDtypeStruct((rows, length, heads), jnp.float32)
+
+    def step(query, key, value, gates):
+        def loss(*operands):
+            return forgetting_attention(*operands).astype(jnp.float32).sum()
+        return jax.grad(loss, argnums=(0, 1, 2, 3))(query, key, value, gates)
+
+    lowered = lowered_for(step, (query, key, key, gates), generation_name)
+    assert any(call.kind == "mosaic_gpu" for call in kernel_calls(lowered, unrun=True))
+    with generation.assumed(generation_name):
+        traced = jax.make_jaxpr(step)(query, key, key, gates)
+    written = [equation.primitive.name for equation in equations(traced.jaxpr)
+               if any(getattr(value.aval, "shape", None) == (rows, heads, length, length)
+                      for value in equation.outvars)]
+    assert not written, f"the step writes out a [B, H, S, S] array: {written}"
 
 
 @pytest.mark.mesh(devices=8)
