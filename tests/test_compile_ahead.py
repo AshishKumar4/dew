@@ -760,7 +760,7 @@ def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_
     the compile point."""
     from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.kernels.options import compiler_options
-    from dew.nn.kernels.templates.report import targeted
+    from dew.nn.kernels.templates.report import AUTOTUNE_CACHE_READ, CUB_NO_FALLBACK, for_devices, targeted
     from dew.training.planning import FitSearch
 
     monkeypatch.setenv("XLA_FLAGS", without_flags(os.environ.get("XLA_FLAGS", ""),
@@ -773,9 +773,16 @@ def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_
         shape = jax.ShapeDtypeStruct((64, 64), jnp.float32, sharding=placed)
         return jax.jit(lambda x: x @ x).lower(shape)
 
+    # One read offline skips the autotuner; one compiled for a device takes the tuned choices, every one
+    # required, and keeps a CUB sort's choice off its key (`CUB_NO_FALLBACK`), as a device's own does.
+    sorts = {"xla_gpu_deviceless_cub_mode": CUB_NO_FALLBACK}
     assert targeted(lowered(deviceless), None) == {"xla_gpu_autotune_level": 0}
     assert targeted(lowered(deviceless), {"xla_gpu_enable_triton_gemm": False}) == {
         "xla_gpu_enable_triton_gemm": False, "xla_gpu_autotune_level": 0}
+    with for_devices():
+        assert targeted(lowered(deviceless), None) == {
+            **sorts, "xla_gpu_experimental_autotune_cache_mode": AUTOTUNE_CACHE_READ,
+            "xla_gpu_require_complete_aot_autotune_results": True}
     assert targeted(lowered(running), {"xla_gpu_enable_triton_gemm": False}) == {
         "xla_gpu_enable_triton_gemm": False}
     # A step whose options are its towers' own compiles as the half rung of XLA's defaults does, one

@@ -529,7 +529,7 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
     if not modules:
         return {}
     return {name: (modules[name], binary)
-            for binary in binaries(lowered.compile(targeted(lowered, None)))
+            for binary in binaries(xla_compiled(lowered, None))
             if (name := launch_name(binary.kernel, binary.launch)) in modules}
 
 
@@ -719,29 +719,107 @@ def attempted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions |
     failed in (a Qwen3.5-4B step and its sampled step for a compile-only H100: `MLIRError: Failure while
     executing pass pipeline`)."""
     try:
-        return Attempt(lowered.compile(targeted(lowered, options)))
+        return Attempt(xla_compiled(lowered, options))
     except jax.errors.JaxRuntimeError as error:
         return Attempt(None, error)
 
 
+UNTUNED = ("No cached config found for HLO instr:", "Failed to get configs for:",
+           "Missing deviceless CUB scratch size data")
+"""What XLA says where a compile without a device, every tuned choice required from the autotune cache, meets
+an instruction no device run has tuned yet (config_assigner.cc's NotFound, sort_rewriter.cc's CUB scratch)."""
+
+
+class Untuned(RuntimeError):
+    """A compile without a device for a device to run (`for_devices`: a job's prepare,
+    `dew.training.ahead.AheadTarget`) met an instruction no device run has tuned yet (`UNTUNED`): the
+    program is not preparable until one has, and its run compiles it on the device, which tunes it for the
+    next. No memory refusal: the plan's search stops at it."""
+
+
+def untuned(code: str, message: str) -> bool:
+    """Whether XLA refused a deviceless compile for want of a tuned result (`UNTUNED`)."""
+    return code == "NOT_FOUND" and any(said in message for said in UNTUNED)
+
+
+def xla_compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
+                 ) -> jax.stages.Compiled:
+    """`lowered` compiled by XLA under `options` for its target (`targeted`): Dew's one call of XLA's
+    compile, where an instruction no device run has tuned yet is said so (`Untuned`)."""
+    try:
+        return lowered.compile(targeted(lowered, options))
+    except jax.errors.JaxRuntimeError as error:
+        if untuned(error.error_code_string, str(error)):
+            raise Untuned(str(error)) from error
+        raise
+
+
+CUB_NO_FALLBACK = 3
+"""`xla_gpu_deviceless_cub_mode`'s DEVICELESS_CUB_NO_FALLBACK: a deviceless compile's CUB sort reads its
+scratch from XLA's table or fails (NOT_FOUND), never keeping another sort under the device compile's key; a
+device compile returns before it reads the mode (sort_rewriter.cc), so every GPU compile takes it and the
+keys stay equal."""
+AUTOTUNE_CACHE_READ = 2
+"""`xla_gpu_experimental_autotune_cache_mode`'s READ: a deviceless compile takes each tuned choice from the
+autotune cache beside the persistent cache (`--xla_gpu_per_fusion_autotune_cache_dir`), which device compiles
+write (the mode's default, UPDATE)."""
+
+_FOR_DEVICES: contextvars.ContextVar[bool] = contextvars.ContextVar("dew_for_devices", default=False)
+
+
+
+@contextlib.contextmanager
+def for_devices() -> Iterator[None]:
+    """Within the block, a deviceless GPU compile makes a program a device will run (a step compiled
+    ahead, into a file or the persistent cache a run reads, `dew.training.ahead`): it takes every tuned
+    choice from the autotune cache a device run wrote and fails where one is missing (`targeted`), so no
+    untuned program reaches a device under a tuned key (row 6046)."""
+    held = _FOR_DEVICES.set(True)
+    try:
+        yield
+    finally:
+        _FOR_DEVICES.reset(held)
+
+
+def autotuned(devices: Sequence) -> bool:
+    """Whether a program compiled for `devices` takes XLA's tuned choices (`targeted`): any device that
+    runs, or compile-only GPUs within `for_devices`; a deviceless GPU compile outside it is read at
+    autotune 0, its workspaces XLA's defaults, which a tuned convolution's on the device may exceed."""
+    device = next(iter(devices), None)
+    return (device is None or device.platform != "gpu" or not deviceless(device) or _FOR_DEVICES.get()
+            or xla_flag("xla_gpu_autotune_level") is not None)
+
+
 def targeted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
              ) -> jax.stages.CompilerOptions | None:
-    """`options` for the target `lowered` compiles for: on compile-only GPUs (`deviceless`) nothing runs to
-    autotune a product on, and XLA's config assigner already gives each matmul its default config there
-    while its autotuner still compiles the candidates it cannot
-    time, and a GEMM fusion whose candidates are cuBLASLt's fails ("CublasLtBackend cannot enumerate
-    configs in deviceless mode"), so the program skips them (`xla_gpu_autotune_level` 0), its memory the
-    same (a frontier search's every probe and rung, 142 s to 99 s on armada, 11-02). A run's own XLA_FLAGS
-    setting, and devices that run, keep `options` as given. Every program compiled here takes it, a
-    run's step and every program it compiles ahead alike."""
+    """`options` for the target `lowered` compiles for. A program a device runs, compiled on it or for it,
+    keeps a CUB sort's choice off its key (`CUB_NO_FALLBACK`), the same on both sides. On compile-only GPUs
+    (`deviceless`) nothing runs to autotune a product on: a program a device will run (`for_devices`) takes
+    each tuned choice the device's runs left in the autotune cache, every one required
+    (`xla_gpu_require_complete_aot_autotune_results`; a miss fails as `Untuned`), the executable a device
+    compile makes under the same key; one only read for its memory or text (a plan offline, a validation,
+    a step compiled into a file, a probe) skips the autotuner (`xla_gpu_autotune_level` 0, its own key,
+    which no device's run reads) and keeps XLA's sorts as they fall back, its memory the same (a frontier
+    search's every probe and rung, 142 s to 99 s on armada, 11-02). A run's own XLA_FLAGS setting keeps
+    `options` as given. Every program compiled here takes it, a run's step and every program it compiles
+    ahead alike."""
     from jax._src.interpreters import pxla
 
     lowering = lowered._lowering
     devices = lowering._device_list if isinstance(lowering, pxla.MeshComputation) else None
     device = None if devices is None else next(iter(devices))
-    if (device is None or device.platform != "gpu" or not deviceless(device)
-            or xla_flag("xla_gpu_autotune_level") is not None):
+    if device is None or device.platform != "gpu":
         return options
+    offline = deviceless(device) and not _FOR_DEVICES.get()
+    sorts = {} if offline or xla_flag("xla_gpu_deviceless_cub_mode") is not None else {
+        "xla_gpu_deviceless_cub_mode": CUB_NO_FALLBACK}
+    if sorts:
+        options = {**(options or {}), **sorts}
+    if not deviceless(device) or xla_flag("xla_gpu_autotune_level") is not None:
+        return options
+    if not offline:
+        return {**(options or {}), "xla_gpu_experimental_autotune_cache_mode": AUTOTUNE_CACHE_READ,
+                "xla_gpu_require_complete_aot_autotune_results": True}
     return {**(options or {}), "xla_gpu_autotune_level": 0}
 
 
@@ -1064,7 +1142,7 @@ def _recorded(found: list, *, stepped: bool) -> None:
 def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
                        read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None
                        ) -> tuple[jax.stages.Compiled, list["Binary"]]:
-    executable = lowered.compile(targeted(lowered, options))
+    executable = xla_compiled(lowered, options)
     return executable, _spilling(lowered, executable, read)
 
 
