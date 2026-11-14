@@ -10,7 +10,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - Layering: `dew.inference.projections` is `dew.nn.projections`; a run's score names, `Summary` and
   `recorded_name`, are `dew.scores`'s (were `dew.training.evaluation`'s); the token count a state holds is
   `dew.state.TokenCount`; the adapted-class mark a reader below the adapters asks is
-  `dew.nn.protocols.Adapted` (`dew.lora.AdaptedClass` its typed reading); a saved run's migration that
+  `dew.nn.protocols.Adapted`; a saved run's migration that
   reads its checkpoints is its run class's `earlier_checkpointed`. A state, an objective, the
   configuration and a checkpoint's metrics import no trainer, inference or front end through them.
 
