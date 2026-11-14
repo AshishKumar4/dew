@@ -12,7 +12,7 @@ from test_capability_matrix import ALL, CACHE, CAUSAL, SEQ, loaded
 from test_mixers import COMPRESSED, KIND_FIELDS, tiny
 
 from dew.inference.banks import HeldBanks
-from dew.nn.backbones.decoder_stack import Loop
+from dew.nn.backbones.decoder_stack import Loop, stacked_rows
 from dew.registry import mixers
 
 ROWS, PROMPT = 2, 4
@@ -115,6 +115,26 @@ def test_a_banked_stores_cache_opens_banked_as_its_decode_opens_and_writes_it(ca
     passes = 1 if loop is None or loop.shared_cache else loop.steps
     assert sorted(cache) == [f"layers_{4 * index}_{4 * index + 3}" for index in range(passes)], list(cache)
     assert_opens_as_it_decodes(scanned, banked)
+
+
+@pytest.mark.parametrize("kind", ["attention", "gated_delta_net", "memory"])
+def test_a_stage_local_stores_cache_opens_a_layer_at_a_time_as_its_decode_opens_and_writes_it(kind):
+    """A scanned stack's one-stage state (`stage_sites`, `StackView.stage_form`), its runs stacked by stage
+    under `stages` and its layers' own scopes empty, opens its cache a layer at a time as its decode over
+    none opens it (the stack reads the store off its stages, `off_stages`) and as its prefill and step
+    leave it: each layer's spec read through its run's first layer as the store holds it."""
+    fields, overrides = KINDS[kind]
+    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, mixer=mixers.build(kind, **fields),
+                   **overrides)
+    params = nn.unbox(scanned.init(jax.random.key(0), jnp.ones((1, PROMPT), jnp.int32)))["params"]
+    (site,) = scanned.stage_sites({"params": params}, 1)
+    staged = {"params": site.view.stage_form("params", dict(params), stacked_rows)}
+    held = staged["params"]
+    assert "stages" in held and not any(f"layers_{index}" in held for index in range(4)), list(held)
+    cache = jax.eval_shape(lambda store: scanned.apply(store, ROWS, method="init_cache", mutable=["cache"]),
+                           staged)[1]["cache"]
+    assert {f"layers_{index}" for index in range(4)} <= set(cache), list(cache)
+    assert_opens_as_it_decodes(scanned, staged)
 
 
 @pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])

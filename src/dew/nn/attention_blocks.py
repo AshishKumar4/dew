@@ -108,8 +108,9 @@ def kept_context(module: nn.Module, spec: Mapping[str, Opened], context: jax.Arr
     """The keys and values a cached call of `module` over a context reads, `[rows, tokens, *shape]`
     each, kept as `spec` states them (`context_cache`). A call that carries a context `[rows, tokens,
     features]` projects them from it (`project`) and keeps them in `CROSS_KEY` and `CROSS_VALUE`, padded
-    to the tokens the cache holds; a call without one reads what the cache keeps. The call reads them as
-    the cache keeps them, in its dtype, to which the projections are cast."""
+    to the tokens the cache holds; a call without one reads what the cache keeps. The projections keep
+    their own dtype, which `spec` states: one of another is refused by the leaf's name (`kept`), not cast
+    to it."""
     held = cache_variables(module, spec)
     keys, values = held[CROSS_KEY], held[CROSS_VALUE]
     if context is None:
@@ -118,7 +119,7 @@ def kept_context(module: nn.Module, spec: Mapping[str, Opened], context: jax.Arr
     if width > length:
         raise ValueError(f"a cached call keeps at most {length} context tokens a row "
                          f"(CrossAttention.context_length), got {width}")
-    key, value = (projected.astype(keys.value.dtype) for projected in project(context))
+    key, value = project(context)
     for name, leaf, written in ((CROSS_KEY, keys, key), (CROSS_VALUE, values, value)):
         kept(leaf, jnp.pad(written, ((0, 0), (0, length - width)) + ((0, 0),) * (written.ndim - 2)), name)
     return key, value
