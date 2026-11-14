@@ -488,7 +488,8 @@ def declarations(language: object) -> Declarations:
 
 Magnitude = int
 """A bound on a value's magnitude (docs/design/algebra.md §6.3): its power of two, `|x| <= 2**log2`, a number
-its constants', its declared ranges' and its equations' prove; a value no number bounds has none (None). A
+its constants', its declared ranges' and its equations' prove of a value proven finite (`Apart.finite`); a
+value no number bounds, or that may be a NaN or an infinity, has none (None). A
 sum's is twice the larger of its terms', a product's their product, a contraction's their product times its
 length. Proved under its arithmetic's contract (`_real_bound`): IEEE rounding to nearest, a native
 transcendental given one power past its real range, a contraction's mode one it states the rounding of
@@ -613,7 +614,10 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
             exponentiated = name in ("exp", "exp2") and held_apart[0].sign < 0
             bound = UNIT + 1 if exponentiated else _bounded(equation, operands, held_apart)
             apart[out] = _apart(equation, held_apart, operands, bound)
-            _typed(dtypes, magnitudes, term, out, bound)
+            # A bound is stated of a value proven finite alone, as a rewrite's side condition reads it (row
+            # 5780; owner, 2026-11-14): a NaN's tanh is no number, and a product of a value that overflowed
+            # reads the bound its real factors have and computes an infinity.
+            _typed(dtypes, magnitudes, term, out, bound if apart[out].finite else None)
             depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
                                    if not isinstance(atom, jcore.Literal)), default=0)
             continue
@@ -818,7 +822,9 @@ def _apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitu
       above zero only of an operand above it (a negative zero's is negative infinity);
     - an absolute value, a negation (which turns the sign), a layout change, a conversion between floats, a
       maximum or minimum along an axis of at least one element keep a floor; a sum along axes of at least
-      one element of values on one side of zero keeps theirs.
+      one element of values on one side of zero keeps theirs;
+    - a sign of a number is a finite number on its operand's side, 1 away from zero where its operand is
+      held away.
     A float is at least 0 where its operation makes it so of a number (a square, an even power, an absolute
     value, an exponential, a root, a logistic). A contraction's sign is not claimed: a mode that splits its
     operands into parts sums parts of either sign."""
@@ -868,6 +874,12 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
         return Apart(floor, signs[0] * signs[1] if apart else 0,
                      numbers and (apart or floors[0] is not None) and (dividend.finite or divisor.finite),
                      dividend.finite and divisor.number and apart)
+    if name == "pow":
+        # A finite base held above zero to a finite exponent is a positive number, finite where its own
+        # bound is within its dtype (`_apart`), the case `_apart_bound` bounds.
+        base, exponent = operands
+        held = base.positive and base.finite and exponent.finite
+        return Apart(None, 1 if base.positive else 0, held, held)
     if name in ("max", "min"):
         side = 1 if name == "max" else -1
         sign = side if side in signs else signs[0] if len(set(signs)) == 1 else 0
@@ -881,6 +893,8 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
                      all(held.number for held in cases), all(held.finite for held in cases))
     if name == "neg":
         return first._replace(sign=-first.sign)
+    if name == "sign":
+        return Apart(0 if first.floor is not None else None, first.sign, first.number, first.number)
     if name == "abs":
         return first._replace(sign=1)
     if name in ("square", "integer_pow"):
@@ -1047,7 +1061,8 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apar
     - `add`, `sub`: `|x +- y| <= 2**a + 2**b <= 2**(max(a, b) + 1)`, monotone in each operand;
     - `mul`: `|x y| <= 2**(a + b)`, bilinear, its extreme at the box's corners;
     - `max`, `min`, a selection, `neg`, `abs`, a conversion, a layout change, a maximum or minimum along an
-      axis: no larger than an operand (`abs` least at its critical point 0, largest at a corner);
+      axis: no larger than an operand (`abs` least at its critical point 0, largest at a corner); a `min`
+      with an operand at least 0, and a `max` with one at most 0, no larger than the other (a clamp's);
     - `floor`, `ceil`, `round`: at most `max(2**a, 1)` (`ceil(2**-126)` is 1);
     - `square`, `integer_pow` of `y >= 1`: `|x|**y <= 2**(y a)`, monotone in `|x|` (an even power least at
       its critical point 0);
@@ -1084,7 +1099,11 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apar
     if name == "mul":
         return given[0] + given[1]
     if name in ("max", "min"):
-        return max(given)
+        # Either operand, and no more than the other where one is on the side it loses to: a minimum with a
+        # value at least 0 is the other operand or less than it, a maximum with one at most 0 likewise.
+        losing = 1 if name == "min" else -1
+        within = [given[1 - at] for at in range(len(given)) if len(given) == 2 and apart[at].sign == losing]
+        return min([max(given), *within])
     if name == "select_n":
         return max(given[1:])
     if name in ("reduce_max", "reduce_min") and _reduced(equation) < 1:
