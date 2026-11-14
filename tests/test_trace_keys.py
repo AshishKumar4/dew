@@ -132,8 +132,8 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
 
     first = fit()
     # The steps this process keeps for a refit to read (`candidate_for`): the refit keeps none of its own.
-    kept = len(candidates._CANDIDATES)
+    kept = set(candidates._CANDIDATES)
     again = fit()
-    assert kept and len(candidates._CANDIDATES) == kept
+    assert kept and set(candidates._CANDIDATES) <= kept
     assert {axis: link.spread for axis, link in again.items()} == {
         axis: link.spread for axis, link in first.items()}
