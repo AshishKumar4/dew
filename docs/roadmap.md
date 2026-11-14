@@ -21,6 +21,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Convolution repairs above their owner. [5665]
 - Abstract values keyed by their printed form. [6287]
 - No program holding a Mosaic GPU kernel hits JAX's persistent cache across processes. [6298]
+- The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822, 5391]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -31,6 +32,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5278, 5327]
 - Derived resources: tiles, registers, residency and issued work. [5567]
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
+- Block-selected attention's other selections as mixers. [6301]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm. [6030]
 - Exact on every path, every edge and every derivative order. [2656]
 - The suite's wall. [5478]
@@ -80,7 +82,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Every MAINPERF measurement since 2026-11-09. [6045]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Bit-level synthesis in dew.algebra. [3733]
-- Greedy extraction prices dearer than the exact optimum when a saturation aid is absent. [6254]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 
