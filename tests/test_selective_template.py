@@ -165,12 +165,14 @@ two) and a chain, each document its predecessor's final; and one stored slot a r
 a document from a zero state among them, so the backward's given and stored slots are as many."""
 
 
-def the_template_is_as_exact_over_a_forked_call(layout: str, dtype=jnp.bfloat16):
+def the_template_is_as_exact_over_a_forked_call(layout: str, dtype=jnp.bfloat16, channels: int | None = None):
     """`FORKED[layout]` through the template (`selective_scan`'s `forked`): its output, the row's last state
     and every input's gradient, its given states' included, on par from float64 with the portable scan's
-    forked path (`dew.nn.mixers.mamba.selective_scan`'s), over check 1's fewest draws (row 5288)."""
+    forked path (`dew.nn.mixers.mamba.selective_scan`'s), over check 1's fewest draws (row 5288), its
+    `channels` the interpreted shape's where None."""
     forked = FORKED[layout]
-    _, length, channels, states = SHAPES["interpreted"]
+    _, length, shaped, states = SHAPES["interpreted"]
+    channels = shaped if channels is None else channels
     rows = forked.firsts.shape[0]
     template = functools.partial(selective.selective_scan, family=taken_family(dtype), interpret=INTERPRETED,
                                  forked=forked)
@@ -193,8 +195,12 @@ def the_template_is_as_exact_over_a_forked_call(layout: str, dtype=jnp.bfloat16)
 @pytest.mark.parametrize("layout", list(FORKED))
 @pytest.mark.check1_shards(seeds=8, per_task=4)
 def test_the_template_is_as_exact_over_a_forked_call_interpreted(layout):
-    """`the_template_is_as_exact_over_a_forked_call` off a GPU."""
-    the_template_is_as_exact_over_a_forked_call(layout)
+    """`the_template_is_as_exact_over_a_forked_call` off a GPU, over one forward program's block of 128
+    channels: its backward interprets a program a row's channel, and at the shape's 256 a draw took 621 s
+    of a CI task (row 6294), 99 s on an idle host against 50 at 128. A forked slot's reads and stores take
+    the program's columns as its other operands do, which the unforked sites hold over two blocks; the GPU
+    flow runs it at 256 (tests/test_gpu_recurrence.py)."""
+    the_template_is_as_exact_over_a_forked_call(layout, channels=128)
 
 
 @pytest.mark.parametrize("route", ROUTES)
