@@ -120,6 +120,27 @@ def test_a_meshless_server_draws_on_the_selected_default_device():
         assert all(leaf.devices() == {device} for leaf in jax.tree.leaves(server.cache))
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_server_over_split_rows_takes_its_projections_on_each_devices_rows():
+    """A bf16 decoder served on a two-device mesh whose slots split its rows, the GEMM template named and
+    interpreted as an H100's: its projections take the template's launch on each device's own rows, the
+    weights entering where its load placed them (`dew.nn.sharding.Placed`, traced under `placing`), as a
+    trainer's step takes them (train 818 F1: a served step traced under no layout left every product to the
+    partitioner, which no launch takes)."""
+    from dew.nn.kernels import generation
+
+    model = decoder().clone(dtype="bfloat16", emb_features=64, max_seq_len=128)
+    served = TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
+                            RunProcessor(Digits()), sampling=task().sampling)
+    with boxed(decoder_axes(model)):
+        placed = served.bind(place(served.variables, MeshSpec(), Layout(min_shard=1, tolerance=1.0)))
+    with (generation.assumed("sm90", interpreted=True), generation.chosen(grouped_matmul="mosaic"),
+          generation.routes() as routes):
+        Server.from_task(placed, slots=2, capacity=128)
+    assert any(route.choice is generation.Choice.GROUPED_MATMUL and route.kernel == "mosaic"
+               for route in routes), routes
+
+
 def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
     """Biases, head norms, RoPE and the cached append still read the same projections."""
     with jax.enable_x64():

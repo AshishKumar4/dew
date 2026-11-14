@@ -22,7 +22,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -33,6 +33,7 @@ from dew.inference.engine import Timed, Waiting, normalized, reloaded, settled
 from dew.inference.tasks import held
 from dew.nn.inputs import mesh_of
 from dew.nn.protocols import StagedStacks
+from dew.nn.sharding import Placed, placing
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,9 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         it, and a reload replaces both at once, so an answer never pairs one task with another's
         weights."""
         self.mesh = mesh_of(placed)
+        self._placed = None if self.mesh is None else Placed.of(placed)
+        """Where the scored weights lie (`dew.nn.sharding.Placed`), which a projection mapped per shard reads
+        as the pass traces (`_context`); None off a mesh."""
         # Read off the leaves, which a call's server is built over: no program traced, and no reference
         # held to the weights a reload replaces.
         self._source_shapes = jax.tree_util.tree_flatten_with_path(jax.tree.map(
@@ -289,9 +293,12 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
             variables = stored_layers(task.model, variables)
         self._served = (task, reloaded(normalized(variables, self._source_shapes), self.variables))
 
-    def _context(self) -> contextlib.AbstractContextManager[None]:
-        """The mesh the task's pass traces under."""
-        return contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh)
+    @contextlib.contextmanager
+    def _context(self) -> Iterator[None]:
+        """The mesh the task's pass traces under, and where its weights lie on it (`placing`)."""
+        with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh),
+              placing(self._placed)):
+            yield
 
     def fail(self, failure: BaseException, taken: Sequence[_Request[Row, Payload, Output, Answer]] = ()
              ) -> None:

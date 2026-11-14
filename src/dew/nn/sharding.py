@@ -39,6 +39,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
+import functools
 import math
 import types
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
@@ -313,6 +314,36 @@ class Placing(Protocol):
     def leaf_spec(self, mesh, path, value) -> jax.sharding.PartitionSpec: ...
 
     def __hash__(self) -> int: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class Placed:
+    """The placement of variables already placed (`Placing`): each leaf's spec its own `NamedSharding`'s, by
+    its variables path, where a loader put it (`dew.inference.loading.place`, by its layout); a leaf on one
+    device, or not on a mesh, replicated. A served model traces under it (`placing`), so its projections
+    map per shard where its weights already lie, the layout that placed them read off the weights
+    themselves."""
+
+    specs: tuple[tuple[tuple, jax.sharding.PartitionSpec], ...]
+    """Each leaf's path and spec, in the variables' order."""
+
+    @classmethod
+    def of(cls, variables) -> Placed:
+        """`variables`' placement, read off its leaves."""
+        return cls(tuple(
+            (tuple(path), leaf.sharding.spec if isinstance(getattr(leaf, "sharding", None), jax.NamedSharding)
+             else jax.sharding.PartitionSpec())
+            for path, leaf in jax.tree_util.tree_flatten_with_path(variables)[0]))
+
+    @functools.cached_property
+    def _by_path(self) -> dict[tuple, jax.sharding.PartitionSpec]:
+        return dict(self.specs)
+
+    def leaf_spec(self, mesh, path, value) -> jax.sharding.PartitionSpec:
+        """The spec of the leaf at `path`, as it is placed (`mesh` and `value` the protocol's, its placement
+        already the leaf's own); a path the variables do not hold is refused by its name."""
+        del mesh, value
+        return self._by_path[tuple(path)]
 
 
 _PLACING: contextvars.ContextVar[Placing | None] = contextvars.ContextVar('placing', default=None)
