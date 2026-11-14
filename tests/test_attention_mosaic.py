@@ -2138,7 +2138,7 @@ def test_a_common_walk_states_every_tile_each_holder_walks():
     """The fast backward's one launch fed by its consumers (`wgmma.fed`, a program two key blocks, each
     consumer walking every query tile either block is read by, `Family.walk_own`) over a causal call of 128
     queries and 192 keys, its keys padded to 256, lowered for an H100: the launch states the tiles each
-    consumer walks (`attention_mosaic_program.issued`), one its own keys are not seen by too. The first
+    consumer walks (`attention_mosaic_program.walked_steps`), one its own keys are not seen by too. The first
     program's consumers walk both 64-row query tiles each, the second keys' tile read by the second alone;
     the second program's none, its first keys past every query's and its second past the keys."""
     rows, heads, width, block = 1, 2, 64, 64

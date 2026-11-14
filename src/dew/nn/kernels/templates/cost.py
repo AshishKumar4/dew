@@ -30,6 +30,14 @@ def estimate(flops: float, *arrays, transcendentals: float = 0) -> pl.CostEstima
 
 
 @dataclasses.dataclass(frozen=True)
+class Stated(pl.CostEstimate):
+    """A launch's cost as it states it (`estimate`'s), with the steps of its walks, every consumer's over the
+    call's batch and heads (`steps`): the trips a count of its work by emission multiplies a step's work by
+    (`emission.Role.step`), stated once where its cost is (attention's `walked_steps`)."""
+    steps: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
 class Work:
     """The cost vocabulary every price is told in (docs/design/algebra.md §6.5): an operation's work by unit
     (tensor-core FLOPs by mode: the 16-bit mode's, 16-bit operands summed in fp32, TF32's, fp32 operands

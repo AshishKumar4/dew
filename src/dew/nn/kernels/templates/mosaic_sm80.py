@@ -644,6 +644,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         if ahead:
             raise NotImplementedError(f"{self.name}'s pipeline reads no stream ahead")
         del first, in_flight, unrolled
+        segments = mosaic.stepped(segments)
         blocks = streams.pipeline.blocks
         names = tuple(blocks)
         carry = (start, self.started(shapes, initial))

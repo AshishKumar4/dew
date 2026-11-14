@@ -37,10 +37,12 @@ from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
 
+from dew.nn import derivatives
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import (
     across,
     bodies,
+    emission,
     handoffs,
     persistent,
     product,
@@ -48,6 +50,7 @@ from dew.nn.kernels.templates import (
     resources,
     swizzling,
 )
+from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.rings import CLUSTER, Ref, Ring, Turn, drain, loads, passed, streamed
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
@@ -510,6 +513,13 @@ def laid(condition, like: jax.Array) -> jax.Array:
     return (jnp.zeros_like(like, jnp.float32) + jnp.asarray(condition, jnp.float32)) != 0.0
 
 
+@emission.stating(lambda: Work())
+def _warpgroup_barrier(ctx) -> None:
+    """A warpgroup's barrier (`synced`), inlined: synchronization alone, no work a count prices."""
+    del ctx
+    mgpu_utils.warpgroup_barrier()
+
+
 def synced(interpret: bool) -> None:
     """The warpgroup's threads past their shared-memory reads and writes before any goes on: a tile one thread
     wrote that another reads, or one written again that another still reads (a walk's scratch tile). Mosaic
@@ -518,7 +528,7 @@ def synced(interpret: bool) -> None:
     tile at once."""
     if interpret:
         return
-    plgpu.inline_mgpu()(lambda ctx: mgpu_utils.warpgroup_barrier())()
+    plgpu.inline_mgpu()(_warpgroup_barrier)()
 
 
 MAGIC_INT, MAGIC_FLOAT = 0x4B400000, 12582912.0
@@ -533,6 +543,19 @@ def converts(dtype) -> bool:
     ptxas refused them, dd-quant4's q3)."""
     return (jnp.issubdtype(dtype, jnp.integer)
             or generation.fp8_tensor_cores(generation.gpu_target().generation))
+
+
+def stepped(segments) -> tuple:
+    """A walk's `segments`, each `(step, lo, hi)`, each step taking its index through a marked call of a walk
+    step (`derivatives.WalkStep`): the one place a family's walk states its steps, which a count of its work
+    by emission reads (`emission`), whatever loop or rotation holds a step. The mark is its index's identity,
+    inlined as it lowers."""
+    marked = derivatives.marked(derivatives.WalkStep(), lambda index: index)
+    return tuple((functools.partial(_marked_step, step, marked), lo, hi) for step, lo, hi in segments)
+
+
+def _marked_step(step: Callable, marked: Callable, index, *rest):
+    return step(marked(index), *rest)
 
 
 class WholeSlots:
@@ -2215,7 +2238,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         segment walks its steps a step a trip or, `unrolled`, a rotation of the rings (`stepping`). A step
         reading `ahead` holds the next step's slot of those streams beside its own, so the rings hold two
         steps' slots at least (`Tiles.stages`' floor, `ahead_stages`); such a segment's first and last steps
-        are peeled from its loop (`peeled`)."""
+        are peeled from its loop (`peeled`). Each step marked (`stepped`)."""
+        segments = stepped(segments)
         stages = min(ring.stages for ring in streams.values())
         if not 0 <= in_flight < stages:
             raise ValueError(f"a walk keeps fewer steps' products in flight than its rings' {stages} slots, "

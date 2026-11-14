@@ -388,6 +388,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         if ahead:
             raise NotImplementedError(f"{self.name}'s walk reads no stream ahead")
         del first, in_flight, unrolled, interpret
+        segments = mosaic.stepped(segments)
         names = tuple(streams.views)
         carry = (start, self.started(shapes, initial))
         for step, lo, hi in segments:
