@@ -55,6 +55,74 @@ def recorded_rows(source):
     return rows
 
 
+VISION_RECORDING = TINY / "vision_recording.npz"
+"""The vision half's recording (tools/deepseek_v41_reference.py --record-vision): the release's span, prefill
+and teacher-forced steps over drawn image prompts its selections clear, summarized over seeds, the prompts
+in vision_rows.npz."""
+
+
+@pytest.fixture(scope="module")
+def vision_source(tmp_path_factory):
+    """The tiny with its vision half, loaded as the release ships the bundle (`vision_bundle`), and the
+    recording's image prompts, each of whose selections, the release's cleared when it was recorded,
+    Dew's plain forward over the whole prompt clears `selection_margins.MARGIN` by too, its prefill's and
+    every step's among them."""
+    import selection_margins
+
+    from dew.interop import Pretrained
+    from tools.deepseek_v41_numerics import unquantized, vision_bundle
+
+    loaded = Pretrained.load(vision_bundle(tmp_path_factory.mktemp("bundle")), dtype="float32",
+                             attention_impl="reference")
+    plain = loaded.model.clone(language_model=unquantized(loaded.model.language_model))
+    with np.load(TINY / "vision.npz") as fixture:
+        # The site's shape, alike for every prompt (tools/deepseek_v41_reference.py `vision_layout`).
+        shape = {"token_types": fixture["token_types"], "decode_prompt": fixture["decode_prompt"]}
+    with np.load(TINY / "vision_rows.npz") as stored:
+        prompts = [{name: stored[name][index] for name in stored.files}
+                   for index in range(len(stored["input_ids"]))]
+    selecting = jax.jit(functools.partial(selection_margins.capturing, plain))
+    for index, prompt in enumerate(prompts):
+        media = shape["token_types"] >= 0
+        indices = jnp.asarray(np.where(media, np.cumsum(media, -1) - 1, -1))
+        conditioning = {"pixel_values": jnp.asarray(prompt["pixels"])[None, None]}
+        _, captured = selecting(loaded.variables, jnp.asarray(prompt["input_ids"]), image_indices=indices,
+                                conditioning=conditioning)
+        smallest = selection_margins.margin(loaded.model_config, captured, f"image prompt {index}")
+        assert smallest > selection_margins.MARGIN, (
+            f"Dew's selections over image prompt {index} clear {smallest:.3g}, not MARGIN")
+    return loaded, prompts, shape
+
+
+def test_an_image_prompt_is_on_par_with_the_releases(vision_source):
+    """The vision half over drawn image prompts its selections clear: the span the image fills, the
+    prefill's logits with it and each teacher-forced text step's after it, through Dew's cache
+    (`vision_run`), on par with the release's from its float64 run's (check 1, the recording's), Dew's
+    own float64 run of the bundle its truth (row 354)."""
+    from model_support import float64_twin, recorded_site
+
+    from tools.deepseek_v41_numerics import vision_run
+
+    loaded, prompts, shape = vision_source
+    wide = float64_twin(loaded.model)
+
+    def leaves(model, variables, prompt) -> dict:
+        span, prompt_logits, steps = vision_run(model, variables, {**prompt, **shape})
+        return {"vision_span": span, "vision_prompt_logits": prompt_logits, "vision_decode_logits": steps}
+
+    def twin(inputs):
+        with jax.enable_x64(new_val=True):
+            return leaves(wide, float64_held(loaded.variables),
+                          {**inputs, "pixels": jnp.asarray(inputs["pixels"], jnp.float64)})
+
+    site = "deepseek v41 vision"
+    draw, recorded, truth, seeds = recorded_site(VISION_RECORDING, site, lambda seed: prompts[int(seed)],
+                                                 twin)
+    # Dew's run compiled as its users compile it, one program a draw's shape.
+    assert_as_exact(lambda index, inputs: leaves(loaded.model, loaded.variables, inputs), recorded, draw,
+                    site, seeds=seeds, truth_fn=truth)
+
+
 def held_to_the_release(plain, variables, rows, site: str, start: int = 0):
     """A recorded site's draw of `rows`, the release's evidence and truth over its declared seeds, Dew's
     plain forward in float64 past `start` its truth, held to the release's (`recorded_site`), and the

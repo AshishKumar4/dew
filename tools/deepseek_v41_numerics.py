@@ -425,27 +425,50 @@ def vision_bundle(directory: Path) -> Path:
     return directory
 
 
-def vision_run(model, variables, reference) -> tuple[jax.Array, jax.Array, np.ndarray]:
-    """The span the fixture's image fills, the prefill's logits with it and
-    the text steps' after it, with the quantizers off as the reference ran.
-    Every call is compiled once per shape."""
-    model = model.clone(language_model=unquantized(model.language_model))
+_VISION: dict[int, tuple] = {}
+"""`vision_run`'s compiled calls by the model's identity, each held with its model."""
+
+
+def _vision_programs(model) -> tuple:
+    """`vision_run`'s calls for `model`, the quantizers off as the reference ran, compiled once per shape
+    across every run of it, the variables an argument of each: the span, the cache, the prefill and a
+    step."""
+    held = _VISION.get(id(model))
+    if held is not None and held[0] is model:
+        return held[1:]
+    plain = model.clone(language_model=unquantized(model.language_model))
+    span = jax.jit(lambda variables, media: plain.apply(
+        variables, media, method=lambda module, pixels: module.conditioner(pixels)))
+    cache = jax.jit(lambda variables, rows: plain.apply(variables, rows, method=plain.init_cache,
+                                                        mutable=["cache"])[1], static_argnums=1)
+    prefill = jax.jit(lambda variables, cache, tokens, indices, media: plain.apply(
+        {**variables, **cache}, tokens, decode=True, image_indices=indices, conditioning=media,
+        mutable=["cache"]))
+    step = jax.jit(lambda variables, cache, tokens: plain.apply(
+        {**variables, **cache}, tokens, decode=True, mutable=["cache"]))
+    _VISION[id(model)] = (model, span, cache, prefill, step)
+    return span, cache, prefill, step
+
+
+def vision_run(model, variables, reference) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The span an image prompt's image fills (`reference`'s pixels, ids, token types and prompt length, as
+    the fixture's or a recording's prompt holds them), the prefill's logits with it and the text steps'
+    after it, with the quantizers off as the reference ran (`_vision_programs`): JAX's arrays, so a
+    caller's trace reads the whole run, its pixels and ids traced alike, its token types and length the
+    prompt's shape."""
+    span, cached, prefill, step = _vision_programs(model)
     ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
     media = reference["token_types"] >= 0
     image_indices = jnp.asarray(np.where(media, np.cumsum(media, -1) - 1, -1))
     conditioning = {"pixel_values": jnp.asarray(reference["pixels"])[None, None]}
-    span = jax.jit(lambda held, media: model.apply(
-        held, media, method=lambda module, pixels: module.conditioner(pixels)))(variables, conditioning)
-    cache = model.apply(variables, ids.shape[0], method=model.init_cache, mutable=["cache"])[1]
-    prompt_logits, cache = jax.jit(lambda cache, tokens, indices, media: model.apply(
-        {**variables, **cache}, tokens, decode=True, image_indices=indices, conditioning=media,
-        mutable=["cache"]))(cache, ids[:, :prompt], image_indices[:, :prompt], conditioning)
-    step = jax.jit(lambda cache, tokens: model.apply({**variables, **cache}, tokens, decode=True, mutable=["cache"]))
+    filled = span(variables, conditioning)
+    prompt_logits, cache = prefill(variables, cached(variables, ids.shape[0]), ids[:, :prompt],
+                                   image_indices[:, :prompt], conditioning)
     steps = []
     for position in range(prompt, ids.shape[1]):
-        logits, cache = step(cache, ids[:, position:position + 1])
-        steps.append(np.asarray(logits[:, 0]))
-    return span[0], prompt_logits, np.stack(steps, 1)
+        logits, cache = step(variables, cache, ids[:, position:position + 1])
+        steps.append(logits[:, 0])
+    return filled[0], prompt_logits, jnp.stack(steps, 1)
 
 
 def residuals() -> dict[str, object]:
