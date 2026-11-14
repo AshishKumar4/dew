@@ -1188,17 +1188,25 @@ def _resident(call: Call, held: Callable[[int], Held], staged: Callable[[int], t
 
 
 def _doubling_held(call: Call) -> list:
-    """A chunk's inverse by doubling as a thread holds it (`algebra.solved`): the inverse, its power and their
-    product beside the masks, merges in parts (`_merged`) splitting the inverse and the power into them; the
-    system, staged negated for the merges, held no longer. Two parts (`FAST_PARTS`, one accumulator in place,
-    `Issuer`) hold one operand's at a time: both at once stated 264 registers for a ranged bf16 call's solve
-    apart, which ptxas held spill-free at 255 on an H100 and an A100 (fast32e at cdcd620ef); three parts,
-    each product its own accumulator, both (as one, an fp32 call's solve spilled 1588 bytes a thread on an
-    H100, gaps4 at 97e2852bf)."""
+    """A chunk's inverse by doubling as a thread holds it (`algebra.doubled`): the inverse and a level's merge
+    products beside the masks, merges in parts (`_merged`) splitting their operands into them; the system,
+    staged negated for the merges, held no longer. The merges stage both operands through the issuer's
+    shared buffers (`_merging`) on every family. On tcgen05, whose products accumulate in tensor memory (no
+    `Family.takes_register_left` among its families), the masked first result is staged before the second
+    merge and read back after it, the inverse beside one result: counted three tiles there, the model stated
+    180 registers for Kimi delta attention's solve and 186 for the 27B gated delta net's where ptxas held
+    them spill-free at 128 and 144. On wgmma and mma.sync, which accumulate in registers, a third tile is the
+    measured need: counted two, the 27B's stated 146 and 176 on sm90 and sm80 where ptxas needed 152 and 192
+    (jsf-allcomp at d1398afdffa, jsf-solve-new, jsf-solve-new2). Two parts (`FAST_PARTS`, one accumulator in
+    place, `Issuer`) hold one operand's at a time: both at once stated 264 registers for a ranged bf16 call's
+    solve apart, which ptxas held spill-free at 255 on an H100 and an A100 (fast32e at cdcd620ef); three
+    parts, each product its own accumulator, both (as one, an fp32 call's solve spilled 1588 bytes a thread on
+    an H100, gaps4 at 97e2852bf)."""
     chunk = call.chunk
     merged = _merged(call)
     held = 1 if merged.parts == FAST_PARTS else 2
-    return ([f32(chunk, chunk)] * 3 + masks(chunk, chunk) * 2
+    tiles = 3 if call.family.takes_register_left else 2
+    return ([f32(chunk, chunk)] * tiles + masks(chunk, chunk) * 2
             + (held_tile(merged, chunk, chunk) * held if merged.parts > 1 else []))
 
 
