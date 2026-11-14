@@ -90,7 +90,7 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
     call's (row 5391: an expert projection over a normalized or scaled token stream).
     `scatter`, int32 `[rows]` of a grouped call, a permutation, writes the product's row `i` at each output's
     row `scatter[i]`: the slots in token order, the un-permute fused into Mosaic GPU's stores
-    (`mosaic.Scattered`), written by XLA elsewhere; the outputs' cotangents are read back through it, a
+    (`stores.Scattered`), written by XLA elsewhere; the outputs' cotangents are read back through it, a
     gather. `applied`, where given, is the prologue's operand already formed, `prologue(lhs, *sides)` rounded
     to `lhs`'s dtype, which its producer wrote (a paired product's epilogue, beside `lhs` and the sides it
     read): the product multiplies it in place of forming each tile, and every derivative is the prologue's

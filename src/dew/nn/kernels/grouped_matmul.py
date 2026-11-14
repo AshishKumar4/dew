@@ -47,7 +47,7 @@ from ..derivatives import marked_call_p
 from ..programs import equations
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import across, base, bundles, mosaic, report, resources, swizzling
+from .templates import across, base, bundles, mosaic, report, resources, stores, swizzling
 from .templates.axes import held as held_axes
 from .templates.gemm import mosaic_gpu, packed, pricing
 from .templates.gemm.hooks import NO_HOOKS, Hooks
@@ -676,7 +676,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     @staticmethod
     def _epilogue_registers(ba, config: mosaic_gpu.Tiles, stored: tuple) -> int:
         """The epilogue's values beyond the mainloop's held set: a family that stages its stores through
-        shared memory holds one staged chunk of the output converted (`mosaic.output_staging`) and the
+        shared memory holds one staged chunk of the output converted (`stores.output_staging`) and the
         store's control (`resources.CONTROL_REGISTERS`); then its side vectors, each side tile of the
         accumulator's shape in fp32 (a residual's: +94 at a 96-word accumulator, HOOKS1) and each output but
         the last held in its stored dtype while the next is computed (a second output: +45..57 at 128
@@ -686,7 +686,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         share, columns = config.share, pricing.tile_columns(config, family)
         staging = 0
         if not family.stores_through_registers:
-            chunk, _ = mosaic.output_staging(columns, stored)
+            chunk, _ = stores.output_staging(columns, stored)
             widest = max(jnp.dtype(dtype).itemsize for dtype in stored)
             staging = -(-share * chunk * widest // (4 * resources.THREADS)) + resources.CONTROL_REGISTERS
         if hooks.epilogue is None:

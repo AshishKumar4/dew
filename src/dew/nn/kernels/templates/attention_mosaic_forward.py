@@ -32,7 +32,15 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, operands, product, rings, swizzling
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    mosaic,
+    operands,
+    product,
+    rings,
+    stores,
+    swizzling,
+)
 from dew.nn.kernels.templates.attention import (
     Hooks,
     KeySpans,
@@ -203,10 +211,10 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     stage = None
     if residuals:
         # Read out of tensor memory a chunk of their columns at a time where the family keeps its sums there
-        # (`scopes_products`), through a stage of one chunk (`mosaic.staged_columns`, CUTLASS's sub-tiled
+        # (`scopes_products`), through a stage of one chunk (`stores.staged_columns`, CUTLASS's sub-tiled
         # epilogue): the 4B call's training program at width 256 on two consumers stages 231,564 bytes so,
         # of the block's 232,448, where the whole split sums' 131,072 refused it.
-        chunk = mosaic.staged_columns(value_width, (jnp.float32,)) if scopes_products(family) else value_width
+        chunk = stores.staged_columns(value_width, (jnp.float32,)) if scopes_products(family) else value_width
         stage = family.staged_memory((consumers, block_q, chunk), jnp.float32)
     elif not peaks and not _stores_through_query(family, width, value_width, dtype, out_dtype):
         stage = family.staged_memory((consumers, block_q, value_width), out_dtype or dtype)

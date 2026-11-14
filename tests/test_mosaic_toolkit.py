@@ -17,7 +17,7 @@ from jax.sharding import Mesh
 from kernel_compile import gate_generations
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import across, handoffs, mosaic, rings, swizzling
+from dew.nn.kernels.templates import across, handoffs, mosaic, rings, stores, swizzling
 
 pytestmark = pytest.mark.kernel
 
@@ -1255,7 +1255,7 @@ def _chained(a, b, c, *, m_warps: int, interpret: bool):
             out = issuer.product(first.astype(jnp.bfloat16), c_smem, (rows, RELAYED))
             plgpu.store(out_smem, out, optimized=False)
             mosaic.synced(interpret)
-            mosaic.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
+            stores.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
                               widest=resources.copied_rows(RELAYED, jnp.float32))
 
         swizzle = resources.widest_swizzle(jnp.bfloat16, RELAYED)
@@ -1319,7 +1319,7 @@ def _negated(a, b, *, path: str, interpret: bool):
                 # Written through registers, read by the store's copy.
                 plgpu.commit_smem()
             mosaic.synced(interpret)
-            mosaic.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(LANDED), 0, LANDED,
+            stores.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(LANDED), 0, LANDED,
                               copy=swizzling.coalesced, widest=resources.copied_rows(LANDED, jnp.float32))
 
         swizzle = resources.widest_swizzle(jnp.bfloat16, LANDED)
@@ -1398,7 +1398,7 @@ def _converted(codes, scale, *, generation_name: str, interpret, scaled: bool = 
             family.converted(codes_smem, into, interpret is not False,
                              row_scale=row_scale if scaled else None)
             mosaic.synced(interpret is not False)
-            mosaic.store_rows(into, out_gmem, 0, 0, jnp.int32(CODES[0]), 0, CODES[0],
+            stores.store_rows(into, out_gmem, 0, 0, jnp.int32(CODES[0]), 0, CODES[0],
                               copy=swizzling.coalesced, widest=resources.copied_rows(CODES[1], jnp.bfloat16))
 
         # Scoped as the family scopes a program's allocations (`Family.program_scoped`: across its thread
@@ -1682,3 +1682,14 @@ def test_a_row_shift_takes_each_row_from_its_groups_row_shift_up(shift):
     rows = np.arange(64)
     kept = (rows % 16 - shift >= 0) & (rows % 16 - shift < 16)
     np.testing.assert_array_equal(out[kept], tile[rows[kept] - shift])
+
+
+def test_a_product_issued_within_a_staged_block_is_refused():
+    """A warpgroup MMA's or tcgen05's product reads shared memory asynchronously, so one issued while a
+    consumer's staged tiles are still unpublished (`Family.staged_together`) is refused, not left to read them
+    unfenced."""
+    from dew.nn.kernels.templates import mosaic
+    from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
+
+    with pytest.raises(ValueError), WGMMA.staged_together():
+        mosaic.committed()

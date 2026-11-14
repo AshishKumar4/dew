@@ -551,6 +551,7 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         role wrote, tcgen05's TS form: FlashAttention 4's P·V), the right from shared memory, issued over its
         `topology`'s CTAs; `released`, where given, a barrier the product arrives at once it has read its
         operands (a stage's release, which a walk of its own gives back by it: attention's on Blackwell)."""
+        mosaic.issuing()
         left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
         plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, released,
                           accumulate=acc.accumulate if accumulate else False, **self.topology.issued())
@@ -562,6 +563,7 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         and their tensor memory: both copied in, then the products read them (`tcgen05_mma`'s `a_scale`,
         `b_scale`)."""
         (a_tiles, a_scale), (b_tiles, b_scale) = scales
+        mosaic.issuing()
         plgpu.async_copy_scales_to_tmem(a_tiles, a_scale)
         plgpu.async_copy_scales_to_tmem(b_tiles, b_scale)
         plgpu.tcgen05_mma(_tensor_memory(acc), lhs, rhs, a_scale=a_scale, b_scale=b_scale,
@@ -1276,6 +1278,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
 
     def _issued(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True) -> Accumulator:
         """`lhs @ rhs` issued into tensor memory's `acc` (`products`), not yet awaited."""
+        mosaic.issuing()
         left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
         if rhs.shape[1] < PADDED:
             rhs = self._padded(rhs)
