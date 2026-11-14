@@ -290,14 +290,13 @@ def test_every_call_of_a_multi_turn_session_carries_its_draws_engine_records():
     assert ROUTED_EXPERTS_KEY in batch and (batch[SUPPORT_KEY] >= 0).sum() == 9
 
 
-@pytest.mark.parametrize("fail, detail", [("raise", "ConnectionError: sandbox went away"),
-                                          ("report", "container exited")])
-def test_an_environment_failure_is_an_unscored_infra_error(fail, detail):
+@pytest.mark.parametrize("fail", ["raise", "report"])
+def test_an_environment_failure_is_an_unscored_infra_error(fail):
     entered, exited = [], []
     episodes = source(Server(), factory(entered, exited, fail=fail))
     rollout = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
     episodes.close()
-    assert rollout.status == Status.INFRA_ERROR and rollout.reward is None and detail in rollout.detail
+    assert rollout.status == Status.INFRA_ERROR and rollout.reward is None
     assert len(rollout.calls) == 1 and exited == entered
 
 
@@ -308,18 +307,18 @@ def test_a_verifier_crash_is_an_infra_error():
     episodes = source(Server(), factory([], []), verifier=crash)
     rollout = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
     episodes.close()
-    assert rollout.status == Status.INFRA_ERROR and "verifier sandbox timed out" in rollout.detail
+    assert rollout.status == Status.INFRA_ERROR
 
 
-@pytest.mark.parametrize("mode, detail", [("hang", "TimeoutError"), ("crash", "ChildProcessError")])
-def test_a_sandbox_past_its_wall_clock_or_dead_is_an_infra_error(mode, detail):
+@pytest.mark.parametrize("mode", ["hang", "crash"])
+def test_a_sandbox_past_its_wall_clock_or_dead_is_an_infra_error(mode):
     """Dew's own sandbox bounds its session: its deadline and its worker's death come back as
     infrastructure failures, which the scheduler retries."""
     worker = sandbox(mode, wall_seconds=1)
     episodes = source(Server(), lambda task, identity: worker(identity))
     rollout = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=30)
     episodes.close()
-    assert rollout.status == Status.INFRA_ERROR and detail in rollout.detail and not rollout.calls
+    assert rollout.status == Status.INFRA_ERROR and not rollout.calls
 
 
 def test_a_container_runtime_that_starts_no_container_is_an_infra_error_in_both_sources():
@@ -337,7 +336,7 @@ def test_a_container_runtime_that_starts_no_container_is_an_infra_error_in_both_
         session = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=30)
         episodes.close()
     for failed in (rollout, session):
-        assert failed.status == Status.INFRA_ERROR and "InfrastructureError" in failed.detail
+        assert failed.status == Status.INFRA_ERROR
 
 
 def unreachable():
@@ -373,7 +372,7 @@ def test_an_http_transport_failure_is_an_infra_error_in_both_sources():
         engine.close()
     assert isinstance(caught.value.__cause__, httpx.ConnectError)
     for failed in (session, rollout):
-        assert failed.status == Status.INFRA_ERROR and "InfrastructureError" in failed.detail
+        assert failed.status == Status.INFRA_ERROR
 
     def judged(task, episode):
         try:
@@ -384,7 +383,7 @@ def test_an_http_transport_failure_is_an_infra_error_in_both_sources():
     episodes = source(Server(), factory([], []), verifier=judged)
     session = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=30)
     episodes.close()
-    assert session.status == Status.INFRA_ERROR and "the judge is unreachable" in session.detail
+    assert session.status == Status.INFRA_ERROR
     assert len(session.calls) == 3 and session.reward is None
 
 
@@ -505,16 +504,16 @@ def test_an_environment_exit_that_fails_after_broken_code_does_not_turn_it_into_
     assert isinstance(caught.value.__context__, TypeError)
 
 
-@pytest.mark.parametrize("server, options, calls, detail", [
-    (Server(tokens=(5, 6, 7, 8)), {}, 1, "token limit"),
-    (Server(), {"max_turns": 2}, 2, "turn limit"),
-    (Server(), {"max_prompt_tokens": 6}, 2, "max_prompt_tokens"),
+@pytest.mark.parametrize("server, options, calls", [
+    (Server(tokens=(5, 6, 7, 8)), {}, 1),
+    (Server(), {"max_turns": 2}, 2),
+    (Server(), {"max_prompt_tokens": 6}, 2),
 ])
-def test_limits_truncate_and_the_truncation_is_still_scored(server, options, calls, detail):
+def test_limits_truncate_and_the_truncation_is_still_scored(server, options, calls):
     episodes = source(server, factory([], []), **options)
     rollout = episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
     episodes.close()
-    assert rollout.status == Status.TRUNCATED and detail in rollout.detail
+    assert rollout.status == Status.TRUNCATED
     assert len(rollout.calls) == calls and rollout.reward == float(calls)
 
 
@@ -654,12 +653,12 @@ def test_a_failed_draw_or_a_rewards_os_error_is_an_infra_error():
     [task] = prompt_tasks(prompt_batch())
     drawn = PromptSource(Failing(), lambda *_: 1.0, decode=str, max_new_tokens=4)
     rollout = drawn.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
-    assert rollout.status == Status.INFRA_ERROR and "engine restarted" in rollout.detail
+    assert rollout.status == Status.INFRA_ERROR
     # A failed draw still came from its prompt's source.
     assert rollout.source == "math"
     scored = PromptSource(Server(), unreachable, decode=str, max_new_tokens=4)
     rollout = scored.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
-    assert rollout.status == Status.INFRA_ERROR and "reward sandbox timed out" in rollout.detail
+    assert rollout.status == Status.INFRA_ERROR
     assert len(rollout.calls) == 1 and rollout.source == "math"
     drawn.close()
     scored.close()

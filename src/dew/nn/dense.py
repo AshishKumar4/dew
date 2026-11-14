@@ -96,15 +96,20 @@ def _accumulated_dot_general(lhs, rhs, dimension_numbers, precision=None, prefer
 
 
 def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dimensions, bias: Array | None,
-            shaped, stored: Array | None = None):
+            shaped, stored: Array | None = None, *, taken: Callable | None = None):
     """The layer's product of `inputs` and `kernel` over `dimensions` as flax takes it, plus `bias`
     reshaped by `shaped` to broadcast over it (`biased`: added as flax adds it, its gradient summed
     at fp32, in float64 on a CPU under Dew's tests); where the layer computes in a 16-bit dtype and its
-    bias is `stored` at fp32, the product and that bias rounded once (`_rounds_once`)."""
+    bias is `stored` at fp32, the product and that bias rounded once (`_rounds_once`). `taken`, where
+    given, takes the product, `taken(product)` of `product(inputs, kernel)`, as its caller forms it (a
+    joined projection's kernels joined on each device's rows, `dew.nn.joined.joined_dense`; `kernel` then
+    one of them, its dtype the product's), the bias added past it as here."""
+    take = taken or (lambda product: product(inputs, kernel))
     if bias is not None and _rounds_once(layer, inputs, kernel, bias, stored):
-        widened = _widened(inputs, kernel, dimensions, layer.precision)
+        widened = take(lambda inputs, kernel: _widened(inputs, kernel, dimensions, layer.precision))
         return biased(widened, shaped(stored)).astype(inputs.dtype)
-    product = _product(layer)(inputs, kernel, dimensions, precision=layer.precision)
+    product = take(lambda inputs, kernel: _product(layer)(inputs, kernel, dimensions,
+                                                          precision=layer.precision))
     if bias is None:
         return product
     return biased(product, shaped(bias))

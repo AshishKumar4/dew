@@ -655,15 +655,18 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         sides are a share's broadcasts, held within it. The forward's products take the result from
         registers (`mosaic_gpu._gmm_step`), each step's held until its products are done, so beside it each
         step its family keeps in flight (`Family.in_flight`) still holds its own; the kernel gradient
-        rewrites its stage (`STAGED_ROWS`) and holds none."""
+        rewrites its stage (`STAGED_ROWS`) and holds none; a family's own role rewriting it
+        (`_prologue_rewritten`) transforms a role's rows of the stage at a time (`mosaic_gpu._prologue_stage`)
+        and holds none past it."""
         hooks = ba.arguments['hooks']
         if hooks.prologue is None:
             return 0
         tiles = sum(len(held_axes(axes)) > 1 for axes in hooks.prologue_axes)
-        share = config.share * config.block_k
         stored = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
-        in_flight = 0 if self.STAGED_ROWS else family.in_flight
+        rewritten = self._prologue_rewritten(ba, family)
+        share = (family.rewriting.role_rows if rewritten else config.share) * config.block_k
+        in_flight = 0 if self.STAGED_ROWS or rewritten else family.in_flight
         # A family whose products read registers casts the result into its left operand's fragments
         # (`MmaIssuer._left`) beside the result itself: a cast forward's least spill-free cap on sm80 was 136
         # at 64 x 128 x 64, its model 127 without the cast's copy (EM-least4).
@@ -767,7 +770,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         stage in a role of its own, `rewrites_in_persist`) where its consumers issue their products."""
         dtype = ba.arguments['tokens'].dtype
         summed = bool(ba.arguments.get('exact_sums'))
-        prepared = (ba.arguments['hooks'].prologue is not None
+        prepared = ((ba.arguments['hooks'].prologue is not None and not self._prologue_rewritten(ba, family))
                     or (self.STAGED_ROWS and not self.unstaged(ba) and not self.rewritten(ba, family))
                     or (summed and not family.sums_in_persist))
         # Gathered rows (`gmm_call`'s `gather`) are a ring family's producer's gather, no prologue rewriting
@@ -915,9 +918,17 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def rewritten(self, ba, family: mosaic.Family) -> bool:
         """Whether the launch's staged rows are rewritten by `family`'s own role (`rewrites_in_persist`): its
         own loads' rows, never rows its tables gather (`mosaic_gpu.tgmm`'s `gather`, which a consumer's
-        cp.async gather stages: the fed rings'), nor rows read as loaded (`unstaged`)."""
+        cp.async gather stages: the fed rings'), nor rows read as loaded (`unstaged`); or a product's rows
+        its prologue rewrites there (`_prologue_rewritten`)."""
         tables = (ba.arguments.get('gather'), ba.arguments.get('scatter'))
-        return self.STAGED_ROWS and mosaic_gpu.rewrites(family, self.K_MAJOR, tables, self.unstaged(ba))
+        return ((self.STAGED_ROWS and mosaic_gpu.rewrites(family, self.K_MAJOR, tables, self.unstaged(ba)))
+                or self._prologue_rewritten(ba, family))
+
+    def _prologue_rewritten(self, ba, family: mosaic.Family) -> bool:
+        """Whether a product's prologue rewrites its rows stage in `family`'s own role
+        (`mosaic_gpu.prologue_rewritten`: tcgen05's rewriting warpgroup); a kernel gradient's prologue, whose
+        consumers prepare their halves of each step's rows (`STAGED_ROWS`), never."""
+        return not self.STAGED_ROWS and mosaic_gpu.prologue_rewritten(family, ba.arguments['hooks'].prologue)
 
     def unstaged(self, ba) -> bool:
         """Whether a kernel gradient's rows stage is read as loaded (`mosaic_gpu.rows_unstaged`): a dense call

@@ -647,8 +647,9 @@ def _emitted_forms(family) -> set[str]:
     paired ones where its launches take a pair whole (`Family.takes_pairs`), the FP8 ones where its products
     take FP8 (`Family.fp8_formats`); where its consumers do not issue their products, none whose step prepares
     them (`Family.issues_in_consumers`: a kernel gradient's consumer zeroes its stage's neighbouring rows
-    first, an exactly summed step takes its product apart); at every projection, its widths padded to whole
-    tiles where they are not (`grouped_matmul._Mosaic._aligned`)."""
+    first, an exactly summed step takes its product apart) but a product's prologue its family's own role
+    rewrites the stage by (`mosaic_gpu.prologue_rewritten`, tcgen05's); at every projection, its widths
+    padded to whole tiles where they are not (`grouped_matmul._Mosaic._aligned`)."""
     if family is None:
         return set()
     tiled = () if family.takes_prologue_tiles else PROLOGUE_TILED_FORMS
@@ -657,9 +658,10 @@ def _emitted_forms(family) -> set[str]:
              *(FP8_FORMS if family.fp8_formats else ())}
     if not family.issues_in_consumers:
         # A dense kernel gradient's step prepares nothing (`mosaic_gpu.rows_unstaged`); a prologue's does.
+        rewritten = mosaic_gpu.prologue_rewritten(family, lambda rows: rows)
         forms = {form for form in forms
                  if (form.startswith("dense") or ("kernel gradient" not in form and form not in EXACT_FORMS))
-                 and form not in PROLOGUE_FORMS}
+                 and (form not in PROLOGUE_FORMS or (rewritten and "kernel gradient" not in form))}
     return forms
 
 
@@ -792,13 +794,17 @@ def test_a_b200s_dense_kernel_gradient_runs_no_rewriting_role():
 
 @functools.cache
 def _contract_cases(generation_name: str, form: str | None = None) -> list:
-    """Each launch form (or `form` alone) at each consumer count of a family's contract
+    """Each launch form of a family's contract (`_family_forms`; or `form` alone) at each consumer count
     (`_gemm_mainloop_cases(every_consumer_count=True)`), at the first projection whose rows give it a legal
-    tile (two consumers' rows past a few rows a MoE expert takes, mma.sync's)."""
+    tile (two consumers' rows past a few rows a MoE expert takes, mma.sync's): a form only another bundle of
+    the generation emits (a B200's gated forward, tcgen05's rewritten prologue beside mma.sync's contract)
+    is that bundle's, compiled at the gate's picks."""
     found: dict = {}
+    contract = _family_forms(generation_name)
     for shape in GEMM_SHAPES:
         for case in _gemm_mainloop_cases(generation_name, shape, every_consumer_count=True, form=form):
-            found.setdefault((case.form, case.consumers), case)
+            if case.form in contract:
+                found.setdefault((case.form, case.consumers), case)
     return list(found.values())
 
 
