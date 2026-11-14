@@ -516,6 +516,37 @@ class WholeSlots:
         """Every slot acquired: the step's blocks are its whole."""
 
 
+class Beside:
+    """A step's slots (`Slots`) beside its persistent tile's once streams' (`Family.persist`'s `once`), by
+    stream name: a once stream's its tile's slot, which the tile gives back, every other the step's own."""
+
+    def __init__(self, slots: "Slots", once: dict):
+        self._slots, self._once = slots, once
+        self.more, self.first = slots.more, slots.first
+
+    def __getitem__(self, name: str):
+        return self._once[name] if name in self._once else self._slots[name]
+
+    def release(self, name: str) -> None:
+        if name not in self._once:
+            self._slots.release(name)
+
+    def opened(self, name: str):
+        return self._slots.opened(name)
+
+    def following(self, name: str):
+        return self._slots.following(name)
+
+    def done(self) -> None:
+        self._slots.done()
+
+    def held(self) -> None:
+        self._slots.held()
+
+    def acquire_all(self) -> None:
+        self._slots.acquire_all()
+
+
 class Slots:
     """A walk step's operand slots (`Family.walk`), by stream name: each acquired when the step first reads
     it (`slots[name]`) and released at the step's end, once its MMAs are done, unless the step `release`s it

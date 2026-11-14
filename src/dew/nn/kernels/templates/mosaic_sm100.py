@@ -772,31 +772,8 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                                     unrolled=unrolled, once=held_once)
 
             def epilogue(index):
-                store = self._stores(smems, index)
-
-                def visit(counter, active, steps, views, tile, done_turns):
-                    del counter, views
-
-                    @pl.when(active)
-                    def _():
-                        into, turn = self._awaited(tensor, held, running, done_turns, steps, summed)
-
-                        def walk(step, start, shapes, *, initial=None):
-                            # The products issued it: the tile's accumulators (its running sums), done.
-                            del step, initial
-                            if tuple(shapes) != accumulators:
-                                raise ValueError(f"a tile walks {shapes}, its launch stated {accumulators}")
-                            return start, into
-
-                        finish(index, tile, issue(index, tile, walk, active=True), store, active=True)
-                        if turn is not None:
-                            tensor.release(turn)
-                        else:
-                            plgpu.wait_load_tmem()
-
-                    pl.when(~active)(lambda: finish(index, tile, issue(index, tile, persistent.unwalked(self),
-                                                                       active=False), store, active=False))
-
+                visit = self._read_out(self._stores(smems, index), index, tensor, held, running, issue,
+                                       finish, summed=summed, accumulators=accumulators)
                 persistent.tiled(tiles, schedule, visit, axis=axis, turns=windows)
                 plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
@@ -828,6 +805,36 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         # Each ring's slots' rewrites published, a barrier of the ring's own (`prepared`).
         pl.run_scoped(scoped, accumulated, *_publish_barriers(rewrites), *staging, collective_axes="wg")
 
+    def _read_out(self, store: Callable, index, tensor: "Tensor", held: Callable, running: tuple,
+                  issue: Callable, finish: Callable, *, summed: int, accumulators: tuple) -> Callable:
+        """`persist`'s epilogue warpgroup's visit of a tile (`persistent.tiled`'s): an active tile's
+        accumulators awaited (`_awaited`), its template's `finish` storing them by `store`, its turn then
+        given back; an inactive tile finished from a walk of no steps."""
+        def visit(counter, active, steps, views, tile, done_turns):
+            del counter, views
+
+            @pl.when(active)
+            def _():
+                into, turn = self._awaited(tensor, held, running, done_turns, steps, summed)
+
+                def walk(step, start, shapes, *, initial=None):
+                    # The products issued it: the tile's accumulators (its running sums), done.
+                    del step, initial
+                    if tuple(shapes) != accumulators:
+                        raise ValueError(f"a tile walks {shapes}, its launch stated {accumulators}")
+                    return start, into
+
+                finish(index, tile, issue(index, tile, walk, active=True), store, active=True)
+                if turn is not None:
+                    tensor.release(turn)
+                else:
+                    plgpu.wait_load_tmem()
+
+            pl.when(~active)(lambda: finish(index, tile, issue(index, tile, persistent.unwalked(self),
+                                                               active=False), store, active=False))
+
+        return visit
+
     def _issued(self, rings, issue: Callable, tensor: "Tensor", held: Callable, running: tuple, *,
                 summed: int, interpret: bool, unrolled: bool, once: dict) -> Callable:
         """`persist`'s product warp's visit of a tile (`persistent.tiled`'s): each active tile's windows (its
@@ -848,7 +855,8 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
                 def walked(lo, hi, start, shapes, accumulators: tuple, step):
                     def stepped(at, slots, carry, accs):
-                        return step(at - counter, {**slots, **once_slots}, carry, accs)
+                        return step(at - counter, mosaic.Beside(slots, once_slots) if once_slots else slots,
+                                    carry, accs)
 
                     return self.walk(rings, ((stepped, lo, hi),), start, shapes, interpret,
                                      initial=accumulators, unrolled=unrolled)
