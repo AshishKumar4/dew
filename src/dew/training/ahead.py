@@ -67,7 +67,7 @@ from jaxlib import xla_client
 from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
 from dew._devices import COMPILE_ONLY_MEMORY, device_memory
-from dew._records import JSON, record
+from dew._records import JSON, boolean, record
 from dew.batch import Batch
 from dew.nn.kernels import options
 from dew.nn.kernels.generation import (
@@ -111,9 +111,14 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-_UNTUNED = ("this step was compiled ahead into a file for %s GPUs without their tuned choices, XLA's "
-            "untuned program; a run's compile on such a GPU tunes it, and a job's prepare into the "
-            "persistent cache takes the choices such runs wrote")
+UNTUNED = ("this step was compiled ahead into a file for %s GPUs without their tuned choices, XLA's "
+           "untuned program, whose products ran up to 48 times slower on a GH200 (UB-4792-AHEAD-TIME): a run "
+           "handed it compiles its step on its GPUs as a run without a file does, and keeps their tuned "
+           "choices beside its compilation cache. To train from a file, compile it ahead over the GPU host's "
+           "own topology (--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY) with that host's compilation "
+           "cache, once a run there has tuned the step")
+"""What a step file compiled without its GPU kind's tuned choices (`AheadOfTime.tuned`) is said as, where it
+is saved and where a run is handed it (`dew.training.trainer.Trainer`)."""
 
 @functools.cache
 def compile_only_tpus(topology: str) -> tuple:
@@ -319,10 +324,6 @@ class AheadOfTime:
     step traces with these in place of its own (`Trainer`'s `ahead`), which could spread a projection
     the step does not and lower another program, and its checkpoints record their bandwidths
     (`link_figures`)."""
-    tuned: bool
-    """Whether its compile took the GPU kind's tuned choices, as the device's own compile makes them
-    (`report.autotuned`): a step compiled on compile-only GPUs outside a prepare into the cache is XLA's
-    untuned program there, which its save and its load say; a TPU's is the device's own."""
     target: GpuTarget | None = None
     """The facts of the GPU its kernels' launches were derived for (`gpu_target` within `assumed`), which a
     run handed the step reproduces it under (`handed`, `derived_for`): another SKU of the generation, its
@@ -391,24 +392,43 @@ class AheadOfTime:
                          "traces with the step's", differ, {axis: self.links[axis] for axis in differ})
         return self.links
 
+    @property
+    def tuned(self) -> bool:
+        """Whether its compile took the GPU kind's tuned choices, as the device's own compile makes them, as
+        its plan records it (`autotuned`, `report.autotuned`): a step compiled on compile-only GPUs outside
+        a prepare is XLA's untuned program there, which its save says, and a run handed it compiles its
+        step on its devices in its place (`runnable`); a TPU's is the device's own."""
+        return boolean(record(self.plan, "plan")["autotuned"], "autotuned")
+
+    def runnable(self, devices: Sequence) -> AheadOfTime | None:
+        """The step a run on `devices` handed it runs: this one where it is tuned, or where the run's own
+        compile would take no tuned choice either (`report.autotuned`: XLA_FLAGS setting the autotuner's
+        level 0, as a repeatable lane's do), its products then the run's own; None where its XLA products
+        are untuned (`tuned`) and the run's would be tuned, which the run then compiles on its devices as
+        without a file, said once (`UNTUNED`). A step of another target is refused first, tuned or not
+        (`held`): no run takes it."""
+        self.held(devices)
+        if self.tuned or not report.autotuned(devices):
+            return self
+        _log.warning(UNTUNED, self.generation)
+        return None
+
     def save(self, path: str | Path) -> None:
         """Write the step to `path`, for `load` on a host of its topology."""
         if not self.tuned:
-            _log.warning(_UNTUNED, self.generation)
+            _log.warning(UNTUNED, self.generation)
         Path(path).write_bytes(filed(self))
 
     @staticmethod
     def load(path: str | Path) -> AheadOfTime:
         """The step `save` wrote to `path`."""
         step = _saved(path, AheadOfTime, "step")
-        if "starts" not in vars(step) or "tuned" not in vars(step):
+        if "starts" not in vars(step) or "autotuned" not in record(step.plan, "plan"):
             raise ValueError(f"{path} holds a step compiled ahead before steps carried their start's "
-                             "programs (`starts`) and said whether XLA tuned them (`tuned`); compile it "
+                             "programs (`starts`) and said whether XLA tuned them (`autotuned`); compile it "
                              "ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
         _current(path, "step", [step.executable, *sampled])
-        if not step.tuned:
-            _log.warning(_UNTUNED, step.generation)
         return step
 
     def loaded(self) -> jax.stages.Compiled:
@@ -416,11 +436,16 @@ class AheadOfTime:
         `generation`: called with the state and batch the step was compiled for, it runs the step. It is
         admitted as a compiled one is (`dew.communicators.admit`)."""
         found = jax.devices()
+        self.held(found)
+        return self.executable.loaded(found)
+
+    def held(self, devices: Sequence) -> None:
+        """Refused, naming what differs, where `devices` are not the target the step was built for
+        (`BuildTarget.held`), or the step recorded none."""
         if self.built is None:
             raise ValueError("this step was compiled ahead before steps recorded the target they were built "
                              "for, which a process loading it must be; compile it ahead again")
-        self.built.held(found)
-        return self.executable.loaded(found)
+        self.built.held(devices)
 
 
     def derived_for(self, device: GpuTarget) -> GpuTarget:
@@ -989,11 +1014,19 @@ class AheadTarget:
         batch = first_step_batch(trainer, loader, steps, examples, resume)
         topology = None if self.topology is None else Path(self.topology).read_bytes()
         if self.path is not None and not self.phases:
-            # As XLA compiles it for its memory and text, untuned on compile-only GPUs, which the step's
-            # record, its save and its load say: a host's autotune cache holds some of a kind's choices or
-            # none, and a step a device runs takes all of them or none (`report.for_devices`, which the
-            # persistent cache's steps take).
-            ahead = _compiled_ahead(trainer, batch, frontier=self.frontier, plan=plan, topology=topology)
+            # Over a host's own GPUs (`topology`), as its run compiles it: every tuned choice the GPU kind's
+            # runs left beside the compilation cache, all or none (`report.for_devices`), so its run takes
+            # it. Over a generation's canonical GPUs, XLA's untuned program, read for its plan and its
+            # kernels, which its record and its save say and a run compiles in its place (`runnable`).
+            with report.for_devices() if self.topology is not None else contextlib.nullcontext():
+                try:
+                    ahead = _compiled_ahead(trainer, batch, frontier=self.frontier, plan=plan,
+                                            topology=topology)
+                except report.Untuned as untuned:
+                    raise ValueError(
+                        "this step is not preparable on this host until a run on such a GPU has tuned it, "
+                        "leaving its choices beside the compilation cache: run it there once, then compile "
+                        f"it ahead again ({untuned})") from untuned
             ahead.save(self.path)
             return CompiledAhead(self.path, ahead)
         # Into the persistent cache the run reads alone: the steps of the phases named, or the first step
@@ -1366,7 +1399,7 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
         flops=step_flops(compiled),
         argument_bytes=memory.argument, output_bytes=memory.output, alias_bytes=memory.alias,
         temp_bytes=memory.temp, code_bytes=memory.generated_code, plan=trainer.plan, planned_seconds=seconds,
-        capacity=capacity, links=dict(trainer.links), tuned=report.autotuned(devices), target=target,
+        capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices), capacity, topology=topology),
         refusals=report.refused_launches(), sampled=sampled, starts=starts)
 
