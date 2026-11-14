@@ -339,7 +339,12 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
     elif shape.kind == 'loglinear':
         from fla.ops.log_linear_attn import chunk_log_linear_attn
 
-        leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'], given['scales']]
+        # The level weights in the operands' dtype, as a bf16 model's layer hands them (its `L` parameter's,
+        # log_linear_mamba2.py:105): fla-core 0.5.2's forward scales its scores by them after rounding to the
+        # queries' dtype and dots them with the values (chunk.py:194-199), which an fp32 weight makes an fp32
+        # operand beside bf16 values, refused by Triton.
+        leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'],
+                  given['scales'].to(bf16)]
 
         def run(q, k, v, g, scales):
             # fla-core 0.5.2's kernel takes one key group (its forward refuses any other, chunk.py:1117) and
