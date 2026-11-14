@@ -145,10 +145,10 @@ def test_the_cumsum_kernel_is_flas_chunk_local_cumsum(reverse, columns):
     def summed(g):
         # Each chunk's inclusive sum in XLA at the decay's width: from the end, the tokens scaled first,
         # forward, scaled after (fla's own order).
+        if not reverse:
+            return support.fla_prefix(g)
         tokens = g.reshape(2, 3, 64, 3, *columns)
-        if reverse:
-            return jnp.flip(jnp.cumsum(jnp.flip(tokens * fla_gdn.RCP_LN2, 2), axis=2), 2).reshape(g.shape)
-        return (jnp.cumsum(tokens, axis=2) * fla_gdn.RCP_LN2).reshape(g.shape)
+        return jnp.flip(jnp.cumsum(jnp.flip(tokens * fla_gdn.RCP_LN2, 2), axis=2), 2).reshape(g.shape)
 
     kernel = functools.partial(cumulated, scale=fla_gdn.RCP_LN2, reverse=reverse, interpret=INTERPRETED)
     label = site_label("chunk_local_cumsum", shape, jnp.float32, "reverse" if reverse else "forward")

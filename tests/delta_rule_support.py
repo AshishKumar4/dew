@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from fla_gdn_support import fla_prefix
 from float64_terms import float64_terms
 from reference_error import widened, with_gradients
 
@@ -485,14 +486,14 @@ def _per_document(block, cuts) -> list[np.ndarray]:
 
 
 def plain_prefix(g, chunk: int = CHUNKED):
-    """`g` re-cut from the port's plain fp32 prefix (`recurrence.cumulated`, fla's): each chunk
+    """`g` re-cut from the port's plain fp32 prefix (`recurrence.cumulated`, fla's, `fla_prefix`): each chunk
     of `chunk` tokens from the row's start summed, then scaled to base 2 (`fla_gdn.RCP_LN2`), each
     token's decay the difference of its prefix and the one before carried back to natural log. The
     portable rule, rebuilding the prefixes, then takes every range as the port does, the difference
     of two rounded base-2 prefixes. Its gradient passes to `g` unchanged."""
     batch, length = g.shape[:2]
     padded = jnp.pad(g, ((0, 0), (0, -length % chunk), *((0, 0),) * (g.ndim - 2)))
-    prefix = jnp.cumsum(padded.reshape(batch, -1, chunk, *g.shape[2:]), axis=2) * fla_gdn.RCP_LN2
+    prefix = fla_prefix(padded, chunk).reshape(batch, -1, chunk, *g.shape[2:])
     earlier = jnp.pad(prefix[:, :, :-1], ((0, 0), (0, 0), (1, 0), *((0, 0),) * (g.ndim - 2)))
     recut = ((prefix - earlier) / fla_gdn.RCP_LN2).reshape(padded.shape)[:, :length]
     return g + jax.lax.stop_gradient(recut - g)

@@ -145,8 +145,21 @@ def import_path(member: Importable) -> str:
     return f"{module}:{name}"
 
 
+MOVED: Mapping[str, str] = {
+    f"dew.inputs.encoders:{name}": f"dew.interop.encoders:{name}"
+    for name in ("CLIPText", "T5Text", "HFAudio")
+} | {
+    f"dew.inputs.diffusion:{name}": f"dew.interop.conditioners:{name}"
+    for name in ("DiffusionConditioner", "QwenImageConditioner", "HiddenStatesConditioner", "WanConditioner")
+}
+"""Import paths an earlier Dew recorded, by the path each names now: the encoders that bind a released
+checkpoint, dew.interop's since row 5996, which a run's record or its layout named under dew.inputs. The one
+place a recorded path is translated (`imported`)."""
+
+
 def imported(path: str) -> Callable[..., Configured]:
-    """The class or function an import path names, importing its module.
+    """The class or function an import path names, importing its module; a path an earlier Dew recorded,
+    as it names it now (`MOVED`).
 
     Records arrive from the Hub, and importing a module runs its top level,
     so a record imports only Dew's own modules and modules already imported.
@@ -154,7 +167,7 @@ def imported(path: str) -> Callable[..., Configured]:
     them; a run of a package not yet imported loads once the caller trusts
     the package (`import_trusted`), as `trust_remote_code` does in
     transformers."""
-    module, _, name = path.partition(":")
+    module, _, name = MOVED.get(path, path).partition(":")
     if not module or not name:
         raise ValueError(f"{path!r} is not an import path, `module:Qualified.name`")
     if module != "dew" and not module.startswith("dew.") and module not in sys.modules:
@@ -1490,13 +1503,13 @@ solvers: Aliases[type[Solver], Solver] = Aliases("solver", {
 # table admits an encoder of any, which only the encoder's run reads.
 encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {
     "char_table": "dew.inputs.encoders:CharTable",
-    "clip_text": "dew.inputs.encoders:CLIPText",
-    "diffusion_text": "dew.inputs.diffusion:DiffusionConditioner",
-    "hf_audio": "dew.inputs.encoders:HFAudio",
-    "hidden_states_text": "dew.inputs.diffusion:HiddenStatesConditioner",
-    "qwen_image_text": "dew.inputs.diffusion:QwenImageConditioner",
-    "t5": "dew.inputs.encoders:T5Text",
-    "wan_text": "dew.inputs.diffusion:WanConditioner",
+    "clip_text": "dew.interop.encoders:CLIPText",
+    "diffusion_text": "dew.interop.conditioners:DiffusionConditioner",
+    "hf_audio": "dew.interop.encoders:HFAudio",
+    "hidden_states_text": "dew.interop.conditioners:HiddenStatesConditioner",
+    "qwen_image_text": "dew.interop.conditioners:QwenImageConditioner",
+    "t5": "dew.interop.encoders:T5Text",
+    "wan_text": "dew.interop.conditioners:WanConditioner",
 }, base="dew.inputs.condition:ConditionEncoder")
 metrics: Aliases[Callable[..., Metric], Metric] = Aliases("metric", {
     "accuracy": "dew.decision.metrics:Accuracy",

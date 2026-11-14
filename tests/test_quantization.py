@@ -960,7 +960,7 @@ def test_a_diffusion_step_compiles_for_the_quantized_text_tower_it_encodes_with(
 
     from dew.diffusion import presets
     from dew.inputs import Condition, Field, InputSpec
-    from dew.inputs.encoders import CLIPText
+    from dew.interop.encoders import CLIPText
     from dew.nn.backbones.dit import SimpleDiT
     from dew.nn.kernels.options import quantizations
     from dew.objectives.diffusion import DiffusionObjective
@@ -1892,7 +1892,7 @@ def test_an_objective_encodes_through_an_int8_text_tower_as_the_host_does():
 def int8_tower_flow():
     from dew.diffusion import presets
     from dew.inputs import Condition, Field, InputSpec
-    from dew.inputs.encoders import CLIPText
+    from dew.interop.encoders import CLIPText
     from dew.nn.backbones.dit import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
 

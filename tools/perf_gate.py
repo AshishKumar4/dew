@@ -362,7 +362,7 @@ def hardware_status(row: Row, device_kind: str) -> str | None:
 def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_head: bool = True,
             cache: Path | None = None, settings: dict[str, str] | None = None) -> dict:
     """One sample of every row in `tree`, run by `python` with `settings` in its environment: a number, or
-    why the row could not run there. The head's external references (`Row.head_only`), each a judged
+    why the row could not run there, and beside each the seconds its probe's process took (`seconds <row>`). The head's external references (`Row.head_only`), each a judged
     pairing of its own, run in its first round alone (`is_head`)."""
     sample = {}
 
@@ -396,8 +396,12 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
                 handed = Path(getattr(args, "ahead", None) or "/nonexistent") / tree.name
                 stepped = probe.tool == "benchmark_step.py" and handed.is_dir()
                 handoff = ["--ahead", str(handed)] if stepped else []
+                began = time.perf_counter()
                 done = _run(tree, python, probe.tool, [*probe.arguments(args, out), *handoff], newer, 3600,
                             cache, settings)
+                # The probe's process's seconds, beside each of its rows, so a run's time is read probe by probe
+                # (its step's compile is in its evidence, `compile_seconds`): where a GPU's minutes went.
+                sample.update({f"seconds {name}": round(time.perf_counter() - began, 3) for name in names})
                 if done.returncode != 0 and not external:
                     raise RuntimeError(f"{probe.tool} exited {done.returncode}: {done.stderr[-1500:]}")
                 values = probe.read(done.stdout, out)

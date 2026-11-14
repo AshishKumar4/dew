@@ -109,21 +109,35 @@ reader.close()
     assert reported == {"refused": "TOMLDecodeError", "cached": "cached bytes", "ids": list(range(8))}
 
 
+def _imported(statement: str, package: str) -> list[str]:
+    """The modules of `package` (it and its submodules) a fresh interpreter holds after running
+    `statement`."""
+    script = f"""
+import json
+import sys
+{statement}
+held = sorted(name for name in sys.modules if name == {package!r} or name.startswith({package + '.'!r}))
+print(json.dumps(held))
+"""
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout.splitlines()[-1])
+
+
 def test_a_models_quantization_imports_no_training():
     """The model's quantization, which loading, adapters and serving read, imports nothing of
     training: a checkpoint's input quantizer is the model's, and reading it starts no trainer,
     runtime or checkpointer."""
-    script = r'''
-import json
-import sys
-from dew.quantization import InputQuantization, Quantization
-training = [name for name in sys.modules if name == "dew.training" or name.startswith("dew.training.")]
-print(json.dumps(sorted(training)))
-'''
-    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
-                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
-    assert run.returncode == 0, run.stderr
-    assert json.loads(run.stdout.splitlines()[-1]) == []
+    assert _imported("from dew.quantization import InputQuantization, Quantization", "dew.training") == []
+
+
+def test_the_conditioning_inputs_import_no_weight_interop():
+    """The conditioning inputs (a spec, the checkpoint-free encoders, an image's conditions) import nothing
+    of dew.interop: the encoders that bind a released checkpoint are interop's, with their loaders (row
+    5996), and a model's inputs read no release's storage."""
+    statement = "import dew.inputs.condition, dew.inputs.diffusion, dew.inputs.encoders, dew.inputs.spec"
+    assert _imported(statement, "dew.interop") == []
 
 
 @pytest.mark.parametrize("module", ["dew.config", "dew.training.budget"])

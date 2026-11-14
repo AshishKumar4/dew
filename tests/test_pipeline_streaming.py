@@ -90,7 +90,7 @@ def encoded(directory: Path, conditioner: str, rows: list, placement: dict, *, w
     float32."""
     import dataclasses
 
-    import dew.inputs.diffusion as conditioners
+    import dew.interop.conditioners as conditioners
 
     encoder = getattr(conditioners, conditioner).from_pretrained(str(directory), dtype="float32", **placement)
     if widened:
