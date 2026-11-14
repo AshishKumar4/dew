@@ -670,6 +670,9 @@ RAISED = re.compile(r"setmaxnreg\.inc\.sync\.aligned\.u32 (\d+);")
 DECREASED = re.compile(r"setmaxnreg\.dec\.sync\.aligned\.u32 (\d+);")
 """A producer's decrease's registers, as a kernel record states them (`decreased`)."""
 
+THREADS = re.compile(r"\.maxntid (\d+),")
+"""A kernel's threads a block (`.maxntid`'s first), as a kernel record states them (`threads`)."""
+
 
 RELOCATABLE = not resources.RAISES_HONORED
 """Whether the GPU compiles a Mosaic GPU kernel's PTX relocatably, as jaxlib's Mosaic GPU does through
@@ -752,6 +755,9 @@ def _compiled_here(cases, generation: str) -> list[dict]:
                 kernel["raised"] = int(raise_.group(1)) if (raise_ := RAISED.search(ptx)) else None
                 # The registers its producer lowers to, as its PTX states (`setmaxnreg.dec`); None likewise.
                 kernel["decreased"] = int(lower.group(1)) if (lower := DECREASED.search(ptx)) else None
+                # Its threads a block, as its PTX states (`.maxntid`); None likewise. A record compiled in a
+                # process of its own (`compiled_apart`) carries it where this process's `PTX` holds none.
+                kernel["threads"] = int(threads.group(1)) if (threads := THREADS.search(ptx)) else None
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
         found.append(record)
     return found

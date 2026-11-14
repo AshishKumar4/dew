@@ -257,6 +257,11 @@ FED = dataclasses.replace(COOPERATIVE, family=mosaic_sm90.FED.name)
 PINGPONG = dataclasses.replace(COOPERATIVE, pingpong=True)
 """`COOPERATIVE`'s two consumers taking alternate tiles whole, their products in turn (ping-pong)."""
 
+PINGPONG_PAIRED = dataclasses.replace(PINGPONG, cluster=2)
+"""`PINGPONG` on a pair of multiprocessors a cluster, the matrix's blocks the pair's row tiles read alike
+loaded once between them (multicast), each program's owning consumer releasing its slots: CUTLASS's sm90
+ping-pong on its 2 x 1 cluster."""
+
 def test_a_family_that_takes_no_pingpong_refuses_it():
     """Ping-pong is a family's whose own producer loads every tile (`mosaic.Family.takes_pingpong`): a
     consumer-fed ring's tile refuses it, its first consumer loading every ring's steps, its partner's tiles'
@@ -275,8 +280,8 @@ matrix's blocks (the interpreter runs the pair's two programs, each loading the 
 
 
 @runs("sm90")
-@pytest.mark.parametrize("forward", [COOPERATIVE, PAIRED, FED, PINGPONG],
-                         ids=["one multiprocessor", "a pair", "fed", "ping-pong"])
+@pytest.mark.parametrize("forward", [COOPERATIVE, PAIRED, FED, PINGPONG, PINGPONG_PAIRED],
+                         ids=["one multiprocessor", "a pair", "fed", "ping-pong", "ping-pong on a pair"])
 @pytest.mark.parametrize("case", ["scaled", "row scaled"])
 def test_a_cooperative_tile_holds_check_1_with_its_hooks(case, forward):
     """The Hopper launches pinned to a cooperative tile, the forward's alone, a pair's (whose second row
@@ -302,18 +307,20 @@ def a_cooperative_tile_holds_check_1_with_its_hooks(case: str, forward: mosaic_g
 
 
 @runs("sm90")
+@pytest.mark.parametrize("forward", [PINGPONG, PINGPONG_PAIRED], ids=["one multiprocessor", "a pair"])
 @pytest.mark.parametrize("case", ["plain", "dense plain"])
-def test_a_pingpong_tile_holds_check_1_with_its_gradients(case):
+def test_a_pingpong_tile_holds_check_1_with_its_gradients(case, forward):
     """The Hopper forward and input gradient pinned to ping-pong's tile (`PINGPONG`: its two consumers take
     alternate tiles whole, their products in turn on the tensor cores, each finishing its tile while the
     other issues the next), interpreted, grouped and dense, a program's tiles more than its consumers: the
     value and every gradient as exact as the plain program's from float64 truth, the kernel gradient on the
-    cooperative tile (which takes no ping-pong, its consumers each preparing half of a step's rows)."""
+    cooperative tile (which takes no ping-pong, its consumers each preparing half of a step's rows); on one
+    multiprocessor and on a multicast pair (`PINGPONG_PAIRED`)."""
     spec = CASES["plain"] if case == "plain" else dataclasses.replace(CASES["plain"], dense=True)
-    pinned = {grouped_matmul.MosaicGmm: PINGPONG, grouped_matmul.MosaicTgmm: COOPERATIVE}
+    pinned = {grouped_matmul.MosaicGmm: forward, grouped_matmul.MosaicTgmm: COOPERATIVE}
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.pinned(pinned):
         assert_as_exact(as_given(_gradients(_dew(spec, interpret_on_cpu=True))), _gradients(_plain(spec)),
-                        _gradient_draw(spec), f"{case} gradients at {PINGPONG}", seeds=SEEDS,
+                        _gradient_draw(spec), f"{case} gradients at {forward}", seeds=SEEDS,
                         truth_fn=_gradients(_plain(spec, truth=True)))
 
 

@@ -100,7 +100,8 @@ class Tiles:
     rows, where those are fewer than a role's (`grouped_matmul.MosaicGmm.derived`); and whether its two
     consumers take alternate tiles whole (`pingpong`, CUTLASS's ping-pong sm90 schedule: each consumer's tile
     its own, their MMA phases alternating, so one's epilogue overlaps the other's products;
-    `Family.persist`'s `pingpong`) rather than halving each tile's rows."""
+    `Family.persist`'s `pingpong`; on a cluster too, its programs multicasting the blocks they read alike)
+    rather than halving each tile's rows."""
     block_m: int
     block_n: int
     block_k: int
@@ -143,11 +144,13 @@ class Tiles:
             # Each consumer's share of the rows is whole roles, and its columns at most one product's
             # (warpgroup MMA's 256).
             raise ValueError(f"{self}: two warpgroups take whole roles of the tile's rows")
-        if self.pingpong and (self.warpgroups != 2 or self.cluster != 1 or self.splits != 1
-                              or not family.takes_pingpong):
+        if self.pingpong and (self.warpgroups != 2 or self.splits != 1 or not family.takes_pingpong):
             # Two consumers alternating whole tiles of one program's walk, each its own, on a family whose
-            # producer loads every tile (`mosaic.Family.takes_pingpong`).
-            raise ValueError(f"{self}: ping-pong is two consumers of one multiprocessor of a family that "
+            # producer loads every tile (`mosaic.Family.takes_pingpong`); on a cluster, each program's
+            # producer loads its tiles' steps in the cluster's one order and its multicast blocks are
+            # released by each program's owning consumer (`rings.ring`'s cluster barrier of `Tiles.sharing`
+            # arrivals a program), as CUTLASS's sm90 ping-pong runs on a 2 x 1 cluster.
+            raise ValueError(f"{self}: ping-pong is two consumers of a multiprocessor of a family that "
                              "takes it, its tiles unsplit")
         if self.warpgroups == 2 and self.stages < 2:
             # A stage is released a step late (an MMA in flight), so one stage would wait on itself.
