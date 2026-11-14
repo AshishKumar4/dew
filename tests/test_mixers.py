@@ -24,6 +24,7 @@ from flax import linen as nn
 from model_support import TINY_DECODER
 from reference_error import assert_as_exact, logits_operands, widened, with_gradients
 from residual_orders import orders, permuted, residual_width
+from selection_margins import MARGIN, capturing, clearing, margin
 
 from dew.batch import coordinates
 from dew.nn import linear
@@ -201,10 +202,9 @@ def pulled(forward, variables, cotangent):
     return with_gradients(lambda variables: forward(variables).astype(cotangent.dtype))(variables, cotangent)
 
 
-def packed_forward(model, tokens, *, documents=DOCUMENTS):
-    """The forward of the documents' `tokens` `[1, sum(documents)]` packed in one row (positions
-    restarting per document, then PADDING slots whose logits the loss ignores), their segment ids
-    given."""
+def packed_row(tokens, documents=DOCUMENTS):
+    """The documents' `tokens` `[1, sum(documents)]` packed in one row (positions restarting per document,
+    then PADDING slots) and the row's coordinates, their segment ids given."""
     total = sum(documents)
     assert tokens.shape == (1, total)
     segments = [jnp.full((1, length), i + 1, jnp.int32) for i, length in enumerate(documents)]
@@ -212,19 +212,24 @@ def packed_forward(model, tokens, *, documents=DOCUMENTS):
     positions = jnp.concatenate([*(jnp.arange(length)[None] for length in documents),
                                  jnp.zeros((1, PADDING), jnp.int32)], axis=1)
     row = jnp.concatenate([tokens, jnp.zeros((1, PADDING), tokens.dtype)], axis=1)
-    tokens_at = coordinates(segments=segments, positions=positions, max_segments=len(documents) + 1)
+    return row, coordinates(segments=segments, positions=positions, max_segments=len(documents) + 1)
+
+
+def packed_forward(model, tokens, *, documents=DOCUMENTS):
+    """The forward of the documents' `tokens` packed in one row (`packed_row`), the logits of their slots,
+    whose PADDING the loss ignores."""
+    row, tokens_at = packed_row(tokens, documents)
 
     def forward(variables):
-        return model.apply(variables, row, coordinates=tokens_at)[:, :total]
+        return model.apply(variables, row, coordinates=tokens_at)[:, :sum(documents)]
 
     return forward
 
 
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
-               # MoBA's blocks of eight places, a query's own and the one earlier its gate picks: the second
-               # document's 70 tokens nine blocks (blocks of two left its float64 truth picking other blocks
-               # than its fp32 run on near-tied gates, unresolved within 512 seeds).
-               "block_sparse_attention": ({"block": 8, "top_k": 2}, {}),
+               # MoBA's chunks of two tokens, a query's own and the one earlier its gate picks: the second
+               # document's 70 tokens 35 chunks.
+               "block_sparse_attention": ({"block": 2, "top_k": 2}, {}),
                "deepseek_v4": ({"rope_head_dim": 8}, {"kinds": {"full_attention": LayerKind(window=8)}}),
                "kimi_delta_attention": ({"linear_num_heads": 2, "linear_head_dim": 32}, {}),
                "lightning_attention": ({"block_size": 64}, {"num_heads": 8, "head_dim": 16}),
@@ -256,7 +261,7 @@ SEEDS = {"attention": 64, "deepseek_v4": 256, "deepseek_v4 csa": 256, "deepseek_
          "kpool_sparse_attention": 16, "kpool_sparse_attention notail": 16, "lightning_attention": 64,
          "llama4": 128, "mamba": 32, "mamba2": 256, "mamba3": 512, "memory": 256,
          "mla": 64,
-         "block_sparse_attention": 128, "mlp": 64, "parallel": 64, "qsa_attention": 128, "short_conv": 64}
+         "block_sparse_attention": 256, "mlp": 64, "parallel": 64, "qsa_attention": 128, "short_conv": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` per kind (on armada): the
 fewest for which documents run alone compared with themselves resolve PARITY in every logit and parameter
 gradient, or for a kind so stated, paired with the packed row (ledger 2889). Mamba2's 8 heads of 32 over a
@@ -377,18 +382,29 @@ def test_a_packed_row_of_kpool_attention_without_tails_computes_what_its_documen
 def assert_packed_as_alone(model, variables, what: str, seeds: int):
     """Check 1 of `model`'s packed row of `DOCUMENTS` against each document run alone, logits and
     parameter gradients, each draw fresh tokens, parameters and cotangents with the residual channels
-    consistently permuted (`residual_orders`), the float64 truth each document alone."""
+    consistently permuted (`residual_orders`), the float64 truth each document alone. A model that selects
+    draws inputs its packed row's selections clear by MARGIN (`selection_margins.clearing`), so its
+    float32 and float64 runs select alike."""
     documents = DOCUMENTS
     total = sum(documents)
     initialize = jax.jit(model.init)
     width = residual_width(variables)
 
-    def draw(seed):
+    def drawn(seed):
         tokens = jax.random.randint(jax.random.key(3 + 3 * seed), (1, total), 0, VOCAB)
         variables = initialize(jax.random.key(4 + 3 * seed), tokens)
         cotangent = jax.random.normal(jax.random.key(5 + 3 * seed), (1, total, VOCAB))
         order = orders(width, 2, seed)[1]
         return permuted(variables, order), tokens, cotangent
+
+    @jax.jit
+    def captured(variables, tokens):
+        row, tokens_at = packed_row(tokens, documents)
+        return capturing(model, variables, row, coordinates=tokens_at)[1]
+
+    def clears(inputs) -> bool:
+        held = captured(*inputs[:2])
+        return not jax.tree.leaves(held) or margin({}, held, what) >= MARGIN
 
     def evaluated(model, variables, tokens, cotangent, *, packed):
         forward = (packed_forward(model, tokens, documents=documents) if packed
@@ -400,7 +416,7 @@ def assert_packed_as_alone(model, variables, what: str, seeds: int):
     dew = jax.jit(functools.partial(evaluated, model, packed=True))
     reference = jax.jit(functools.partial(evaluated, model, packed=False))
     truth = jax.jit(functools.partial(evaluated, model.clone(dtype=jnp.float64), packed=False))
-    assert_as_exact(dew, reference, draw, what, seeds=seeds, truth_fn=truth)
+    assert_as_exact(dew, reference, clearing(drawn, clears), what, seeds=seeds, truth_fn=truth)
 
 
 def embedded(module, tokens):
