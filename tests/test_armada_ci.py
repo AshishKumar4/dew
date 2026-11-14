@@ -189,6 +189,26 @@ def test_a_task_states_the_same_key_in_every_plan_that_cuts_it_whatever_its_name
     assert set(cold) == set(before) and all(cold[rows][0] != before[rows][0] for rows in before)
 
 
+def test_the_tested_pythons_are_named_once_and_a_collection_gate_for_another_set_is_refused(
+        ci, tmp_path, monkeypatch):
+    """`pythons --check` holds every file that names the tested Pythons to PYTHONS, the collection gates of
+    tools/check_gates among them: a gate for a Python no environment is built for fails every pull request, and
+    one missing collects nowhere (train 805's review, F1)."""
+    (tmp_path / "tools").mkdir()
+    (tmp_path / ".python-version").write_text(f"{ci.PYTHONS[0]}\n")
+    (tmp_path / ".armada.json").write_text(json.dumps({"environment": {"smoke": " && ".join(
+        f".venv-{version}/bin/python -c 'import dew'" for version in ci.PYTHONS)}}))
+    monkeypatch.setattr(ci, "REPO", tmp_path)
+
+    def gates(*versions: str) -> int:
+        (tmp_path / "tools/check_gates").write_text("".join(
+            f"collect-{version}\t.venv-{version}/bin/python -m pytest --co tests\n" for version in versions))
+        return ci.pythons(check=True)
+
+    assert gates(*ci.PYTHONS) == 0
+    assert gates(ci.PYTHONS[0]) == 1 and gates(*ci.PYTHONS, "3.15") == 1
+
+
 def test_the_newest_pythons_collection_is_planned_within_the_target_at_the_slowest_rate_it_ran_at(
         ci, tmp_path, monkeypatch):
     """Each collect task holds at most the target's seconds of files at the slowest per-file rate armada
