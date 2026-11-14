@@ -104,7 +104,7 @@ def collected():
 @contextlib.contextmanager
 def traced(decided: dict | None = None):
     """Each cache rounding a store writes while tracing inside reports itself to `collected` as its program
-    runs; with `decided` (one row's decisions by name, `Written.held`'s), each takes its codes and scales
+    runs; with `decided` (one row's decisions by name, `held`'s), each takes its codes and scales
     from it at its tokens' slots, so a run of one row reads them. A program compiled inside, and so a
     server constructed inside, runs inside: its traces are keyed apart (`CAPTURED`)."""
     writing: list[tuple[KVStore, jax.Array, jax.Array, list[str]]] = []
