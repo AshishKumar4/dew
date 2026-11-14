@@ -996,9 +996,9 @@ class FitSearch[LossT, EffectsT]:
         if self.dropped_from is not None and self.copies_freed():
             self.dropped_from = None
         elif self.dropped_from is not None:
-            # Dropped, the step held no fewer temporaries at the split both missed at: on a GPU the step
-            # casts its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with
-            # them), so the copies come back, their 1-2% of a step kept, and the ladder climbs on with them.
+            # Dropped, the step fell no less short at the split both missed at: on a GPU the step casts its
+            # weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with them), so the
+            # copies come back, their 1-2% of a step kept, and the ladder climbs on with them.
             _log.warning("the step's narrow copies free nothing it needs: it keeps them and climbs on")
             self.dropped_from, self.narrow, self.copies_kept = None, True, True
             self.lowered.clear()
@@ -1012,15 +1012,16 @@ class FitSearch[LossT, EffectsT]:
         return self.onward(self.compiled_again)
 
     def copies_freed(self) -> bool:
-        """Whether dropping the narrow copies freed temporaries: the step without them, at the split it last
-        missed at, held fewer than with them at that split; True where either compile read no memory, the
+        """Whether dropping the narrow copies brought the step nearer to fitting: without them, at the split
+        it last missed at, it fell less short than with them at that split, the copies' own bytes and the
+        temporaries their absence changes counted together; True where either compile read no memory, the
         drop standing as before. Every process gathers its verdict, as at every miss (`after`), so all keep
         the copies or none."""
         here = self.rung()
         latest = next((miss for (rung, _), miss in reversed(self.misses.items()) if rung == here), None)
         before = None if latest is None or self.dropped_from is None else self.misses.get(
             (self.dropped_from, latest.split))
-        kept = before is not None and latest is not None and latest.scaled >= before.scaled
+        kept = before is not None and latest is not None and latest.shortfall >= before.shortfall
         return not any(self.gather(kept))
 
     def compiled_again(self) -> bool:

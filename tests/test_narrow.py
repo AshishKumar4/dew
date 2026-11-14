@@ -484,11 +484,11 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
 def test_a_step_that_does_not_fit_drops_its_copies_before_it_recomputes_where_that_frees_bytes(monkeypatch):
     """The narrow copies are the fit ladder's first rung. In the geometry of row 1661's run, a window of
     two steps, a step that does not fit with its copies drops them before it recomputes more, and keeps
-    them dropped where the step without them holds fewer temporaries; where it holds no fewer, the copies
+    them dropped where the step without them falls less short; where it falls no less short, the copies
     come back, their 1-2% of a step kept, and the ladder recomputes with them. The plan says which
     (`narrow`). On a CPU the drop frees bytes, the step's casts fused into their uses; on a GPU the step
     casts its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with them, rows
-    5041, train 857 F2). The devices hold the step fully recomputed, with its copies or without."""
+    5041, train 857 F2). The devices hold the step fully recomputed without its copies."""
     free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
@@ -496,14 +496,15 @@ def test_a_step_that_does_not_fit_drops_its_copies_before_it_recomputes_where_th
     def trained(*, copies, remat):
         return _trained(ADAM_3, copies=copies, steps=1, accumulation=2, split=1, remat=remat)
 
-    free -= min(trained(copies=copies, remat="full")[2].plan["probes"][0]["headroom"]
-                for copies in (True, False))
+    _, _, recomputed = trained(copies=False, remat="full")
+    free -= recomputed.plan["probes"][0]["headroom"]
     state, _, trainer = trained(copies=True, remat=None)
     probes = trainer.plan["probes"]
     first, second = probes[0], probes[1]
     assert (first["narrow"], first["fits"], second["narrow"]) == (True, False, False)
     assert second["remat"] == first["remat"] and probes[-1]["fits"] is True
-    assert trainer.plan["narrow"] is (second["temp"] >= first["temp"])
+    # Kept where the step without them fell no less short (its headroom no greater).
+    assert trainer.plan["narrow"] is (second["headroom"] <= first["headroom"])
     assert (state.compute is None) is not trainer.plan["narrow"]
 
 
@@ -630,12 +631,12 @@ def test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits
     assert run.plan["probes"][-1]["split"] == 2
 
 
-def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_dropped(monkeypatch):
+def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_only_where_dropping_them_helped(monkeypatch):
     """A window of one step that recomputes nothing holds about as much without its copies as with them:
     its backward keeps the whole gradient, in float32 where the copies' is bfloat16. Where it fits its
-    own rung neither way, the plan climbs past the rung that dropped them, and keeps them dropped at the
-    rung and split it reaches: once a plan fits, a run compiles no other (whether the copies would be
-    faster there is the offline plan's to weigh, `compile_ahead`)."""
+    own rung neither way, the plan climbs past the rung that dropped them, and at the rung and split it
+    reaches holds them dropped where dropping them left the step less short, and back where it did not
+    (train 857 F2): once a plan fits, a run compiles no other."""
     free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
@@ -651,9 +652,10 @@ def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_dropped(monkeypatch):
     rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults")
     planned = {key: plan[key] for key in rung}
     last = probes[-1]
+    kept = probes[1]["headroom"] <= probes[0]["headroom"]
     assert planned != {key: base[key] for key in rung}
-    assert {key: last[key] for key in rung} == planned and (last["narrow"], last["fits"]) == (False, True)
-    assert not plan["narrow"] and state.compute is None
+    assert {key: last[key] for key in rung} == planned and (last["narrow"], last["fits"]) == (kept, True)
+    assert plan["narrow"] is kept and (state.compute is None) is not kept
 
 
 @pytest.mark.check1_shards(seeds=8, per_task=2)
