@@ -2182,15 +2182,23 @@ def _draws_roundings(truth_fn, arguments, counted: dict) -> int:
         if "draw" not in counted:
             counted["draw"] = chain_roundings(jax.make_jaxpr(program)(*traced))
         return counted["draw"]
-    total = 0
-    with jax.enable_x64(new_val=True):
-        for run, held in stated(*traced):
+
+    def summed(window) -> int:
+        total = 0
+        for run, held in stated(*window):
             signature = (run, jax.tree.structure(held),
                          tuple((np.shape(leaf), np.result_type(leaf)) for leaf in jax.tree.leaves(held)))
             if signature not in counted:
                 counted[signature] = chain_roundings(jax.make_jaxpr(run)(*held))
             total += counted[signature]
-    return total
+        return total
+
+    # A window loop's every window, each a draw of its own whose programs may differ: the most of them.
+    count = len(jax.tree.leaves(arguments)[0]) if isinstance(truth_fn, _Windowed) else 0
+    each = ([jax.tree.map(lambda leaf, at=at: leaf[at], arguments) for at in range(count)]
+            if count else [traced])
+    with jax.enable_x64(new_val=True):
+        return max(map(summed, each))
 
 
 def certifier(site: str, truth_fn, shapes: Mapping[str, np.ndarray], recorded_sketch):
