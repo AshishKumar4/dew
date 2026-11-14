@@ -1021,7 +1021,8 @@ class Issuer[Accumulator](abc.ABC):
         return resources.widest_swizzle(dtype, columns)
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
-                        ahead: tuple[int, ...] = (), sums: tuple[int, ...] = ()) -> tuple | dict:
+                        ahead: tuple[int, ...] = (), sums: tuple[int, ...] = (),
+                        together: tuple[int, ...] = ()) -> tuple | dict:
         """The memory a program's products take where the issuer keeps each product's accumulator itself
         (tcgen05's chunks: tensor memory of each product width in `widths` and a tensor-core barrier, a
         consumer role each), and stages a register left operand of each `(depth, dtype)` in `lefts` where
@@ -1030,8 +1031,9 @@ class Issuer[Accumulator](abc.ABC):
         every warpgroup); none where its products need none. A product of each width in `ahead` a role
         issues a step before it reads it (`issued_ahead`) takes two accumulators and a barrier each. A walk's
         sums of each width in `sums` stay in an accumulator of the issuer's across the walk (`accumulated`),
-        where it keeps them so, a role each."""
-        del consumers, widths, lefts, ahead, sums
+        where it keeps them so, a role each. Groups of `together`'s widths a role sums together
+        (`summed_together`) take an accumulator each where the issuer awaits them as one."""
+        del consumers, widths, lefts, ahead, sums, together
         return ()
 
     def keeps_sums(self, width: int) -> bool:
@@ -1089,6 +1091,16 @@ class Issuer[Accumulator](abc.ABC):
         `shape` (zero), its value once they are done: a register accumulator's, which a family whose
         accumulator is a ref scopes (wgmma's)."""
         return issue(self.zeros(shape))
+
+    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple) -> tuple[Callable, ...]:
+        """Groups of products none of which reads another's sum, each `issues[i](acc) -> acc` into a fresh
+        fp32 accumulator of `shapes[i]`: a reader of each group's value, which its caller calls where it uses
+        it, so no more sums are held in registers at once than it reads together. Where the issuer awaits its
+        products (tensor memory's), every group is issued before any is awaited, one wait for them all, and a
+        reader reads its group's accumulator (`Tcgen05ChunksIssuer`'s); elsewhere a reader sums its group
+        where it is read (`summed`), in the caller's order."""
+        return tuple(functools.partial(self.summed, shape, issue)
+                     for shape, issue in zip(shapes, issues, strict=True))
 
     @abc.abstractmethod
     def added_into(self, acc: Accumulator, value: jax.Array, interpret: bool) -> Accumulator:

@@ -14,6 +14,7 @@ registers a program takes are its warpgroups' entry share alone (`registers`), t
 (addresses and counters) left to a per-launch rule once a liveness model prices its branch
 (`resources.producer_floor`)."""
 
+import collections
 import contextlib
 import contextvars
 import dataclasses
@@ -1016,7 +1017,8 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
                     swizzling.NARROWEST_SWIZZLE_BYTES)
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
-                        ahead: tuple[int, ...] = (), sums: tuple[int, ...] = ()) -> dict:
+                        ahead: tuple[int, ...] = (), sums: tuple[int, ...] = (),
+                        together: tuple[int, ...] = ()) -> dict:
         # A role's accumulator of each product width: a half-lane tile's columns split between its two lane
         # groups, so a narrower product's is no column slice of a wider one's (Mosaic GPU's layout inference
         # refused one, jsf-tmem4). A 16-column product is issued 32 wide, its right operand padded
@@ -1026,12 +1028,15 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         # step's issued, each its barrier (`issued_ahead`, `taken`). A walk's sums, each of `sums` an
         # accumulator a role in their order, held across the walk (`accumulated`), where every one is at
         # least an accumulator's least width (`keeps_sums`): one plan for them all, else each carried in
-        # registers, a fresh accumulator its products'. The padded tile only where a product is narrower than
-        # `PADDED` (a forward at width 256 over 64-key tiles takes none: 8 KB its two consumers' training
-        # program needs for its split sums' stage).
-        narrow = min((*widths, *ahead, *sums), default=PADDED) < PADDED
+        # registers, a fresh accumulator its products'. The groups a role sums together (`summed_together`),
+        # each of `together` at least `PADDED` wide an accumulator a role, a width's groups its accumulators
+        # of that width in turn; a narrower group is summed in turn, in its width's one accumulator.
+        # The padded tile only where a product is narrower than `PADDED` (a forward at width 256 over 64-key
+        # tiles takes none: 8 KB its two consumers' training program needs for its split sums' stage).
+        narrow = min((*widths, *ahead, *sums, *together), default=PADDED) < PADDED
         kept = all(self.keeps_sums(width) for width in sums)
-        widths = tuple(sorted({max(width, PADDED) for width in (*widths, *(() if kept else sums))}))
+        alone = tuple(width for width in together if width < PADDED)
+        widths = tuple(sorted({max(width, PADDED) for width in (*widths, *alone, *(() if kept else sums))}))
         ahead = tuple(sorted({max(width, PADDED) for width in ahead}))
         later = {"ahead": {width: tuple(tuple(accumulator_columns(self.rows, width) for _ in range(2))
                                         for _ in range(consumers)) for width in ahead},
@@ -1040,7 +1045,12 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
                      for width in (sums if kept else ()))
         # A walk's kept sums take a barrier of a role's own for its step's settle (`settled`).
         settles = {"settles": plgpu.Barrier(num_barriers=consumers, orders_tensor_core=True)}
+        concurrent = collections.Counter(width for width in together if width >= PADDED)
+        grouped = {width: tuple(tuple(accumulator_columns(self.rows, width) for _ in range(count))
+                                for _ in range(consumers))
+                   for width, count in concurrent.items()}
         return {**(later if ahead else {}), **({"sums": held, **settles} if held else {}),
+                **({"together": grouped} if grouped else {}),
                 "tmem": {width: tuple(accumulator_columns(self.rows, width) for _ in range(consumers))
                          for width in widths},
                 "padded": tuple(plgpu.SMEM((self.rows, PADDED), jnp.bfloat16,
@@ -1070,8 +1080,9 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         if products is None:
             return 0
         scratch = self.product_scratch(*products)
-        return resources.tensor_memory_columns(jax.tree.leaves(
-            (scratch["tmem"], scratch.get("ahead", {}), scratch.get("sums", ()))))
+        held = (scratch["tmem"], scratch.get("ahead", {}), scratch.get("sums", ()),
+                scratch.get("together", {}))
+        return resources.tensor_memory_columns(jax.tree.leaves(held))
 
     def _ahead(self, width: int, buffer):
         """The building role's two accumulators `width` columns wide (`PADDED` at least) of a product it
@@ -1136,6 +1147,49 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
     def summed(self, shape: tuple[int, int], issue) -> jax.Array:
         return self._summed(shape, issue)
 
+    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple) -> tuple[Callable, ...]:
+        """`Issuer.summed_together` in tensor memory: each group issued into its own accumulator of the
+        role's together scratch (`product_scratch`'s `together`, a width's groups its accumulators in turn),
+        then one commit and one wait for every group, each group's reader then reading its accumulator, until
+        the role's next groups summed together: a group's commit and wait no longer stand between the next
+        group's issue and its own (a persistent recurrence gradient waited on six commits a tile, each ~600
+        cycles, its value products independent). The commit follows every group's issue, so it never stands
+        behind a wait with nothing pending (row 5671). A group narrower than `PADDED` is summed where its
+        reader is called, as every other issuer sums each."""
+        if len(shapes) != len(issues):
+            raise ValueError(f"{len(shapes)} groups' shapes for {len(issues)} groups")
+        # A group narrower than `PADDED` pads its right operand into the role's one padded tile (`_padded`),
+        # which another group's would overwrite while the first's product still reads it: it is summed where
+        # its reader is called (`summed`), after the others' wait, its own commit behind its own products.
+        wide = [index for index, shape in enumerate(shapes) if shape[1] >= PADDED]
+        readers: list[Callable] = [functools.partial(self.summed, shape, issue)
+                                   for shape, issue in zip(shapes, issues, strict=True)]
+        if not wide:
+            # No product pending: a commit here would stand behind the role's last wait (row 5671).
+            return tuple(readers)
+        found, role = self._scoped(), mosaic.ROLE.get()
+        taken: collections.Counter = collections.Counter()
+        accumulators = []
+        for shape in (shapes[index] for index in wide):
+            width = shape[1]
+            held = found.get("together", {}).get(width, ())
+            kept = len(held[role]) if held else 0
+            if taken[width] >= kept:
+                raise ValueError(f"{self.name} sums {taken[width] + 1} groups {width} columns wide together; "
+                                 f"its program's product scratch holds {kept} (`product_scratch`'s together)")
+            accumulators.append(_addressed_here(held[role][taken[width]], axis=1))
+            taken[width] += 1
+        token = _TOGETHER.set(True)
+        try:
+            for tmem, index in zip(accumulators, wide, strict=True):
+                issues[index](Accumulator(tmem, shapes[index], accumulate=False))
+        finally:
+            _TOGETHER.reset(token)
+        self._waited(self._done())
+        for index, tmem in zip(wide, accumulators, strict=True):
+            readers[index] = functools.partial(_read, tmem)
+        return tuple(readers)
+
     def keeps_sums(self, width: int) -> bool:
         # A sum at least an accumulator's least width: a narrower one's columns are no column slice of the
         # padded accumulator's half-lane tile (`product_scratch`), so its initial value has no place there.
@@ -1183,10 +1237,19 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         """`acc` with every product issued into it done: committed and awaited, but where it is already
         (`awaited`), whose commit would have nothing pending behind the wait that took it (row 5671)."""
         if not acc.awaited:
-            done = self._done()
-            plgpu.tcgen05_commit_arrive(done)
-            plgpu.barrier_wait(done)
+            self._waited(self._done())
         return dataclasses.replace(acc, awaited=True)
+
+    @staticmethod
+    def _waited(done) -> None:
+        """The building role's products committed to its barrier `done` and awaited: every wait on it is
+        this one, refused while groups are issued together (`summed_together`), whose one wait follows them
+        all; a group's own wait would leave that one behind nothing pending (row 5671)."""
+        if _TOGETHER.get():
+            raise ValueError("a group summed together awaits none of its own products (a register left "
+                             "operand's, a value added into it, a sum read or settled): one wait for all")
+        plgpu.tcgen05_commit_arrive(done)
+        plgpu.barrier_wait(done)
 
     def _summed(self, shape: tuple[int, int], issue, carried: jax.Array | None = None) -> jax.Array:
         """`summed`'s products issued into the building role's fresh accumulator and read, onto the sum a walk
@@ -1207,8 +1270,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
             plgpu.commit_tmem()
         issued = issue(Accumulator(tmem, (shape[0], max(shape[1], PADDED)), accumulate=onto))
         if not (isinstance(issued, Accumulator) and issued.awaited):
-            plgpu.tcgen05_commit_arrive(done)
-            plgpu.barrier_wait(done)
+            self._waited(done)
         found = _read(tmem)
         found = found if shape[1] >= PADDED else found[:, :shape[1]]
         return found if carried is None or onto else carried + found
@@ -1261,8 +1323,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
             plgpu.store(tile, part, optimized=False)
             plgpu.commit_smem()
             acc = self._issued(acc, tile, rhs)
-            plgpu.tcgen05_commit_arrive(done)
-            plgpu.barrier_wait(done)
+            self._waited(done)
             acc = dataclasses.replace(acc, awaited=True)
         return acc
 
@@ -1326,9 +1387,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         if _PRODUCTS.get() is None:
             return
         scoped = self._scoped()
-        done = scoped["settles"].at[mosaic.ROLE.get()] if "settles" in scoped else self._done()
-        plgpu.tcgen05_commit_arrive(done)
-        plgpu.barrier_wait(done)
+        self._waited(scoped["settles"].at[mosaic.ROLE.get()] if "settles" in scoped else self._done())
 
 
 class Tcgen05Chunks(Tcgen05ChunksIssuer, mosaic.RingFamily):
@@ -1380,6 +1439,10 @@ def _addressed_here(ref, *, axis: int):
 
 CHUNKS = Tcgen05Chunks()
 """tcgen05's bundle for the recurrence's 64-row chunks."""
+
+_TOGETHER: contextvars.ContextVar[bool] = contextvars.ContextVar("summed_together", default=False)
+"""Whether groups summed together are being issued (`Tcgen05ChunksIssuer.summed_together`): a product that
+awaits its own (`register_products`, `summed`) is refused there."""
 
 _PRODUCTS: contextvars.ContextVar[dict | None] = contextvars.ContextVar("products", default=None)
 """The program's product scratch while it is traced (`Tcgen05ChunksIssuer.products_in`)."""

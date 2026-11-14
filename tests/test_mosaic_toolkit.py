@@ -1538,6 +1538,108 @@ def _kept_sums(x, w, *, interpret):
                          interpret=interpret, name="chunks_kept")(x, w)
 
 
+def _summed_together(x, w, *, interpret, awaiting: bool = False):
+    """`x_0 @ w_0`, `x_1 @ w_1` and `x_0 @ w_1` (`x`'s and `w`'s two depth blocks, each a stream of its own)
+    on tcgen05's chunks from shared memory, three groups of one width summed together in one step
+    (`summed_together`): each issued into its own accumulator of the issuer's together scratch, one commit and
+    one wait for all three, each read where it is stored. `awaiting`, the last group adds a value into its
+    accumulator, which awaits its own products (`added_into`)."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.CHUNKS
+    rows, columns = family.rows, w.shape[1]
+
+    def body(x_gmem, w_gmem, *outs):
+        blocks = dict.fromkeys(('x0', 'x1'), ((rows, CHUNK_DEPTH), jnp.bfloat16))
+        blocks |= dict.fromkeys(('w0', 'w1'), ((CHUNK_DEPTH, columns), jnp.bfloat16))
+
+        def scope(*, streams):
+            rings = family.opened(streams)
+            views = {f'x{k}': (x_gmem, lambda j, k=k: (0, k)) for k in range(2)}
+            views |= {f'w{k}': (w_gmem, lambda j, k=k: (k, 0)) for k in range(2)}
+
+            def step(index, slots, carry, accumulators):
+                del index, carry
+                # Every slot awaited first, so the step's only waits after its first product are the groups'.
+                slots.acquire_all()
+                pairs = (('x0', 'w0'), ('x1', 'w1'), ('x0', 'w1'))
+                issues = [lambda acc, x=x, w=w: family.products(acc, slots[x], slots[w]) for x, w in pairs]
+                if awaiting:
+                    issues[-1] = lambda acc: family.added_into(family.products(acc, slots['x0'], slots['w1']),
+                                                               jnp.zeros((rows, columns), jnp.float32),
+                                                               interpret=False)
+                readers = family.summed_together(((rows, columns),) * 3, tuple(issues))
+                return tuple(read() for read in readers), accumulators
+
+            def walked(wg):
+                del wg
+                found, _ = family.walk(rings, ((step, 0, 1),), (family.zeros((rows, columns)),) * 3, (),
+                                       interpret)
+                for out_gmem, value in zip(outs, found, strict=True):
+                    out_gmem[...] = value
+
+            family.scheduled(1, walked, lambda: family.stream(rings, views, 0, 1))
+
+        family.scoped(scope, streams=family.streams(blocks, 2, 1),
+                      products=(1, (), (), (), (), (columns,) * 3))
+
+    out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
+    return family.kernel(body, out_type=(out, out, out), grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="chunks_together")(x, w)
+
+
+@INTERPRETS
+def test_groups_summed_together_in_tcgen05s_tensor_memory_are_each_its_own_sum():
+    """Interpreted: on tcgen05's chunks, three groups of one width summed together (`summed_together`: each
+    its own accumulator, one commit and one wait for all) are exactly each group's product, none another's."""
+    keys = jax.random.split(jax.random.key(5))
+    x = jax.random.randint(keys[0], (64, 2 * CHUNK_DEPTH), -4, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (2 * CHUNK_DEPTH, 128), -4, 4).astype(jnp.bfloat16)
+    first, second, crossed = (np.asarray(out) for out in _summed_together(x, w, interpret=INTERPRETED))
+    x32, w32 = np.asarray(x, np.float32), np.asarray(w, np.float32)
+    np.testing.assert_array_equal(first, x32[:, :CHUNK_DEPTH] @ w32[:CHUNK_DEPTH])
+    np.testing.assert_array_equal(second, x32[:, CHUNK_DEPTH:] @ w32[CHUNK_DEPTH:])
+    np.testing.assert_array_equal(crossed, x32[:, :CHUNK_DEPTH] @ w32[CHUNK_DEPTH:])
+
+
+def test_groups_summed_together_on_tcgen05_issue_every_product_before_one_commit_and_wait():
+    """Traced for a B200 (`summed_together` on tcgen05's chunks): the three groups' products are all issued
+    before the role commits its tensor-core barrier once and waits on it once, no commit or wait between
+    them, so no group's wait stands between another's issue and its own."""
+    from jax.extend.core import ClosedJaxpr, Jaxpr
+
+    keys = jax.random.split(jax.random.key(5))
+    x = jax.random.randint(keys[0], (64, 2 * CHUNK_DEPTH), -4, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (2 * CHUNK_DEPTH, 128), -4, 4).astype(jnp.bfloat16)
+    with generation.assumed("sm100"):
+        traced = jax.make_jaxpr(lambda x, w: _summed_together(x, w, interpret=False))(x, w)
+    order = []
+
+    def walk(jaxpr):
+        for equation in jaxpr.eqns:
+            if equation.primitive.name in ("tcgen05_mma", "tcgen05_commit_arrive", "barrier_wait"):
+                order.append(equation.primitive.name)
+            for param in equation.params.values():
+                for inner in (param if isinstance(param, (tuple, list)) else (param,)):
+                    if isinstance(inner, ClosedJaxpr | Jaxpr):
+                        walk(inner.jaxpr if isinstance(inner, ClosedJaxpr) else inner)
+
+    walk(traced.jaxpr)
+    first = order.index("tcgen05_mma")
+    issued = [index for index, name in enumerate(order) if name == "tcgen05_mma"]
+    assert len(issued) == 3 and issued == list(range(first, first + 3)), order
+    assert order[first + 3:first + 5] == ["tcgen05_commit_arrive", "barrier_wait"], order
+
+
+def test_a_group_summed_together_that_awaits_its_own_products_is_refused():
+    """A group summed together on tcgen05 whose issue awaits its own products (a value added into its
+    accumulator, `added_into`) is refused as it traces: its wait would leave the groups' one commit behind
+    nothing pending (row 5671)."""
+    x = jnp.zeros((64, 2 * CHUNK_DEPTH), jnp.bfloat16)
+    w = jnp.zeros((2 * CHUNK_DEPTH, 128), jnp.bfloat16)
+    with generation.assumed("sm100"), pytest.raises(ValueError):
+        jax.make_jaxpr(lambda x, w: _summed_together(x, w, interpret=False, awaiting=True))(x, w)
+
+
 @INTERPRETS
 def test_a_walks_sums_kept_in_tcgen05s_tensor_memory_are_its_products_onto_its_initial_value():
     """Interpreted: on tcgen05's chunks, a walk's two sums of one width kept in tensor memory across three
