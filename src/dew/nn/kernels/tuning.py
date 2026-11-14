@@ -957,7 +957,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     eviction, so every config starts with its operands out of cache. A config of the op's space the call
     refuses is no candidate: measured, its launch raised `Unpinnable` and ended the run (row 5326, a
     Triton forward's 128 x 128 tile holding 320 registers a thread)."""
-    from dew.telemetry.benchmark import TIMED, CuptiHeld, NoKernels, behind, device_time, eviction
+    from dew.telemetry.benchmark import UNGRAPHED_OPTIONS, CuptiHeld, NoKernels, behind, device_time, eviction
 
     arrays, fill = materialized(op, ba)
     flush = eviction()
@@ -974,7 +974,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
         # that spills is measured slow, never refused and lowered afresh (`OuterProgram.compiled`). The
         # launch runs behind the flush, which reads the whole buffer through the cache.
         # Without command buffers, which CUPTI does not read whole (`benchmark.Ungraphed`).
-        lowered = owned_program(behind(launched), step=TIMED).lower(flush, (arrays,))
+        lowered = owned_program(behind(launched), step=UNGRAPHED_OPTIONS).lower(flush, (arrays,))
         middle = time.perf_counter()
         executable = lowered.compile()
         return executable, (middle - start) * 1e3, (time.perf_counter() - middle) * 1e3

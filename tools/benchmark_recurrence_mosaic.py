@@ -12,10 +12,12 @@ XLA's). One arm a process
 With `--profile DIR` the arms named (`--arm mosaic,port`) run in one process under one capture of Dew's
 profiler (`dew.telemetry.profile.Profiler`, XProf's reports), each `--repeats` times after `--warmup`, and
 each arm's kernels come out of XProf's kernel_stats: time, registers, shared memory, occupancy and
-tensor-core use a kernel, attributed to the arm whose program ran it. Profile with
-`XLA_FLAGS=--xla_gpu_enable_command_buffer=` (the profiler's note), and time without it.
+tensor-core use a kernel, attributed to the arm whose program ran it. Profile and time with
+`XLA_FLAGS=--xla_gpu_enable_command_buffer=`: neither the profiler nor CUPTI reads a command buffer whole,
+and a timing refuses a pass compiled to run as them (`dew.telemetry.benchmark.Ungraphed`).
 
-    PYTHONPATH=src:tools python tools/benchmark_recurrence_mosaic.py --arm mosaic --out runs.jsonl
+    XLA_FLAGS=--xla_gpu_enable_command_buffer= PYTHONPATH=src:tools \
+        python tools/benchmark_recurrence_mosaic.py --arm mosaic --out runs.jsonl
     XLA_FLAGS=--xla_gpu_enable_command_buffer= PYTHONPATH=src:tools \
         python tools/benchmark_recurrence_mosaic.py --arm mosaic,port --profile captures --out kernels.jsonl
 """

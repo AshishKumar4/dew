@@ -194,9 +194,7 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
         assert stored[rows]["rms_norm_backward"] == [[1], 8]
     assert stored["40"] == heuristics["40"]
     assert tuned is True
-    # The store and the lock its writers take (`tuning._store`), no part of a write left beside them.
-    stored_as = os.path.basename(path)
-    assert sorted(os.listdir(os.path.dirname(path))) == [stored_as, stored_as + '.lock']
+    assert os.listdir(os.path.dirname(path)) == [os.path.basename(path)]
     repeatable, _ = fresh(READ, cache_dir=tmp_path / "cache", flags=f"{flags} {DETERMINISTIC_OPS}")
     assert repeatable == heuristics
     assert repeatable != stored

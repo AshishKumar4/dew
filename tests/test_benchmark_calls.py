@@ -352,41 +352,48 @@ def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however
     assert found == dict.fromkeys(outcomes, True), found
 
 
-def test_a_timing_refuses_a_jitted_call_its_process_runs_as_command_buffers(monkeypatch):
-    """A jitted call is refused a device time (`Ungraphed`) in a process whose XLA runs command buffers,
-    which CUPTI does not read whole (a conditional node's branch unrecorded, G4-LF-2; an A100's measured call
-    failing, row 4880), and read in one that runs none (`UNGRAPHED`), with a conditional or without."""
+def test_a_timing_runs_a_call_without_the_command_buffers_its_process_runs(monkeypatch):
+    """In a process whose XLA runs command buffers, which CUPTI does not read whole (a conditional node's
+    branch unrecorded, G4-LF-2; an A100's measured call failing, row 4880), a call is read as a program of
+    the session's, compiled without them, that computes what the call does, jitted or not, and a call
+    compiled already is refused (`Ungraphed`); in one that runs none (`UNGRAPHED`), the call itself is read,
+    compiled or not."""
     from dew.telemetry.benchmark import UNGRAPHED, DeviceTime, Ungraphed
 
     class Read(Exception):
-        """CUPTI's reading reached: the call was not refused."""
+        """CUPTI's reading reached, with the program it reads."""
 
     class Cupti:
         def measure(self, fn, aggregate):
-            raise Read
+            raise Read(fn)
 
     branched = jax.jit(lambda x: jax.lax.cond(jnp.max(x) > 0, lambda a: a @ a, lambda a: a @ a.T, x))
-    plain = jax.jit(jnp.sin)
     x = jnp.ones((256, 256))
+    compiled = branched.lower(x).compile()
     session = DeviceTime(Cupti())
     monkeypatch.delenv("XLA_FLAGS", raising=False)
-    for call in (branched, plain):
-        with pytest.raises(Ungraphed):
+    for call in (branched, lambda a: jnp.sin(a) + 1):
+        with pytest.raises(Read) as read:
             session.kernels(call, x)
+        [program] = read.value.args
+        assert program is not call and np.array_equal(program(x), call(x))
+    with pytest.raises(Ungraphed):
+        session.kernels(compiled, x)
     # The last occurrence holds, a list replacing the one before it and `-KIND`s amending it.
     for flags in (f"--xla_gpu_enable_command_buffer={UNGRAPHED}",
                   "--xla_gpu_enable_command_buffer=FUSION --xla_gpu_enable_command_buffer=-FUSION"):
         monkeypatch.setenv("XLA_FLAGS", flags)
-        for call in (branched, plain):
-            with pytest.raises(Read):
+        for call in (branched, compiled):
+            with pytest.raises(Read) as read:
                 session.kernels(call, x)
+            assert read.value.args == (call,)
     for flags in ("--xla_gpu_enable_command_buffer=-FUSION",
                   f"--xla_gpu_enable_command_buffer={UNGRAPHED} --xla_gpu_enable_command_buffer=+FUSION",
                   "--xla_gpu_enable_command_buffer=CONDITIONAL"
                   " --xla_gpu_enable_command_buffer=-CONDITIONAL,+CONDITIONAL"):
         monkeypatch.setenv("XLA_FLAGS", flags)
         with pytest.raises(Ungraphed):
-            session.kernels(plain, x)
+            session.kernels(compiled, x)
 
 
 def test_a_projection_benchmark_names_a_grouped_matmul_kernel_and_runs_it(monkeypatch):
