@@ -14,6 +14,7 @@ from pathlib import Path
 
 import lane_environment
 import apart_records
+import check1_wire
 
 # The lane's environment, before JAX reads it.
 os.environ.update(lane_environment.configured(os.environ))
@@ -143,12 +144,32 @@ def pytest_runtest_protocol(item, nextitem):
         _remote.closed(bundle(item))
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_pyfunc_call(pyfuncitem):
+    """A sharded test's judge (`check1_wire.POOL`) judges the check-1 sites its map tasks' manifests name from
+    their records and runs none of its body (`check1_judge.judged_from_records`): every assertion of the
+    body ran in each map task, and a judge draws nothing. A test none of whose map tasks wrote a manifest,
+    or one whose sites judge units of their own (`map_judge.sharded`), runs its body."""
+    if os.environ.get(check1_wire.POOL):
+        import check1_judge
+
+        if check1_judge.judged_from_records(pyfuncitem.nodeid):
+            return True
+    return None
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     """A test the gate fails reports its findings as data (`reference_error.Finding`), the JUnit property
     `gate_findings`, a JSON list of each finding's leaf, rule, measure (an infinite one `Infinity`) and
     the phase it failed: what a promotion matches a candidate's failures to its parent's by."""
     outcome = yield
+    # A map task's sites of this test, written as its manifest once its call is done, whatever it ended in
+    # (`map_judge.manifested`): its judge judges the test from them. Only a test that loaded the map judge
+    # reached a site.
+    judge = sys.modules.get("map_judge")
+    if call.when == "call" and judge is not None:
+        judge.manifested(item.nodeid)
     # Only a test that loaded the gate can raise its GateFailure: a skip or another failure loads none, so
     # the files whose tests skip are not keyed on the gate's every change in the test cache.
     gate = sys.modules.get("reference_error")
