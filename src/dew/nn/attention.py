@@ -1177,8 +1177,8 @@ def quantized_rule(sinks: bool, dropout: bool = False) -> str | None:
     """`AttentionCase.quantized`'s kernel for a call with `sinks` or `dropout`: the template's quantized
     attention where a quantized model's rule owning its products takes it, the reference path where it does
     not; None where no rule owns them or it quantizes no activation."""
-    rule = attention_quantized.owner()
-    if rule is None or attention_quantized.whole(rule):
+    rule = attention_quantized.quantizing()
+    if rule is None:
         return None
     return 'template' if attention_quantized.takes(rule) and not (sinks or dropout) else 'reference'
 

@@ -27,6 +27,7 @@ import pytest
 from deepseek_v41_support import ROOT, TINY
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import decode_through
+from quantized_arms import QUANTIZERS
 from quantized_basis import dequantized_in_own_basis
 from reference_error import FACTOR, as_given, assert_as_exact, distance
 
@@ -44,7 +45,7 @@ from dew.nn.sharding import down_projection
 from dew.nn.visibility import visible
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
-from tools.deepseek_v41_numerics import QUANTIZERS, vision_bundle, vision_run
+from tools.deepseek_v41_numerics import vision_bundle, vision_run
 
 RELEASED = ROOT / "deepseek-v41-flash"
 TRUTH = np.load(TINY / "reference_f64.npz")
