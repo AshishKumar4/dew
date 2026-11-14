@@ -1033,7 +1033,8 @@ def test_a_host_tier_of_more_states_than_pages_reads_each_state_back():
     serving = {**HYBRID_SHARED, "slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8),
                "host_pages": 2, "prefix_states": 1}
     server = Server.from_task(task, **serving)
-    assert server.rows.pages[0].states.host.slots == 5
+    # More states than pages, whatever count the tier derives for them (its budget's own test above).
+    assert server.rows.pages[0].states.host.slots > serving["host_pages"]
     assert_served_as_exact(task, requests, "thin hybrid host states", serving=serving,
                            rounds=(1,) * len(requests), budget=8, seeds=(256, 256))
 
