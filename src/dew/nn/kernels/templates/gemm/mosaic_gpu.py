@@ -863,15 +863,14 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     (m, n, k, g), block_m, block_n, block_k = shape, tiles.block_m, tile_columns(tiles, family), tiles.block_k
     consumers, pair, share = tiles.warpgroups, tiles.cluster, tiles.share
     part = (share, block_n)
-    # A stream for each operand that follows the steps, but a vector a family does not copy, which its
-    # step reads from global memory; a prologue side operand without depth is loaded once a tile.
+    # The side operands streamed with the steps, read from global memory, or loaded once a tile (`_stepped`).
     stepped, read, fixed = _stepped(family, prologue_axes, 'depth')
+    rewritten = prologue_rewritten(family, prologue)
     allocations = _gmm_allocated(tiles, family, (lhs, rhs, paired, scales, step_scales, mx_scales, gather),
                                  hooks, sides, dtypes, transpose_rhs=transpose_rhs, packed_rows=packed_rows,
                                  transpose_lhs=transpose_lhs, interpret=bool(interpret))
-    # The streams that follow the matrix's group and column tile: its own, and a packed one's scales.
     matrices = ('matrix',) if paired is None else ('matrix', 'paired')
-    streamed = matrices + (() if scales is None else ('scales',))
+    streamed = matrices + (() if scales is None else ('scales',))  # a packed matrix's scales beside it
     # A pair's tiles: g groups' boundaries, and the unrouted rows.
     grid = (pl.cdiv(m, block_m * pair) + (0 if dense else g), pl.cdiv(n, block_n))
 
@@ -908,7 +907,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                 if tail is not None and not active:
                     return None  # past its program's range: another program walks the tile
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
-                if active:
+                if active and not rewritten:
                     _fixed_loaded(family, prologue_gmems, prologue_axes, fixed, fixed_refs, fixed_barriers,
                                   wg=wg, rows=pl.ds(row_start, block_m))
                 step = stepped_at(wg, tile, fixed_tiles=dict(zip(fixed, fixed_refs, strict=True)),
@@ -932,7 +931,9 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                            in_flight=family.in_flight, unrolled=_unrolled(prologue, packed_rows, exact_sums),
                            accumulators=(part,) * len(matrices), **_summed(family, tiles, exact_sums),
                            producer=gmm_producer(family, gather is not None),
-                           **({'pingpong': True} if tiles.pingpong else {}))
+                           **({'pingpong': True} if tiles.pingpong else {}),
+                           **_prologue_rewrite(rewritten, family, prologue, (prologue_axes, prologue_gmems),
+                                               (stepped, read, fixed), (fixed_smems, fixed_barriers), g))
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, tiles.sharing,
@@ -943,7 +944,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     out_type = _declared(m if stored is None else stored, n, tiles.splits, dtypes)
     operands = _gmm_operands(lhs, rhs, paired, scales, step_scales, mx_scales, gather, scatter)
     kernel = family.kernel(body, out_type=out_type,
-                           grid=(multiprocessors // pair,), grid_names=("programs",), consumers=consumers,
+                           grid=(multiprocessors // pair,), grid_names=("programs",),
+                           consumers=consumers + rewritten,
                            interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
                            resident=tiles.programs, scalars=0 if dense else 1, registers=registers,
                            producer=gmm_producer(family, gather is not None), shared=shared, moves=MOVES,
@@ -1038,6 +1040,51 @@ def _stored_rows(group, part_row, rows: int, m: int, *, dense: bool, row_tile: i
         return 0, (rows if m % row_tile == 0 else jnp.clip(m - part_row, 0, rows))
     first = jnp.clip(group.actual_start - part_row, 0, rows)
     return first, jnp.clip(group.actual_end - part_row, 0, rows) - first
+
+
+def _prologue_rewrite(rewritten: bool, family: mosaic.Family, prologue, operands: tuple, sides: tuple,
+                      held: tuple, groups: int) -> dict:
+    """Dew: `gmm`'s persist argument where its family's own role rewrites its stage by the prologue
+    (`rewritten`, `prologue_rewritten`; the consumers' steps then read the stage as rewritten): each step's
+    rows stage rewritten (`_prologue_stage`), the prologue's axes and side operands `operands`, its
+    side tiles without depth loaded into the first of each of the `held` staging's refs and barriers; none
+    elsewhere."""
+    if not rewritten:
+        return {}
+    (prologue_axes, prologue_gmems), (smems, barriers) = operands, held
+    return {'prepared': functools.partial(_prologue_stage, family, prologue, prologue_axes, prologue_gmems,
+                                          sides, ([smem.at[0] for smem in smems], barriers), groups=groups)}
+
+
+def _prologue_stage(family: mosaic.Family, prologue, prologue_axes: tuple, prologue_gmems, sides: tuple,
+                    held: tuple, tile, index, slots, *, groups: int) -> None:
+    """Dew: a `gmm` step's rows stage rewritten whole by its prologue in its family's own role
+    (`prologue_rewritten`, `mosaic.Family.persist`'s `prepared`), in the layouts that role reads it in
+    (`mosaic.Family.rewriting`, `_rewritten`): its side tiles the step's slots of those streamed
+    (`sides`' first), the step's depth of those read from global memory (its second, at the tile's group,
+    `_reads`), and those without depth (its third) loaded once a tile, at its first step, into the role's
+    `held` refs and barriers (`_fixed_loaded`, a consumer's own where its consumers take the prologue); a
+    role's rows at a time (`Family.role_rows` of the layouts it reads in), so its registers hold that many
+    rows' tiles whatever the stage's (a gated prologue's two tiles of 128 rows widened would hold 160)."""
+    stepped, read, fixed = sides
+    refs, barriers = held
+    group, row_start, _, first = tile[:4]
+    stage = slots['rows']
+    block_m, depth = stage.shape
+
+    @pl.when(index == 0)
+    def _():
+        _fixed_loaded(family, prologue_gmems, prologue_axes, fixed, refs, barriers, wg=0,
+                      rows=pl.ds(row_start, block_m))
+
+    reads = _reads(prologue_gmems, prologue_axes, read, group, groups)
+    tiles_of = {**{i: slots[f'side_{i}'] for i in stepped},
+                **{i: reads[i].at[pl.ds((first + index) * depth, depth)] for i in read},
+                **dict(zip(fixed, refs, strict=True))}
+    rows = family.rewriting.role_rows
+    for first_row in range(0, block_m, rows):
+        part = pl.ds(first_row, rows)
+        _rewritten(family.rewriting, prologue, prologue_axes, stage.at[part], tiles_of, 'rows', part)
 
 
 def _fixed_loaded(family: mosaic.Family, prologue_gmems, prologue_axes: tuple, fixed, refs, barriers, *, wg,
@@ -1687,7 +1734,8 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
     if packed_rows:
         words = [slots[f'words_{q}'].at[mine_rows] for q in range(slots['scales'].shape[1] // 8)]
         left = packing.rows_decoded(words, slots['scales'].at[mine_rows], interpret)
-    elif prologue is not None:
+    elif prologue is not None and not prologue_rewritten(family, prologue):
+        # A prologue its family's own role rewrites the stage by (`_prologue_stage`) leaves it read as staged.
         stage = slots['rows']
         depth = stage.shape[1]
         tiles_of = {i: fixed_tiles[i] if i in fixed_tiles
@@ -1725,7 +1773,7 @@ def _transformed(prologue, axes_of: tuple, mine: jax.Array, tiles_of: dict, halv
     return prologue(mine, *cut).astype(mine.dtype)
 
 
-def _rewritten(family: mosaic.Family, prologue, axes_of: tuple, mine, tiles_of: dict, halved: str,
+def _rewritten(family: mosaic.Issuer, prologue, axes_of: tuple, mine, tiles_of: dict, halved: str,
                half) -> None:
     """Dew: `mine` rewritten in place by the prologue (`_transformed`), read in its family's accumulator
     layout (`Family.tile_of`); its reader publishes the writes (`mosaic.Family.published`). Read
@@ -1891,6 +1939,15 @@ def rows_unstaged(*, dense: bool, prologue, tabled: bool) -> bool:
     it and no table gathering its rows (`tabled`). Its step is then its products alone
     (`_gradient_unrolled`)."""
     return dense and prologue is None and not tabled
+
+
+def prologue_rewritten(family: mosaic.Family, prologue) -> bool:
+    """Dew: whether `gmm`'s prologue rewrites each step's rows stage in its family's own role
+    (`mosaic.Family.rewrites_in_persist`, tcgen05's rewriting warpgroup, `persist`'s `prepared`), the
+    products reading the stage as rewritten, where its consumers issue no products to take the prologue's
+    value in registers (warpgroup MMA's register operand, mma.sync's fragments). The one decision: the
+    kernel's role and its planning's (`grouped_matmul._Mosaic.rewritten`)."""
+    return prologue is not None and family.rewrites_in_persist
 
 
 def rewrites(family: mosaic.Family, k_major: bool, tables: tuple, unstaged: bool) -> bool:
