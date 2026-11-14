@@ -2287,7 +2287,7 @@ def test_cli_exports_a_recorded_chain_whose_step_its_trust_names_in_a_fresh_proc
     """A chain's record naming a step of a package outside Dew exports from a fresh CLI that trusts that
     package (`--trust`), as a run's command does; without it the record's import is refused (row 6280)."""
     (tmp_path / "steps_of_mine.py").write_text(
-        "from dataclasses import dataclass\nimport grain\n\n\n@dataclass(frozen=True)\n"
+        "from dataclasses import dataclass\nimport grain.python as grain\n\n\n@dataclass(frozen=True)\n"
         "class Shouted(grain.MapTransform):\n    identity = 'shouted@1'\n\n"
         "    def map(self, row):\n        return {**row, 'text': row['text'].upper()}\n")
     recorded = tmp_path / "chain.json"

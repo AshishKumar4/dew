@@ -246,6 +246,15 @@ def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy, over
     assert memory and memory == windows("indexed")
 
 
+def read_windows(pipeline, read):
+    """The windows' tokens a validation read of `pipeline` reads, one window a batch."""
+    reader = validation(pipeline, batch=1, read=read, loading=READ)(DataPartition())
+    try:
+        return [np.asarray(batch["text"]).tolist() for batch in reader]
+    finally:
+        reader.close()
+
+
 @pytest.mark.parametrize("read", ["indexed", "memory"])
 def test_a_planned_first_fit_places_an_empty_document_as_a_stream_does(read):
     """An empty document is a document to first-fit, which counts it against a window's segments: two
@@ -255,16 +264,8 @@ def test_a_planned_first_fit_places_an_empty_document_as_a_stream_does(read):
     documents = [{"text": np.arange(length, dtype=np.int32) + 10 * index}
                  for index, length in enumerate((2, 0, 2))]
     pipeline = Pipeline(Memory(documents)).pack(4, bins=1, segments=2)
-
-    def windows(read):
-        reader = validation(pipeline, batch=1, read=read, loading=READ)(DataPartition())
-        try:
-            return [np.asarray(batch["text"]).tolist() for batch in reader]
-        finally:
-            reader.close()
-
-    streamed = windows("streamed")
-    assert len(streamed) == 2 and windows(read) == streamed
+    streamed = read_windows(pipeline, "streamed")
+    assert len(streamed) == 2 and read_windows(pipeline, read) == streamed
 
 
 def pairs(batch, field="text"):
@@ -335,17 +336,9 @@ def test_a_window_with_no_target_is_left_out_whatever_the_read(read):
     with how it reads."""
     documents = Memory([{"text": np.asarray([1], np.int32)}, {"text": np.asarray([2, 3], np.int32)}])
     pipeline = Pipeline(documents).pack(4, segments=1)
-
-    def windows(read):
-        reader = validation(pipeline, batch=1, read=read, loading=READ)(DataPartition())
-        try:
-            return [np.asarray(batch["text"]).tolist() for batch in reader]
-        finally:
-            reader.close()
-
-    memory = windows("memory")
+    memory = read_windows(pipeline, "memory")
     assert memory == [[[2, 3, 0, 0]]]
-    assert windows(read) == memory
+    assert read_windows(pipeline, read) == memory
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
