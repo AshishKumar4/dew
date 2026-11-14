@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gen_exports
 import lint_scopes as scopes
 
 FEATURES = ("dew.nn", "dew.data", "dew.inputs", "dew.objectives", "dew.training", "dew.inference",
@@ -54,8 +55,7 @@ LAYERS: Mapping[str, Contract] = {
     "the algebra imports nothing above the network layer": Contract(
         ("dew.algebra",), (), tuple(name for name in FEATURES if name not in ("dew.nn", "dew.telemetry")),
         closure=True),
-    # Over its closure once dew.quantization reaches no trainer (row 4265's quantized arithmetic).
-    "the network layer imports no trainer": Contract(("dew.nn",), (), ("dew.training",)),
+    "the network layer imports no trainer": Contract(("dew.nn",), (), ("dew.training",), closure=True),
     "kernels import nothing above the network layer": Contract(
         ("dew.nn.kernels",), (), tuple(name for name in FEATURES if name not in ("dew.nn", "dew.telemetry"))),
     "training imports no front end": Contract(("dew.training",), (), ("dew._cli", "dew.decision")),
@@ -72,12 +72,11 @@ LAYERS: Mapping[str, Contract] = {
     "only the reinforcement-learning packages import dew.rl": Contract(
         ("dew",), ("dew.rl", "dew.objectives.rl"), ("dew.rl",)),
     # A model computes; where a release stores its tensors and config is dew.interop's (row 4264).
-    "models import no weight interop": Contract(("dew.nn",), (), ("dew.interop",)),
+    "models import no weight interop": Contract(("dew.nn",), (), ("dew.interop",), closure=True),
     # A model's inputs are its own types (`dew.nn.inputs`, `dew.nn.flops`), which the diffusion process and
-    # the condition encoders read; a release's preprocessing is interop's (row 4265). Quantized arithmetic is
-    # the next of that row's crossings to settle.
+    # the condition encoders read; a release's preprocessing is interop's (row 4265).
     "models import no diffusion, conditioning or data module": Contract(
-        ("dew.nn",), (), ("dew.diffusion", "dew.inputs", "dew.data")),
+        ("dew.nn",), (), ("dew.diffusion", "dew.inputs", "dew.data"), closure=True),
     # A readout's source states its own axes (`HeadComponent.axes`), so a release's reader names no task
     # (row 4269).
     "interop imports no decision module": Contract(("dew.interop",), (), ("dew.decision",)),
@@ -118,21 +117,10 @@ def read(root: Path) -> Source:
     parents = {module: scopes.package_of(module, path.name == "__init__.py")
                for module, path in paths.items()}
     named = {module: scopes.modules_imported(tree, parents[module]) for module, tree in trees.items()}
-    exported = {module: _exports(tree) for module, tree in trees.items()}
+    exported = {module: gen_exports.exported(tree) for module, tree in trees.items()}
     runs = {module: frozenset(_run(_executed(tree), parents[module], paths, exported))
             for module, tree in trees.items()}
     return Source(paths, named, runs)
-
-
-def _exports(tree: ast.Module) -> Mapping[str, str]:
-    """A lazy package's exports (`_EXPORTS`, tools/gen_exports.py): each name its attribute reads, by the
-    module it imports then."""
-    for node in tree.body:
-        if (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "_EXPORTS"
-                                                 for target in node.targets)):
-            held = ast.literal_eval(node.value)
-            return {name: value if isinstance(value, str) else value[0] for name, value in held.items()}
-    return {}
 
 
 def _executed(tree: ast.Module) -> list[ast.Import | ast.ImportFrom]:
@@ -180,10 +168,11 @@ def _prefixes(name: str, paths: Mapping[str, Path]) -> Iterator[str]:
 
 def _exported(package: str, name: str, paths: Mapping[str, Path],
               exported: Mapping[str, Mapping[str, str]]) -> Iterator[str]:
-    """The modules reading `name` off `package` runs where `package` exports it lazily (`_exports`, read by
-    `dew._exports.lookup`): the module that defines it, with every package above it, and where that module
-    is the package's own module of that name, nothing more; else the name read off that module in turn, a
-    lazy package's export of it followed as its lookup's `getattr` follows it."""
+    """The modules reading `name` off `package` runs where `package` exports it lazily
+    (`gen_exports.exported`, read by `dew._exports.lookup`): the module that defines it, with every package
+    above it, and where that module is the package's own module of that name, nothing more; else the name
+    read off that module in turn, a lazy package's export of it followed as its lookup's `getattr` follows
+    it."""
     seen = set()
     while (package, name) not in seen and (target := exported.get(package, {}).get(name)) is not None:
         seen.add((package, name))
