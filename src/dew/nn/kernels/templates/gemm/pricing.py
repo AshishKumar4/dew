@@ -31,9 +31,10 @@ def tile_columns(tiles: "Tiles", family: mosaic.Family) -> int:
 
 
 def tile_rows(tiles: "Tiles", family: mosaic.Family) -> int:
-    """The output rows a tile spans: its `block_m`, or both CTAs' of a pair whose family's products span it
-    (`tile_columns`: each CTA's accumulators its own `block_m` rows)."""
-    return tiles.block_m * (tiles.cluster if family.pairs_product else 1)
+    """The output rows a cluster's tile spans: each CTA's `block_m` its own, side by side, whether a pair's
+    products span them (`tile_columns`) or its CTAs multicast the blocks they read alike."""
+    del family
+    return tiles.block_m * tiles.cluster
 
 
 def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],

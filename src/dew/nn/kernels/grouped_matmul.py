@@ -1639,7 +1639,7 @@ class MosaicTgmm(_Mosaic):
             rhs_dtype=ba.arguments['cotangent'].dtype, prologue_axes=ba.arguments['hooks'].prologue_axes,
             prologue_dtypes=tuple(side.dtype for side in ba.arguments['prologue_operands']),
             out_dtype=ba.arguments['out_dtype'], k_major=self.K_MAJOR, step_scaled=self.K_MAJOR,
-            unstaged=self.unstaged(ba))
+            unstaged=self.unstaged(ba), gathered=ba.arguments.get('gather') is not None)
 
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         # A gradient tile's rows are the tokens' width; its steps run over a group's rows, padded to whole
@@ -1765,7 +1765,7 @@ class MosaicTgmm(_Mosaic):
         rows, _, width = self._generated_extents(ba)  # a pair's tile both CTAs' (`pricing.tile_rows`)
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
         whole = (rows % pricing.tile_rows(config, family) == 0
-                 or (self._ragged(ba, family) and not family.pairs_product))
+                 or (self._ragged(ba, family) and config.cluster == 1))
         return whole and width % pricing.tile_columns(config, family) == 0
 
     def _ragged(self, ba, family: mosaic.Family) -> bool:
@@ -1781,14 +1781,12 @@ class MosaicTgmm(_Mosaic):
                 and mosaic_gpu.ragged_rows(rows, prologue=prologue, k_major=self.K_MAJOR))
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
-        """`_Mosaic.candidate` on one multiprocessor a tile or a pair (`tgmm` multicasts nothing), a family
-        whose products read registers loading its transposed stage in whole row atoms of its products (the
-        step, `block_k`, in `Family.transposed_rows`)."""
+        """`_Mosaic.candidate` on a family whose products read registers loading its transposed stage in whole
+        row atoms of its products (the step, `block_k`, in `Family.transposed_rows`)."""
         if not super().candidate(ba, config, target):
             return False
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
-        return ((config.cluster == 1 or family.pairs_product)
-                and not (family.operands_in_registers and config.block_k % family.transposed_rows))
+        return not (family.operands_in_registers and config.block_k % family.transposed_rows)
 
     BLOCKS: ClassVar[dict[str, str]] = {'rows': 'block_k', 'depth': 'block_m'}
 
