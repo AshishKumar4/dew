@@ -108,6 +108,7 @@ from dew.objectives.base import (
     EMASpec,
     Exponentiated,
     Omitted,
+    Pooled,
     Prediction,
     Ratio,
     Shown,
@@ -1751,7 +1752,7 @@ class LMObjective(TokenScorer):
         units = shares(losses, weights)
         mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
         prediction = Ratio(self.row_mean(losses, batch, weights=weights).total, mass)
-        reported: dict[str, jax.Array | Ratio] = {
+        reported: dict[str, jax.Array | Pooled] = {
             "ce": prediction, "perplexity": Exponentiated(prediction.total, prediction.mass)}
         if correct is not None:
             reported["token_accuracy"] = self.accuracy(correct, batch, weights)

@@ -191,6 +191,13 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
     operands_in_registers = True
 
+    def depths(self, dtype) -> tuple[int, ...]:
+        # A step's fragments read by ldmatrix from a block staged at a 128- or 64-byte swizzle, cp.async's
+        # (`Mma`, `swizzled`) or a TMA ring's at the widest that fits (`bundles.MmaFed`, `swizzling.staged`):
+        # the shallower step holds a balanced tile's ring where the deeper does not (an RTX PRO 6000's 99 KB
+        # block at 128 x 128, cuBLASLt's 32-deep rings).
+        return tuple(swizzling.swizzle_columns(dtype, swizzle) for swizzle in (swizzling.SWIZZLE_BYTES, 64))
+
     def column_unit(self, dtype) -> int:
         # A warp's lanes, whatever loader stages its tiles: the guarded attention walk's 32-column key
         # blocks held where its 64 held no tile's registers at width 128 (its fragments are registers), a
@@ -541,11 +548,12 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                ahead: Callable | None = None, settled: tuple[int, ...] = (),
                prefetched: Callable | None = None, registers: int | None = None,
-               producer: int | None = None) -> Callable:
+               producer: int | None = None, shared: int | None = None,
+               moves: bool | None = None) -> Callable:
         # Its one warpgroup its consumer, no producer beside it, and no cluster; its kernels' default
         # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
         # Its programs read a table from global memory as any operand, and no producer runs beside them.
-        del reducing_warpgroups, scalars, producer
+        del reducing_warpgroups, scalars, producer, moves  # one warpgroup: no roles to move registers between
         _one(consumers, clustered=cluster > 1)
         built = launches.kernel(bodies.dependent(entry, interpret, ahead=ahead, settled=settled,
                                                  prefetched=prefetched),
@@ -556,7 +564,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                                 interpret=bodies.interpreted(interpret),
                                 kernel_name=report.named(
                                     name, model=(None if registers is None
-                                                 else resources.register_model(self, consumers, registers))),
+                                                 else resources.register_model(self, consumers, registers,
+                                                                               shared=shared))),
                                 cost_estimate=cost)
         return mosaic.checked(built, name or self.name, resident, model_flops,
                               settled if bodies.waits(interpret) else ())
@@ -590,8 +599,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             raise ValueError("a pipelined family's streams take their views where they open (its walk loads)")
         return Streams(allocated, views)
 
-    def stream(self, streams, views, lo, hi, *, adds: tuple | None = None) -> None:
-        del streams, views, lo, hi, adds
+    def stream(self, streams, views, lo, hi) -> None:
+        del streams, views, lo, hi
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
@@ -723,10 +732,6 @@ class Mma(MmaIssuer, CpAsync):
     # spilled where the forward derived them (sm80 width 64, split residuals), and no GEMM derived them;
     # FlashAttention 2's rows come from one warpgroup's wider tiles, not a second warpgroup.
     consumers = 1
-
-    def depths(self, dtype) -> tuple[int, ...]:
-        # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).
-        return tuple(swizzling.swizzle_columns(dtype, swizzle) for swizzle in (swizzling.SWIZZLE_BYTES, 64))
 
 
 def _one(consumers: int, *, clustered: bool = False) -> None:

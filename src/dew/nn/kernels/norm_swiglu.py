@@ -538,6 +538,15 @@ FP16_NORM_FASTER = ("FSNORM16 (base/kernels 4d31032c6, CUPTI, arms rotated): Qwe
                     "74.5 and 227.8)")
 """The receipt behind the fused norm's fp16 cells."""
 
+B200_FUSED = ("M-EM-40 (base/kernels df82480cb5c, a B200, CUPTI medians of 5 rounds, two warm arms): the "
+              "4B's one-row step's shapes in bf16, the fused kernels' forward and their forward with reverse "
+              "against XLA's fusions of the same math: SwiGLU over 12,288 x 9,216 114.8 and 314.1 us against "
+              "214.5 and 607.6; the gated norm over 12,288 x 32 heads of 128 70.7 and 246.1 against 66.6 and "
+              "313.7; the seam over 12,288 x 2,560 50.1 and 152.3 against 57.6 and 141.4. A remat step runs "
+              "each forward twice and its reverse once: per 4B step its 24 gated norms 1.5 ms faster fused, "
+              "its 64 seams 0.2 ms slower, one cell of narrow bf16 rows")
+"""The receipt behind the B200's fused norm's and SiLU product's cells."""
+
 FUSED_NORM = Kernel[NormCase]('pallas', NORM_SUPPORTS)
 """The fused norm's kernel."""
 
@@ -546,6 +555,7 @@ NORM_CELLS: dict[tuple[str | None, NormRows], tuple[Kernel[NormCase], str]] = {
     ('sm90', NormRows(jnp.dtype(jnp.bfloat16), narrow=True)): (FUSED_NORM, FUSED_FASTER),
     ('sm80', NormRows(jnp.dtype(jnp.float16), narrow=True)): (FUSED_NORM, FP16_NORM_FASTER),
     ('sm90', NormRows(jnp.dtype(jnp.float16), narrow=True)): (FUSED_NORM, FP16_NORM_FASTER),
+    ('sm100', NormRows(jnp.dtype(jnp.bfloat16), narrow=True)): (FUSED_NORM, B200_FUSED),
 }
 """The fused norm's declared cells (`selection.Op.declared`), (device generation, rows) to the fused kernel
 and its receipt: a literal of them, which the selector reads and thresh's declared-set seam registers
@@ -617,6 +627,7 @@ FUSED_SWIGLU = Kernel[SwigluCase]('pallas', SWIGLU_SUPPORTS)
 SWIGLU_CELLS: dict[tuple[str | None, np.dtype], tuple[Kernel[SwigluCase], str]] = {
     ('sm80', jnp.dtype(jnp.bfloat16)): (FUSED_SWIGLU, FUSED_FASTER),
     ('sm90', jnp.dtype(jnp.bfloat16)): (FUSED_SWIGLU, FUSED_FASTER),
+    ('sm100', jnp.dtype(jnp.bfloat16)): (FUSED_SWIGLU, B200_FUSED),
 }
 """The fused SiLU product's declared cells (`selection.Op.declared`), as `NORM_CELLS` holds the norm's."""
 

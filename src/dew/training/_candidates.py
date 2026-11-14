@@ -415,7 +415,7 @@ def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, c
                                               stepping.model_batch(micro), part, batch_tokens(micro),
                                               micro.get(CLOSES_WINDOW), whole)
         stepped, *rest = outcome(current, advanced, loss, aux, committed, batch, part == split - 1,
-                                 batch_consumed(micro))
+                                 batch_consumed(micro), split=split)
         return (apart(stepped)[0], *rest)
 
     returned = (moving, replicated, replicated, replicated, replicated, replicated)

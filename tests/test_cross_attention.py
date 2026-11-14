@@ -617,6 +617,12 @@ def test_a_served_request_reads_its_own_context(options):
     assert (hits, server.prefix_hits) == ((4, 4) if shares else (0, 0))
 
 
+SERVED_CONTEXT_SEEDS = {"dense": 512, "kv_cache": 512, "kv_cache, chunk": 256,
+                        "kv_cache, chunk, prefix_cache": 256}
+"""Check 1's declared seeds for each served-contexts site, by its serving options, sized paired by `seeds_for`
+on armada (main f57250bb2)."""
+
+
 @pytest.mark.parametrize("options", [
     {},
     {"kv_cache": KVCache(page_size=4, pages=40)},
@@ -638,10 +644,10 @@ def test_served_requests_score_their_draws_from_their_own_contexts(options):
     repeated = [Served(len(PROMPTS[2]), conditioning=functools.partial(drawn_context, 2)),
                 Served(len(PROMPTS[2]), conditioning=lambda row: {
                     **drawn_context(2, row), CONTEXT_LENGTHS: np.asarray([1], np.int32)})]
-    label = f"served contexts {', '.join(options) or 'dense'}"
-    assert_served_as_exact(served_task(eos_token_ids=None), [*requests, *repeated], label,
+    site = ", ".join(options) or "dense"
+    assert_served_as_exact(served_task(eos_token_ids=None), [*requests, *repeated], f"served contexts {site}",
                            serving={"slots": 4, "capacity": 128, "admission": 2, **options},
-                           rounds=(len(requests), 1, 1))
+                           rounds=(len(requests), 1, 1), seeds=(SERVED_CONTEXT_SEEDS[site],) * 2)
 
 
 def test_a_server_refuses_a_context_its_layers_cannot_read():

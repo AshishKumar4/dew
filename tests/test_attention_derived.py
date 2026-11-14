@@ -490,28 +490,6 @@ def test_a_derived_backward_scales_its_cotangents_before_their_products():
     assert all(np.isfinite(np.asarray(grad)).all() for grad in (grads.query, grads.key, grads.value))
 
 
-def test_a_derived_forward_keeps_an_fp16_weight_its_dropout_multiplies_finite():
-    """The fp16 witness of the stability suite (tests/test_attention_dropout.py): a rate of
-    1 - 2^-16 (a kept weight's multiplier 2^16) with one of two equal-logit keys kept. The kept weight times
-    its multiplier is past fp16's largest; its normalized weight times it is not, as the reference's is, and
-    the output is finite (the dropping step's scaled parts, which the declaration states none of)."""
-    rate = 1.0 - 2.0 ** -16
-    seeds = jnp.arange(1 << 16, dtype=jnp.uint32)[:, None, None]
-    kept = np.asarray(template.Draw((seeds, jnp.zeros_like(seeds)), jnp.int32(0), jnp.int32(0), rate).keep(
-        jnp.zeros((1, 1), jnp.int32), jnp.arange(2, dtype=jnp.int32)[None, :]))
-    words = jnp.asarray([next(index for index in range(kept.shape[0]) if int(kept[index, 0].sum()) == 1), 0],
-                        jnp.uint32)
-    hooks = template.Hooks(drop=template.Dropout(words, jnp.arange(1, dtype=jnp.int32),
-                                                 jnp.arange(1, dtype=jnp.int32), rate))
-    query, key, value, _ = one_key(jnp.float16, [[0.0]], [[0.0], [0.0]], [[2.0 ** -10] * 8] * 2,
-                                          [[0.0]])
-    spans = template.spans(1, 2, 1)
-    assert np.isfinite(np.asarray(template.reference(query, key, value, spans, hooks))).all()
-    with fast():
-        out = attention_portable.xla_mainloop(ONE_KEY, query, key, value, spans, hooks, scale=SCALE)
-    assert np.isfinite(np.asarray(out)).all()
-
-
 def test_a_derived_backward_at_a_scale_of_zero_gives_zero_query_and_key_gradients():
     """A call at a scale of zero (`attention.prescale`'s own case) under the derived backward: its weights
     uniform, its query's and key's gradients zero, as the reference's, its value's finite."""

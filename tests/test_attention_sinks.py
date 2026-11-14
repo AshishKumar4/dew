@@ -6,7 +6,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_computes_the_oracle, chain_roundings
+from attention_oracle import attention_on_par, kept
+from contract_support import normal_drawn
+from reference_error import FEWEST_SEEDS, assert_computes_the_oracle, chain_roundings
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
@@ -15,19 +17,24 @@ FIXTURE = Path(__file__).parent / "fixtures" / "gpt_oss" / "attention.npz"
 
 
 def test_xla_sink_attention_keeps_causal_window_and_gradients():
+    """GPT-OSS's sinks under a causal window of three keys on the xla kernel, at the shapes of GPT-OSS's
+    recorded eager attention (tools/gpt_oss_reference.py's fixture): over fresh draws its output and every
+    gradient, the sinks' among them, on par with the reference path's from float64 (check 1,
+    `attention_on_par`); the reference path's formula is GPT-OSS's to float64's own rounding
+    (`test_sinks_a_softcap_and_dropout_compose_on_one_reference_path`)."""
     with np.load(FIXTURE) as fixture:
-        arrays = {name: jnp.asarray(value) for name, value in fixture.items()}
+        shapes = [fixture[name].shape for name in ("query", "key", "value", "sinks", "output")]
 
-    def attend(sinks):
-        return scaled_dot_product_attention(
-            arrays["query"], arrays["key"], arrays["value"], sinks=sinks,
-            implementation="xla", causal=True, sliding_window=3)
+    def attend(implementation):
+        def run(query, key, value, sinks):
+            return scaled_dot_product_attention(query, key, value, sinks=sinks,
+                                                implementation=implementation, causal=True, sliding_window=3)
+        return run
 
-    np.testing.assert_allclose(attend(arrays["sinks"]), arrays["output"], atol=5e-7, rtol=0)
-    gradient = jax.grad(lambda sinks: jnp.square(attend(sinks)).sum())(arrays["sinks"])
-    assert bool(jnp.all(gradient < 0))
-    without = attend(jnp.full_like(arrays["sinks"], -jnp.inf))
-    assert float(jnp.max(jnp.abs(without - arrays["output"]))) > 0.5
+    queries, keys = shapes[0][1], shapes[1][1]
+    attention_on_par(attend("xla"), attend("reference"), normal_drawn(0x515, *shapes),
+                     "xla sinks in a window", keep=kept(queries, keys, causal=True, sliding_window=3),
+                     seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize("dropout_rate", [0.0, 0.25])

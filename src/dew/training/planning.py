@@ -69,7 +69,7 @@ from dew.training.memory import (
     step_fits,
     temporaries_factor,
 )
-from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
+from dew.training.model_flops import TOKENS, TRAINING_FLOPS
 from dew.training.profiling import PGLE_CAPTURE
 
 if TYPE_CHECKING:
@@ -266,16 +266,13 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
 
 def _pooled(name: str, values: list):
     """A step's metric `name` from its microbatches' `values`: a recording step's evaluations every
-    microbatch's in the order they ran (`RECORD`); the model FLOPs and tokens counted, summed; a `Pooled`
-    statistic by its own pooling (`Pooled.pooled`); any other its last microbatch's (`Aux.metrics`)."""
+    microbatch's in the order they ran (`RECORD`); a `Pooled` statistic by its own pooling
+    (`Pooled.pooled`); any other its last microbatch's (`Aux.metrics`), the model FLOPs and tokens among
+    them, which every microbatch counts of the whole batch it is read from (`step_counts`)."""
     if name.startswith(RECORD):
         return jnp.concatenate(values)
-    if name == TOKENS:
-        return functools.reduce(_TokenCount.add, values)
     if isinstance(values[-1], Pooled):
         return Pooled.pooled(values)
-    if name == TRAINING_FLOPS:
-        return jax.tree.map(lambda *parts: sum(parts), *values)
     return values[-1]
 
 
@@ -854,12 +851,14 @@ class FitSearch[LossT, EffectsT]:
         # Its derivation is its trace's (row 5479's 47 minutes were the derivation's own, 13 s since).
         # A rung fits where its most microbatches do; the derivation then finds its split there, which
         # alone is compiled where it is right (`derived_split`). A step that fits at its fewest fits at
-        # every split, at the rung it stands on: one derivation says so, and no rung is walked.
+        # every split, at the rung it stands on: one derivation says so, and no rung is walked. The plan's
+        # spills and refusals are those of its derivation's traces too: a launch certified as it traces
+        # (`report.certified`) refuses a spilling config there, before any compile.
+        seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
+        passed = len(report.passes())
         if not self.fits_at_fewest(candidates, first):
             self.derived_start(candidates[-1])
         first = self.derived_split(candidates, first)
-        seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
-        passed = len(report.passes())
         split = planned(candidates, first, self.fits, self.climb, self.likely,
                         functools.partial(self.fits, pruned=True))
         spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]

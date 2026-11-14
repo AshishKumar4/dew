@@ -36,7 +36,7 @@ from dew.nn.autoencoders import AutoEncoder, LatentAffine
 from dew.nn.autoencoders.kl import posterior_moments
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Objective
+from dew.objectives.base import Objective, Pooled, Ratio, Summed
 
 AUTOENCODER = "autoencoder"
 """Where the trained autoencoder's parameters sit in `params`."""
@@ -292,7 +292,7 @@ class EndToEnd:
 
     def regularizer(self, images: jax.Array, reconstruction: jax.Array, moments: jax.Array, *,
                     perceptual: Variables | None, discriminator: Variables | None,
-                    step: jax.Array, batch: Batch) -> tuple[jax.Array, jax.Array, dict[str, jax.Array]]:
+                    step: jax.Array, batch: Batch) -> tuple[jax.Array, jax.Array, dict[str, Pooled]]:
         """Return the autoencoder's own loss, the discriminator's loss, and their terms.
 
         `perceptual` is the LPIPS network's variables and `discriminator` the
@@ -302,8 +302,9 @@ class EndToEnd:
         the values the step began with. Every mean is over `batch`'s rows
         (`Objective.row_mean`).
         """
-        def mean_of(values: jax.Array) -> jax.Array:
-            return Objective.row_mean(values, batch).mean()[0]
+        def mean_of(values: jax.Array) -> Ratio:
+            # Each term the ratio its mean is over the batch's rows, which a split step pools.
+            return Objective.row_mean(values, batch)
 
         # At least float32, and a float64 run stays float64.
         dtype = at_least_fp32(jnp.result_type(moments, reconstruction))
@@ -312,25 +313,30 @@ class EndToEnd:
         kl = mean_of(0.5 * jnp.sum(jnp.square(mean) + jnp.exp(log_variance) - 1.0 - log_variance, axis=axes))
         reconstruction = reconstruction.astype(dtype)
         reconstruction_error = mean_of(jnp.abs(images - reconstruction))
-        total = self.reconstruction_weight * reconstruction_error + self.kl_weight * kl
-        terms = {"reconstruction": reconstruction_error, "kl": kl}
+        total = self.reconstruction_weight * reconstruction_error.mean()[0] + self.kl_weight * kl.mean()[0]
+        terms: dict[str, Pooled] = {"reconstruction": reconstruction_error, "kl": kl}
         if perceptual is not None:
             from dew.eval.lpips import LPIPSNetwork
 
-            terms["perceptual"] = mean_of(_applied(LPIPSNetwork(), perceptual, images, reconstruction))
-            total = total + self.perceptual_weight * terms["perceptual"]
+            perceived = mean_of(_applied(LPIPSNetwork(), perceptual, images, reconstruction))
+            terms["perceptual"] = perceived
+            total = total + self.perceptual_weight * perceived.mean()[0]
         hinge = jnp.zeros((), dtype)
         network = self.discriminator
         if network is not None and discriminator is not None:
             started = (step >= self.discriminator_start).astype(dtype)
             frozen = jax.lax.stop_gradient(discriminator)
-            terms["generator"] = -mean_of(_applied(network, frozen, reconstruction, batch))
-            total = total + self.discriminator_weight * started * terms["generator"]
+            fooled = mean_of(_applied(network, frozen, reconstruction, batch))
+            terms["generator"] = Ratio(-fooled.total, fooled.mass)
+            total = total - self.discriminator_weight * started * fooled.mean()[0]
             real, fake = (_applied(network, discriminator, jax.lax.stop_gradient(pixels), batch)
                           for pixels in (images, reconstruction))
             charged_real, charged_fake = hinge_charges(real, fake)
-            hinge = started * 0.5 * (mean_of(charged_real) + mean_of(charged_fake))
-            terms["discriminator"] = hinge
+            charged = tuple(mean_of(charge) for charge in (charged_real, charged_fake))
+            # Half of each side's mean, from the discriminator's start: the two ratios' means summed.
+            terms["discriminator"] = Summed(tuple(Ratio(started * 0.5 * side.total, side.mass)
+                                                  for side in charged))
+            hinge = terms["discriminator"].mean()[0]
         return total, hinge, terms
 
 

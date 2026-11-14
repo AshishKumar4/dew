@@ -32,6 +32,7 @@ from dew._records import JSON, integer, json_value
 from dew.batch import Batch
 from dew.data.analysis import (
     _EAGER,
+    _VIEWS,
     Measuring,
     _analyzed,
     _at,
@@ -146,17 +147,7 @@ from dew.data.pipeline import (
     with_children,
     with_stores,
 )
-from dew.data.plan import (
-    PLAN_VERSIONS,
-    DataResume,
-    Plan,
-    StepIdentity,
-    described,
-    fingerprint,
-    identified,
-    read_by,
-    structured,
-)
+from dew.data.plan import DataResume, Plan, StepIdentity, described, fingerprint, identified, structured
 from dew.data.readers import GRAIN, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
     Read,
@@ -768,7 +759,6 @@ def compile(
     widths: Mapping[str, object] | None = None,
     measured: _TrainingMeasured | None = None,
     epochs: int | None = None,
-    plan_version: int = PLAN_VERSIONS[-1],
     steps: int | None = None,
     tokens: int | None = None,
 ) -> Loader:
@@ -779,13 +769,9 @@ def compile(
     its first that many source examples, before they are packed and before the objective makes rows
     of them (`_bounded`), a run's `examples=` budget. `epochs` reads the chain endlessly, or, where its
     read has no record count, bounds it to that many passes over the source examples it states a pass
-    holds once it is prepared (`_staged`, `Loader.pass_examples`). `plan_version` is the data plan version
-    of the run it reads for (`dew.config.RunConfig.data_plan_version`): this Dew's, or the one a resumed
-    run saved under, which this Dew reads as its own, refused before anything is provisioned where it reads
-    none of it (`dew.data.plan.read_by`). `steps` or `tokens` is the
+    holds once it is prepared (`_staged`, `Loader.pass_examples`). `steps` or `tokens` is the
     run's length where it is no bound of the read's own, which automatic loading sizes its workers for
     (`_run_batches`)."""
-    read_by(plan_version)
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _TRAINING_LOADING
@@ -1276,24 +1262,21 @@ def _held_coordinated(validation: Pipeline, training: tuple[Coordinated, ...]) -
     return held + tuple(Coordinated(step.fields, None) for step in training if step.fields[0] not in declared)
 
 
-_KEEPS_RECORDS = (Shuffle, Repeat, Limit, Slice)
-"""The stages that hand a record on as it is, only ordering, repeating or bounding the records."""
-
-
 def _floor(pipeline: Pipeline, at: int, pack: Pack) -> int | None:
     """The fewest tokens along `pack`'s ids field of a record the pack at `at` receives, where a memory read
     holds the records its stages before it read (`_Memory`) and each of those stages hands a record on as it
-    is (`_KEEPS_RECORDS`, a bound's marks) but at most one, a step that states its floor (`Shortest`): each
-    held record's length, or that step's floor of it. A pack's window then holds at most `seq_len` over it
-    documents, the most a memory read that cannot run its pack (a random step before it) declares, a fitting
-    pack cutting no document. None where it cannot be read so: a concatenating pack, which cuts documents
-    where its windows end, a stream, a held record still encoded, or another step between."""
+    is (a view of its inputs, `dew.data.analysis._VIEWS`, a bound's marks) but at most one, a step that states
+    its floor (`Shortest`): each held record's length, or that step's floor of it. A pack's window then holds
+    at most `seq_len` over it documents, the most a memory read that cannot run its pack (a random step before
+    it) declares, a fitting pack cutting no document. None where it cannot be read so: a concatenating pack,
+    which cuts documents where its windows end, a stream, a held record still encoded, or another step
+    between."""
     source = pipeline.source
     if pack.policy == "concat" or not isinstance(source, _Memory) or not source.held:
         return None
     stating: Shortest | None = None
     for stage in pipeline.stages[:at]:
-        if isinstance(stage, _KEEPS_RECORDS) or (isinstance(stage, Map)
+        if isinstance(stage, _VIEWS) or (isinstance(stage, Map)
                                                   and isinstance(stage.step, MarkConsumed)):
             continue
         ran = runs(stage)
@@ -1303,7 +1286,8 @@ def _floor(pipeline: Pipeline, at: int, pack: Pack) -> int | None:
     field = pack.fields[0]
     floors = []
     for row in source.held:
-        if not isinstance(row, Mapping) or field not in row:
+        # A stating step makes the field from what it reads (an encoding, its tokens); else the row holds it.
+        if not isinstance(row, Mapping) or (stating is None and field not in row):
             return None
         floors.append(len(row[field]) if stating is None else stating.shortest(row, field))
     return max(1, min(floors))
@@ -2008,12 +1992,10 @@ def iterate(
     read: Read = "streamed",
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
-    plan_version: int = PLAN_VERSIONS[-1],
 ) -> pygrain.IterDataset:
-    """A finite record pass through the same lowering, for publication and export, read by data plan
-    `plan_version` (`compile`'s), in the process: automatic workers (`Loading.unsized`) and those the chain
-    names (row 5735), whose turns would interleave the records out of the order the pass publishes."""
-    read_by(plan_version)
+    """A finite record pass through the same lowering, for publication and export, in the process:
+    automatic workers (`Loading.unsized`) and those the chain names (row 5735), whose turns would
+    interleave the records out of the order the pass publishes."""
     loading = loading.unsized()
     pipeline = _in_process(pipeline)
     if any(isinstance(stage, (RandomMap, BatchStage, MapBatch, Repeat)) for stage in _steps(pipeline)):
@@ -2167,7 +2149,6 @@ def fitted[Entry](
     seed: int = 0,
     examples: int | None = None,
     epochs: int | None = None,
-    plan_version: int = PLAN_VERSIONS[-1],
     steps: int | None = None,
     tokens: int | None = None,
     resume: DataResume = "relaxed",
@@ -2186,10 +2167,7 @@ def fitted[Entry](
     is passed on as it is. A run of `epochs` over a chain whose read has no
     record count, but states the source examples a pass holds
     (`Loader.pass_examples`), reads it bounded to that many passes, as
-    `examples` bounds it (`Loader.epochs`), in the one compile (`_staged`).
-    A run of a data plan version this Dew reads none of is refused, whatever
-    it is handed (`read_by`)."""
-    read_by(plan_version)
+    `examples` bounds it (`Loader.epochs`), in the one compile (`_staged`)."""
     if isinstance(dataset, Dataset):
         dataset = dataset._chain()
     if isinstance(validation, Dataset):
@@ -2228,7 +2206,7 @@ def fitted[Entry](
                   if scored else {})
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
                          widths=widths, read=read, measured=measured,
-                         epochs=epochs if examples is None else None, plan_version=plan_version,
+                         epochs=epochs if examples is None else None,
                          steps=steps, tokens=tokens, resume=resume)
     else:
         widths = run_widths(list(scored.values()), objective) if scored else {}
@@ -2241,9 +2219,8 @@ def fitted[Entry](
                              "its chain")
     if named is None:
         return loader, None
-    # Validation is refused where training is, by the run's version (`read_by`).
     return loader, {name: held(entry, objective=objective, batch=loader.batch, seed=seed, widths=widths,
-                               measured=scored[name], plan_version=plan_version)
+                               measured=scored[name])
                     if isinstance(entry, Dataset) else entry
                     for name, entry in named.items()}
 
@@ -2296,8 +2273,8 @@ def _reads_on(chain: Pipeline) -> bool:
 
 
 def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int | None = None,
-         seed: int = 0, widths: Mapping[str, object] | None = None, measured: _Measured | None = None,
-         plan_version: int = PLAN_VERSIONS[-1]) -> Reader:
+         seed: int = 0, widths: Mapping[str, object] | None = None,
+         measured: _Measured | None = None) -> Reader:
     """`dataset` read once to validate or evaluate on, in its own batches, else in batches of `batch`,
     read and loaded as it asks, its random steps drawing from `seed`; one that states neither batch is
     refused. A pass reads every record: a batch it fills only in part keeps the records it holds,
@@ -2317,7 +2294,7 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
     # The chain's own batch is the one it is read in; validation's `batch` adds none to it.
     return validation(measured.branches[0], batch=1, objective=objective, read=_held_read(chain),
                       loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed, widths=widths,
-                      measured=measured, plan_version=plan_version)
+                      measured=measured)
 
 
 def _held_batched(chain: Pipeline, batch: int | None, *, unbatched: bool = False) -> Pipeline:
@@ -2360,13 +2337,10 @@ def validation(
     seed: int = 0,
     widths: Mapping[str, object] | None = None,
     measured: _Measured | None = None,
-    plan_version: int = PLAN_VERSIONS[-1],
 ) -> Reader:
     """Compile one finite evaluation branch without constructing a training
     stream. With no `read`, the sources choose it (`_preferred_read`); `widths` are the run's static
-    widths its steps bind to (`run_widths`), and `measured` the branch as they measured it, batched; it
-    reads by data plan version `plan_version`, its run's (`compile`)."""
-    read_by(plan_version)
+    widths its steps bind to (`run_widths`), and `measured` the branch as they measured it, batched."""
     read = read or _preferred_read((pipeline,), provision=provision)
 
     # One pass reads every record, in the chain's own batches or `batch`'s (`_held_batched`).
@@ -2392,18 +2366,15 @@ def publish(
     read: Read = "streamed",
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
-    plan_version: int = PLAN_VERSIONS[-1],
 ):
     """Fill and seal a deterministic prefix, then publish its certified
     generation, unless one is already published under its key (with the plan
     of a terminal pack), which it returns, its stream's fill numbering its rows
-    by the shards its source states (`dew.data.sources.base.Source.manifest`);
-    refused where this Dew reads no plan of `plan_version` (`read_by`)."""
+    by the shards its source states (`dew.data.sources.base.Source.manifest`)."""
     from dew.data.cache import Cache
     from dew.data.generation import Generation
     from dew.data.packing import PackingPlan, plan_name
 
-    read_by(plan_version)
     if not isinstance(cache, Cache):
         raise TypeError("publish needs a Cache destination")
     if isinstance(pipeline.source, Combined):
@@ -2431,7 +2402,7 @@ def publish(
     found = published()
     if found is not None:
         return found
-    iterator = iter(iterate(pipeline.cache(cache), read=read, loading=loading, plan_version=plan_version))
+    iterator = iter(iterate(pipeline.cache(cache), read=read, loading=loading))
     try:
         for _ in iterator:
             pass

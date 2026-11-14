@@ -34,6 +34,7 @@ from upstream_support import upstream_arm
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kernels import generation, recurrence_chunk
+from dew.nn.kernels.chunked_launch import Forked
 from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm90, report
 from dew.nn.kernels.templates.recurrence import selective
 from dew.nn.mixers.mamba import Mamba, selective_scan as portable
@@ -151,6 +152,51 @@ def the_template_is_as_exact_as_its_reference(case: str, packed: bool, dtype=jnp
 # The template's scan interpreted, each case a check-1 site of its own, its eight draws in armada map tasks of
 # four (`check1_shards`): whole, both took 200 s (site-tasks2 at d87423e30), a task of two seeds of both 91 s
 # (site-tasks at c17a54df2); on each route (`ROUTES`).
+FORKED = {
+    "shared and chained": Forked(jnp.asarray([[0, 25, 46], [0, 10, 48]], jnp.int32),
+                                 jnp.asarray([[1, 2, 2], [1, 2, 3]], jnp.int32),
+                                 jnp.asarray([[1, 0, 0], [1, 2, 0]], jnp.int32), None, 2),
+    "a slot a given state": Forked(jnp.asarray([[0, 30, 50], [0, 20, 44]], jnp.int32),
+                                   jnp.asarray([[1, 2, 2], [1, 0, 2]], jnp.int32),
+                                   jnp.asarray([[1, 0, 0], [1, 0, 0]], jnp.int32), None, 1)}
+"""The interpreted shape's forked calls (`Chunk.loads`), two rows of three documents from one given state
+each, laid from chunks' edges: a request's questions entering its shared part's final (the first row's later
+two) and a chain, each document its predecessor's final; and one stored slot a row beside its one given state,
+a document from a zero state among them, so the backward's given and stored slots are as many."""
+
+
+def the_template_is_as_exact_over_a_forked_call(layout: str, dtype=jnp.bfloat16):
+    """`FORKED[layout]` through the template (`selective_scan`'s `forked`): its output, the row's last state
+    and every input's gradient, its given states' included, on par from float64 with the portable scan's
+    forked path (`dew.nn.mixers.mamba.selective_scan`'s), over check 1's fewest draws (row 5288)."""
+    forked = FORKED[layout]
+    _, length, channels, states = SHAPES["interpreted"]
+    rows = forked.firsts.shape[0]
+    template = functools.partial(selective.selective_scan, family=taken_family(dtype), interpret=INTERPRETED,
+                                 forked=forked)
+
+    def draws(seed):
+        inputs, _, dy = draw(dtype, seed, rows, length, channels, states, packed=False)
+        keys = jax.random.split(jax.random.key(seed + 9))
+        given = 0.3 * jax.random.normal(keys[0], (rows, 1, channels, states))
+        # The row's last state's cotangent beside the output's, so the backward's final reaches its slots.
+        dfinal = jax.random.normal(keys[1], (rows, channels, states)).astype(dtype)
+        return (*inputs, given, (dy, dfinal))
+
+    reference = jax.jit(with_gradients(functools.partial(portable, chunk_size=selective.CHUNK,
+                                                         forked=forked)))
+    assert_as_exact(jax.jit(with_gradients(template)), reference, draws,
+                    f"the selective template, a forked call, {layout}", seeds=FEWEST_SEEDS,
+                    truth_fn=reference)
+
+
+@pytest.mark.parametrize("layout", list(FORKED))
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_the_template_is_as_exact_over_a_forked_call_interpreted(layout):
+    """`the_template_is_as_exact_over_a_forked_call` off a GPU."""
+    the_template_is_as_exact_over_a_forked_call(layout)
+
+
 @pytest.mark.parametrize("route", ROUTES)
 @pytest.mark.check1_shards(seeds=8, per_task=4)
 def test_the_template_is_as_exact_as_its_reference_interpreted(route):

@@ -293,34 +293,26 @@ def cudnn_runs_inside_either_exchange(exchange, causal):
     (`_check_qkv_bias_mask_spec` in jax/_src/cudnn/fused_attention_stablehlo.py),
     which is what the gather hands a kernel it leaves to GSPMD: every call
     that took the gather failed to compile on a GPU. Both exchanges run the
-    kernel on local arrays, forward and backward. bf16 has no fixed bound,
-    so each is measured against fp32 attention on one device and may land
-    at most twice as far from it as the same cuDNN call on one GPU."""
-    keys = jax.random.split(jax.random.key(0), 3)
-    query = jax.random.normal(keys[0], (2, 256, 4, 64), jnp.bfloat16)
-    key, value = (jax.random.normal(k, (2, 256, 2, 64), jnp.bfloat16) for k in keys[1:])
+    kernel on local arrays: the split call's output and every gradient on par
+    with the same cuDNN call on one GPU, from float64 (check 1, the truth the
+    reference path's float64 run)."""
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 4)
+        query = jax.random.normal(keys[0], (2, 256, 4, 64), jnp.bfloat16)
+        key, value = (jax.random.normal(k, (2, 256, 2, 64), jnp.bfloat16) for k in keys[1:3])
+        return query, key, value, jax.random.normal(keys[3], query.shape, jnp.bfloat16)
 
-    def outputs(attend):
-        def loss(q, k, v):
-            return jnp.sum(attend(q, k, v).astype(jnp.float32) ** 2)
-        return jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2)))
+    def whole(implementation):
+        return lambda q, k, v: scaled_dot_product_attention(q, k, v, causal=causal,
+                                                            implementation=implementation)
 
-    exact = outputs(lambda q, k, v: scaled_dot_product_attention(
-        q, k, v, causal=causal, implementation="xla"))(
-            *(x.astype(jnp.float32) for x in (query, key, value)))
-    whole = outputs(lambda q, k, v: scaled_dot_product_attention(
-        q, k, v, causal=causal, implementation="cudnn"))(query, key, value)
-    with jax.set_mesh(MeshSpec(sequence=2).build(jax.devices()[:2])):
-        split = outputs(lambda q, k, v: through(
-            exchange, q, k, v, causal=causal, implementation="cudnn"))(query, key, value)
+    def split(q, k, v):
+        with jax.set_mesh(MeshSpec(sequence=2).build(jax.devices()[:2])):
+            return through(exchange, q, k, v, causal=causal, implementation="cudnn")
 
-    def distance(got):
-        return [float(np.max(np.abs(np.asarray(a, np.float32) - np.asarray(b, np.float32)))
-                      / np.max(np.abs(np.asarray(b, np.float32))))
-                for a, b in zip(jax.tree.leaves(got), jax.tree.leaves(exact), strict=True)]
-
-    for split_distance, whole_distance in zip(distance(split), distance(whole), strict=True):
-        assert split_distance <= 2 * whole_distance, (split_distance, whole_distance)
+    assert_as_exact(jax.jit(with_gradients(split)), jax.jit(with_gradients(whole("cudnn"))), draw,
+                    f"cudnn inside the {exchange}", seeds=FEWEST_SEEDS,
+                    truth_fn=with_gradients(whole("reference")))
 
 
 def test_equal_multimodal_coordinates_rotate_the_shared_keys_like_plain_positions():

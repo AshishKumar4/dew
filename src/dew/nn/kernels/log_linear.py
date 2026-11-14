@@ -7,7 +7,14 @@ weighing its levels apart,
 `G` the log decay's running sum, `level(l, c)` zero for `c = l` and else the bit length of `l XOR c` (the
 highest bit in which they differ: the bucket `[l` with its low `j` bits cleared, `l` with its low `j - 1`
 cleared`)` at level `j`), `lambda` a token's level weights `[levels]`. Grouped keys serve `H / G` value heads
-each; packed documents each count positions from their first token and see their own keys alone."""
+each; packed documents each count positions from their first token and see their own keys alone.
+
+An orchestrator over the recurrence (kernel-templates.md, Table 3): level `j` is the decayed linear
+recurrence (`recurrence_chunk.chunk`, a decay a head, no delta rule) over the keys in the left half of each
+`2^j`-aligned block of a document's positions, its memory reset where each block starts, read by the queries
+in the right half at their weight `lambda[j]`; level zero is a token's own key. Each level is one linear pass
+over the sequence, `ceil(log2 T) + 1` of them, where a masked attention over every query and key took `T^2`
+of each array (a 4096-token call's scores alone 64 MiB in fp32)."""
 
 from __future__ import annotations
 
@@ -16,8 +23,8 @@ import math
 import jax
 import jax.numpy as jnp
 
-from dew.nn.documents import within_documents
-from dew.nn.kernels.deltaformer import causal_masks
+from dew.nn.kernels import recurrence
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.precision import at_least_fp32
 
 
@@ -26,37 +33,36 @@ def levels(length: int) -> int:
     return math.ceil(math.log2(length)) + 1
 
 
-def _levels(positions):
-    """Each query's level of each key `[B, T, T]`, of positions `[B, T]`: zero on the diagonal, else the bit
-    length of the positions' exclusive or (keys after the query any, masked)."""
-    differing = positions[:, :, None] ^ positions[:, None, :]
-    return jnp.where(differing == 0, 0, 32 - jax.lax.clz(differing))
-
-
-def log_linear_attention(query, key, value, g, level_scales, *, scale: float | None = None, starts=None):
+def log_linear_attention(query, key, value, g, level_scales, *, scale: float | None = None, starts=None,
+                         max_segments: int | None = None):
     """`query`, `key` `[B, T, G, N]`, `value` `[B, T, H, P]`, `g` `[B, T, H]` a token's log decay,
     `level_scales` `[B, T, H, levels(T)]` each query's weight of each level, `scale` `N ** -0.5` where None,
-    `starts` `[B, T]` each packed document's first token: the output `[B, T, H, P]` in the operands' dtype,
-    computed in at least fp32 as a masked attention over the sequence."""
+    `starts` `[B, T]` each packed document's first token, at most `max_segments` a row (every token where
+    None): the output `[B, T, H, P]` in the operands' dtype, computed in at least fp32, a recurrence a level,
+    level `j`'s at most `ceil(T / 2^j)` blocks a row past its documents (`chunk`'s `max_segments`, which a
+    kernel laying each from a chunk's edge sizes its layout by)."""
     dtype = jnp.result_type(query, key, value)
     work = at_least_fp32(dtype)
-    _, length, groups, width = query.shape
+    rows, length, groups, width = query.shape
     heads = value.shape[2]
     scale = width ** -0.5 if scale is None else scale
-    q, k = (jnp.repeat(jnp.asarray(x, work), heads // groups, axis=2) for x in (query, key))
-    v, g, weights = (jnp.asarray(x, work) for x in (value, g, level_scales))
+    q, k, v, g, weights = (jnp.asarray(x, work) for x in (query, key, value, g, level_scales))
     tokens = jnp.arange(length, dtype=jnp.int32)
-    first = (jnp.zeros((query.shape[0], length), jnp.int32) if starts is None
+    first = (jnp.zeros((rows, length), jnp.int32) if starts is None
              else jax.lax.cummax(jnp.where(jnp.asarray(starts, bool), tokens, 0), axis=1))
-    _, causal = causal_masks(length, starts)
-    # A key after its query, or in another document, at level zero: masked by its decay.
-    level = jnp.where(causal, _levels(tokens - first)[:, None], 0)
-    # Each document's own running sum, its differences free of earlier documents' digits.
-    begins = jnp.zeros(g.shape[:2], bool) if starts is None else jnp.asarray(starts, bool)
-    begins = begins.at[:, 0].set(True)
-    running = within_documents(g, begins).transpose(0, 2, 1)
-    decay = jnp.exp(jnp.where(causal, running[..., :, None] - running[..., None, :], -jnp.inf))
-    weighed = jnp.take_along_axis(weights.transpose(0, 2, 1, 3), jnp.broadcast_to(level, decay.shape),
-                                  axis=-1)
-    scores = jnp.einsum('blhn,bchn->bhlc', q, k) * decay * weighed
-    return (jnp.einsum('bhlc,bchp->blhp', scores, v) * scale).astype(dtype)
+    # Each token's position in its document, which its levels' blocks align to.
+    positions = tokens - first
+    # Level zero: each token's own key.
+    grouped = jnp.repeat(q * k, heads // groups, axis=2).sum(-1)
+    out = (scale * weights[..., 0] * grouped)[..., None] * v
+    hooks = recurrence.Hooks(decay='scalar', delta=False, scale=scale)
+    documents = 1 if starts is None else length if max_segments is None else max_segments
+    for level in range(1, levels(length)):
+        half = 1 << (level - 1)
+        # A key in its block's left half; a query in the right half reads them; a block starts afresh.
+        left, opened = (positions & half) == 0, positions % (2 * half) == 0
+        blocks = min(length, -(-length // (2 * half)) + documents)
+        read, _ = chunk(hooks, Chunk(q, k * left[..., None, None], v, log_decay=g, starts=opened),
+                        max_segments=blocks, dtype=work)
+        out = out + read * jnp.where(left[..., None], 0.0, weights[..., level])[..., None]
+    return out.astype(dtype)

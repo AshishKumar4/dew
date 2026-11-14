@@ -12,8 +12,9 @@ their products through `portable` and read a chunk's memory through `remembered`
 across the mesh axis. Packed documents restart the decays at each document's first position (varlen).
 
 The algebra declares its products and issues none (the design's layering): every product goes through the
-caller's `issue(name, left, right)`, the mainloop's, by its name in `PRODUCTS`, which says what it multiplies;
-the portable math's issuer is XLA's (`portable`), a kernel's its own dot."""
+caller's `issue(name, left, right)`, the mainloop's, by its name, which its launch's issuer dispatches to the
+buffers it stages that product's operands in; the portable math's issuer is XLA's (`portable`), a kernel's its
+own dot."""
 
 import functools
 import math
@@ -39,44 +40,8 @@ from dew.nn.precision import (
 )
 
 Issue = Callable[[str, "Operand", "Operand"], jax.Array]
-"""A mainloop's product: `issue(name, left, right)` is `left @ right` over the last two axes, the product
-`PRODUCTS[name]` declares, in the mainloop's own dot."""
-
-PRODUCTS = {
-    "intra": "the write-gated keys against the keys, `kb k^T`, under a decay a head (`intra`)",
-    "scores": "the queries against the keys, `q k^T`, under a decay a head (`readout`)",
-    "merge": "two diagonal blocks' inverses joined across the block below them (`factor`)",
-    "apply_w": "the inverse against the decayed write-gated keys, `L (kb exp(gc))` (`apply`)",
-    "apply_u": "the inverse against the write-gated values, `L (vb)` (`apply`)",
-    "corrected": "the write's keys against the memory entering, `W S` (`carry`)",
-    "write": "the decayed keys against the corrected values, `(k last)^T v_new` (`carry`)",
-    "memory": "the decayed queries against the memory entered, `(q exp(gc)) S` (`readout`)",
-    "local": "the chunk's scores against its corrected values, `A_qk v_new` (`readout`)",
-    "compose": "a transition against another's, `T2 T1` and `T2 W1` (`compose`)",
-    "local_t": "the keys against the queries, `k q^T`, the scores' transpose (`local_gradient`)",
-    "local_dv": "the scores' transpose against the output's gradient, `A^T do` (`local_gradient`)",
-    "reads": "the queries' transpose against the decayed output gradient, `q^T (do exp(gc))`",
-    "values_dv": "the keys against the leaving memory's gradient, `k dS` (`reverse_carried`)",
-    "weights_dv": "the weights' transpose against the values' gradient, `w^T dv` (`reverse_carried`)",
-    "values_ds": "the output's gradient against the corrected values, `do v^T` (`scores_gradient`)",
-    "memory_dq": "the output's gradient against the entered memory's transpose, `do S^T`",
-    "memory_dk": "the corrected values against the leaving memory's gradient, `v dS^T`",
-    "memory_dw": "the values' gradient against the entered memory's transpose, `dv S^T`",
-    "memory_trace": "the entered memory against the leaving one's gradient's transpose, `S dS^T`, whose "
-                    "diagonal sums `sum(S dS)` a key row each (a mainloop's `memory_gradients` launch)",
-    "scores_dq": "the scores' gradient against the keys, `ds k`, and its transpose against the queries",
-    "inverse_t": "the inverse's transpose against a gradient, `L^T dX` (`system_gradient`)",
-    "inverse_dx": "the weights' gradient against the weighted keys' transpose, `dw (k b exp(gc))^T`",
-    "inverse_du": "the corrected values' gradient against the gated values' transpose, `du (v b)^T`",
-    "inverse_l": "the inverse's gradient through the inverse, `L^T dX L^T`",
-    "keys_dl": "the system's gradient against the keys, `dL k`, and the keys against themselves, `k k^T`",
-    "keys_dlt": "the system's gradient, its rows scaled by the write gates, transposed against the keys",
-    "summed": "a decay's range terms against a triangle or the identity, each token's sum (`summed_pairs`)",
-}
-"""The algebra's products by name. A decay a key dimension weighs each term of `intra`'s and `scores`'
-contractions (`paired`), which a mainloop issues as a product of the factored operands within the range its
-decay's bound keeps exact, or as the weighed sum."""
-
+"""A mainloop's product: `issue(name, left, right)` is `left @ right` over the last two axes, in the
+mainloop's own dot, `name` the product its launch's issuer stages it as."""
 
 STATE_PRECISION = exact_float32(None)
 """The precision the portable math's products take: a chunk's products carry the recurrent state, whose
@@ -103,6 +68,17 @@ def portable_einsum(subscripts: str, *operands):
     return float32_einsum(subscripts, *operands, precision=STATE_PRECISION)
 
 
+def suffix_sums(x: jax.Array) -> jax.Array:
+    """Each position's sum over its chunk's positions at and after it, along `x`'s second-last axis (a
+    chunk's tokens), in float32: a product with the chunk's upper triangle of ones (`portable_einsum`, its
+    ones exact in every form a product splits `x` into), one dot. As a reversed cumulative sum, XLA's GPU
+    reduce-window summed each position's window apart: Kimi delta attention's decay gradient's, the one
+    cumulative sum its training traces, took 0.336 ms of its 5.806 ms on a B200 (M-JS-114)."""
+    size = x.shape[-2]
+    upper = jnp.triu(jnp.ones((size, size), jnp.float32))
+    return portable_einsum('ij,...jt->...it', upper, x.astype(jnp.float32))
+
+
 LOG2_E = math.log2(math.e)
 """log2(e) to double precision, the prefix's base-2 scale (fla's RCP_LN2 is 1.93e-8 short of it)."""
 
@@ -113,13 +89,22 @@ def prefix(g):
     lo)`, each token's `g log2(e)` an exact pair (its product with log2(e)'s fp32 rounding error-free,
     `precision.two_product`, plus its product with the rounding's remainder) summed compensated
     (`precision.compensated_add`), so a difference of two positions is as precise as its own range. One
-    program JAX traces once for `g`'s type: its exact sums traced afresh, each layer's forward, its kept
-    forward in the backward and its gradient's preparation each paid them, 226 s of Qwen3.5-4B's 1208 s
-    ahead-of-time compile (row 3142, FS2440-4B-STACKS)."""
+    variadic reduce-window over each position's chunk so far, which XLA fuses into the launches' layout of the
+    pair: as an associative scan its log-depth levels were XLA launches of their own, fourteen of the gated
+    delta net's 364 us forward on a GH200, 45 us of it (LF-GDN-NCU-gh200; four fusions in all compiled for an
+    sm90 with the window, jsf-prefix-rw), the pair as precise either way (1.2e-14 to 1.5e-14 relative from
+    float64 over decays of 1e-3 to 30 a token). One program JAX traces once for `g`'s type: its exact sums
+    traced afresh, each layer's forward, its kept forward in the backward and its gradient's preparation each
+    paid them, 226 s of Qwen3.5-4B's 1208 s ahead-of-time compile (row 3142, FS2440-4B-STACKS)."""
     scale = np.float32(LOG2_E)
     scaled, error = two_product(g, jnp.full_like(g, scale), bit_split=True)
     error = error + g * float(np.float32(LOG2_E - float(scale)))
-    return jax.lax.associative_scan(compensated_add, (scaled, error), axis=g.ndim - 2)
+    axis, size = g.ndim - 2, g.shape[g.ndim - 2]
+    window = tuple(size if dim == axis else 1 for dim in range(g.ndim))
+    padding = tuple((size - 1, 0) if dim == axis else (0, 0) for dim in range(g.ndim))
+    zero = jnp.zeros((), g.dtype)
+    return jax.lax.reduce_window((scaled, error), (zero, zero), compensated_add, window, (1,) * g.ndim,
+                                 padding)
 
 
 def scanned_prefix(g, stage: Callable[[tuple], Callable[[int], tuple]], *, chunk: int) -> tuple:
@@ -162,9 +147,12 @@ def raised(whole, part):
 
 
 def _floor(x):
-    """`floor(x)` of fp32 `x` from its truncation toward zero, which Mosaic GPU lowers (it lowers no floor),
-    the same value (a zero's sign aside): every fp32 of magnitude 2^23 or more is an integer, and infinities
-    and NaNs are their own floor."""
+    """`floor(x)` of fp32 `x` from its truncation toward zero, the same value (a zero's sign aside): every
+    fp32 of magnitude 2^23 or more is an integer, and infinities and NaNs are their own floor. Mosaic GPU
+    lowers `jnp.floor` too (one cvt.rmi since post81), but there the sm100 Kimi delta attention two-role
+    training launch (`recurrence_intra`, the compensated prefix's whole part) spills 8 bytes at its
+    residency's 248-register share, which this form holds at with none: its least spill-free cap is 240
+    either way (audit K2-1, jsf-calib-floor), ptxas not monotone between them."""
     truncated = jnp.clip(x, -2.0 ** 23, 2.0 ** 23).astype(jnp.int32).astype(x.dtype)
     floor = jnp.where(truncated > x, truncated - 1.0, truncated)
     return jnp.where(jnp.abs(x) < 2.0 ** 23, floor, x)

@@ -80,8 +80,14 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, families: Sequence[Famil
     `NORMS`), an anchor's candidates in the order its family
     names them, the first equal one taken, no two regions sharing an equation nor one `held` (a product's
     epilogue's). Each region's choice is held by its structure and its constants' values (`_HELD_REGIONS`),
-    the body's whole recognition by its structure and constants (`_HELD_BODIES`)."""
-    key = (_body_key(jaxpr, index), held, tuple(family.anchor for family in families), derive.context(),
+    the body's whole recognition by its structure and constants (`_HELD_BODIES`). A body binding none of the
+    families' anchors, at any depth of the programs it nests (`_bound`), has no region to find and is
+    answered at once, before any key of it is built: most bodies of a model built of Dew's own layers, whose
+    kernels its selectors already call (a Qwen3.5-4B training step's plan keyed and searched 7,034 bodies,
+    half of one equation, for no region, 37 of its seconds, row 5556)."""
+    if _bound(jaxpr).isdisjoint(family.anchor for family in families):
+        return []
+    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families), derive.context(),
            _cache.KERNEL_CHOICES.value)
     if key not in _HELD_BODIES:
         _HELD_BODIES[key] = [_positioned(jaxpr, written)
@@ -96,6 +102,14 @@ _HELD_BODIES: collections.OrderedDict[Hashable, list] = collections.OrderedDict(
 """Each body's recognition by its structure, its constants and the context it was weighed in
 (`recognized`), positioned (`_positioned`): every retrace of a step, and every layer body of one structure,
 recognized once, the latest `fusion.DECISIONS_HELD` held."""
+
+
+def _keyed(jaxpr: jcore.Jaxpr, index: fusion.Index) -> Hashable:
+    """`jaxpr`'s key (`_body_key`), built once a body however many family sets are asked of it (the
+    compile point asks attention's, then the norms'), held on its index."""
+    if index.key is None:
+        index.key = _body_key(jaxpr, index)
+    return index.key
 
 
 def _body_key(jaxpr: jcore.Jaxpr, index: fusion.Index) -> Hashable:
@@ -192,12 +206,13 @@ def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, places: tuple[int, ...]
 
 
 def _digest(value) -> Hashable:
-    """A constant by its type and bits; a traced one (a value an enclosing trace closes over), which holds no
-    bits until it runs, by its type alone, as an input is."""
+    """A constant by its type and bits (`terms.held_bits`: a typed PRNG key's its key data); a traced one (a
+    value an enclosing trace closes over), which holds no bits until it runs, by its type alone, as an input
+    is."""
     if isinstance(value, jax_core.Tracer):
         return value.aval
-    value = np.asarray(value)
-    return str(value.dtype), value.shape, hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
+    dtype, array = terms.held_bits(value)
+    return dtype, array.shape, hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
 
 
 def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Candidate],
@@ -223,9 +238,35 @@ def _holds(equation: jcore.JaxprEqn, primitive: jcore.Primitive) -> bool:
 
 
 def _binds(equation: jcore.JaxprEqn, primitives: Sequence[jcore.Primitive]) -> bool:
-    """Whether `equation` binds one of `primitives`, at any depth of the programs it nests."""
+    """Whether `equation` binds one of `primitives`, at any depth of the programs it nests (`_bound`)."""
     return equation.primitive in primitives or any(
-        _binds(nested, primitives) for body in bodies(equation) for nested in body.eqns)
+        not _bound(body).isdisjoint(primitives) for body in bodies(equation))
+
+
+def _bound(jaxpr: jcore.Jaxpr) -> frozenset[jcore.Primitive]:
+    """The primitives `jaxpr` binds, at any depth of the programs it nests, found once a program
+    (`_HELD_BOUND`): a step's bodies nest (a checkpoint's layer, its calls, their derivatives), and each
+    level is asked of every program beneath it, which walked anew for each equation above grew with the
+    nesting's depth times the program's size. The programs beneath it are read innermost first from a
+    stack of this function's own, so their nesting's depth takes none of the interpreter's."""
+    pending = [jaxpr]
+    while pending:
+        program_ = pending[-1]
+        if program_ in _HELD_BOUND:
+            pending.pop()
+            continue
+        nested = [body for equation in program_.eqns for body in bodies(equation)]
+        unread = [body for body in nested if body not in _HELD_BOUND]
+        if unread:
+            pending.extend(unread)
+            continue
+        _HELD_BOUND[program_] = frozenset({equation.primitive for equation in program_.eqns}).union(
+            *(_HELD_BOUND[body] for body in nested))
+    return _HELD_BOUND[jaxpr]
+
+
+_HELD_BOUND: weakref.WeakKeyDictionary[jcore.Jaxpr, frozenset[jcore.Primitive]] = weakref.WeakKeyDictionary()
+"""Each program's primitives (`_bound`), held while the program lives."""
 
 
 def _between(index: fusion.Index, operands: Sequence[jcore.Var],
@@ -391,11 +432,8 @@ def _reads(index: fusion.Index, places: Sequence[int], var: jcore.Var) -> bool:
 
 
 def _forward(index: fusion.Index, var: jcore.Var, reach: int = REACH) -> dict[jcore.Var, int]:
-    """The values `var` reaches within `reach` equations, with their distance, walked once a body."""
-    held = _HELD_WALKS.setdefault(index, {})
-    if ("forward", var, reach) not in held:
-        held["forward", var, reach] = _walked_forward(index, var, reach)
-    return held["forward", var, reach]
+    """The values `var` reaches within `reach` equations, with their distance (`_walked`)."""
+    return _walked(index, "forward", var, reach)
 
 
 def _walked_forward(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jcore.Var, int]:
@@ -413,17 +451,18 @@ def _walked_forward(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jco
     return found
 
 
-_HELD_WALKS: weakref.WeakKeyDictionary[fusion.Index, dict] = weakref.WeakKeyDictionary()
-"""Each body's walks from its values (`_backward`, `_forward`), held while its index lives: every candidate
-of an anchor walks from the same rows and results again."""
-
-
 def _backward(index: fusion.Index, var: jcore.Var, reach: int = REACH) -> dict[jcore.Var, int]:
-    """The values `var` is made from within `reach` equations, with their distance, walked once a body."""
-    held = _HELD_WALKS.setdefault(index, {})
-    if (var, reach) not in held:
-        held[var, reach] = _walked_back(index, var, reach)
-    return held[var, reach]
+    """The values `var` is made from within `reach` equations, with their distance (`_walked`)."""
+    return _walked(index, "backward", var, reach)
+
+
+def _walked(index: fusion.Index, direction: str, var: jcore.Var, reach: int) -> dict[jcore.Var, int]:
+    """A walk from `var` in `direction` within `reach` equations, walked once a body and held on its index:
+    every candidate of an anchor walks from the same rows and results again."""
+    if (direction, var, reach) not in index.walks:
+        walk = _walked_forward if direction == "forward" else _walked_back
+        index.walks[direction, var, reach] = walk(index, var, reach)
+    return index.walks[direction, var, reach]
 
 
 def _walked_back(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jcore.Var, int]:
@@ -474,20 +513,16 @@ def _constant(index: fusion.Index, var: jcore.Var) -> bool:
     return var in _constants(index)
 
 
-_HELD_CONSTANTS: weakref.WeakKeyDictionary[fusion.Index, frozenset[jcore.Var]] = weakref.WeakKeyDictionary()
-"""Each body's constant values (`_constants`), held while its index lives."""
-
-
 def _constants(index: fusion.Index) -> frozenset[jcore.Var]:
     """The values of the body `index` reads made from its constants and literals alone, in one pass over its
-    equations in order."""
-    if index not in _HELD_CONSTANTS:
+    equations in order, found once a body and held on its index."""
+    if index.constants is None:
         found: set[jcore.Var] = set(index.consts)
         for equation in index.jaxpr.eqns:
             if all(isinstance(atom, jcore.Literal) or atom in found for atom in equation.invars):
                 found.update(equation.outvars)
-        _HELD_CONSTANTS[index] = frozenset(found)
-    return _HELD_CONSTANTS[index]
+        index.constants = frozenset(found)
+    return index.constants
 
 
 def _scalars(index: fusion.Index, places: Sequence[int],
@@ -846,7 +881,8 @@ def _selections(index: fusion.Index, operands: Sequence[jcore.Var], places: Sequ
         if equation.primitive is not jax.lax.select_n_p:
             continue
         for atom in equation.invars:
-            if not isinstance(atom, jcore.Literal):
+            # A mask is boolean and a fill a float: a typed key's literal (a key's selection) is neither.
+            if not isinstance(atom, jcore.Literal) or terms.typed_key(atom.val):
                 continue
             held = np.asarray(atom.val)
             if held.dtype == np.bool_ and held.ndim >= 2:
@@ -864,10 +900,13 @@ def _band(mask: np.ndarray) -> int | None:
     pattern, or every key at or before its query (plain causality)."""
     queries, keys = mask.shape[-2:]
     distance = np.arange(queries)[:, None] - np.arange(keys)[None, :]
-    for width in range(1, keys):
-        if np.array_equal(np.broadcast_to((distance >= 0) & (distance < width), mask.shape), mask):
-            return width
-    return None
+    # The one width a band of these entries can have, one past the farthest key any query keeps, held to
+    # the whole mask once (each width from 1 compared with it cost a square mask its keys' count again).
+    width = int(np.max(np.where(mask, distance, 0), initial=0)) + 1
+    if not 1 <= width < keys:
+        return None
+    band = np.broadcast_to((distance >= 0) & (distance < width), mask.shape)
+    return width if np.array_equal(band, mask) else None
 
 
 KEPT = frozenset({"xla", "reference"})

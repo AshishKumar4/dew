@@ -30,11 +30,11 @@ from multimodal_families import (
     TEXT_IDS,
     TEXT_LENGTHS,
     TEXT_OUTPUTS,
-    WEIGHED,
     text_rows,
 )
 from one_draw import assert_as_exact_as_the_reference
-from reference_error import GateFailure, Inconclusive, widened
+from recorded_truths import assert_truths_as_recorded
+from reference_error import GateFailure, Inconclusive, UnrecordedTruth, recording as read_recording, widened
 from reference_runs import assert_arms_as_recorded
 from safetensors.numpy import load_file
 
@@ -618,9 +618,9 @@ def test_source_trained_export_and_frozen_buffers_match_reference(family_source,
                 np.testing.assert_array_equal(actual, original)
 
 
-SEEDS = {"llama4": 512, "qwen35/text": 512}
-"""Each drawn site's declared seeds (multimodal_families.DRAWN, TEXT_DRAWN), sized by `seeds_for` paired as
-its recording confirmed them."""
+SEEDS = {"llama4": 512}
+"""Each drawn site's declared seeds (multimodal_families.DRAWN), sized by `seeds_for` paired as its recording
+confirmed them."""
 
 
 def drawing(family: str):
@@ -700,50 +700,75 @@ def computing(family: str, *, slipped: str | None = None, text: bool = False):
 
 def pipeline_arms(arms: str):
     """tools/venv_reference.py's `multimodal-<family>` site (`arms` its family) or `multimodal-<family>-text`
-    site (`<family>/text`): its recording, draw, Dew run and leaves."""
+    site (`<family>/text`, its float64 truths alone: `TEXT_TRUTHS`): its recording, draw, Dew run and
+    leaves."""
     family, _, kind = arms.partition("/")
-    directory = FIXTURE.parent / FAMILIES[family][0]
     if kind == "text":
-        return (directory / "recording-text.npz", drawing_text(family), computing(family, text=True),
-                TEXT_OUTPUTS)
-    return directory / "recording.npz", drawing(family), computing(family), OUTPUTS
+        return text_recording(family), drawing_text(family), computing(family, text=True), TEXT_OUTPUTS
+    return FIXTURE.parent / FAMILIES[family][0] / "recording.npz", drawing(family), computing(family), OUTPUTS
 
 
-DRAWN_SITES = [*sorted(DRAWN), *(f"{family}/text" for family in sorted(TEXT_DRAWN))]
-"""Every drawn site's arms (`pipeline_arms`): each drawn family's over images and audio, and each family's
-over token rows alone."""
+def text_recording(family: str) -> Path:
+    """`family`'s text site's recording: its float64 truths alone (`TEXT_TRUTHS`)."""
+    return FIXTURE.parent / FAMILIES[family][0] / "recording-text.npz"
 
 
-
-@pytest.mark.parametrize("arms", DRAWN_SITES)
-def test_a_drawn_site_is_on_par_with_its_reference(arms):
+@pytest.mark.parametrize("family", sorted(DRAWN))
+def test_a_drawn_site_is_on_par_with_its_reference(family):
     """A drawn site's leaves, on par with the reference's (check 1), the truth the reference's float64 twin
     taking the same step: a family's valid logits, its summed next-token loss, its pixel gradient and its
-    logits after one SGD step of every parameter over drawn images and audio, or all but the pixel gradient
-    over drawn token rows alone."""
-    family, _, kind = arms.partition("/")
-    site = f"multimodal-{family}" + (f"-{kind}" if kind else "")
-    assert_arms_as_recorded(pipeline_arms(arms), site, SEEDS[arms], arms, weighed=arms in WEIGHED)
+    logits after one SGD step of every parameter over drawn images and audio."""
+    assert_arms_as_recorded(pipeline_arms(family), f"multimodal-{family}", SEEDS[family], family)
 
 
 @pytest.mark.parametrize("slipped", ["inputs", "gradient"])
-@pytest.mark.parametrize("arms", DRAWN_SITES)
-def test_a_drawn_sites_slip_fails_its_check(arms, slipped):
+@pytest.mark.parametrize("family", sorted(DRAWN))
+def test_a_drawn_sites_slip_fails_its_check(family, slipped):
     """`test_a_drawn_site_is_on_par_with_its_reference`'s site with its characteristic slip, or one layer's
     gradient with its sign flipped, in its narrow arm alone fails the same check, decided: a slip the
     site leaves undecided (`Inconclusive`, a `GateFailure` too) is no slip caught. A test of its own, as
-    each is a check-1 run of the site's whole draws (qwen35/text's three in one task ran past its 1,680 s
-    deadline, the CPU suite at 87e689ba5)."""
-    family, _, kind = arms.partition("/")
-    site = f"multimodal-{family}" + (f"-{kind}" if kind else "")
-    recording, draw, dew, leaves = pipeline_arms(arms)
-    slip = computing(family, slipped=slipped, text=kind == "text")
+    each is a check-1 run of the site's whole draws."""
+    recording, draw, dew, leaves = pipeline_arms(family)
+    slip = computing(family, slipped=slipped)
     with pytest.raises(GateFailure) as failed:
         # The slip is the narrow arm's alone: the truth stays the recorded one's (`dew`'s float64 run).
         assert_arms_as_recorded(
             (recording, draw, lambda dtype, inputs: (dew if dtype == jnp.float64 else slip)(dtype, inputs),
-             leaves), site, SEEDS[arms], f"{arms} slipped {slipped}", weighed=arms in WEIGHED)
+             leaves), f"multimodal-{family}", SEEDS[family], f"{family} slipped {slipped}")
     assert not isinstance(failed.value, Inconclusive)
+
+
+def text_truths(family: str, *, slipped: str | None = None) -> None:
+    """`family`'s text site (`text_recording`) held by its function: Dew's float64 step over
+    each recorded draw's token rows, `slipped` as `computing` slips it, the reference's float64 truth there
+    (`assert_truths_as_recorded`)."""
+    run = computing(family, slipped=slipped, text=True)
+
+    def truth(inputs):
+        with jax.enable_x64(new_val=True):
+            return run(jnp.float64, inputs)
+
+    assert_truths_as_recorded(read_recording(text_recording(family)), f"multimodal-{family}-text", truth)
+
+
+@pytest.mark.parametrize("family", sorted(TEXT_DRAWN))
+def test_a_text_sites_float64_step_is_its_references(family):
+    """A text site's leaves (`TEXT_OUTPUTS`: the valid logits, the summed next-token loss and the logits after
+    one SGD step of every parameter over drawn token rows) from Dew's float64 run, the reference's float64
+    truth's at each recorded draw, each within float64's rounding of the step (`assert_truths_as_recorded`).
+    Its float32 errors no count of draws resolves (multimodal_families.TEXT_DRAWN; docs/design/testing.md:
+    the step's float32 parity with the reference is held by no cell)."""
+    text_truths(family)
+
+
+@pytest.mark.parametrize("slipped", ["inputs", "gradient"])
+@pytest.mark.parametrize("family", sorted(TEXT_DRAWN))
+def test_a_text_sites_slip_is_another_function(family, slipped):
+    """`test_a_text_sites_float64_step_is_its_references`'s step with its family's characteristic slip into
+    its inputs, or one layer's gradient with its sign flipped, is no longer the reference's function, at
+    float64 itself: refused (`UnrecordedTruth`)."""
+    with pytest.raises(UnrecordedTruth):
+        text_truths(family, slipped=slipped)
 
 
 def _float32_values_in_float64(loaded, inputs) -> int:

@@ -8,6 +8,7 @@ import itertools
 
 import jax
 import jax.numpy as jnp
+import kernel_matrix
 import numpy as np
 import pytest
 from reference_error import assert_as_exact
@@ -23,14 +24,26 @@ rows took 6.2 s, armada jsf-steptime)."""
 """A decode token with grouped heads, idle rows and a four-tap history."""
 
 NORMS = (None, recurrence.OutputNorm(1e-6, 'silu'), recurrence.OutputNorm(1e-6, 'sigmoid'))
-HOOKS = [recurrence.Hooks(conv=conv, l2norm=norm, decay='scalar' if decay == 'gates' else decay,
-                          gates=recurrence.Gates() if decay == 'gates' else None, delta=delta,
-                          write_gate=write, skip=skip, output=output)
-         for conv, norm, decay, delta, write, skip, output in itertools.product(
-             (None, recurrence.Conv('silu')), (False, True), ('none', 'scalar', 'vector', 'gates'),
-             (False, True), (False, True), (False, True), NORMS)
-         # The delta rule and the gates read a write gate whatever `write_gate` says.
-         if (decay != 'gates' or delta) and not (write and (delta or decay == 'gates'))]
+AXES = {"conv": (None, recurrence.Conv('silu')), "l2norm": (False, True),
+        "decay": ('none', 'scalar', 'vector', 'gates'), "delta": (False, True), "write_gate": (False, True),
+        "skip": (False, True), "output": NORMS}
+"""The hooks a decode token's step takes, each with its values (a decay of 'gates' the gated delta rule's)."""
+
+COMBINATIONS = [dict(zip(AXES, values, strict=True)) for values in itertools.product(*AXES.values())
+                # The delta rule and the gates read a write gate whatever `write_gate` says.
+                if (values[2] != 'gates' or values[3])
+                and not (values[4] and (values[3] or values[2] == 'gates'))]
+"""Every combination of the hooks' values a step serves."""
+
+
+def hooked(combination: dict) -> recurrence.Hooks:
+    """A combination's hooks (`COMBINATIONS`)."""
+    gated = combination["decay"] == 'gates'
+    return recurrence.Hooks(**{**combination, "decay": 'scalar' if gated else combination["decay"],
+                               "gates": recurrence.Gates() if gated else None})
+
+
+HOOKS = [hooked(combination) for combination in COMBINATIONS]
 
 SEEDS = dict(zip(HOOKS, (
     8, 16, 8, 8, 32, 8, 8, 16, 8, 8, 8, 8, 8, 16, 8, 8, 16, 16, 8, 16,
@@ -49,6 +62,14 @@ SEEDS = dict(zip(HOOKS, (
 """Each hook combination's declared seeds, sized independently by `seeds_for` on armada (2026-10-20).
 The reference compared with itself resolves the factor in every leaf; the count holds at every config.
 """
+
+COVERING = [hooked(combination) for combination in kernel_matrix.pairwise(
+    sorted(COMBINATIONS, key=lambda combination: SEEDS[hooked(combination)]), [])]
+"""The hook combinations a decode token's check holds (row 5492): every pair of hook values some combination
+serves, of combinations covering as many pairs the one its float64 form resolves in the fewest seeds
+(`SEEDS`), 14 of 240 and 168 of their 7,120 seeds: with the formed sites 603 s of the suite, every case at
+90 s or less, where every combination took 16,410 s; seeded with the combinations of 128 seeds or more, 14
+conv cases ran past the 120 s target a task (a conv's interpreted step 1.2 s a call, row 5526)."""
 
 FORMED = [
     recurrence.Hooks(decay='scalar', gates=recurrence.Gates(write='step', limit=(0.0, 0.5)), delta=False,
@@ -198,12 +219,6 @@ def summed(hooks: recurrence.Hooks):
     return run
 
 
-DRAWN_APART = recurrence.Hooks(conv=recurrence.Conv('silu'), decay='none', delta=False)
-"""The hook combination whose check draws past 120 s in one task (`check1_shards`): a conv's interpreted step
-costs 1.2 s a call, the Mosaic GPU interpreter's 10,000 memory callbacks a token (cProfile at ed9f379ff:
-523,710 of the check's 640,068), and its 64 declared seeds took 119.7 s (armada jsf-profile-hook)."""
-
-
 def assert_steps_as_its_float64_form(hooks) -> None:
     """A decode token through the launch, the recurrence template's step on Mosaic GPU
     (`templates.recurrence.step`, interpreted off a GPU), within tests/reference_error.py's rule of the XLA
@@ -224,18 +239,11 @@ def assert_steps_as_its_float64_form(hooks) -> None:
         np.testing.assert_array_equal(np.asarray(history)[1], np.asarray(given.held)[1])
 
 
-@pytest.mark.parametrize('hooks', [hooks for hooks in HOOKS + FORMED if hooks != DRAWN_APART], ids=hook_id)
-def test_every_hook_combination_steps_as_its_float64_form(hooks):
-    """Every hook combination's decode token as its float64 form steps it
-    (`assert_steps_as_its_float64_form`), but the one whose draws run apart (`DRAWN_APART`)."""
+@pytest.mark.parametrize('hooks', COVERING + FORMED, ids=hook_id)
+def test_each_covering_hook_combination_steps_as_its_float64_form(hooks):
+    """Each covering hook combination's decode token (`COVERING`) and each other prologue value's (`FORMED`)
+    as its float64 form steps it (`assert_steps_as_its_float64_form`)."""
     assert_steps_as_its_float64_form(hooks)
-
-
-@pytest.mark.check1_shards(seeds=64, per_task=32)
-def test_a_conv_without_a_decay_or_the_delta_rule_steps_as_its_float64_form():
-    """`DRAWN_APART`'s decode token as its float64 form steps it, its 64 seeds drawn by armada's map tasks 32
-    at a time (`check1_shards`)."""
-    assert_steps_as_its_float64_form(DRAWN_APART)
 
 
 NARROW = {recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True): 8,
@@ -426,3 +434,40 @@ def test_a_decode_tokens_launch_runs_per_shard_moving_nothing(local):
     cases = [KernelCase("decode token", call, expected=expected)]
     failed = route_failures(cases, compile_mosaic_kernels(cases, "sm90"))
     assert (failed == []) == local, failed
+
+
+@pytest.mark.parametrize('rows', [1, 128], ids=['one row', '128 rows'])
+@pytest.mark.parametrize('target', ['sm80', 'sm90', 'sm100'])
+def test_a_decode_step_holds_its_registers_at_the_residency_it_plans(target, rows):
+    """Mamba-2's decode step (its rated decay and skip, the most registers a step's hooks hold) over 128 keys
+    a head, compiled for a compile-only `target` (`kernel_compile`) at one row, whose grid the plan may split
+    between two warpgroups a program, and at 128, past a wave (`step._plan`): its launch spills nothing at
+    the registers its planned residency leaves a thread (`mosaic.compiler_params`' `resident`), and ptxas's
+    least spill-free cap is within the step's model (`step.step_registers`), so a step whose need grows past
+    its share fails here rather than spilling or leaving programs out on the GPU (row 4864; uncapped, an
+    A100's step took all 255 registers, two programs a multiprocessor)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import bundles
+    from dew.nn.kernels.templates.recurrence import step as template
+
+    hooks = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
+    heads, key_width, value_width = 64, 128, 64
+
+    def call():
+        def token(state, query, key, value, beta, rate, skip):
+            given = recurrence.Step(state, query=query, key=key, value=value, beta=beta, rate=rate, skip=skip)
+            return template.step(hooks, given, dtype=None, family=bundles.of(target, jnp.float32))
+
+        shaped = jax.ShapeDtypeStruct
+        return token, (shaped((rows, heads, key_width, value_width), jnp.float32),
+                       *(shaped((rows, 1, key_width), jnp.bfloat16),) * 2,
+                       shaped((rows, heads, value_width), jnp.bfloat16), shaped((rows, heads), jnp.float32),
+                       *(shaped((heads,), jnp.float32),) * 2)
+
+    (record,) = compile_mosaic_kernels([KernelCase('decode step', call)], target, least=True)
+    assert not mosaic_failures([record]), mosaic_failures([record])
+    (kernel,) = [kernel for kernel in record['kernels'] if 'recurrence_step' in kernel['kernel']]
+    assert kernel['spilled'] == 0 and kernel['least'] is not None, kernel
+    assert kernel['least'] <= template.step_registers(), kernel

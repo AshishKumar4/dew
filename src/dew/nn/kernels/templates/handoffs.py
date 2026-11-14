@@ -15,7 +15,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import resources
-from dew.nn.kernels.templates.bodies import RESIDENT
+from dew.nn.kernels.templates.bodies import MOVES, RESIDENT
 
 
 @dataclasses.dataclass(frozen=True)
@@ -138,10 +138,16 @@ class Schedule:
             return bodies[role.name](0 if self.axis is None else lax.axis_index(self.axis))
         wg = lax.axis_index(self.axis)
         budgets = self.registers(RESIDENT.get())
+        # Registers move between the roles only where the consumers need more than the program's entry share
+        # (`MOVES`): a drop that buys nothing holds the values both sides of it form across it (a B200's d256
+        # forward over two rows spilled its row's 64-bit offset at the producer's drop under ptxas 12.9, and
+        # held it in 154 registers with none moved).
+        moving = MOVES.get()
         branches, bounds, first = [], [], 0
         for role in self.raised:
             def raised(role=role, first=first):
-                plgpu.set_max_registers(budgets[role.name], action="increase")
+                if moving:
+                    plgpu.set_max_registers(budgets[role.name], action="increase")
                 # The first role's warpgroups are those below its count, each its own index: no bound and no
                 # shift is traced for it (an attention forward's spill-free registers on an H100 turn on it,
                 # test_attention_mosaic's compile gate).
@@ -153,7 +159,8 @@ class Schedule:
         lowered = [role for role in self.roles if not role.weight]
 
         def lower():
-            plgpu.set_max_registers(budgets[lowered[0].name], action="decrease")
+            if moving:
+                plgpu.set_max_registers(budgets[lowered[0].name], action="decrease")
             if not lowered[0].warp:
                 bodies[lowered[0].name]()
                 return

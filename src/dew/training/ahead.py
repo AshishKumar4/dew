@@ -893,7 +893,8 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
         def lowered(function=function, shapes=shapes, name=name) -> jax.stages.Lowered:
             """The program lowered for the target, afresh at each call (a relowering's, past a spill)."""
             try:
-                with assumed(target, portable=True), jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+                with (assumed(target, portable=True), jax.sharding.use_abstract_mesh(mesh.abstract_mesh),
+                      report.certifying(mesh.devices.flat[0])):
                     return owned_program(function, out_shardings=placed).lower(*shapes)
             except Unlowerable as refused:
                 raise refused.refusing(name) from refused
@@ -1334,7 +1335,12 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
     # The first step's pass count, the phase its batch was read in (`Trainer`'s `phase_passes`).
     trainer.phase_passes.at(batch)
     try:
-        with assumed(on, portable=portable), trainer.phase_passes.scoped(trainer, trainer._compiler):
+        # Each launch's derived config certified on one of the compile-only devices it compiles for
+        # (`report.certified`), as a run on that GPU certifies it: the cache it prepares holds that run's.
+        certifying = (contextlib.nullcontext() if on_tpus
+                      else report.certifying(trainer.device_mesh.devices.flat[0]))
+        with (assumed(on, portable=portable), certifying,
+              trainer.phase_passes.scoped(trainer, trainer._compiler)):
             target = gpu_target()
             planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, frontier)
             starts = started(trainer, start, planned, plan)
@@ -1396,7 +1402,6 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     evaluations' warming pass over its first state, compiled where the run's own code calls them over
     shapes (`collecting`), by digest: `started`'s last part."""
     from dew.distributed.placement import placed_shapes
-    from dew.objectives.base import Pooled
     from dew.state import apart, together
     from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest
     from dew.training.planning import whole_step_program
@@ -1412,8 +1417,8 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
             trainer._window_of(dataclasses.replace(placed, compute=None), candidate, window)
         for step in steps:
             moving, loss, aux, finite, accepted, committed = shapes_of(step.out_info)
-            # As the step runs it: its whole where it is split or states a statistic (`StepCompiler.runner`).
-            if split > 1 or any(isinstance(value, Pooled) for value in (aux or {}).values()):
+            # As the step runs it: its whole where it is split (`StepCompiler.runner`).
+            if split > 1:
                 loss, aux, finite, accepted, committed = whole_step_program(trainer.objective)(
                     [(loss, aux, finite, accepted, committed)] * split)
             book = book_shapes(loss)

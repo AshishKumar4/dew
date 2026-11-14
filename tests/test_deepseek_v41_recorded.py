@@ -1,13 +1,15 @@
-"""DeepSeek-V4.1-Flash's tiny held to the release's own recorded runs by check 1 (tests/reference_error.py).
+"""DeepSeek-V4.1-Flash's tiny held to the release's own recorded runs (tests/reference_error.py).
 
 recording.npz (tools/deepseek_v41_reference.py --record, pinned in the fetched store) holds the release's
 outputs over drawn rows whose every selection clears the gate's margin, summarized over seeds with their
-float64 truth: the plain forward's logits and a cached walk's, the quantization-aware forward's, and the
-cached run with DSpark's drafts. Dew's quantization-aware forward is held against the float64 run that
-rounds where it rounded, every quantizer's input a leaf of its own (docs/design/testing.md, a quantized
-computation's truth): a value within float32 noise of where a rounding changes goes either way in two
-float32 runs, and in a float32 run and its float64 twin, so no truth that rounds for itself holds every
-arm."""
+float64 truth, for check 1: the plain forward's logits and a cached walk's, the quantization-aware
+forward's, and the cached run with DSpark's drafts. Dew's quantization-aware runs are held against the
+float64 run that rounds where each rounded, every quantizer's input a leaf of its own
+(docs/design/testing.md, a quantized computation's truth): a value within float32 noise of where a rounding
+changes goes either way in two float32 runs, and in a float32 run and its float64 twin, so no truth that
+rounds for itself holds every arm. step_truths.npz and quantized_step_truths.npz (--record-step-truths)
+hold the training step's float64 truth alone at a few draws, which Dew's float64 step is held to leaf by
+leaf: the step's float32 errors no count of draws resolves (testing.md, the training step's finding)."""
 
 import functools
 
@@ -17,7 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from arm_arithmetic import float64_held
-from deepseek_v41_support import TINY
+from deepseek_v41_support import TINY, training_step
 from reference_error import as_given, assert_as_exact
 
 from dew.nn.inputs import ModelInputs
@@ -211,8 +213,53 @@ def test_a_quantization_aware_forward_is_on_par_with_the_releases(source, quanti
                     followed=Followed(truth, quantized_arms.rounds))
 
 
+def test_a_training_steps_float64_gradients_are_the_releases(source):
+    """The tiny's training step in float64, the next-token loss and its gradient in every tensor the
+    release trains (the MTP layers', the DSpark stages', the routing biases' among them), by the release's
+    name for it, the release's own float64 step's at each recorded draw, each leaf within float64's
+    rounding of the step (`assert_truths_as_recorded`): the step's function, whatever its float32 run
+    rounds (docs/design/testing.md, the training step's finding)."""
+    from model_support import float64_twin
+    from recorded_truths import assert_truths_as_recorded
+    from reference_error import recording
+
+    loaded, plain, _ = source
+    wide_step = training_step(loaded, float64_twin(plain))
+
+    def truth(inputs):
+        with jax.enable_x64(new_val=True):
+            return wide_step(float64_held(loaded.variables), jnp.asarray(inputs["input_ids"]))[0]
+
+    assert_truths_as_recorded(recording(TINY / "step_truths.npz"), "deepseek v41 plain step", truth)
+
+
+def test_a_quantization_aware_training_steps_float64_gradients_are_the_releases(source):
+    """The tiny's training step with its activations rounding through the release's quantizers, in float64
+    following the release's recorded decisions: its loss, its gradient in every tensor the release trains
+    and every quantizer's input, the release's own followed float64 step's at each recorded draw, each
+    within float64's rounding of the step (`assert_truths_as_recorded`). The release's quantizers are
+    inference kernels with no backward: its recording passes a rounding's gradient straight through
+    (tools/deepseek_v41_kernels.py), so Dew's (`dew.nn.fake_quant.straight_through`) is held to that rule
+    here, and a rounding's input to the release's before it."""
+    from model_support import float64_twin
+    from recorded_truths import assert_truths_as_recorded
+    from reference_error import recording
+
+    loaded, _, _ = source
+    wide_step = training_step(loaded, float64_twin(loaded.model), quantized=True)
+
+    def truth(decisions, inputs):
+        with jax.enable_x64(new_val=True):
+            leaves, (rounded, _) = wide_step(float64_held(loaded.variables), jnp.asarray(inputs["input_ids"]),
+                                             decisions)
+            return {**leaves, **rounded}
+
+    assert_truths_as_recorded(recording(TINY / "quantized_step_truths.npz"), "deepseek v41 quantized step",
+                              truth)
+
+
 CACHED_LEAVES = ("prompt_logits", "decode_logits", "draft_logits", "draft_confidence")
-"""The recorded cached run's leaves (tools/deepseek_v41_reference.py `cached_evaluated`): its draft ids are
+"""The recorded cached run's leaves (tools/deepseek_v41_reference.py `cached_leaves`): its draft ids are
 its draft logits' argmax, which the rows' margins hold apart (`cleared_cached_run`)."""
 
 

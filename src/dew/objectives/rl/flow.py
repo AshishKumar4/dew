@@ -36,7 +36,7 @@ from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inspection import INSPECTED
 from dew.nn.precision import at_least_fp32, weighted_total
-from dew.objectives.base import OMITTED, Aux, Objective, Omitted, Ratio, Shown, Step, own_objective
+from dew.objectives.base import OMITTED, Aux, Objective, Omitted, Pooled, Ratio, Shown, Step, own_objective
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.rl.advantage import group_normalised
 from dew.rl.surrogate import clipped_surrogate_terms
@@ -250,12 +250,13 @@ class FlowGRPOObjective(DiffusionObjective):
         _, (summed, sown) = jax.lax.scan(terms, None, (*(jnp.swapaxes(value, 0, 1) for value in (
             latents, following, times, next_times, old, advantages, mask)), jnp.arange(times.shape[1])))
         pg, kl, mass, clipped_count = (value.sum() for value in summed)
-        denominator = jnp.where(mass > 0, mass, 1)
-        metrics = {"pg": pg / denominator, "actor/clipfrac": clipped_count / denominator}
+        # Each over the kept transitions, pooled by them across a step's microbatches (`Aux.metrics`).
+        metrics: dict[str, jax.Array | Pooled] = {
+            "pg": Ratio(pg, mass), "actor/clipfrac": Ratio(clipped_count.astype(pg.dtype), mass)}
         if self.beta > 0:
-            metrics["transition_kl"] = kl / denominator
+            metrics["transition_kl"] = Ratio(kl, mass)
         if REWARDS_KEY in batch:
-            metrics["reward"] = self.row_mean(jnp.asarray(batch[REWARDS_KEY], jnp.float32), batch).mean()[0]
+            metrics["reward"] = self.row_mean(jnp.asarray(batch[REWARDS_KEY], jnp.float32), batch)
         # The policy's forward at each trajectory's first transition, its own trained call's.
         inspected = None if sown is None else jax.tree.map(lambda summary: summary[0], sown).get(
             INSPECTED, {})

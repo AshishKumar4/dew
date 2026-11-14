@@ -798,6 +798,15 @@ def _structured_families() -> dict[str, Family]:
 
 
 FAMILIES = _families()
+
+
+@functools.cache
+def _drawn_first(family: str) -> tuple:
+    """`FAMILIES[family]`'s draw at seed 0, drawn once a process: the shapes and state the family lists read
+    (`DECODED`, `hookless_families`)."""
+    return FAMILIES[family].draw(0)
+
+
 FORMS = {"default": None, "natural": True}
 """The forms the decode kernel takes each family in: the default (`template.NATURAL`) and natural logits."""
 FAMILY_RUNS = [(family, form) for family in FAMILIES for form in FORMS
@@ -966,7 +975,7 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
         with tuning.pinned({attention_mosaic.MosaicBackward: TWO_LAUNCHES}):
             return mosaic_backward(*operands)
 
-    if ON_HOPPER and _mosaic_takes(family):
+    if ON_HOPPER and _mosaic_takes(family, family.draw(0)):
         mainloops["mosaic"] = mainloop(mosaic_forward, mosaic_backward)
         if not options and family.draw(0)[3] is None:
             mainloops["mosaic two launches"] = mainloop(mosaic_forward, two_launch_backward)
@@ -983,10 +992,10 @@ ON_HOPPER = generation.device_generation() == "sm90"
 on a CPU, past a CI task's time, and the interpreter is coverage, not proof (`test_attention_mosaic`)."""
 
 
-def _mosaic_takes(family: Family) -> bool:
+def _mosaic_takes(family: Family, drawn: tuple) -> bool:
     """Whether the Mosaic mainloop takes `family`'s calls, forward and backward, by its own legality rule
-    (`attention_mosaic.refused`)."""
-    query, _, value, extra, _ = family.draw(0)
+    (`attention_mosaic.refused`), read off a draw of the family's (`drawn`)."""
+    query, _, value, extra, _ = drawn
     hooks = _hooks(jnp.asarray(query), jax.tree.map(jnp.asarray, extra))
     return attention_mosaic.refused(jnp.dtype(family.dtype), query.shape[-1], value.shape[-1], hooks,
                                     backward=True, family=mosaic_sm90.WGMMA) is None
@@ -1166,13 +1175,19 @@ def test_a_share_in_bf16s_subnormal_band_is_on_par_with_every_references_form(fa
     assert_as_exact(portable, reference, draw, f"portable against {form}", seeds=seeds, truth_fn=truth)
 
 
-MOSAIC_FAMILIES = [family for family in TEMPLATE_FAMILIES if _mosaic_takes(FAMILIES[family])]
-"""The template's families the Mosaic mainloop takes (`_mosaic_takes`)."""
+@functools.cache
+def mosaic_families() -> tuple[str, ...]:
+    """The template's families the Mosaic mainloop takes (`_mosaic_takes`), read where a GPU's run builds its
+    cells (tests/test_gpu_attention.py), so no CPU collection draws them."""
+    return tuple(family for family in TEMPLATE_FAMILIES
+                 if _mosaic_takes(FAMILIES[family], _drawn_first(family)))
 
 
-HOOKLESS_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].draw(0)[3] is None]
-"""The Mosaic families of no sinks or resumed state, whose fast-form backward derives one launch
-(`MosaicBackward.derived`)."""
+@functools.cache
+def hookless_families() -> tuple[str, ...]:
+    """The Mosaic families of no sinks or resumed state (`mosaic_families`), whose fast-form backward derives
+    one launch (`MosaicBackward.derived`)."""
+    return tuple(family for family in mosaic_families() if _drawn_first(family)[3] is None)
 
 
 GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",
@@ -1326,8 +1341,8 @@ def test_gradients_at_a_scale_far_below_one_are_on_par(options, name, dtype):
 
 
 DECODED = [(family, form) for family, form in FAMILY_RUNS
-           if FAMILIES[family].draw(0)[0].shape[1] == 1 and FAMILIES[family].draw(0)[0].shape[3] >= 16
-           and not isinstance(FAMILIES[family].draw(0)[3], tuple)
+           if _drawn_first(family)[0].shape[1] == 1 and _drawn_first(family)[0].shape[3] >= 16
+           and not isinstance(_drawn_first(family)[3], tuple)
            and not (form == "natural" and jnp.dtype(FAMILIES[family].dtype) == jnp.float32)]
 """The families a decode step is: one query a row, a head width the decode kernel takes (16 to 256),
 sinks or none (a resumed state is the template's); fp32 operands in the default form alone, which resolves

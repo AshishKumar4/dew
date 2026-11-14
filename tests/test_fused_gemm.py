@@ -9,7 +9,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import INTERPRETS
+from reference_error import assert_as_exact
+from test_algebra import traces_cheaper
 
+from dew import algebra
 from dew.nn.kernels import fused_gemm, generation, selection
 
 
@@ -43,6 +46,39 @@ def test_a_fused_regions_consumer_reads_its_product_as_the_dot_rounds_it(generat
     # The draw tells the two roundings apart: the fp32 sum plus the bias, rounded once, differs.
     once = jax.lax.ragged_dot(x, w, sizes, preferred_element_type=jnp.float32) + bias.astype(jnp.float32)
     assert np.any(np.asarray(once.astype(jnp.bfloat16), np.float32) != expected)
+
+
+@INTERPRETS
+def test_a_fused_regions_consumer_is_rewritten_by_the_algebra_pass_before_its_epilogue_tiles_it():
+    """A region fused through `fused_gemm.fused` whose consumer two capped column scales of the product
+    summed, which the epilogue takes tile by tile: the region traces the consumer's cheaper form, the one
+    program its analysis tiles and its epilogue runs (algebra.md §2), and computes the region's values as
+    the unfused program does (check 1); with the pass off, the consumer as written."""
+    sizes = jnp.asarray([96, 40], jnp.int32)
+
+    def region(x, w, a, b):
+        capped = jnp.tanh(fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, interpret_on_cpu=True))
+        return capped * jnp.tanh(a) + capped * jnp.tanh(b)
+
+    def program(x, w, a, b):
+        capped = jnp.tanh(jax.lax.ragged_dot(x, w, sizes))
+        return capped * jnp.tanh(a) + capped * jnp.tanh(b)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.standard_normal((136, 128)) / 8, jnp.float32),
+                jnp.asarray(rng.standard_normal((2, 128, 256)) / 8, jnp.float32),
+                *(jnp.asarray(rng.uniform(0.5, 2.0, 256), jnp.float32) for _ in range(2)))
+
+    fused = functools.partial(fused_gemm.fused, region)
+    with generation.assumed("sm90"):
+        found = fused_gemm.analysis(region, *draw(0))
+        assert found.epilogue is not None and found.epilogue.kernel == "fused", found
+        assert traces_cheaper(fused, *draw(0))
+        with algebra.passes(on=False):
+            assert not traces_cheaper(fused, *draw(0))
+        assert_as_exact(jax.jit(fused), jax.jit(program), draw, "a fused region's rewritten consumer",
+                        seeds=8)
 
 
 def test_a_regions_analysis_prices_it_fused_and_unfused_on_one_model():

@@ -11,7 +11,6 @@ import collections
 import contextlib
 import dataclasses
 import functools
-import inspect
 import math
 import threading
 import time
@@ -22,7 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from egglog import DagCostModel, EGraph, Schedule, String, Vec, get_callable_args, i64, set_
-from jax._src import config as jax_config
+from jax._src import api_util, config as jax_config
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
 
@@ -38,14 +37,25 @@ from dew.nn.programs import called, control_flow, inlined, live, with_bodies
 @dataclasses.dataclass(frozen=True)
 class Saturation:
     """The limits a region's saturation stops at, from its size (`limits`): nodes at `growth` per equation,
-    iterations at `depth` per level of its longest chain of the language's equations."""
+    iterations at `depth` per level of its longest chain of the language's equations, each at least one."""
 
     growth: int
     depth: int
 
+    def __post_init__(self):
+        if self.growth < 1 or self.depth < 1:
+            raise ValueError(f"a saturation's limits are each at least one, not growth {self.growth} and "
+                             f"depth {self.depth}: none would stop a region before its first iteration")
+
     def limits(self, region: terms.Region) -> tuple[int, int]:
         """The nodes and iterations `region` may take."""
-        return self.growth * max(1, region.equations), self.depth * max(1, region.depth)
+        return self.sized(region.equations, region.depth)
+
+    def sized(self, equations: int, depth: int) -> tuple[int, int]:
+        """The nodes and iterations an input of `equations` equations whose longest chain is `depth` may
+        take: a region's (`limits`), and a derivation's whose input is no region, sized by the rows its
+        e-graph holds as registered (a scan's token programs' terms, its chunk's root term and leaves)."""
+        return self.growth * max(1, equations), self.depth * max(1, depth)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -53,7 +63,8 @@ class AlgebraReport:
     """What one region's rewrite did: the equations it read, the sets admitted and the matches each fired,
     its limits, its iterations and nodes, whether a limit stopped it, the region's price before and after in
     seconds (`cost.model`; None for a region no rule may fire in, `rules.reorderable`, whose terms are never
-    built and so never priced), the seconds this program's rewrite of it took, the roots whose cheaper form
+    built and so never priced, and a scan's own derivations price no form before theirs, `reported`), the
+    seconds this program's rewrite of it took, the roots whose cheaper form
     the program took (`spliced`, `_splices`: a picked form that does not land, a value another window's form
     made or a form of another type, is none), and whether an earlier window of its structure derived its
     forms (`reused`, `_derived`: its seconds a lookup's)."""
@@ -92,8 +103,8 @@ def passes(on: bool = True, target: str | None = None) -> Iterator[None]:
         yield
 
 
-def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tuple[int, ...] = (),
-              static_argnames: str | tuple[str, ...] = (), kernels: bool = False) -> Callable:
+def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tuple[int, ...] | None = None,
+              static_argnames: str | tuple[str, ...] | None = None, kernels: bool = False) -> Callable:
     """`fn` with its program rewritten where the switch is on (`passes`): its static arguments bound as the
     jit around it binds them (`static_argnums`, `static_argnames`), traced over the others, its terms
     saturated under the rule sets the run's numerics admit (`rules.admitted`: the `exact` sets alone under
@@ -102,18 +113,15 @@ def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tup
     Dew's kernels where they take them (`fusion.fused_program`), which a program a kernel itself traces (a
     fused prologue's producer, a score mod) never is. Its arguments, outputs and their structure are
     `fn`'s."""
-    # The static positions and names as jit resolves them: each given, and its other spelling read from the
-    # signature's positional parameters, so a static argument passed either way is bound.
-    numbers = {static_argnums} if isinstance(static_argnums, int) else set(static_argnums)
-    names = {static_argnames} if isinstance(static_argnames, str) else set(static_argnames)
-    try:
-        parameters = list(inspect.signature(fn).parameters.values())
-    except (TypeError, ValueError):
-        parameters = []
-    positional = [parameter.name for parameter in parameters
-                  if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)]
-    numbers |= {number for number, name in enumerate(positional) if name in names}
-    names |= {positional[number] for number in numbers if -len(positional) <= number < len(positional)}
+    # The static positions and names as jit resolves them, by JAX's own inference: the spelling omitted is
+    # read from the signature, and where both are given each is taken as given (a union of the two made a
+    # static of an argument jit traces, passed the other way).
+    numbers, names = static_argnums, static_argnames
+    signature = api_util.fun_signature(fn)
+    if signature is not None:
+        numbers, names = api_util.infer_argnums_and_argnames(signature, numbers, names)
+    numbers = set(() if numbers is None else (numbers,) if isinstance(numbers, int) else numbers)
+    names = set(() if names is None else (names,) if isinstance(names, str) else names)
 
     @functools.wraps(fn)
     def run(*args, **kwargs):
@@ -264,8 +272,8 @@ def structure(window: jcore.Jaxpr) -> Hashable:
 
     def operand(atom) -> Hashable:
         if isinstance(atom, jcore.Literal):
-            value = np.asarray(atom.val)
-            return value.dtype, value.shape, value.tobytes(), atom.aval
+            dtype, value = terms.held_bits(atom.val)
+            return dtype, value.shape, value.tobytes(), atom.aval
         return position[atom]
 
     equations = []
@@ -285,7 +293,7 @@ def _deriving(accurate: bool, saturation: Saturation) -> Hashable:
     (`rules.admitted`, by name), so a target assumed, a precision set or a set registered later derives
     afresh."""
     return (accurate, saturation, cost.target(), str(jax.config.jax_default_matmul_precision),
-            tuple(sets.name for sets in rules.admitted(accurate)))
+            rules.admitted_names(accurate))
 
 
 def _derived(window: jcore.Jaxpr, accurate: bool, saturation: Saturation,
@@ -417,7 +425,8 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
 def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> Rewrite:
     """`closed`'s roots' forms, its bodies already rewritten, chosen together from its terms saturated under
     the admitted rule sets where they are cheaper than the region as traced (`cost.cheaper`), and the report
-    of the rewrite. A region no reordering may touch (`rules.reorderable`) builds no e-graph. The saturated
+    of the rewrite. A region no admitted set may change (`rules.firing`: one no reordering may touch, where
+    no exact set past the saturation aids is admitted) builds no e-graph. The saturated
     graph's forms are extracted first; only where one differs from its root is the region as traced
     extracted too, from the graph as it stood (egglog's `push`, `pop`): a region whose forms are its roots'
     (commutativity's alone) takes one extraction."""
@@ -425,7 +434,8 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
     admitted = rules.admitted(accurate)
     # A window's structure decides first, its egglog terms built only where a rule may fire.
     skeleton = terms.region(closed, forms=terms.Skeleton)
-    if not rules.reorderable(skeleton):
+    firing = rules.firing(admitted, skeleton)
+    if not firing:
         fired = dict.fromkeys((sets.name for sets in admitted), 0)
         report = AlgebraReport(skeleton.equations, tuple(fired), fired, saturation.limits(skeleton),
                                iterations=0, nodes=0, limited=False, before=None, after=None,
@@ -435,7 +445,7 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
     priced = cost.model(region, cost.fused(cost.target()))
     graph, bundle, roots = graphed(region)
     graph.push()
-    saturated = saturate(graph, region, admitted, saturation)
+    saturated = saturate(graph, region, firing, saturation)
     nodes = node_count(graph)
     forms, after = extracted(graph, bundle, priced)
     changed = any(terms.key(form) != terms.key(root) for root, form in zip(roots, forms, strict=True))
@@ -445,9 +455,10 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
         _, before = extract.cheapest(graph, bundle, priced)
     picked = ({terms.key(root): form for root, form in zip(roots, forms, strict=True)}
               if changed and cost.cheaper(after, before) else {})
-    report = AlgebraReport(region.equations, tuple(saturated.fired), saturated.fired, saturated.limits,
-                           saturated.iterations, nodes, saturated.limited, before.value, after.value,
-                           time.perf_counter() - began)
+    # Every admitted set is reported, one that could not fire here (`rules.firing`) at no match.
+    fired = {**dict.fromkeys((sets.name for sets in admitted), 0), **saturated.fired}
+    report = AlgebraReport(region.equations, tuple(fired), fired, saturated.limits, saturated.iterations,
+                           nodes, saturated.limited, before.value, after.value, time.perf_counter() - began)
     return Rewrite(region, picked, report)
 
 
@@ -510,7 +521,8 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
 
 
 def _products(region: terms.Region) -> list:
-    """The facts a region's products state: which compute in their operands' dtype (`rules.plain`: no
+    """The facts a region's products state, each of a mode whose rounding is stated
+    (`terms.contraction_slack`): which compute in their operands' dtype (`rules.plain`: no
     accumulation wider than their operands they round back from), which of those are matrix products
     (`rules.matrix_product`), which values are matrices (`rules.matrix`), and the broadcasts of a vector to
     each matrix's extent along either axis (`rules.lifted`), their parameters added to the region's table."""
@@ -523,12 +535,21 @@ def _products(region: terms.Region) -> list:
             continue
         index = terms.integer(args[2])
         _, params = region.params[index]
-        # Its contracted length's power, the elements each output sums (`rules.contracted_length`).
+        left, right = (region.dtypes.get(terms.key(operand)) for operand in args[:2])
+        # Its mode's powers (`terms.product_slack`): a product whose rounding nothing states has no
+        # bound, so nothing here says what a rule would need to factor it or to make another in its mode.
+        slack = terms.product_slack(region, index)
+        if slack is None:
+            continue
+        facts.append(set_(rules.mode_power(i64(index))).to(i64(slack)))
+        # Its contracted length's power, the elements each output sums, and its mode's beside it
+        # (`rules.contracted_length`): what a product a rule makes in its place, in its mode, adds to its
+        # operands' bounds (a split-precision product's one power more, as its own traced bound takes).
         (contracting, _), _ = params["dimension_numbers"]
         length = math.prod(region.shape(args[0])[axis] for axis in contracting)
-        facts.append(set_(rules.contracted_length(term)).to(i64(max(length - 1, 0).bit_length())))
+        facts.append(set_(rules.contracted_length(term)).to(i64(max(length - 1, 0).bit_length() + slack)))
         wanted = params.get("preferred_element_type")
-        operands = {region.dtypes.get(terms.key(args[0])), region.dtypes.get(terms.key(args[1]))}
+        operands = {left, right}
         if wanted is None or operands == {jnp.dtype(wanted)}:
             facts.append(rules.plain(i64(index)))
             if jax.tree.map(int, params["dimension_numbers"]) == plain_numbers:
@@ -541,6 +562,9 @@ def _products(region: terms.Region) -> list:
             facts.append(set_(rules.lifted(Vec[i64](*(i64(size) for size in extent)), i64(axis))).to(
                 i64(len(region.params) - 1)))
     for index, value in enumerate(region.literals):
+        # A typed key's literal (a key a selection or a layout moves) states no number.
+        if terms.typed_key(value):
+            continue
         literal = terms.Term.literal(i64(index))
         if _power_of_two(value):
             facts.append(rules.exact_scale(literal))
@@ -586,6 +610,31 @@ def saturate(graph: EGraph, region: terms.Region, admitted: tuple[rules.Rules, .
             break
     graph.run(facts)
     return Saturated(fired, (nodes, steps), iterations, limited)
+
+
+def run_within(graph: EGraph, ruleset, limits: tuple[int, int], name: str) -> Saturated:
+    """`graph` run under one `ruleset`, reported as `name`, to its fixpoint or `limits` (nodes, iterations;
+    `Saturation.sized`), an iteration at a time with the count read between them, as `saturate` reads it:
+    its matches, the iterations it ran and whether a limit stopped it."""
+    nodes, steps = limits
+    iterations, matches = 0, 0
+    while iterations < steps and node_count(graph) <= nodes:
+        ran = graph.run(ruleset)
+        iterations += 1
+        matches += sum(ran.num_matches_per_rule.values())
+        if not ran.updated:
+            return Saturated({name: matches}, limits, iterations, limited=False)
+    return Saturated({name: matches}, limits, iterations, limited=True)
+
+
+def reported(graph: EGraph, sized: int, saturated: Saturated, began: float,
+             after: float | None = None) -> AlgebraReport:
+    """A derivation's own saturation (`run_within`: a scan's token programs', its chunk's) as the report a
+    region's rewrite makes, recorded with the kernels' (`kernel_report.record_rewrite`): its size as
+    registered, its limits, its iterations and rows, whether a limit stopped it, and its form's price."""
+    return AlgebraReport(sized, tuple(saturated.fired), saturated.fired, saturated.limits,
+                         saturated.iterations, node_count(graph), saturated.limited, None, after,
+                         time.perf_counter() - began)
 
 
 def extracted[Price: Linear](graph: EGraph, bundle: terms.Term, model: DagCostModel[Price], *,

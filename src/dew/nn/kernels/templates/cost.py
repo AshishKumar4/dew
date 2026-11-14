@@ -69,11 +69,12 @@ def rates(target: generation.GpuTarget, *, device: bool) -> tuple[float | None, 
     """`target`'s rate of each unit `units` prices, per second: the tensor cores' 16-bit, TF32 and FP8 modes
     (FP8's the 16-bit one's where the generation states none, its codes unpacked into 16-bit products), the
     CUDA cores, the special-function units, shared memory and device memory. Each is a multiprocessor's at
-    the target's clock, or with `device` the whole device's (its multiprocessors at its clock, the tensor
-    cores at its datasheet's dense peak where it states no clock), where a tile walk's device bytes and XLA's
-    fusion's staged bytes cost nothing (infinite); None for a unit the target states no rate of (a TPU's
-    vector and transcendental units, a datasheet's missing clock)."""
-    clock = target.clock_hz
+    the clock the target holds under a step's tensor-core load (`GpuTarget.loaded_clock_hz`: a B200's
+    measured 1.549 GHz, not its 1.965 GHz boost), or with `device` the whole device's (its multiprocessors
+    at that clock, the tensor cores at its datasheet's dense peak where it states no clock), where a tile
+    walk's device bytes and XLA's fusion's staged bytes cost nothing (infinite); None for a unit the target
+    states no rate of (a TPU's vector and transcendental units, a datasheet's missing clock)."""
+    clock = target.loaded_clock_hz
     if not device:
         each = clock
     else:

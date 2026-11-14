@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import recurrence_algebra as algebra
-from dew.nn.kernels.templates import mosaic, product, resources, swizzling
+from dew.nn.kernels.templates import mosaic, operands, product, resources, swizzling
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.mainloop import (
@@ -34,24 +34,49 @@ from dew.nn.kernels.templates.resources import largest_live_set
 
 
 def _output_streams(call: Call, bv: int) -> tuple[dict, tuple]:
-    """`output_launch`'s streamed blocks and its staging tiles at value blocks `bv` wide: the queries, a value
-    block's memory entered and values; under a decay a head the keys, the scores staged once for every
-    value block's product; under one a key dimension the prefix tiles and the intra launch's scores, a key
-    block's product staged."""
+    """`output_launch`'s streamed blocks and its staging tiles at value blocks `bv` wide: a value block's
+    memory entered and values; under a decay a head the queries and keys, the scores staged once for every
+    value block's product; under one a key dimension the intra launch's scores, and each key block's gated
+    queries staged, their queries and prefix halves read from global memory at the first step alone
+    (`_gated_queries`), no stream's slots held for the walk: streamed, the queries' and the two fp32
+    prefixes' slots staged Kimi delta attention's output at 147,456 bytes at every value block, past a 99 KB
+    part's block (an sm86's, sm89's and sm120's: its call the port's there, jsf-kda-derive)."""
     chunk = call.chunk
-    width, held, memories, gates = call.width, call.held, call.memories, call.gates
+    width, held, memories = call.width, call.held, call.memories
+    queries = {} if call.per_key else {"queries": ((chunk, width), call.given)}
     if call.per_key:
-        given = {"gates": ((chunk, width), gates), "lows": ((chunk, width), gates),
-                 "scores": ((chunk, chunk), held)}
+        given = {"scores": ((chunk, chunk), held)}
         # The local product's staged scores, then each key block's gated queries.
         staging = (staging_tiles(held, (chunk, chunk)) + staging_tiles(call.given, *[(chunk, call.block)]
                                                                        * (width // call.block)),)
     else:
         given = {"keys": ((chunk, width), call.given)}
         staging = staging_tiles(held, (chunk, chunk))
-    blocks = stream_blocks(queries=((chunk, width), call.given), entered=((width, bv), memories),
-                           values=((chunk, bv), held), **given)
+    blocks = stream_blocks(**queries, entered=((width, bv), memories), values=((chunk, bv), held), **given)
     return blocks, staging
+
+
+def _gated_queries(call: Call, refs: tuple, row, h, scale: float, staged) -> None:
+    """Each key block's queries gated by their decays to the chunk's start and scaled (`algebra.key_gated`)
+    into its staging tile of `staged`, a decay a key dimension's at the first step: the queries and the
+    prefix's halves (`refs`, the launch's queries and its high and low prefixes) read from global memory a key
+    block at a time in the accumulator's layout (`Family.tile_of`), each operand's parts summed as its tiles'
+    (`Parts.value`), no slot held past the step, and staged as the parts the products read (`operands.staged`:
+    an fp32 call's two under the fast forms, whose first alone staged left the second's buffer unwritten)."""
+    family, width, chunk = call.family, call.width, call.chunk
+    q_ref, hi_ref, lo_ref = refs
+
+    def read(operand, ref, column):
+        tiles = [family.tile_of(view) for view in operand.views(ref, row, chunk, column, call.block)]
+        if len(tiles) == 1:
+            return tiles[0]
+        return functools.reduce(jnp.add, (tile.astype(jnp.float32) for tile in tiles))
+
+    for c, tile in enumerate(staged):
+        column = c * call.block
+        query = read(call.given, q_ref, h // call.group * width + column)
+        decays = tuple(read(call.gates, ref, h * width + column) for ref in (hi_ref, lo_ref))
+        operands.staged(family, algebra.key_gated(query, decays, scale), tile)
 
 
 def _output_swizzle(call: Call, bv: int, staging: tuple, landing: dict) -> int:
@@ -88,7 +113,7 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     warpgroup product's descriptors at its use, JAX 0.12.0.1.post33; post32's hoisted descriptors held the
     128-wide block past 255, where both phases were stated at once). Under a decay a key dimension the value
     block's phase, and apart from it the first step's: a key block's prefix halves, its decay raised from them
-    and its queries widened, staged for every step (`algebra.key_gated`)."""
+    and its queries widened, read from global memory and staged for every step (`_gated_queries`)."""
     chunk = call.chunk
     held, memories, given, family = call.held, call.memories, call.given, call.family
     products = largest_live_set(
@@ -159,7 +184,7 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
     `[HV]` adds `D v` from the values the step holds (there the corrected ones)."""
     chunk = call.chunk
     assert skip is None or call.gated_keys, "a skip reads the values a call whose keys take the gate holds"
-    width, value_width, bv, gates = call.width, call.value_width, tiles.output_block, call.gates
+    width, value_width, bv = call.width, call.value_width, tiles.output_block
     held, memories, family = dataclasses.replace(call.held, rows=call.rows), call.memories, call.family
     steps = value_width // bv
 
@@ -170,15 +195,13 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
         row, span = n * chunk, pl.ds(n * chunk, chunk)
         (staged,) = staging
         if call.per_key:
-            given = {"gates": gates.views(hi_ref, row, chunk, h * width, width),
-                     "lows": gates.views(lo_ref, row, chunk, h * width, width),
-                     "scores": held.views(k_ref, row, chunk, h * chunk, chunk)}
+            given = {"scores": held.views(k_ref, row, chunk, h * chunk, chunk)}
         else:
-            given = {"keys": call.given.views(k_ref, row, chunk, h // call.group * width, width)}
+            given = {name: call.given.views(ref, row, chunk, h // call.group * width, width)
+                     for name, ref in (("queries", q_ref), ("keys", k_ref))}
         # Step `i` the `i`-th value block: its columns of the memory entered and of the values.
-        queried = call.given.views(q_ref, row, chunk, h // call.group * width, width)
         entering = memories.views(h_ref, (n * call.heads + h) * width, width, 0, value_width)
-        views = {**stream_views(lambda i: (0, 0), queries=queried, **given),
+        views = {**stream_views(lambda i: (0, 0), **given),
                  **stream_views(lambda i: (0, i), entered=entering,
                                 values=held.views(v_ref, row, chunk, h * value_width, value_width))}
 
@@ -199,18 +222,12 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
             value = stream_tile(slots, "values", held)
             if call.per_key:
                 local, *gated = staged
-                # The tiles taken before the first step's branch: a slot is the stream's, every step's.
-                queries, halves = ([block(name, operand, c) for c in range(width // call.block)]
-                                   for name, operand in (("queries", call.given), ("gates", gates)))
-                lows = [block("lows", gates, c) for c in range(width // call.block)]
 
                 # Each key block's gated queries staged once, at the first step, for every value block's
                 # product: computed each step, they were live across the walk's steps beside each one's sum.
                 @pl.when(index == 0)
                 def _():
-                    for c, tile in enumerate(gated):
-                        decays = (halves[c].value(), lows[c].value())
-                        family.staged(algebra.key_gated(queries[c].value(), decays, scale), tile[0])
+                    _gated_queries(call, (q_ref, hi_ref, lo_ref), row, h, scale, gated)
 
                 out = algebra.key_decayed_output(
                     lambda c: Parts(gated[c], call.given.dtype), entered, width // call.block,
@@ -229,10 +246,7 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
                     scored = algebra.chunk_scores(
                         queries.__getitem__, keys.__getitem__, width // call.block, gate, low, held.dtype,
                         Issuer(call), laid=laid, column_scale=gated)
-                    pieces = (product.formed(scored.astype(jnp.float32), held.parts) if held.parts > 1
-                              else (scored,))
-                    for piece, buffer in zip(pieces, staged, strict=True):
-                        family.staged(piece, buffer)
+                    operands.staged(family, scored, staged)
 
                 out = algebra.chunk_output(queries.__getitem__, entered, width // call.block, gate, low,
                                            Parts(staged, held.dtype), value, scale, Issuer(call))

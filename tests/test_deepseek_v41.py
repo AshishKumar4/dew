@@ -27,6 +27,7 @@ import pytest
 from deepseek_v41_support import ROOT, TINY
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import decode_through
+from quantized_arms import QUANTIZERS
 from quantized_basis import dequantized_in_own_basis
 from reference_error import FACTOR, as_given, assert_as_exact, distance
 
@@ -44,7 +45,7 @@ from dew.nn.sharding import down_projection
 from dew.nn.visibility import visible
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
-from tools.deepseek_v41_numerics import QUANTIZERS, vision_bundle, vision_run
+from tools.deepseek_v41_numerics import next_token_loss, vision_bundle, vision_run
 
 RELEASED = ROOT / "deepseek-v41-flash"
 TRUTH = np.load(TINY / "reference_f64.npz")
@@ -143,21 +144,13 @@ def test_a_quantization_aware_step_is_never_wrong(source, monkeypatch):
     from certified import assert_certified
 
     from dew.nn.precision import WIDE_CPU_ARITHMETIC
-    from dew.objectives.base import Step
-    from dew.objectives.lm import LMObjective
 
     loaded, _, reference = source
     shape = reference["input_ids"].shape
-    objective = LMObjective(loaded.model, shape[1] - 1, ema_decay=None, pad_id=2)
     optimizer = optax.sgd(2.0 ** -4)
 
     def step(params, ids):
-        def loss(params):
-            statistics, _ = objective.loss({**loaded.variables, "params": params}, {"text": ids},
-                                           Step(step=jnp.int32(0), key=jax.random.key(0), ema=None))
-            return objective.reduce_loss(statistics)[0]
-
-        value, gradient = jax.value_and_grad(loss)(params)
+        value, gradient = jax.value_and_grad(next_token_loss(loaded.model, loaded.variables, ids))(params)
         updates, _ = optimizer.update(gradient, optimizer.init(params), params)
         return value, gradient, optax.apply_updates(params, updates)
 

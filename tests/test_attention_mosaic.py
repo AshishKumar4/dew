@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 from attention_oracle import attention_terms
 from float64_terms import float64_terms
-from generation_support import INTERPRETS, lowers
+from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import assert_as_exact, widened
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
@@ -40,13 +40,14 @@ from dew.nn.kernels.templates import (
     attention_triton,
     bundles,
     mosaic_sm90,
-    resources,
 )
 
 pytestmark = pytest.mark.kernel
 
 ON_HOPPER = pytest.mark.skipif(generation.device_generation() != "sm90",
                                reason="runs the sm90 mainloop compiled, on an H100")
+ON_BLACKWELL = pytest.mark.skipif(generation.device_generation() != "sm100",
+                                  reason="runs the sm100 mainloop compiled, on a B200")
 CALLS = {"full": {}, "causal": {"causal": True}}
 """The call forms the mainloop takes."""
 SHAPES = {"interpreted": (1, 160, 2, 1), "compiled": (2, 400, 4, 2)}
@@ -80,24 +81,19 @@ _INTERPRETED = contextvars.ContextVar("interpreted_on", default="sm90")
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_program.split_queries`), as the derivation takes it."""
-RAISED_FORMS = ("fused-shared-dq", "fused-producer-dq")
-"""The backward's forms whose consumers hold more registers than a warpgroup's even share, legal only where
-the GPU's compile honors their raise (`resources.RAISES_HONORED`)."""
-BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys",
-                  *(RAISED_FORMS if resources.RAISES_HONORED else ()), "accurate")
-"""The backward's forms (`_backward_form`): the fast in two launches and in one each way, the raised ones
-where raises hold (`RAISED_FORMS`), and the accurate."""
-WGMMA_FORMS = ("fused", "fused-keys-first", "fused-shared-keys", *RAISED_FORMS)
+BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys", "accurate")
+"""The backward's forms (`_backward_form`): the fast in two launches and in one each way, and the
+accurate."""
+WGMMA_FORMS = ("fused", "fused-keys-first", "fused-shared-keys")
 """The backward's forms on an H100's layouts alone: its one launch, whose tile of the call forms an A100's
 registers hold at no extent (64 x 64 holds 258 a thread, 32 x 128 in two column halves 258, et-a100bwd2),
-and `FED`'s fed consumers, its shared keys and dQ, which an A100's mma.sync, one warpgroup, takes none of."""
+and `FED`'s fed consumers and its shared keys, which an A100's mma.sync, one warpgroup, takes none of."""
 HOOKED_FORMS = ("default", "accurate")
 """The forms every hooked call takes: its fast form's one launch takes a hook of no parameters, an initial
 state or a draw alone."""
 
 
-FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128, "fused-shared-dq": 128,
-               "fused-producer-dq": 128}
+FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128}
 """The head width a backward form takes where the checks' own (128, a call form's 64) is not one it holds:
 the keys-first one launch holds width 64 alone (its dK, dV and dQ tiles past a consumer's registers at
 128), the shared keys' consumers 128 and wider (each its share of the columns whole swizzled rows)."""
@@ -110,9 +106,7 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
     `accurate-halves` (a width split's, `BackwardTiles.columns`); or the fast form's one launch (`fused`),
     queries first on the dQ launch's layout, or keys first on `FED`'s (`fused-keys-first`), each consumer
     64 of a slot's 128 queries, or queries first over keys its two consumers share on `FED`'s layout
-    (`fused-shared-keys`), or keys first on the dQ launch's layout, each of its two consumers its own keys,
-    their score cotangents exchanged for a shared dQ (`fused-shared-dq`, FlashAttention 3's width 128), its
-    producer adding it (`fused-producer-dq`); or the fast form at its derivation's tiles (`derived`)."""
+    (`fused-shared-keys`); or the fast form at its derivation's tiles (`derived`)."""
     family = INTERPRETED_ON[_INTERPRETED.get()]
     if family != WGMMA:
         # An A100's forms: its own layout's two launches, the accurate and the derived.
@@ -129,10 +123,6 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
     if form == "fused-shared-keys":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family=FED["dkv_family"],
                                                      shared_keys=True)
-    if form in ("fused-shared-dq", "fused-producer-dq"):
-        return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, dkv_family="wgmma",
-                                                     dkv_consumers=2, shared_dq=True, staged_logits=True,
-                                                     producer_dq=form == "fused-producer-dq", family=WGMMA)
     if form == "fused-keys-first":
         return False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, family=WGMMA, **FED)
     if form == "accurate":
@@ -1005,6 +995,59 @@ def _forward_call(shape, width: int, value_width: int, residuals: template.Kept)
 
 
 @pytest.mark.parametrize("residuals", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])
+def test_a_refused_forward_config_is_derived_no_more(residuals):
+    """A B200's forward of Qwen3.5-4B's attention (16 heads over 4, width 256, a 12,288-token causal row):
+    its derived config refused as a compile refuses a spilling launch (`report.refuse_launch`, at the config
+    the launch traced, its natural rewalk's tiles named) is derived no more, the derivation taking another
+    legal one or none (PF03: read at the config's own tiles alone, the refusal reached nothing, and a B200
+    compiled the same step twice)."""
+    from dew.nn.kernels.templates import report
+
+    with generation.assumed("sm100"), report.refusals():
+        target = generation.gpu_target()
+        op, ba = _forward_call((1, 12288, 16, 4), 256, 256, residuals)
+        first = op.derived(ba, target)
+        assert first is not None
+        report.refuse_launch(op, ba, first, {"attention_forward"})
+        again = op.derived(ba, target)
+        assert again != first
+        assert again is None or op.legal(ba, again, target)
+
+
+@COMPILES_ON_CPU
+def test_a_relowering_that_launches_its_refused_config_again_keeps_the_program():
+    """A run's compile (`report.kept`) whose kernel spills, and whose relowering launches the refused config
+    again (a derivation that does not read its refusal), keeps the program it compiled: no second compile
+    of the same program, the spill recorded as a miss not stepped down and no refusal committed (PF03: a
+    B200's 4B step compiled the same program twice, 150 s)."""
+    import kernel_compile
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.lowered import kernel_calls
+    from dew.nn.kernels.templates import report
+
+    mesh = kernel_compile._device("sm100")
+    spans = template.spans(512, 512, 1, causal=True)
+    shape = jax.ShapeDtypeStruct((1, 512, 2, 128), jnp.bfloat16,
+                                 sharding=NamedSharding(mesh, PartitionSpec()))
+
+    def forward(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None)
+
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm100")):
+        first = jax.jit(forward).trace(shape, shape, shape).lower()
+    calls = [call for call in kernel_calls(first, unrun=True) if call.kind == "mosaic_gpu" and call.launch]
+    assert calls
+    # Every compile's kernels read as spilling, as a B200's ptxas read the 4B forward's.
+    spilled = [report.Binary(report.kernel_of(call.name)[0], call.launch, 255, 8) for call in calls]
+    with generation.assumed("sm100"), report.refusals():
+        report.kept(first, relower=lambda: first, read=lambda executable: spilled)
+        misses = report.misses()
+        assert misses and not any(miss.stepped for miss in misses), misses
+        assert report.refused_launches() == ()
+
+
+@pytest.mark.parametrize("residuals", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])
 @pytest.mark.parametrize(("width", "value_width"), [(128, 64), (128, 128), (128, 256), (256, 256)])
 def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, residuals):
     """On an H100 the forward's tiles derived from the facts (`MosaicForward.derived`) stage within its
@@ -1236,21 +1279,38 @@ def test_a_hook_shaped_to_the_launchs_tile_is_taken():
                     seeds=SEEDS)
 
 
+WALKED_CASES = ("full", "causal", "causal-window", "documents", "cross-causal-lengths-starts", "block-causal",
+                "valid", "widest-window", "runs", "runs-documents-valid")
+"""The call forms a one-launch walk (`WGMMA_FORMS`) is checked over: one of each mechanism its block map and
+masks meet (`attention.block_map`, `algebra.seen`), whole tiles, causality's diagonal, a window's band,
+documents' ids, another sequence's documents aligned with key lengths and starts, block groups, key validity
+and its empty rows, a window at int32's largest, and runs alone and beside documents and validity. Every
+other call form combines these mechanisms, each checked on the two launches' walks and the accurate form's,
+which every call form runs on (`test_the_backward_is_on_par_over_every_call_form_interpreted`)."""
+
+
+def _walked(cases, forms) -> list[tuple[str, str]]:
+    """Each `(case, form)` of `cases` and `forms` a backward check takes: every case on a form of two launches
+    or the accurate form's, the `WALKED_CASES` on a one-launch walk."""
+    return [(case, form) for form in forms for case in cases
+            if form not in WGMMA_FORMS or case in WALKED_CASES]
+
+
 @INTERPRETS
-@on_each_family_for("form", BACKWARD_FORMS)
-@pytest.mark.parametrize("case", CASES)
+@on_each_family_for(("case", "form"), _walked(CASES, BACKWARD_FORMS), ids=str)
 def test_the_backward_is_on_par_over_every_call_form_interpreted(case, form):
-    """The backward in both forms over each of the template core's call forms under the interpreter."""
+    """The backward over the template core's call forms under the interpreter: every call form in the fast
+    form's two launches and in the accurate form, the call forms of `WALKED_CASES` on each one-launch walk."""
     _check_call_form(case, interpret=True, backward=True, form=form)
 
 
 @INTERPRETS
-@on_each_family_for("form", ["forward", *BACKWARD_FORMS])
-@pytest.mark.parametrize("case", RUN_CASES)
+@on_each_family_for(("case", "form"), _walked(RUN_CASES, ["forward", *BACKWARD_FORMS]), ids=str)
 def test_a_call_over_runs_is_on_par_interpreted(case, form):
     """A decision row's runs (`test_attention_template.RUN_CASES`), several key intervals a query, under the
     interpreter: each block walks its runs' envelope (`attention.block_map`), each tile masked by the union
-    of its queries' runs (`algebra.seen`), the forward and the backward in each form."""
+    of its queries' runs (`algebra.seen`), the forward and the backward in each form, a one-launch walk over
+    the runs of `WALKED_CASES`."""
     backward = form != "forward"
     _check_call_form(case, interpret=True, backward=backward, form=form if backward else "default")
 
@@ -1860,6 +1920,32 @@ def the_natural_forward_is_on_par_on_an_h100(call, dtype):
 def the_forward_is_on_par_over_every_call_form_on_an_h100(form):
     """The forward over each of the template core's call forms compiled on an H100."""
     _check_call_form(form, interpret=False)
+
+
+WEDGED = attention_mosaic.Tiles(block_q=64, block_k=128, stages=2, consumers=2, family="tcgen05.chunks",
+                                relaunch_k=64, relaunch_consumers=2)
+"""The forward's config a B200 wedged at (row 5671): its consumers' tensor-core commits."""
+
+
+@ON_BLACKWELL
+def the_forward_runs_back_to_back_at_128_key_tiles_on_a_b200():
+    """The forward of Qwen3-8B's attention (2 x 4096, 32 query heads over 8, 128 wide, causal bf16) at
+    `WEDGED`, called 4,000 times back to back, every call's output bitwise its first's (each compared on the
+    device as the calls run, none waited for): a consumer whose warps stood two of its tensor-core barrier's
+    phases apart (one committed it again right behind its wait, before a lagging warp had seen the phase)
+    wedged the launch within 800 to 7,000 calls (row 5671)."""
+    rows, tokens, heads, kv_heads = 2, 4096, 32, 8
+    spans = template.spans(tokens, tokens, rows, causal=True)
+    query, key, value, _ = _drawn((rows, tokens, heads, kv_heads), jnp.bfloat16)(0)
+    with _pinned(WEDGED):
+        forward = jax.jit(lambda q, k, v: attention_mosaic.forward(q, k, v, spans, None))
+        first = forward(query, key, value)
+        differs = jax.jit(lambda seen, out, first: seen | jnp.any(out.view(jnp.uint16)
+                                                                   != first.view(jnp.uint16)))
+        seen = jnp.zeros((), bool)
+        for _ in range(4000):
+            seen = differs(seen, forward(query, key, value), first)
+    assert not bool(seen), "a call's output differed from the first's"
 
 
 @ON_HOPPER

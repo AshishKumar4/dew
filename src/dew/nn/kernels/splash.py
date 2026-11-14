@@ -23,7 +23,9 @@ references, its multi-query and sequence-minor layouts, its dynamic masks, its f
 saved residuals and manual sharding spec are left out; its long functions are cut into named parts and
 its style moved to this tree's lint, every operation and its order as upstream's.
 
-Two changes of logic, marked `# Dew:`. The backward's delta (D, the row sums the softmax's derivative
+Three changes of logic, marked `# Dew:`. A hidden key's logit is -inf, which no key a row sees
+falls below, where upstream's finite mask value outweighed a row's own keys under it (`DEFAULT_MASK_VALUE`).
+The backward's delta (D, the row sums the softmax's derivative
 subtracts) is each query's sum_k p * dp, taken in a pass of the dQ kernel's own before the dQ and dK/dV
 kernels from the same weights and products the dQ kernel forms, where upstream takes rowsum(o * do). The
 two are equal in exact arithmetic; only the first cancels exactly where a query's weight is all on one key
@@ -59,10 +61,14 @@ from dew.nn.attention_kernels import SPLASH_BLOCK, SPLASH_LANES
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.options import program
-from dew.nn.kernels.templates import product
+from dew.nn.kernels.templates import attention_algebra, product
 from dew.nn.precision import compensated_sum, products_dtype
 
-DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
+# Dew: a hidden key's logit -inf, not upstream's finite -0.7 * float32's largest, which outweighed a row's
+# own keys below it (a causal first query's one key at -3e38 read the hidden keys' values); a row's state
+# that has seen no key stays -inf, its weights and rescale taken against 0 (`_shift`), its output and
+# weights 0 (`attention_algebra.inverse` of its denominator).
+DEFAULT_MASK_VALUE = -float("inf")
 NUM_LANES = 128
 NUM_SUBLANES = 8
 NN_DIM_NUMBERS = (((1,), (0,)), ((), ()))  # a @ b
@@ -463,11 +469,12 @@ def _forward_step(
     bkv_repeats, rem = divmod(bkv_compute, NUM_LANES)
     if rem != 0:
         raise NotImplementedError(f"{bkv_compute=} should be a multiple of {NUM_LANES}")
-    s_curr = jnp.exp(qk - jnp.tile(m_next, (1, bkv_repeats)))
+    shift = _shift(m_next)
+    s_curr = jnp.exp(qk - jnp.tile(shift, (1, bkv_repeats)))
     assert s_curr.shape == (bq, bkv_compute)
     l_curr = jax.lax.broadcast_in_dim(s_curr.sum(axis=-1), l_prev.shape, (0,))
     assert l_curr.shape == (bq, NUM_LANES)
-    alpha = jnp.exp(m_prev - m_next)
+    alpha = jnp.exp(m_prev - shift)
     l_next = l_curr + alpha * l_prev
     m_scratch_ref[...], l_scratch_ref[...] = m_next, l_next
     o_curr = _dot(s_curr, v_ref[slice_k, :].astype(jnp.float32), NN_DIM_NUMBERS, _precision(v_ref.dtype),
@@ -549,7 +556,8 @@ def _forward_kernel(
     @pl.when(j == grid_width - 1)
     def end():
         total = l_scratch_ref[...]
-        l_inv = jnp.tile(1.0 / total, (1, pl.cdiv(head_dim_v, NUM_LANES)))[..., : o_scratch_ref.shape[-1]]
+        l_inv = jnp.tile(attention_algebra.inverse(total), (1, pl.cdiv(head_dim_v, NUM_LANES)))[
+            ..., : o_scratch_ref.shape[-1]]
         o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
         if statistics_ref is not None:
             assert statistics_ref.shape == (step["bq"], NUM_LANES)
@@ -1133,7 +1141,13 @@ def _weights(logits: jax.Array, peak: jax.Array, inverse: jax.Array) -> jax.Arra
     from the forward's maximum and denominator, as the template's backward takes them
     (`attention_gradient.normalized`). Upstream's exp(s - lse) carried its log-sum-exp's rounding, a few of
     its ulps, into every weight of the query alike."""
-    return jnp.exp(logits - peak) * inverse
+    return jnp.exp(logits - _shift(peak)) * inverse
+
+
+def _shift(peak: jax.Array) -> jax.Array:
+    """Dew: the maximum a row's exponentials are taken against: its own, 0 where it has seen no key (-inf), so
+    a hidden key's exp(-inf) is 0 there, never exp(-inf - -inf)."""
+    return jnp.where(peak == -jnp.inf, 0.0, peak)
 
 
 def _precision(*dtypes) -> lax.Precision | None:
@@ -1186,7 +1200,7 @@ def _attention_fwd(
 def _attention_bwd(blocks: BlockSizes, call: _Call, residuals: tuple, do: jax.Array):
     """dQ, dK and dV from the delta pass, the dK/dV kernel and the dQ kernel; the sinks' gradient."""
     q, k, v, segment_ids, sinks, peak, total, dq_mask_info, dkv_mask_info = residuals
-    inverse = 1.0 / total
+    inverse = attention_algebra.inverse(total)
     # Dew: di is each query's sum_k p * dp from the dQ kernel's own pass, not rowsum(o * do).
     di = _dq(
         q, k, v, segment_ids, sinks, peak, inverse, do, None, blocks=blocks, mask_info=dq_mask_info, call=call

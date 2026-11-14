@@ -3,6 +3,7 @@ every hook combination it takes, a sequence over several chunks and a ragged las
 too, held to the same recurrence run a token at a time (the decode step's reference,
 `recurrence.step_reference`) under the accuracy gate (tests/reference_error.py), both from float64."""
 
+import collections
 import contextlib
 import dataclasses
 import functools
@@ -13,6 +14,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tiny_models
+from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec as P
 from port_support import row_names_port
 from reference_error import (
@@ -22,6 +25,7 @@ from reference_error import (
     assert_rounds_where_the_reference_does,
     chain_roundings,
     dot_precisions,
+    equations,
     widened,
     with_gradients,
 )
@@ -106,16 +110,17 @@ def on_route(route: str | None):
     return generation.assumed(route, interpreted=True) if route else contextlib.nullcontext()
 
 
-def routed(check) -> Callable:
-    """The decorator making `check` the test it decorates, run on each route (`ROUTES`, `on_route`): its
-    name and documentation the test's, its one parameter the route."""
+def routed(check, routes: tuple = ROUTES) -> Callable:
+    """The decorator making `check` the test it decorates, run on each of `routes` (every one of `ROUTES`
+    where none are given, `on_route`): its name and documentation the test's, its one parameter the
+    route."""
     def run(route):
         with on_route(route):
             check()
 
     def declared(test):
         run.__name__, run.__qualname__, run.__doc__ = test.__name__, test.__qualname__, test.__doc__
-        return pytest.mark.parametrize('route', ROUTES)(run)
+        return pytest.mark.parametrize('route', [route for route in ROUTES if route in routes])(run)
 
     return declared
 
@@ -393,6 +398,26 @@ def test_the_portable_maths_products_state_ieee_float32_as_a_gpu_runs_them(hooks
     narrowed = {(str(stated), shapes) for stated, dtype, shapes in precisions
                 if dtype == jnp.float32 and stated != highest}
     assert precisions and not narrowed, narrowed
+
+
+def test_a_decoder_of_equal_gated_delta_net_layers_traces_the_portable_walk_once():
+    """A Qwen3.5 toy decoder (tests/architecture_cases.py's, three equal gated delta net layers) traced for
+    its training step on the portable math: each layer's walk the one trace (`_walk_once`: the forms its
+    facts derive once, the walk one jitted function), where every layer derived its forms and traced its walk
+    again, 0.65 s a layer (a 4B decoder's plan spent 70 s of its trace there, row 5556)."""
+    model = tiny_models.build_model("causal_transformer+qwen35", dtype="float32")
+    tokens = jnp.arange(2 * 16, dtype=jnp.int32).reshape(2, 16) % 16
+    params = nn.unbox(model.init(jax.random.key(0), tokens))["params"]
+
+    def loss(params):
+        return jnp.sum(model.apply({"params": params}, tokens).astype(jnp.float32))
+
+    with generation.chosen(gated_delta_rule='xla'):
+        graph = jax.make_jaxpr(jax.grad(loss))(params)
+    # Each of the walk's traces (the step's forward, and the one its linearization takes) the three layers'.
+    layers = collections.Counter(id(equation.params["jaxpr"]) for equation in equations(graph)
+                                 if equation.params.get("name") == "recurrence_walk")
+    assert layers and set(layers.values()) == {3}, layers
 
 
 def test_fla_refuses_a_forked_call_named_or_handed_to_it():
@@ -799,24 +824,6 @@ PORTABLE_SEEDS = 8
 """The portable rule's differentiation sites' declared draws (check 1), sized by `seeds_for` (paired, on
 armada): the remat rung's gradients, the public seam's tangents, two forwards and a TPU's scan under
 forward mode."""
-
-
-def test_a_call_runs_its_products_kernels_apart():
-    """`_per_product`: a call's value is its forward kernel's where no derivative is taken; its gradient the
-    training kernel's forward and pullback; and its tangent the portable math's, `run('xla', ...)`."""
-    def run(kernel, x):
-        return {'forward': 2.0, 'training': 3.0, 'xla': 5.0}[kernel] * x
-
-    def kernel_of(product):
-        return product
-
-    x = jnp.arange(3.0)
-    np.testing.assert_array_equal(recurrence_chunk._per_product(kernel_of, run, x), 2.0 * x)
-    value, grad = jax.value_and_grad(lambda x: recurrence_chunk._per_product(kernel_of, run, x).sum())(x)
-    assert value == 3.0 * x.sum()
-    np.testing.assert_array_equal(grad, jnp.full(3, 3.0))
-    np.testing.assert_array_equal(jax.jvp(functools.partial(recurrence_chunk._per_product, kernel_of, run),
-                                          (x,), (jnp.ones(3),))[1], jnp.full(3, 5.0))
 
 
 def portable_draw(seed: int, rows: int, packed: bool) -> tuple:

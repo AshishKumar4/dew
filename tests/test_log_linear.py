@@ -2,6 +2,7 @@
 with fla's reference, the Fenwick tree's level masks built level by level (fla/ops/log_linear_attn/naive.py),
 from float64, one sequence and packed documents (check 1)."""
 
+import functools
 import math
 
 import jax.numpy as jnp
@@ -72,5 +73,8 @@ def test_the_masked_form_is_as_exact_as_flas_level_by_level(packed):
     level its position's highest bit apart from the query's) on par with fla's reference building each
     level's mask, from float64, one sequence and packed documents counting positions from their own first
     tokens (check 1)."""
-    assert_packed_on_par(log_linear_attention, naive, draw, 'log-linear attention', packed=packed,
-                         documents=DOCUMENTS, length=LENGTH, seeds=SEEDS[packed])
+    # Packed, each row's documents bound its levels' blocks (`max_segments`).
+    dew = functools.partial(log_linear_attention, max_segments=max(map(len, DOCUMENTS))) if packed else \
+        log_linear_attention
+    assert_packed_on_par(dew, naive, draw, 'log-linear attention', packed=packed, documents=DOCUMENTS,
+                         length=LENGTH, seeds=SEEDS[packed])

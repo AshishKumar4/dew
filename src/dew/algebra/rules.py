@@ -8,6 +8,7 @@ value it makes is constant along `axis`, so a sum along that axis may take it ou
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
@@ -22,6 +23,7 @@ from egglog import (
     Unit,
     Vec,
     birewrite,
+    declarations,
     eq,
     function,
     i64,
@@ -114,13 +116,24 @@ def log2_of(size: i64Like) -> i64: ...
 
 
 @function(merge=lambda old, new: old)
+def mode_power(params: i64) -> i64: ...
+"""The powers a contraction of parameters `params` adds to its bound for its mode (`terms.product_slack`: none
+for one that rounds each operand once and accumulates, one where it splits its operands into parts whose
+products it sums), stated for each product of a region whose mode's rounding is stated and for none other: a
+rule that makes a product at `params` adds it to the product's length's power (`contracted_length` holds the
+two together for a traced product), so no rule makes a product of a mode nothing bounds."""
+
+
+@function(merge=lambda old, new: old)
 def contracted_length(product: Term) -> i64: ...
 """A contraction's (`Term.dot`'s, by its term) length's power of two, `ceil(log2(...))` of the elements each
 of its outputs sums: a rule that makes a contraction bounds its products' and its sum's magnitude by its
 operands' and this (`product_magnitude`), read off the product it replaces, which contracts the same
 elements. Stated per product, not per parameters' index, which two products of different lengths share
-(row 3577). A contraction of no stated length (an operand of no known shape) has none, so a rule that asks it
-does not fire."""
+(row 3577). Its mode's powers are in it (`terms.contraction_slack`: one more where the mode splits its
+operands into parts), so the product a rule makes in that mode is bounded as the mode computes it. A
+contraction of no stated length (an operand of no known shape, a mode whose rounding nothing states) has none,
+so a rule that asks it does not fire."""
 
 
 @function(merge=lambda old, new: old)
@@ -489,7 +502,8 @@ def _scale_lifts() -> tuple[RuleFamily, ...]:
     product_extent = var("product_extent", Vec[i64])
     length2, row_lift, column_lift = vars_("length2 row_lift column_lift", i64)
     left = var("left", Vec[i64])
-    contracted = (eq(left).to(shape(x)), eq(length2).to(log2_of(left[i64(1)])))
+    # The lifted product contracts x's columns in the mode of the one it replaces (`mode_power`).
+    contracted = (eq(left).to(shape(x)), eq(length2).to(log2_of(left[i64(1)]) + mode_power(params)))
     facts, power = product_magnitude(magnitude(x, "x"), magnitude(y, "y"), length2)
     product = x.dot(y, params)
     lifted_by: dict[str, list] = {"row": [], "column": []}
@@ -583,16 +597,80 @@ def _identities() -> tuple[RuleFamily, ...]:
 
 FACTS = _facts()
 RULES: dict[str, Rules] = {}
+_HEADS: dict[str, set[tuple[str, ...]]] = {}
+"""What each registered rule's left side reads at its head (`_head`), by the operation it heads at: the
+operations that make its operands, where the left side states them. The program pass opens a window at an
+equation one of them matches (`heads`, `program.WINDOW` deep), so a rule is reachable from the moment it is
+registered; a set that only aids the others (`Rules.aid`: commutativity leaves every price as it was) or runs
+at dev time alone (`Rules.dev`) opens none."""
+
+
+def _operation(pattern) -> declarations.CallDecl | None:
+    """A left side's term where it writes an operation: a call of a method of the term it reads
+    (`Term.binary`, `Term.dot`); None for a variable, which any value answers, and for a leaf, a literal or
+    a state, the class's own constructors."""
+    held = pattern.expr if isinstance(pattern, declarations.TypedExprDecl) else pattern
+    if isinstance(held, declarations.CallDecl) and isinstance(held.callable, declarations.MethodRef):
+        return held
+    return None
+
+
+def _spoken(pattern) -> str | None:
+    """The symbol a left side's term is spoken as (`terms.written_as`), None where it writes no operation
+    (`_operation`)."""
+    call = _operation(pattern)
+    if call is None or not isinstance(call.callable, declarations.MethodRef):
+        return None
+    named = call.args[1].expr if len(call.args) > 1 else None
+    name = named.value if isinstance(named, declarations.LitDecl) else None
+    return terms.written_as(call.callable.method_name, name if isinstance(name, str) else None)
+
+
+def _left_side(decl):
+    """A rule's left side: a rewrite's own; a rule's the term its union rewrites, read from the equality
+    that binds the root it unions (`eq(t).to(...)`, either way round and wherever among its facts), or the
+    union's own left where it is written out; None where it states none."""
+    if not isinstance(decl, declarations.RuleDecl):
+        return decl.lhs
+    rewritten = next((action.lhs for action in decl.head if isinstance(action, declarations.UnionDecl)), None)
+    if rewritten is None or isinstance(rewritten, declarations.CallDecl):
+        return rewritten
+    for fact in decl.body:
+        if isinstance(fact, declarations.EqDecl) and rewritten in (fact.left, fact.right):
+            return fact.right if fact.left == rewritten else fact.left
+    return None
+
+
+def _head(written) -> tuple[str, tuple[str, ...]] | None:
+    """The head of a rule's left side (`_left_side`): the operation it heads at and those that make its
+    operands where it states them, in order of their names; None where it heads at no operation."""
+    left = _left_side(written.decl)
+    call, root = (None, None) if left is None else (_operation(left), _spoken(left))
+    if call is None or root is None:
+        return None
+    made = (_spoken(operand) for operand in call.args if isinstance(operand, declarations.TypedExprDecl))
+    return root, tuple(sorted(symbol for symbol in made if symbol is not None))
 
 
 def register(rules: Rules) -> None:
     """Add a set of rules to the registry, which runs them in the order they were registered: a set states
-    its rewrites, each with the instance that qualifies it (`Rules.declared`, `instances`), or is refused."""
+    its rewrites, each with the instance that qualifies it (`Rules.declared`, `instances`), or is refused;
+    each rule of a set that may change a program opens the pass's windows at its own left side's head
+    (`_HEADS`), and one whose left side heads at no operation of the language, which no window could open
+    for, is refused."""
     if rules.name in RULES:
         raise ValueError(f"a rule set named {rules.name!r} is registered already")
     if not rules.families:
         raise ValueError(f"the rule set {rules.name!r} declares no rewrites to qualify it by")
+    found = [] if rules.aid or rules.dev else [
+        (family.name, _head(written)) for family in rules.families for written in family.rules]
+    headless = [name for name, head in found if head is None]
+    if headless:
+        raise ValueError(f"the rule set {rules.name!r}: the left side of {headless} heads at no operation "
+                         f"of the language, so no window of a program opens for it")
     RULES[rules.name] = rules
+    for root, made in (head for _, head in found if head is not None):
+        _HEADS.setdefault(root, set()).add(made)
 
 
 register(Rules.declared("identities", "exact", _identities(), "docs/design/algebra.md §1", aid=True))
@@ -605,24 +683,14 @@ register(Rules.declared("linear", "reorders", _linear(), "docs/design/algebra.md
 register(Rules.declared("joined", "reorders", _joined(), "docs/design/algebra.md §1; ledger 1308"))
 
 
-HEADS = {"add": frozenset({"reduce_sum", "mul", "dot_general"}), "reduce_sum": frozenset({"mul"}),
-         "reduce_max": frozenset({"mul"}), "reduce_min": frozenset({"mul"}),
-         "mul": frozenset({"dot_general"}), "dot_general": frozenset({"mul"})}
-"""What a rule's left side that may lower a price reads at its head: a sum (`add`) of two reductions, two
-products or two contractions of one kind (`linear`), a reduction of a product (a sum's, or an extremum's of a
-positive scale), a contraction scaled, or a contraction of a scaled operand (a dequant's matrix scale, its
-broadcast within `program.WINDOW`). Commutativity alone (`identities`) leaves every price as it was."""
-
-
 def heads(primitive: str, operands: Sequence[str | None]) -> bool:
     """Whether an equation binding `primitive` over operands made by `operands` (each producer's primitive, or
-    None for a value from outside) is a head a rule may lower the price at (`HEADS`)."""
-    kinds = HEADS.get(primitive)
-    if kinds is None:
-        return False
-    if primitive == "add":
-        return len(operands) == 2 and operands[0] == operands[1] and operands[0] in kinds
-    return any(operand in kinds for operand in operands)
+    None for a value from outside) is a head a registered rule may lower the price at: some rule's left side
+    heads at that operation over operands of those makers (`_HEADS`, each rule's own as it is registered),
+    each of the equation's operands answering one of the left side's at most, in any order (commutativity
+    may have swapped them)."""
+    made = collections.Counter(operand for operand in operands if operand is not None)
+    return any(not collections.Counter(needed) - made for needed in _HEADS.get(primitive, ()))
 
 
 def reorderable(region: terms.Region) -> bool:
@@ -662,6 +730,22 @@ def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]:
     whose choice measures each candidate's error instead."""
     return tuple(rules for rules in RULES.values()
                  if (dev or not rules.dev) and (dev or not accurate or rules.rounding == "exact"))
+
+
+def admitted_names(accurate: bool) -> tuple[str, ...]:
+    """The admitted sets by name, in their order: what a derivation kept keys on beside its program, so a set
+    registered later derives afresh (the program pass's windows, a reduction's forms)."""
+    return tuple(sets.name for sets in admitted(accurate))
+
+
+def firing(sets: tuple[Rules, ...], region: terms.Region) -> tuple[Rules, ...]:
+    """The sets of `sets` that may change `region`: every one where a reordering rule may fire
+    (`reorderable`); else the `exact` ones, whose rewrites read no bound, and none where those are saturation
+    aids alone, which change no program by themselves (`Rules.aid`)."""
+    if reorderable(region):
+        return sets
+    exact = tuple(held for held in sets if held.rounding == "exact")
+    return () if all(held.aid for held in exact) else exact
 
 
 def instances() -> Mapping[str, Instance]:

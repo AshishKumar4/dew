@@ -131,10 +131,10 @@ def test_each_stall_of_a_tasks_runs_of_the_same_rows_keeps_its_own_record(ci, tm
 
 def test_a_stalled_pytests_threads_say_which_still_compute(ci, tmp_path):
     """A stalled pytest's record tells a process still computing from a stalled one (`stalls.activity`): its
-    main thread waiting on another's result, as pytest waits on an XLA computation's buffer, uses no CPU over
-    the watch, the thread computing it does (rows 5452, 5454: a dump of Python threads alone showed the
-    wait, never whether XLA's threads computed). The computing thread is named past the kernel's 15 bytes
-    (prctl's PR_SET_NAME, 15), its name cut mid-character, as a thread's may be."""
+    main thread waiting on another's result, as pytest waits on an XLA computation's buffer, sleeps in the
+    kernel and uses next to no CPU over the watch, the thread computing it does (rows 5452, 5454: a dump of
+    Python threads alone showed the wait, never whether XLA's threads computed). The computing thread is named
+    past the kernel's 15 bytes (prctl's PR_SET_NAME, 15), its name cut mid-character, as a thread's may be."""
     source = ("import ctypes, sys, threading\n\n\ndef spin(started):\n"
               "    ctypes.CDLL(None).prctl(15, ('\\u00e9' * 9).encode())\n    started.set()\n"
               "    while True:\n        pass\n\n\n"
@@ -151,7 +151,12 @@ def test_a_stalled_pytests_threads_say_which_still_compute(ci, tmp_path):
     finally:
         process.kill()
         process.wait()
-    assert threads[computing].cpu > 0 and threads[process.pid].cpu == 0
+    # The waiting thread sleeps in the kernel, and the computing one used ten times its CPU at least: a
+    # sleeping thread may be charged a clock tick (0.01 s) on a busy host, so no reading of its time is
+    # exactly none (train 805: 0.01 s against the computing thread's 1.0).
+    waiting, spinning = threads[process.pid], threads[computing]
+    assert (waiting.state, waiting.waits != "0") == ("S", True), waiting
+    assert spinning.cpu >= 10 * max(waiting.cpu, 0.01), (spinning, waiting)
 
 
 def test_a_task_within_its_deadline_writes_no_stacks(ci, tmp_path):

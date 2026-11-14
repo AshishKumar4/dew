@@ -3,6 +3,7 @@ codes' fields, its cheapest instruction form found by the price-ordered search a
 the decoded registers read as the consumer reads them, values its format defines."""
 
 import dataclasses
+import functools
 import itertools
 
 import jax
@@ -41,7 +42,9 @@ def test_a_formats_decode_is_found_at_the_cheapest_price_and_reads_back_its_valu
     values)."""
     form = bits.synthesized(bits.NVFP4_BFLOAT16, reach=6)
     assert form.price <= (5, 8)
-    assert form == bits.NVFP4_BFLOAT16_FORM
+    # The form the kernels hold is proven and no dearer than the one the search finds, whichever it finds.
+    bits.proven(bits.NVFP4_BFLOAT16, bits.NVFP4_BFLOAT16_FORM)
+    assert bits.NVFP4_BFLOAT16_FORM.price <= form.price
     rng = np.random.default_rng(3731)
     codes = rng.integers(0, 16, size=(4096, 8))
     codes[:16, :] = np.arange(16)[:, None]
@@ -187,6 +190,23 @@ def test_a_forms_depth_counts_a_constant_as_the_start_of_a_chain():
         assert 1 < encoding.depth <= len(encoding.steps)
 
 
+def test_a_forms_live_registers_hold_each_value_until_its_last_reader_and_each_output_to_the_end():
+    """A form's live registers are the most values its decode holds at once: the word and each step's value
+    until the step that last reads it, whose result may take its register, an output register's to the
+    end. A word, its shift and a constant all read by one join hold three before it; with the shift an
+    output too, it is held past the join beside the join's result, still three at most; a chain whose every
+    value is read once, by the next step, holds one."""
+    alu = bits.Unit.ALU
+    joined = bits.BitForm((bits.BitStep(bits.BitOp.SHR, (0,), 1, alu),
+                           bits.BitStep(bits.BitOp.IADD3, (), 3, alu),
+                           bits.BitStep(bits.BitOp.LOGIC, (0, 1, 2), 0, alu, 0xFC)), (3,), (1, 2))
+    assert joined.live == 3
+    assert dataclasses.replace(joined, outputs=(1, 3)).live == 3
+    chain = bits.BitForm((bits.BitStep(bits.BitOp.SHR, (0,), 1, alu),
+                          bits.BitStep(bits.BitOp.SHR, (1,), 1, alu)), (2,), (1, 2))
+    assert chain.live == 1
+
+
 def test_a_transform_kept_off_the_fma_pipe_takes_its_shifts_on_the_alu():
     """The NVFP4 decode declared for a consumer whose FMA pipe is its own (`units`): its form's every shift
     issues on the ALU, its price the ALU's, and it is proven."""
@@ -211,6 +231,8 @@ FORMS = {
     "nibbles": lambda: bits.synthesized(_nibbles()),
     "nibbles-alu": lambda: bits.synthesized(_nibbles(ALU)),
     "encode-e4m3": lambda: bits.encode_form(bits.E4M3),
+    "encode-e5m2": lambda: bits.encode_form(bits.E5M2),
+    "encode-e2m1": lambda: bits.encode_form(bits.E2M1),
 }
 """Forms whose steps together take every instruction a form's PTX writes (`BitForm.ptx`): a rotation, left
 and right shifts on either pipe, and a mask of one value and of two values' XOR; and an encode's (every
@@ -300,11 +322,30 @@ def reference_codes(words: np.ndarray, minifloat: bits.Minifloat, dtype) -> np.n
     return np.where(np.isnan(x), signed, codes)
 
 
-@pytest.mark.shards(units=192, per_task=8)
+@functools.cache
+def _encodes(name: str):
+    """A slice of fp32 words (`SLICES`) through `name`'s encode and its instruction form as a kernel traces
+    them (`bits.encoded`, `BitForm.traced`), one compiled program: each word's code, whether the form
+    differs from the encode on any, and the first word it does on."""
+    minifloat, _ = MINIFLOATS[name]
+    form = bits.encode_form(minifloat)
+
+    @jax.jit
+    def run(words):
+        codes = bits.encoded(words, minifloat)
+        (formed,) = form.traced(words)
+        apart = formed != codes
+        return codes.astype(jnp.uint8), jnp.any(apart), words[jnp.argmax(apart)]
+
+    return run
+
+
+@pytest.mark.shards(units=192, per_task=32)
 def test_each_encode_is_the_reference_cast_on_every_fp32_word():
     """Each of e4m3's, e5m2's and e2m1's encodes (`bits.encoded`) is ml_dtypes' round-to-nearest-even cast
     saturated to its largest finite value on every one of the 2^32 fp32 words, a NaN as its NaN code, and its
-    instruction form (`bits.encode_form`) is the encode on every word: a proof by exhaustion (row 4050)."""
+    instruction form (`bits.encode_form`) is the encode on every word: a proof by exhaustion (row 4050), of
+    the encode and the form as a kernel traces them, each slice of words one compiled program's."""
     cases = list(itertools.product(MINIFLOATS, range(SLICES)))
     assert len(cases) == 192, "the shards mark counts each slice of each encode"
 
@@ -312,28 +353,27 @@ def test_each_encode_is_the_reference_cast_on_every_fp32_word():
         for name, index in cases[start:stop]:
             minifloat, dtype = MINIFLOATS[name]
             words = np.arange(index << 26, (index + 1) << 26, dtype=np.uint64).astype(np.uint32)
-            got = bits.encoded(words, minifloat, np)
-            want = reference_codes(words, minifloat, dtype)
-            differ = np.flatnonzero(got != want)
-            assert differ.size == 0, (name, [(hex(int(words[i])), int(got[i]), int(want[i]))
-                                             for i in differ[:4]])
-            (formed,) = bits.encode_form(minifloat).decoded(words)
-            differ = np.flatnonzero(formed != got)
-            assert differ.size == 0, (name, "form", [(hex(int(words[i])), int(formed[i]), int(got[i]))
-                                                     for i in differ[:4]])
+            codes, apart, first = _encodes(name)(words)
+            assert not apart, (name, "form", hex(int(first)))
+            got = np.asarray(codes).astype(np.uint32)
+            differ = np.flatnonzero(got != reference_codes(words, minifloat, dtype))
+            assert differ.size == 0, (name, [(hex(int(words[i])), int(got[i])) for i in differ[:4]])
         return stop - start
 
     sharded("every fp32 word's encode", checked, len(cases))
 
 
-def test_an_nvfp4_tile_packed_from_its_encode_decodes_to_its_rounded_values():
+@pytest.mark.parametrize("e2m1", [bits.E2M1, bits.Minifloat(*bits.E2M1)], ids=["the format", "an equal one"])
+def test_an_nvfp4_tile_packed_from_its_encode_decodes_to_its_rounded_values(e2m1):
     """fp32 values encoded to e2m1 (`bits.encoded`) and packed eight a word (`bits.packed`), with a block
     scale of 1 (an e4m3 scale of 2^8, `NVFP4_OWED`), decode (`nvfp4_decoded`) to their e2m1 rounding: the
-    pack is the stored NVFP4 order the decode reads, in jax.numpy as a kernel's portable path runs it."""
+    pack is the stored NVFP4 order the decode reads, in jax.numpy as a kernel's portable path runs it,
+    whichever object states the format: one built equal to `bits.E2M1` packs as it does, where it packed
+    its codes in their natural order, which the decode read as other values."""
     rng = np.random.default_rng(4050)
     x = rng.standard_normal((64, 8)).astype(np.float32) * 3
-    codes = bits.encoded(jnp.asarray(x).view(jnp.uint32), bits.E2M1)
-    words = bits.packed(codes.T, bits.E2M1).T
+    codes = bits.encoded(jnp.asarray(x).view(jnp.uint32), e2m1)
+    words = bits.packed(codes.T, e2m1).T
     scales = jnp.full((4, 8), 2.0 ** 8, ml_dtypes.float8_e4m3fn)
     decoded = np.asarray(bits.nvfp4_decoded(words, scales), np.float32)
     rounded = np.clip(x, -6, 6).astype(ml_dtypes.float4_e2m1fn).astype(np.float32)

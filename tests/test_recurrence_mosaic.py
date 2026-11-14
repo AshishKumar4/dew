@@ -18,6 +18,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+import kernel_matrix
 import numpy as np
 import pytest
 from fla_sites import the_template_is_as_exact_as_fla
@@ -27,6 +28,7 @@ from reference_error import assert_as_exact
 from test_recurrence_chunk import (
     FORMED,
     HOOKS,
+    ROUTES,
     SEEDS as HOOK_SEEDS,
     chunk_on,
     draw as hooked_draw,
@@ -89,10 +91,66 @@ INTERPRETED_FORWARD = {('one sequence', 'fp32'), ('a ragged length', 'bf16'), ('
                        ('a decay a key dimension', 'bf16'), ('a decay a key dimension', 'fp32'),
                        ('a decay a key dimension, packed', 'bf16'),
                        ('a decay a key dimension, packed', 'fp32')}
-"""The forward's cases the CPU interprets: each launch in each arithmetic (an fp32 call's three parts, a
-16-bit call's), over key blocks and key heads' groups, a ragged chunk, packed documents, a decay a key
-dimension's launches packed and not, and an fp32 call's refusal under one. Interpreted, the whole grid took
-3.5 times these (2838 against 805 seconds)."""
+"""The forward's cases off the GPU flow (`native`): each launch in each arithmetic (an fp32 call's three
+parts, a 16-bit call's), over key blocks and key heads' groups, a ragged chunk, packed documents, a decay a
+key dimension's launches packed and not, in fp32 too (refused at exact products). The CPU interprets each as
+a drawn test of its own (`drawn_forward`) but the 16-bit call under a decay a key dimension, whose output
+and final memory test_recurrence_mosaic_gradient's cell judges on the same recorded site (`fla_sites.ruled`'s
+leaves) by the same launches: under a decay a key dimension the inference forward is the training forward's
+launches keeping nothing (`chunk_forward.forward`, `kept_forward`'s `keeps`). Under a decay a head a 16-bit
+inference forward walks once (`walks_once`: one scan launch, its own rounded expression), so its ragged and
+packed cases are drawn tests of their own. Interpreted, the whole grid took 3.5 times these (2838 against
+805 seconds)."""
+
+INTERPRETED_GRADIENT = frozenset({
+    ('packed documents', 'bf16', 'kept'), ('a ragged length', 'bf16', 'kept'),
+    ('one sequence', 'bf16', 'kept'), ('a ragged length', 'bf16', 'recomputed'),
+    ('a decay a key dimension', 'bf16', 'kept'), ('a decay a key dimension', 'fp32', 'kept'),
+    ('a ragged length', 'fp32', 'kept')})
+"""The gradient's cases the CPU interprets, each `(case, dtype, remat)` a check-1 site of its own
+(test_recurrence_mosaic_gradient's `interpreted_gradient`): the fast backward's launches over a ragged chunk,
+two key blocks and two key heads' groups, packed documents, its forward's memories kept and recomputed, under
+a decay a key dimension (`key_backward`'s), and an fp32 call's under the run's fast forms. Interpreted, the
+whole grid took 5.4 times these (7828 against 1452 seconds)."""
+
+FORWARD_SITES = frozenset(
+    (case, dtype) for case, dtype in INTERPRETED_FORWARD
+    if not (SHAPES[case].get('per_key') and DTYPES[dtype] == jnp.bfloat16
+            and (case, dtype, 'kept') in INTERPRETED_GRADIENT))
+"""The interpreted forward's sites (`drawn_forward`), each `(case, dtype)`: `INTERPRETED_FORWARD` but a
+16-bit call under a decay a key dimension whose gradient site judges its output and final memory by the same
+launches (`INTERPRETED_FORWARD`'s)."""
+
+SEEDED_SITES = ({'route': 'sm80', 'case': 'a decay a key dimension', 'dtype': 'bf16', 'pass': 'kept'},
+                {'route': None, 'case': 'a decay a key dimension', 'dtype': 'fp32', 'pass': 'forward'})
+"""The interpreted sites at the routes their faults showed on, which every covering keeps: an A100's Kimi
+delta attention gradients wrong unseen off a GPU while wgmma's alone was interpreted (row 5194), and an fp32
+call's output under a decay a key dimension non-finite on every seed under the fast forms (audit A6)."""
+
+
+def covering(routes: tuple) -> dict[tuple, frozenset]:
+    """Each interpreted site's routes, `(case, dtype, pass)` (a pass 'forward', or the gradient's remat
+    rung) to those of `routes` it runs on: a covering set over route, case, dtype and pass chosen pairwise
+    (testing.md: every pair of settings meets once; `kernel_matrix.pairwise`), `SEEDED_SITES` first, so each
+    case's launches run on every route's bundle in some arithmetic and pass. An fp32 call's gradient runs on
+    every route: it trains on the interpreter's route alone and is checked refused on the others (the fast
+    backward's 264 to 328 registers a thread), which no pair may count as covered. The whole cross took
+    52.3 task-hours of the suite at cd98dda014e, its covering 29.1 (jsf-forks6's draws)."""
+    sites = sorted([(case, dtype, 'forward') for case, dtype in FORWARD_SITES]
+                   + [site for site in INTERPRETED_GRADIENT if site[1] != 'fp32'])
+    served = [{'route': route, 'case': case, 'dtype': dtype, 'pass': passed}
+              for case, dtype, passed in sites for route in routes]
+    seeded = [site for site in SEEDED_SITES if site['route'] in routes]
+    covered = {site: frozenset(routes) for site in INTERPRETED_GRADIENT if site[1] == 'fp32'}
+    for cell in kernel_matrix.pairwise(served, seeded):
+        key = (cell['case'], cell['dtype'], cell['pass'])
+        covered[key] = covered.get(key, frozenset()) | {cell['route']}
+    return covered
+
+
+COVERED = covering(ROUTES)
+"""The interpreted sites' routes on this backend's routes (`covering`)."""
+
 
 def interpreted(grid: list[tuple], chosen: set[tuple]) -> list:
     """`grid`'s parameters the CPU interprets, those in `chosen`, each id its values joined by '-'; the rest
@@ -223,8 +281,8 @@ def taken(given: Chunk, hooks: recurrence.Hooks) -> bool:
 
 REFUSED = (Unfitted, NotImplementedError, KernelRefused)
 """The template's refusals: no config whose launches the device holds, a call its mainloop does not take
-(an fp32 call's decay a key dimension, `mainloop.per_key_refusal`), or a requirement of its route's the named
-template fails (`selection.KernelRefused`)."""
+(an fp32 call's decay a key dimension at exact products, `mainloop.per_key_refusal`), or a requirement of
+its route's the named template fails (`selection.KernelRefused`)."""
 
 
 def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fast'):
@@ -233,16 +291,17 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     the selectors, at its derived tiles);
     else, the route refusing them (a launch's registers past a thread's), the mainloop's rule at its narrowest
     value block, one chunk in flight (`mosaic_rule`), whose arithmetic is the same at any tiles. None where
-    the mainloop's rule refuses the call too (checked): an fp32 call's decay a key dimension
-    (`mainloop.per_key_refusal`); and on a GPU where its launches at those tiles pass the device's shared
-    memory (an fp32 call's solve on an A100's block), whose arithmetic the CPU interprets."""
+    the mainloop's rule refuses the call too (checked): an fp32 call's decay a key dimension at exact
+    products (the accurate forms, `mainloop.per_key_refusal`); and on a GPU where its launches at those
+    tiles pass the device's shared memory (an fp32 call's solve on an A100's block), whose arithmetic the
+    CPU interprets."""
     (operands,) = draw(dtype, 0, **geometry(case))
     if formed(forms, taken)(operands, hooks):
         return formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks))
     with pytest.raises(REFUSED):
         jax.eval_shape(formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks)), operands)
     family, _ = mainloop.issued()
-    if SHAPES[case].get('per_key') and mainloop.per_key_refusal(dtype):
+    if SHAPES[case].get('per_key') and mainloop.per_key_refusal(dtype, rounded=forms == 'fast'):
         # The portable math's arm is test_recurrence_chunk's.
         with pytest.raises(NotImplementedError):
             jax.eval_shape(functools.partial(mosaic_rule, tiles=NARROW),
@@ -267,20 +326,16 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     return rule
 
 
-DRAWN_FORWARD: set[tuple] = set()
-"""The interpreted forward's drawn cases, each a test of its own (`drawn_forward`); the rest of
-`INTERPRETED_FORWARD` the template refuses (the refusal test below)."""
-
-
 def drawn_forward(case: str, dtype: str) -> Callable:
-    """A drawn forward case's test: the case taken out of the refused ones (`DRAWN_FORWARD`) and
+    """A drawn forward case's test, each case of `INTERPRETED_FORWARD` one:
     `the_mosaic_forward_is_as_exact_as_its_reference` run by the test it decorates, a check-1 site of its own
     (its `check1_shards` mark). A map task of 128 seeds of the three 256-seed cases took 1045 to 1071 s on
     main's CI (Main, 2026-11-02); the 128-seed cases under a decay a key dimension 250 s and past 600 s whole
     (int-g1-each at 7683420535), a task of 8 seeds of both 117 to 125 s, half of it their compiles
-    (keyed-shards at 7e3a5fb48); on each route (`routed`)."""
-    DRAWN_FORWARD.add((case, dtype))
-    return routed(lambda: the_mosaic_forward_is_as_exact_as_its_reference(case, DTYPES[dtype]))
+    (keyed-shards at 7e3a5fb48); on the routes its covering gives it (`COVERED`, `routed`)."""
+    assert (case, dtype) in FORWARD_SITES, (case, dtype)
+    return routed(lambda: the_mosaic_forward_is_as_exact_as_its_reference(case, DTYPES[dtype]),
+                  COVERED[case, dtype, 'forward'])
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=16)
@@ -303,26 +358,26 @@ def test_the_mosaic_forward_over_packed_documents_is_as_exact_as_its_reference()
 
 
 @pytest.mark.check1_shards(seeds=128, per_task=8)
-@drawn_forward('a decay a key dimension', 'bf16')
-def test_the_mosaic_forward_over_a_decay_a_key_dimension_is_as_exact_as_its_reference():
-    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call under a decay a key dimension."""
-
-
-@pytest.mark.check1_shards(seeds=128, per_task=8)
 @drawn_forward('a decay a key dimension, packed', 'bf16')
 def test_the_packed_mosaic_forward_over_a_decay_a_key_dimension_is_as_exact_as_its_reference():
     """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call of packed documents under a decay a
     key dimension."""
 
 
-@pytest.mark.parametrize(('case', 'dtype'), interpreted(FORWARD_GRID, INTERPRETED_FORWARD - DRAWN_FORWARD))
-def test_an_fp32_call_under_a_decay_a_key_dimension_is_refused_by_the_mainloop(case, dtype):
-    """An fp32 call under a decay a key dimension: the template's route and the mainloop's rule both refuse
-    it, under either forms (`on_the_mainloop`, `mainloop.per_key_refusal`); its arm is the portable math's
-    (test_recurrence_chunk's)."""
-    hooks = case_hooks(case)
-    assert on_the_mainloop(hooks, case, dtype, forms='accurate') is None
-    assert on_the_mainloop(hooks, case, dtype) is None
+@pytest.mark.check1_shards(seeds=128, per_task=8)
+@drawn_forward('a decay a key dimension', 'fp32')
+def test_the_mosaic_forward_over_an_fp32_decay_a_key_dimension_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at an fp32 call under a decay a key dimension:
+    refused at exact products (the accurate forms, `mainloop.per_key_refusal`), its arm the portable math's
+    (test_recurrence_chunk's); under the fast forms held to recorded fla-core's fp32 at its 128 seeds."""
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=8)
+@drawn_forward('a decay a key dimension, packed', 'fp32')
+def test_the_packed_mosaic_forward_over_an_fp32_decay_a_key_dimension_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at an fp32 call of packed documents under a decay a
+    key dimension, as `test_the_mosaic_forward_over_an_fp32_decay_a_key_dimension_is_as_exact_as_its_
+    reference`, recorded fla-core's at its 128 seeds."""
 
 
 def the_mosaic_forward_is_as_exact_as_its_reference(case: str, dtype) -> None:
@@ -370,8 +425,8 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles(dtype):
     the bundle declares it within a block of it (`template.planned`), with two chunks in flight
     unless two are past it or leave a multiprocessor fewer of the states launch's programs
     (`Mosaic.states_held`). Its variants, which the opt-in tuner times (`Mosaic.variants`), lead with those
-    tiles, each legal there. An fp32 call it refuses: a launch's registers at its narrowest tiles pass a
-    thread's (the fp32 solve's merges hold the inverse's three parts)."""
+    tiles among them, each legal there. An fp32 call it refuses: a launch's registers at its narrowest tiles
+    pass a thread's (the fp32 solve's merges hold the inverse's three parts)."""
     assert generation.family(UNSEEN.generation) == 'mma.sync'
     _, bound = unseen_call(dtype)
     budget = generation.shared_budget(UNSEEN)
@@ -392,7 +447,7 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles(dtype):
                     or template.MOSAIC.states_held(bound, wider, UNSEEN)
                     < template.MOSAIC.states_held(bound, picked, UNSEEN))
         variants = template.MOSAIC.variants(bound)
-        assert variants[0] == picked and len(set(variants)) == len(variants)
+        assert picked in variants and len(set(variants)) == len(variants)
         assert all(template.MOSAIC.legal(bound, tiles, UNSEEN) for tiles in variants)
 
 
@@ -831,9 +886,9 @@ def resource_operands(name: str, dtype, rows: int, length: int) -> list[jax.Shap
 @lowers('sm90')
 def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     """The 27B gated delta net's forward launched twice in one program on an H100, at its derived tiles and
-    at a variant: a kernel's name compiled under both launches (`report.launching`) is gated on each
-    launch's evidence, the variant's shared memory its own; a gate that read a kernel by its name alone kept
-    one launch's and dropped the other's."""
+    at a variant's, each the forward's own (`_ran`): a kernel's name compiled under both launches
+    (`report.launching`) is gated on each launch's evidence, the variant's shared memory its own; a gate that
+    read a kernel by its name alone kept one launch's and dropped the other's."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -843,7 +898,7 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256)
     bound = template.MOSAIC.bind(*args, None, max_segments=None, bound=1.0)
     with generation.assumed(facts):
-        derived, variant = template.MOSAIC.variants(bound)[:2]
+        derived, variant = (_ran(tiles, training=False) for tiles in template.MOSAIC.variants(bound)[:2])
 
     def call():
         def fn(*operands):
@@ -869,10 +924,10 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
 @lowers('sm90')
 def test_two_launches_whose_padded_lengths_meet_name_their_own_kernels():
     """The 27B gated delta net's forward over 4089 tokens and over 4096 in one program on an H100, each at its
-    derived tiles under its own launch (`report.launching`): the mainloop pads both lengths to the same
-    chunks, so its launches' statics meet, and each launch's kernels still carry its own launch's digest
-    (`tuning.lowered_once` keys a trace on the launch tracing it). They shared one trace and the second's
-    kernels were named for the first, a spill of one refused as the other (row 2941)."""
+    derived forward's tiles (`_ran`) under its own launch (`report.launching`): the mainloop pads both
+    lengths to the same chunks, so its launches' statics meet, and each launch's kernels still carry its own
+    launch's digest (`tuning.lowered_once` keys a trace on the launch tracing it). They shared one trace and
+    the second's kernels were named for the first, a spill of one refused as the other (row 2941)."""
     from dew.nn.kernels.lowered import kernel_calls
 
     target = 'sm90'
@@ -883,7 +938,7 @@ def test_two_launches_whose_padded_lengths_meet_name_their_own_kernels():
     with generation.assumed(facts):
         launches = {length: (bound := template.MOSAIC.bind(*operands[length], None, max_segments=None,
                                                            bound=1.0),
-                             template.MOSAIC.variants(bound)[0])
+                             _ran(template.MOSAIC.variants(bound)[0], training=False))
                     for length in lengths}
 
     def both(*flat):
@@ -906,6 +961,31 @@ def test_two_launches_whose_padded_lengths_meet_name_their_own_kernels():
     assert all(len(found) == 2 for found in named.values()), named
 
 
+@pytest.mark.parametrize('target', ['sm90', 'sm100'])
+@pytest.mark.parametrize('name', ['qwen3.5-27b-gdn', 'kimi-linear-kda'])
+def test_a_plan_at_a_rings_depth_is_the_trace_at_that_depth(target, name):
+    """The template's plan of a call at tiles some stages deep (`Tiles.stages`), the call traced at one stage
+    and the launches whose ring is the tiles' planned again at that depth (`template._planned`,
+    `mainloop.Launch.deepened`), is the plan a trace at that depth records, every launch's shared memory,
+    ring, residency and registers among it: a forward's, a training forward's and a backward's, asked under
+    another target than the plan's (an A100's), whose facts a plan for this one reads none of."""
+    facts, ambient = generation.gpu_target(target), generation.gpu_target('sm80')
+    family = template.bundle(facts)
+    q, k, v, g, beta, _ = resource_operands(name, jnp.bfloat16, 1, 1024)
+    formed = {'rounded': False, 'wide': False, 'ranged': template.ranged(jnp.bfloat16, delta=True, bound=1.0)}
+    kinds = [{'backward': False, 'training_forward': False}, {'backward': False, 'training_forward': True},
+             {'backward': True, 'training_forward': False}]
+    for stages in (2, 3, 5):
+        tiles = mainloop.Tiles(32, stages, 128, chunk=64)
+        for kind in kinds:
+            with generation.assumed(ambient):
+                deepened = template._planned((q, k, v, g, beta, None, None), tiles, family, facts,
+                                             max_segments=None, delta=True, **formed, **kind)
+            traced = template.planned(q, k, v, g, beta, None, tiles=tiles, family=family, target=facts,
+                                      **formed, **kind)
+            assert deepened == traced, (stages, kind)
+
+
 @pytest.mark.parametrize('kernel', ['recurrence_scan', 'recurrence_states', 'recurrence_reverse'],
                          ids=['forward', 'training forward', 'backward'])
 def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
@@ -921,9 +1001,9 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
         report.refuse([(report._identity(template.MOSAIC, bound), first, {kernel})])
         stepped = template.MOSAIC.derived(bound, target)
         taken = template.MOSAIC.fits(bound, target)
-    assert stepped is not None and taken == (stepped,)
-    # The refused tiles' block or ring stepped down (`_staged` takes the next ring a refusal leaves).
-    assert (stepped.block_v, stepped.stages) < (first.block_v, first.stages)
+        legal = stepped is not None and template.MOSAIC.legal(bound, stepped, target)
+    # The call takes legal tiles other than the refused ones.
+    assert legal and stepped != first and taken == (stepped,)
 
 
 def test_a_refusal_under_the_remat_rung_reaches_the_route():
@@ -979,11 +1059,13 @@ def _model(launch: mainloop.Launch, family: mosaic.Family,
     `kernel_compile.decisions`): its stated registers (`Launch.registers`) at its consumer roles
     (`Launch.consumers`, a walk's `Tiles.walkers`), by the bundle it issues by (`Launch.family`; the solve
     launch's warpgroup MMA layout without a producer), `family` where it names none; its producer lowered as
-    its schedule lowers it (`Launch.producer`), bounded by the launch's shared-memory allocation."""
+    its schedule lowers it (`Launch.producer`), bounded by the launch's shared-memory allocation, and moving
+    registers where its plan's residency does (`Launch.resident`, `RegisterModel.moves`)."""
     facts = generation.gpu_target() if target is None else target
     with generation.assumed(facts):
         model = resources.register_model(launch.family or family, launch.consumers, launch.registers,
-                                         producer=launch.producer, shared=launch.shared, target=facts)
+                                         producer=launch.producer, shared=launch.shared, target=facts,
+                                         programs=launch.resident or 1)
     # The plan reserves an upper bound, including reduction scratch a lowering can omit.
     # `planned_failures` checks that bound; RegisterModel.shared declares an exact allocation.
     return dataclasses.replace(model, shared=None)
@@ -1003,7 +1085,7 @@ def _models(launches: tuple[mainloop.Launch, ...], family: mosaic.Family,
             raise ValueError(f"{launch.name} names incompatible launch layouts")
         combined[launch.name] = dataclasses.replace(
             previous, registers=max(previous.registers, launch.registers),
-            shared=max(previous.shared, launch.shared))
+            shared=max(previous.shared, launch.shared), resident=min(previous.resident, launch.resident))
     return {name: _model(launch, family, target) for name, launch in combined.items()}
 
 
@@ -1013,8 +1095,8 @@ class Unbudgeted(template.Mosaic):
     holds at its registers (`Launch.resident` zero) one program a multiprocessor, as it would hold were its
     registers held."""
 
-    def _held(self, ba, config) -> bool:
-        del ba, config
+    def _launches_hold(self, launches, family) -> bool:
+        del launches, family
         return True
 
     def states_held(self, ba, tiles, target, *, training: bool = False) -> int:
@@ -1072,17 +1154,23 @@ def _skipped(name: str, dtype) -> dict:
     return {'skip': jax.ShapeDtypeStruct((RESOURCE_SHAPES[name][1],), jnp.float32)}
 
 
-def _two_roles(name: str, bound, derived, family, facts, *, packed: bool) -> list:
+def _ran(tiles, *, training: bool):
+    """The tiles a product runs at: a training call's the derived ones, a forward without a gradient's its own
+    (`Tiles.forward`, the derived where None)."""
+    return tiles if training else tiles.forward or tiles
+
+
+def _two_roles(name: str, bound, derived, family, facts, *, packed: bool, training: bool) -> list:
     """The walks at two consumer roles a program (`Tiles.walkers`) as a gate case's tiles, which the
     derivation gives a call whose walks fill more than a wave and `RESOURCE_SHAPES` never do: a role's
     registers are its share of the program's; none where the family's walks take one role
     (`template.walk_roles`), packed documents', a value width of an odd number of blocks, or two roles' tiles
-    past the GPU's resources (`Mosaic._staged` None)."""
+    past the GPU's resources for the product, a training call's where `training` (`Mosaic._staged` None)."""
     value_width = RESOURCE_SHAPES[name][3]
     if template.walk_roles(family) < 2 or packed or value_width // derived.block_v % 2:
         return []
     two = template.MOSAIC._staged(bound, derived.block_v, facts, derived.chunk, walkers=2,
-                                  wide=derived.block_o or derived.block_v)
+                                  wide=derived.block_o or derived.block_v, training=training)
     return [] if two is None else [(two, 'two roles ')]
 
 
@@ -1138,8 +1226,8 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
             held = Unbudgeted().derived(bound, facts)
             # The tile the derivation takes where every register held, refused for its registers alone.
             unheld = [] if held is None or held == derived else [(held, 'refused ')]
-            if unheld and any(launch.shared > shared for launch in
-                              template.MOSAIC.launches(bound, held, facts, backward=training)):
+            if unheld and any(launch.shared > shared for launch in template.MOSAIC.launches(
+                    bound, _ran(held, training=training), facts, backward=training)):
                 unheld = []
             if derived is None and variant is not None:
                 return []
@@ -1149,11 +1237,12 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                 assert not template.MOSAIC.eligible(bound, facts)
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
                              kind=kind) for tiles, kind in unheld]
-            tiled = template.MOSAIC.variants(bound)
+            # The variants beside the derived tiles, whatever their order (`Mosaic.variants`).
+            others = [tiles for tiles in template.MOSAIC.variants(bound) if tiles != derived]
             if isinstance(variant, int):
-                assert len(tiled) - 1 <= NEIGHBOURS, f"{name} has {len(tiled) - 1} variants, past NEIGHBOURS"
+                assert len(others) <= NEIGHBOURS, f"{name} has {len(others)} variants, past NEIGHBOURS"
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
-                             kind='') for tiles in tiled[1:][variant:variant + 1]]
+                             kind='') for tiles in others[variant:variant + 1]]
             unwide = {key: value for key, value in _form(name, dtype).items() if key != 'wide'}
             if training and not template.backward_holds(
                     *args, tiles=derived, family=family, target=facts, starts=starts,
@@ -1168,20 +1257,18 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                     return []
                 return [case(name, dtype, args, starts, bound, derived, training=True, packed=packed,
                              kind='refused ')]
-        assert tiled[0] == derived, f"{name} on {target}: variants {tiled} lead with no {derived}"
-        derived_tiles = [(derived, '')]
-        walked = _two_roles(name, bound, derived, family, facts, packed=packed)
+        walked = _two_roles(name, bound, _ran(derived, training=training), family, facts, packed=packed,
+                            training=training)
         if variant == TWO_ROLES:
             return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
                     for tiles, kind in walked]
         # A training pass's two-role walks a group of their own (`TWO_ROLES`).
         walked = [] if training else walked
-        # A forward without a gradient at its own tiles (`Tiles.forward`), which no fast backward narrows.
-        alone = [] if training or derived.forward is None else [(derived.forward, 'alone ')]
         return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
-                for tiles, kind in derived_tiles + walked + alone + ([] if training else unheld)]
+                for tiles, kind in [(derived, ''), *walked, *([] if training else unheld)]]
 
     def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
+        tiles = _ran(tiles, training=training)
         _, value_heads, key_width, value_width, _ = RESOURCE_SHAPES[name]
 
         def array(*shape, kind=dtype):
@@ -1197,8 +1284,8 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
             held = not training or kind != 'two roles ' or template.backward_holds(
                 *args, tiles=tiles, family=family, target=facts, starts=starts,
                 **unwide, **_skipped(name, dtype))
-        if not held or kind in ('two roles ', 'alone '):
-            # Forced role counts and standalone forward tiles can include a launch the model refuses.
+        if not held or kind == 'two roles ':
+            # Forced role counts can include a launch the model refuses.
             # Its admitted neighbours still have to hold (`apart_failures`).
             unheld = {launch.name for launch in plans[label]
                       if launch.registers > _model(launch, family, facts).budget}
@@ -1326,6 +1413,44 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     assert not failed, "\n".join(failed)
 
 
+@lowers('sm100')
+@pytest.mark.parametrize('name', ['qwen3.5-27b-gdn', 'nemotron-h-4b-ssd'])
+def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blackwell(name):
+    """A geometry's 16-bit training at its derived tiles, compiled for a compile-only B200 over one row of
+    2048 tokens, so each persistent launch's programs walk several tiles (the gate's 256 tokens walk one): no
+    launch spills, and ptxas's least spill-free cap is within each launch's register model. Its producer at
+    24 registers, the walk's indices and addresses spilled once a program walked three tiles or more and
+    ptxas allocated the consumers past their live set around them (`mainloop.PERSISTENT_PRODUCER`, row 5693:
+    the 4B SSD's scores' gradient spilled 16 bytes at its 248 registers, its model 223)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    dtype, rows, length = jnp.bfloat16, 1, 2048
+    facts = generation.gpu_target('sm100')
+    family = template.bundle(facts)
+    args = resource_operands(name, dtype, rows, length)
+    bound = template.MOSAIC.bind(*args, None, max_segments=None, bound=None if name in RATED else 1.0,
+                                 **_form(name, dtype), **_skipped(name, dtype))
+    with generation.assumed(facts):
+        tiles = template.MOSAIC.derived(bound, facts)
+        models = _models(template.MOSAIC.launches(bound, tiles, facts, backward=True), family, facts)
+    # The output's and the final memory's cotangents.
+    cotangents = [jax.ShapeDtypeStruct(args[2].shape, dtype),
+                  jax.ShapeDtypeStruct(args[5].shape, jnp.float32)]
+    call = functools.partial(_gate_call, name, dtype, [*args, *cotangents], None, tiles, family,
+                             training=True)
+    (record,) = compile_mosaic_kernels([KernelCase(name, call, models)], 'sm100', least=True)
+    assert not mosaic_failures([record]), mosaic_failures([record])
+
+    def modelled(kernel) -> int:
+        # The model's registers in the allocator's steps of 8, as ptxas's least cap is stated.
+        return -(-models[kernel['kernel'].split('__')[0]].registers // 8) * 8
+
+    over = [(kernel['kernel'], kernel['least'], modelled(kernel)) for kernel in record['kernels']
+            if kernel['spilled'] or kernel['least'] is None or kernel['least'] > modelled(kernel)]
+    assert not over, over
+
+
 def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple[list, list]:
     """The gate's cases of `group` on `target` (`compiled_cases`) and their records, compiled, then, for as
     long as a required launch spills at a config not refused before, its launch refused
@@ -1390,25 +1515,6 @@ def test_a_packed_key_decay_training_call_checks_forward_and_recomputed_kernels(
     assert resource_failures([case], found, {label: launches}, apart) == []
 
 
-@COMPILES_ON_CPU
-@pytest.mark.parametrize('training', [False, True], ids=['forward', 'training'])
-def test_each_launchs_producer_lowers_its_registers_as_its_model_states_on_a_b200_spilling_none(training):
-    """The gated delta rule's 16-bit forward and training pass on a B200's tcgen05 bundle, compiled by Mosaic
-    on this CPU (`compiled_cases`): each launch's producer warpgroup lowers its registers in its PTX
-    (`setmaxnreg.dec`) to what its register model states (`RegisterModel.producer`, its plan's
-    `Launch.producer`), a launch's plan and its schedule one fact, and no kernel spills: the states, solve,
-    reverse walk's and the forward's one walk's producers spilled at the default 24 (52, 164, 40 and 52 bytes;
-    none from 40, 32, 72 and 80, jsf-pfloor-ab and armada 20261110172902-73ad9c43, row 5357), the states
-    launch planned at 48 and run at 24 (the promotion's review)."""
-    from kernel_compile import compile_mosaic_kernels
-
-    plans, apart = {}, {}
-    group = ('qwen3.5-27b-gdn', jnp.bfloat16, training, False, None)
-    cases = compiled_cases('sm100', plans, [], apart, only=group)
-    found = compile_mosaic_kernels(cases, 'sm100')
-    assert resource_failures(cases, found, plans, apart) == []
-
-
 FORKED_GATE = [(target, name, training) for target in ('sm80', 'sm90', 'sm100') for name in RESOURCE_SHAPES
                if name != 'a 192-wide value head' for training in (False, True)]
 """The forked gate's cases (`forked_case`): each scoreboard geometry's 16-bit forward and training pass over
@@ -1418,10 +1524,10 @@ a forked call on each family's bundle."""
 def forked_case(target: str, name: str, training: bool) -> tuple:
     """`name`'s 16-bit call over a forked call's three documents a row, entering a table of a given memory
     and two stored slots (`chunked_launch.Forked`), the gated delta net's with an entry write, at the
-    template's derived tiles on `target`, its forward or training pass as a gate case (`KernelCase`): its
-    operands laid from the chunks' edges and its table as the walks take it (`template.forked_laid`). Returns
-    the case (None where the template derives no tiles), the bound call, its tiles and the same call
-    unforked, bound."""
+    template's derived tiles on `target` (a forward alone at its own, `_ran`), its forward or training pass
+    as a gate case (`KernelCase`): its operands laid from the chunks' edges and its table as the walks take it
+    (`template.forked_laid`). Returns the case (None where the template derives no tiles), the bound call, its
+    derived tiles and the same call unforked, bound."""
     from fla_gdn_support import KernelCase
 
     facts = generation.gpu_target(target)
@@ -1457,12 +1563,12 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
             if training:
                 return mainloop_backward.gradients(q, k, v, g, beta, None, *rest, tiles=tiles, family=family,
                                                    forked=forked, skip=fused, **formed)
-            return chunk_forward.forward(q, k, v, g, beta, None, tiles=tiles, family=family, forked=forked,
-                                         skip=fused, **formed)
+            return chunk_forward.forward(q, k, v, g, beta, None, tiles=_ran(tiles, training=False),
+                                         family=family, forked=forked, skip=fused, **formed)
 
         return fn, (*laid, *tabled, *cotangents, *skip)
 
-    label = f"{name} bfloat16 {'training' if training else 'forward'} forked {tiles}"
+    label = f"{name} bfloat16 {'training' if training else 'forward'} forked {_ran(tiles, training=training)}"
     return KernelCase(label, call), bound, tiles, unforked
 
 

@@ -24,8 +24,8 @@ reference recorded, in the units of its margins (a quantizer's input over
 its block's amax, a top-k row over its largest finite magnitude), which the
 reference tool's NOISE, its seed rank's estimate, takes twice the largest of.
 
-The tests share the runs (`forward`, `updated`, `cached_run`,
-`vision_run`), `decided`, `selections` and the vision bundle from here.
+The tests share `unquantized`, `cached_run`, `vision_run` and the vision
+bundle from here.
 """
 
 from __future__ import annotations
@@ -47,23 +47,16 @@ from flax import linen as nn
 from flax.core import freeze
 from jax.experimental import io_callback
 from model_support import float64_twin
+from quantized_arms import QUANTIZERS
 from reference_error import distance
 
 from dew.interop import Pretrained
-from dew.nn.fake_quant import FakeQuantizing, fake_quant_fp4, fake_quant_fp8, straight_through
+from dew.nn.fake_quant import FakeQuantizing, straight_through
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 
 TINY = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf" / "deepseek-v41-tiny"
-
-
-# The release's three quantizer sites: FP8 over 32 channels under
-# power-of-two scales, FP4 over 16 under E4M3 scales, FP4 over 32 under
-# power-of-two scales.
-QUANTIZERS = {"window": lambda v: fake_quant_fp8(v, 32),
-              "entries": lambda v: fake_quant_fp4(v, 16, e4m3_scale=True),
-              "index": lambda v: fake_quant_fp4(v, 32, e4m3_scale=False)}
 
 
 def unquantized(model):
@@ -80,8 +73,10 @@ def forward(model, variables, ids):
     return jax.jit(lambda held, tokens: model.apply(held, tokens))(variables, ids)
 
 
-def loss_and_gradient(model, variables, ids):
-    """The next-token loss LMObjective reports and its gradient in the parameters."""
+def next_token_loss(model, variables, ids):
+    """The next-token loss LMObjective reports over `ids`, a function of the parameters: the one loss every
+    V4.1 step takes (`loss_and_gradient`, tests/deepseek_v41_support.py `training_step`,
+    tests/test_deepseek_v41.py's quantization-aware step)."""
     objective = LMObjective(model, ids.shape[1] - 1, variables=variables, ema_decay=None)
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
@@ -89,7 +84,12 @@ def loss_and_gradient(model, variables, ids):
         statistics, _ = objective.loss({**variables, "params": params}, {"text": ModelInputs(ids)}, step)
         return objective.reduce_loss(statistics)[0]
 
-    return jax.jit(jax.value_and_grad(loss))(variables["params"])
+    return loss
+
+
+def loss_and_gradient(model, variables, ids):
+    """The next-token loss LMObjective reports and its gradient in the parameters."""
+    return jax.jit(jax.value_and_grad(next_token_loss(model, variables, ids)))(variables["params"])
 
 
 def stepped(variables, gradient, rate):
