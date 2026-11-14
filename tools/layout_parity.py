@@ -360,6 +360,11 @@ def placed(batch, mesh):
     return jax.tree.map(put, batch, batch_shardings(mesh, batch))
 
 
+_DRAWN: list[tuple[object, list]] = []
+"""The last draws `zeros_drawn` made, by its key's data and the leaves it drew for, which every trace of
+one case's initializer (each arm's, the replay's, an abstract evaluation's) draws again alike."""
+
+
 def zeros_drawn(params, key):
     """`params` with every leaf its initializer left all zeros drawn from a
     normal of std 0.02 instead, each from its own fold of `key`.
@@ -370,22 +375,32 @@ def zeros_drawn(params, key):
     Every state of a comparison, the reference's, a layout's, a floor's and
     the fp64 anchor's, comes through here from one key, so they start alike.
 
-    `key` is concrete, and each draw runs eagerly even inside a trace
-    (`jax.ensure_compile_time_eval`), so an initializer holds the draws as
+    `key` is concrete, and the draws run eagerly even inside a trace
+    (`jax.ensure_compile_time_eval`), so an initializer holds them as
     constants: staged, a normal for every leaf made the initializer's compile
-    most of a cell's time (the UNet's 286 leaves, 187 s of its 302)."""
+    most of a cell's time (the UNet's 286 leaves, 187 s of its 302). They are
+    kept for the next trace of the same leaves (`_DRAWN`), where every trace of
+    the initializer (each arm's, the replay's, each abstract evaluation's) drew
+    them again (the UNet's draw cell, 1,430 normals, 38 s of its 166, row 4766).
+    Drawn in one program instead, they compiled for longer still."""
     import jax
     import jax.numpy as jnp
-
-    def draw(index, leaf):
-        if not jnp.issubdtype(leaf.dtype, jnp.floating):
-            return leaf
-        with jax.ensure_compile_time_eval():
-            drawn = (0.02 * jax.random.normal(jax.random.fold_in(key, index), leaf.shape)).astype(leaf.dtype)
-        return jnp.where(jnp.any(leaf != 0), leaf, drawn)
+    import numpy as np
 
     leaves, tree = jax.tree.flatten(params)
-    return jax.tree.unflatten(tree, [draw(index, leaf) for index, leaf in enumerate(leaves)])
+    floating = tuple((index, tuple(leaf.shape), jnp.dtype(leaf.dtype))
+                     for index, leaf in enumerate(leaves) if jnp.issubdtype(leaf.dtype, jnp.floating))
+    with jax.ensure_compile_time_eval():
+        # Drawn under the process's precision mode, which the normals' own dtype follows.
+        held = (np.asarray(jax.random.key_data(key)).tobytes(), floating, jax.config.jax_enable_x64)
+        if not _DRAWN or _DRAWN[0][0] != held:
+            normals = [0.02 * jax.random.normal(jax.random.fold_in(key, index), shape)
+                       for index, shape, _ in floating]
+            kept = [normal.astype(dtype) for normal, (_, _, dtype) in zip(normals, floating, strict=True)]
+            _DRAWN[:] = [(held, kept)]
+        drawn = dict(zip((index for index, _, _ in floating), _DRAWN[0][1], strict=True))
+    return jax.tree.unflatten(tree, [jnp.where(jnp.any(leaf != 0), leaf, drawn[index]) if index in drawn
+                                     else leaf for index, leaf in enumerate(leaves)])
 
 
 def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumulation: int = 1,
