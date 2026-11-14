@@ -339,8 +339,8 @@ class Passes:
     """Whether the algebra pass rewrites the programs Dew compiles (`dew.algebra.passes`), the GPU whose
     facts it prices them for (a `GpuTarget` name; None for the process's own), whether each template
     derivation's greedy extraction is held to the exact optimum (`checked`, the test suite's oracle,
-    `dew.algebra.extract.cheapest`), and the registered rule sets it leaves out (`without`, by name: a
-    receipt's arm without a set, docs/design/algebra.md §1.6)."""
+    `dew.algebra.extract.cheapest`), and the rule sets it leaves out (`without`, by name, each of
+    `dew.algebra.rules.nameable`: a receipt's arm, docs/design/algebra.md §1.6 and §6.4)."""
 
     on: bool = True
     target: str | None = None

@@ -642,6 +642,10 @@ class Rules:
 RULES: Mapping[str, Rules]                   # every registered set, by name
 def register(rules: Rules) -> None: ...
 def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]   # the sets numerics and a mode allow
+ARMS: Mapping[str, Rules]                    # a derivation's own sets a receipt's arm may leave out (carried)
+def armed(sets: Rules) -> Rules: ...         # registers one in ARMS
+def nameable() -> frozenset[str]: ...        # every registered non-dev set and each of ARMS
+def admits(sets: Rules) -> bool: ...         # whether the pass runs it: none an arm leaves out
 ```
 
 - A set's rules are egglog `rewrite`/`birewrite`/`rule` objects in its `ruleset`.
@@ -652,6 +656,13 @@ def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]   # the 
   numerics where it traces (`generation.numerics`, in JAX's trace context), so a program held across the two
   traces afresh.
 - At dev time every set is admitted, and the declared accuracy (§1.5) decides which forms extraction may take.
+- A set's measured receipt (§1.6) compares programs with the set and without it: a receipt's arm leaves sets
+  out (`passes(without=...)`, §6.7), any of `nameable()`: a registered set but a dev-time one, which runs at
+  dev time alone, and a derivation's own set where the derivation still makes a program without it
+  (`ARMS`: the carry split's, which then extracts its traced forms). A derivation's defining set (the
+  attention derivation's `decoupled`, a scan's identities) makes its program, which no arm has without it,
+  so no arm names it. Every set's saturation, a derivation's own among them, reads `admits`, and every
+  derivation keys on the sets left out (`derive.context`), so arms share no derivation.
 
 ### 6.5 Cost and extraction
 
@@ -832,11 +843,13 @@ class Passes:                         # dew._cache
     on: bool = True                   # the pass runs
     target: str | None = None         # the GpuTarget whose facts it prices for; None: the process's own
     checked: bool = False             # each derivation's greedy extraction held to the exact optimum
+    without: frozenset[str] = frozenset()   # the sets a receipt's arm leaves out (rules.nameable, §6.4)
 
 ALGEBRA = jax.make_user_context(default_value=Passes())   # dew._cache, in JAX's trace context
 
 @contextlib.contextmanager
-def passes(on: bool = True, target: str | None = None) -> Iterator[None]: ...   # sets ALGEBRA
+def passes(on: bool = True, target: str | None = None,
+           without: Collection[str] = ()) -> Iterator[None]: ...   # sets ALGEBRA; refuses a name not nameable
 
 @dataclass(frozen=True)
 class Rewrite:                        # one region's
