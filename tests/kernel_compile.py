@@ -703,9 +703,9 @@ def ptxas_notes(ptx: str, generation: str) -> str:
 
 def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
     """Each kernel's registers a thread and spilled bytes as the GPU compiles the PTX Mosaic printed into
-    `directory` (`_ptxas_text`, at its own entry), by its name and launch (`report.launch_name`), the most of each
-    under every CUDA build the gate judges the generation under (`assemblers`) and every build's notes: its
-    binary is its compile in this process, which may not be the GPU's (`RELOCATABLE`)."""
+    `directory` (`_ptxas_text`, at its own entry), by its name and launch (`report.launch_name`), the most of
+    each under every CUDA build the gate judges the generation under (`assemblers`) and every build's notes:
+    its binary is its compile in this process, which may not be the GPU's (`RELOCATABLE`)."""
     found = {}
     for path in Path(directory).glob("*.ptx"):
         reads = []
