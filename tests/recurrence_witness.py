@@ -369,33 +369,24 @@ SUB = recurrence_algebra.SUB
 def key_pairs(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
     """`algebra.key_block_pairs` `[C, C]` under a decay a key dimension, the pairs of sub-chunks before each
     row's (zero within it, `key_diagonal`'s): `sum_k r_ik k_jk exp2(E_ik - E_jk)` factored at row `i`'s
-    sub-chunk's first token `G_s` and key `j`'s last `E_t`, the rows gated down (`exp2(E_i - G_s)`) and by
-    the middle factor (`exp2(G_s - E_t)`), the keys up (`exp2(E_t - E_j)`), each an fp32 product taken as
-    its operand form (`operand`), the products' sum over every key block within one native sum's bound of
-    its terms (a key block's sum and its adds into the total, at most as many roundings as the width's
-    terms). The caller masks the lags."""
+    sub-chunk's first token `G_s`, the rows gated down (`exp2(E_i - G_s)`) and every earlier key up
+    (`exp2(G_s - E_j)`, `algebra.gated_up`), each an fp32 product taken as its operand form (`operand`), a
+    sub-chunk's rows against the keys before it one product over every key block, summed in one native
+    sum's bound of its terms (each pair one sub-chunk's product's; the others add its exact zeros)."""
     exact, bound = exponents.exact, exponents.bound
     size = np.shape(k)[0]
-    sub_of = np.arange(size) // SUB
-    firsts, lasts = sub_of * SUB, sub_of * SUB + SUB - 1
+    firsts = np.arange(size) // SUB * SUB
     down = between(exact, bound, exact[firsts], bound[firsts], lane)
-    gated = fp32(mul(rows, down), lane)
-    up = operand(fp32(mul(point(k), between(exact[lasts], bound[lasts], exact, bound, lane)), lane), lane,
-                 lane.pairing)
-    found = point(np.zeros((size, size)))
-    for t in range(size // SUB):
-        reached = sub_of > t
-        middle = between(exact[firsts], bound[firsts], exact[t * SUB + SUB - 1][None, :],
-                         bound[t * SUB + SUB - 1][None, :], lane)
-        middle = where(reached[:, None], middle, point(np.zeros(middle.lo.shape)))
-        left = operand(fp32(mul(gated, middle), lane), lane, lane.pairing)
-        columns = slice(t * SUB, (t + 1) * SUB)
-        # Each operand its pairing form (`operand`), the product over its parts' issued pairs.
-        product = dot(left, Iv(up.lo[columns].T, up.hi[columns].T), lane, FLOAT32,
+    gated = operand(fp32(mul(rows, down), lane), lane, lane.pairing)
+    lo, hi = np.zeros((size, size)), np.zeros((size, size))
+    for place in range(SUB, size, SUB):
+        up = between(exact[place][None, :], bound[place][None, :], exact[:place], bound[:place], lane)
+        keyed = operand(fp32(mul(point(np.asarray(k)[:place]), up), lane), lane, lane.pairing)
+        mine = slice(place, place + SUB)
+        product = dot(Iv(gated.lo[mine], gated.hi[mine]), Iv(keyed.lo.T, keyed.hi.T), lane, FLOAT32,
                       parts=(lane.pairing, lane.pairing))
-        found = Iv(np.concatenate([found.lo[:, :t * SUB], product.lo, found.lo[:, (t + 1) * SUB:]], 1),
-                   np.concatenate([found.hi[:, :t * SUB], product.hi, found.hi[:, (t + 1) * SUB:]], 1))
-    return found
+        lo[mine, :place], hi[mine, :place] = product.lo, product.hi
+    return Iv(lo, hi)
 
 
 def key_diagonal(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
@@ -454,11 +445,11 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
               np.broadcast_to(raised.hi[-1][:, None], step.carry.lo.shape))
     leaving = fp32(add(fused(mul(step.carry, held), lane), write), lane)
     factor = point(np.float32(scale))
-    scores = fp32(mul(pairs(point(step.q)), factor), lane)
-    # Each key block's scores scaled before their sum: one rounding a block more, at most the width's.
-    width = np.asarray(step.k).shape[-1]
-    slack = width * 2.0 ** -24 * np.maximum(np.abs(scores.lo), np.abs(scores.hi))
-    scores = staged(where(_lags(size) >= 0, outward(scores.lo - slack, scores.hi + slack), zeros), lane)
+    # The pairs of sub-chunks the scaled queries' (their sum held across the key blocks), each sub-chunk's
+    # own scaled once summed (`algebra.band_masked`).
+    crossed = key_pairs(fp32(mul(point(step.q), factor), lane), step.k, exponents, lane)
+    within = fp32(mul(key_diagonal(point(step.q), step.k, exponents, lane), factor), lane)
+    scores = staged(where(_lags(size) >= 0, where(own, within, crossed), zeros), lane)
     queries = staged(fp32(mul(fp32(mul(point(step.q), raised), lane), factor), lane), lane)
     left = Iv(np.concatenate([queries.lo, scores.lo], 1), np.concatenate([queries.hi, scores.hi], 1))
     right = point(np.concatenate([step.h, step.c], 0))

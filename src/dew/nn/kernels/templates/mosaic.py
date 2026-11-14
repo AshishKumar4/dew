@@ -691,6 +691,14 @@ class Walk:
     prologue: Callable | None = None
     segments: tuple = ()
     carry: object = ()
+    sums: tuple = ()
+    """The fp32 accumulators `(rows, columns)` its steps issue their products into (`Issuer.summed`'s
+    `into`), held across the steps by the family (`Family.walk`'s `shapes`: tcgen05's tensor memory, wgmma's
+    scoped accumulators, mma.sync's carried registers), zero as the walk starts, each step given them as its
+    `accumulators`."""
+    read: Callable | None = None
+    """Where given, run by the consumer after the last step with the walk's carry and its `sums` as the family
+    hands them back (`Issuer.read` takes each one's value): a walk's sums read and stored once."""
 
     def stepped(self) -> tuple:
         """Its segments, each step given its prologue's value, the prologue run here (in the consumer)."""
@@ -702,6 +710,8 @@ class Walk:
         """Its one step walked by a persistent tile's `walk(step, start, shapes)` (`Transport.persist`'s)."""
         if self.segments:
             raise ValueError("a persistent tile walks its one step, not segments of its own")
+        if self.sums or self.read is not None:
+            raise ValueError("a persistent tile's sums are its own accumulators (`Transport.persist`'s)")
         ((step, _, _),) = self.stepped()
         walk(step, self.carry, ())
 
@@ -1672,12 +1682,15 @@ class Transport[Allocated, Opened](abc.ABC):
     def run(self, allocated: Allocated, walk: Walk, interpret: bool, *, floor: int | None = None) -> None:
         """`walk` on a program's roles: the producer's loads of its views into `allocated`'s streams (opened
         here) where the family has one, lowered to `floor` (`roles`), and its consumer's walk of them, fed by
-        the producer or by its own loads (`fed`)."""
+        the producer or by its own loads (`fed`), its sums held across the walk and then read
+        (`Walk.sums`, `Walk.read`)."""
         streams = self.opened(allocated, walk.views)
 
         def consumer(wg):
-            self.walk(self.fed(streams, walk.views, 0, walk.steps, wg), walk.stepped(), walk.carry, (),
-                      interpret)
+            carry, sums = self.walk(self.fed(streams, walk.views, 0, walk.steps, wg), walk.stepped(),
+                                    walk.carry, walk.sums, interpret)
+            if walk.read is not None:
+                walk.read(carry, sums)
 
         self.scheduled(1, consumer, lambda: self.stream(streams, walk.views, 0, walk.steps), floor=floor)
 
