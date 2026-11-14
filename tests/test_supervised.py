@@ -17,6 +17,7 @@ from affine_run import BATCH, Affine, Counting, Replaying, dataset
 from flax import linen as nn
 from learning_gate import assert_learns
 from recording import RecordingTracker
+from scenario_contract import held_out_losses
 
 from dew.batch import VALID_ROWS
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
@@ -47,31 +48,23 @@ RUNS = 32
 gate's t threshold is 38.7, past what these runs' spread of initial losses reaches."""
 
 
-def learned(objective, optimizer, loader_of, held_out_of, steps: int, margin: float) -> np.ndarray:
-    """Each of RUNS independent runs' contrast for "training lowers the held-out loss by `margin` times":
-    the log of the loss before over the loss after, less the log of `margin`, on the run's own held-out
-    batch, each run from its own initialization key and data. A ratio's claim in logs, so a run's
-    initial loss scales none of it."""
-    contrasts = []
-    for run in range(RUNS):
-        trainer = Trainer(objective, optimizer, key=jax.random.key(run))
-        start = trainer.initial_state()
-        state = trainer.fit(loader_of(run), steps=steps, log_every=steps)
-        held_out = held_out_of(run)
-        before, _ = objective.scalar_loss(start.variables, held_out, STEP)
-        after, _ = objective.scalar_loss(state.variables, held_out, STEP)
-        contrasts.append(float(np.log(float(before) / float(after)) - np.log(margin)))
-    return np.asarray(contrasts)
+def cut(before: np.ndarray, after: np.ndarray, margin: float) -> np.ndarray:
+    """Each run's contrast for "training cuts the held-out loss by `margin` times": the log of its loss
+    before over its loss after, less the log of `margin`. A ratio's claim in logs, so a run's initial loss
+    scales none of it."""
+    return np.log(before / after) - np.log(margin)
 
 
 def test_a_plain_flax_model_trains_on_a_loss_function():
     """Over independent runs, each from its own key on its own data, sixty steps of Adam cut the affine
     model's held-out squared error to under a quarter (`assert_learns`)."""
     objective = Supervised(Affine(), squared, inputs=INPUTS)
-    drop = learned(objective, optax.adam(0.1),
-                   lambda run: dataset(train=lambda run=run: Replaying(lambda step: batch(seed=[run, step])),
-                                       batch=8),
-                   lambda run: batch(rows=256, seed=[run, 10_000]), steps=60, margin=4)
+    def loader(run):
+        return dataset(train=lambda: Replaying(lambda step: batch(seed=[run, step])), batch=8)
+
+    drop = cut(*held_out_losses(objective, optax.adam(0.1), loader,
+                                lambda run: batch(rows=256, seed=[run, 10_000]), runs=RUNS, steps=60),
+               margin=4)
     assert_learns(lambda runs: {"training cuts the held-out loss to a quarter": drop[runs]},
                   "a plain flax model", units=RUNS)
 
@@ -252,10 +245,12 @@ def test_the_autoencoders_evidence_bound_falls_over_independent_runs():
 
     config = autoencoder_experiment.run()
     objective = config.objective.build(model=config.model.build())
-    drop = learned(objective, config.optim.build(config.trainer.steps),
-                   lambda run: dataset(train=lambda run=run: Replaying(lambda step: points([run, step])),
-                                       batch=32),
-                   lambda run: points([run, 10_000], rows=256), steps=config.trainer.steps, margin=2)
+    def loader(run):
+        return dataset(train=lambda: Replaying(lambda step: points([run, step])), batch=32)
+
+    drop = cut(*held_out_losses(objective, config.optim.build(config.trainer.steps), loader,
+                                lambda run: points([run, 10_000], rows=256), runs=RUNS,
+                                steps=config.trainer.steps), margin=2)
     assert_learns(lambda runs: {"training halves the held-out evidence bound": drop[runs]},
                   "the autoencoder experiment", units=RUNS)
 
