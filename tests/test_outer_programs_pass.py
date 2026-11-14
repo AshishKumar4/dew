@@ -29,7 +29,7 @@ def passed():
         yield report.passes
 
 
-def added(passed, run) -> int:
+def passes_of(passed, run) -> int:
     """The passes `run` records, its own window of the test's."""
     before = len(passed())
     run()
@@ -47,7 +47,7 @@ def test_a_host_master_step_passes_each_of_its_phases_and_an_evaluation_its_prog
 
         def stepped():
             trainer.compile(state, batch)(state, batch)
-        return added(passed, stepped)
+        return passes_of(passed, stepped)
 
     on_host = compiled(Layout(min_shard=1, tolerance=1.0, host=("opt_state", "ema")))
     on_device = compiled(Layout(min_shard=1, tolerance=1.0))
@@ -56,7 +56,7 @@ def test_a_host_master_step_passes_each_of_its_phases_and_an_evaluation_its_prog
     state = trainer.initial_state()
     data = Loader(train=lambda partition: Counting(), val=lambda partition: val_batches()(), records=None,
                   batch=BATCH)
-    assert added(passed, lambda: Evaluation.run(trainer.objective, state.variables, data.val,
+    assert passes_of(passed, lambda: Evaluation.run(trainer.objective, state.variables, data.val,
                                                 metrics=(Spread([]),), key=0)) >= 1
 
 
@@ -70,7 +70,7 @@ def test_a_text_generation_and_an_rl_rollout_are_read_by_the_pass_unless_it_is_o
     with algebra.passes(on=False):
         TextGeneration(model, params, sampling=sampling)([[1, 2, 3]], 3, key=0)
     assert not passed()
-    assert added(passed, lambda: TextGeneration(model, params, sampling=sampling)([[1, 2, 3]], 3, key=0)) >= 1
+    assert passes_of(passed, lambda: TextGeneration(model, params, sampling=sampling)([[1, 2, 3]], 3, key=0)) >= 1
     rollout = RolloutScheduler.sampled(objective, lambda text, record: float(len(text) % 3), groups=2,
                                        max_new_tokens=4, sampling=sampling)
     state = Trainer(objective, optax.sgd(.01), key=jax.random.key(1)).initial_state()
@@ -79,4 +79,4 @@ def test_a_text_generation_and_an_rl_rollout_are_read_by_the_pass_unless_it_is_o
                "data_source": np.array([[97], [98]], np.int32),
                "ground_truth": np.array([[49], [50]], np.int32),
                "extra_info": np.zeros((2, 1), np.int32)}
-    assert added(passed, lambda: rollout(state, prompts, jax.random.key(3), objective=objective)) >= 1
+    assert passes_of(passed, lambda: rollout(state, prompts, jax.random.key(3), objective=objective)) >= 1
