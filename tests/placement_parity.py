@@ -26,7 +26,9 @@ def widened_start(trainer) -> object:
         return trainer.place()[0]
     with jax.enable_x64(new_val=False):
         start = trainer.place()[0]
-    return float64_held(start)
+    # Its keys and counters as they are: a floating leaf alone widens.
+    return jax.tree.map(lambda leaf: float64_held(leaf) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
+                        start)
 
 
 def floats(state) -> dict[str, np.ndarray]:
