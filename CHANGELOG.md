@@ -11,8 +11,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `HFAudio` in `dew.interop.encoders`, and `DiffusionConditioner`, `QwenImageConditioner`,
   `HiddenStatesConditioner` and `WanConditioner` in `dew.interop.conditioners`, each with its
   `from_pretrained`. `dew.inputs` still exports them by name, and its registry aliases (`clip_text`, `t5`,
-  `hf_audio`, `diffusion_text`, …) are unchanged; a record that named their earlier import paths under
-  `dew.inputs` reads as their new ones (`dew.registry.MOVED`). `dew.inputs` itself imports no interop.
+  `hf_audio`, `diffusion_text`, …) are unchanged. A saved record that named them under `dew.inputs` (a
+  run's record, a step's artifact, a data position) reads as naming their new paths
+  (`dew._records.MOVED_PATHS`), and a data position saved before the move resumes; an import path given
+  today names only the module it names. `dew.inputs` itself imports no interop.
 
 - A run whose data phases run other steps (`phase_passes`) plans and compiles each later phase's step on a
   thread of its own once its first step is dispatched, so the phase's boundary takes the executable

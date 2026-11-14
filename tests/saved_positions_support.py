@@ -1,10 +1,12 @@
-"""The chains whose positions a main saved under the plan version before this Dew's
-(`tools/positions_saved_by_main.py`, `tests/fixtures/positions`), each step declaring its identity or defined
-here, so an edit elsewhere in the tests leaves the positions resumable: phases on their own streams, a
-bounded mixture laid out and shuffled, a shuffled chain through a configured step taken to a bound, streamed
-and read into memory, and a seeded mix of two named corpora."""
+"""The chains whose positions a main saved (`tools/positions_saved_by_main.py`, `tests/fixtures/positions`),
+each step declaring its identity or defined here, so an edit elsewhere in the tests leaves the positions
+resumable: under the plan version before this Dew's, phases on their own streams, a bounded mixture laid out
+and shuffled, a shuffled chain through a configured step taken to a bound, streamed and read into memory,
+and a seeded mix of two named corpora; before the condition encoders moved to dew.interop (row 5996), phases
+and a mix whose steps depend on one (`Conditioned`)."""
 
 import dataclasses
+from collections.abc import Mapping
 
 import numpy as np
 from test_chain_compile import Tokens
@@ -80,8 +82,37 @@ def mixture():
     return compile(mix([named("a", 1), named("b", 2)], seed=4).batch(2), read="streamed", loading=READ)
 
 
+@dataclasses.dataclass(frozen=True)
+class Conditioned:
+    """A record step whose rows depend on a condition encoder, as a diffusion run's caption step's do
+    (`dew.inputs.InputSpec.dependencies`): its identity names the encoder's class by the path the saving Dew
+    imports it from, dew.inputs.encoders before row 5996 and dew.interop.encoders since. Each row as it is."""
+
+    def dependencies(self) -> Mapping[str, object]:
+        from dew.inputs import CLIPText
+        from dew.registry import import_path
+
+        return {"encoder": {"class": import_path(CLIPText), "fields": {"checkpoint": "saved"}}}
+
+    def __call__(self, row):
+        return row
+
+
+def conditioned_phases():
+    """`step_phases` with the first phase's rows through a step that depends on an encoder."""
+    return compile(phases((source(1).map(Conditioned()), 3), (source(2), None)), read="indexed", loading=READ)
+
+
+def conditioned_mixture():
+    """`mixture` with the first corpus's rows through a step that depends on an encoder: a member of a
+    streamed mix, kept by its digest."""
+    return compile(mix([named("a", 1).map(Conditioned()), named("b", 2)], seed=4).batch(2), read="streamed",
+                   loading=READ)
+
+
 SAVED = {"step_phases": (step_phases, 2), "step_phases_later": (step_phases, 5),
          "bounded_mixture_strided": (lambda: bounded_mixture("strided"), 2),
          "bounded_mixture_held": (lambda: bounded_mixture("held"), 3), "taken": (taken, 3),
-         "taken_in_memory": (lambda: taken(read="memory"), 3), "mixture": (mixture, 3)}
+         "taken_in_memory": (lambda: taken(read="memory"), 3), "mixture": (mixture, 3),
+         "conditioned_phases": (conditioned_phases, 5), "conditioned_mixture": (conditioned_mixture, 3)}
 """Each saved position's loader and the steps read before it was saved."""

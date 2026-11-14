@@ -22,7 +22,16 @@ import numpy as np
 from dew import _checkout
 from dew._hashing import array_header
 from dew._position import PER_SHARE, PlanChanged, unplaced
-from dew._records import ADDED, JSON, json_value, listed, moved_paths, record
+from dew._records import (
+    ADDED,
+    JSON,
+    earlier_spelling,
+    json_value,
+    listed,
+    moved_paths,
+    moved_spelling,
+    record,
+)
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 
@@ -135,7 +144,8 @@ def array_digest(dtype: np.dtype, shape: Sequence[int]) -> Digest:
 
 
 def fingerprint(value: JSON | Mapping[str, object] | np.ndarray) -> str:
-    """Hash order metadata, including an array's shape and dtype."""
+    """Hash order metadata, including an array's shape and dtype; a moved class by the path an earlier Dew
+    wrote (`dew._records.earlier_spelling`), so a digest a position saved before it moved is this one."""
     if isinstance(value, np.ndarray):
         digest = array_digest(value.dtype, value.shape)
         if value.dtype.hasobject:
@@ -143,7 +153,7 @@ def fingerprint(value: JSON | Mapping[str, object] | np.ndarray) -> str:
         else:
             digest.update(np.ascontiguousarray(value).tobytes())
         return digest.hexdigest()
-    return hashlib.sha256(_canonical(value)).hexdigest()
+    return hashlib.sha256(earlier_spelling(_canonical(value).decode()).encode()).hexdigest()
 
 
 def identified(value: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> bool:
@@ -569,7 +579,7 @@ def same_order(saved: str, current: str) -> bool:
     """Whether two orders, as a saved position and a stream state them in JSON, are one order:
     compared without their sources' descriptions, which name where a host mounted them, as a
     pool compares its processes' orders (`Plan.identity`)."""
-    return unplaced(json.loads(saved)) == unplaced(json.loads(current))
+    return unplaced(moved_paths(json.loads(saved))) == unplaced(json.loads(current))
 
 
 def described(order) -> JSON:
@@ -751,14 +761,17 @@ afresh."""
 def saved_identity(identity: str) -> str:
     """A plan's identity (`Plan.identity`) a position saved, as this Dew states it: one of 14 held its
     format's version among its parts, which no version this Dew reads tells rows apart by, so it is read
-    without it; any other as saved (a phases' position's finished phases, `dew.data.dataset.StepPhases`)."""
-    order, separator, parts = identity.rpartition(" under plan ")
+    without it; any other as saved (a phases' position's finished phases, `dew.data.dataset.StepPhases`);
+    a class an earlier Dew kept elsewhere by the path it has now (`moved_spelling`), its parts' digests
+    hashing the path it had (`fingerprint`)."""
+    moved = moved_spelling(identity)
+    order, separator, parts = moved.rpartition(" under plan ")
     try:
         held = json.loads(parts) if separator else None
     except json.JSONDecodeError:
-        return identity
+        return moved
     if not isinstance(held, dict) or "version" not in held:
-        return identity
+        return moved
     del held["version"]
     return f"{order}{separator}{json.dumps(held, sort_keys=True)}"
 
@@ -893,16 +906,16 @@ class Plan:
 
     def _compared(self, saved: Mapping[str, object], current: Mapping[str, JSON], resume: DataResume
                   ) -> tuple[str, ...]:
-        """`check` of all but the version and the rules, the changed environment and members returned."""
+        """`check` of all but the version and the rules, the changed environment and members returned; the
+        saved plan's classes by the paths they have now (`moved_paths`, row 5996)."""
+        saved = record(moved_paths(json_value(saved, "saved data plan")), "saved data plan")
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "relaxed":
             raise PlanChanged(
                 ("exact",),
                 "data plan contains a step without stable identity or a store given no name "
                 "(from_grain(..., identity=), from_iter(..., identity=)), which an exact resume cannot "
                 "check; name it, or resume relaxed (`data_resume='relaxed'`)")
-        # Its steps' identities name an encoder by the import path it has now (row 5996).
-        manifest = record(moved_paths(json_value(saved.get("manifest"), "saved data manifest")),
-                          "saved data manifest")
+        manifest = record(saved.get("manifest"), "saved data manifest")
         semantic = self.manifest.semantic()
         saved_steps = _identities(manifest.get("steps", []))
         # The saved order described, as this plan's is (`spelled_order`), whichever version recorded it.
