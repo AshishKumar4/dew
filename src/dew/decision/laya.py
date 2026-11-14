@@ -20,13 +20,13 @@ import numpy as np
 
 from dew import _records
 from dew._files import write_atomically
-from dew.config.release import RELEASE_FILE
 from dew.decision.calibration import Calibration, Temperatures
 from dew.decision.formats import beyond_temperatures
 from dew.decision.head import DecisionHead
 from dew.decision.layout import Layout, MarkerLayout, QuestionLayout
 from dew.decision.questions import KINDS
 from dew.interop.decoder_parts import Packed, layout_tensors, packed_layouts
+from dew.interop.release_record import RELEASE_FILE
 from dew.interop.releases import HeadFiles
 from dew.interop.safetensors_io import LazyTensors
 from dew.registry import from_record
