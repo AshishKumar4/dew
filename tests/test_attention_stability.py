@@ -34,7 +34,7 @@ import numpy as np
 import pytest
 from arm_arithmetic import Truth
 from attention_oracle import anchored_softmax, exact_attention
-from reference_error import as_given, assert_as_exact, widened, with_gradients
+from reference_error import as_given, assert_as_exact, assert_merges_no_ties, widened, with_gradients
 
 from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
@@ -1088,44 +1088,6 @@ def assert_finite(dew_fn, truth_fn, draw, label: str, *, seeds: int) -> None:
             lost = np.isfinite(rounded.astype(np.float32)) & ~np.isfinite(mine.astype(np.float32))
             assert not lost.any(), (f"{label}{jax.tree_util.keystr(path)} seed {seed}: {int(lost.sum())} "
                                     "values not finite where the truth's rounded to their dtype are")
-
-
-def _ulp(magnitude: np.ndarray, dtype) -> np.ndarray:
-    """The spacing of `dtype`'s values at each `magnitude` (a float64 array): its binade's, or its least
-    subnormal's below its normals (`jnp.finfo`, which knows bfloat16)."""
-    info = jnp.finfo(dtype)
-    exponent = np.frexp(np.maximum(magnitude, float(info.tiny)))[1]
-    return np.maximum(np.ldexp(1.0, exponent - 1 - info.nmant), float(info.smallest_subnormal))
-
-
-def assert_merges_no_ties(dew_fn, reference_fn, truth_fn, draw, label: str, *, seeds: int) -> None:
-    """The accurate form's ties (docs/design/testing.md, fast and accurate forms) over `seeds` draws: no group
-    of a leaf's entries `dew_fn` returns equal whose reference values (`reference_fn`'s) the reference keeps
-    apart, that is spread past twice the reference's own error over the group (its largest distance from
-    the float64 truth, `truth_fn` on the inputs widened: two entries each that far off may meet) and one
-    ulp more, the ulp of the group's largest magnitude in the leaf's dtype (each entry's rounding to its
-    dtype moves it at most half its own ulp, which is at most half that one)."""
-    truth_of = jax.jit(truth_fn)
-    for seed in range(seeds):
-        inputs = draw(seed)
-        with jax.enable_x64(new_val=True):
-            truth = jax.tree.leaves(truth_of(*widened(inputs)))
-        found = jax.tree_util.tree_leaves_with_path(dew_fn(*inputs))
-        theirs_all = jax.tree.leaves(reference_fn(*inputs))
-        for (path, mine), theirs, exact in zip(found, theirs_all, truth, strict=True):
-            dtype = np.asarray(mine).dtype
-            mine, theirs, exact = (np.asarray(x, np.float64).ravel() for x in (mine, theirs, exact))
-            finite = np.isfinite(mine) & np.isfinite(theirs) & np.isfinite(exact)
-            order = np.lexsort((theirs[finite], mine[finite]))
-            tied, kept, off = (x[finite][order] for x in (mine, theirs, np.abs(theirs - exact)))
-            starts = np.flatnonzero(np.concatenate([[True], tied[1:] != tied[:-1]]))
-            spread = np.maximum.reduceat(kept, starts) - np.minimum.reduceat(kept, starts)
-            largest = np.maximum.reduceat(np.abs(kept), starts)
-            ulp = _ulp(largest, dtype)
-            merged = spread > 2 * np.maximum.reduceat(off, starts) + ulp
-            assert not merged.any(), (f"{label}{jax.tree_util.keystr(path)} seed {seed}: {int(merged.sum())} "
-                                      "groups of equal values the reference keeps apart, the widest "
-                                      f"{float(np.max(spread[merged] / ulp[merged])):.0f} ulps")
 
 
 GPU_ONLY = {
