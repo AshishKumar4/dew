@@ -167,6 +167,30 @@ def test_a_rollout_samples_the_old_policy_and_normalizes_by_the_batchs_spread():
     assert_filled_batch_invariants(nft, filled_nft, corrupted, FilledBatch(4, real=False).map(three))
 
 
+def test_a_step_read_in_two_microbatches_trains_and_logs_its_reward():
+    """A step of sampled rows the trainer reads in two microbatches trains, and logs the reward it shows,
+    pooled over its rows, which a split step once refused (train 800's F2); a run whose rollout writes its
+    batches steps it whole."""
+    from recording import RecordingTracker
+
+    from dew.data.dataset import Loader
+
+    nft = objective(variables=nudged(objective().init(jax.random.key(20)), jax.random.key(22)))
+    prompts = nft.inputs.tokenize(PROMPTS)
+    sampled, initial, _ = fitted(nft, reward, prompts, groups=2, steps=3, train_steps=2)
+    batch = sampled(initial, prompts, jax.random.key(23), objective=nft)
+    tracker = RecordingTracker()
+    trainer = Trainer(nft, optax.sgd(1e-2), key=jax.random.key(21), split=2, tracker=tracker)
+    rows = len(batch["rewards"])
+    # The images the objective's inputs declare, which a step of sampled rows reads none of.
+    batch = {**batch, "image": np.zeros((rows, 4, 4, 1), np.float32)}
+    data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=rows, batch=rows)
+    final = trainer.fit(data, steps=1, log_every=1)
+    assert int(final.updates) == 1
+    logged = [scalars["train/reward"] for _, scalars in tracker.scalars if "train/reward" in scalars]
+    assert len(logged) == 1 and np.isfinite(logged[0])
+
+
 def test_the_released_decay_is_its_trainers_schedule():
     """The old policy's decay at the update after s completed ones is min(0.001 (s + 1), 0.5), the
     released trainer's decay_type 1 at the gradient steps taken (train_nft_sd3.py:169-189 and

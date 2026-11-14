@@ -64,7 +64,7 @@ from op_certificates import BFLOAT16, FLOAT16, FLOAT32
 
 from dew.nn.kernels import recurrence_algebra, tables
 from dew.nn.kernels.templates import product
-from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, template
+from dew.nn.kernels.templates.recurrence import chunk_forward, intra, mainloop, template
 
 LOG2E = recurrence_algebra.LOG2_E
 EXPONENT_BOUND = 2.0 ** -38
@@ -541,7 +541,7 @@ class Run:
     walked: bool
     """Whether it is the fused inference walk's (`walk_enclosures`), its records `WALKED`'s."""
     pairing: int
-    """The parts a factored pair's fp32 operand takes (`Lane.pairing`, `mainloop.pairing_parts`)."""
+    """The parts a factored pair's fp32 operand takes (`Lane.pairing`, `intra.pairing_parts`)."""
     tf32: Literal["plain", "rna", "read"]
     """How a one-part fp32 operand reaches its product (`Lane.tf32`): its family's issuer's, or plain where
     the launches were interpreted."""
@@ -757,7 +757,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                          for first, _ in table])
     return Run(**hosted_operands, a=chunked(a, chunk), w=chunked(w, key_width), h=memories, scale=scale,
                write=write, held=held, given=given, wide=bool(wide), walked=walked,
-               pairing=mainloop.pairing_parts(family, held),
+               pairing=intra.pairing_parts(family, held),
                tf32=tf32_conversion(family), trained=bool(trained),
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)

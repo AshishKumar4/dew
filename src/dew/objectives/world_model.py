@@ -242,7 +242,7 @@ class TokenizerObjective(Objective[Ratio]):
         tokenizer = self.model.bind(variables)
         stats = self.row_mean(jnp.square(tokenizer.decode(tokenizer.encode(video, masked=masked)) - video),
                               batch)
-        return stats, Aux({"mse": stats.mean()[0]})
+        return stats, Aux({"mse": stats})
 
 
 class Dynamics(nn.Module):
@@ -442,7 +442,7 @@ class WorldModelObjective(Objective[Ratio]):
         else:
             per_frame = diffusion_forcing_loss(f, clean, noise, jnp.floor(tau / d_min) * d_min, d_min)
         stats = self.row_mean(per_frame, batch)
-        return stats, Aux({"frame_loss": stats.mean()[0]})
+        return stats, Aux({"frame_loss": stats})
 
     def generate(self, variables: Variables, context: jax.Array, frames: int, key: jax.Array, *,
                  steps: int = 4, tau_ctx: float = 0.1, actions: jax.Array | None = None) -> jax.Array:
