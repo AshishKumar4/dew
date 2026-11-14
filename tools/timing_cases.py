@@ -23,6 +23,17 @@ run's step is, under the algebra pass with every registered rule set ("every") o
     {"builder": "tools/timing_cases.py:stepped", "cells": [{"case": "step lm-dense 4x1024"}],
      "arms": [{"name": "every", "implementation": "every"},
               {"name": "without linear", "implementation": "without linear"}]}
+
+A cell's `objective` trains the case's decoder by another objective (`benchmark_cases.Case`'s
+`decoder_objective`: "dpo", "grpo").
+
+`flowed`: a GPU model flow's program (tests/model_flows.py's `FLOWS`, its training step or decode loop) on
+the routes Dew takes for it on this GPU, compiled and run as Dew compiles a program, under every registered
+rule set or without one, as `stepped`'s arms.
+
+    {"builder": "tools/timing_cases.py:flowed", "cells": [{"flow": "delta attention (KDA)", "kind": "train"}],
+     "arms": [{"name": "every", "implementation": "every"},
+              {"name": "without linear", "implementation": "without linear"}]}
 """
 import atexit
 import contextlib
@@ -128,8 +139,9 @@ def stepped(cell: dict, implementation: str) -> tuple:
 
     from dew.algebra.program import passes
 
-    without = () if implementation == "every" else (implementation.removeprefix("without "),)
-    case = Case(**STEP_CASES[cell["case"]])
+    without = _left_out(implementation)
+    objective = {"decoder_objective": cell["objective"]} if "objective" in cell else {}
+    case = Case(**STEP_CASES[cell["case"]], **objective)
     placed = contextlib.ExitStack()
     with passes(without=without):
         step = placed.enter_context(compiled_step(case, build_trainer(case), fixed_batch=True))
@@ -145,3 +157,37 @@ def stepped(cell: dict, implementation: str) -> tuple:
     atexit.register(placed.close)
     jax.block_until_ready(call())
     return call, lambda index: ()
+
+
+def _left_out(implementation: str) -> tuple[str, ...]:
+    """An arm's sets left out: none for "every", else the one "without <set>" names."""
+    return () if implementation == "every" else (implementation.removeprefix("without "),)
+
+
+def flowed(cell: dict, implementation: str) -> tuple:
+    """`cell["flow"]`'s program of `cell["kind"]` (tests/model_flows.py: its training step or its decode
+    loop, Dew's arm), on the routes Dew takes for it on this GPU, compiled on it as Dew compiles a program
+    (`dew.nn.kernels.options.program`), under the algebra pass with every registered rule set
+    (`implementation` "every") or without the one it names ("without <set>"), and its first draw of inputs
+    (`Flow.draw`). The pass acts as the program traces, so every call holds its switch."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+    import model_flows
+
+    from dew.algebra.program import passes
+    from dew.nn.kernels.options import program
+
+    flow, without = model_flows.flow_named(cell["flow"]), _left_out(implementation)
+    flat, _ = model_flows.programs_of(flow)[f"{cell['kind']} dew"]
+    params, ids = flow.draw(0)
+    inputs = jax.device_put((*jax.tree.leaves(params), ids))
+    compiled = program(flat)
+
+    def call(*arguments):
+        with passes(without=without):
+            return compiled(*arguments)
+
+    jax.block_until_ready(call(*inputs))
+    return call, lambda index: inputs
