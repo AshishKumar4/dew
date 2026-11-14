@@ -112,9 +112,9 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
     again: its key holds the links' measured figures (`dew.nn.sharding.trace_context`) and not the links
     its last compile decided, which keyed every refit on a tensor- or sequence-split mesh apart from the
     fit before it (row 6022); the kept step's spreads are its trace's (`Candidate.spread`)."""
+    import jax.monitoring
     import numpy as np
 
-    import dew.training._candidates as candidates
     from dew.data.dataset import Loader
     from dew.optim import OptimConfig
     from dew.training import MeshSpec, Trainer
@@ -125,15 +125,28 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
                       mesh=MeshSpec(fsdp=2, sequence=2))
     rows = {"text": np.random.default_rng(0).integers(0, 8, size=(4, 17)).astype(np.int32)}
 
-    def fit():
+    traced = []
+
+    def heard(event: str, seconds: float, **_) -> None:
+        if event == "/jax/core/compile/jaxpr_trace_duration":
+            traced.append(seconds)
+
+    jax.monitoring.register_event_duration_secs_listener(heard)
+
+    def fit() -> tuple[dict, int]:
+        """The links the fit's step decided, and the programs JAX traced for it."""
+        before = len(traced)
         data = Loader(train=lambda partition: iter([rows] * 4), val=None, records=None, batch=4)
         trainer.fit(data, steps=2)
-        return dict(trainer.links)
+        return dict(trainer.links), len(traced) - before
 
-    first = fit()
-    # The steps this process keeps for a refit to read (`candidate_for`): the refit keeps none of its own.
-    kept = set(candidates._CANDIDATES)
-    again = fit()
-    assert kept and set(candidates._CANDIDATES) <= kept
+    try:
+        first, tracing = fit()
+        again, retracing = fit()
+    finally:
+        jax.monitoring.unregister_event_duration_listener(heard)
+    # The step, its plan's candidates and their lowering are traced once; a refit traces what it reads afresh
+    # alone, its batches' placement and its evaluation, a small part of it.
+    assert retracing < tracing / 4, (tracing, retracing)  # measuring
     assert {axis: link.spread for axis, link in again.items()} == {
         axis: link.spread for axis, link in first.items()}
