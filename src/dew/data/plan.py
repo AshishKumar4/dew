@@ -368,7 +368,24 @@ def _described(value) -> tuple[JSON, bool]:
     return {"text": re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))}, False
 
 
-_ENVIRONMENT = ("revision", "lock", "python", "platform", "clean")
+@dataclasses.dataclass(frozen=True)
+class _Environment:
+    """The code and machine this process runs, as a manifest and a checkpoint step record them
+    (`running_environment`, `Manifest.of`)."""
+
+    revision: str
+    lock: str
+    python: str
+    platform: str
+    clean: bool
+
+    @classmethod
+    def now(cls) -> _Environment:
+        (revision, clean), lock = checkout_now(), _locked()
+        return cls(revision, lock, platform.python_version(), platform.platform(), clean)
+
+
+_ENVIRONMENT = tuple(field.name for field in dataclasses.fields(_Environment))
 
 
 def _changed(saved: Mapping[str, object], current: Mapping[str, object]) -> tuple[str, ...]:
@@ -426,9 +443,7 @@ def running_environment() -> dict[str, JSON]:
     its checkout is clean, its lock, the interpreter and the platform. A checkpoint step records it beside
     its data position (`dew.checkpoints`), which holds what decides the rows alone, and a resume warns where
     it changed (row 5862)."""
-    (revision, clean), lock = checkout_now(), _locked()
-    return {"revision": revision, "lock": lock, "python": platform.python_version(),
-            "platform": platform.platform(), "clean": clean}
+    return dataclasses.asdict(_Environment.now())
 
 
 @functools.cache
@@ -483,20 +498,24 @@ class Manifest:
         ran: Sequence[StepIdentity] = (),
         fill: Mapping[str, object] | None = None,
     ) -> Manifest:
-        (revision, clean), lock = checkout_now(), _locked()
+        """The manifest of `source` through `steps`, under this process's code and machine
+        (`running_environment`)."""
+        environment = _Environment.now()
         return cls(
             source,
             tuple(steps),
             tuple(ran),
-            revision=revision,
-            lock=lock,
+            revision=environment.revision,
+            lock=environment.lock,
+            python=environment.python,
+            platform=environment.platform,
             fill={} if fill is None else fill,
             tokenizer={
                 f"{index}/{step.name}": step.dependencies
                 for index, step in enumerate(steps)
                 if step.dependencies
             },
-            clean=clean,
+            clean=environment.clean,
         )
 
     def record(self) -> dict[str, JSON]:
@@ -746,9 +765,9 @@ def saved_identity(identity: str) -> str:
 
 
 def read_by(version: int) -> int:
-    """The version a read of a run saved under `version` reads by, this Dew's, refused where this Dew reads
-    none of it (`PLAN_VERSIONS`): what every read (`dew.data.compile`'s `compile`, `iterate` and `publish`)
-    asks before it prepares anything."""
+    """The version a run saved under `version` reads by, this Dew's, refused where this Dew reads none of it
+    (`PLAN_VERSIONS`): what a run asks before its data compiles (`dew.config.RunConfig.compiled`), the one
+    place a version is refused."""
     if version not in PLAN_VERSIONS:
         raise PlanChanged(("version",), f"this Dew reads data plans by version "
                                         f"{', '.join(map(str, PLAN_VERSIONS))}, not {version}: {_RESUMED}")
