@@ -7,7 +7,6 @@ import json
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from flax import linen as nn
 
 from dew.artifacts import Representations
@@ -25,11 +24,14 @@ class Affine(nn.Module):
 
 
 class Regression(Objective):
-    """Squared error of an affine map against `2 * x[:, :2]`."""
+    """Squared error of an affine map against `2 * x[:, :2]`, its trace keyed by what it reads (`traced`, its
+    EMA's constant decay), so a refit in the same process reads the step an equal one traced (row 3873)."""
+
+    traced = ("probe",)
 
     def __init__(self, ema_decay=0.5, *, probe=True):
         self.model = Affine()
-        self.ema = EMASpec(decay=optax.constant_schedule(ema_decay))
+        self.ema = EMASpec.constant(ema_decay)
         self.probe = probe
 
     def fresh_variables(self, key, held):
