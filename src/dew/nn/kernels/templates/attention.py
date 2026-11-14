@@ -742,16 +742,19 @@ class Capped(tuning.FieldHook):
 
 @dataclasses.dataclass(frozen=True)
 class Biased(tuning.FieldHook):
-    """`score_mod`'s logits (the scaled logits where None) plus a bias as a score hook, its parameter the
-    tile's keys' `[1, k]` (a `Kind.KEY` one: ALiBi's slope times each key's place) or its entries' `[q, k]` (a
-    `Kind.TILE` one: a dense bias), added after a softcap as `reference_attention` adds its bias: equal for
-    equal inner hooks (`Capped`); its call reads its inner hook alone (`tuning.FieldHook`)."""
+    """`score_mod`'s logits (the scaled logits where None) plus a bias as a score hook, its parameters the
+    bias's terms: the tile's keys' `[1, k]` (a `Kind.KEY` one: ALiBi's slope times each key's place), its
+    entries' `[q, k]` (a `Kind.TILE` one: a dense bias), or its queries' `[q, 1]` and keys' `[1, k]` (a
+    `Kind.QUERY` and a `Kind.KEY` one: `dew.nn.attention.SeparableBias`, FoX's prefix at the query less the
+    key's). The terms are summed before the logits take them, so a logit adds their difference and not each
+    one's magnitude, after a softcap as `reference_attention` adds its bias: equal for equal inner hooks
+    (`Capped`); its call reads its inner hook alone (`tuning.FieldHook`)."""
 
     score_mod: Callable | None = None
 
-    def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array, bias: jax.Array) -> jax.Array:
+    def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array, *terms: jax.Array) -> jax.Array:
         capped = logits if self.score_mod is None else self.score_mod(logits, q_pos, k_pos)
-        return capped + bias
+        return capped + functools.reduce(operator.add, terms)
 
 
 @dataclasses.dataclass(frozen=True)
