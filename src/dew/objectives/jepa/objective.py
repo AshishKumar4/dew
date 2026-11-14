@@ -38,6 +38,7 @@ from dew.inference.models import ReleasesModel
 from dew.inputs import Field, InputSpec, unit_range
 from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites
 from dew.nn.inspection import INSPECTED
+from dew.nn.norms import LayerNorm
 from dew.nn.precision import accumulated, at_least_fp32
 from dew.nn.protocols import StagedStacks
 from dew.nn.sharding import explicit_spec, whole_spec
@@ -93,8 +94,8 @@ def normalize_targets(x: jax.Array, epsilon: float = 1e-5) -> jax.Array:
     prediction problem keeps a fixed scale as the encoder drifts, and
     shrinking the representation does not lower the loss.
     """
-    normalized = nn.LayerNorm(epsilon=epsilon, use_scale=False, use_bias=False,
-                              use_fast_variance=False).apply({}, x)
+    normalized = LayerNorm(epsilon=epsilon, use_scale=False, use_bias=False,
+                           use_fast_variance=False).apply({}, x)
     # `mutable` is unset, so apply returns the output alone, not a pair.
     assert not isinstance(normalized, tuple)
     return normalized
