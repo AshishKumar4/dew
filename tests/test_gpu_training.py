@@ -18,6 +18,8 @@ directory, rung records and data cache of its own:
 - A program on this GPU is admitted against the room its pool left outside XLA's pool (test_communicators).
 - A program loaded from the compilation cache is admitted from its kept communicators (test_communicators).
 - A staged commit holds two layers of host-resident moments at once (test_staging).
+- A convolution trained under quantized gradients and served quantized computes Qwix's own integer products,
+  taken in float32 chunks on a GPU (test_quantization).
 """
 
 import dataclasses
@@ -27,6 +29,7 @@ import pytest
 import test_communicators as communicators
 import test_compile_ahead as compile_ahead
 import test_plan as plan
+import test_quantization as quantization
 import test_run_option_matrix as run_option_matrix
 import test_staging as staging
 import test_trainer as trainer
@@ -89,6 +92,8 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
              in_own(admitted, "admitted")),
         Cell("a program loaded from the compilation cache is admitted from its kept communicators",
              in_own(loaded, "loaded")),
+        Cell("a quantized convolution trains and serves on this GPU as Qwix computes it on the CPU",
+             quantization.a_quantized_convolution_trains_and_serves_on_this_gpu_as_qwix_computes_it_on_the_cpu),
         Cell("a staged commit holds two layers of host-resident moments at once",
              in_own(staging.a_staged_commit_holds_two_layers_of_host_resident_moments_at_once, "staged")),
         # A fast form is a fast kernel on sm90 alone: on sm80 the default route computes IEEE fp32.
