@@ -45,7 +45,7 @@ from dew.distributed.batches import (
 )
 from dew.distributed.placement import Layout, MeshSpec, Placement
 from dew.nn.kernels.options import program, shapes_of
-from dew.nn.sharding import Link, measured_links, pipeline_microbatches
+from dew.nn.sharding import Link, boxed, measured_links, pipeline_microbatches, placing
 from dew.objectives.base import Effects, Loss, Metric, Objective, Ratio, Shown, Step, TrainingScalar, Weighted
 from dew.objectives.passes import PassReports
 from dew.scores import Summary, recorded_name
@@ -1116,10 +1116,12 @@ class Evaluator[L, E]:
 
     @contextlib.contextmanager
     def scoring(self, links: Mapping[str, Link]) -> Iterator[None]:
-        """The rules an evaluation traces its programs under: the microbatch count, the layout's rules and
-        the mesh's links (`evaluate`, `warmed_ahead`)."""
+        """The rules an evaluation traces its programs under: the microbatch count, the layout's rules, the
+        mesh's links and the layout with the axes the modules declared (`placing`, `boxed`), as a step traces
+        (`Trainer._traced_on`) (`evaluate`, `warmed_ahead`)."""
         with (pipeline_microbatches(self.microbatches),
-              nn.logical_axis_rules(self.layout.axis_rules), measured_links(links)):
+              nn.logical_axis_rules(self.layout.axis_rules), measured_links(links),
+              boxed(self.objective.parameter_axes), placing(self.layout)):
             yield
 
     def evaluation(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState],
