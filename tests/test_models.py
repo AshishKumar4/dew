@@ -667,6 +667,25 @@ def test_group_norm_is_flax_s(rng, dtype, shape):
                     f"group norm {dtype} {shape}", seeds=GROUP_NORM_SEEDS, truth_fn=truth)
 
 
+def offset_draw(shape):
+    """Check 1's draw for a norm over `shape`: activations a hundred from zero at a spread of one, where
+    E[x^2] - E[x]^2 cancels in fp32, a scale and bias about the initial ones, and a cotangent."""
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 4)
+        return (np.asarray(jax.random.normal(keys[0], shape, jnp.float32) + 100.0),
+                np.asarray(1.0 + 0.1 * jax.random.normal(keys[1], shape[-1:], jnp.float32)),
+                np.asarray(0.1 * jax.random.normal(keys[2], shape[-1:], jnp.float32)),
+                np.asarray(jax.random.normal(keys[3], shape, jnp.float32)))
+    return draw
+
+
+def normalized(module):
+    """A norm `module`'s output and its gradients along a cotangent, of its input, scale and bias."""
+    def apply(x, scale, bias):
+        return module.apply({"params": {"scale": scale, "bias": bias}}, x)
+    return with_gradients(apply)
+
+
 OFFSET_GROUP_NORM_SEEDS = 64
 """The offset group norm's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
 
@@ -680,26 +699,34 @@ def test_group_norm_is_as_exact_as_torch_s_where_a_group_s_mean_dwarfs_its_sprea
 
     shape, groups = (2, 4, 4, 16), 4
 
-    def draw(seed):
-        """Activations a hundred from zero at a spread of one, a scale and bias about the initial ones,
-        and a cotangent."""
-        keys = jax.random.split(jax.random.key(seed), 4)
-        return (np.asarray(jax.random.normal(keys[0], shape, jnp.float32) + 100.0),
-                np.asarray(1.0 + 0.1 * jax.random.normal(keys[1], shape[-1:], jnp.float32)),
-                np.asarray(0.1 * jax.random.normal(keys[2], shape[-1:], jnp.float32)),
-                np.asarray(jax.random.normal(keys[3], shape, jnp.float32)))
-
-    def normalized(module):
-        def apply(x, scale, bias):
-            return module.apply({"params": {"scale": scale, "bias": bias}}, x)
-        return with_gradients(apply)
-
     def torch_s(x, scale, bias):
         return torch.nn.functional.group_norm(x.movedim(-1, 1), groups, scale, bias, eps=1e-6).movedim(1, -1)
 
     assert_as_exact(normalized(GroupNorm(groups, epsilon=1e-6)), torch_with_gradients(torch_s),
-                    draw, "offset group norm", seeds=OFFSET_GROUP_NORM_SEEDS,
+                    offset_draw(shape), "offset group norm", seeds=OFFSET_GROUP_NORM_SEEDS,
                     truth_fn=normalized(nn.GroupNorm(groups, epsilon=1e-6, dtype=jnp.float64)))
+
+
+OFFSET_LAYER_NORM_SEEDS = 64
+"""The offset layer norm's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada
+(cfbb134bf)."""
+
+
+def test_a_layer_norms_variance_is_its_centered_mean_square():
+    """A layer's variance is its centered mean square, as torch's LayerNorm takes it (`dew.nn.norms.
+    LayerNorm`): over activations a hundred from zero at a spread of one, where E[x^2] - E[x]^2 cancels in
+    fp32, the forward and the gradients of the input, scale and bias along a drawn cotangent are on par
+    (check 1) with torch's float32 LayerNorm from flax's in float64 (row 5907)."""
+    import torch
+
+    shape = (2, 6, 16)
+
+    def torch_s(x, scale, bias):
+        return torch.nn.functional.layer_norm(x, shape[-1:], scale, bias, eps=1e-5)
+
+    assert_as_exact(normalized(LayerNorm(epsilon=1e-5)), torch_with_gradients(torch_s), offset_draw(shape),
+                    "offset layer norm", seeds=OFFSET_LAYER_NORM_SEEDS,
+                    truth_fn=normalized(nn.LayerNorm(epsilon=1e-5, dtype=jnp.float64)))
 
 
 def test_a_group_norm_narrower_than_its_input_normalizes_at_its_own_width(rng):
@@ -762,8 +789,8 @@ def test_every_production_layer_norm_is_dews_rematerialized_one():
 @pytest.mark.parametrize('use_scale,use_bias', [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize('dtype', [None, jnp.bfloat16, jnp.float32])
 def test_layer_norm_is_flax_s_keeping_only_its_input_for_the_backward(rng, use_scale, use_bias, dtype):
-    """`dew.nn.norms.LayerNorm` is flax's `nn.LayerNorm` under `nn.remat` saving nothing: the
-    same parameter tree and auto-named scope; its output and the gradients of its input and
+    """`dew.nn.norms.LayerNorm` is flax's `nn.LayerNorm` under `nn.remat` saving nothing, its variance
+    centered: the same parameter tree and auto-named scope; its output and the gradients of its input and
     parameters as near float64 over drawn inputs and parameters as flax's own (check 1); and its
     pullback holds the input as it arrived, no wider copy of the activations."""
     x = jax.random.normal(rng, (2, 6, 16), jnp.float32)

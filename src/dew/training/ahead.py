@@ -65,7 +65,7 @@ from jaxlib import xla_client
 
 from dew import communicators
 from dew._cache import cuda_libraries, plugin_builds, topology_digest, uncached
-from dew._devices import COMPILE_ONLY_MEMORY, device_limit
+from dew._devices import COMPILE_ONLY_MEMORY, device_memory
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.nn.kernels import options
@@ -166,13 +166,36 @@ def compile_only_gpus(generation: str, count: int = 1, memory: int | None = None
     compiled for these devices reads the allocator's limit derived from it (`dew._devices.allocator_limit`,
     `COMPILE_ONLY_MEMORY`), as the GPU's own allocator states it. Absent it, the devices state no memory: a
     step is compiled ahead for them only where it is stated (`compile_ahead`)."""
-    if memory is not None and memory <= 0:
-        raise ValueError(f"a GPU states a positive count of bytes, not {memory}")
+    if memory is not None:
+        _positive(memory)
     stated = built_target(generation, multiprocessors).multiprocessors
     devices = _compile_only_gpus(generation, count, memory, stated)
     if memory is not None:
         COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
     return devices
+
+
+@contextlib.contextmanager
+def stand_in_gpus(devices: Sequence, memory: int) -> Iterator[tuple]:
+    """`devices`, a host's own CPU devices (`jax.devices("cpu")`), each stated to hold a GPU's `memory`, its
+    total bytes as the GPU states them, while the block runs: every layout check and admission on them reads
+    the allocator's limit derived from it (`dew._devices.allocator_limit`, `COMPILE_ONLY_MEMORY`), as
+    `compile_only_gpus`' do, where JAX's CUDA plugin, which those need, does not install. `Trainer.validate`
+    checks a run's layout on them against the GPUs' limits; a program compiles for the CPU."""
+    _positive(memory)
+    devices = tuple(devices)
+    COMPILE_ONLY_MEMORY.update(dict.fromkeys(devices, memory))
+    try:
+        yield devices
+    finally:
+        for device in devices:
+            del COMPILE_ONLY_MEMORY[device]
+
+
+def _positive(memory: int) -> None:
+    """Refuse a GPU's stated memory that is not a positive count of bytes."""
+    if memory <= 0:
+        raise ValueError(f"a GPU states a positive count of bytes, not {memory}")
 
 
 @functools.cache
@@ -583,7 +606,7 @@ class BuildTarget:
     @staticmethod
     def of(devices: Sequence) -> BuildTarget:
         """The target `devices` are, each by its own facts whatever `assumed` says (`device_target`), the
-        least allocator limit among them its memory where they state one (`device_limit`: an attached
+        least allocator limit among them its memory where they state one (`device_memory`: an attached
         device's own, a compile-only GPU's derived from its stated memory), a CPU's with its host's
         processor (`host_cpu`), under this process's JAX, XLA flags and host; refused where they are not
         all of one generation and multiprocessors."""
@@ -591,7 +614,8 @@ class BuildTarget:
         if len(found) != 1:
             raise ValueError(f"these devices are of several targets, {sorted(found, key=str)}: programs "
                              "compiled ahead load onto devices of one")
-        limits = [limit for device in devices if (limit := device_limit(device)) is not None]
+        limits = [limit for device in devices
+                  if (limit := device_memory(device).get("bytes_limit")) is not None]
         own = device_target(devices[0])
         # No topology: the attached GPUs' serialization differs call to call (`topology`).
         built = BuildTarget.built(own, len(devices), min(limits, default=None))
@@ -968,9 +992,7 @@ class AheadTarget:
     topology: str | None = None
     """A host's own serialized GPU topology (`host_gpus`), which states the GPUs it compiles for whole:
     their memory and multiprocessors, so it sets neither `capacity_gib` nor `multiprocessors`. A dew-ops
-    prepare is handed its node's ($DEW_NODE_TOPOLOGY), so its compiles key the cache the node's run reads.
-    With it, `capacity_gib` states the bytes the run's plan is admitted to on each GPU (the pool XLA's
-    allocator holds there), which the topology's own memory does not."""
+    prepare is handed its node's ($DEW_NODE_TOPOLOGY), so its compiles key the cache the node's run reads."""
     phases: tuple[int, ...] = ()
     """The run's data phases whose steps are compiled in place of the first's, each over a batch of its own
     (`phase_batch`), into the run's persistent compilation cache, where that phase's first compile in the
@@ -986,8 +1008,9 @@ class AheadTarget:
         `topology` (`host_gpus`), the TPU topology's, which must hold `devices`, or `devices` GPUs of the
         generation at the stated capacity."""
         if self.topology is not None:
-            if self.multiprocessors is not None:
-                raise ValueError("a host's topology states its GPUs' multiprocessors; set none with it")
+            if self.multiprocessors is not None or self.capacity_gib is not None:
+                raise ValueError("a host's topology states its GPUs' memory and multiprocessors; set neither "
+                                 "capacity_gib nor multiprocessors with it")
             return host_gpus(self.generation, self.topology, self.devices)
         if ":" not in self.generation:
             return compile_only_gpus(self.generation, self.devices, self.memory, self.multiprocessors)
@@ -1037,11 +1060,11 @@ class AheadTarget:
 
 def stated_limit(devices: Sequence) -> int | None:
     """The allocator's limit a step compiled ahead for `devices` is planned against: the least their stated
-    memory gives (`device_limit`); None for a TPU topology's, which states its own. Compile-only GPUs that
+    memory gives (`device_memory`); None for a TPU topology's, which states its own. Compile-only GPUs that
     state none are refused, before anything traces, naming how to state it once."""
     if {device.platform for device in devices} == {"tpu"}:
         return None
-    limits = [device_limit(device) for device in devices]
+    limits = [device_memory(device).get("bytes_limit") for device in devices]
     if None in limits:
         generation = gpu_target(devices[0].device_kind).generation
         raise ValueError(f"the {generation} GPUs this step compiles for state no memory, which every plan "

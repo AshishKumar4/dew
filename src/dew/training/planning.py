@@ -31,6 +31,7 @@ from jax.experimental.profiler import get_profiled_instructions_proto
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
+from dew._devices import device_memory
 from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
@@ -52,7 +53,6 @@ from dew.training.memory import (
     climbed,
     compiled_if_it_fits,
     derived_headroom,
-    device_memory,
     head_fused_of,
     head_tile_of,
     headed_more,
