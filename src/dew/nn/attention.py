@@ -1263,7 +1263,9 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                    and laid[-2] in (1, query.shape[1]) and laid[0] in (1, query.shape[0])
                    and laid[1] in (1, query.shape[2])
                    and jnp.dtype(bias.dtype).itemsize <= 4),
-        dense_bias=laid is not None and len(laid) == 4 and laid[-2] > 1,
+        dense_bias=(laid is not None and len(laid) == 4 and laid[-2] > 1
+                    and not isinstance(bias, SeparableBias)),
+        separable_bias=isinstance(bias, SeparableBias),
         sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),
