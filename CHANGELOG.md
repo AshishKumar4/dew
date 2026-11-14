@@ -27,6 +27,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   memory. `AheadTarget.capacity_gib` is that memory, and `AheadOfTime.capacity` the limit the plan held to.
 
 
+- Dew requires its JAX build 0.12.0.1.post87 (Python alone; the CUDA and PJRT plugins stay post81's): a run under
+  a profiler or dumping XLA's programs reads the Mosaic GPU lowerings and kernel certifications an unprofiled run
+  stored, where it lowered and certified them afresh.
 - Dew requires its JAX build 0.12.0.1.post86 (Python alone; the CUDA and PJRT plugins stay post81's): a Mosaic
   GPU kernel's identity reads its operations, not its source locations, so a kernel traced alone and again in a
   step's gradient compiles once; cuDNN's attention gates read the capability of the GPU a program is traced
