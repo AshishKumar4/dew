@@ -827,14 +827,15 @@ class Server:
     def _context(self) -> Iterator[None]:
         """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it,
         and its projections' weights each whole (`placing`, `dew.nn.sharding.FORWARD`), so a projection
-        mapped per shard takes a launch on each device's rows, under the numerics its task's run trained
+        mapped per shard takes a launch on each device's rows, a prefill on a mesh of its own beneath a
+        server that decodes on none included, under the numerics its task's run trained
         in, with its rows' PRNG implementation the default, so a key a layer draws (a stochastic rounding
         stream) is of the implementation its cache was opened with, whatever thread serves it. The model
         runs its stack and sequences whole (`whole`): on a mesh with a stage or sequence axis the training
         forward pipelines the stack or splits a sequence's positions, which one token a step leaves nothing
         to do."""
         with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh), whole(),
-              placing(None if self.mesh is None else FORWARD),
+              placing(FORWARD),
               contextlib.nullcontext() if self.precision is None
               else generation.run_precision(self.precision),
               jax.default_prng_impl(self.prng)):
