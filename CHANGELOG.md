@@ -10,15 +10,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - A compile-ahead target with no path (`--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY`, its generation
   and devices) compiles the run's first step and every later data phase's step into the run's persistent
   compilation cache and exits 0, as a job's prepare compiles its node's run, where it refused for want of a
-  path. Those steps take every tuned choice a run on such a GPU left in the autotune cache beside it, or are
-  said not preparable until one has; a step compiled ahead into a file is XLA's untuned program, which its
-  record (`AheadOfTime.tuned`), its save and its load say.
-
-- A run whose data phases run other steps (`phase_passes`) plans and compiles each later phase's step on a
-  thread of its own once its first step is dispatched, so the phase's boundary takes the executable
-  compiled off the loop and the GPUs no longer idle while it compiles. Its plan is still made at the
-  boundary, against the devices as they stand. The separate `dew train` process a configured run started
-  for this is removed, and so is `dew.registry.trusted_packages`, which only it read.
+  path; one with neither a path nor a host's topology is refused, as its compiles key entries no run reads.
+  Those steps take every tuned choice a run on such a GPU left in the autotune cache beside it, or are said
+  not preparable until one has; a step compiled on compile-only GPUs anywhere else is XLA's untuned
+  program, which its record (`AheadOfTime.tuned`), its save and its load say. A step file saved before
+  steps recorded this is refused at load; compile it ahead again.
 
 - `SourceOptions` and its keyword types live in `dew.interop.source_options`, and the release contract
   (`Release`, `RELEASE_FILE`) in `dew.interop.release_record`, so a source's load imports no trainer;
@@ -128,6 +124,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   issues tcgen05's products of fp32 shared-memory operands as TF32 (`.kind::tf32`), which Dew's Blackwell kernels
   do not select yet, and a compile ahead that requires its autotune results keys its programs as its device's
   compile does.
+- Dew requires its JAX build 0.12.0.1.post90 (Python alone; the CUDA and PJRT plugins stay post81's): a Blackwell
+  kernel's fp32 products take TF32 on its tensor cores (tcgen05's `.kind::tf32`), and a compile ahead that requires
+  its autotune results keys its programs as its device's compile does.
 - Dew requires its JAX build 0.12.0.1.post87 (Python alone; the CUDA and PJRT plugins stay post81's): a run under
   a profiler or dumping XLA's programs reads the Mosaic GPU lowerings and kernel certifications an unprofiled run
   stored, where it lowered and certified them afresh.

@@ -256,7 +256,9 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
     lowered = program.lower(*args, **kwargs)
     pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dew-compile-ahead")
     try:
-        return Compiling(program_digest(lowered), pool.submit(report.attempted, lowered, None))
+        # In this thread's context: the compile's target reads it (`report.for_devices`).
+        return Compiling(program_digest(lowered),
+                         pool.submit(contextvars.copy_context().run, report.attempted, lowered, None))
     finally:
         pool.shutdown(wait=False)
 
