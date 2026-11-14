@@ -1102,8 +1102,8 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         def issue(tmem) -> None:
             self._issued(Accumulator(tmem, (shape[0], max(shape[1], PADDED)), accumulate=False), lhs, rhs)
 
-        # One branch issued, its accumulator's (a count of its emission reads one product, `emission`).
-        lax.switch(buffer, [functools.partial(issue, tmem) for tmem in tmems])
+        for index, tmem in enumerate(tmems):
+            pl.when(buffer == index)(functools.partial(issue, tmem))
         plgpu.tcgen05_commit_arrive(done)
 
     def taken(self, shape: tuple[int, int], buffer) -> jax.Array:

@@ -85,11 +85,11 @@ class Role:
         """One step of the role's walk in `unit` (a `Work` field's reading): the mean of its loops' steps
         (`walks`), none where it walks nothing. It is the walk's step wherever its loops step alike in it (a
         rotation's, `mosaic.stepping`; its products and exponentials over a causal walk's segments), and
-        where a segment's peeled first and last steps take together two of its loop's (a walk reading
-        ahead, `RingFamily._walked`'s `peeled`: its first issues two products, its last none, a segment of
-        any length its loop's one a step). The trips of each loop would be a statement the count does not
-        have: a unit a causal walk's masked segment takes more of (the CUDA cores' operations) is its
-        segments' mean."""
+        where a walk's parts its loops split it into take together as many of its steps' work as they mark
+        (a pipelined walk's opening, steady and closing loops: the opening issuing a step ahead, the closing
+        none). The trips of each loop would be a statement the count does not have: a unit a causal walk's
+        masked segment takes more of (the CUDA cores' operations) is its segments' mean. A loop's guards on
+        its steps' place are read at their trips (`_Place`)."""
         return unit(_mean(self.walks)) if self.walks else None
 
 
@@ -247,13 +247,59 @@ class _Loop:
     marks: float = 0
 
 
+@dataclasses.dataclass(frozen=True)
+class _Same:
+    """A value the count holds by the atom that gives it where its value is unknown (a loop's range's bound
+    read inside its body), so a guard comparing a step's place with it is read (`_Place`)."""
+
+    atom: object
+
+
+type _Bound = int | np.integer | _Same
+"""A range's bound as the count holds it: its concrete value, else the atom that gives it (`_Same`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _Place:
+    """A data-decided loop's trip counter (a `fori_loop`'s) as one of its trips holds it, `plus` past it: its
+    first trip (`at` "first"), its last ("last") or one between ("steady"), at its `parity`; `start` and
+    `stop` its range's bounds as the count holds them. A step's guard on its place (`index == lo`,
+    `index + 1 < hi`: a walk's first step opening its own slots, every step but the last reading the next's,
+    `mosaic.Slots`) and on its parity (`index % 2`: the accumulator of two a step issues ahead into) read
+    concretely at each."""
+
+    at: str
+    start: _Bound
+    stop: _Bound
+    parity: int
+    plus: int = 0
+
+    def compared(self, primitive, other) -> bool | int | None:
+        """`self <primitive> other` where the place decides it: equal to its range's start at its first
+        trip alone, one past it short of its range's stop at every trip but its last, its remainder by two
+        its parity; None otherwise."""
+        if primitive is lax.eq_p and self.plus == 0 and other == self.start:
+            return self.at == "first"
+        if primitive is lax.lt_p and self.plus == 1 and other == self.stop:
+            return self.at != "last"
+        if primitive is lax.rem_p and other == 2:
+            return (self.parity + self.plus) % 2
+        return None
+
+
+_PLACES = ("steady", "first", "last")
+"""The trips a data-decided loop's guards on its place tell apart (`_Place`), its steady trip first, each
+counted at either parity and their mean taken."""
+
+
 class _Counting:
     """A walk of a jaxpr as warpgroup `index` along `axis` runs it: its work outside its walks (`fixed`)
     and a step of each walk (`walks`), each scalar its index's arithmetic decides held concretely; within
-    `loops` loops where it starts (a conditional's branch, `cond`)."""
+    `loops` loops where it starts (a conditional's branch, `cond`), and as warp `warp` (its axis and index)
+    of its warpgroup's warps where it is one's (`warps`)."""
 
-    def __init__(self, axis: str | None, index: int, loops: int = 0):
-        self.axis, self.index = axis, index
+    def __init__(self, axis: str | None, index: int, loops: int = 0, warp: tuple | None = None):
+        self.axis, self.index, self.warp = axis, index, warp
         self.fixed = Work()
         self.walks: list[Work] = []
         self.loops = [_Loop() for _ in range(loops)]
@@ -287,9 +333,11 @@ class _Counting:
         primitive, params = equation.primitive, equation.params
         unknown = [None] * len(equation.outvars)
         if primitive is lax.axis_index_p:
-            return [self.index if params["axis_name"] in (self.axis, (self.axis,)) else None]
+            return [self.place(params["axis_name"])]
         if primitive in _CONCRETE and values and all(_scalar(value) for value in values):
             return [_CONCRETE[primitive](*values)]
+        if (placed := _placed(primitive, values)) is not None:
+            return [placed]
         if primitive is lax.convert_element_type_p and _scalar(values[0]):
             self.add(Work(conversions=1))
             return [values[0]]
@@ -336,13 +384,8 @@ class _Counting:
             self.add(work(*(variable.aval for variable in arguments)))
         elif primitive is lax.cond_p:
             return self.cond(params["branches"], values)
-        elif primitive is lax.while_p:
-            self.loop(params["body_jaxpr"])
-        elif primitive is lax.scan_p:
-            return self.scanned(params, values)
-        elif primitive is pallas.run_scoped_p:
-            # Its operands are its body's constants; its body's inputs are the refs it allocates.
-            return self.run(params["jaxpr"], [None] * len(params["jaxpr"].invars), values)
+        elif (region := _REGIONS.get(primitive)) is not None:
+            return region(self, equation, values) or unknown
         elif primitive is derivatives.marked_call_p and isinstance(params["kind"], derivatives.WalkStep):
             if self.loops:
                 self.loops[-1].marks += 1
@@ -353,19 +396,82 @@ class _Counting:
             raise Unpriced(f"no rule prices {primitive} in a kernel's body")
         return unknown
 
-    def loop(self, body: jax_core.Jaxpr) -> None:
-        """A loop whose trips its data decides (a while's): the outermost such loop that runs walk steps
-        (`derivatives.WalkStep` marks along the branches its warpgroup takes) a walk, its trip's work over its
-        marks one step of it (`walks`), which the launch's statement of its steps multiplies; any other its
-        trip counted once where it stands, its marks its enclosing loop's."""
-        self.loops.append(_Loop())
-        self.run(body, [None] * len(body.invars))
-        self.ended(self.loops.pop(), walks=True)
+    def place(self, name) -> int | None:
+        """The concrete index along axis `name`: its warp's among its warpgroup's warps (`warp`), its
+        warpgroup's along `axis`; None along any other."""
+        found = dict([(self.axis, self.index), *([self.warp] if self.warp is not None else [])])
+        return next((index for axis, index in found.items() if name in (axis, (axis,))), None)
 
-    def scanned(self, params, values: list) -> list:
+    def scoped(self, equation, values: list) -> list:
+        """A scope (`run_scoped`): its operands its body's constants, its body's inputs the refs it
+        allocates."""
+        body = equation.params["jaxpr"]
+        return self.run(body, [None] * len(body.invars), values)
+
+    def loop(self, equation, values: list) -> None:
+        """A loop whose trips its data decides (a while's): the outermost such loop that runs walk steps
+        (`derivatives.WalkStep` marks along the branches its warpgroup takes) a walk, its steady trip's work
+        over its marks one step of it (`walks`), which the launch's statement of its steps multiplies; any
+        other its trip counted once where it stands, its marks its enclosing loop's. A walk over a range (a
+        `fori_loop`'s, `_ranged`) whose steps guard on their place (`_Place`) is counted at its steady trip,
+        its first and last trips' difference from it once where it stands."""
+        params = equation.params
+        held = [value if value is not None else _Same(atom) for atom, value in zip(equation.invars, values,
+                                                                                   strict=True)]
+        body, consts = params["body_jaxpr"], held[params["cond_nconsts"]:][:params["body_nconsts"]]
+        carry = len(body.invars) - len(consts)
+        ranged = _ranged(params, held)
+
+        def trip(at: str, parity: int) -> "_Counting":
+            # A carried value is unknown past the first trip, but a range's counter and stop (`_ranged`).
+            inputs = [*consts, *([None] * carry)]
+            if ranged is not None:
+                counter, start, stop, bound = ranged
+                inputs[len(consts) + counter] = _Place(at, start, stop, parity)
+                inputs[len(consts) + bound] = stop
+            trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp)
+            trial.run(body, inputs)
+            return trial
+
+        steady, odd = trip("steady", 0), trip("steady", 1)
+        self.fixed = self.fixed + steady.fixed
+        self.walks.extend(steady.walks)
+        found = _Loop(_mean([steady.loops[-1].work, odd.loops[-1].work]), steady.loops[-1].marks)
+        self.ended(found, walks=True)
+        if ranged is not None and found.marks and not self.loops:
+            # The first and last trips each take their own work in place of a steady one's.
+            for at in _PLACES[1:]:
+                taken = _mean([trip(at, parity).loops[-1].work for parity in (0, 1)])
+                self.fixed = self.fixed + taken + _times(found.work, -1)
+
+    def warps(self, equation, values: list) -> None:
+        """A warpgroup's warps each running its role (`plgpu.warp_map`'s `mpmd_map`: tcgen05's load and
+        product warps): each warp's body counted with its warp's index concrete, so its role's branch is the
+        one it takes; the warpgroup's work theirs together, a step of its walk each warp's step summed, and
+        the steps its warps take together its enclosing loop's (the most any warp marks)."""
+        del values
+        (mesh,), (inner,) = equation.params["meshes"], equation.params["jaxprs"]
+        ((name, count),) = mesh.shape.items()
+        steps, marks = [], 0.0
+        for warp in range(count):
+            counted = _Counting(self.axis, self.index, loops=len(self.loops), warp=(name, warp))
+            counted.run(inner, [None] * len(inner.invars))
+            self.fixed = self.fixed + counted.fixed
+            if counted.walks:
+                steps.append(_mean(counted.walks))
+            if self.loops:
+                self.loops[-1].work = self.loops[-1].work + counted.loops[-1].work
+                marks = max(marks, counted.loops[-1].marks)
+        if steps:
+            self.walks.append(sum(steps, Work()))
+        if self.loops:
+            self.loops[-1].marks += marks
+
+    def scanned(self, equation, values: list) -> list:
         """A loop of the trips its jaxpr states (a scan's), each trip counted as it runs, its carry's
         concrete values carried to the next (a walk's step index, so a step's guard on it takes its
         branch): its work where it stands, its marks its enclosing loop's; its outputs' concrete carry."""
+        params = equation.params
         body, length = params["jaxpr"], params["length"]
         consts, carried, xs = map(list, params["ft_in"].update(values).unpack())
         self.loops.append(_Loop())
@@ -395,7 +501,7 @@ class _Counting:
             return self.run(branches[int(index)], operands)
         trials = []
         for branch in branches:
-            trial = _Counting(self.axis, self.index, loops=len(self.loops))
+            trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp)
             trial.run(branch, operands)
             trials.append(trial)
         self.fixed = self.fixed + _envelope(trial.fixed for trial in trials)
@@ -405,6 +511,40 @@ class _Counting:
             self.loops[-1].work = self.loops[-1].work + _envelope(trial.loops[-1].work for trial in trials)
             self.loops[-1].marks += max(trial.loops[-1].marks for trial in trials)
         return [None] * len(branches[0].outvars)
+
+
+def _ranged(params, values: list) -> tuple[int, _Bound, _Bound, int] | None:
+    """A while loop over a range (`fori_loop`'s: its condition `counter < stop` of two carried values, the
+    stop carried through unchanged): its counter's place in its carry, its range's start and stop as the count
+    holds them (`_Bound`), and its stop's place; None for any other loop."""
+    condition = params["cond_jaxpr"]
+    if len(condition.eqns) != 1 or condition.eqns[0].primitive is not lax.lt_p:
+        return None
+    carry = condition.invars[params["cond_nconsts"]:]
+    counter, stop = condition.eqns[0].invars
+    if counter not in carry or stop not in carry:
+        return None
+    carried = values[params["cond_nconsts"] + params["body_nconsts"]:]
+    return carry.index(counter), carried[carry.index(counter)], carried[carry.index(stop)], carry.index(stop)
+
+
+def _placed(primitive, values: list):
+    """A step's place read where `primitive` reads it (`_Place`): one past it (`counter + 1`), or a guard
+    its place decides; None where it reads none."""
+    if len(values) != 2 or not any(isinstance(value, _Place) for value in values):
+        return None
+    place, other = values if isinstance(values[0], _Place) else values[::-1]
+    if not (_scalar(other) or isinstance(other, _Same)):
+        return None
+    if primitive is lax.add_p and other == 1:
+        return dataclasses.replace(place, plus=place.plus + 1)
+    return place.compared(primitive, other) if place is values[0] else None
+
+
+_REGIONS = {pallas.run_scoped_p: _Counting.scoped, lax.while_p: _Counting.loop, lax.scan_p: _Counting.scanned,
+            mpmd.mpmd_map_p: _Counting.warps}
+"""The regions a kernel's body counts within it, each by its method: its outputs' concrete values, or none
+where it leaves them unknown."""
 
 
 def _mean(walks: Sequence[Work]) -> Work:
