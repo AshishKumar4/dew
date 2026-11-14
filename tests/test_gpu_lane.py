@@ -165,6 +165,37 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
     assert stored, "its run's rows are recorded as any lane's"
 
 
+def test_a_follow_up_lane_hands_each_files_pytest_the_owed_sites_and_reuses_no_row(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A GPU lane given the accuracy gate's owed sites (`--owed FILE`) hands that option to each file's
+    pytest, its prepare's and its run's alike, and its run reuses no row the test cache holds: a follow-up
+    judges other sites than the run it follows, never a green its files' inputs earned before (Main,
+    2026-11-14)."""
+    url, stored, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    (tmp_path / "tests/conftest.py").write_text(
+        "def pytest_addoption(parser):\n    parser.addoption('--owed', default=None)\n")
+    (tmp_path / "tests/test_flows.py").write_text(
+        "import os\n"
+        "def test_flow(request):\n"
+        "    kind = 'prepared' if os.environ.get('DEW_TIER_PREPARE') == '1' else 'ran'\n"
+        "    with open(f'{kind}.log', 'a') as log:\n"
+        "        log.write(str(request.config.getoption('--owed')) + chr(10))\n")
+    owed = tmp_path / "owed.json"
+    owed.write_text(json.dumps({"sites": [{"site": "sinks, the lane's: train", "draws": 64}]}))
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_lane("3.12", ["tests/test_flows.py"], out, cache="on", processes=1, deadline=600.0) == 0
+    assert (tmp_path / "ran.log").read_text().split() == ["None"]
+    # Its rows recorded, so a lane with the cache on would reuse them; a follow-up runs its files again.
+    assert stored
+    assert ci.gpu_lane("3.12", ["tests/test_flows.py"], out, cache="on", processes=1, deadline=600.0,
+                       owed=owed) == 0
+    assert (tmp_path / "ran.log").read_text().split() == ["None", str(owed)]
+    assert ci.owed_options(None) == [] and ci.owed_options(owed) == ["--owed", str(owed)]
+
+
 def test_a_file_that_does_not_collect_is_its_own_red_row_and_the_lanes_other_files_run(
         ci, tmp_path, monkeypatch, cache_worker):
     """A lane reads which of its files hold tests for another process by collecting them: a file that does
