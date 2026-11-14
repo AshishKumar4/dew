@@ -145,21 +145,8 @@ def import_path(member: Importable) -> str:
     return f"{module}:{name}"
 
 
-MOVED: Mapping[str, str] = {
-    f"dew.inputs.encoders:{name}": f"dew.interop.encoders:{name}"
-    for name in ("CLIPText", "T5Text", "HFAudio")
-} | {
-    f"dew.inputs.diffusion:{name}": f"dew.interop.conditioners:{name}"
-    for name in ("DiffusionConditioner", "QwenImageConditioner", "HiddenStatesConditioner", "WanConditioner")
-}
-"""Import paths an earlier Dew recorded, by the path each names now: the encoders that bind a released
-checkpoint, dew.interop's since row 5996, which a run's record or its layout named under dew.inputs. The one
-place a recorded path is translated (`imported`)."""
-
-
 def imported(path: str) -> Callable[..., Configured]:
-    """The class or function an import path names, importing its module; a path an earlier Dew recorded,
-    as it names it now (`MOVED`).
+    """The class or function an import path names, importing its module.
 
     Records arrive from the Hub, and importing a module runs its top level,
     so a record imports only Dew's own modules and modules already imported.
@@ -167,7 +154,7 @@ def imported(path: str) -> Callable[..., Configured]:
     them; a run of a package not yet imported loads once the caller trusts
     the package (`import_trusted`), as `trust_remote_code` does in
     transformers."""
-    module, _, name = MOVED.get(path, path).partition(":")
+    module, _, name = path.partition(":")
     if not module or not name:
         raise ValueError(f"{path!r} is not an import path, `module:Qualified.name`")
     if module != "dew" and not module.startswith("dew.") and module not in sys.modules:

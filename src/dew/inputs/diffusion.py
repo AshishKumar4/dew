@@ -1,9 +1,10 @@
-"""Native CLIP conditioning and image preprocessing for latent diffusion."""
+"""Image preprocessing and image conditions for latent diffusion: a CLIP image transform, a safety check's
+inputs, and an inpainting run's masked latents; the text conditioning that binds a released pipeline's
+encoders is dew.interop's (`dew.interop.conditioners`)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -12,10 +13,6 @@ import numpy as np
 from dew.artifacts import pixel_levels
 from dew.nn.blocks import torch_nearest_resize
 from dew.nn.safety import CLIPSafetyHead
-
-if TYPE_CHECKING:
-
-    pass
 
 
 def latent_image_conditions(autoencoder, params, pixels, mask, key, noise=None):
