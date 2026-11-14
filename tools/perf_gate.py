@@ -210,7 +210,7 @@ def _stepped(out: Path) -> tuple:
     return step["ms_per_step"], peak(step), None if mfu is None else 100.0 * mfu
 
 
-STALL = 1.5
+STALL = 1.5  # benchmark_step's STALL, which keeps the stalled parts' stacks
 """How many times its window's median a part of a step's timed window takes to be said stalled (`stalled`)."""
 
 
@@ -516,8 +516,9 @@ def environments(trees: tuple[tuple[str, Path], ...], lock: str, cache: str) -> 
 def rounds(args: argparse.Namespace, results: dict, sample: Callable[[str, int], dict]) -> None:
     """`results`' arms sampled `--rounds` rounds (`sample` of an arm and a round), each round's arms in an
     order drawn at random and kept (`orders`), so no arm holds one place in every round and the rounds'
-    ratios fall either side of their medians as the judgment reads them (`verdict`); the results written
-    after each arm, so an interrupted run reports what it measured, partial."""
+    ratios fall either side of their medians as the judgment reads them (`verdict`), after a warm arm the
+    judgment never reads (`warm`); the results written after each arm, so an interrupted run reports what it
+    measured, partial."""
     from dew._files import write_atomically
 
     places = secrets.SystemRandom()
@@ -525,6 +526,12 @@ def rounds(args: argparse.Namespace, results: dict, sample: Callable[[str, int],
         order = places.sample(list(results["samples"]), len(results["samples"]))
         results["orders"].append(order)
         began = time.perf_counter()
+        # A warm arm first, discarded: a round's first arm lost a window part to a host stall its later arms
+        # did not (2026-11-14, PK-PERF-PROOF-series3 and -main-4e91280b0: 119 ms against 27 ms a step), so no
+        # judged arm runs first. Its reading is kept apart, a diagnostic (`warm`); the base's tree runs it.
+        results.setdefault("warm", []).append(sample("alone", round_))
+        write_atomically(args.out, json.dumps(results, indent=2))
+        print(f"round {round_ + 1}: warm arm measured (discarded)", flush=True)
         for arm in order:
             results["samples"][arm].append(sample(arm, round_))
             write_atomically(args.out, json.dumps(results, indent=2))
