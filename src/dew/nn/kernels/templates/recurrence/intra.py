@@ -169,12 +169,7 @@ def _intra_prefix(call: Call, scanned, decays: jax.Array, keys: int) -> tuple:
         return scanned.at[half, rows]
 
     def stage(pair):
-        # A thread reads other threads' rows: the last shift's reads done before the rows are written again,
-        # and the writes made visible before they are read (`mosaic.synced`).
-        mosaic.synced(call.interpret)
-        for half, value in enumerate(pair):
-            plgpu.store(half_at(half, pl.ds(chunk, chunk)), value, optimized=False)
-        mosaic.synced(call.interpret)
+        _staged_rows(call, scanned, pair)
         return lambda shift: tuple(_rows_of(half_at(half, pl.ds(chunk - shift, chunk)), keys)
                                    for half in (0, 1))
 
@@ -189,7 +184,8 @@ def _intra_prefix(call: Call, scanned, decays: jax.Array, keys: int) -> tuple:
 
 def _staged_rows(call: Call, scanned, pair: tuple) -> None:
     """`pair`'s two `[C, keys]` tiles stored over the scan's rows (`scanned`'s rows `C` on,
-    `_intra_prefix`'s), once the scan is read, and made visible before other threads read their rows."""
+    `_intra_prefix`'s): a thread reads other threads' rows, so their last reads are done before the rows are
+    written again, and the writes made visible before they are read (`mosaic.synced`)."""
     chunk = call.chunk
     mosaic.synced(call.interpret)
     for half, value in enumerate(pair):
