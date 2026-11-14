@@ -537,7 +537,8 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path
         # remats by a structured policy.
         plan = {"split": 1, "rows": 4, "remat": {"policy": "dots_saveable"} if head else None,
                 "head_tile": [1024, 2] if head else None}
-        printed = json.dumps({"seconds": 48.0 if head else 32.0,
+        parts = {"traced": 6.0, "lowered": 2.0, "compiled": 30.0 if head else 18.0, "algebra": 4.0}
+        printed = json.dumps({"seconds": 48.0 if head else 32.0, "parts": parts,
                               "plan": {key: plan.get(key) for key in command[-1].split(",")}})
         return subprocess.CompletedProcess(command, 0, f"compiling\n{printed}\n", "")
 
@@ -569,6 +570,12 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path
              "head_fused": None, "xla_defaults": None, "narrow": None}
     assert judged[dense]["plans"]["head"] == [tiled] * 6
     assert judged[dense]["plans"]["base"][0]["remat"] is None
+    # Each arm's planning by its parts beside the verdict, and which part moved said in its state (row 6108).
+    assert len(judged[dense]["parts"]["head"]) == 6 and judged[dense]["parts"]["head"][0]["compiled"] == 30.0
+    table = tmp_path / "table.md"
+    gate.report(SimpleNamespace(results=out, table=str(table), claim=False, verdicts=None))
+    [line] = [line for line in table.read_text().splitlines() if line.startswith(f"| {dense} ")]
+    assert "compiled 18.00/30.00" in line and "traced 6.00/6.00" in line
     a100 = SimpleNamespace(**{**vars(args), "kind": "a100", "rounds": 1, "only": ["finetune"],
                               "out": str(tmp_path / "a100.json")})
     assert gate.compile_battery(a100) == 0
@@ -599,16 +606,18 @@ def test_a_step_compiled_ahead_for_an_absent_gpu_is_a_sample_of_its_planners_sec
     script = gate._script(tmp_path / "compiled.json", gate.COMPILED)
     environ = {**outside_suite(os.environ), "PYTHONPATH": f"{ROOT / 'src'}:{ROOT / 'tools'}"}
 
-    def compiled(attention: str) -> tuple[float, dict]:
+    def compiled(attention: str) -> tuple[float, dict, dict | None]:
         argv = [str(script), json.dumps(TINY), "sm90", str(1 << 30), attention, ",".join(gate.SELECTED)]
         done = subprocess.run([sys.executable, *argv], cwd=ROOT, env=environ, capture_output=True, text=True,
                               timeout=900, check=False)
         assert done.returncode == 0, done.stderr[-3000:]
         return gate.compiled_sample(done.stdout)
 
-    seconds, plan = compiled(gate.AHEAD_ATTENTION)
+    seconds, plan, parts = compiled(gate.AHEAD_ATTENTION)
     assert isinstance(seconds, float) and seconds > 0
     assert set(plan) == set(gate.SELECTED) and plan["split"] == 1
+    # Its seconds by their parts: JAX's traces, lowerings and compiles, and the algebra's passes.
+    assert set(parts) == {"traced", "lowered", "compiled", "algebra"} and parts["compiled"] > 0
 
 
 def paired(rates: dict[str, list[float]], session: str = "s") -> dict[str, list[dict]]:
