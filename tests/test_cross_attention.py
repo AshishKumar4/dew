@@ -507,6 +507,34 @@ def test_the_blocks_train_beside_an_adapter_with_the_source_frozen(source, tmp_p
         np.testing.assert_array_equal(np.asarray(kept[path]), np.asarray(leaf), err_msg=path)
 
 
+def test_a_run_of_a_cross_attending_media_model_loads_as_its_source_carrying_it(tmp_path):
+    """A media model (the tiny multimodal Qwen3.5, a `MediaWrapper`) with cross-attention attached trains
+    two steps on text, and its run loads back (`Pretrained.from_run`, `from_saved`'s wrapper arm) as its
+    source's bundle carrying the attached model, as a decoder's does above (`PretrainedDecoder.carrying`),
+    its export, which no family's format holds, refused (ledger 4799)."""
+    from dew.nn.protocols import MediaWrapper
+
+    media = Pretrained.load(ROOT / "tests" / "fixtures" / "hf" / "qwen35-tiny-mm", dtype="float32",
+                            attention_impl="reference")
+    cross = CrossAttention(layer_ids=(1,), context_length=3, context_features=8)
+    attached = media.with_cross_attention(cross, key=0)
+    rng = np.random.default_rng(1)
+    rows = 2 * jax.device_count()
+    inputs = ModelInputs(jnp.asarray(rng.integers(1, 256, (rows, 8)), jnp.int32), conditioning={
+        CONTEXT: jnp.asarray(rng.standard_normal((rows, 3, 8)), jnp.float32),
+        CONTEXT_LENGTHS: jnp.asarray(rng.integers(1, 4, rows), jnp.int32)})
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    trainer = Trainer(LMObjective(attached, 7), optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
+                      layout=Layout(min_shard=2**30), checkpoints=checkpoints)
+    trainer.fit(Loader(train=lambda partition: iter([{"text": inputs}] * 2), val=None, records=rows,
+                       batch=rows), steps=2, log_every=2, checkpoint_every=2)
+    checkpoints.wait()
+    restored = Pretrained.from_run(tmp_path / "run")
+    assert isinstance(restored.model, MediaWrapper) and restored.model == attached.model
+    with pytest.raises(ValueError):
+        restored.export()
+
+
 def test_the_blocks_train_beside_a_whole_source_where_it_is_not_frozen(source):
     """With `frozen=False` the blocks join an unsplit source's weights, which all train beside them, a
     full fine-tune: the source's leaves are its own, the blocks' gates zero, so the bundle computes

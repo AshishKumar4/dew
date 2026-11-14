@@ -12,7 +12,8 @@ from typing import TYPE_CHECKING
 import jax
 from etils import epath
 
-from dew.checkpoints import frozen_entries, is_uri, step_artifact
+from dew._files import is_uri
+from dew.checkpoints import frozen_entries, step_artifact
 from dew.interop.saved_sources import step_records
 
 if TYPE_CHECKING:

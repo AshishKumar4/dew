@@ -21,6 +21,7 @@ from dew.nn.dense import Dense, _biased, _plain_dense, _promoted, intercepted
 from dew.nn.precision import float32_dot_general
 
 from .kernels.generation import INHERENT, Choice, device_generation
+from .kernels.projections import per_shard, rows_split
 from .kernels.selection import Kernel, Op, Requirement, select
 
 
@@ -164,13 +165,25 @@ def joined_dense(x: jax.Array, projections: Sequence[Dense], *, axis: int) -> ja
     # A kernel is [inputs, features]; the stacked axis sits beside its features as it will in the output,
     # and the biases beside theirs, so the kernels side by side and the biases flattened alike pair each
     # output column with its own bias.
-    kernel = jnp.stack([kernel for _, kernel, _ in promoted], axis=axis + 3)
-
     def flat(biases: list) -> jax.Array | None:
         return None if biases[0] is None else jnp.stack(biases, axis=axis + 2).reshape(-1)
 
     dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
-    # One matrix product of the kernels side by side, as a Dense takes its own (`dense._biased`).
-    y = _biased(first, inputs, kernel.reshape(kernel.shape[0], -1), dimensions,
-                flat([bias for _, _, bias in promoted]), lambda bias: bias, flat(stored))
-    return y.reshape(*y.shape[:-1], *kernel.shape[1:])
+    kernels = tuple(kernel for _, kernel, _ in promoted)
+
+    def taken(product):
+        # One matrix product of the kernels side by side, as a Dense takes its own (`dense._biased`). On a
+        # mesh whose automatic axes split the rows alone, each device's rows are their own product, the
+        # kernels entering apart and joined there, so each one's gradient is summed at its own shape
+        # (`projections.per_shard`); the bias is added past it, its gradient summed as a Dense's.
+        def joined(inputs, *held):
+            return product(inputs, jnp.stack(held, axis=axis + 3).reshape(inputs.shape[-1], -1))
+
+        if rows_split(inputs) is not None:
+            return per_shard(joined, inputs, kernels)
+        return joined(inputs, *kernels)
+
+    y = _biased(first, inputs, kernels[0], dimensions, flat([bias for _, _, bias in promoted]),
+                lambda bias: bias, flat(stored), taken=taken)
+    stacked = (len(kernels), kernels[0].shape[1]) if axis == -2 else (kernels[0].shape[1], len(kernels))
+    return y.reshape(*y.shape[:-1], *stacked)

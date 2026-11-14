@@ -630,6 +630,9 @@
 "tests/test_compile_ahead.py::test_compiling_ahead_on_gpus_of_no_stated_memory_is_refused_before_anything_traces[False]",
 "tests/test_compile_ahead.py::test_programs_kept_under_other_code_settings_or_target_are_refused_by_name[setting-process3-target3]"
 ],
+"tests/test_config_paths.py": [
+"tests/test_config_paths.py::test_a_run_trained_from_python_trains_as_dew_train_trains_it[jepa]"
+],
 "tests/test_contracts_gemm.py": [
 "tests/test_contracts_gemm.py::test_a_gemm_prologue_holds_every_order[normal]",
 "tests/test_contracts_gemm.py::test_a_quantized_convolution_holds_every_order_it_takes[1-normal]",
@@ -751,9 +754,6 @@
 "tests/test_decision_laya.py": [
 "tests/test_decision_laya.py::test_padded_rows_score_as_they_do_alone",
 "tests/test_decision_laya.py::test_the_rule_catches_a_head_that_ignores_the_question_type"
-],
-"tests/test_decision_letters_context.py": [
-"tests/test_decision_letters_context.py::test_a_slot_readout_pools_each_option_line_from_the_context_that_holds_it"
 ],
 "tests/test_decision_objective.py": [
 "tests/test_decision_objective.py::test_a_held_out_row_fewer_than_a_batch_counts_once_in_the_loss_and_the_metrics",
@@ -1263,6 +1263,9 @@
 "tests/test_gemm_gather.py": [
 "tests/test_gemm_gather.py::test_a_gathered_grouped_product_reads_each_row_where_its_table_says"
 ],
+"tests/test_gemm_nvfp4.py": [
+"tests/test_gemm_nvfp4.py::test_a_stack_of_nvfp4_banks_is_read_at_its_layer_as_that_layers_bank[xla-gathered-rows]"
+],
 "tests/test_gemm_tcgen05.py": [
 "tests/test_gemm_tcgen05.py::test_tcgen05s_epilogues_hold_check_1[row scale-128x2]"
 ],
@@ -1602,6 +1605,9 @@
 "tests/test_kernel_matrix.py::test_a_familys_cells_cover_every_pair_of_axis_values_its_route_serves_and_nothing_else[recurrence]",
 "tests/test_kernel_matrix.py::test_a_familys_cells_cover_every_pair_of_axis_values_its_route_serves_and_nothing_else[recurrence_tpu]",
 "tests/test_kernel_matrix.py::test_every_matrix_flow_is_a_test_its_tier_selects[gpu]"
+],
+"tests/test_kernel_spills.py": [
+"tests/test_kernel_spills.py::test_a_run_steps_its_spilling_launch_down_and_trains"
 ],
 "tests/test_kimi_k3.py": [
 "tests/test_kimi_k3.py::test_forward_and_cached_decode_match_the_reference_over_left_padding",
@@ -2724,6 +2730,9 @@
 "tests/test_speculative.py::test_tree_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk[dspark]",
 "tests/test_speculative.py::test_tree_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk[recurrent]",
 "tests/test_speculative.py::test_tree_speculation_reproduces_the_greedy_walk_to_the_end_of_its_cache[two-two-one-2]"
+],
+"tests/test_ssd_kernel.py": [
+"tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[fixture-one-chunk-resets]"
 ],
 "tests/test_stage_local.py": [
 "tests/test_stage_local.py::test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own",
