@@ -341,12 +341,9 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
 
         leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'], given['scales']]
 
-        group = shape.value_heads // shape.key_heads
-
         def run(q, k, v, g, scales):
-            # fla-core 0.5.2's kernel takes a key head a value head and no scale (unscaled): the layers'
-            # repeat inside the timed call, as the gated delta rule's arm takes it.
-            q, k = (x.repeat_interleave(group, dim=2) for x in (q, k))
+            # fla-core 0.5.2's kernel takes one key group (its forward refuses any other, chunk.py:1117) and
+            # no scale (unscaled), the queries and keys as its layer hands them (log_linear_mamba2.py:107).
             return (chunk_log_linear_attn(q, k, v, g, scales)[0],)
 
         cotangents = (given['do'].to(bf16),)

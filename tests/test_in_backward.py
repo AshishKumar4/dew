@@ -197,13 +197,15 @@ def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype):
 PLANNED_SEEDS = 256
 """Check 1's declared seeds for the scanned steps updating in their backward against a layer at a time's,
 sized by `seeds_for` paired on armada (256 for each update): the two arms share every draw's state and
-batch."""
+batch. Drawn in armada's map tasks of 32 (`check1_shards`, its count this one), each cell having taken
+466 to 595 s whole (CI 11-14)."""
 
 
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize(("optimizer", "fields"),
                          [(ADAMW, {}), (GROUPED, {}), (ADAMW, {"layer_scalar": "frozen"})],
                          ids=["adamw", "groups", "frozen scalar"])
+@pytest.mark.check1_shards(seeds=256, per_task=32)
 def test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time(optimizer, fields):
     """Two steps of a decoder whose one stage scans its layers, each updating them in its backward
     (`Transaction.planned`: the step runs `in_backward.scanned_run`), leave its variables, optimizer state

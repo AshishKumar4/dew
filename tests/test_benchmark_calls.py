@@ -11,7 +11,7 @@ import pytest
 from sampling_gate import FALSE_RED
 from tool_support import run_from
 
-from dew.telemetry.benchmark import EVICTION_KERNEL, CuptiHeld, behind, benchmark, device_time, eviction
+from dew.telemetry.benchmark import benchmark
 
 
 class Slow:
@@ -285,75 +285,116 @@ def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation
     assert measured["allocated"] >= size
 
 
-@pytest.mark.gpu(reason="CUPTI times a GPU's kernels")
-def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however_it_ends(tmp_path):
-    """A session reads each kernel a call launched with its device time and refuses a call that launched
-    none, whose time would read as zero; a call timed behind an eviction in its program reads its own
-    kernels, the eviction's left out; the session detaches CUPTI however it ends, after a read or only a
-    refused one, so a profile capture after it records the call's kernels, and a read inside that capture
-    is refused as held. Leaving a session runs none of its calls again: an input deleted inside it stays
-    deleted."""
-    from dew.telemetry.profile import Profiler, program_kernels
+DEVICE_TIMED = """
+import json, sys
+import jax, jax.numpy as jnp
+from dew.telemetry.benchmark import EVICTION_KERNEL, CuptiHeld, behind, device_time, eviction
+from dew.telemetry.profile import Profiler, program_kernels
 
-    def squared(a):
-        return a @ a
-    x = jnp.ones((1024, 1024))
-    matmul = jax.jit(squared)
-    used = jnp.ones((1024, 1024))
-    with pytest.raises(ZeroDivisionError), device_time() as device:
+def squared(a):
+    return a @ a
+x = jnp.ones((1024, 1024))
+matmul = jax.jit(squared)
+used = jnp.ones((1024, 1024))
+found = {}
+try:
+    with device_time() as device:
         kernels = device.kernels(matmul, used)
-        assert kernels and all(kernel.milliseconds > 0 for kernel in kernels)
-        assert device.seconds(matmul, used) > 0
+        found["read"] = bool(kernels) and all(kernel.milliseconds > 0 for kernel in kernels)
+        found["seconds"] = device.seconds(matmul, used) > 0
         used.delete()
         raise ZeroDivisionError
-    with device_time() as device:
-        with pytest.raises(ValueError):
-            device.kernels(lambda: None)
-        buffer = eviction()
-        # The eviction runs as its own kernel in the program its call is timed in, which the compiler keeps.
-        joined = device.kernels(jax.jit(behind(matmul)), buffer, (x,))
-        assert any(EVICTION_KERNEL in kernel.name for kernel in joined)
-        timed = device.kernels(matmul, x, evicted=True)
-        assert timed and not any(EVICTION_KERNEL in kernel.name for kernel in timed)
-        # A sum behind the eviction keeps every kernel it launches alone.
-        summed = jax.jit(jnp.sum)
-        assert len(device.kernels(summed, x, evicted=True)) == len(device.kernels(summed, x))
-    profiler = Profiler(tmp_path)
-    with profiler, device_time() as device:
-        jax.block_until_ready(matmul(x))
-        with pytest.raises(CuptiHeld):
-            device.kernels(matmul, x)
-    assert program_kernels(profiler.captures[-1], ["squared"])["squared"]
+except ZeroDivisionError:
+    found["deleted"] = used.is_deleted()
+with device_time() as device:
+    try:
+        device.kernels(lambda: None)
+        found["nothing_refused"] = False
+    except ValueError:
+        found["nothing_refused"] = True
+    buffer = eviction()
+    joined = device.kernels(jax.jit(behind(matmul)), buffer, (x,))
+    found["eviction_read"] = any(EVICTION_KERNEL in kernel.name for kernel in joined)
+    timed = device.kernels(matmul, x, evicted=True)
+    found["eviction_left_out"] = bool(timed) and not any(EVICTION_KERNEL in kernel.name for kernel in timed)
+    summed = jax.jit(jnp.sum)
+    found["evicted_alike"] = len(device.kernels(summed, x, evicted=True)) == len(device.kernels(summed, x))
+profiler = Profiler(sys.argv[1])
+with profiler, device_time() as device:
+    jax.block_until_ready(matmul(x))
+    try:
+        device.kernels(matmul, x)
+        found["held_refused"] = False
+    except CuptiHeld:
+        found["held_refused"] = True
+found["profiled"] = bool(program_kernels(profiler.captures[-1], ["squared"])["squared"])
+print(json.dumps(found))
+"""
+"""A device-timing session in a process that runs no command buffers (`benchmark.UNGRAPHED_FLAG`), each of its
+behaviours read into a JSON object of truths (its test's)."""
 
 
-def test_a_timing_refuses_a_conditional_its_process_may_graph(monkeypatch):
-    """A jitted call holding a conditional is refused a device time (`Ungraphed`) in a process whose XLA may
-    run it as a command buffer's conditional node, whose taken branch's kernels CUPTI does not record (a B32
-    decode on an RTX PRO 6000 read its reduces alone, G4-LF-2), and read in one that keeps conditionals out
-    of command buffers (`UNGRAPHED`), as a call without one is in either. Its branches are products, which
-    XLA:GPU keeps as a conditional; branches as cheap as an elementwise sin or cos it compiles to a select of
-    both, a program with no conditional, which is read (row 5908: a GH200's compile of `cond(sin, cos)`)."""
-    from dew.telemetry.benchmark import UNGRAPHED, DeviceTime, Ungraphed
+@pytest.mark.gpu(reason="CUPTI times a GPU's kernels")
+def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however_it_ends(tmp_path):
+    """In a process that runs no command buffers (`benchmark.UNGRAPHED_FLAG`, the timing tool's device
+    workers'):
+    a session reads each kernel a call launched with its device time and refuses a call that launched none,
+    whose time would read as zero; a call timed behind an eviction in its program reads its own kernels, the
+    eviction's left out; the session detaches CUPTI however it ends, after a read or only a refused one, so a
+    profile capture after it records the call's kernels, and a read inside that capture is refused as held.
+    Leaving a session runs none of its calls again: an input deleted inside it stays deleted."""
+    from process_support import fresh
+
+    from dew.telemetry.benchmark import UNGRAPHED_FLAG
+
+    found = fresh(DEVICE_TIMED, str(tmp_path), flags=UNGRAPHED_FLAG)
+    outcomes = ("read", "seconds", "deleted", "nothing_refused", "eviction_read", "eviction_left_out",
+                "evicted_alike", "held_refused", "profiled")
+    assert found == dict.fromkeys(outcomes, True), found
+
+
+def test_a_timing_runs_a_call_without_the_command_buffers_its_process_runs(monkeypatch):
+    """In a process whose XLA runs command buffers, which CUPTI does not read whole (a conditional node's
+    branch unrecorded, G4-LF-2; an A100's measured call failing, row 4880), a call is read as a program of
+    the session's, compiled without them, that computes what the call does, jitted or not, and a call
+    compiled already is refused (`Ungraphed`); in one that runs none (`UNGRAPHED_FLAG`), the call itself is
+    read, compiled or not."""
+    from dew.telemetry.benchmark import UNGRAPHED_FLAG, DeviceTime, Ungraphed
 
     class Read(Exception):
-        """CUPTI's reading reached: the call was not refused."""
+        """CUPTI's reading reached, with the program it reads."""
 
     class Cupti:
         def measure(self, fn, aggregate):
-            raise Read
+            raise Read(fn)
 
     branched = jax.jit(lambda x: jax.lax.cond(jnp.max(x) > 0, lambda a: a @ a, lambda a: a @ a.T, x))
-    plain = jax.jit(jnp.sin)
     x = jnp.ones((256, 256))
+    compiled = branched.lower(x).compile()
     session = DeviceTime(Cupti())
     monkeypatch.delenv("XLA_FLAGS", raising=False)
+    for call in (branched, lambda a: jnp.sin(a) + 1):
+        with pytest.raises(Read) as read:
+            session.kernels(call, x)
+        [program] = read.value.args
+        assert program is not call and np.array_equal(program(x), call(x))
     with pytest.raises(Ungraphed):
-        session.kernels(branched, x)
-    with pytest.raises(Read):
-        session.kernels(plain, x)
-    monkeypatch.setenv("XLA_FLAGS", f"--xla_gpu_enable_command_buffer={UNGRAPHED}")
-    with pytest.raises(Read):
-        session.kernels(branched, x)
+        session.kernels(compiled, x)
+    # The last occurrence holds, a list replacing the one before it and `-KIND`s amending it.
+    for flags in (UNGRAPHED_FLAG,
+                  "--xla_gpu_enable_command_buffer=FUSION --xla_gpu_enable_command_buffer=-FUSION"):
+        monkeypatch.setenv("XLA_FLAGS", flags)
+        for call in (branched, compiled):
+            with pytest.raises(Read) as read:
+                session.kernels(call, x)
+            assert read.value.args == (call,)
+    for flags in ("--xla_gpu_enable_command_buffer=-FUSION",
+                  f"{UNGRAPHED_FLAG} --xla_gpu_enable_command_buffer=+FUSION",
+                  "--xla_gpu_enable_command_buffer=CONDITIONAL"
+                  " --xla_gpu_enable_command_buffer=-CONDITIONAL,+CONDITIONAL"):
+        monkeypatch.setenv("XLA_FLAGS", flags)
+        with pytest.raises(Ungraphed):
+            session.kernels(compiled, x)
 
 
 def test_a_projection_benchmark_names_a_grouped_matmul_kernel_and_runs_it(monkeypatch):

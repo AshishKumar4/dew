@@ -22,9 +22,9 @@ from jax.typing import DTypeLike
 from dew._cache import persist_compilations
 from dew.batch import Variables
 from dew.checkpoints import PYTHON_RUN, RUN_FILE
-from dew.config import SourceOptions
 from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
+from dew.interop.source_options import SourceOptions
 from dew.nn.precision import Numerics
 from dew.objectives.base import SavedTask
 from dew.registry import dtype_name, import_trusted
@@ -144,7 +144,7 @@ def pipeline(
 def released_model(root: epath.Path) -> bool:
     """Whether `root` holds a native release (`dew.interop.releases.native_plan`): a release record
     that states the run it was written of, which a source's own files never state."""
-    from dew.config.release import Release
+    from dew.interop.release_record import Release
 
     release = Release.load(str(root))
     return release is not None and release.task is not None and "run" in release.task

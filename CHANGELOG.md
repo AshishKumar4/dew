@@ -26,6 +26,18 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   program, which its record (`AheadOfTime.tuned`), its save and its load say. A step file saved before
   steps recorded this is refused at load; compile it ahead again.
 
+- `SourceOptions` and its keyword types live in `dew.interop.source_options`, and the release contract
+  (`Release`, `RELEASE_FILE`) in `dew.interop.release_record`, so a source's load imports no trainer;
+  `dew.config`, `dew.config.trainer` and `dew.config.release` keep exporting them, and a saved run's record
+  that names `dew.config.trainer:SourceOptions` reads as before.
+- A run's plan search, past a candidate whose compile misses, asks for the split computed from the
+  compile that missed (`dew.training.memory.MemoryMiss`): the first at which its temporaries, taken as scaled
+  by a microbatch's rows, leave room for its shortfall. This replaces the forecast (`Forecast`) and the
+  halving. A split that fits past one not asked is followed by the split before it until one misses, so
+  the plan is still the fewest microbatches that fit; where none is computed to fit, the finest is asked
+  before the search climbs a rung. A tight start compiles twice cold and once warm where the split
+  computed is the next.
+
 - The condition encoders that bind a released checkpoint are dew.interop's: `CLIPText`, `T5Text` and
   `HFAudio` in `dew.interop.encoders`, and `DiffusionConditioner`, `QwenImageConditioner`,
   `HiddenStatesConditioner` and `WanConditioner` in `dew.interop.conditioners`, each with its

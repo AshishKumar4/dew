@@ -2,7 +2,8 @@
 task declaration, the numerics its tasks trace under and the dtype its model computes in, which
 `Pretrained.save` writes and `Pretrained.load` reads back in place of a family's defaults (ledger 4314).
 generation_config.json, which every other reader reads, is derived from the same declaration. The record, its
-file and its other fields (a decision release's layout) are the release contract's, `dew.config.release`.
+file and its other fields (a decision release's layout) are the release contract's,
+`dew.interop.release_record`.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from dew.nn.protocols import Bounded, ComputesIn
 from dew.registry import DtypeName, dtype_name, from_record, record_fields
 
 if TYPE_CHECKING:
-    from dew.config.release import Release
+    from dew.interop.release_record import Release
 
 
 @dataclass(frozen=True)
@@ -80,7 +81,7 @@ def release_record(settings: TaskSettings, numerics: Numerics | None, model: nn.
     """The release of a run's export: its task settings, its numerics, the dtype its model computes in
     (`computed_in`), how it rounds (`rounding`) and the cache it holds (`capacity`); the parameters' own
     dtypes are the export's."""
-    from dew.config.release import Release
+    from dew.interop.release_record import Release
 
     dtypes = ReleaseDtypes(computed_in(numerics, model, variables))
     return Release(task=ReleaseTask(settings, numerics, dtypes, rounding(model), capacity(model)).record())
@@ -137,7 +138,7 @@ def released(directory: Path) -> ReleaseTask:
     """The run's own task settings, numerics, compute dtype, rounding and cache capacity an export of it
     wrote (`release_record`), or none of them where the directory holds none: a source with no run behind
     it builds its tasks from its own files, in the load's dtypes."""
-    from dew.config.release import Release
+    from dew.interop.release_record import Release
 
     release = Release.load(directory)
     return ReleaseTask() if release is None or release.task is None else ReleaseTask.read(release.task)

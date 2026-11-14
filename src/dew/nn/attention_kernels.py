@@ -624,17 +624,23 @@ def _dense_peak(case: AttentionCase) -> int | None:
 def _dense_peak_of(rows: int, queries: int, heads: int, keys: int, kv_heads: int, width: int, dtype: str,
                    causal: bool, placed, mesh, assumed) -> int | None:
     """`_dense_peak` of a call of these shapes, each operand `placed` whole (on the context's `mesh` where
-    None), compiled once a shape, mesh and device `assumed` through Dew's compile point (`options.jit`): a
-    device's arguments, its outputs past those they alias, and its temporaries (`compiled_memory`)."""
+    None), compiled once a shape, mesh and device `assumed` through Dew's compile point (`options.jit`) by
+    Dew's one call of XLA's compile for its target (`report.xla_compiled`), offline whatever compiles around
+    it (`report.read_offline`: a program read for its memory alone, which no device runs, so a prepare's
+    compile ahead judges a call as its device run does): a device's arguments, its outputs past those they
+    alias, and its temporaries (`compiled_memory`)."""
     del mesh, assumed
     import jax
 
     from dew.nn.kernels import options
+    from dew.nn.kernels.templates import report
     from dew.telemetry.instrumentation import compiled_memory
 
     query = jax.ShapeDtypeStruct((rows, queries, heads, width), dtype, sharding=placed)
     key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), dtype, sharding=placed)
-    memory = compiled_memory(options.jit(_dense_step(causal)).lower(query, key, key, query).compile())
+    with report.read_offline():
+        compiled = report.xla_compiled(options.jit(_dense_step(causal)).lower(query, key, key, query), None)
+    memory = compiled_memory(compiled)
     return None if memory is None else memory.argument + memory.output - memory.alias + memory.temp
 
 

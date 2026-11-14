@@ -152,8 +152,8 @@ class ReleasedRun(SavedRun):
         """The run step the release in `directory` holds, the packages `trust` names that its record imports
         imported first (`dew.registry.import_trusted`), as a run's are (`SavedRun.at`); a directory that
         holds none is refused."""
-        from dew.config.release import Release
         from dew.inference.tasks import earlier_shapes
+        from dew.interop.release_record import Release
         from dew.registry import import_trusted
 
         release = Release.load(directory)

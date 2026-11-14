@@ -78,7 +78,7 @@ from dew._files import write_atomically
 from dew._records import JSON
 from dew.algebra.terms import opaque, parameter_key
 from dew.nn import programs
-from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.options import UNGRAPHED_OPTIONS, owned_program
 
 from . import generation
 from .templates import report
@@ -973,7 +973,8 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
         # A candidate's lowering and its compile timed apart, the compile of its config as it is: a config
         # that spills is measured slow, never refused and lowered afresh (`OuterProgram.compiled`). The
         # launch runs behind the flush, which reads the whole buffer through the cache.
-        lowered = owned_program(behind(launched)).lower(flush, (arrays,))
+        # Without command buffers, which CUPTI does not read whole (`benchmark.Ungraphed`).
+        lowered = owned_program(behind(launched), step=UNGRAPHED_OPTIONS).lower(flush, (arrays,))
         middle = time.perf_counter()
         executable = lowered.compile()
         return executable, (middle - start) * 1e3, (time.perf_counter() - middle) * 1e3
