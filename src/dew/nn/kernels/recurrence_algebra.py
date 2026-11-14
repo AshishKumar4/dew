@@ -1101,7 +1101,8 @@ def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: Ti
                      value_grads: TileLoad | None, entered: TileLoad, leaving: TileLoad, blocks: int, ds,
                      gate, low, last, last_low, memory_decay, scale: float,
                      summed: Callable[[list], jax.Array], emit: Callable[[str, int, jax.Array], None],
-                     row_scale=None) -> tuple[jax.Array, jax.Array]:
+                     row_scale=None, summed_all: Callable[[list], tuple] | None = None
+                     ) -> tuple[jax.Array, jax.Array]:
     """The queries', keys' and weights' gradients of a chunk and value head (fla's dqkwg's memory products)
     under a decay a head, given its scores' gradient `ds` (`scores_gradient`'s, a tile its products read as
     they are, in the operands' dtype): over the value blocks `j`, `dq = do S^T`, `dk = v dS^T` and
@@ -1116,21 +1117,31 @@ def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: Ti
     and no `dw`. `row_scale` `[C]`, where given, scales each token's row of `dk`'s memory products in fp32:
     the write gate on the keys' side (`keys_gated_carried`), mamba_ssm's `dB = (x dstates^T) dt`. Each sum
     of products over the value blocks issued into one accumulator (`summed`, the mainloop's: a list of
-    `(name, left, right)`), as `scores_gradient`'s are."""
+    `(name, left, right)`), as `scores_gradient`'s are; a key block's sums, none reading another's, issued
+    together where the mainloop gives `summed_all` (a list of such lists, each its own accumulator, one wait
+    for all, each read where it is used: a reader a sum), each issued where it is read where not."""
     row_decay = raised(gate, low)[:, None]
+    gathered = summed_all or (lambda groups: tuple(functools.partial(summed, group) for group in groups))
     leaving_decay = range_decay(last, last_low, gate, low)[:, None]
     leaving_terms, after = [], []
     for c in range(columns):
-        dq = summed([("memory_dq", out_grads(j), entered(c, j).T) for j in range(blocks)])
-        dq = dq * row_decay * scale
+        groups = [[("memory_dq", out_grads(j), entered(c, j).T) for j in range(blocks)],
+                  [("memory_dk", values(j), leaving(c, j).T) for j in range(blocks)]]
+        if value_grads is not None:
+            groups.append([("memory_dw", value_grads(j), entered(c, j).T) for j in range(blocks)])
+        if ds is not None:
+            groups += [[("scores_dq", ds, keys(c))], [("scores_dq", Transposed(ds), queries(c))]]
+        read_dq, read_dk, *reads = gathered(groups)
+        read_dw = reads.pop(0) if value_grads is not None else None
+        dq = read_dq() * row_decay * scale
         after.append(jnp.sum(dq * queries(c).value().astype(jnp.float32), axis=1))
-        emit("dq", c, dq if ds is None else dq + summed([("scores_dq", ds, keys(c))]))
-        dk = summed([("memory_dk", values(j), leaving(c, j).T) for j in range(blocks)])
+        emit("dq", c, dq if ds is None else dq + reads[0]())
+        dk = read_dk()
         dk = dk * leaving_decay if row_scale is None else dk * (leaving_decay * row_scale[:, None])
         leaving_terms.append(jnp.sum(dk * keys(c).value().astype(jnp.float32), axis=1))
-        emit("dk", c, dk if ds is None else dk + summed([("scores_dq", Transposed(ds), queries(c))]))
-        if value_grads is not None:
-            emit("dw", c, -summed([("memory_dw", value_grads(j), entered(c, j).T) for j in range(blocks)]))
+        emit("dk", c, dk if ds is None else dk + reads[1]())
+        if read_dw is not None:
+            emit("dw", c, -read_dw())
     after = _summed(after)
     if memory_decay is not None:
         lag = _lags((after.shape[0],) * 2)

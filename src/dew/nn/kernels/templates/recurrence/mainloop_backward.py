@@ -688,12 +688,14 @@ def _values_gated_back(call: Call, slots, columns, out: Parts, dv, betas, skip) 
 
 
 def _query_key_views(call: Call, keyed: tuple, served: tuple, memory: tuple, *, row, key_columns, first,
-                     chunk, block, split=0, vq: int | None = None) -> dict:
+                     chunk, block, scores: tuple, split=0, vq: int | None = None) -> dict:
     """`_query_key`'s streams' views (`stream_views`) for a program's key block `block` of chunk `chunk`, its
     key head's first value head `first`: the queries' and keys' block (`keyed`, their refs), and each step `i`
     the group's `i`-th value head's values, output gradient and corrected values' gradient (`served`) at
-    its columns, and its entered memory and leaving memory's gradient (`memory`) a head's rows apart; of
-    each value head's columns the `split`-th `vq` (all of them where None, `_query_key_split`)."""
+    its columns, its entered memory and leaving memory's gradient (`memory`) a head's rows apart, and its
+    scores' gradient (`scores`: the ref and the key head; without the delta rule each step the key head's,
+    summed over its value heads, `_scores_back`); of each value head's columns the `split`-th `vq` (all of
+    them where None, `_query_key_split`)."""
     width, value_width, group = call.width, call.value_width, call.group
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
     q_ref, k_ref = keyed
@@ -707,7 +709,11 @@ def _query_key_views(call: Call, keyed: tuple, served: tuple, memory: tuple, *, 
     # Step `i` the `i`-th value head's columns from the split's, a value head's columns apart: the view from
     # the first head's split to the last head's, `vq` blocks.
     columns, apart, rows = first * value_width + split * vq, value_width // vq, call.chunk
-    return {**stream_views(lambda i: (0, 0), queries=given.views(q_ref, row, rows, key_columns, call.block),
+    ds_ref, keyed_head = scores
+    scored = (first, group) if call.delta else (keyed_head, 1)
+    return {**stream_views(lambda i: (0, i if call.delta else 0), ds=_score_grads(call).views(
+                ds_ref, row, rows, scored[0] * rows, scored[1] * rows)),
+            **stream_views(lambda i: (0, 0), queries=given.views(q_ref, row, rows, key_columns, call.block),
                            keys=given.views(k_ref, row, rows, key_columns, call.block)),
             **stream_views(lambda i: (0, i * apart),
                            **{name: operand.views(ref, row, rows, columns, (group - 1) * value_width + vq)
@@ -880,12 +886,8 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         key_columns = keyed * width + c * call.block
         first = keyed * group
         views = _query_key_views(call, (q_ref, k_ref), (v_ref, do_ref, dv_ref), (h_ref, dh_ref), row=row,
-                                 key_columns=key_columns, first=first, chunk=n, block=c, split=split, vq=vq)
-        # Step `i` the group's `i`-th value head's scores' gradient; without the delta rule each step the key
-        # head's, summed over its value heads (`_scores_back`).
-        scored = (first, group) if call.delta else (keyed, 1)
-        views |= stream_views(lambda i: (0, i if call.delta else 0),
-                              ds=grads.views(ds_ref, row, chunk, scored[0] * chunk, scored[1] * chunk))
+                                 key_columns=key_columns, first=first, chunk=n, block=c, split=split, vq=vq,
+                                 scores=(ds_ref, keyed))
 
         def step(index, slots, carry, accumulators, *, scores: bool = True):
             h = first + index
@@ -918,7 +920,8 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
                 functools.partial(column, "value_grads", held) if call.delta else None,
                 lambda i, j: column("entered", memories, j), lambda i, j: column("leaving", memories, j),
                 blocks, ds if splits == 1 else None, gate, low, ending, ending_low, None, scale, issue.summed,
-                emit=stored, row_scale=family.rows_of(beta_ref.at[h, span]) if call.gated_keys else None)
+                emit=stored, row_scale=family.rows_of(beta_ref.at[h, span]) if call.gated_keys else None,
+                summed_all=issue.summed_together)
             if splits > 1 and ds is not None:
                 # The scores' gradient's products the first split's alone, added after its memory products.
                 @pl.when(split == 0)
@@ -958,7 +961,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         grid=(splits, width // call.block, call.chunks, call.heads // group),
         grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(10),
         work=_query_key_work(call), held=_query_key_held(call, vq), landing=_query_key_landing(call, splits),
-        persistent=call.delta)(
+        persistent=call.delta, together=(call.block,) * (2 + call.delta + 2 * (splits == 1)))(
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta)
     # The splits' own sums added (one split's, as they are, where a program takes every value column).
     if splits > 1:

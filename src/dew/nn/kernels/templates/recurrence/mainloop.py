@@ -629,7 +629,7 @@ Planning (`template.planned`) traces every call, each launch recording itself (`
 
 def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *, once: dict | None = None,
                       consumers: int = 1, swizzles: dict[str, int] | None = None, reduces: bool = True,
-                      after: tuple = (), issues: bool = True
+                      after: tuple = (), issues: bool = True, together: tuple[int, ...] = ()
                       ) -> tuple[Callable[[int], dict], Callable[[int], resources.Scope], tuple, dict]:
     """A launch's shared memory at a ring depth, as `launch_kernel` lays it: its walked streams' and its
     streams loaded once' allocations (each its own; a pipelined family's stages are its allocation's), which
@@ -642,7 +642,7 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
     staged = (*staged, _landed(landed, family))
     # The products' shared memory and barriers where the family keeps them (`Issuer.product_held`, of the
     # scratch `launch_kernel` scopes beside the staging).
-    scoped = _products_scoped(call, blocks, staging, consumers, issues)
+    scoped = _products_scoped(call, blocks, staging, consumers, issues, together)
     products, addresses = family.product_held(scoped), family.product_addresses(scoped)
 
     def allocations(depth: int) -> dict:
@@ -658,12 +658,16 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
     return allocations, scope, staged, landed
 
 
-def _products_scoped(call: Call, blocks: dict, staging: tuple, consumers: int, issues: bool) -> tuple | None:
+def _products_scoped(call: Call, blocks: dict, staging: tuple, consumers: int, issues: bool,
+                     together: tuple[int, ...] = ()) -> tuple | None:
     """The products a launch's family scopes memory for (`Family.scoped`'s `products`): its roles' and each
-    width one of its tiles' (its streams', its staging's) or the chunk's; None where it issues none (a
+    width one of its tiles' (its streams', its staging's) or the chunk's, and the widths of the groups it sums
+    together (`together`, `Issuer.summed_together`'s, each its own accumulator); None where it issues none (a
     launch of elementwise work alone, `own_pairs`': an sm100's tensor memory scoped for none cost one 16 bytes
     of spills, jsf-sm100-redgreen)."""
-    return (consumers, _product_widths(blocks, staging, call.chunk), ()) if issues else None
+    if not issues:
+        return None
+    return consumers, _product_widths(blocks, staging, call.chunk), (), (), (), together
 
 
 def allocation_scope(family: mosaic.Family, streams: dict, staged: tuple, *, reduces: bool = True,
@@ -800,7 +804,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                   landing: dict | None = None, persistent: bool = False, reduces: bool = True,
                   after: tuple = (), consumers: int = 1, swizzles: dict[str, int] | None = None,
                   name: str | None = None, hardware: float | None = None, issues: bool = True,
-                  producer: int | None = None, ringed: bool = False):
+                  producer: int | None = None, ringed: bool = False, together: tuple[int, ...] = ()):
     """`program(at, *refs, streams, staging, landing)` as a kernel over `grid`, `at` a tile's indices by the
     grid's axis names, run where `live(at, refs)` holds (a laid call's chunks and sequences are as many as its
     worst case, most of them empty): its streams' allocations (of `blocks`, `stages` deep, and of `once`'s
@@ -826,7 +830,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     (`Tiles.stages`), its record its plan's input (`Launch.ring`), which a plan at other tiles' depth reads.
     A program of `consumers` consumer roles (a walk's, `Tiles.walkers`) holds each staging and landing tile
     once a role, along a leading axis a role indexes (`role_tiles`): one role's products' tiles are no other's
-    to write while its products read them."""
+    to write while its products read them. `together` are the widths of the groups a step sums together
+    (`Issuer.summed_together`), each its own accumulator in the products' scratch."""
     family = call.family
     if persistent and producer is None:
         producer = stated_producer(call, PERSISTENT_PRODUCER)
@@ -834,7 +839,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     registers = held.registers(family, addressed(staging, landing or {}))
     allocations, scope, staging, landing = shared_allocation(call, blocks, staging, landing or {}, once=once,
                                                              consumers=consumers, swizzles=swizzles,
-                                                             reduces=reduces, after=after, issues=issues)
+                                                             reduces=reduces, after=after, issues=issues,
+                                                             together=together)
     tiles = math.prod(grid)
     hardware = issued_flops(call, work.flops) if hardware is None else hardware
     threads = 128 * family.warpgroups(consumers)
@@ -886,7 +892,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
 
         # The products' own memory where the family's issuer keeps each (`Family.scoped`'s `products`): a
         # product's width is one of its tiles' (its streams', its staging's) or the chunk's.
-        products = _products_scoped(call, blocks, staging, consumers, issues)
+        products = _products_scoped(call, blocks, staging, consumers, issues, together)
         if persistent:
             family.scoped(run, staging, streams=streams, products=products)
         else:
