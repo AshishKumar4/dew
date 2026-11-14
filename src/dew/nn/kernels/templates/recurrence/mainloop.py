@@ -156,6 +156,9 @@ class Tiles:
     forward: "Tiles | None" = None
     chunk: int = dataclasses.field(kw_only=True)
     """The tokens a chunk (`Call.chunk`), derived as the other tiles are (`template.Mosaic.derived`)."""
+    producers: resources.Producers = dataclasses.field(default_factory=resources.Producers, kw_only=True)
+    """The registers its launches lower their producers to where a compile found them spilling at fewer
+    (`template.Mosaic._raised`), every other launch's at the least."""
 
     @property
     def output_block(self) -> int:
@@ -280,6 +283,13 @@ class Call:
     """Whether its solve holds the chunk inverse at fp32's range: a 16-bit delta rule whose form proves no
     bound on the inverse's entries (`recurrence.Hooks.inverse_bound`), its merges in bf16 parts
     (`_merging`)."""
+    producers: resources.Producers = dataclasses.field(default_factory=resources.Producers)
+    """Its tiles' (`Tiles.producers`)."""
+
+    def producer(self, launching: Callable) -> int | None:
+        """The registers the producer of the launch `launching` makes (`launch_kernel`'s, named for it)
+        lowers to (`Tiles.producers`), None at the least."""
+        return self.producers.of(f"recurrence{launching.__name__}")
 
     @property
     def gated_keys(self) -> bool:
@@ -733,7 +743,7 @@ def _planned_launch(call: Call, launch: resources.Launch) -> resources.LaunchPla
 
 
 def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, tiles: int, *,
-          stages: int | tuple[int, int] | None, consumers: int = 1, producer: int | None = None,
+          stages: int | tuple[int, int] | None, consumers: int = 1,
           entry: int = 0) -> tuple[resources.LaunchPlan | None, int, resources.Launch]:
     """A launch's plan, its programs and what its plan read (`resources.Launch`, its streams `scope`d at each
     depth and its stated `registers`): a persistent launch's (`stages` None) as many as a multiprocessor
@@ -745,17 +755,16 @@ def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, t
     A100's launches held one program each, a quarter of the warps fla's held, SE-family-a100-8c5b5b16a);
     any other a program a tile at its `stages`, or at the depth `resources.plan` takes between a `(floor,
     most)` pair's; None where no multiprocessor holds it (`_planned_launch`), a persistent launch then a
-    program a multiprocessor; its producer lowered to `producer` (`resources.Launch.producer`), its programs
-    launching with `entry` registers a thread at least (`resources.Launch.entry`)."""
+    program a multiprocessor; planned at setmaxnreg's least producer, its programs launching with `entry`
+    registers a thread at least (`resources.Launch.entry`)."""
     if stages is None:
         most = 1 if call.family.walks_scoped else 2
-        launch = resources.Launch(scope, 1, registers, floor=1, most=most, producer=producer, entry=entry)
+        launch = resources.Launch(scope, 1, registers, floor=1, most=most, entry=entry)
         found = _planned_launch(call, launch)
         held = (call.target.multiprocessors or 1) * (found.programs if found else 1)
         return found, min(tiles, held), launch
     floor, most = stages if isinstance(stages, tuple) else (stages, stages)
-    launch = resources.Launch(scope, consumers, registers, floor=floor, most=most, producer=producer,
-                              entry=entry)
+    launch = resources.Launch(scope, consumers, registers, floor=floor, most=most, entry=entry)
     return _planned_launch(call, launch), tiles, launch
 
 
@@ -781,9 +790,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                   steps: float, model: float, held: Held, staging: tuple = (), once: dict | None = None,
                   landing: dict | None = None, persistent: bool = False, reduces: bool = True,
                   after: tuple = (), consumers: int = 1, swizzles: dict[str, int] | None = None,
-                  name: str | None = None, issues: bool = True,
-                  producer: int | None = None, ringed: bool = False, together: tuple[int, ...] = (),
-                  sums: tuple[int, ...] = ()):
+                  name: str | None = None, issues: bool = True, ringed: bool = False,
+                  together: tuple[int, ...] = (), sums: tuple[int, ...] = ()):
     """`program(at, *refs, streams, staging, landing)` as a kernel over `grid`, `at` a tile's indices by the
     grid's axis names, run where `live(at, refs)` holds (a laid call's chunks and sequences are as many as its
     worst case, most of them empty): its streams' allocations (of `blocks`, `stages` deep, and of `once`'s
@@ -796,14 +804,13 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     is its kernel's emission (`emission.costed`) over the `steps` its walk takes a tile, each of its consumer
     roles taking each on its share (`cost.Stated`: a sequence's chunks, a laid call's mean over its
     sequences); `model` is the model's FLOPs a tile, which it declares to Dew's FLOP count apart
-    (`Family.kernel`'s `model_flops`). Its
-    producer is lowered to `producer` (`resources.Launch.producer`), and its programs launch with the
-    registers its products assemble at least (`Held.entry`, `resources.Launch.entry`).
+    (`Family.kernel`'s `model_flops`). Its producer lowers to the registers its call's tiles certified for
+    it (`Call.producers`, by its name; `resources.producer_floor` where none), and its programs launch with
+    the registers its products assemble at least (`Held.entry`, `resources.Launch.entry`).
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
     once, its streams' rings running on across them (`_planned_launch`): the family's `persist` takes each
-    tile's walk from its program at the tile's indices (`_tile_at`), its producer at `PERSISTENT_PRODUCER`
-    where no floor is given. A program that `reduces` none takes no
+    tile's walk from its program at the tile's indices (`_tile_at`). A program that `reduces` none takes no
     reduction scratch (`_scope`; the compile gate holds its plan's shared memory to at least the compiled
     kernel's).
     `after` are the `(shape, dtype)` tiles its program scopes after its walks (`final_memory_landing`), which
@@ -816,8 +823,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     sums its walk holds across its steps (`mosaic.Walk.sums`), which a family keeping them in memory of its
     own scopes there (`Issuer.keeps_sums`)."""
     family = call.family
-    if persistent and producer is None:
-        producer = stated_producer(call, PERSISTENT_PRODUCER)
+    name = name or f"recurrence{program.__qualname__.split('.')[0]}"
+    producer = call.producers.of(name)
     staging = halves_tiled(family, staging)
     registers = held.registers(family, addressed(staging, landing or {}))
     allocations, scope, staging, landing = shared_allocation(call, blocks, staging, landing or {}, once=once,
@@ -827,15 +834,17 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     tiles = math.prod(grid)
     threads = 128 * family.warpgroups(consumers)
 
+    # Planned at setmaxnreg's least: a raised producer moves registers within a program's pool, which its
+    # entry sets and so how many programs a multiprocessor holds, and its consumers' share beside it is the
+    # assembler's to certify (`template.Mosaic._raised`), not the model's.
     found, programs, planning = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
-                                      consumers=consumers, producer=producer, entry=held.entry(family))
+                                      consumers=consumers, entry=held.entry(family))
     # Where no multiprocessor holds the launch, its record says so (`Launch.resident` zero), which the
     # template's legality refuses, and it builds at its shallowest depth, as a probe of the config compiles
     # it.
     shallowest = 1 if persistent else stages[0] if isinstance(stages, tuple) else stages
     stages = found.stages if found else shallowest
     streams = allocations(stages)
-    name = name or f"recurrence{program.__qualname__.split('.')[0]}"
     collected = PLANNED.get()
     if collected is not None:
         def recorded(*arrays):
@@ -1736,10 +1745,9 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
 
     # Where the keys take the write gate, the corrected values are the values as given: none stored.
     stores_corrected = not call.gated_keys
-    # Its producer's floor, the one value its plan and its walk's schedule read (`stated_producer`): 48, its
-    # loads spilling at 24 (60 bytes on Nemotron-H 4B's fp32 states, 52 on GDN's and 44 on KDA's bf16; none
-    # at 40 or 48, jsf-states-held, jsf-pfloor-ab).
-    producer = stated_producer(call, 48)
+    # Its producer's registers, the one value its plan and its walk's schedule read, as its tiles certified
+    # them (`Call.producer`).
+    producer = call.producer(_states)
 
     def program(at, k_ref, w_ref, u_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, taken_ref, *refs,
                 streams, staging, landing):
@@ -1816,9 +1824,9 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
                                      bv, row, lambda role: roled(role)[1].get("table")))
 
     launched, stored = stored_split(table, _states_launched(
-        program, call, tiles, delta, keys, values, batch, sequences.shape[0], stores_corrected, table,
-        producer)(k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken,
-                  *(() if table is None else table.operands)))
+        program, call, tiles, delta, keys, values, batch, sequences.shape[0], stores_corrected, table)(
+        k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken,
+        *(() if table is None else table.operands)))
     if stores_corrected:
         return (*launched, stored)
     assert jnp.dtype(u.dtype) == held.dtype, "the values as given are held so (`Call.gated_keys`)"
@@ -1827,8 +1835,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
 
 
 def _states_launched(program, call: Call, tiles: Tiles, delta: bool, keys: Operand, values: Operand,
-                     batch: int, sequences: int, stores_corrected: bool, table: Table | None,
-                     producer: int | None):
+                     batch: int, sequences: int, stores_corrected: bool, table: Table | None):
     """`_states`' `program` launched (`launch_kernel`): its outputs (the memories, the corrected values where
     it stores them, the final memories, and a forked call's stored slots where its `table` holds any), its
     streamed blocks and its initial memories' at `tiles`, its staging and landing tiles (a stored slot's,
@@ -1864,28 +1871,7 @@ def _states_launched(program, call: Call, tiles: Tiles, delta: bool, keys: Opera
                          held=table_held(_states_held(call, values, keys, bv), call, table, bv),
                          once=initials, landing=landing, after=after,
                          # Its last write's column sums an fp32 call's alone (`column_sums`).
-                         reduces=held.parts > 1, producer=producer)
-
-
-PERSISTENT_PRODUCER = 32
-"""The floor a persistent launch's producer lowers to on a family whose producers load past the floor
-(`stated_producer`): its walk over the program's tiles carries their indices and addresses, which at the 24
-registers of `resources.producer_floor` ptxas spilled (32 bytes, an `STL.64` of an address pair after the
-producer's `setmaxnreg` decrease) once a program walked three tiles or more, and allocated the consumers
-past their live set around it: on a compile-only sm100 the gated delta net's scores' gradient held at 240
-registers a consumer from 512 tokens against 168 with its producer at 32, Nemotron-H 4B's SSD scores'
-gradient spilled 16 bytes at its 248 from 2048 tokens against holding at 200, and its local products'
-gradient held at 240 against 104, their consumers' live peaks the same at either floor (161 for the delta
-net's); 40, 48 and 64 gave 32's (row 5693, armada at 816a3c6d3f1). The gated delta net's 16-bit solve, one
-tile a program, spilled 164 bytes at 24 and none from 32. A consumer's raise at one program a multiprocessor
-stays 248; at two it is 224, 232 at 24."""
-
-
-def stated_producer(call: Call, registers: int) -> int | None:
-    """`registers`, the floor a launch's producer lowers to on a family whose producers load past the floor
-    (`Issuer.loads_past_floor`, tcgen05's: its issue loop's live set, as ptxas assembled it), else None
-    (`resources.producer_floor`'s 24, which a warpgroup MMA's and mma.sync's launches hold)."""
-    return registers if call.family.loads_past_floor else None
+                         reduces=held.parts > 1)
 
 
 def _scan_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
@@ -1950,7 +1936,7 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
     assert delta == call.delta, "the delta rule's walk corrects its values from the chunks' inverses"
     values = keys = call.given
     skipped = int(skip is not None)
-    producer = _scan_producer(call)
+    producer = call.producer(_scan)
 
     def program(at, q_ref, k_ref, a_ref, v_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, taken_ref, *refs,
                 streams, staging, landing):
@@ -2030,7 +2016,7 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
                                      bv, row, lambda role: roled(role)[1].get("table")))
 
     launched = _scan_launched(program, call, tiles, out_dtype, sequences=sequences.shape[0], batch=batch,
-                              table=table, producer=producer)(
+                              table=table)(
         q, k, k if a is None else a, v, hi, lo, beta, h0, sequences, taken,
         *(() if skip is None else (skip.astype(jnp.float32),)), *(() if table is None else table.operands))
     # The output and final memories; a forked call's stored slots no caller reads.
@@ -2056,21 +2042,14 @@ def _scan_corrected(call: Call, slots, tile, bv: int, state, prefix: tuple, beta
     return algebra.corrected(written, None, state, held.dtype, issue)
 
 
-def _scan_producer(call: Call) -> int | None:
-    """`_scan`'s producer's floor (`stated_producer`): 80, its loads spilling at 24 to 64 (52 bytes on a
-    B200's 27B GDN and Nemotron-H 4B SSD forwards), 16 at 72, none at 80 (rows 5357 and 5355, armada
-    20261110172539-d12d4eb1 and 20261110172902-73ad9c43)."""
-    return stated_producer(call, 80)
-
-
 def scan_holds(call: Call, tiles: Tiles, out_dtype, table: Table | None) -> bool:
     """Whether `_scan`'s consumer threads at `tiles` hold their registers (its model, `_scan_planned`'s,
-    within `Family.registers` at its roles beside its producer's floor, `_scan_producer`), its output landing
+    within `Family.registers` at its roles beside its producer's, `Call.producer`), its output landing
     in `out_dtype`: a forked call's forward walks its states and output in one launch only where it does
     (`chunk_forward.prepared`), else in two."""
     staging, landing, _, held = _scan_planned(call, tiles, out_dtype, table)
     return held.registers(call.family, addressed(staging, landing)) <= call.family.registers(
-        tiles.walkers, producer=_scan_producer(call))
+        tiles.walkers, producer=call.producer(_scan))
 
 
 def _scan_planned(call: Call, tiles: Tiles, out_dtype, table: Table | None) -> tuple:
@@ -2090,7 +2069,7 @@ def _scan_planned(call: Call, tiles: Tiles, out_dtype, table: Table | None) -> t
 
 
 def _scan_launched(program, call: Call, tiles: Tiles, out_dtype, *, sequences: int, batch: int,
-                   table: Table | None, producer: int | None):
+                   table: Table | None):
     """`_scan`'s `program` launched (`launch_kernel`): its plan (`_scan_planned`), its walk over the laid
     sequences' mean of chunks, and its outputs (the output, the final memories, and a forked call's stored
     slots where its `table` holds any)."""
@@ -2121,7 +2100,6 @@ def _scan_launched(program, call: Call, tiles: Tiles, out_dtype, *, sequences: i
                          live=sequence_live(8),
                          steps=steps, model=model,
                          consumers=walkers, staging=staging, held=modelled,
-                         once=initials, landing=landing, after=after, reduces=held.parts > 1,
-                         producer=producer)
+                         once=initials, landing=landing, after=after, reduces=held.parts > 1)
 
 

@@ -104,6 +104,9 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
         program, family=backward_family(bundles.named(dkv_tiles.family, query.dtype), dkv_tiles),
         tiles=dkv_tiles),
         consumers=dkv_tiles.consumers)
+    # The dK/dV launch's readers by its own blocks where it has them (`BackwardTiles.dkv_blocks`).
+    dkv_spans = (spans if (dkv_tiles.block_q, dkv_tiles.block_k) == (tiles.block_q, tiles.block_k)
+                 else _spans_of(spec, padded, dkv_tiles.block_q, dkv_tiles.block_k, readers=True))
     if walk.fused:
         if tiles.shared_keys:
             dq, dk, dv = _coop_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
@@ -112,7 +115,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
             # The fused launch keys first on its own layout (`BackwardTiles.dkv`): its consumers' shares of a
             # slot's queries each a warpgroup MMA's rows, dQ added a tile at a time.
             dq, dk, dv = _dkv_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
-                                     spans, score_params, drop, scaled, walk=dkv_walk)
+                                     dkv_spans, score_params, drop, scaled, walk=dkv_walk)
         else:
             dq, dk, dv = _fused_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
                                        spans, drop, walk=walk)
@@ -130,7 +133,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                                                                   (total0, initial_term), maximum, anchor,
                                                                   delta, accurate=accurate)
     dk, dv, *key_tile = _dkv_launch(query, key, value, dout, maximum, denominator, anchor, refined, chosen,
-                                    spans, score_params, drop, scaled, walk=dkv_walk)
+                                    dkv_spans, score_params, drop, scaled, walk=dkv_walk)
     summed_kinds = [kind for kind in score_kinds if kind in DQ_GRADS]
     head_query = tuple(grad.sum(axis=-1)[None, :, :, None] if kind == Kind.HEAD else grad
                        for grad, kind in zip(dq_grads, summed_kinds, strict=True))

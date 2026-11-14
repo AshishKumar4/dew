@@ -711,7 +711,7 @@ class Issuer[Accumulator](abc.ABC):
         """The rows a walked tile (a forward's keys) comes in whole multiples of: the products' rows, which a
         consumer's weights' product takes as its depth (wgmma's and the chunks' 64, mma.sync's 16); a family
         whose products a role issues takes its weights from tensor memory, a swizzle tile's 64 rows of a
-        16-bit stream (`Tcgen05Placed`)."""
+        16-bit stream (`placed.Tcgen05Placed`)."""
         return self.rows
 
     @property
@@ -763,13 +763,6 @@ class Issuer[Accumulator](abc.ABC):
         returned = plgpu.ShapeDtypeStruct(tile.shape, tile.dtype, layout=self.layout)
         return plgpu.inline_mgpu(arg_types=(self.layout, plgpu.Layout.WG_SPLAT(())), return_type=returned)(
             shifted)(tile, jnp.asarray(shift, jnp.int32))
-
-    loads_past_floor: bool = False
-    """Whether this is an issuer on which some launches' producers hold more than `resources.producer_floor`'s
-    registers in their issue loop: each such launch states its floor where a receipt shows the need
-    (`Launch.producer`), and the compile gate holds the rest to the default (`producer_failures`, spills).
-    tcgen05's: the recurrence's states, solve and reverse walk spilled 52, 164 and 40 bytes at 24 on sm100
-    (row 5357), its other launches spill-free at 24; none of warpgroup MMA's or mma.sync's."""
 
     def entry_floor(self, tiles) -> int:
         """The least registers a thread a program issuing products into a consumer's fp32 `tiles` (each
