@@ -481,13 +481,14 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     assert copies > 0 and held[0] - held[1] == copies
 
 
-def test_a_step_that_does_not_fit_drops_its_copies_before_it_recomputes(monkeypatch):
+def test_a_step_that_does_not_fit_drops_its_copies_before_it_recomputes_where_that_frees_bytes(monkeypatch):
     """The narrow copies are the fit ladder's first rung. In the geometry of row 1661's run, a window of
-    two steps, a step that does not fit with its copies drops them before it recomputes more, and its plan
-    says so (`narrow`), on devices that hold the step fully recomputed without its copies alone. Whether
-    the drop gives bytes back is the backend's: on a CPU it does, the step's casts fused into their uses;
-    on a GPU the step casts its weights whole, holding no fewer (a GH200: 68.352 MB without its copies,
-    68.344 MB with them, row 5041), and the ladder goes on to recompute."""
+    two steps, a step that does not fit with its copies drops them before it recomputes more, and keeps
+    them dropped where the step without them holds fewer temporaries; where it holds no fewer, the copies
+    come back, their 1-2% of a step kept, and the ladder recomputes with them. The plan says which
+    (`narrow`). On a CPU the drop frees bytes, the step's casts fused into their uses; on a GPU the step
+    casts its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with them, rows
+    5041, train 857 F2). The devices hold the step fully recomputed, with its copies or without."""
     free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
@@ -495,14 +496,15 @@ def test_a_step_that_does_not_fit_drops_its_copies_before_it_recomputes(monkeypa
     def trained(*, copies, remat):
         return _trained(ADAM_3, copies=copies, steps=1, accumulation=2, split=1, remat=remat)
 
-    _, _, recomputed = trained(copies=False, remat="full")
-    free -= recomputed.plan["probes"][0]["headroom"]
+    free -= min(trained(copies=copies, remat="full")[2].plan["probes"][0]["headroom"]
+                for copies in (True, False))
     state, _, trainer = trained(copies=True, remat=None)
     probes = trainer.plan["probes"]
     first, second = probes[0], probes[1]
     assert (first["narrow"], first["fits"], second["narrow"]) == (True, False, False)
     assert second["remat"] == first["remat"] and probes[-1]["fits"] is True
-    assert trainer.plan["narrow"] is False and state.compute is None
+    assert trainer.plan["narrow"] is (second["temp"] >= first["temp"])
+    assert (state.compute is None) is not trainer.plan["narrow"]
 
 
 def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monkeypatch):

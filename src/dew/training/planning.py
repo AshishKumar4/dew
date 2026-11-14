@@ -693,6 +693,11 @@ class FitSearch[LossT, EffectsT]:
     gather: Callable[[object], list] = from_every_process
     """How every process's figure is read (`from_every_process`), so each asks the same split."""
     misses: dict[tuple[str, int], MemoryMiss] = dataclasses.field(default_factory=dict)
+    dropped_from: str | None = None
+    """The rung (`rung`) the search dropped the narrow copies from, whose miss at a split the step without
+    them must hold fewer temporaries than for the drop to stand (`copies_freed`)."""
+    copies_kept: bool = False
+    """Whether the copies came back after their drop freed nothing, so no later rung drops them again."""
     """What each compile that did not fit read, by its rung and split (`MemoryMiss`), which names the split
     the search asks next (`after`)."""
     chosen: jax.stages.CompilerOptions | None = None
@@ -983,10 +988,20 @@ class FitSearch[LossT, EffectsT]:
 
     def climb(self) -> bool:
         # The first rung drops the narrow copies, two bytes a parameter held all run for 1-2% of a step.
-        if self.narrow and any(candidate.copies for candidate in self.lowered.values()):
-            self.narrow = False
+        copied = any(candidate.copies for candidate in self.lowered.values())
+        if self.narrow and not self.copies_kept and copied:
+            self.dropped_from, self.narrow = self.rung(), False
             self.lowered.clear()
             return True
+        if self.dropped_from is not None and self.copies_freed():
+            self.dropped_from = None
+        elif self.dropped_from is not None:
+            # Dropped, the step held no fewer temporaries at the split both missed at: on a GPU the step
+            # casts its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with
+            # them), so the copies come back, their 1-2% of a step kept, and the ladder climbs on with them.
+            _log.warning("the step's narrow copies free nothing it needs: it keeps them and climbs on")
+            self.dropped_from, self.narrow, self.copies_kept = None, True, True
+            self.lowered.clear()
         # XLA's default options, but `required`, are the half rung above the step's own where those
         # are another program: the Triton GEMM fusions they keep can take fewer temporaries (sm89).
         if not self.xla_defaults and self.chosen != self.required:
@@ -995,6 +1010,18 @@ class FitSearch[LossT, EffectsT]:
         self.xla_defaults = False
         self.lowered.clear()
         return self.onward(self.compiled_again)
+
+    def copies_freed(self) -> bool:
+        """Whether dropping the narrow copies freed temporaries: the step without them, at the split it last
+        missed at, held fewer than with them at that split; True where either compile read no memory, the
+        drop standing as before. Every process gathers its verdict, as at every miss (`after`), so all keep
+        the copies or none."""
+        here = self.rung()
+        latest = next((miss for (rung, _), miss in reversed(self.misses.items()) if rung == here), None)
+        before = None if latest is None or self.dropped_from is None else self.misses.get(
+            (self.dropped_from, latest.split))
+        kept = before is not None and latest is not None and latest.scaled >= before.scaled
+        return not any(self.gather(kept))
 
     def compiled_again(self) -> bool:
         """Climb the objective one rung, as `recompute_more` does, saying it compiles the step again
