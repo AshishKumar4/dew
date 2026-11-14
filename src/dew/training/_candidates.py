@@ -1,8 +1,8 @@
 """The step a fit search lowers at each candidate (`dew.training.planning.FitSearch`): the loss traced
 once for its shapes and the narrow copies it reads (`prepared_for`), the state its window of microbatches
-pools, its program over one microbatch (`step_program`), lowered or traced for its footprint, with what the
-fit check holds beside it (`candidate_for`), and the same step lowered for a GPU this process lacks
-(`lowered_for`). The trainer reads each one's (`StepCompiler._planned`)."""
+pools, its program over one microbatch (`step_program`), lowered, with what the fit check holds beside it
+(`candidate_for`), and the same step lowered for a GPU this process lacks (`lowered_for`). The trainer
+reads each one's (`StepCompiler._planned`)."""
 
 from __future__ import annotations
 

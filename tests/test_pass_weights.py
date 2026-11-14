@@ -357,6 +357,36 @@ def test_a_phased_runs_later_phase_is_compiled_off_its_loop(monkeypatch, tmp_pat
         np.testing.assert_array_equal(mine, theirs)
 
 
+def test_a_plan_off_the_loop_traces_under_the_loops_thread_states():
+    """A later phase's plan off the loop (`dew.training.ahead.LaterPlans`) traces under the states the loop
+    traces under, which JAX holds per thread and a copied context does not carry: the run's numerics and
+    kernel choices (`dew.config.RunConfig.traced`) and JAX's default matmul precision, carried
+    (`dew._cache.carried`) and entered again in the worker (train 822 review F1)."""
+    import threading
+
+    from jax._src import config
+
+    from dew import _cache
+    from dew.nn.kernels import generation
+    from dew.nn.precision import Numerics
+
+    numerics = Numerics(matmul="highest")
+    with generation.run_precision(numerics), generation.chosen(attention="xla"):
+        entered = _cache.carried()
+        expected = (_cache.NUMERICS.value, _cache.KERNEL_CHOICES.value, config.default_matmul_precision.value)
+    seen = []
+
+    def worker() -> None:
+        with entered():
+            seen.append((_cache.NUMERICS.value, _cache.KERNEL_CHOICES.value,
+                         config.default_matmul_precision.value))
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert seen == [expected] and expected[0] == numerics and expected[1]
+
+
 def test_a_phase_whose_program_plans_other_copies_counts_them_built_in_its_fit(monkeypatch):
     """A run whose loop runs 3 passes in its first phase and 1 in its second, in bf16 over fp32 weights with
     narrow copies on: the second phase's program plans other copies than the first's, which its step makes

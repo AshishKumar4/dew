@@ -553,7 +553,7 @@ def temporaries_factor(mesh: Mesh) -> int:
 
 def pooled_headroom(headroom: int | None) -> int | None:
     """The pool's headroom, the same on every process: the tightest any process states of its own devices
-    (`headroom`, a compile's measure or a derivation's judgment), which reads only its own devices' memory;
+    (`headroom`, a compile's measure), which reads only its own devices' memory;
     a process that states none does not affect it, and None where none states one."""
     from dew._coordination import from_every_process
 
@@ -627,18 +627,11 @@ def recompute_more[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     return climbed(objective, base) is not None
 
 
-def headed_more[LossT, EffectsT](objective: Objective[LossT, EffectsT],
-                                  base: tuple[int, int] | None = None) -> bool:
-    """Move the objective one rung up its ladder where the rung is its head's (`climbed`'s without its
-    remat), and return whether there was one: a run that states its remat climbs no further."""
-    return climbed(objective, base, remat=False) is not None
-
-
 def climbed[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                              base: tuple[int, int] | None = None, *, remat: bool = True) -> str | None:
     """Move the objective one rung up its ladder as `recompute_more` does, and say what it moved to,
     None where there was no rung: the words a search that compiles again there logs
-    (`dew.training.planning.FitSearch.climb`), which a derivation's walk, compiling nothing, does not.
+    (`dew.training.planning.FitSearch.climb`).
     Without `remat` the ladder ends at its head's rungs (the generation's tile for the whole logits, then
     that tile unfused): a run that states its remat keeps it (docs/design/training.md, every choice can be
     overridden)."""
