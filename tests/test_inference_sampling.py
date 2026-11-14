@@ -368,7 +368,7 @@ def test_prompts_inside_one_bucket_trace_once_and_draw_what_their_own_width_draw
     exact = {width: generate(roomy.model, roomy.variables, ramp(width), 8, key=0,
                              sampling=roomy.sampling) for width in (100, 120)}
     drawn = {100: roomy(ramp(100), 8, key=0)}
-    # The bucket's second prompt runs the executable its first compiled (`dew.inference.tasks._checked`).
+    # The bucket's second prompt runs the executable its first compiled (`dew.sampling.text._checked`).
     with Compiles("_checked") as again:
         drawn[120] = roomy(ramp(120), 8, key=0)
     assert again.count == 0
