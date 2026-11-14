@@ -73,9 +73,11 @@ def compiler_params(*, approx_math: bool = False, reduction_scratch: int = 0,
     bytes, which Mosaic GPU splits between the block's warpgroups; with none, such a reduction fails to
     lower rather than share one. `resident`, the programs a multiprocessor holds at once, caps each thread's
     registers so that many fit its register file (CUDA's `__launch_bounds__` minimum blocks, Mosaic GPU's
-    `min_blocks_per_sm`, nvvm.minctasm); at one, ptxas takes up to 255."""
+    `min_blocks_per_sm`, nvvm.minctasm); at one, ptxas takes up to 255. The launch tracing it travels as the
+    call's metadata (`report.launch_metadata`), beside the kernel's name."""
     return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math,
-                                reduction_scratch_bytes=reduction_scratch, min_blocks_per_sm=resident)
+                                reduction_scratch_bytes=reduction_scratch, min_blocks_per_sm=resident,
+                                metadata=report.launch_metadata())
 
 
 def cluster_index(cluster: int) -> jax.Array | int:

@@ -602,6 +602,18 @@ class Mosaic(base.Template[mainloop.Tiles]):
             tiles = _producing(tiles, raised)
         return tiles
 
+    def emitted(self, config: Hashable, kernel: str) -> Hashable:
+        """What `kernel` reads of `config` as it is emitted: all of it but the other launches' producers
+        (`Tiles.producers`, each launch's own setmaxnreg cap), so a producer's raise leaves every other kernel
+        of the launch the module it was, which a rung's certification then reads from the lowering cache and
+        Mosaic's compile (`rungs`): a rung re-lowered and recompiled every kernel of the 4B's training launch,
+        7 and 5 s of each 12."""
+        if not self._typed(config):
+            return config
+        owner = _owner(kernel, dict(config.producers.raised_to))
+        return _producing(config, resources.Producers(tuple(
+            (launch, cap) for launch, cap in config.producers.raised_to if launch == owner)))
+
     def rungs(self, ba: tokamax.BoundArguments, config: Hashable) -> Iterator[mainloop.Tiles]:
         """The tiles a refused `config`'s spilling launches' producers rise through, a setmaxnreg step a rung
         (`_raised`), up to the most their consumers' least share allows, each planned as it is asked for: the
@@ -885,12 +897,16 @@ def _spilled(op, ba: tokamax.BoundArguments, tiles: mainloop.Tiles) -> frozenset
                                             else frozenset())
 
 
+def _owner(kernel: str, names: Iterable[str]) -> str | None:
+    """The launch of `names` that ran `kernel`: the longest it starts with, a name another launch's extends
+    (`recurrence_intra` beside `recurrence_intra_solve`) owning only its own."""
+    return next((name for name in sorted(names, key=len, reverse=True) if kernel.startswith(name)), None)
+
+
 def _owners(kernels: Iterable[str], launches: Iterable[mainloop.Launch]) -> frozenset[str]:
-    """The launches that ran `kernels`, by name: each kernel's the longest launch name it starts with, a name
-    another launch's extends (`recurrence_intra` beside `recurrence_intra_solve`) owning only its own."""
-    names = sorted({launch.name for launch in launches}, key=len, reverse=True)
-    return frozenset(owner for kernel in kernels
-                     if (owner := next((name for name in names if kernel.startswith(name)), None)))
+    """The launches that ran `kernels`, by name (`_owner`)."""
+    names = {launch.name for launch in launches}
+    return frozenset(owner for kernel in kernels if (owner := _owner(kernel, names)))
 
 
 def _producing(tiles: mainloop.Tiles, producers: resources.Producers) -> mainloop.Tiles:

@@ -612,6 +612,15 @@ class KernelOp(tokamax.Op):
             config = stepped
         return config
 
+    def emitted(self, config: Hashable, kernel: str) -> Hashable:
+        """What the kernel named `kernel` reads of `config` as it is emitted, its identity's part beside its
+        launch's (`report.named`): the whole config, unless the op states a part of it each kernel reads
+        alone, so that a change to one kernel's part leaves every other kernel the module it was. A stated
+        part that leaves out what its kernel reads would serve a stale kernel; the gate's property holds it
+        (test_recurrence_mosaic's one module a kernel's identity)."""
+        del kernel
+        return config
+
     def rungs(self, ba: tokamax.BoundArguments, config: Hashable) -> Iterator[Hashable]:
         """The configs above a refused `config` its derivation steps through in turn, each the same launch
         with one more of a resource the assembler alone decides (a recurrence's producer registers, a

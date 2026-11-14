@@ -12,6 +12,7 @@ GPU's interpreter on the interpreted target's bundle (`mainloop.issued`) at one 
 roles' streams, not proof of its kernels, which the GPU gate is;
 the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
 
+import collections
 import dataclasses
 import functools
 import types
@@ -1639,6 +1640,52 @@ def test_a_launch_whose_producer_must_rise_climbs_its_ladder_a_round_at_a_time()
     # The first config's round, then the ladder's: as many as its rungs fill at the host's round size.
     rounds = {each.round for each in certified}
     assert len(rounds) <= 1 + -(-len(climbed) // report.rung_round()), (rounds, len(climbed))
+
+
+@lowers('sm100')
+@pytest.mark.parametrize('target', ['sm100', 'sm90'])
+def test_a_kernel_named_alike_at_every_rung_is_one_module(target):
+    """Each 16-bit gate geometry's training call at its derived tiles and at every rung of each launch's
+    producer ladder alone (`Mosaic._raised`, a setmaxnreg step a rung), lowered afresh: a kernel whose
+    identity (`report.named`: the launch's and what its emission reads of the config, `Mosaic.emitted`) is
+    alike at two configs is one module at both, so a rung's certification may read every kernel it leaves
+    alone from the lowering cache and Mosaic's compile; one the rung raises is another module."""
+    from dew.nn.kernels.lowered import kernel_calls
+
+    facts = generation.gpu_target(target)
+    unchanged = raised = 0
+    for name in [name for name in RESOURCE_SHAPES if name != 'a 192-wide value head']:
+        operands = resource_operands(name, jnp.bfloat16, 1, 4096)[:5]
+        form = {**_form(name, jnp.bfloat16), **_skipped(name, jnp.bfloat16)}
+        bound = template.MOSAIC.bind(*operands, None, bound=1.0, **form)
+        with generation.assumed(facts), report.refusals():
+            tiles = template.MOSAIC.derived(bound, facts)
+            if tiles is None:
+                continue
+            ladders = [tiles]
+            for launch in template.MOSAIC.launches(bound, tiles, facts, backward=True):
+                rung = tiles
+                while (up := template.MOSAIC._raised(bound, rung, frozenset({launch.name}),
+                                                     facts)) is not None:
+                    rung = template._producing(rung, up)
+                    ladders.append(rung)
+            modules: dict[tuple[str, str], set[bytes]] = collections.defaultdict(set)
+            for config in ladders:
+                def loss(*given, config=config, form=form):
+                    out, final = mosaic_rule(*given, tiles=config, bound=1.0, **form)
+                    return out.astype(jnp.float32).sum() + final.sum()
+
+                # A lowering cache's hit is the module its lowering gives: its key is all the lowering reads.
+                program = jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(*operands).lower(
+                    lowering_platforms=('cuda',))
+                for call in kernel_calls(program, unrun=True):
+                    if call.kind == 'mosaic_gpu':
+                        modules[call.name, repr(template.MOSAIC.emitted(config, call.name))].add(call.ir)
+        assert all(len(found) == 1 for found in modules.values()), name
+        named = collections.Counter(kernel for kernel, _ in modules)
+        unchanged += sum(1 for kernel, _ in modules if named[kernel] == 1)
+        raised += sum(1 for kernel in named if named[kernel] > 1)
+    assert unchanged and raised, (unchanged, raised)
 
 
 def test_a_spilling_kernel_raises_only_the_launch_it_belongs_to():
