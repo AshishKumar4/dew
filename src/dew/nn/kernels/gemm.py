@@ -36,6 +36,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
 
@@ -267,6 +268,63 @@ def _nvfp4_gemm(lhs, matrix: "NvFp4", group_sizes, *, epilogue, epilogue_operand
         sizes = jnp.asarray([summed.shape[0]], jnp.int32) if group_sizes is None else group_sizes
         [summed] = _tupled(epilogue, summed, *_rows(arrays, axes, sizes, summed.shape[0]))
     return scattered(summed.astype(out_dtype), scatter)
+
+
+BATCHED_ROW = 'ledger 5972'
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchedCase:
+    """A batched product as its selector reads it (`BATCHED`): its operands' dtype, and whether its left
+    operand contracts its last axis (`rows`: the template's rows, unmoved)."""
+
+    dtype: jnp.dtype
+    rows: bool
+
+
+BATCHED: selection.Op[BatchedCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
+    selection.Kernel('mosaic', (
+        selection.Requirement(
+            'dtype', lambda case: case.dtype in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)),
+            lambda case: f"a batched product of {case.dtype} operands, where the template's grouped products "
+            "take 16-bit ones (a complex or wider one keeps XLA's dot, uncast)", BATCHED_ROW),
+        selection.Requirement(
+            'rows', lambda case: case.rows, "its left operand contracts an axis other than its last: the "
+            "template's rows would be a transposed copy", BATCHED_ROW),
+        selection.Requirement(
+            'measured', lambda case: False, "no receipt yet has the template's grouped product beat XLA's "
+            "batched dot (M-EM-47)", BATCHED_ROW, kind='measured'))),
+    selection.Kernel('xla', (), generic=True)))
+"""A batched product's selector (`batched_product`): the template's grouped product, its batches the groups,
+where a receipt names it; else XLA's dot as the caller wrote it."""
+
+
+def batched_product(a: jax.Array, b: jax.Array, contract: tuple[int, int], *,
+                    interpret_on_cpu: bool = False) -> jax.Array:
+    """`jax.lax.dot_general(a, b, ((contract[0],), (contract[1],)), (batch, batch))` over every leading axis
+    of `a` and `b` but their last two (`batch`, as many as there are, none for a plain product), contracting
+    `a`'s axis `contract[0]` with `b`'s `contract[1]`, each one of their last two: XLA's dot itself, or,
+    where the selector takes it (`BATCHED`), the template's grouped product of its batches, `a`'s rows
+    `[batches x m, k]` in equal groups by `b`'s matrices `[batches, k, n]` (`[batches, n, k]` read
+    transposed), in `a`'s dtype, summed in fp32 and rounded once. Muon's Newton-Schulz products' route
+    (dew/newton_schulz.py, row 5972)."""
+    last = a.ndim - 1
+    batch = tuple(range(a.ndim - 2))
+    if (b.ndim != a.ndim or a.shape[:-2] != b.shape[:-2] or {contract[0], contract[1]} - {last - 1, last}):
+        raise ValueError(f"a batched product of {a.shape} and {b.shape} over their leading axes contracts "
+                         f"one of each one's last two, not {contract}")
+    dimensions = (((contract[0],), (contract[1],)), (batch, batch))
+    taken = selection.select(BATCHED, BatchedCase(
+        jnp.dtype(a.dtype) if a.dtype == b.dtype else jnp.dtype(jnp.result_type(a, b)), contract[0] == last))
+    if taken.kernel != 'mosaic':
+        return jax.lax.dot_general(a, b, dimensions)
+    *batches, rows, depth = a.shape
+    count = int(np.prod(batches, dtype=np.int64))
+    matrices = b.reshape(count, *b.shape[-2:])
+    out = gemm(a.reshape(count * rows, depth), matrices if batches else matrices[0],
+               jnp.full((count,), rows, jnp.int32) if batches else None,
+               transpose_rhs=contract[1] == last, out_dtype=a.dtype, interpret_on_cpu=interpret_on_cpu)
+    return out.reshape(*batches, rows, out.shape[-1])
 
 
 def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, prologue=None,

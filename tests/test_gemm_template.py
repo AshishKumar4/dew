@@ -2461,3 +2461,4 @@ def test_each_familys_deepest_ring_compiles_within_its_resources(generation_name
     assert found[0].get("kernels"), found
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
+
