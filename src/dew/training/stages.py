@@ -797,8 +797,7 @@ class _Numbering:
 
 def _scan_counts(equation) -> tuple[int, int]:
     """A loop's (`scan`) count of constants and of carried values among its operands, as JAX's own
-    declaration of its operands splits them (`ft_in`), which the footprint and the compiled program read
-    too."""
+    declaration of its operands splits them (`ft_in`)."""
     consts, carries, _ = equation.params["ft_in"].update(range(len(equation.invars))).unpack()
     return len(consts), len(carries)
 

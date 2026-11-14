@@ -17,7 +17,7 @@ Compiler temporary bytes include activation and gradient workspaces. Device
 peak bytes are the allocator high-water mark for this fresh process, including
 initialization; they are not a pure activation-memory counter. The activation
 bytes are the residuals the loss's pullback keeps, its arguments left out
-(`jax.ad_checkpoint.saved_residuals`), before XLA scheduling and buffer reuse.
+(JAX's `saved_residuals`, `jax.ad_checkpoint.print_saved_residuals`'s), before XLA scheduling and buffer reuse.
 
 RTX 4080 16 GiB, driver 595.84, JAX/jaxlib 0.11.1, Flax 0.12.9, Optax
 0.2.8: default dimensions with --dtype bfloat16 (FP32 master weights),
@@ -47,7 +47,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from jax.ad_checkpoint import saved_residuals
+from jax._src.ad_checkpoint import saved_residuals
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, Mixture

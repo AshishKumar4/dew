@@ -406,6 +406,36 @@ cache would hand a later plain call of the same shapes, and a plain trace a
 quantized call. In this context their traces are kept apart."""
 
 
+TRACED = (KERNEL_TUNES, ALGEBRA, DERIVED, WHOLE, PLACING, KERNEL_PINS, KERNEL_ASSUMED, KERNEL_CHOICES,
+          NUMERICS, PROJECTION_ROLE, QUANTIZED_TRACE)
+"""The contexts a program's trace reads, beside the contexts it records into (`RECORDING`): JAX keys its
+caches on each, and each holds per thread, so a trace in another thread (a run's later phases planned off
+its loop, `dew.training.ahead.LaterPlans`) reads them as its loop did only where they are carried
+(`carried`)."""
+
+
+def carried() -> Callable[[], contextlib.AbstractContextManager[None]]:
+    """This thread's trace-affecting states as they stand (`TRACED`, and JAX's default matmul precision and
+    x64, which hold per thread too), entered again by what this returns in another thread: a run's numerics
+    and kernel choices (`dew.config.RunConfig.traced`) among them, so a program it traces there is the one
+    its loop traces, under the same keys."""
+    from jax._src import config
+
+    held = [(context, context.value) for context in TRACED]
+    states = [(state, state.value) for state in (config.default_matmul_precision, config.enable_x64)]
+
+    @contextlib.contextmanager
+    def entered() -> Iterator[None]:
+        with contextlib.ExitStack() as stack:
+            for context, value in held:
+                stack.enter_context(context(value))
+            for state, value in states:
+                stack.enter_context(state(value))
+            yield
+
+    return entered
+
+
 def unintercepted[**Arguments, Result](function: Callable[Arguments, Result]) -> Callable[Arguments, Result]:
     """`function` run with a quantization provider's interception off, where Qwix is loaded (its
     `disable_interceptions`, qwix/_src/interception.py): a trace of Dew's own, a derivation's declaration

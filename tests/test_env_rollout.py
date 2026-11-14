@@ -242,11 +242,14 @@ def test_ppo_trains_on_a_filled_batchs_real_sequences_alone():
 def test_ppo_split_step_preserves_whitening_draws_and_mid_window_resume(tmp_path):
     """Splitting a PPO step into microbatches whitens advantages over the logical minibatch (so two
     one-step sequences of advantages [1, 3] do not collapse to [0, 0] in singleton microbatches), draws
-    identical per-example entropy noise, and resumes mid-window from its stored `batch_statistics`."""
+    identical per-example entropy noise, adds no forward-to-backward residuals to a microbatch's loss over
+    the same rows unsplit, and resumes mid-window from its stored `batch_statistics`."""
+    from jax._src.ad_checkpoint import saved_residuals
     from rl_split_support import assert_mid_window_resume, recorded_step_tapes
 
     from dew.distributed.placement import MeshSpec
     from dew.training import Trainer
+    from dew.training.transaction import traced_loss
 
     actor_only = ControlPPOObjective(ActorCritic(1, (8,), (8,)), 2, discount=0.9, value_cost=0.0,
                                      entropy_cost=0.0)
@@ -282,6 +285,19 @@ def test_ppo_split_step_preserves_whitening_draws_and_mid_window_resume(tmp_path
     np.testing.assert_array_equal(split_tapes["entropy noise"], whole_tapes["entropy noise"])
 
     assert_mid_window_resume(objective, batch_a, batch_b, str(tmp_path / "mid"))
+
+    def residuals(split: int) -> list:
+        # What the loss's pullback saves of one microbatch of two rows, read as one of a split of four or
+        # as the whole step (`traced_loss`, the step's own loss), its arguments left out.
+        state = Trainer(objective, optax.adam(1e-2), key=jax.random.key(8), split=split, checkpoints=None,
+                        tracker=None).initial_state()
+        loss, (variables, *rest) = traced_loss(objective, state, split, split)
+        rows = jax.tree.map(lambda leaf: leaf[:2], batch_a)
+        saved = saved_residuals(lambda held: loss(held, rows, *rest)[0], variables)
+        return sorted((tuple(aval.shape), str(aval.dtype)) for aval, source in saved
+                      if not source.startswith("from the argument"))
+
+    assert residuals(2) == residuals(1)
 
 
 @struct.dataclass
