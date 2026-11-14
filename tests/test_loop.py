@@ -16,6 +16,7 @@ from flax import linen as nn
 from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, with_gradients
 
+from dew.nn.backbones.call_metadata import prepared_embeddings
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 
@@ -323,7 +324,7 @@ def _theta_method(module, ids):
     first, end = loop.layers
     inputs = {"train": False, "decode": False, "per_layer_input": None,
               "attention_metadata": call_metadata(module, ids, *(False, *(None,) * 9))}
-    x = module._prepared(module.scaled_embeddings(module.token_embeddings(ids)), None)
+    x = prepared_embeddings(module.scaled_embeddings(module.token_embeddings(ids)), None)
     a = module.stack(x, span=(0, first), **inputs)
     h = module.stack(a, span=(first, end), **inputs)
     cut = None if loop.backprop_steps is None else loop.steps - loop.backprop_steps
@@ -394,7 +395,7 @@ def _unrolled_passes(module, ids):
     first, end = loop.layers
     inputs = {"train": False, "decode": False, "per_layer_input": None,
               "attention_metadata": call_metadata(module, ids, *(False, *(None,) * 9))}
-    x = module._prepared(module.scaled_embeddings(module.token_embeddings(ids)), None)
+    x = prepared_embeddings(module.scaled_embeddings(module.token_embeddings(ids)), None)
     h = module.stack(module.stack(x, span=(0, first), **inputs), span=(first, end), **inputs)
     cut = None if loop.backprop_steps is None else loop.steps - loop.backprop_steps
     logits, gates = [], []
@@ -499,7 +500,7 @@ def _passes_exiting(module, ids):
     first, end = loop.layers
     inputs = {"train": False, "decode": False, "per_layer_input": None,
               "attention_metadata": call_metadata(module, ids, *(False, *(None,) * 9))}
-    x = module._prepared(module.scaled_embeddings(module.token_embeddings(ids)), None)
+    x = prepared_embeddings(module.scaled_embeddings(module.token_embeddings(ids)), None)
     h = module.stack(module.stack(x, span=(0, first), **inputs), span=(first, end), **inputs)
     leaving, kept, chosen = [], 1.0, None
     for _ in range(loop.steps - 1):

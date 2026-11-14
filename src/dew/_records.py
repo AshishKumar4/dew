@@ -254,10 +254,13 @@ MOVED_CLASSES: Mapping[tuple[str, str], tuple[str, ...]] = {
     ("dew.inputs.encoders", "dew.interop.encoders"): ("CLIPText", "T5Text", "HFAudio"),
     ("dew.inputs.diffusion", "dew.interop.conditioners"): (
         "DiffusionConditioner", "QwenImageConditioner", "HiddenStatesConditioner", "WanConditioner"),
+    ("dew.config.trainer", "dew.interop.source_options"): (
+        "SourceOptions", "SourcePlacement", "SourceBuild", "SourceOptionsKeywords"),
 }
 """The classes an earlier Dew kept in another module, by that module and the one each is in now: the
 encoders that bind a released checkpoint, dew.interop's since row 5996, which a run's record, its steps'
-artifacts and its data plans named under dew.inputs. Carried to 1.0 with the other `earlier_*` readers."""
+artifacts and its data plans named under dew.inputs; a run's source options, dew.interop's since row 5999,
+which a run's record named under dew.config.trainer. Carried to 1.0 with the other `earlier_*` readers."""
 
 MOVED_PATHS: Mapping[str, str] = {
     f"{earlier}{separator}{name}": f"{now}{separator}{name}"

@@ -1746,14 +1746,18 @@ def test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention
         listed = {route.kernel for route in routes if route.site.endswith("._one_work_list")}
         return kernels, listed
 
+    # The routes each step's own program takes: the cache's allocation, traced for its shapes alone,
+    # reports none (`generation.unforced`).
     plain, listed = routes_of(model)
-    assert plain[Choice.PAGED_DECODE] - {"gathered"}, plain
-    assert listed == ({"template"} if step == "mixed" else set()), listed
-    owned, listed = routes_of(Quantization(dtype="int8").apply(model))
+    owned, owned_listed = routes_of(Quantization(dtype="int8").apply(model))
+    if step == "decode":
+        assert plain[Choice.PAGED_DECODE] - {"gathered"}, plain
+        assert owned[Choice.PAGED_DECODE] == {"gathered"}, owned
+    else:
+        assert listed == {"template"}, listed
     attended = owned[Choice.ATTENTION] | owned[Choice.DECODE]
-    assert owned[Choice.PAGED_DECODE] == {"gathered"}, owned
     assert attended and not attended & _whole_product_kernels(), owned
-    assert not listed, listed
+    assert not owned_listed, owned_listed
 
 
 def test_an_int8_attention_block_on_xla_is_on_par_with_the_reference_path(monkeypatch):

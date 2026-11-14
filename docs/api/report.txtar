@@ -383,7 +383,7 @@ dew.config.DecoderRunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
+  source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: dew.config.ObjectiveConfig | None = None
@@ -423,7 +423,7 @@ dew.config.RunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
+  source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: dew.config.ObjectiveConfig | None = None
@@ -438,7 +438,7 @@ dew.config.diffusion.DiffusionRunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
+  source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('diffusion', {'solver': to_record(EulerAncestral(), Solver)}))()
@@ -472,7 +472,7 @@ dew.config.env.EnvRunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
+  source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: TrainerConfig = (lambda: TrainerConfig(eval_every=None, checkpoint_every=None))()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('dew.objectives.rl.dreamer:DreamerV3Objective'))()
@@ -505,7 +505,7 @@ dew.config.jepa.JepaRunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
+  source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.001))()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('jepa'))()
@@ -526,7 +526,7 @@ dew.config.lm.LMRunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
+  source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.0006, weight_decay=0.1, clip_grads=1.0))()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('lm'))()
@@ -565,26 +565,11 @@ dew.config.lm.ServedRollout
   max_lag: int = 1
   sync_every: int = 1
   page_size: int | None = None
-dew.config.release.Release
-  task: Mapping[str, object] | None = None
-  layout: Mapping[str, object] | None = None
-  max_length: int | None = None
-  calibration: Mapping[str, object] | None = None
 dew.config.sweep.GridSearch
 dew.config.sweep.OptunaSearch
   seed: int = 0
 dew.config.sweep.RandomSearch
   seed: int = 0
-dew.config.trainer.SourceOptions
-  text_only: bool = False
-  prediction_depths: int | None = None
-  attention: dict[str, Literal['causal', 'block_bidirectional']] | None = None
-  dex: Annotated[DifferentialExtension, record_argument(DifferentialExtension)] | None = None
-  scan_layers: bool = False
-  packed_experts: bool = False
-  param_dtype: str | None = None
-  step: int | str | None = None
-  ema: bool | None = None
 dew.config.trainer.TrainerConfig
   name: str | None = None
   checkpoint_dir: str = './checkpoints'
@@ -641,7 +626,7 @@ dew.config.world_model.WorldModelRunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
+  source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('dew.objectives.world_model:TokenizerObjective'))()
@@ -661,7 +646,7 @@ dew.decision.config.DecisionRunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
+  source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=2.5e-05))()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('decision'))()
@@ -882,6 +867,21 @@ dew.interop.autoencoders.pretrained.PretrainedAutoencoder
   dtype: DtypeName = 'bfloat16'
   latent_shift: float | None = None
   latent_scale: float | None = None
+dew.interop.release_record.Release
+  task: Mapping[str, object] | None = None
+  layout: Mapping[str, object] | None = None
+  max_length: int | None = None
+  calibration: Mapping[str, object] | None = None
+dew.interop.source_options.SourceOptions
+  text_only: bool = False
+  prediction_depths: int | None = None
+  attention: dict[str, Literal['causal', 'block_bidirectional']] | None = None
+  dex: Annotated[DifferentialExtension, record_argument(DifferentialExtension)] | None = None
+  scan_layers: bool = False
+  packed_experts: bool = False
+  param_dtype: str | None = None
+  step: int | str | None = None
+  ema: bool | None = None
 dew.lora.LoRA
   rank: int
   modules: tuple[str, ...]

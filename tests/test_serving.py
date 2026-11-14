@@ -127,8 +127,8 @@ def test_a_server_over_split_rows_takes_its_projections_on_each_devices_rows(sca
     scanned as one stack, the GEMM template named and interpreted as an H100's: its projections take the
     template's launch on each device's own rows, each weight entering whole (`dew.nn.sharding.FORWARD`,
     traced under `placing`), as a trainer's step takes them per shard, and every request draws what it
-    draws alone on one device (train 818 F1: a served step traced under no placement left every product to
-    the partitioner, which no launch takes; train 821 F2)."""
+    draws alone on one device: a served step traced under no placement left every product to the
+    partitioner, which no launch takes."""
     from dew.nn.kernels import generation
 
     model = decoder().clone(dtype="bfloat16", emb_features=64, max_seq_len=128, num_layers=2,
@@ -155,8 +155,8 @@ def test_a_server_decoding_on_one_device_prefills_its_split_rows_through_each_de
     whose rows split, the GEMM template named and interpreted as an H100's: the prefill's projections take
     the template's launch on each prefilling device's rows, each weight whole (`dew.nn.sharding.FORWARD`,
     which the prefill takes on its mesh whether or not the decode has one), and every request draws what
-    it draws alone (train 821 F1: the unmeshed server traced its prefill under no placement, whose chosen
-    launch the partitioned rows refused)."""
+    it draws alone: an unmeshed server traced its prefill under no placement, whose chosen launch the
+    partitioned rows refused."""
     from dew.nn.kernels import generation
 
     model = decoder().clone(dtype="bfloat16", emb_features=64, max_seq_len=128)
@@ -444,25 +444,24 @@ def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone
 
 
 def test_a_server_compiles_its_decoding_step_once_and_each_admission_width_once():
-    """A server's warm-up is its step programs' compiles: building it compiles the decoding step,
-    which every decode-only call then runs without compiling again, and each admission width it
-    meets compiles its admitting step at most once, so the widths 1, 2, 4 and 8 cost at most four
-    admitting compiles beside the one decoding step, and meeting them again compiles nothing."""
+    """What a server's calls pay in compiles: its decoding step is compiled before its first call ends and
+    never again, so a call of a width the server has met, and every decode-only step, compiles nothing,
+    and each admission width it meets costs at most one compile, the widths 1, 2, 4 and 8 at most four
+    beside what building it paid. How many programs building it and a first call compile is the server's
+    own arrangement and not held."""
     from dew.telemetry.compiles import Compiles
 
+    widths = (1, 2, 4, 8)
     with Compiles("_stepped") as compiled:
         server = Server.from_task(task(), slots=8, capacity=128, admission=8)
-        assert compiled.count == 1, "building a server compiles its decoding step"
-        server([PROMPTS[0]], 12, key=0)
-        assert compiled.count == 2, "one admission and the decode-only calls after it compile one program"
-        widths = (1, 2, 4, 8)
+        built = compiled.count
         for width in widths:
-            server([PROMPTS[0]] * width, 2, key=0)
+            server([PROMPTS[0]] * width, 12, key=0)
         first = compiled.count
-        assert first <= 1 + len(widths)
+        assert first - built <= len(widths), "each admission width compiles at most once"
         for width in widths:
-            server([PROMPTS[0]] * width, 2, key=0)
-        assert compiled.count == first, "a width the server has met compiles nothing again"
+            server([PROMPTS[0]] * width, 12, key=1)
+        assert compiled.count == first, "a met width, and its decode-only steps, compile nothing again"
 
 
 def test_host_task_and_server_preserve_nonzero_lora_branches():

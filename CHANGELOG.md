@@ -20,6 +20,18 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   boundary, against the devices as they stand. The separate `dew train` process a configured run started
   for this is removed, and so is `dew.registry.trusted_packages`, which only it read.
 
+- `SourceOptions` and its keyword types live in `dew.interop.source_options`, and the release contract
+  (`Release`, `RELEASE_FILE`) in `dew.interop.release_record`, so a source's load imports no trainer;
+  `dew.config`, `dew.config.trainer` and `dew.config.release` keep exporting them, and a saved run's record
+  that names `dew.config.trainer:SourceOptions` reads as before.
+- A run's plan search, past a candidate whose compile misses, asks for the split computed from the
+  compile that missed (`dew.training.memory.Miss`): the first at which its temporaries, taken as scaled
+  by a microbatch's rows, leave room for its shortfall. This replaces the forecast (`Forecast`) and the
+  halving. A split that fits past one not asked is followed by the split before it until one misses, so
+  the plan is still the fewest microbatches that fit; where none is computed to fit, the finest is asked
+  before the search climbs a rung. A tight start compiles twice cold and once warm where the split
+  computed is the next.
+
 - The condition encoders that bind a released checkpoint are dew.interop's: `CLIPText`, `T5Text` and
   `HFAudio` in `dew.interop.encoders`, and `DiffusionConditioner`, `QwenImageConditioner`,
   `HiddenStatesConditioner` and `WanConditioner` in `dew.interop.conditioners`, each with its
@@ -112,6 +124,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   memory. `AheadTarget.capacity_gib` is that memory, and `AheadOfTime.capacity` the limit the plan held to.
 
 
+- Dew requires its JAX build 0.12.0.1.post90 (Python alone; the CUDA and PJRT plugins stay post81's): Mosaic GPU
+  issues tcgen05's products of fp32 shared-memory operands as TF32 (`.kind::tf32`), which Dew's Blackwell kernels
+  do not select yet, and a compile ahead that requires its autotune results keys its programs as its device's
+  compile does.
 - Dew requires its JAX build 0.12.0.1.post87 (Python alone; the CUDA and PJRT plugins stay post81's): a run under
   a profiler or dumping XLA's programs reads the Mosaic GPU lowerings and kernel certifications an unprofiled run
   stored, where it lowered and certified them afresh.

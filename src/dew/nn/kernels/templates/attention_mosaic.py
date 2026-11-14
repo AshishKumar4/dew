@@ -23,6 +23,7 @@ from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     cost,
     mosaic,
+    placed,
     product,
     report,
     resources,
@@ -53,7 +54,7 @@ from dew.nn.kernels.templates.attention import (
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import _launch_backward
 from dew.nn.kernels.templates.attention_mosaic_coop import _coop_allocations
-from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_allocations
+from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_allocations, dq_halves
 from dew.nn.kernels.templates.attention_mosaic_dq import _dq_allocations
 from dew.nn.kernels.templates.attention_mosaic_forward import (
     NATURAL_NAME,
@@ -92,6 +93,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     loads_parts,
     most_consumers,
     placed_draws,
+    placed_scratch,
     query_rows,
     reducing,
     refused,
@@ -101,6 +103,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     streams_operands,
     varying_slopes,
     walked_extents,
+    walked_layouts,
     whole_tiles,
 )
 from dew.nn.kernels.templates.base import Template, Unfitted
@@ -262,6 +265,10 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """The bundles the launch takes (`layouts`)."""
         return layouts(generation_name, dtype, rows)
 
+    def _named(self, generation_name: str | None, dtype, rows: int | None = None) -> dict[str, mosaic.Family]:
+        """Every bundle a config of the launch may name, by name (`legal`): those it takes (`_layouts`)."""
+        return {family.name: family for family in self._layouts(generation_name, dtype, rows)}
+
     def padded(self, ba: tokamax.BoundArguments, config: Config) -> float | None:
         """The share of the score grid, each head's queries by its keys, that the launch's blocks pad
         past the call's (`_padded`, `tuning.KernelOp.padded`): its query and key blocks' tails."""
@@ -302,9 +309,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         tiles its program takes (`whole_tiles`), a call the launch takes (`refusal`), and the block and
         registers `Template.legal` holds it to. A pinned or stored config is held to it as a derived one."""
         query = ba.arguments["query"]
-        found = {family.name: family
-                 for family in self._layouts(target.generation, query.dtype, query.shape[1])}
-        family = found.get(config.family)
+        family = self._named(target.generation, query.dtype, query.shape[1]).get(config.family)
         # A forward's and a dQ launch's layout streams through a producer (`Family.stream`); a layout whose
         # consumers feed their own rings (`split_queries`) runs the dK/dV launches alone, the keys-first one
         # and the fused one, each consumer its own keys over the stream they walk whole. The forward on it
@@ -1230,6 +1235,45 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         del rows
         return backward_layouts(generation_name, dtype)
 
+    def _named(self, generation_name: str | None, dtype, rows: int | None = None) -> dict[str, mosaic.Family]:
+        # Those its launches take, and those whose walks are placed on a role (`walked_layouts`), which a
+        # config names where its launch is pinned there (none a derivation offers before a receipt).
+        del rows
+        return {family.name: family for family in (*self._layouts(generation_name, dtype),
+                                                   *walked_layouts(generation_name, dtype))}
+
+    def _walked_legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, family: mosaic.Family,
+                      tiles: BackwardTiles, target: generation.GpuTarget) -> bool:
+        """Whether a launch whose products `family` places on a role (`placed.Tcgen05Walked`, row 4839)
+        takes the call at its `tiles` (the dK/dV launch's keys first, `placed.KEYS`, at `config.dkv`; the dQ
+        launch's queries first, `placed.QUERIES`, at `config`): the fast form of a plain call (no score
+        hook's parameters, whose gradients and operands its compute warpgroups read from no stream of their
+        own; no dropout; no spans of several queries; the logits' queries no stage of a consumer's), its held
+        block the issuer's rows and its consumers its compute warpgroups, one launch (`BackwardTiles.fused`,
+        its dQ its own) keys first alone, within the multiprocessor's tensor memory: two turns of the scores
+        and of their cotangents, a step's walked tile each, beside its kept sums' shares of their columns
+        (`BackwardTiles.columns`)."""
+        query = ba.arguments["query"]
+        keys_first = isinstance(family, placed.Tcgen05KeysFirst)
+        # Its operands 16-bit of one part (bf16: fp16's weights and cotangents two scaled parts, whose
+        # products no placed walk issues), a fused walk's dQ products a 64- or 128-row tile of its queries
+        # (tcgen05's M).
+        if (jnp.dtype(query.dtype) != jnp.dtype(jnp.bfloat16) or self.accurate or self.score_kinds
+                or ba.arguments["drop"] is not None or self.per_span > 1 or config.staged_logits
+                or config.shared_keys or tiles.consumers != family.consumers
+                or (config.fused and (not keys_first or tiles.block_q not in (64, 128)))):
+            return False
+        held, walked = (tiles.block_k, tiles.block_q) if keys_first else (tiles.block_q, tiles.block_k)
+        if held != family.rows:
+            return False
+        # Its scratch as its launch allocates it (`placed_scratch`, the head widths as staged, `_width`).
+        width, value_width = (_width(ba.arguments[name].shape[-1], family, query.dtype) // config.columns
+                              for name in ("query", "value"))
+        halves = dq_halves(width * config.columns) if config.fused else ()
+        products = placed_scratch(family, walked, query.dtype, halves,
+                                  (width, value_width) if keys_first else (width,))["products"]
+        return family.product_columns(products) <= (target.tmem_columns or 0)
+
     def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:
         # The one launch adds each tile's dQ under the first pass's D: the fast form's, a call's of equal
         # head widths, its dK/dV program queries first on the dQ launch's layout or keys first on
@@ -1247,12 +1291,22 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return False
         if config.fused and dropped and config.shared_keys:
             return False
-        found = {family.name: family
-                 for family in self._layouts(target.generation, ba.arguments["query"].dtype)}
+        dtype = ba.arguments["query"].dtype
+        found = self._named(target.generation, dtype)
         dkv_family = found.get(config.dkv.family)
         # A family the device has no bundle of (a pin of an H100's wgmma on an A100) is not read here: the
         # mainloop's legality refuses it (`_Mainloop.legal`).
         if dkv_family is None or not whole_tiles(dkv_family, config.dkv):
+            return False
+        # A placement takes the launch it is written for (`placed.walked_launch`): keys first the dK/dV
+        # launch's, queries first the dQ launch's; the one launch's keys first apart from its config's own.
+        dq_named = found.get(config.family)
+        walked_dkv = placed.walked_launch(dkv_family) == "dkv" if dkv_family.places_on_role else None
+        if walked_dkv is False or (walked_dkv and not self._walked_legal(ba, config, dkv_family, config.dkv,
+                                                                          target)):
+            return False
+        if dq_named is not None and dq_named.places_on_role and (
+                config.fused or placed.walked_launch(dq_named) != "dq"):
             return False
         # A dK/dV launch whose producer streams a TILE parameter's keys-first blocks with its queries
         # (`streams_operands`) stages one key block's (`_dkv_allocations`): a launch of more holders takes
@@ -1264,18 +1318,24 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return False
         # The one launch's tiles a role's rows at least (`_role_rows`): no issuer specializes it below them
         # (`fewer_rows` the two launches' alone), its 32 x 32 tile on an sm120's fed mma.sync and an sm86's
-        # mma.sync "cannot relayout" (et-sm120fused). The dQ launch streams through a producer
+        # mma.sync "cannot relayout" (et-sm120fused); a family placing its products on a role keys first
+        # walks its own blocks (`BackwardTiles.dkv_blocks`). The dQ launch streams through a producer
         # (`runs_backward`), which a family whose consumers feed their own rings has not: the one launch
         # there, queries first.
-        if config.fused and min(config.block_q, config.block_k) < dkv_family.role_rows:
+        if (config.fused and not dkv_family.places_on_role
+                and min(config.block_q, config.block_k) < dkv_family.role_rows):
             return False
         dq_family = found.get(config.family)
         if not config.fused and dq_family is not None and split_queries(dq_family):
             return False
+        if (not config.fused and dq_family is not None and dq_family.places_on_role
+                and not self._walked_legal(ba, config, dq_family, config, target)):
+            return False
         keys_first = config.dkv_apart
         if config.fused and (ba.arguments["query"].shape[-1] != ba.arguments["value"].shape[-1] or (
-                keys_first and not (split_queries(dkv_family)
-                                    and (config.block_q // config.dkv.consumers) % dkv_family.rows == 0))
+                keys_first and not dkv_family.places_on_role
+                and not (split_queries(dkv_family)
+                         and (config.block_q // config.dkv.consumers) % dkv_family.rows == 0))
                 or (config.staged_logits and not keys_first)):
             return False
         dtype = ba.arguments["query"].dtype
@@ -1324,6 +1384,37 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         units = [unit(width) for width in widths]
         return config.columns == 1 or (not config.fused and all(
             (width / config.columns) % unit == 0 for width, unit in zip(widths, units, strict=True)))
+
+    def walked(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
+        """The config whose launches tcgen05's walked placements take for the call (`walked_layouts`,
+        `placed.Tcgen05Walked`, row 4839), the derivation's search of them by what fits (`legal`: shared
+        memory, tensor memory and registers as the model has them): the one launch keys first, its dQ its
+        own (FlashAttention 4's), at the largest step of queries that holds; else the two launches, dQ queries
+        first and dK/dV keys first, each at the largest walked tile that holds, dK's and dV's columns in the
+        fewest shares that hold (at width 256 the one launch's resident keys and values and its query streams
+        pass a B200's block, row 4839's arithmetic). None where the device has none or none holds. A B200's
+        A/B pins it (M-ET-74); `derived` offers it once its receipt moves the route."""
+        query, key = ba.arguments["query"], ba.arguments["key"]
+        found = {family.name: family for family in walked_layouts(target.generation, query.dtype)}
+        keys, queries = found.get(placed.KEYS.name), found.get(placed.QUERIES.name)
+        base = next((layout for layout in self._layouts(target.generation, query.dtype)
+                     if not split_queries(layout)), None)
+        if keys is None:
+            return None
+        steps = walked_extents(keys, query.dtype, query.shape[1])
+
+        def keys_first(step: int, **tiles) -> BackwardTiles:
+            return BackwardTiles(**tiles, dkv_family=keys.name, dkv_consumers=keys.consumers,
+                                 dkv_blocks=(step, keys.rows))
+
+        # The one launch's own tiles its padding's alone, no launch walking them (`_block`).
+        fused = [keys_first(step, block_q=step, block_k=step, stages=2, consumers=1, fused=True,
+                            family=base.name) for step in steps] if base is not None else []
+        two = [keys_first(step, block_q=queries.rows, block_k=walked, stages=2, consumers=queries.consumers,
+                          family=queries.name, columns=columns)
+               for columns in (1, 2, 4) for walked in walked_extents(queries, query.dtype, key.shape[1])
+               for step in steps] if queries is not None else []
+        return next((config for config in (*fused, *two) if self.legal(ba, config, target)), None)
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
         """Its tiles from the facts (`_derived`): each dK/dV consumer a unit of keys, the query tile both

@@ -64,80 +64,60 @@ ROWS, SEQ = 32, 16
 BATCH = {"text": jnp.asarray((np.arange(ROWS * (SEQ + 1)).reshape(ROWS, SEQ + 1) * 7) % 64, jnp.int32)}
 
 
-@pytest.mark.parametrize("fitting, first, plan, asked", [
+@pytest.mark.parametrize("fitting, first, computed, plan, asked", [
     # The batch whole fits: one compile.
-    (lambda rung, split: True, 0, (0, 1), [(0, 1)]),
-    # Four microbatches fit with no recomputation: the largest split, then halving.
-    (lambda rung, split: split >= 4, 0, (0, 4), [(0, 1), (0, 8), (0, 2), (0, 4)]),
-    # No split fits without recomputing: one compile at that rung past the
-    # first, then the next rung's fewest microbatches.
-    (lambda rung, split: rung >= 1 and split >= 2, 0, (1, 2), [(0, 1), (0, 8), (1, 8), (1, 2), (1, 1)]),
+    (lambda rung, split: True, 0, {}, (0, 1), [(0, 1)]),
+    # The whole batch's miss computes two microbatches, which fit: two compiles.
+    (lambda rung, split: split >= 2, 0, {(0, 1): 1}, (0, 2), [(0, 1), (0, 2)]),
+    # It computes four, which fit, past two not asked: two is asked, and fits, the fewest.
+    (lambda rung, split: split >= 2, 0, {(0, 1): 2}, (0, 2), [(0, 1), (0, 4), (0, 2)]),
+    # Four fit and two miss: four, the fewest.
+    (lambda rung, split: split >= 4, 0, {(0, 1): 2}, (0, 4), [(0, 1), (0, 4), (0, 2)]),
+    # Its miss computes two, whose program misses too, and that miss computes four: the third compile,
+    # where the next program held otherwise than the one that missed read.
+    (lambda rung, split: split >= 4, 0, {(0, 1): 1, (0, 2): 2}, (0, 4), [(0, 1), (0, 2), (0, 4)]),
+    # No split is asked past a miss: the next rung, from the batch whole, whose miss there computes two.
+    (lambda rung, split: rung >= 1 and split >= 2, 0, {(1, 1): 1}, (1, 2), [(0, 1), (1, 1), (1, 2)]),
     # A recorded plan is asked first and kept where it fits.
-    (lambda rung, split: split >= 2, 2, (0, 4), [(0, 4)]),
-    # Nothing fits: the largest split at every rung, then no plan.
-    (lambda rung, split: False, 0, None, [(0, 1), (0, 8), (1, 8), (2, 8)]),
+    (lambda rung, split: split >= 2, 2, {}, (0, 4), [(0, 4)]),
+    # Nothing fits: each rung's batch whole, then no plan.
+    (lambda rung, split: False, 0, {}, None, [(0, 1), (1, 1), (2, 1)]),
 ])
-def test_the_plan_takes_the_least_recomputation_then_the_fewest_microbatches(fitting, first, plan, asked):
-    """Candidates are (rung, split), rung-major; memory falls along both, so
-    the search asks the first split, each rung's largest, and halves the
-    range at the first rung where that fits."""
+def test_the_plan_asks_what_each_miss_computes_then_climbs(fitting, first, computed, plan, asked):
+    """Candidates are (rung, split), rung-major: the first asked, then, past each miss, the split that
+    miss computes as the first to fit (`after`, an index into the candidates), until one fits, then each
+    split before it not asked until one misses; none named, the next rung."""
     rung, compiled = [0], []
+    candidates = [1, 2, 4, 8]
 
     def fits(split):
         compiled.append((rung[0], split))
         return fitting(rung[0], split)
 
+    def after(index):
+        return computed.get((rung[0], candidates[index]))
+
     def climb():
         rung[0] += 1
         return rung[0] < 3
 
-    split = planned([1, 2, 4, 8], first, fits, climb)
+    split = planned(candidates, first, fits, climb, after)
     assert (None if split is None else (rung[0], split)) == plan
     assert compiled == asked
 
 
-@pytest.mark.parametrize("likely, asked", [
-    # Past a miss, the first split likely to fit is asked in place of the largest, and the range below
-    # it halved as ever: the guess orders the compiles.
-    (lambda split: split >= 4, [1, 4, 2]),
-    # A guess that misses leads to the next likely split above it, or the largest.
-    (lambda split: split == 2, [1, 2, 8, 4]),
-])
-def test_a_likely_split_is_asked_first_and_the_plan_is_the_same(likely, asked):
-    """Four microbatches fit, two do not: the plan is four whatever the guess."""
-    compiled = []
+def test_a_miss_computes_the_split_its_temporaries_leave_room_at():
+    """A compile that missed by its `shortfall`, its stranding counted: a split above it holds what its
+    rows scale at their share, the rest as they stand (`Miss.fits_at`)."""
+    from dew.training.memory import Miss
 
-    def fits(split):
-        compiled.append(split)
-        return split >= 4
-
-    assert planned([1, 2, 4, 8], 0, fits, lambda: False, likely) == 4
-    assert compiled == asked
-
-
-def test_a_forecast_guesses_from_every_processs_compiles_above_a_split():
-    """One compile above a split: its temporaries taken as all per row; two: a line in the rows. A guess
-    is every process's least; a process that read no memory is no guess, and a split with no compile
-    above it is guessed nothing, not likely."""
-    from dew.training.planning import Forecast
-
-    # Two processes; the second's device holds 10 bytes less.
-    forecast = Forecast(gather=lambda local: [local, None if local is None else (local[0], local[1] - 10,
-                                                                                  local[2])])
-    forecast.read("rung", 1, None, None, 1)
-    assert forecast.guess("rung", 2) is None and not forecast.likely("rung", 2)
-    forecast.measured.clear()
-    # The batch whole needs 90 bytes of temporaries and misses by 50.
-    forecast.measured["rung"] = [(1, [(90, -50, 1), (90, -60, 1)])]
-    assert forecast.guess("rung", 2) == -60 + 45 and not forecast.likely("rung", 2)
-    assert forecast.guess("rung", 4) == -60 + 90 - 22 and forecast.likely("rung", 4)
-    forecast.measured["rung"].append((2, [(50, -10, 1), None]))
-    # The first process's two compiles, as a line in 1/split, give 10 at four; the second's one, 8.
-    assert forecast.guess("rung", 4) == min(-10 + 40 * (1 / 4 - 1 / 2) / (1 / 2 - 1), 8)
-    # A miss at the rung moved to its half rung, whose compiles count too.
-    forecast.half_of["rung"] = "half"
-    forecast.measured["half"] = [(1, [(20, 80, 1), (20, 70, 1)])]
-    assert forecast.likely("rung", 2)
+    # The batch whole: 90 bytes of temporaries its rows scale, 50 short.
+    whole = Miss(1, 0, 90, 50, 1)
+    assert not whole.fits_at(2) and whole.fits_at(4)
+    # 60 of them fixed: only the 30 its rows scale fall, never by 50.
+    assert not any(Miss(1, 60, 30, 50, 1).fits_at(split) for split in (2, 4, 8, 64))
+    # An allocator that strands its temporaries needs half the bytes back.
+    assert Miss(1, 0, 90, 50, 2).fits_at(2)
 
 
 def test_the_fit_ladder_tiles_the_head_fused_then_unfused_before_it_recomputes_more():
@@ -1082,13 +1062,13 @@ def asked(trainer) -> list[tuple[int, str | None, bool]]:
     return [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]]
 
 
-def assert_searched(probes, chosen, below, *, half=None):
+def assert_searched(probes, chosen, *, half=None):
     """`probes`, a search that settled on `chosen` (split, remat): the batch whole asked first, no
-    compile asked twice, every split that missed at no recomputation asked at the `half` rung next,
-    `below`, the largest split under the plan, asked and missed at each rung it may fit at, a plan at
-    the half rung missed at no recomputation before, and no optional frontier is asked. Which splits
-    between are asked, and in what order, follows the memory each compile measured, which differs
-    between devices (`Forecast`)."""
+    compile asked twice, every split that missed at no recomputation asked at the `half` rung next, every
+    one below the plan missed, a plan at the half
+    rung missed at no recomputation before, and no optional frontier is asked. Which splits between are
+    asked follows the memory each compile that missed read, which differs between devices: ascending from
+    each miss (`after`) to the first that fits, then descending from it to one that misses."""
     assert probes[0][:2] == (1, None) and not probes[0][2]
     assert len({probe[:2] for probe in probes}) == len(probes)
     assert (*chosen, True) in probes
@@ -1096,8 +1076,12 @@ def assert_searched(probes, chosen, below, *, half=None):
     for index, (split, remat, fits) in enumerate(probes[:-1]):
         if half is not None and remat is None and not fits:
             assert probes[index + 1] == (split, half, probes[index + 1][2])
-    rungs = [None] if half is None else [None, half] if chosen[1] is None else [half]
-    assert all((below, remat, False) in probes for remat in rungs)
+    splits = list(dict.fromkeys(split for split, _, _ in probes))
+    fitted = next(index for index, split in enumerate(splits) if (split, chosen[1], True) in probes
+                  or (split, None, True) in probes)
+    assert splits[:fitted + 1] == sorted(splits[:fitted + 1])
+    assert splits[fitted:] == sorted(splits[fitted:], reverse=True)
+    assert not any(fits for split, _, fits in probes if split < chosen[0])
     if half is not None and chosen[1] == half:
         # A plan at the half rung missed at no recomputation first.
         assert probes.index((chosen[0], None, False)) < probes.index((*chosen, True))
@@ -1138,7 +1122,7 @@ def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monk
         trainer.compile(state, HALVED_BATCH, trials)
         assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
     assert trainer.objective.model.remat == REMAT_POLICIES[half]
-    assert_searched(asked(trainer), (4, half), 2, half=half)
+    assert_searched(asked(trainer), (4, half), half=half)
 
 
 def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypatch):
@@ -1162,7 +1146,7 @@ def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monke
     state, _, _ = trainer.place()
     trials = Trials(state, BATCH)
     trainer.compile(state, BATCH, trials)
-    assert_searched(asked(trainer), (4, None), 2)
+    assert_searched(asked(trainer), (4, None))
     assert all(remat is None for _, remat, _ in asked(trainer))
 
 
@@ -1364,6 +1348,37 @@ def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, r
     except jax.errors.JaxRuntimeError as raised:
         outcome = raised
     assert (outcome, refusals) == ((None, [error]) if refused else (error, []))
+
+
+@pytest.mark.parametrize("width, between, cold", [
+    # Its temporaries scaled by its rows (a narrow layer): the batch whole's miss computes two
+    # microbatches, which fit: two compiles.
+    (16, (1, 2), 2),
+    # They fall faster than its rows: the miss computes four, which fit, and two, not asked, is asked, and
+    # misses: the third compile, stated.
+    (16, (2, 4), 3),
+    # Mostly fixed (a wide layer over few tokens: the gradients of its weights): XLA states no live set of
+    # a compile to Python, so the miss takes them as scaled and computes two, which misses, and that miss
+    # computes four, which fit: the third compile, stated.
+    (1024, (2, 4), 3),
+])
+def test_a_tight_start_compiles_twice_cold_and_once_warm(monkeypatch, tmp_path, width, between, cold):
+    """What a run pays at its start where its batch does not fit whole (the owner's contract: "a single
+    trace and compile most often"): cold, the batch whole compiles and misses, and that compile computes
+    the split asked next (`Miss`), XLA's compile the judge of it, until the fewest microbatches that fit,
+    those `between` missing at the first and fitting at the second; warm, the plan its cold start recorded
+    (`keep_rung`, beside the compilation cache) is the first candidate, one compile."""
+    fewer, fewest = (needs(monkeypatch, lm(split=split, width=width)) for split in between)
+    assert fewest < fewer, (fewest, fewer)
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    free(monkeypatch, (fewer + fewest) // 2)
+    cold_run, warm = lm(width=width), lm(width=width)
+    with Compiles("step") as compiles:
+        trained(cold_run, steps=0)
+    assert compiles.count == cold and cold_run.plan["split"] == between[1]
+    with Compiles("step") as compiles:
+        trained(warm, steps=0)
+    assert compiles.count == 1 and warm.plan["split"] == between[1]
 
 
 def test_a_run_that_sets_its_remat_compiles_its_step_once(monkeypatch, tmp_path):
