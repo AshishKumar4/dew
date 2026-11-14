@@ -28,7 +28,7 @@ import numpy as np
 from dew.nn import derivatives
 from dew.nn.kernels.generation import linear_map, unbroadcast
 from dew.nn.kernels.options import program
-from dew.nn.kernels.templates.attention_algebra import power2
+from dew.nn.kernels.templates.attention_algebra import exact_power2, power2
 from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
 from dew.nn.precision import (
     compensated_add,
@@ -178,21 +178,9 @@ def range_decay(later, later_low, earlier, earlier_low):
     return raised(*compensated_add((later, later_low), (-earlier, -earlier_low)))
 
 
-PAIR_FLOOR = -124.0
-"""The least power of two `_scaled` scales by, past which a pair's decay is zero: `x 2^k` of an `x` at least
-1/4 stays a normal fp32 down to it, and a decay under 2^-122 weighs nothing beside the chunk's own token."""
-
 PAIR_CEILING = 120.0
-"""The largest power of two `_scaled` scales by, where it holds: the pairs past a token (a decay's inverse,
+"""The largest power of two `between` scales by, where it holds: the pairs past a token (a decay's inverse,
 which every caller masks) stay finite."""
-
-
-def _scaled(x, k):
-    """`x * 2^k` of `x` in [1/4, 4) (`exp2` of a pair's fraction) and an integral `k`, exactly, by adding `k`
-    to `x`'s exponent bits: zero where `k` is under `PAIR_FLOOR`, and `k` held at `PAIR_CEILING` above."""
-    held = jnp.clip(k, PAIR_FLOOR, PAIR_CEILING).astype(jnp.int32)
-    bits = jax.lax.bitcast_convert_type(x, jnp.int32) + jax.lax.shift_left(held, jnp.full_like(held, 23))
-    return jnp.where(k < PAIR_FLOOR, 0.0, jax.lax.bitcast_convert_type(bits, jnp.float32))
 
 
 def separated(hi, lo):
@@ -205,17 +193,30 @@ def separated(hi, lo):
 
 def between(later, earlier):
     """`exp2(later - earlier)` of two separated exponents (`separated`, broadcasting), to fp32's resolution:
-    exp2 of the fractions' difference scaled by the wholes' difference (`_scaled`), zero below 2^-124. A
-    difference of the rounded sums lost the fraction's last bits at the exponent's size, 1e-6 of the decay
-    near -43, which put a port's decay gradient under decays near zero 9 to 14 times the token-by-token
-    recurrence's error from float64 (ledger 2098). The fractions' difference stays within two, its exp2
-    within `_scaled`'s range, for exponents under 2^24, where a fraction's remainder `lo` is at most one: a
-    chunk's prefix (its 64 tokens' at most 2^18 each). Truncating the difference into the scale, for any
-    size, cost the template's forward 1% on an H100 and 3% on an A100 (JS-954-57bf6dc05). Every pair's
-    decay, the ports' of their separated prefix and the template's of its halves (`decayed`), and the ports'
-    ranges; the template's ranges (`range_decay`) and a decay from the prefix's start are `raised`'s."""
+    exp2 of the fractions' difference times the wholes' difference's exact power of two (`exact_power2`),
+    zero below 2^-127 (its zero exponent bits) and held at `PAIR_CEILING` above. A difference of the rounded
+    sums lost the fraction's last bits at the exponent's size, 1e-6 of the decay near -43, which put a port's
+    decay gradient under decays near zero 9 to 14 times the token-by-token recurrence's error from float64
+    (ledger 2098). The fractions' difference stays within two, its exp2 within [1/4, 4), for exponents
+    under 2^24, where a fraction's remainder `lo` is at most one: a chunk's prefix (its 64 tokens' at most
+    2^18 each). Truncating the difference into the scale, for any size, cost the template's forward 1% on an
+    H100 and 3% on an A100 (JS-954-57bf6dc05). Every pair's decay whose exponent may be either sign, the
+    ports' of their separated prefix and the template's of its halves (`decayed`), and the ports' ranges; a
+    decay whose exponent is at most zero is `decay`'s; the template's ranges (`range_decay`) and a decay from
+    the prefix's start are `raised`'s."""
     (whole, fraction), (other, its_fraction) = later, earlier
-    return _scaled(jnp.exp2(fraction - its_fraction), whole - other)
+    return jnp.exp2(fraction - its_fraction) * exact_power2(jnp.clip(whole - other, -127.0, PAIR_CEILING))
+
+
+def decay(later, earlier):
+    """`between` of a `later` exponent at most `earlier` (a decay, its exponent at most zero), held below
+    alone: no ceiling a decay never reaches. The intra walk's factored pairs and own bands and their
+    gradients' (`key_block_pairs`, `key_diagonal_bands`, `key_decayed_pairs_back`,
+    `key_diagonal_pairs_back`), where the exponent's two clips and a zero's select were 5.5k of a compute
+    warp's 28.9k issues in a B200's Kimi Linear intra walk once its prefix was separated (modelled at
+    191cb7975e4)."""
+    (whole, fraction), (other, its_fraction) = later, earlier
+    return jnp.exp2(fraction - its_fraction) * exact_power2(jnp.maximum(whole - other, -127.0))
 
 
 def first_decays(dg, entered, d_entered, first, memory, takes, live):
@@ -684,13 +685,13 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
 
         return jax.lax.fori_loop(0, blocks, lay, (jnp.zeros(index.shape, jnp.float32),) * 2)
 
-    down = between(prefix, laid(start))
-    up = staged(keys * between(laid(end), prefix))
+    down = decay(prefix, laid(start))
+    up = staged(keys * decay(laid(end), prefix))
 
     def middle(t) -> jax.Array:
         """`exp2(G_s - E_t)` on the rows of each sub-chunk `s` past `t`, zero above."""
         def lay(s, factor):
-            return jnp.where(index >= s * sub, between(start(s), end(t))[None, :], factor)
+            return jnp.where(index >= s * sub, decay(start(s), end(t))[None, :], factor)
 
         return jax.lax.fori_loop(t + 1, blocks, lay, jnp.zeros(index.shape, jnp.float32))
 
@@ -735,8 +736,8 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], prefix
 
     def offset(e, bands):
         keys, *earlier = shifted(e)
-        decay, within = between(prefix, tuple(earlier)), index % sub >= e
-        return tuple(band + jnp.where(lane == e, jnp.sum(jnp.where(within, row * keys * decay, 0.0),
+        decayed_keys, within = keys * decay(prefix, tuple(earlier)), index % sub >= e
+        return tuple(band + jnp.where(lane == e, jnp.sum(jnp.where(within, row * decayed_keys, 0.0),
                                                          axis=1)[:, None], 0.0)
                      for band, row in zip(bands, rows, strict=True))
 
@@ -1022,7 +1023,7 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
     for c in range(columns):
         prefix = separated(*gates(c))
         index, _ = _grid(prefix[0].shape)
-        down = between(prefix, _laid_references(reference, c, index, chunk, sub))
+        down = decay(prefix, _laid_references(reference, c, index, chunk, sub))
         key = keys(c)
         gated_rows = [staged(row(c) * down) for row in rows]
 
@@ -1031,7 +1032,7 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
             place = s * sub
             whole, fraction = separated(*reference(s, c))
             before = index < place
-            up = jnp.where(before, between((whole[None, :], fraction[None, :]), prefix), 0.0)
+            up = jnp.where(before, decay((whole[None, :], fraction[None, :]), prefix), 0.0)
             within = (index >= place) & (index < place + sub)
             # The keys gated up staged once, every pairs' product reading them.
             raised_keys = key * up
@@ -1073,14 +1074,14 @@ def key_diagonal_pairs_back(strips: list, own: list, prefix: tuple, behind: Call
         # Selected, never scaled by zero: a row before its offset reads past the shifted tile's start, any
         # value (an interpreter's NaN in shared memory left unwritten).
         within = index % sub >= e
-        decay = jnp.where(within, between(prefix, tuple(earlier)), 0.0)
+        pair = jnp.where(within, decay(prefix, tuple(earlier)), 0.0)
         bands = [strip(e) for strip in strips]
-        d_rows = tuple(total + jnp.where(within, strip * keys * decay, 0.0)
+        d_rows = tuple(total + jnp.where(within, strip * keys * pair, 0.0)
                        for total, strip in zip(d_rows, bands, strict=True))
         # The rows read where they are weighed, not held across the offsets: held, an sm100's own pairs'
         # backward needed all of its 248 registers, read here 232 (row 5298).
         weighted = functools.reduce(jnp.add, (strip * row() for strip, row in zip(bands, own, strict=True)))
-        return d_rows, d_keys + jnp.where(index % sub + e < sub, lower(e, weighted * decay), 0.0)
+        return d_rows, d_keys + jnp.where(index % sub + e < sub, lower(e, weighted * pair), 0.0)
 
     return jax.lax.fori_loop(0, sub, offset, (d_rows, d_keys))
 
