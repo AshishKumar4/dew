@@ -316,7 +316,19 @@ def kernel_picks_path(device_kind: str) -> str:
                         f"{name}.json")
 
 
-KERNEL_TUNES = jax.make_user_context(0)
+_CONTEXTS: list = []
+
+
+def _context(default_value=None):
+    """A context of Dew's that JAX keys its trace and compile caches on (`jax.make_user_context`), each one
+    registered, so the contexts a trace reads are carried whole to a trace in another thread (`carried`):
+    each holds per thread, which a copied context does not carry."""
+    context = jax.make_user_context(default_value)
+    _CONTEXTS.append(context)
+    return context
+
+
+KERNEL_TUNES = _context(0)
 """How many times this process's kernel picks changed (`dew.nn.kernels.tuning.tune`):
 a context JAX keys its trace and compile caches on, so a program lowered
 after picks change traces again. Made at `import dew`, as JAX makes a user
@@ -334,34 +346,34 @@ class Passes:
     checked: bool = False
 
 
-ALGEBRA = jax.make_user_context(default_value=Passes())
+ALGEBRA = _context(Passes())
 """The algebra pass's switch (`Passes`), keyed on as `KERNEL_TUNES` is: a program a switch traced is never run
 under another, and the accuracy gate opens it per arm (docs/design/algebra.md §6.7)."""
 
-DERIVED = jax.make_user_context(default_value=False)
+DERIVED = _context(default_value=False)
 """Whether the templates take their algebra's derived forms (`dew.algebra.forms.derived`) in place of their
 hand-written ones, keyed on as `ALGEBRA` is: a program traced under one set of forms is never run under the
 other, and check 1 drives both (docs/design/algebra.md §6.9)."""
 
-WHOLE = jax.make_user_context(default_value=False)
+WHOLE = _context(default_value=False)
 """Whether a model runs its layer stack and sequences whole (`dew.nn.sharding.whole`), keyed on as `ALGEBRA`
 is: a trace reads it, so a call's identity states it with JAX's trace context, and a program traced whole
 is never run staged."""
 
-PLACING = jax.make_user_context(default_value=None)
+PLACING = _context(None)
 """What places the traced program's parameters (`dew.nn.sharding.placing`: a trainer's layout, or
 `dew.nn.sharding.FORWARD` for a served or scored model's forward-only trace, each weight whole), None
 outside any, keyed on as `WHOLE` is: a projection mapped per shard reads it as it traces, so a call's
 identity states it with JAX's trace context, and a program traced under one placement is never run under
 another."""
 
-KERNEL_SEEN = jax.make_user_context(default_value=None)
+KERNEL_SEEN = _context(None)
 """The collection a lowering records its kernel launches into as it traces them
 (`dew.nn.kernels.tuning.seen`): JAX keys its trace caches on its identity, so a
 trace cached before traces, and records, again. The program is the same, and so
 is its key in the persistent cache, which reads no user context."""
 
-KERNEL_ROUTES = jax.make_user_context(())
+KERNEL_ROUTES = _context(())
 """The collections each open `dew.nn.kernels.generation.routes` block records its dispatches' routes
 into: JAX keys its trace caches on their identities, as on `KERNEL_SEEN`'s, so a trace cached before
 traces, and reports its routes, again."""
@@ -372,32 +384,32 @@ values' identities so a cached trace records again, and the program is the same 
 program's identity states none (`dew.training.ahead.call_identity`), as the persistent cache's key reads
 none."""
 
-KERNEL_PINS = jax.make_user_context(())
+KERNEL_PINS = _context(())
 """The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this
 thread, keyed on as `KERNEL_TUNES` is."""
 
-KERNEL_ASSUMED = jax.make_user_context(default_value=None)
+KERNEL_ASSUMED = _context(None)
 """The device `dew.nn.kernels.generation.assumed` stands in for in this thread (`generation.Assumption`:
 its generation and its facts where given them), keyed on as `KERNEL_TUNES` is, so a program traced for one
 device's launches traces again for another's."""
 
-KERNEL_CHOICES = jax.make_user_context(())
+KERNEL_CHOICES = _context(())
 """The `(choice, kernel)` pairs `dew.nn.kernels.generation.chosen` holds in
 this thread, keyed on as `KERNEL_TUNES` is, so a program traced before a
 choice traces again within it."""
 
-NUMERICS = jax.make_user_context(default_value=None)
+NUMERICS = _context(None)
 """The run's numerics `dew.nn.kernels.generation.run_precision` holds in this thread
 (`dew.nn.precision.Numerics`, None outside any), keyed on as `KERNEL_TUNES` is, so a program traced under one
 run's numerics, its outputs' dtype and its ops' forms, traces again under another's."""
 
-PROJECTION_ROLE = jax.make_user_context(default_value=None)
+PROJECTION_ROLE = _context(None)
 """The role of the projections a trace is in (`dew.nn.precision.projection_role`), None outside any, keyed on
 as `NUMERICS` is: the run's low-precision recipe reads it as a projection traces (`recipe_role`), so a
 projection jitted under one role (an MLP's, which the recipe takes) traces again under another's (a
 router's, which it keeps)."""
 
-QUANTIZED_TRACE = jax.make_user_context(default_value=None)
+QUANTIZED_TRACE = _context(None)
 """What a quantized model's methods trace under, its provider's kind and spec
 (`dew.quantization`), keyed on as `KERNEL_TUNES` is. Qwix intercepts
 `jax.lax.dot_general` by swapping its code while a wrapped method runs, and
@@ -407,23 +419,18 @@ cache would hand a later plain call of the same shapes, and a plain trace a
 quantized call. In this context their traces are kept apart."""
 
 
-TRACED = (KERNEL_TUNES, ALGEBRA, DERIVED, WHOLE, PLACING, KERNEL_PINS, KERNEL_ASSUMED, KERNEL_CHOICES,
-          NUMERICS, PROJECTION_ROLE, QUANTIZED_TRACE)
-"""The contexts a program's trace reads, beside the contexts it records into (`RECORDING`): JAX keys its
-caches on each, and each holds per thread, so a trace in another thread (a run's later phases planned off
-its loop, `dew.training.ahead.LaterPlans`) reads them as its loop did only where they are carried
-(`carried`)."""
-
-
 def carried() -> Callable[[], contextlib.AbstractContextManager[None]]:
-    """This thread's trace-affecting states as they stand (`TRACED`, and JAX's default matmul precision and
-    x64, which hold per thread too), entered again by what this returns in another thread: a run's numerics
-    and kernel choices (`dew.config.RunConfig.traced`) among them, so a program it traces there is the one
-    its loop traces, under the same keys."""
+    """This thread's trace-affecting states as they stand (every context of Dew's but those a trace records
+    into, `RECORDING`, and every setting of JAX's that holds
+    per thread, its matmul precision and x64 among them, as `dew.training.identity.settings` reads them),
+    entered again by what this returns in another thread: a run's numerics and kernel choices
+    (`dew.config.RunConfig.traced`) among them, so a program it traces there is the one its loop traces,
+    under the same keys."""
     from jax._src import config
 
-    held = [(context, context.value) for context in TRACED]
-    states = [(state, state.value) for state in (config.default_matmul_precision, config.enable_x64)]
+    held = [(context, context.value) for context in _CONTEXTS if context not in RECORDING]
+    states = [(state, state.value) for name, state in config.config._value_holders.items()
+              if isinstance(state, config.State) and name not in UNCACHED]
 
     @contextlib.contextmanager
     def entered() -> Iterator[None]:
@@ -446,7 +453,7 @@ def unintercepted[**Arguments, Result](function: Callable[Arguments, Result]) ->
     return function if interception is None else interception.disable_interceptions(function)
 
 
-INTERCEPTED = jax.make_user_context(default_value=False)
+INTERCEPTED = _context(default_value=False)
 """Whether Dew installed a layer interceptor in this trace: adapters, input QDQ and Qwix retain
 their individual projection calls. This is independent of Qwix's arithmetic trace key above."""
 

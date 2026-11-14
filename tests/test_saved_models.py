@@ -158,6 +158,9 @@ def test_a_native_release_is_cast_a_leaf_at_a_time_as_it_is_placed(tmp_path):
     export_run(SavedRun.pinned(str(tmp_path / "teacher")), tmp_path / "policy", ema=False)
 
     def peak(**options):
+        # Each load once before it is measured: a first call's traces and compiles, which a load's code
+        # and a program cache's state decide, are not host arrays it holds.
+        pipeline(str(tmp_path / "policy"), **options)
         tracemalloc.start()
         try:
             loaded = pipeline(str(tmp_path / "policy"), **options)

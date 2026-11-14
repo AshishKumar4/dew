@@ -208,7 +208,7 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
             inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'], given['scales'])
 
             def template(q, k, v, g, scales):
-                # Scaled by one, as fla's layer calls it.
+                # Scaled by one, as fla's kernel is unscaled.
                 return (log_linear.log_linear_attention(q, k, v, g, scales, scale=1.0),)
 
             # No kernel of its own beside the template's.
@@ -342,7 +342,9 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
         leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'], given['scales']]
 
         def run(q, k, v, g, scales):
-            return (chunk_log_linear_attn(q, k, v, g, scales, scale=1.0)[0],)
+            # fla-core 0.5.2's kernel takes one key group (its forward refuses any other, chunk.py:1117) and
+            # no scale (unscaled), the queries and keys as its layer hands them (log_linear_mamba2.py:107).
+            return (chunk_log_linear_attn(q, k, v, g, scales)[0],)
 
         cotangents = (given['do'].to(bf16),)
     elif shape.kind == 'conv':

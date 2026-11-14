@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import lowers
+from generation_support import COMPILES_ON_CPU, lowers
 from reference_error import (
     FEWEST_SEEDS,
     as_given,
@@ -472,6 +472,7 @@ def test_a_named_template_refuses_a_state_row_no_bulk_copy_takes(states):
     assert [refusal.code for refusal in refused.value.refusals] == ["state rows"]
 
 
+@COMPILES_ON_CPU
 @lowers('sm90')
 @pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
 def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):

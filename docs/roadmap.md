@@ -62,6 +62,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - Dory: the release qualified and its tests' oracles. [596]
 - Training and serving efficiency. [3330, 1880, 5292]
+- CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
 
 ## Algebra
 

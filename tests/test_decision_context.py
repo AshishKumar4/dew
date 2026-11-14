@@ -336,13 +336,16 @@ def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_doe
                         truth_fn=truth)
 
 
-def test_a_conditioned_run_logs_its_training_work_and_serves_with_its_context():
-    """Examples with a context trained through context layers: every logged step reports its
-    training work, and beyond what its batch's rows cost without their contexts by the
-    cross-attention's work over them (`test_the_context_layers_work_is_counted_in_a_conditioned_batch`
-    holds the count itself), far past the float32 sum the step logs it by. The gates move off zero and
-    every frozen leaf stays as it was; the run's task answers a request otherwise for another context."""
-    objective = conditioned()
+@pytest.mark.parametrize("encoder", ["table", "backbone"])
+def test_a_conditioned_run_logs_its_training_work_and_serves_with_its_context(encoder):
+    """Examples with a context trained through context layers, the context read through the source's
+    token table or its own frozen pass (`encode_context`, whose states a frozen trunk takes no gradient
+    of, row 6119): every logged step reports its training work, and beyond what its batch's rows cost
+    without their contexts by the cross-attention's work over them
+    (`test_the_context_layers_work_is_counted_in_a_conditioned_batch` holds the count itself), far past
+    the float32 sum the step logs it by. The gates move off zero and every frozen leaf stays as it was;
+    the run's task answers a request otherwise for another context."""
+    objective = conditioned(encoder=encoder)
     data = decision_rows(examples(), 8, objective=objective.data())
     batches = list(itertools.islice(data.train(DataPartition()), 2))
     plain = [objective.training_flops(None, {name: value for name, value in batch.items()
@@ -579,6 +582,23 @@ def test_a_context_its_cross_attention_cannot_hold_is_refused_never_cut():
                           type(None))
     with pytest.raises(ValueError):
         fit.map({"example": Example("one two", QUESTION, {"pick": "a"}, context=over)})
+
+
+def test_a_backbone_without_cross_attention_refuses_a_requests_context():
+    """A task over a backbone with no cross-attention refuses a request that brings a context, by a call
+    and over the wire (its own refusal, ValueError), rather than answering it without the context; the
+    same request without one is answered (docs/design/training.md, context)."""
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    objective = DecisionObjective(source, tokenizer=ByteTokenizer(), specials=SPECIALS)
+    task = Decide(objective.model, objective.init(jax.random.key(0)), objective.layout, objective.tokenizer,
+                  objective.specials)
+    assert isinstance(task("one two", QUESTION)["pick"], ChoiceAnswer)
+    with pytest.raises(ValueError):
+        task("one two", QUESTION, context="a first note")
+    wire = {"pick": {"type": "choice", "instructions": "Which one?", "criteria": ["a", "b", "c"]}}
+    refused, answered = task.systemone([{"state": "one two", "questions": wire, "context": "a first note"},
+                                        {"state": "one two", "questions": wire}])
+    assert isinstance(refused, ValueError) and not isinstance(answered, Exception)
 
 
 def test_the_batched_engine_reads_a_requests_context():
