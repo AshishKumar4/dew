@@ -230,9 +230,10 @@ opened before Dew prepared it."""
 
 WRITTEN = "DEW_POOL_WRITTEN"
 """The environment variable naming the fraction Dew wrote and what wrote it (`write_share`), as `share:by`:
-`dew`, its own share, or `sized`, lowered to leave the host's communicators room
-(`dew.communicators.sized_pool`). In the environment, so a process started from one Dew prepared (a data
-worker, a launcher's child) inherits it beside the fraction, which it states as Dew's, not the run's."""
+`dew`, its own share, `sized`, lowered to leave the host's communicators room
+(`dew.communicators.sized_pool`), or `named`, the run's own (`dew.training.share_pool`). In the
+environment, so a process started from one Dew prepared (a data worker, a launcher's child) inherits it
+beside the fraction, which it states as what wrote it (`pool_statement`)."""
 
 
 def allocator() -> str:
