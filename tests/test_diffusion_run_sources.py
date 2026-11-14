@@ -69,12 +69,16 @@ def test_a_resumed_pipeline_run_reads_none_of_the_pipelines_weights(pipelines, t
     weights' shapes alone, which its restore fills (docs/design/training.md, resume; row 6148): no tensor
     of the pipeline's files is read (`safetensors_io.read_file`, which every read of their bytes goes
     through), and it trains on from the step its checkpoint holds."""
+    from run_kinds import pictures, read
+
+    from dew.data import images as image_steps, presets
     from dew.interop import safetensors_io, sources
     from dew.training import MeshSpec
 
+    train, _ = pictures()
     config = DiffusionRunConfig(
         pretrained=str(pipelines / "sd3" / "pipeline"), preset=None, model=precision(),
-        data=images_of("tfds://oxford_flowers102", 16), val_metrics=(),
+        data=read(train.pipe(presets.images, 16, batch=8, caption=image_steps.caption())), val_metrics=(),
         objective=ObjectiveConfig("diffusion", {"solver": Euler(), "guidance": None, "steps": 2,
                                                 "unconditional_prob": 0.0, "ema_decay": None}))
 
