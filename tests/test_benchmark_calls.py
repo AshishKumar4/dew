@@ -330,13 +330,14 @@ with profiler, device_time() as device:
 found["profiled"] = bool(program_kernels(profiler.captures[-1], ["squared"])["squared"])
 print(json.dumps(found))
 """
-"""A device-timing session in a process that runs no command buffers (`benchmark.UNGRAPHED`), each of its
+"""A device-timing session in a process that runs no command buffers (`benchmark.UNGRAPHED_FLAG`), each of its
 behaviours read into a JSON object of truths (its test's)."""
 
 
 @pytest.mark.gpu(reason="CUPTI times a GPU's kernels")
 def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however_it_ends(tmp_path):
-    """In a process that runs no command buffers (`benchmark.UNGRAPHED`, the timing tool's device workers'):
+    """In a process that runs no command buffers (`benchmark.UNGRAPHED_FLAG`, the timing tool's device
+    workers'):
     a session reads each kernel a call launched with its device time and refuses a call that launched none,
     whose time would read as zero; a call timed behind an eviction in its program reads its own kernels, the
     eviction's left out; the session detaches CUPTI however it ends, after a read or only a refused one, so a
@@ -344,9 +345,9 @@ def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however
     Leaving a session runs none of its calls again: an input deleted inside it stays deleted."""
     from process_support import fresh
 
-    from dew.telemetry.benchmark import UNGRAPHED
+    from dew.telemetry.benchmark import UNGRAPHED_FLAG
 
-    found = fresh(DEVICE_TIMED, str(tmp_path), flags=f"--xla_gpu_enable_command_buffer={UNGRAPHED}")
+    found = fresh(DEVICE_TIMED, str(tmp_path), flags=UNGRAPHED_FLAG)
     outcomes = ("read", "seconds", "deleted", "nothing_refused", "eviction_read", "eviction_left_out",
                 "evicted_alike", "held_refused", "profiled")
     assert found == dict.fromkeys(outcomes, True), found
@@ -356,9 +357,9 @@ def test_a_timing_runs_a_call_without_the_command_buffers_its_process_runs(monke
     """In a process whose XLA runs command buffers, which CUPTI does not read whole (a conditional node's
     branch unrecorded, G4-LF-2; an A100's measured call failing, row 4880), a call is read as a program of
     the session's, compiled without them, that computes what the call does, jitted or not, and a call
-    compiled already is refused (`Ungraphed`); in one that runs none (`UNGRAPHED`), the call itself is read,
-    compiled or not."""
-    from dew.telemetry.benchmark import UNGRAPHED, DeviceTime, Ungraphed
+    compiled already is refused (`Ungraphed`); in one that runs none (`UNGRAPHED_FLAG`), the call itself is
+    read, compiled or not."""
+    from dew.telemetry.benchmark import UNGRAPHED_FLAG, DeviceTime, Ungraphed
 
     class Read(Exception):
         """CUPTI's reading reached, with the program it reads."""
@@ -380,7 +381,7 @@ def test_a_timing_runs_a_call_without_the_command_buffers_its_process_runs(monke
     with pytest.raises(Ungraphed):
         session.kernels(compiled, x)
     # The last occurrence holds, a list replacing the one before it and `-KIND`s amending it.
-    for flags in (f"--xla_gpu_enable_command_buffer={UNGRAPHED}",
+    for flags in (UNGRAPHED_FLAG,
                   "--xla_gpu_enable_command_buffer=FUSION --xla_gpu_enable_command_buffer=-FUSION"):
         monkeypatch.setenv("XLA_FLAGS", flags)
         for call in (branched, compiled):
@@ -388,7 +389,7 @@ def test_a_timing_runs_a_call_without_the_command_buffers_its_process_runs(monke
                 session.kernels(call, x)
             assert read.value.args == (call,)
     for flags in ("--xla_gpu_enable_command_buffer=-FUSION",
-                  f"--xla_gpu_enable_command_buffer={UNGRAPHED} --xla_gpu_enable_command_buffer=+FUSION",
+                  f"{UNGRAPHED_FLAG} --xla_gpu_enable_command_buffer=+FUSION",
                   "--xla_gpu_enable_command_buffer=CONDITIONAL"
                   " --xla_gpu_enable_command_buffer=-CONDITIONAL,+CONDITIONAL"):
         monkeypatch.setenv("XLA_FLAGS", flags)

@@ -32,7 +32,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-COMMAND_BUFFERS_OFF = "--xla_gpu_enable_command_buffer="
 FALLBACK = "as a regular thunk sequence because we detected active profiling session"
 STEPS = 3
 
@@ -77,9 +76,11 @@ def capture(out: Path) -> dict:
 
 def variant(name: str, out: Path) -> dict:
     """`capture` in a child process with its variant's flags, and what XLA logged."""
+    from dew.telemetry.benchmark import UNGRAPHED_FLAG
+
     flags = os.environ.get("XLA_FLAGS", "")
     env = {**os.environ, "TF_CPP_VMODULE": "command_buffer_thunk=1", "TF_CPP_MIN_LOG_LEVEL": "0",
-           "XLA_FLAGS": f"{flags} {COMMAND_BUFFERS_OFF}".strip() if name == "attributed" else flags,
+           "XLA_FLAGS": f"{flags} {UNGRAPHED_FLAG}".strip() if name == "attributed" else flags,
            "PYTHONPATH": os.pathsep.join(filter(None, (str(Path(__file__).parent),
                                                        os.environ.get("PYTHONPATH"))))}
     done = subprocess.run([sys.executable, __file__, "--capture", str(out / name)], env=env,
