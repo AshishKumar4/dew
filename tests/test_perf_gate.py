@@ -340,7 +340,10 @@ def test_a_tree_imports_the_wheels_its_lock_names_and_dew_from_its_own_source(ga
     for name, version in (("main", "1.0"), ("head", "2.0")):
         tree = trees[name] = tmp_path / name
         (tree / "locks").mkdir(parents=True)
-        (tree / "locks" / "cpu.txt").write_text(f"probe-wheel @ {wheel(tmp_path, version).as_uri()}\n")
+        built = wheel(tmp_path, version)
+        # As every lock holds it: each file's sha256, which Dew's installer requires.
+        digest = hashlib.sha256(built.read_bytes()).hexdigest()
+        (tree / "locks" / "cpu.txt").write_text(f"probe-wheel @ {built.as_uri()} --hash=sha256:{digest}\n")
         (tree / "tools").mkdir()
         shutil.copy(ROOT / "tools" / "install_environment.sh", tree / "tools")
         (tree / ".python-version").write_text("3.12\n")
