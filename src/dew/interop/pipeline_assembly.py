@@ -29,7 +29,9 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceGrid, SourceSchedule
 from dew.inference.loading import place
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
-from dew.inputs.diffusion import (
+from dew.interop import decoder_parts, hf_decoders as decoders, sources
+from dew.interop.components import bind_component
+from dew.interop.conditioners import (
     Composition,
     DiffusionConditioner,
     HiddenStatesConditioner,
@@ -37,8 +39,6 @@ from dew.inputs.diffusion import (
     T5Segment,
     WanConditioner,
 )
-from dew.interop import decoder_parts, hf_decoders as decoders, sources
-from dew.interop.components import bind_component
 from dew.interop.decoder_bindings import decoder_layouts
 from dew.interop.safetensors_io import LazyTensors
 from dew.interop.sources import StoredWeights

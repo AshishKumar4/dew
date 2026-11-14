@@ -7,6 +7,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- The condition encoders that bind a released checkpoint are dew.interop's: `CLIPText`, `T5Text` and
+  `HFAudio` in `dew.interop.encoders`, and `DiffusionConditioner`, `QwenImageConditioner`,
+  `HiddenStatesConditioner` and `WanConditioner` in `dew.interop.conditioners`, each with its
+  `from_pretrained`. `dew.inputs` still exports them by name, and its registry aliases (`clip_text`, `t5`,
+  `hf_audio`, `diffusion_text`, …) are unchanged; a record that named their earlier import paths under
+  `dew.inputs` reads as their new ones (`dew.registry.MOVED`). `dew.inputs` itself imports no interop.
+
 - On a CPU every process sums a bias's gradient, a broadcast's transpose (`dew.nn.precision.spread`), in
   blocks of about the square root of its positions, each an fp32 product sum: about N / B + B roundings
   where XLA:CPU's reduction took N in order, and what check 1 measures; it was the suite's alone.
