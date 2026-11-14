@@ -15,6 +15,7 @@ import functools
 import jax
 import jax.numpy as jnp
 
+from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import accumulated, at_least_fp32, float32_einsum
 from dew.nn.scatter import DROPPED
@@ -47,24 +48,30 @@ def index_scores(agreements, weights, width: int, precision=None):
                        weighted, scores).squeeze(-2)
 
 
-def top_k_selection(scores, keep, top_k: int):
+def top_k_selection(scores, keep, top_k: int, *, forced=None):
     """The `top_k` highest-scoring keys of each query among those `keep`
-    allows: `[B, S, K]` indices with `K = min(top_k, T)`, -1 in a slot no
-    allowed key fills.
+    allows: `[..., K]` indices with `K = min(top_k, T)`, -1 in a slot no
+    allowed key fills, then each of `forced` `[..., F]` (-1 for none), taken
+    whatever its score and `keep`, which the top k passes over.
 
     Exactly `top_k` keys where at least that many are allowed, and every
     allowed key where fewer are, so a sequence the top-k covers attends as
     the dense mixer does. Equal scores choose the lower key index, because
     `jax.lax.top_k` is stable; torch's `topk` promises no tie order, so a
     selection a tie decides may differ from the reference's. `keep` is the
-    `[B, S, T]` attention mask (a leading axis of one broadcasts), and a key
-    it forbids is never selected whatever the tie rule.
+    attention mask over `scores` `[..., T]` (a leading axis of one
+    broadcasts), and a key it forbids is never selected whatever the tie
+    rule. A block selection takes blocks for keys (`block_maxima`,
+    `dew.nn.block_sparse`).
     """
-    batch, length, total = scores.shape
-    keep = jnp.broadcast_to(keep, (batch, length, total))
+    total = scores.shape[-1]
+    keep = jnp.broadcast_to(keep, scores.shape)
+    if forced is not None:
+        keep = keep & ~jnp.any(jnp.arange(total)[:, None] == forced[..., None, :], axis=-1)
     ranked = jnp.where(keep, scores, jnp.finfo(at_least_fp32(scores.dtype)).min)
     chosen = jax.lax.top_k(ranked, min(top_k, total), is_stable=True)[1]
-    return jnp.where(jnp.take_along_axis(keep, chosen, axis=-1), chosen, -1)
+    chosen = jnp.where(jnp.take_along_axis(keep, chosen, axis=-1), chosen, -1)
+    return chosen if forced is None else jnp.concatenate([chosen, forced.astype(chosen.dtype)], axis=-1)
 
 
 def selection_mask(indices, total: int):
@@ -150,21 +157,109 @@ def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, valu
                       precision=precision)
 
 
+def block_maxima(scores, visible, block_size: int):
+    """Each block of `block_size` entries' best score among those `visible`
+    allows (every one where None), `[..., ceil(T / block_size)]`, -inf for a
+    block with none: the
+    Hierarchical Sparse Indexer's first level's pooling (`candidate_pool`),
+    and MiniMax's indexer's onto its key blocks
+    (`dew.nn.block_sparse.pooled_selection`)."""
+    total = scores.shape[-1]
+    count = -(-total // block_size)
+    ranked = scores if visible is None else jnp.where(visible, scores, -jnp.inf)
+    ranked = jnp.pad(ranked, [(0, 0)] * (ranked.ndim - 1) + [(0, count * block_size - total)],
+                     constant_values=-jnp.inf)
+    return jnp.max(ranked.reshape(*ranked.shape[:-1], count, block_size), axis=-1)
+
+
 def candidate_pool(scores, visible, blocks: int, block_size: int):
     """The Hierarchical Sparse Indexer's first level (v41:583-610): the
-    `blocks` blocks of `block_size` entries with the highest best score, the
-    block holding the query's newest entry always among them, as the
-    entries they hold, `[B, S, blocks * block_size]` in ascending order, -1
-    for a pick past the reachable blocks or an entry past the last."""
-    batch, length, total = scores.shape
-    count = -(-total // block_size)
-    ranked = jnp.where(visible, scores, -jnp.inf)
-    ranked = jnp.pad(ranked, ((0, 0), (0, 0), (0, count * block_size - total)),
-                     constant_values=-jnp.inf)
-    best = jnp.max(ranked.reshape(batch, length, count, block_size), axis=-1)
+    `blocks` blocks of `block_size` entries with the highest best score
+    (`block_maxima`), the block holding the query's newest entry always
+    among them (`top_k_selection`'s `forced`), as the entries they hold,
+    `[B, S, min(blocks, ceil(T / block_size)) * block_size]` in ascending
+    order, -1 for a pick past the reachable blocks or an entry past the
+    last."""
+    total = scores.shape[-1]
+    best = block_maxima(scores, visible, block_size)
     newest = (jnp.sum(visible, axis=-1) - 1) // block_size
-    best = jnp.where(jnp.arange(count) == newest[..., None], jnp.inf, best)
-    values, chosen = jax.lax.top_k(best, min(blocks, count))
-    chosen = jnp.repeat(jnp.sort(jnp.where(values > -jnp.inf, chosen, -1), axis=-1), block_size, axis=-1)
+    chosen = top_k_selection(best, best > -jnp.inf, min(blocks, best.shape[-1]) - 1, forced=newest[..., None])
+    chosen = jnp.repeat(jnp.sort(chosen, axis=-1), block_size, axis=-1)
     entries = chosen * block_size + jnp.tile(jnp.arange(block_size), chosen.shape[-1] // block_size)
     return jnp.where((chosen >= 0) & (entries < total), entries, -1)
+
+
+def selected_runs(selected, chunks, *, slots=None, causal: bool = True, own: bool = True):
+    """Key runs `[B, Q, S + own, 2]` of a selection `selected` `[B, Q, S]`
+    (each query's chunks, -1 for none) over keys numbered into `chunks`
+    `[B, K]` or `[K]` (each key's, its chunk's keys consecutive, -1 for a
+    key in none: blocks of a row, `arange(K) // block`, or of each document
+    from its first place, `dew.nn.inputs.numbered_blocks`): each selected
+    chunk's keys, under causality up to the query's own key (`slots` `[B, Q]`,
+    each query's key, its index where None; -1 for a query with none), and
+    with `own` the query's own chunk up to it; sorted, duplicates and empty
+    chunks an empty run, as `scaled_dot_product_attention`'s `key_runs`
+    takes them. A selection takes no gradient."""
+    rows, queries, _ = selected.shape
+    keys = chunks.shape[-1]
+    chunks = jnp.broadcast_to(chunks, (rows, keys))
+    slots = jnp.broadcast_to(jnp.arange(queries) if slots is None else slots, (rows, queries))
+    # Each chunk's first key and the key past its last, `[B, K]` (no chunk outnumbers its keys).
+    index, numbered = jnp.arange(keys), jnp.where(chunks >= 0, chunks, keys)
+    first = jax.vmap(lambda ids: jax.ops.segment_min(index, ids, num_segments=keys))(numbered)
+    past = jax.vmap(lambda ids: jax.ops.segment_max(index, ids, num_segments=keys))(numbered) + 1
+    taken = selected.astype(jnp.int32)
+    if own:
+        mine = jnp.take_along_axis(chunks, jnp.maximum(slots, 0), axis=-1)
+        taken = jnp.concatenate([taken, jnp.where(slots >= 0, mine, -1)[..., None]], axis=-1)
+    taken = jnp.sort(jnp.where(taken < 0, jnp.iinfo(jnp.int32).max, taken), axis=-1)
+    repeated = jnp.concatenate([jnp.zeros_like(taken[..., :1], bool), taken[..., 1:] == taken[..., :-1]],
+                               axis=-1)
+    kept = (taken != jnp.iinfo(jnp.int32).max) & ~repeated
+    at = jnp.where(kept, taken, 0).reshape(rows, -1)
+    start, end = (jnp.take_along_axis(table, at, axis=-1).reshape(taken.shape) for table in (first, past))
+    if causal:
+        end = jnp.minimum(end, slots[..., None] + 1)
+    held = kept & (end > start)
+    # The held runs first, in order, the empty after them.
+    order = jnp.argsort(jnp.where(held, start, jnp.iinfo(jnp.int32).max), axis=-1, stable=True)
+    start, end, held = (jnp.take_along_axis(each, order, axis=-1) for each in (start, end, held))
+    runs = jnp.stack([jnp.where(held, start, 0), jnp.where(held, end, 0)], axis=-1)
+    return jax.lax.stop_gradient(runs)
+
+
+def selected_attention(query, key, value, selected, chunks, *, slots=None, causal: bool = True,
+                       own: bool = True, implementation: AttentionImpl = 'auto', **options):
+    """Attention whose each query reads the chunks its selection names
+    (`selected` `[B, R, Q, S]`, a selection a GQA group's or a query head's,
+    `selected_runs` over `chunks`), each of the `R` selections a row of the
+    call's batch (the key runs are a row's): `query` `[B, Q, R * h, D]`,
+    `key` and `value` `[B, K, G, D]` with `R` a multiple of `G` (a head's
+    selection reads its group's keys), out `[B, Q, R * h, Dv]`, through the
+    template's indexed form (`scaled_dot_product_attention`'s `key_runs`).
+    `options` are the call's other arguments. A call whose queries are its
+    keys (`slots` None) states its causality to the kernel too; a cache
+    call's runs alone end each query's keys."""
+    rows, queries, heads, _ = query.shape
+    groups = selected.shape[1]
+    per = heads // groups
+    shared = groups // key.shape[2]
+
+    def batched(array: jax.Array, held: int) -> jax.Array:
+        # `[B, S, R * held, D]` as `[B * R, S, held, D]`, a selection a row.
+        length, depth = array.shape[1], array.shape[-1]
+        return array.reshape(rows, length, groups, held, depth).transpose(0, 2, 1, 3, 4).reshape(
+            rows * groups, length, held, depth)
+
+    def rowed(array):
+        return None if array is None else jnp.repeat(jnp.broadcast_to(array, (rows, array.shape[-1])),
+                                                     groups, axis=0)
+
+    runs = selected_runs(selected.reshape(rows * groups, queries, -1), rowed(chunks), slots=rowed(slots),
+                         causal=causal, own=own)
+    key, value = (jnp.repeat(each, shared, axis=2) for each in (key, value))
+    out = scaled_dot_product_attention(batched(query, per), batched(key, 1), batched(value, 1),
+                                       causal=causal and slots is None, key_runs=runs,
+                                       implementation=implementation, **options)
+    out = out.reshape(rows, groups, queries, per, -1).transpose(0, 2, 1, 3, 4)
+    return out.reshape(rows, queries, heads, -1)

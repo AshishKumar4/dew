@@ -8,12 +8,18 @@ import numpy as np
 import pytest
 from attention_oracle import qkv
 from reference_error import assert_as_exact, with_gradients
+from test_mixers import tiny
+from test_text_rollout_contract import assert_generation_scores_as_full_forwards
 
-from dew.nn import block_sparse
+from dew.nn import block_sparse, sparse_selection
 from dew.nn.attention import scaled_dot_product_attention
+from dew.registry import mixers
 
 SEEDS = 8
 """The draws each check-1 site here takes (`reference_error.seeds_for`, sized: 8 each)."""
+
+DECODED_SEEDS = {"block-selected decoding raw": 8, "block-selected decoding policy": 8}
+"""The cached generation's check-1 sites' seeds (`reference_error.seeds_for`, sized on armada)."""
 
 
 def _selected_mask(selected: np.ndarray, block: int, keys: int, *, own: bool) -> np.ndarray:
@@ -50,25 +56,29 @@ def test_a_selections_runs_hold_its_selected_blocks_keys_up_to_each_query(own):
     rng = np.random.default_rng(0)
     selected = rng.integers(-1, queries // block, size=(rows, queries, 4))
     selected[:, :, 3] = selected[:, :, 2]
-    runs = np.asarray(block_sparse.selected_runs(jnp.asarray(selected), block, queries, own=own))
+    chunks = block_sparse.row_blocks(queries, block)
+    runs = np.asarray(sparse_selection.selected_runs(jnp.asarray(selected), chunks, own=own))
     index = jnp.arange(queries)[None, None, :, None]
     seen = np.asarray(jnp.any((index >= runs[:, :, None, :, 0]) & (index < runs[:, :, None, :, 1]), axis=-1))
     np.testing.assert_array_equal(seen, _selected_mask(selected, block, queries, own=own))
 
 
 def test_moba_selects_each_heads_top_earlier_blocks_by_its_gate():
-    """MoBA's selection (`moba_selection`): each query head's `top_k` earlier key blocks by its query's
-    product with the block's mean key, as written out over numpy (the same blocks)."""
-    rows, queries, heads, width, block, top_k = 1, 64, 2, 8, 8, 3
-    query, key, _ = (np.asarray(each, np.float32) for each in qkv((rows, queries, heads, width), jnp.float32))
-    selected = np.asarray(block_sparse.moba_selection(jnp.asarray(query), jnp.asarray(key), block=block,
-                                                      top_k=top_k))
-    means = key.reshape(rows, queries // block, block, heads, width).mean(2)
+    """MoBA's selection (`moba_selection`): each query head's own block and the `top_k - 1` earlier key blocks
+    by its query's product with the block's mean key, its group's, as moba_naive.py forces the own block into
+    its top k, written out over numpy (the same blocks)."""
+    rows, queries, heads, groups, width, block, top_k = 1, 64, 4, 2, 8, 8, 3
+    drawn = qkv((rows, queries, heads, width), jnp.float32, kv_shape=(rows, queries, groups, width))
+    query, key, _ = (np.asarray(each, np.float32) for each in drawn)
+    selected = np.asarray(block_sparse.moba_selection(jnp.asarray(query), jnp.asarray(key),
+                                                      block_sparse.row_blocks(queries, block), top_k=top_k,
+                                                      count=queries // block))
+    means = key.reshape(rows, queries // block, block, groups, width).mean(2)
     for head in range(heads):
         for index in range(queries):
-            earlier = index // block
-            gate = query[0, index, head] @ means[0, :earlier, head].T
-            expected = set(np.argsort(-gate)[:top_k].tolist())
+            own = index // block
+            gate = query[0, index, head] @ means[0, :own, head // (heads // groups)].T
+            expected = {*np.argsort(-gate)[:top_k - 1].tolist(), own}
             assert {int(b) for b in selected[0, head, index] if b >= 0} == expected
 
 
@@ -96,7 +106,8 @@ def test_attention_over_a_groups_selection_holds_check_1_against_its_dense_mask(
     draw = _drawn(rows, queries, heads, groups, width)
 
     def ours(query, key, value):
-        return block_sparse.selected_attention(query, key, value, selected, block=block)
+        return sparse_selection.selected_attention(query, key, value, selected,
+                                                   block_sparse.row_blocks(queries, block))
 
     def reference(query, key, value):
         return scaled_dot_product_attention(query, key, value, mask=dense, implementation="xla")
@@ -157,8 +168,9 @@ def test_infllm_selects_each_groups_top_blocks_by_its_pooled_keys(keys):
     rng = np.random.default_rng(4)
     query = rng.standard_normal((rows, keys, groups, per, width)).astype(np.float32)
     key = rng.standard_normal((rows, keys, groups, width)).astype(np.float32)
-    selected = np.asarray(block_sparse.infllm_selection(jnp.asarray(query), jnp.asarray(key), block=block,
-                                                        top_k=top_k, kernel=kernel, stride=stride))
+    flat = jnp.asarray(query.reshape(rows, keys, groups * per, width))
+    selected = np.asarray(block_sparse.infllm_selection(flat, jnp.asarray(key), block=block, top_k=top_k,
+                                                        kernel=kernel, stride=stride))
     starts = list(range(0, keys - kernel + 1, stride))
     step, span = block // stride, block // stride + kernel // stride - 1
     for group in range(groups):
@@ -228,3 +240,13 @@ def test_nsa_attention_holds_check_1_against_its_branches_written_out():
 
     assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(reference)), draw,
                     "NSA attention's three branches gated", seeds=SEEDS)
+
+
+def test_a_cached_generation_selects_the_blocks_its_full_forward_selects():
+    """A decoder of block-selected attention (`block_sparse_attention`, MoBA's) at blocks of two places, a
+    query's own and one earlier: a left-padded batch drawn through the cache, each step selecting over the
+    cache's keys at the places it keeps, scores each drawn token on par with a fresh full forward over the
+    row's unpadded tokens (`assert_generation_scores_as_full_forwards`), over prompts and draws of up to
+    seven tokens, four blocks."""
+    model = tiny(mixer=mixers.build("block_sparse_attention", block=2, top_k=2), dtype="float32")
+    assert_generation_scores_as_full_forwards(model, "block-selected decoding", seeds=DECODED_SEEDS)
