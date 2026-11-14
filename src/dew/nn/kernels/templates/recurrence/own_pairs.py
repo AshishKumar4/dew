@@ -45,6 +45,15 @@ def own_staging(call: Call, keys: int) -> tuple:
     return (swizzling.plain((2, algebra.SUB + call.chunk, keys), jnp.float32),)
 
 
+def own_zeroed(call: Call, staged) -> None:
+    """`staged`'s (`own_staging`'s) rows below the chunk zeroed, which a shifted read takes for the tokens
+    before it and nothing writes: once a program, before its walk, so a row's reads before its sub-chunk are
+    finite (`algebra.key_diagonal_pairs_back` masks its strips, not its terms)."""
+    for index in range(2):
+        below = staged.at[index, pl.ds(0, algebra.SUB)]
+        plgpu.store(below, call.family.zeros(below.shape), optimized=False)
+
+
 def shifted_keys(call: Call, staged, keys: jax.Array, prefix: tuple):
     """A key block's keys and its tokens' own decays (`algebra.token_decays` of its separated prefix, the
     prefix halves `prefix`, each row against the row before, shifted in registers once a block), each
@@ -127,7 +136,7 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
             return bands, accumulators
 
         carry = tuple(family.as_tile(family.zeros((chunk, algebra.SUB))) for _ in products)
-        return mosaic.Walk(views, step, steps=steps, carry=carry)
+        return mosaic.Walk(views, step, steps=steps, carry=carry, prologue=lambda: own_zeroed(call, shifts))
 
     blocks = _own_streamed(call, keys, queries=scored)
     out_type = tuple(_band_form(call, name).shape(call.heads * algebra.SUB) for name in products)
@@ -229,10 +238,11 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
         shifts, = staging
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
-        # The pairs' own bands' gradients once, the same tile every step.
+        # The pairs' own bands' gradients once, the same tile every step, an offset a row
+        # (`algebra.own_bands`).
         views = {**stream_views(lambda i: (0, 0),
-                                scores=square.views(ds_ref, row, chunk, h * algebra.SUB, algebra.SUB),
-                                system=square.views(da_ref, row, chunk, h * algebra.SUB, algebra.SUB)),
+                                scores=square.views(ds_ref, h * algebra.SUB, algebra.SUB, row, chunk),
+                                system=square.views(da_ref, h * algebra.SUB, algebra.SUB, row, chunk)),
                  **pairs_back_views(call, row, h, q_ref, k_ref, hi_ref, lo_ref)}
 
         def step(index, slots, d_betas, accumulators):
@@ -241,9 +251,11 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
             query = stream_tile(slots, "queries", given).value().astype(jnp.float32)
             key = stream_tile(slots, "keys", given).value().astype(jnp.float32)
             prefix = stream_tile(slots, "gates", gates).value(), stream_tile(slots, "lows", gates).value()
-            # Each pairs' gradient's band read at each offset, the scores' scaled as their pairs were.
+            # Each pairs' gradient's band read at each offset, its row (every token's pair `e` back) as a
+            # row's vector, the scores' scaled as their pairs were.
             def strip(name, scaled, e):
-                return algebra.band_strip(stream_tile(slots, name, square).value(), e) * scaled
+                return functools.reduce(jnp.add, (family.rows_of(slots[f"{name}{p}"].at[e])
+                                                  for p in range(square.parts))) * scaled
 
             strips = [functools.partial(strip, name, scaled)
                       for name, scaled in (("scores", scale), ("system", 1.0))]
@@ -266,7 +278,8 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
 
             return d_betas, accumulators
 
-        return mosaic.Walk(views, step, steps=steps, carry=family.as_row(family.zeros((chunk,))))
+        return mosaic.Walk(views, step, steps=steps, carry=family.as_row(family.zeros((chunk,))),
+                           prologue=lambda: own_zeroed(call, shifts))
 
     tiles = _key_own_streamed(call, keys)
     staging, landing = _key_own_staged(call, keys)
@@ -278,15 +291,18 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
                          grid_names=("chunks", "heads"), blocks=tiles, stages=(1, 2), live=chunk_liveness(7),
                          steps=steps, model=terms,
                          held=_key_own_held(call, keys), staging=staging, landing=landing,
-                         name="recurrence_key_pairs_own", issues=False)(
+                         name="recurrence_key_pairs_own", issues=False,
+                         # The bands read a row at a time, at a traced offset: staged plain.
+                         swizzles={f"{name}{p}": swizzling.UNSWIZZLED for name in ("scores", "system")
+                                   for p in range(fp32_operand(call).parts)})(
         q, k, hi, lo, beta, *(algebra.own_bands(d, chunk=chunk) for d in (d_scores, d_system)), taken)
 
 
 def _key_own_streamed(call: Call, keys: int) -> dict:
-    """`key_pairs_own`'s streams at key block `keys`: the pairs' gradients' own bands once, the queries,
-    keys and prefix halves a block at a time."""
+    """`key_pairs_own`'s streams at key block `keys`: the pairs' gradients' own bands once, an offset a row
+    (`algebra.own_bands`), the queries, keys and prefix halves a block at a time."""
     chunk, given, gates, square = call.chunk, call.given, call.gates, fp32_operand(call)
-    bands = ((chunk, algebra.SUB), square)
+    bands = ((algebra.SUB, chunk), square)
     return stream_blocks(scores=bands, system=bands,
                          queries=((chunk, keys), given), keys=((chunk, keys), given),
                          gates=((chunk, keys), gates), lows=((chunk, keys), gates))
@@ -304,13 +320,13 @@ def _key_own_held(call: Call, keys: int) -> Held:
     three gradients carried, the pair's decay and the decay following it, the two shifted reads
     (`shifted_keys`, from their staged tile) and the block's keys and queries kept for the gradients'
     stores, the queries and keys as read, the masks and a row's vector; at its strips' reads seven of those
-    tiles, a pairs' gradient's band `[C, SUB]` and its lanes' mask, the queries and keys and three row
-    vectors (ptxas's least spill-free cap at Kimi Linear's training 112 on sm100, sm90 and sm80 where each
-    offset read the separated prefix and held it, jsf-own-smem2)."""
+    tiles, the queries and keys and three row vectors, each strip read from its band's row in shared memory
+    (a band `[C, SUB]` and its lanes' mask held where it was taken out of a token's band; ptxas's least
+    spill-free cap at Kimi Linear's training 112 on sm100, sm90 and sm80 where each offset read the
+    separated prefix and held it, jsf-own-smem2)."""
     chunk = call.chunk
     tile, given = f32(chunk, keys), held_tile(call.given, chunk, keys)
     row = f32(chunk, 4)
     banded = masks(chunk, keys)
-    band = [f32(chunk, algebra.SUB), *masks(chunk, algebra.SUB)]
     return Held(carried=[row], phases=([tile] * 8 + given * 2 + banded + [row],
-                                       [tile] * 7 + band + given * 2 + banded + [row] * 3))
+                                       [tile] * 7 + given * 2 + banded + [row] * 3))
