@@ -200,7 +200,30 @@ def _stepped(out: Path) -> tuple:
     the run on any host (`compile`)."""
     [step] = json.loads(out.read_text())
     mfu = step.get("mfu")
+    # The window's whole elapsed time a step: a pause a head adds is a regression, never averaged past; a
+    # part that stalled is said beside it (`stalled`), its row's diagnostics.
     return step["ms_per_step"], peak(step), None if mfu is None else 100.0 * mfu
+
+
+STALL = 1.5
+"""How many times its window's median a part of a step's timed window takes to be said stalled (`stalled`)."""
+
+
+def stalled(out: Path) -> dict | None:
+    """A step's timed window's worst part where it took `STALL` times its parts' median or more: its ms a
+    step, the median's, and whose time it was (`host` where its dispatch was as slow, `device` where only
+    its readiness was); None where no part stalled, or its tool times no parts. A diagnostic beside the
+    step's time, which stays the window's whole elapsed time."""
+    [step] = json.loads(out.read_text())
+    series, sent = step.get("window_ms_series"), step.get("window_dispatch_ms_series")
+    if not series:
+        return None
+    middle = statistics.median(series)
+    worst = max(range(len(series)), key=series.__getitem__)
+    if series[worst] < STALL * middle:
+        return None
+    by = None if not sent else "host" if sent[worst] >= STALL * statistics.median(sent) else "device"
+    return {"part_ms": series[worst], "median_ms": round(middle, 3), "by": by}
 
 
 def _forwarded(out: Path, name: str) -> tuple:
@@ -410,6 +433,9 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
                 sample.update({row.name: {**value, "exit_code": done.returncode} if external
                                else None if value is None else float(value)
                                for row, value in zip(probe.rows, values, strict=True)})
+                # A step whose window stalled in one part, said beside its rows (`stalled`).
+                if probe.rows[0].name.startswith("step ") and out.is_file() and (stall := stalled(out)):
+                    sample.update({f"stalled {row.name}": stall for row in probe.rows})
             except Exception as error:  # a row that cannot run in this tree is reported, not gated
                 failure = ({"error": str(error)[-400:],
                             "exit_code": None if done is None else done.returncode}
@@ -772,6 +798,14 @@ def report(args: argparse.Namespace) -> int:
             state += " (parts, median s base/head: " + ", ".join(
                 f"{part} {statistics.median(each[part] for each in spent['base']):.2f}/"
                 f"{statistics.median(each[part] for each in spent['head']):.2f}" for part in shared) + ")"
+        stalls = [found[f"stalled {row.name}"] for arm in ARMS for found in samples[arm]
+                  if isinstance(found, dict) and f"stalled {row.name}" in found]
+        if stalls:
+            worst = max(stalls, key=lambda stall: stall["part_ms"])
+            verdicts[row.name]["stalled"] = stalls
+            by = worst["by"] or "unknown"
+            state += (f" (stalled in {len(stalls)} samples, in its time: worst part "
+                      f"{worst['part_ms']:.2f} ms against {worst['median_ms']:.2f}, the {by}'s)")
         if state.startswith("partial"):
             state += " (" + ", ".join(f"{arm} {count} of {rounds} rounds unmeasured"
                                       for arm, count in numbers["unmeasured rounds"].items()) + ")"

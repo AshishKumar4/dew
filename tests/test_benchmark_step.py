@@ -152,7 +152,8 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     assert row["ms_per_step"] > 0 and row["p50_ms"] > 0
     # The timed window's time as its parts' series, each part's steps' mean, of which ms_per_step is the mean
     # weighted by each part's steps; every synced step's own time, which the spread reads.
-    assert len(row["window_ms_series"]) == 2 and len(row["synced_ms_series"]) == 2
+    assert len(row["window_ms_series"]) == len(row["window_dispatch_ms_series"]) == 2
+    assert len(row["synced_ms_series"]) == 2
     sizes = tool.window_parts(2)
     weighted = sum(ms * size for ms, size in zip(row["window_ms_series"], sizes, strict=True)) / sum(sizes)
     assert row["ms_per_step"] == pytest.approx(weighted, abs=1e-3)
@@ -326,5 +327,7 @@ def test_a_windows_parts_are_stamped_as_each_becomes_ready_whether_dispatch_or_d
         return state + 1, np.float32(state), True
 
     *_, parts = tool.timed_parts(step, 0, [2, 2, 2])
-    assert [size for size, _ in parts] == [2, 2, 2]
-    assert all(seconds >= 0.03 for _, seconds in parts), parts
+    assert [size for size, _, _ in parts] == [2, 2, 2]
+    assert all(seconds >= 0.03 for _, seconds, _ in parts), parts
+    # The host's dispatch was the slow part: each part's dispatch takes its two steps' sleeps.
+    assert all(sent >= 0.03 for _, _, sent in parts), parts

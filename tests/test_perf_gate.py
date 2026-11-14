@@ -840,3 +840,22 @@ def test_a_steps_compiled_ahead_on_a_host_with_no_gpu_are_named_for_their_cases(
     assert done.returncode == 0, done.stderr[-3000:]
     [case] = step.cases_from_json(json.dumps([TINY]))
     assert [path.name for path in (tmp_path / "ahead").iterdir()] == [step.ahead_name(case)]
+
+
+@pytest.mark.parametrize(("dispatched", "by"), [([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], "device"),
+                                                ([1.0, 1.0, 1.0, 55.0, 1.0, 1.0], "host")])
+def test_a_step_whose_window_stalled_in_one_part_keeps_its_elapsed_time_and_says_the_stall_beside_it(
+        gate, tmp_path, dispatched, by):
+    """A step's time is its window's whole elapsed time a step, a stall in it counted as a head's pause
+    would be; a part that took `STALL` times its parts' median is said beside it, with whose time it was:
+    the host's where its dispatch was as slow, the device's where only its readiness was (2026-11-14: a
+    round's first arm read 36.41 ms where one of six parts took 83.72 against 27)."""
+    out = tmp_path / "step.json"
+    series = [27.41, 26.92, 27.01, 83.72, 26.46, 26.95]
+    out.write_text(json.dumps([{"ms_per_step": 36.412, "window_ms_series": series,
+                                "window_dispatch_ms_series": dispatched}]))
+    assert gate._stepped(out)[0] == 36.412
+    assert gate.stalled(out) == {"part_ms": 83.72, "median_ms": 26.98, "by": by}
+    steady = [27.1, 26.9, 27.0, 27.2, 26.8, 27.0]
+    out.write_text(json.dumps([{"ms_per_step": 27.0, "window_ms_series": steady}]))
+    assert gate.stalled(out) is None

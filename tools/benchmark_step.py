@@ -490,7 +490,9 @@ def timed_parts(step, state, parts: list[int]):
     dispatched to a thread that awaits each in turn and stamps the seconds since the first dispatch as it
     becomes ready: no wait inside the window, and a part's stamp its readiness whether the host's dispatch or
     the device is the slower (a host-bound step's parts all ready before a wait after the whole dispatch
-    could read them). Returns the last state, loss and finiteness, and each part's (steps, seconds)."""
+    could read them). Returns the last state, loss and finiteness, and each part's (steps, seconds, the
+    host's seconds dispatching it): a part slow in both was the host's, one slow only to be ready the
+    device's."""
     ready: queue.Queue = queue.Queue()
     ends: list[float] = []
 
@@ -502,18 +504,20 @@ def timed_parts(step, state, parts: list[int]):
     waiter = threading.Thread(target=waited, name="timed-parts")
     started = time.perf_counter()
     waiter.start()
-    carry = (state, None, None)
+    carry, dispatched = (state, None, None), []
     try:
         for size in parts:
             for _ in range(size):
                 carry = step(carry[0])
+            dispatched.append(time.perf_counter() - started)
             ready.put(carry[1])
     finally:
         ready.put(None)
         waiter.join()
     jax.block_until_ready(carry)
-    begins = [0.0, *ends[:-1]]
-    return (*carry, [(size, end - begun) for size, end, begun in zip(parts, ends, begins, strict=True)])
+    begins, sent = [0.0, *ends[:-1]], [0.0, *dispatched[:-1]]
+    return (*carry, [(size, end - begun, out - went) for size, end, begun, out, went
+                     in zip(parts, ends, begins, dispatched, sent, strict=True)])
 
 
 def tuning_digest() -> dict[str, object] | None:
@@ -568,7 +572,7 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
         finally:
             window_ended = datetime.datetime.now()
             device_window.__exit__()
-        elapsed = sum(seconds for _, seconds in parts)
+        elapsed = sum(seconds for _, seconds, _ in parts)
 
         # A second window of the same length, waiting on every step, for the
         # spread. The loop above dispatches asynchronously on purpose, as a run
@@ -633,7 +637,10 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
             # The timed window's parts, each's ms a step in order, and every synced step's ms in order:
             # how the step's time moves from the window's start (2026-11-14: a perf gate round's first arm
             # read 40% slow on the very tree its others read).
-            "window_ms_series": [round(seconds / size * 1e3, 3) for size, seconds in parts],
+            "window_ms_series": [round(seconds / size * 1e3, 3) for size, seconds, _ in parts],
+            # Each part's host dispatch, ms a step: a part slow here too was the host's (a pause of its
+            # process), one slow only to be ready the device's.
+            "window_dispatch_ms_series": [round(sent / size * 1e3, 3) for size, _, sent in parts],
             "synced_ms_series": [round(seconds * 1e3, 3) for seconds in synced],
             # The GPUs under the timed window's load: each one's samples' count in it, its SM clock,
             # power and temperature as sampled through it, and the clock event reasons any sample held
