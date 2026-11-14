@@ -210,6 +210,8 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
         trainer = Trainer(objective, optimizer, key=jax.random.key(seed), mesh=mesh or MeshSpec(),
                           layout=Layout(min_shard=1, tolerance=1.0), accumulation=accumulation, split=split,
                           param_dtype="float64" if wide else None)
+        # A configured optimizer built over the run's updates, as a fit builds it.
+        trainer.scheduled((steps + padded) // accumulation)
         state = trainer.initial_state()
         steps_by = {False: (trainer.compile(state, batch), None)}
         if long:
