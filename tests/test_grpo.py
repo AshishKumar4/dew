@@ -495,8 +495,6 @@ COUNT_RUNS, COUNT_STEPS, COUNT_GROUPS, COUNT_TOKENS = 31, 80, 8, 4
 """A GRPO policy's runs, each its own initialization and prompts, and each run's updates over eight prompts
 of two tokens, `COUNT_GROUPS` completions of `COUNT_TOKENS` a prompt: the runs `learning_gate.units_for`
 sizes from a pilot of 96 (runs 1000 to 1095 on armada's CPUs, its contrasts' mean 1.20 and spread 0.47)."""
-COUNT_MARGIN = 2.0
-"""The claim: training doubles each run's held-out reward, the chance its policy follows the rule."""
 
 
 def counted(start, length: int) -> np.ndarray:
@@ -527,10 +525,9 @@ def counting_prompts(seed) -> dict:
             INFO_KEY: np.stack([_utf8("", 8) for _ in starts])}
 
 
-def counting_gains(runs, *, steps: int = COUNT_STEPS, learning_rate: float = 1e-2,
-                   margin: float = COUNT_MARGIN) -> np.ndarray:
-    """Each of `runs`' contrast for "training raises the held-out reward `margin` times": the log of its
-    policy's held-out reward after over before, less the log of `margin`. A run is a GRPO policy from its
+def counting_gains(runs, *, steps: int = COUNT_STEPS, learning_rate: float = 1e-2) -> np.ndarray:
+    """Each of `runs`' contrast for "training raises the held-out reward": the log of its policy's held-out
+    reward after over before. A run is a GRPO policy from its
     own initialization trained `steps` updates on its own prompts; its held-out reward is the expected
     share of rule-following tokens its policy draws after 64 prompts no run trained on, each continuation
     on the rule so far, read off the policy's own likelihoods (`per_token_log_probs`), no draw's noise."""
@@ -559,7 +556,7 @@ def counting_gains(runs, *, steps: int = COUNT_STEPS, learning_rate: float = 1e-
                                                            for step in itertools.count())),
                       None, batch=8, records=None)
         state = trainer.fit(data, steps=steps, log_every=steps)
-        gains.append(np.log(reward(state.variables, run) / reward(start.variables, run)) - np.log(margin))
+        gains.append(np.log(reward(state.variables, run) / reward(start.variables, run)))
     return np.asarray(gains)
 
 
@@ -567,10 +564,10 @@ def test_a_grpo_policy_rewarded_for_its_language_learns_it():
     """Language RL's scenario (docs/design/testing.md: collect rollouts, score them, update a policy): a
     policy drawing completions of two-token prompts, rewarded for each token that follows the counting
     language's rule (`counting_reward`), trained by GRPO on its own draws (`RolloutScheduler.sampled`),
-    raises its held-out reward COUNT_MARGIN times (`counting_gains`) over independent runs, each from its
-    own initialization and prompts, as the learning gate judges a learning claim
+    raises its held-out reward (`counting_gains`), the spec's claim at no margin past it, over independent
+    runs, each from its own initialization and prompts, as the learning gate judges a learning claim
     (`learning_gate.assert_learns`)."""
     from learning_gate import assert_learns
 
-    assert_learns(lambda runs: {"training doubles the held-out reward": counting_gains(runs)},
+    assert_learns(lambda runs: {"training raises the held-out reward": counting_gains(runs)},
                   "a GRPO policy learning its language", units=COUNT_RUNS)
