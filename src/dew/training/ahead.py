@@ -43,7 +43,6 @@ import dataclasses
 import functools
 import hashlib
 import importlib.metadata
-import importlib.util
 import io
 import json
 import logging
@@ -253,16 +252,12 @@ class Executable:
 
 
 def _wheel_targets_registered() -> None:
-    """Each installed Dew kernel wheel's FFI targets registered with jax: a wheel registers its own at the
-    first call that traces one, and a process that only loads a program compiled ahead traces none, so its
-    first run of a call to one found no handler (dew-cutlass's grouped GEMM, dew-flash's attention)."""
-    if importlib.util.find_spec("dew_cutlass") is not None:
-        from dew.nn.kernels import grouped_matmul
-
-        grouped_matmul.cutlass_registered()
-    if importlib.util.find_spec("dew_flash_attn") is not None:
-        # The wheel's own registration of its targets (`dew_flash_attn.TARGETS`), which its calls run.
-        importlib.import_module("dew_flash_attn")._registered()
+    """Each installed Dew kernel wheel's FFI targets registered with jax, by the callable each names in the
+    `dew.kernel_wheels` entry-point group (dew-cutlass's grouped GEMM, dew-flash-attn's attention): a wheel
+    registers its own at the first call that traces one, and a process that only loads a program compiled
+    ahead traces none, so its first run of a call to one found no handler."""
+    for wheel in importlib.metadata.entry_points(group="dew.kernel_wheels"):
+        wheel.load()()
 
 
 @dataclasses.dataclass(frozen=True)

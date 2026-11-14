@@ -1819,14 +1819,6 @@ class MosaicTgmm(_Mosaic):
         return out[:, :depth, :width], None
 
 
-@functools.cache
-def cutlass_registered() -> None:
-    """dew_cutlass's FFI targets, registered with jax once: at the first launch that runs one, or before a
-    program compiled ahead is loaded (`dew.training.ahead.Executable.loaded`), which traces none."""
-    for target, capsule in importlib.import_module('dew_cutlass').targets().items():
-        jax.ffi.register_ffi_target(target, capsule, platform="CUDA")
-
-
 @dataclasses.dataclass(frozen=True)
 class _ScaledGmm(MosaicGmm):
     """`MosaicGmm` of a product whose rows' and matrix's scales its binding takes as one operand (`scales`),
@@ -2035,7 +2027,7 @@ class CutlassGmm(_Cutlass):
         # not eligible for them (`_Cutlass.eligible`); a dense call is one group, as any.
         del prologue_operands, epilogue_operands, paired, first, gather, scatter, interpret, hooks, exact_sums
         del dense, config
-        cutlass_registered()
+        importlib.import_module('dew_cutlass').registered()
         width = kernel.shape[1] if trans_rhs else kernel.shape[2]
         out = jax.ShapeDtypeStruct((tokens.shape[0], width), jnp.dtype(out_dtype))
         call = _cutlass_call(0, out)
@@ -2061,7 +2053,7 @@ class CutlassTgmm(_Cutlass):
              exact_sums: bool = False, dense: bool = False, config: mosaic_gpu.Tiles,
              return_residuals: bool = False):
         del prologue_operands, gather, interpret, hooks, exact_sums, dense, config  # as `CutlassGmm._fwd`'s
-        cutlass_registered()
+        importlib.import_module('dew_cutlass').registered()
         out = jax.ShapeDtypeStruct((sizes.shape[0], tokens.shape[1], cotangent.shape[1]),
                                    jnp.dtype(out_dtype))
         return _cutlass_call(1, out)(tokens, cotangent, sizes), None
