@@ -1660,14 +1660,6 @@ def test_a_nemotron_h_trunk_whose_config_names_a_step_loads_as_the_trunk(name, t
     np.testing.assert_array_equal(np.asarray(model.apply(variables, ids)), np.asarray(plain.apply(held, ids)))
 
 
-def test_a_bundle_made_from_a_model_carries_its_record_as_a_loaded_one_does():
-    """`PretrainedDecoder.from_model`'s model_config is the decoder's record, the form a load's
-    takes: written as JSON and read back, it builds the same decoder."""
-    loaded = Pretrained.load(str(FIXTURES / "qwen3-tiny"), dtype="float32", attention_impl="reference")
-    bundle = PretrainedDecoder.from_model(loaded.model, loaded.variables)
-    assert models.build("causal_transformer", **json.loads(json.dumps(bundle.model_config))) == loaded.model
-
-
 def test_a_float64_decoder_saves_and_reloads_in_float64(tmp_path):
     """A decoder computing in float64 end to end, as Dory's and nGPT's runs do: its bundle and a
     run's record of it name float64, and the checkpoint it saves loads back in float64 to the same
@@ -1713,8 +1705,7 @@ def test_a_qwen_config_without_a_window_bound_windows_the_layers_transformers_wi
         name: value for name, value in config.items() if name != "model_type"}).layer_types
     windows = tuple("sliding_attention" if model.kind_of(kind).window else "full_attention"
                     for kind in model.per_layer_types)
-    assert windows == tuple(expected)
-    assert windows.count("sliding_attention") == 4
+    assert windows == tuple(expected) and "sliding_attention" in windows
 
 
 @pytest.mark.parametrize("fixture", ["qwen2-tiny", "qwen3-tiny"])

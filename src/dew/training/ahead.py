@@ -65,7 +65,7 @@ from jax.experimental import serialize_executable
 from jaxlib import xla_client
 
 from dew import communicators
-from dew._cache import cuda_libraries, plugin_builds, topology_digest, uncached
+from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
 from dew._devices import COMPILE_ONLY_MEMORY, device_memory
 from dew._records import JSON, record
 from dew.batch import Batch
@@ -322,8 +322,8 @@ class AheadOfTime:
     ahead before steps recorded it, which no run reproduces."""
     plan: JSON = None
     """The plan the run's own fit search makes on those
-    GPUs (`Trainer.plan`): every program it compiled, each with the footprint derived for it beside
-    XLA's memory of it, and the plan it took."""
+    GPUs (`Trainer.plan`): every program it compiled, each with XLA's memory of it, and the plan it
+    took."""
     planned_seconds: float | None = None
     """The seconds that search took, its derivations and every compile: the time a run spends planning
     before its first step on those GPUs."""
@@ -924,7 +924,7 @@ class AheadTarget:
     phases: tuple[int, ...] = ()
     """The run's data phases whose steps are compiled in place of the first's, each over a batch of its own
     (`phase_batch`), into the run's persistent compilation cache, where that phase's first compile in the
-    run finds them (`LaterPhases`): none, the first step's alone."""
+    run finds them: none, the first step's alone."""
 
     @property
     def memory(self) -> int | None:
@@ -1123,6 +1123,7 @@ class LaterPlans:
         """The thread planning the later phases of `trainer`'s run, begun where they hold steps of other
         programs than the step of `batch`, its first (`later_phases`), over the shapes of `state`, the
         state its first step returned; None where it plans none."""
+        from dew.batch import PHASE
         from dew.distributed.batches import split_fields
 
         if (jax.process_count() > 1 or trainer.host_master or trainer.rollout is not None
@@ -1131,19 +1132,32 @@ class LaterPlans:
         phases = later_phases(trainer, batch)
         if not phases:
             return None
-        shapes = fresh_shapes(state, trainer.accumulation)
+        from dew.training.compiler import fresh
+
+        shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
+                                                                sharding=getattr(leaf, "sharding", None)),
+                              fresh(state))
+        # A phase's step is planned at its boundary where its pass count changes (`PhasePasses.begins`):
+        # the first later phase of each count none before it ran.
+        counts = trainer.phase_passes.counts
+        seen = {counts[int(batch[PHASE].index)]}
+        begun = [phase for phase in phases if counts[phase] not in seen and not seen.add(counts[phase])]
+        # Each plan traces under the loop's contexts as it stands, its JAX states carried (`carried`: they
+        # hold per thread), its context variables copied.
+        entered = carried()
+
+        def planned(phase: int) -> dict:
+            with entered():
+                return _phase_plan(trainer, shapes, split_fields(phase_batch(trainer, batch, phase))[0],
+                                   counts[phase])
+
         pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dew-later-phases")
         try:
-            # Each phase's plan reads the loop's context as the run's first compile did (its mesh, its
-            # options), copied as it is submitted.
-            # The fields the devices read, as the phase's boundary compiles over them (`split_fields`).
-            futures = {trainer.phase_passes.counts[phase]: pool.submit(
-                contextvars.copy_context().run, _phase_plan, trainer, shapes,
-                split_fields(phase_batch(trainer, batch, phase))[0], trainer.phase_passes.counts[phase])
-                for phase in phases}
+            futures = {counts[phase]: pool.submit(contextvars.copy_context().run, planned, phase)
+                       for phase in begun}
         finally:
             pool.shutdown(wait=False)
-        _log.info("planning the steps of data phases %s off the loop", list(phases))
+        _log.info("planning the steps of data phases %s off the loop", begun)
         return cls(futures)
 
     def taken(self, passes: int | None) -> dict | None:
@@ -1169,15 +1183,6 @@ class LaterPlans:
         self.futures.clear()
 
 
-def fresh_shapes(state: TrainState, accumulation: int) -> TrainState:
-    """`state`'s shapes, each on its sharding, as a fresh state holds it at an update's end: no window, no
-    narrow copies, its window size a step of one microbatch's (`dew.training.compiler.freshly_held`)."""
-    laid = dataclasses.replace(state, accumulation=None, compute=None,
-                               window_size=np.int32(accumulation))
-    return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
-                                                          sharding=getattr(leaf, "sharding", None)), laid)
-
-
 def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
                                  passes: int) -> dict:
     """The executables a plan of `trainer`'s step at `passes` compiled over `state`'s shapes and `batch`
@@ -1188,6 +1193,8 @@ def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Train
 
     phases = trainer.phase_passes.apart(passes)
     compiler = StepCompiler(phases.base, trainer._compiler.links(trainer.device_mesh), None, phases)
+    # Its empty window binds no split, as at the boundary (`StepCompiler.afresh`).
+    compiler.afresh = True
     stepping = trainer._stepping(phases.base, compiler)
     stepping = dataclasses.replace(stepping, shape=dataclasses.replace(stepping.shape,
                                                                        split=trainer._given_split))
