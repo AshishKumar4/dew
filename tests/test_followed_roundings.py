@@ -156,6 +156,40 @@ def test_an_error_before_a_rounding_is_charged_though_its_decision_is_followed()
     assert {finding.leaf.rpartition("[")[2] for finding in failed.value.findings} == {"'rounded']"}
 
 
+NAMES = ("x", "w1", "w2")
+"""A draw's inputs by name, as a recording keeps them."""
+
+
+def drawn(seed: int) -> dict[str, np.ndarray]:
+    """`draw(seed)` by name (`NAMES`), on the host, as a recorder draws it."""
+    return dict(zip(NAMES, (np.asarray(value) for value in draw(seed)), strict=True))
+
+
+def evaluated(inputs):
+    """A recorder's evaluation of the site (`record_case`, `record_truths`): the float32 arm's judged
+    leaves, the float64 truth following its decisions, and those decisions."""
+    ran = layer(product)(*(jnp.asarray(inputs[name]) for name in NAMES))
+    with jax.enable_x64(new_val=True):
+        truth = followed_truth(ran.decisions, *(jnp.asarray(inputs[name], jnp.float64) for name in NAMES))
+    return (jax.tree.map(np.asarray, ran.judged), jax.tree.map(np.asarray, truth),
+            jax.tree.map(np.asarray, ran.decisions))
+
+
+def for_itself(decisions, x, w1, w2):
+    """The site's float64 computation rounding for itself, its decisions ignored: no followed truth."""
+    del decisions
+    return {"output": rounded(x @ w1) @ w2, "rounded": x @ w1}
+
+
+def decided_otherwise(seed: int) -> bool:
+    """Whether a float64 path that rounds for itself decides some rounding of draw `seed` otherwise than
+    the float32 arm."""
+    x, w1, w2 = draw(seed)
+    with jax.enable_x64(new_val=True):
+        own = np.asarray(rounded(jnp.asarray(x, jnp.float64) @ jnp.asarray(w1, jnp.float64)))
+    return not np.array_equal(np.asarray(layer(product)(x, w1, w2).decisions["q"], np.float64), own)
+
+
 def test_a_float64_path_that_rounds_for_itself_is_no_recorded_followed_truth():
     """A recorded reference's truth followed its own decisions, which the recording keeps
     (`record_case(..., followed=True)`): a float64 path that follows them is held to the recorded truth at
@@ -165,44 +199,51 @@ def test_a_float64_path_that_rounds_for_itself_is_no_recorded_followed_truth():
 
     recorder = load("recorded_references")
     reference = layer(product)
-
-    def drawn(seed):
-        return dict(zip(("x", "w1", "w2"), (np.asarray(value) for value in draw(seed)), strict=True))
-
-    def evaluate(inputs):
-        ran = reference(*(jnp.asarray(inputs[name]) for name in ("x", "w1", "w2")))
-        with jax.enable_x64(new_val=True):
-            truth = followed_truth(ran.decisions, *(jnp.asarray(inputs[name], jnp.float64)
-                                                     for name in ("x", "w1", "w2")))
-        return (jax.tree.map(np.asarray, ran.judged), jax.tree.map(np.asarray, truth),
-                jax.tree.map(np.asarray, ran.decisions))
-
-    recorded = recorder.record_case("site", drawn, evaluate, summary=True, store_inputs=False, followed=True)
+    recorded = recorder.record_case("site", drawn, evaluated, summary=True, store_inputs=False, followed=True)
     seeds = int(recorded["site.seeds"])
 
     def by_name(fn):
-        return lambda decisions, inputs: fn(decisions, *(inputs[name] for name in ("x", "w1", "w2")))
+        return lambda decisions, inputs: fn(decisions, *(inputs[name] for name in NAMES))
 
     draws, recorded_reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=drawn,
                                                          truth_fn=by_name(followed_truth))
     dew = layer(product, split=True)
-    assert_as_exact(lambda index, inputs: dew(*(jnp.asarray(inputs[name]) for name in ("x", "w1", "w2"))),
+    assert_as_exact(lambda index, inputs: dew(*(jnp.asarray(inputs[name]) for name in NAMES)),
                     recorded_reference, draws, "recorded and followed", seeds=seeds,
                     followed=Followed(truth, rounds))
 
-    def for_itself(decisions, x, w1, w2):
-        return {"output": rounded(x @ w1) @ w2, "rounded": x @ w1}
-
-    def own_rounding(seed):
-        x, w1, _ = draw(seed)
-        with jax.enable_x64(new_val=True):
-            return np.asarray(rounded(jnp.asarray(x, jnp.float64) @ jnp.asarray(w1, jnp.float64)))
-
-    flipped = next(seed for seed in range(seeds) if not np.array_equal(
-        np.asarray(reference(*draw(seed)).decisions["q"], np.float64), own_rounding(seed)))
+    flipped = next(seed for seed in range(seeds) if decided_otherwise(seed))
     _, _, own = indexed_recording(recorded, "site", seeds, inputs_of=drawn, truth_fn=by_name(for_itself))
     with jax.enable_x64(new_val=True), pytest.raises(UnrecordedTruth):
         own(jax.device_get(reference(*draw(flipped)).decisions), np.int32(flipped), widened(drawn(flipped)))
+
+
+def test_a_followed_truths_recording_holds_a_float64_path_to_the_references_function():
+    """A truths recording (`record_truths(..., followed=True)`) keeps the reference's float64 truth and the
+    decisions it followed at a few draws, and no float32 evidence: a float64 path that follows them and
+    computes the reference's function is held to it leaf by leaf at every draw (`assert_truths_as_recorded`);
+    one that rounds for itself is refused at a draw whose roundings it decides otherwise, and one whose
+    rounded values are a part in 2**30 off the reference's, below any float32 noise, at the first."""
+    from recorded_truths import assert_truths_as_recorded
+    from tool_support import load
+
+    recorder = load("recorded_references")
+    flipped = next(seed for seed in range(64) if decided_otherwise(seed))
+    recorded = recorder.record_truths("site", drawn, evaluated, flipped + 1, followed=True)
+
+    def by_name(fn):
+        def truth(decisions, inputs):
+            with jax.enable_x64(new_val=True):
+                return fn(decisions, *(jnp.asarray(inputs[name], jnp.float64) for name in NAMES))
+        return truth
+
+    def nudged(decisions, x, w1, w2):
+        return {**followed_truth(decisions, x, w1, w2), "rounded": (x @ w1) * (1 + 2.0 ** -30)}
+
+    assert_truths_as_recorded(recorded, "site", by_name(followed_truth))
+    for other in (for_itself, nudged):
+        with pytest.raises(UnrecordedTruth):
+            assert_truths_as_recorded(recorded, "site", by_name(other))
 
 
 def near_one(seed: int):
