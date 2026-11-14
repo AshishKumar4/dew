@@ -108,10 +108,12 @@ def test_a_settings_value_holds_its_mappings_in_order_and_none_for_a_function():
 
 @pytest.mark.mesh(devices=4)
 def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
-    """A trainer whose mesh splits the sequence fits again in the same process without tracing its step
-    again: its key holds the links' measured figures (`dew.nn.sharding.trace_context`) and not the links
-    its last compile decided, which keyed every refit on a tensor- or sequence-split mesh apart from the
-    fit before it (row 6022); the kept step's spreads are its trace's (`Candidate.spread`)."""
+    """A trainer whose mesh splits the sequence fits again in the same process tracing what a trainer on a
+    mesh of no split axis traces again, its step and its plan's candidates read as its first fit traced
+    them: its key holds the links' measured figures (`dew.nn.sharding.trace_context`) and not the links its
+    last compile decided, and each fit plans from the split the trainer was given, both of which keyed every
+    refit on a tensor- or sequence-split mesh apart from the fit before it (row 6022); the kept step's
+    spreads are its trace's (`Candidate.spread`)."""
     import jax.monitoring
     import numpy as np
 
@@ -119,34 +121,33 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
     from dew.optim import OptimConfig
     from dew.training import MeshSpec, Trainer
 
-    # The optimizer stated as a config, which keys the step.
-    optimizer = OptimConfig(optimizer="adam", learning_rate=1e-2)
-    trainer = Trainer(LMObjective(tiny(max_seq_len=16), 16), optimizer, key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=2, sequence=2))
-    rows = {"text": np.random.default_rng(0).integers(0, 8, size=(4, 17)).astype(np.int32)}
-
     traced = []
 
     def heard(event: str, seconds: float, **_) -> None:
         if event == "/jax/core/compile/jaxpr_trace_duration":
             traced.append(seconds)
 
+    rows = {"text": np.random.default_rng(0).integers(0, 8, size=(4, 17)).astype(np.int32)}
+
+    def refit(mesh: MeshSpec) -> tuple[dict, dict, int]:
+        """The links each of two fits decided, and the programs JAX traced again for the second."""
+        # The optimizer stated as a config, which keys the step.
+        optimizer = OptimConfig(optimizer="adam", learning_rate=1e-2)
+        trainer = Trainer(LMObjective(tiny(max_seq_len=16), 16), optimizer, key=jax.random.key(0), mesh=mesh)
+        fitted = []
+        for _ in range(2):
+            before = len(traced)
+            data = Loader(train=lambda partition: iter([rows] * 4), val=None, records=None, batch=4)
+            trainer.fit(data, steps=2)
+            fitted.append((dict(trainer.links), len(traced) - before))
+        return fitted[0][0], fitted[1][0], fitted[1][1]
+
     jax.monitoring.register_event_duration_secs_listener(heard)
-
-    def fit() -> tuple[dict, int]:
-        """The links the fit's step decided, and the programs JAX traced for it."""
-        before = len(traced)
-        data = Loader(train=lambda partition: iter([rows] * 4), val=None, records=None, batch=4)
-        trainer.fit(data, steps=2)
-        return dict(trainer.links), len(traced) - before
-
     try:
-        first, tracing = fit()
-        again, retracing = fit()
+        _, _, plain = refit(MeshSpec(fsdp=4))
+        first, again, split = refit(MeshSpec(fsdp=2, sequence=2))
     finally:
         jax.monitoring.unregister_event_duration_listener(heard)
-    # The step, its plan's candidates and their lowering are traced once; a refit traces what it reads afresh
-    # alone, its batches' placement and its evaluation, a small part of it.
-    assert retracing < tracing / 4, (tracing, retracing)  # measuring
+    assert split == plain
     assert {axis: link.spread for axis, link in again.items()} == {
         axis: link.spread for axis, link in first.items()}
