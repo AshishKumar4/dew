@@ -756,10 +756,10 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
                 else declared(jnp.asarray(1, wide) / value))
 
     values = jax.lax.stop_gradient(x).astype(wide)
-    amax = declared(jnp.asarray(spec.scale, jnp.float32).astype(wide) * 448)
+    amax = declared(jnp.asarray(spec.scale, jnp.float32).astype(wide) * E4M3_MAX)
     safe = jnp.where(amax <= 2 ** -24, jnp.asarray(1, wide), amax)
     # torch's scalar/tensor reverse divide is reciprocal then multiply.
-    multiplier = declared(reciprocal(safe) * 448)
+    multiplier = declared(reciprocal(safe) * E4M3_MAX)
     scale = reciprocal(multiplier)
     # The composed GPU forward must round this product before the FP8 cast.
     quotients = jax.lax.optimization_barrier(values * multiplier)
@@ -782,7 +782,7 @@ def _cast(qwix: ModuleType, quotients: jax.Array, qtype: jax.typing.DTypeLike):
     along the last axis, which Qwix requires of it and a fixed range, always per tensor, leaves
     unread."""
     if qtype == jnp.float8_e4m3fn:
-        return qwix.quantize(fp8_codes(quotients), qtype, calibration_method="fixed,448")
+        return qwix.quantize(fp8_codes(quotients), qtype, calibration_method=f"fixed,{E4M3_MAX:g}")
     return qwix.quantize(fp4_codes(quotients), qtype, tiled_axes={quotients.ndim - 1: 16},
                          calibration_method="fixed,6")
 
@@ -860,7 +860,7 @@ def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qwix: ModuleType) ->
     global_scale = jnp.where(spec.scale > 0, spec.scale, 1e-12).astype(jnp.float32)
     denominator = jnp.full(largest.shape, 6, jnp.float32) * global_scale
     normalized = largest * correctly_rounded_divide(jnp.ones_like(largest), denominator)
-    saturated = jnp.minimum(normalized, 448)
+    saturated = jnp.minimum(normalized, E4M3_MAX)
     scales = fp8_codes(saturated) * global_scale
     scales = jnp.where(scales >= 1e-5, scales, 1)
     spread = jnp.broadcast_to(scales[..., None], groups.shape).reshape(x.shape)
