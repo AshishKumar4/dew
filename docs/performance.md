@@ -120,7 +120,7 @@ extra transfer or a hidden full-FT assumption for LoRA.
 Device milliseconds, the template against the kernel it replaces, each pair in one job on the same operands. The delta-rule rows come from `tools/benchmark_recurrence_mosaic.py` (shapes in `tools/benchmark_recurrence.py`'s `SHAPES`, one row of 4,096 tokens, bf16):
 
 ```
-PYTHONPATH=src:tools python tools/benchmark_recurrence_mosaic.py --arm <mosaic|port> \
+XLA_FLAGS=--xla_gpu_enable_command_buffer= PYTHONPATH=src:tools python tools/benchmark_recurrence_mosaic.py --arm <mosaic|port> \
     --shape <qwen3.5-27b-gdn|kimi-linear-kda> --pass <forward|training> --repeats 20
 ```
 

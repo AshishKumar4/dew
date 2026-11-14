@@ -58,7 +58,7 @@ from dew.registry import models, projectors, read_arguments, resolve_dtype, towe
 from dew.state import TrainState
 from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.ahead import AheadOfTime, compile_ahead, step_batch
+from dew.training.ahead import AheadOfTime, compile_ahead, host_gpus, step_batch
 from dew.training.planning import Trials
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
@@ -296,13 +296,16 @@ def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
     return trainer
 
 
-def ahead_of(case: Case, generation: str, capacity: int,
-             attention_impl: AttentionImpl = 'auto') -> AheadOfTime:
-    """Case `case`'s step planned and compiled ahead of its run for one compile-only GPU of the CUDA
-    `generation` of `capacity` bytes of memory (`dew.training.ahead.compile_ahead`), on any host: what a GPU
-    node's prepare hands its run (`build_trainer`'s `ahead`), and what perf_gate's compile rows time."""
+def ahead_of(case: Case, generation: str, capacity: int | None,
+             attention_impl: AttentionImpl = 'auto', topology: str | None = None) -> AheadOfTime:
+    """Case `case`'s step planned and compiled ahead of its run (`dew.training.ahead.compile_ahead`) for one
+    GPU of the CUDA `generation`: of a host's own serialized `topology` (`host_gpus`: what a GPU node's
+    prepare hands its run, `build_trainer`'s `ahead`, a step of the run's own target), else a canonical one of
+    `capacity` bytes, on any host (what perf_gate's compile rows time)."""
     trainer = build_trainer(case, attention_impl)
-    trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus(generation, 1, capacity)))
+    devices = (host_gpus(generation, topology, 1) if topology is not None
+               else compile_only_gpus(generation, 1, capacity))
+    trainer.device_mesh = trainer.mesh.build(list(devices))
     return compile_ahead(trainer, global_batch(case))
 
 

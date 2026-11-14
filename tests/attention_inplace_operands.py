@@ -25,7 +25,7 @@ from reference_error import assert_as_exact
 from test_attention_mosaic import ON_HOPPER
 
 from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
-from dew.nn.kernels import tuning
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
 from dew.nn.precision import at_least_fp32
 
@@ -88,22 +88,53 @@ def a_routes_one_launch_backward_is_on_par_on_an_h100(name: str, causal: bool) -
 
 
 WINDOW = 256
-SPANNED = {"fused-64": (64, TILES(128, 64, 2, 2, fused=True, family="wgmma.fed")),
-           "fused-128": (128, TILES(64, 64, 2, 2, fused=True, family="wgmma.fed"))}
-"""Row 3171's call (ET-3171-BAND-h100), the one launch pinned at the tiles a plain call derives: a packed
-windowed causal call, three documents and padding over 1024 keys (ids from 1: 0 is padding), a window of
-256, 8 query heads over 2, at width 64 and at 128."""
+SPANNED = {"fused-64": 64, "fused-128": 128}
+"""Row 3171's call (ET-3171-BAND-h100) by its head width: a packed windowed causal call, three documents and
+padding over 1024 keys (ids from 1: 0 is padding), a window of 256, 8 query heads over 2."""
+
+ONE_LAUNCHES = tuple(TILES(walked, rows, 2, consumers, fused=True, family="wgmma.fed")
+                     for rows in (64, 128) for walked in (128, 64) for consumers in (2, 1))
+"""The one launch's configs on wgmma's fed rings a span call may take, the larger tiles and more consumers
+first."""
+
+
+def one_launch(width: int, step_operands: tuple) -> TILES:
+    """The first of `ONE_LAUNCHES` this GPU's legality takes for row 3171's call at `width`
+    (`MosaicBackward.legal`): the one launch the call's backward is pinned to, whichever this GPU's
+    assemblers hold."""
+    query, key, value, dout = step_operands
+    spans = _spans()
+    # The residuals' shapes alone: legality reads no value.
+    _, *residuals = jax.eval_shape(lambda q, k, v: attention_mosaic.forward(
+        q, k, v, spans, None, residuals=template.Kept.SPLIT), query, key, value)
+    op, args = attention_mosaic._backward_call(query, key, value, spans, None, dout, tuple(residuals),
+                                               scale=None, natural=attention_mosaic.NATURAL,
+                                               accurate=attention_mosaic.ACCURATE)
+    ba, target = op.bind(*args, interpret=False), generation.gpu_target()
+    taken = next((config for config in ONE_LAUNCHES if op.legal(ba, config, target)), None)
+    assert taken is not None, f"no one launch on wgmma's fed rings holds row 3171's call at width {width}"
+    return taken
+
+
+def _segments() -> np.ndarray:
+    """Row 3171's segment ids `[1, LENGTH]`: three documents, then padding (0)."""
+    lengths = (300, 400, 200)
+    padding = np.zeros(LENGTH - sum(lengths), int)
+    return np.concatenate([np.repeat(np.arange(1, 4), lengths), padding])[None]
+
+
+def _spans() -> template.KeySpans:
+    """Row 3171's spans: its documents, causal, under a window of WINDOW."""
+    return template.spans(LENGTH, LENGTH, 1, causal=True, sliding_window=WINDOW,
+                          segment_ids=jnp.asarray(_segments(), jnp.int32))
 
 
 def _spanned(width: int, implementation: str):
     """Row 3171's training step through the route (`attention_route.attend`) or the template's reference path:
     the output, and the gradients of `sum(out * dout)` of the query, key and value, and the keys each query
     keeps."""
-    lengths = (300, 400, 200)
-    padding = np.zeros(LENGTH - sum(lengths), int)
-    segments = np.concatenate([np.repeat(np.arange(1, 4), lengths), padding])[None]
-    spans = template.spans(LENGTH, LENGTH, 1, causal=True, sliding_window=WINDOW,
-                           segment_ids=jnp.asarray(segments, jnp.int32))
+    segments = _segments()
+    spans = _spans()
 
     def step(query, key, value, dout):
         def attended(query, key, value):
@@ -120,12 +151,12 @@ def _spanned(width: int, implementation: str):
 @ON_HOPPER
 @pytest.mark.parametrize("name", SPANNED)
 def a_span_calls_one_launch_is_on_par_on_an_h100(name: str) -> None:
-    """Row 3171's packed windowed call through the route on an H100, its backward pinned to the one launch,
-    on par with the reference path's (check 1): its dK and dV, wrong and unrepeatable there before row 3180's
-    fix, on par with it (ET-SPAN-h100); span calls derive the one launch as plain ones do
-    (`MosaicBackward.derived`)."""
-    width, config = SPANNED[name]
+    """Row 3171's packed windowed call through the route on an H100, its backward pinned to the first one
+    launch this GPU takes for it (`one_launch`), on par with the reference path's (check 1): its dK and dV,
+    wrong and unrepeatable there before row 3180's fix, on par with it (ET-SPAN-h100)."""
+    width = SPANNED[name]
     step, keep = _spanned(width, "template")
+    config = one_launch(width, operands(width, HEADS, 2, jnp.bfloat16)(0)[:4])
 
     def ours(*operands):
         with tuning.pinned({attention_mosaic.MosaicBackward: config}):
