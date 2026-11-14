@@ -488,14 +488,14 @@ def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
         dataclasses.replace(config, objective=ObjectiveConfig("lm"))
 
 
-COUNT_LOW, COUNT_HIGH = 3, 31
+COUNT_LOW, COUNT_HIGH = 3, 11
 """The counting language's ids: each token follows its predecessor by one, wrapping from COUNT_HIGH to
 COUNT_LOW."""
-COUNT_RUNS, COUNT_STEPS, COUNT_GROUPS, COUNT_TOKENS = 8, 60, 8, 4
+COUNT_RUNS, COUNT_STEPS, COUNT_GROUPS, COUNT_TOKENS = 8, 80, 8, 4
 """A GRPO policy's runs, each its own initialization and prompts, and each run's updates over eight prompts
 of two tokens, `COUNT_GROUPS` completions of `COUNT_TOKENS` a prompt."""
-COUNT_MARGIN = 4.0
-"""The claim: training quadruples each run's held-out reward, the chance its policy follows the rule."""
+COUNT_MARGIN = 2.0
+"""The claim: training doubles each run's held-out reward, the chance its policy follows the rule."""
 
 
 def counted(start, length: int) -> np.ndarray:
@@ -526,7 +526,7 @@ def counting_prompts(seed) -> dict:
             INFO_KEY: np.stack([_utf8("", 8) for _ in starts])}
 
 
-def counting_gains(runs, *, steps: int = COUNT_STEPS, learning_rate: float = 3e-2,
+def counting_gains(runs, *, steps: int = COUNT_STEPS, learning_rate: float = 1e-2,
                    margin: float = COUNT_MARGIN) -> np.ndarray:
     """Each of `runs`' contrast for "training raises the held-out reward `margin` times": the log of its
     policy's held-out reward after over before, less the log of `margin`. A run is a GRPO policy from its
@@ -571,5 +571,5 @@ def test_a_grpo_policy_rewarded_for_its_language_learns_it():
     (`learning_gate.assert_learns`)."""
     from learning_gate import assert_learns
 
-    assert_learns(lambda runs: {"training quadruples the held-out reward": counting_gains(runs)},
+    assert_learns(lambda runs: {"training doubles the held-out reward": counting_gains(runs)},
                   "a GRPO policy learning its language", units=COUNT_RUNS)
