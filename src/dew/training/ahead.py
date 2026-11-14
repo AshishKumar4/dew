@@ -1132,16 +1132,12 @@ class LaterPlans:
         phases = later_phases(trainer, batch)
         if not phases:
             return None
+        from dew.training._candidates import _shapes
         from dew.training.compiler import fresh
 
-        shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
-                                                                sharding=getattr(leaf, "sharding", None)),
-                              fresh(state))
-        # A phase's step is planned at its boundary where its pass count changes (`PhasePasses.begins`):
-        # the first later phase of each count none before it ran.
+        shapes = _shapes(fresh(state))
         counts = trainer.phase_passes.counts
-        seen = {counts[int(batch[PHASE].index)]}
-        begun = [phase for phase in phases if counts[phase] not in seen and not seen.add(counts[phase])]
+        begun = trainer.phase_passes.begun(int(batch[PHASE].index), phases)
         # Each plan traces under the loop's contexts as it stands, its JAX states carried (`carried`: they
         # hold per thread), its context variables copied.
         entered = carried()
@@ -1193,8 +1189,6 @@ def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Train
 
     phases = trainer.phase_passes.apart(passes)
     compiler = StepCompiler(phases.base, trainer._compiler.links(trainer.device_mesh), None, phases)
-    # Its empty window binds no split, as at the boundary (`StepCompiler.afresh`).
-    compiler.afresh = True
     stepping = trainer._stepping(phases.base, compiler)
     stepping = dataclasses.replace(stepping, shape=dataclasses.replace(stepping.shape,
                                                                        split=trainer._given_split))
