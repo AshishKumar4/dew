@@ -297,7 +297,7 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         """The mesh the task's pass traces under, and its projections' weights each whole (`placing`,
         `dew.nn.sharding.FORWARD`), so a projection mapped per shard takes a launch on each device's rows."""
         with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh),
-              placing(FORWARD)):
+              placing(None if self.mesh is None else FORWARD)):
             yield
 
     def fail(self, failure: BaseException, taken: Sequence[_Request[Row, Payload, Output, Answer]] = ()

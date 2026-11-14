@@ -154,8 +154,8 @@ def test_a_server_decoding_on_one_device_prefills_its_split_rows_through_each_de
     """A bf16 decoder decoding on one device with no mesh, its prompts prefilled on two devices of their own
     whose rows split, the GEMM template named and interpreted as an H100's: the prefill's projections take
     the template's launch on each prefilling device's rows, each weight whole (`dew.nn.sharding.FORWARD`,
-    which a forward-only trace takes with or without a mesh of its own), and every request draws what it
-    draws alone (train 821 F1: the unmeshed server traced its prefill under no placement, whose chosen
+    which the prefill takes on its mesh whether or not the decode has one), and every request draws what
+    it draws alone (train 821 F1: the unmeshed server traced its prefill under no placement, whose chosen
     launch the partitioned rows refused)."""
     from dew.nn.kernels import generation
 
@@ -163,7 +163,7 @@ def test_a_server_decoding_on_one_device_prefills_its_split_rows_through_each_de
     served = TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
                             RunProcessor(Digits()), sampling=task().sampling)
     placed = dataclasses.replace(served, variables=jax.device_put(served.variables, jax.devices()[0]))
-    prefilling = MeshSpec(fsdp=2).build(jax.devices()[1:3])
+    prefilling = MeshSpec().build(jax.devices()[1:3])
     with (generation.assumed("sm90", interpreted=True), generation.chosen(grouped_matmul="mosaic")):
         _, tickets = served_by(Server.from_task(placed, slots=4, capacity=128, admission=2,
                                                 prefill_mesh=prefilling))

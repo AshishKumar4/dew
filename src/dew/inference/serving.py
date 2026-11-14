@@ -826,16 +826,16 @@ class Server:
     @contextlib.contextmanager
     def _context(self) -> Iterator[None]:
         """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it,
-        and its projections' weights each whole (`placing`, `dew.nn.sharding.FORWARD`), so a projection
-        mapped per shard takes a launch on each device's rows, a prefill on a mesh of its own beneath a
-        server that decodes on none included, under the numerics its task's run trained
-        in, with its rows' PRNG implementation the default, so a key a layer draws (a stochastic rounding
-        stream) is of the implementation its cache was opened with, whatever thread serves it. The model
+        and its projections' weights each whole on it (`placing`, `dew.nn.sharding.FORWARD`), so a
+        projection mapped per shard takes a launch on each device's rows (off a mesh none, so its programs
+        are its task's own calls'), under the numerics its task's run trained in, with its rows' PRNG
+        implementation the default, so a key a layer draws (a stochastic rounding stream) is of the
+        implementation its cache was opened with, whatever thread serves it. The model
         runs its stack and sequences whole (`whole`): on a mesh with a stage or sequence axis the training
         forward pipelines the stack or splits a sequence's positions, which one token a step leaves nothing
         to do."""
         with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh), whole(),
-              placing(FORWARD),
+              placing(None if self.mesh is None else FORWARD),
               contextlib.nullcontext() if self.precision is None
               else generation.run_precision(self.precision),
               jax.default_prng_impl(self.prng)):
@@ -1281,7 +1281,8 @@ class Server:
         split = admission.slots.shape[0] % row_groups(mesh) == 0
         rows = _moved(admission, NamedSharding(mesh, P(batch_axes(mesh) or None) if split else P()),
                       phase="an admission to the prefill mesh")
-        with jax.set_mesh(mesh), whole():
+        # Each weight whole on the prefill mesh (`FORWARD`), whether or not the decode has a mesh of its own.
+        with jax.set_mesh(mesh), whole(), placing(FORWARD):
             prefilled = self._prefill(self.model, self._prefill_variables, self.pad_id, self.rows.placement,
                                       rows, self.progress)
         # Onto the decoding rows: the server's mesh's, or the default device's, where an unmeshed state is.
