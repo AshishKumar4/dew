@@ -29,11 +29,11 @@ from dew.data import ByteTokenizer
 from dew.data.dataset import Loader
 from dew.diffusion.discrete import MDLM, Unmask
 from dew.inference import RunProcessor, pipeline
-from dew.inference.projections import unpacked
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.inputs import ModelInputs, request_axes
 from dew.nn.progress import END, Progress
+from dew.nn.projections import unpacked
 from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
@@ -566,7 +566,7 @@ def test_a_masked_task_packs_its_projections_as_a_decoder_does(masked_source, tm
     the pipeline loads holds them packed; its denoising logits are on par with the unpacked
     model's (check 1); its canvases are those of a task over the unpacked tree, which packs the same
     groups in its call; and unpacking gives back the source's tree, exporting as the source does."""
-    from dew.inference.projections import packed_layout
+    from dew.nn.projections import packed_layout
 
     source, prompt = masked_source
     source.save(tmp_path / "source")

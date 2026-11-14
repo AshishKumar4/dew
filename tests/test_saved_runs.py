@@ -181,12 +181,12 @@ def checkout_of(tmp_path: Path, recorded: str) -> Path:
 def laid_out_otherwise(run: Path, objective) -> bool:
     """Whether `run`'s last checkpoint holds a decision backbone's projections packed, as a run trained from
     a loaded task stored them before ledger 2299's fix: a group the backbone declares
-    (`dew.inference.projections.declared_groups`) stored as its packed leaf in place of its members. A
+    (`dew.nn.projections.declared_groups`) stored as its packed leaf in place of its members. A
     resume refuses such a checkpoint (Dew continues no earlier Dew's layout); the run's weights still load
     (`Decide.from_run`)."""
     from dew.batch import part, thaw
     from dew.decision.objective import DecisionObjective
-    from dew.inference.projections import declared_groups
+    from dew.nn.projections import declared_groups
 
     if not isinstance(objective, DecisionObjective):
         return False
@@ -449,7 +449,7 @@ def test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_fr
     a later Dew's default writes none of its rows otherwise (row 3867); it resumes when its command runs
     again and when read back from its record. A record a Dew before that wrote holds None, which reading
     it leaves (no checkpoint is read before its process is prepared, train 589's review) and its resume
-    reads off its checkpoint's layout (`resumed`, `dew.config.earlier_option_writing`), and it resumes
+    reads off its checkpoint's layout (`resumed`, `DecisionRunConfig.earlier_checkpointed`), and it resumes
     either way."""
     from run_kinds import trained
 

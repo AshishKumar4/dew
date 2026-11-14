@@ -60,10 +60,9 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.objectives.lm import LMObjective
 from dew.optim import Cosine, OptimConfig, Power
-from dew.state import CHECKPOINTED, TrainState
+from dew.state import CHECKPOINTED, TokenCount, TrainState
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, ema_update
 from dew.training.evaluation import WARM_BATCHES
-from dew.training.model_flops import _TokenCount
 from dew.training.runtime import Preempted
 
 
@@ -224,7 +223,7 @@ def test_a_token_budget_counts_the_tokens_of_committed_updates(tmp_path):
     stopped = first.fit(dataset(), steps=3, log_every=1)
     assert int(stopped.step) == 3
     assert first.checkpoints.control(3)["committed_tokens"] == 24
-    assert _TokenCount.host(jax.device_get(stopped.accumulation.tokens)) == 24
+    assert TokenCount.host(jax.device_get(stopped.accumulation.tokens)) == 24
     resumed = make_trainer(tmp_path, objective=TokenRegression(), accumulation=2)
     assert int(resumed.fit(dataset(), steps=4, log_every=1).step) == 4
     assert resumed.checkpoints.control(4)["committed_tokens"] == 80

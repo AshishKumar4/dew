@@ -13,7 +13,8 @@ if TYPE_CHECKING:
     from dew.checkpoints import Ranking
     from dew.state import TrainState
 
-from dew.training.evaluation import Declared, SplitLoss, Summary
+from dew.scores import Summary
+from dew.training.evaluation import Declared, SplitLoss
 
 type Source = Metric | TrainingScalar | Summary | SplitLoss | Callable[[Mapping], float]
 """What a selection ranks by: a declared score, a training scalar, or a custom score of the fit's scores."""

@@ -395,9 +395,9 @@ def test_a_banked_store_packed_for_serving_or_adapted_exports_as_its_layers_do(t
     from safetensors.numpy import load_file
 
     from dew.batch import thaw
-    from dew.inference.projections import inference_projections
     from dew.interop.pretrained import PretrainedDecoder
     from dew.lora import LoRA
+    from dew.nn.projections import inference_projections
 
     plain, scanned, variables, _ = pair(num_layers=3)
     banked = HeldBanks(variables).place(scanned, layout=DEVICE)

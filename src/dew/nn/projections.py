@@ -35,7 +35,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import SingleDeviceSharding
 
 from dew.batch import FROZEN, PACKED_FROZEN, Variables, merge, select, thaw, under
-from dew.nn.protocols import ProjectionGroup, Serving
+from dew.nn.protocols import Adapted, ProjectionGroup, Serving
 from dew.quantization import QUANTIZATION, Quantization, QuantizedClass
 
 
@@ -116,9 +116,7 @@ def _declares(model: nn.Module) -> TypeGuard[Serving]:
     wraps it. An adapter's LoRA branches bind the members' own paths, so an adapted model's tree
     holds them unpacked, and its interceptor places the base weights only as it applies, so the model
     binds over its tree for no declaration."""
-    from dew.lora import AdaptedClass
-
-    return isinstance(model, Serving) and not isinstance(type(model), AdaptedClass)
+    return isinstance(model, Serving) and not isinstance(type(model), Adapted)
 
 
 def _quantization(model: nn.Module | Serving) -> Quantization | None:

@@ -389,11 +389,11 @@ def test_a_run_trains_a_loaded_tasks_own_tree_and_a_release_trains_unpacked(tmp_
 def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_path, frozen):
     """A run that held its trunk frozen, or some members of a projection group (each attention layer's
     keys and values, its queries trained), loads as a task whose backbone packs as its export's, the
-    same weights in one collection, does (`dew.inference.projections`, ledger 2439): one layout, so the
+    same weights in one collection, does (`dew.nn.projections`, ledger 2439): one layout, so the
     two loads compute alike and answer alike. A run trained from either task holds frozen exactly what
     its run held frozen (`trained_tree`), a group's frozen members among them."""
     from dew.batch import FROZEN, freeze, part, thaw
-    from dew.inference.projections import inference_projections
+    from dew.nn.projections import inference_projections
     from dew.objectives.base import joined
 
     release = tmp_path / "release"

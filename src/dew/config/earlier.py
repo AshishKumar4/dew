@@ -7,7 +7,6 @@ from collections.abc import Mapping
 
 from dew import _records, registry
 from dew._records import JSON, earlier_fields
-from dew.checkpoints import Checkpoints
 from dew.data import records
 from dew.nn.precision import Numerics, numerics_of
 from dew.registry import from_record, models, objectives
@@ -74,12 +73,13 @@ def earlier_option_text(record: Mapping[str, object]) -> Mapping[str, object]:
     return {**record, "fields": {**named[1], "option_text": "named"}}
 
 
-def _earlier_default(record: Mapping[str, object], field: str, kinds: registry.Aliases, kind: type,
+def _earlier_default(record: Mapping[str, object], field: str, kinds: registry.Aliases, kind: str,
                      argument: str, earlier: JSON) -> Mapping[str, object]:
     """A saved run's record whose `field` (its objective, its model), named in `kinds` as whatever alias or
-    import path it saved, the class `kind`, states `argument` neither in its fields nor in the defaults it
-    recorded: saved before the class took it, it trained as `earlier` computes, which its defaults read
-    now; a run saved since records its own."""
+    import path it saved, the class at import path `kind` (`registry.import_path`), states `argument`
+    neither in its fields nor in the defaults it recorded: saved before the class took it, it trained as
+    `earlier` computes, which its defaults read now; a run saved since records its own. The class is named
+    by its path, so reading a record imports only the class it names."""
     named = registry.class_record(record)
     if named is None:
         return record
@@ -88,7 +88,7 @@ def _earlier_default(record: Mapping[str, object], field: str, kinds: registry.A
     if not isinstance(held, Mapping) or not isinstance(held.get("name"), str):
         return record
     stated, defaulted = held.get("fields", {}), held.get("defaults", {})
-    if (kinds[held["name"]] is not kind or not isinstance(stated, Mapping)
+    if (registry.import_path(kinds[held["name"]]) != kind or not isinstance(stated, Mapping)
             or not isinstance(defaulted, Mapping) or argument in {*stated, *defaulted}):
         return record
     return {**record, "fields": {**fields, field: {**held, "defaults": {**defaulted, argument: earlier}}}}
@@ -99,10 +99,8 @@ def earlier_none_of_the_above(record: Mapping[str, object]) -> Mapping[str, obje
     above" on (`none_of_the_above_options`) neither in its fields nor in the defaults it recorded: saved
     before the argument, its rows drew it on every choice, a yes or a no among them, so it reads 0, as
     they drew (`_earlier_default`; row 2938: the default became 3). Carried to 1.0 (ledger 1552)."""
-    from dew.decision.objective import DecisionObjective
-
-    return _earlier_default(record, "objective", objectives, DecisionObjective, "none_of_the_above_options",
-                            0)
+    return _earlier_default(record, "objective", objectives, "dew.decision.objective:DecisionObjective",
+                            "none_of_the_above_options", 0)
 
 
 def earlier_tokenizer_positions(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -110,9 +108,8 @@ def earlier_tokenizer_positions(record: Mapping[str, object]) -> Mapping[str, ob
     nowhere: saved before rotary positions, its tokens knew their places by learned vectors alone, so it
     reads "learned", as it trained (`_earlier_default`; row 4669: the default became "rotary"). Carried to
     1.0 (ledger 1552)."""
-    from dew.objectives.world_model import CausalTokenizer
-
-    return _earlier_default(record, "model", models, CausalTokenizer, "positions", "learned")
+    return _earlier_default(record, "model", models, "dew.objectives.world_model:CausalTokenizer",
+                            "positions", "learned")
 
 
 def earlier_dynamics_positions(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -120,31 +117,8 @@ def earlier_dynamics_positions(record: Mapping[str, object]) -> Mapping[str, obj
     saved before rotary positions, its tokens knew their frame and place by learned vectors alone, so it
     reads "learned", as it trained (`_earlier_default`; row 4802: the default became "rotary"). Carried
     to 1.0 (ledger 1552)."""
-    from dew.objectives.world_model import Dynamics
-
-    return _earlier_default(record, "model", models, Dynamics, "positions", "learned")
-
-
-def earlier_option_writing(record: Mapping[str, object], checkpoints: Checkpoints) -> Mapping[str, object]:
-    """A saved decision run's record (`earlier_run`'s) whose option text is None, which a Dew before row
-    3867 recorded where the run left it to its layout: the writing the layout its last checkpoint in
-    `checkpoints` (its tiers, as the run keeps them) records wrote (`dew.decision.layout.layout_writing`),
-    so a resume writes its rows as it did, whatever a later Dew's layout leaves; as it is where no
-    checkpoint records one (a run that trained no step, or a layout no record described), whose writing
-    its build resolves again (`RunConfig.check_resume`). Carried to 1.0 (ledger 1552)."""
-    named = registry.class_record(record)
-    if named is None or "option_text" not in named[1] or named[1]["option_text"] is not None:
-        return record
-    from dew.decision.layout import Layout, layout_writing
-    from dew.inference.tasks import saved_artifact
-
-    step = checkpoints.latest
-    artifact = None if step is None else saved_artifact(checkpoints, step)
-    laid = None if artifact is None else artifact.get("layout")
-    if not isinstance(laid, Mapping):
-        return record
-    writing = layout_writing(registry.from_record(Layout, laid))
-    return {**record, "fields": {**named[1], "option_text": writing}}
+    return _earlier_default(record, "model", models, "dew.objectives.world_model:Dynamics", "positions",
+                            "learned")
 
 
 def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:

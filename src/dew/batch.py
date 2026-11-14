@@ -61,7 +61,7 @@ two before the model reads them."""
 
 PACKED_FROZEN = "packed_frozen"
 """The collection that flags, beside a projection group packed from a tree split for training whose
-members are some trained and some frozen (`dew.inference.projections`), which members were frozen: at
+members are some trained and some frozen (`dew.nn.projections`), which members were frozen: at
 each of its packed leaves' paths, one flag a member, in the group's order. With `FROZEN` it is the
 training split, which a split of the group restores and `thaw` drops: the model reads neither."""
 
