@@ -1278,7 +1278,7 @@ def test_a_server_scores_its_draws_over_a_quantized_cache_as_its_rounding_does(c
                                              hits=hits)
 
 
-@pytest.mark.distributed
+@pytest.mark.mesh(devices=3)
 def test_a_server_that_prefills_on_a_mesh_of_its_own_scores_its_draws_as_a_full_forward():
     """Disaggregated serving's arithmetic: prompts prefilled on two devices of their own, their rows' state
     moved to the decoding device, draw what the lone task draws and score it on par with a full forward's
