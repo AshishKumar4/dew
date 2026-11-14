@@ -85,7 +85,6 @@ from dew.nn.flops import (
 from dew.nn.kernels import low_rank, selection
 from dew.nn.precision import accumulated, at_least_fp32, biased, float32_dot_general
 from dew.nn.protocols import (
-    Adapted,
     Counted,
     CountedConditionedSpatial,
     CountedImages,
@@ -1658,9 +1657,10 @@ def unadapted(model: nn.Module) -> nn.Module:
 
 
 @runtime_checkable
-class AdaptedClass(Adapted, Protocol):
-    """An adapted module class (`Adapted`) with its marks as the adapter states them: the interceptor its
-    `apply` and `init` run under and the names it binds."""
+class AdaptedClass(Protocol):
+    """An adapted module class with its marks as the adapter states them, the interceptor its `apply` and
+    `init` run under and the names it binds: `dew.nn.protocols.Adapted`, which a reader below the adapters
+    asks, typed."""
 
     _dew_lora_interceptor: ClassVar[Interceptor]
     _dew_lora_bound: ClassVar[_Bound]
