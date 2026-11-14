@@ -26,7 +26,7 @@ import functools
 import math
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import NamedTuple
+from typing import Literal, NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
@@ -245,6 +245,20 @@ def planned(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             return None, rows, row_spans, whole
         work[walk] = found
     return work, rows, row_spans, whole
+
+
+@overload
+def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
+           scale: float | None = None, interpret: bool = False, table: jax.Array | None = None,
+           sources: jax.Array | None = None, scales: tuple[jax.Array, jax.Array] | None = None,
+           bounds: jax.Array | None = None, finished: Literal[True] = True) -> jax.Array: ...
+
+
+@overload
+def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
+           scale: float | None = None, interpret: bool = False, table: jax.Array | None = None,
+           sources: jax.Array | None = None, scales: tuple[jax.Array, jax.Array] | None = None,
+           bounds: jax.Array | None = None, finished: Literal[False]) -> Initial: ...
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
