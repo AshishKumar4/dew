@@ -29,11 +29,19 @@ A cell's `objective` trains the case's decoder by another objective (`benchmark_
 
 `flowed`: a GPU model flow's program (tests/model_flows.py's `FLOWS`, its training step or decode loop) on
 the routes Dew takes for it on this GPU, compiled and run as Dew compiles a program, under every registered
-rule set or without one, as `stepped`'s arms.
+rule set or without one, as `stepped`'s arms. Each arm's env is the flow's variant: its XLA flags in
+XLA_FLAGS (`lane_environment.REPEATABLE_GPU_FLAGS` for a lane's flow, `USERS_GPU_FLAGS` for a user's, which
+Dew's import joins to its own, `model_flows.flow_flags`) and its matmul precision in
+JAX_DEFAULT_MATMUL_PRECISION (`Flow.precision`: "highest" for a lane's flow, unset for a user's); a worker of
+another variant is refused (`model_flows.WrongProcess`). A lane's flow:
 
     {"builder": "tools/timing_cases.py:flowed", "cells": [{"flow": "delta attention (KDA)", "kind": "train"}],
-     "arms": [{"name": "every", "implementation": "every"},
-              {"name": "without linear", "implementation": "without linear"}]}
+     "arms": [{"name": "every", "implementation": "every", "env": LANE},
+              {"name": "without linear", "implementation": "without linear", "env": LANE}]}
+
+with LANE = {"XLA_FLAGS": "--xla_gpu_deterministic_ops=true --xla_gpu_autotune_level=0",
+"JAX_DEFAULT_MATMUL_PRECISION": "highest"}; a user's flow's arms take {"XLA_FLAGS":
+"--xla_gpu_deterministic_ops=false --xla_gpu_autotune_level=0"}.
 """
 import atexit
 import contextlib
@@ -169,7 +177,9 @@ def flowed(cell: dict, implementation: str) -> tuple:
     loop, Dew's arm), on the routes Dew takes for it on this GPU, compiled on it as Dew compiles a program
     (`dew.nn.kernels.options.program`), under the algebra pass with every registered rule set
     (`implementation` "every") or without the one it names ("without <set>"), and its first draw of inputs
-    (`Flow.draw`). The pass acts as the program traces, so every call holds its switch."""
+    (`Flow.draw`), in a worker of the flow's variant (its arm's env, the module's docstring), which it
+    refuses otherwise (`model_flows.held_process`). The pass acts as the program traces, so every call holds
+    its switch."""
     import sys
     from pathlib import Path
 
@@ -180,8 +190,6 @@ def flowed(cell: dict, implementation: str) -> tuple:
     from dew.nn.kernels.options import program
 
     flow, without = model_flows.flow_named(cell["flow"]), _left_out(implementation)
-    # Its process the flow's variant (its XLA flags and matmul precision, which the cell's arms' env state:
-    # `model_flows.flow_flags`, `Flow.precision`), as its GPU tier's run holds it.
     model_flows.held_process(flow)
     flat, _ = model_flows.programs_of(flow)[f"{cell['kind']} dew"]
     params, ids = flow.draw(0)

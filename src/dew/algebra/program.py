@@ -103,7 +103,7 @@ def passes(on: bool = True, target: str | None = None, without: Collection[str] 
     if unknown := sorted(set(without) - rules.nameable()):
         raise ValueError(f"no arm leaves out {unknown}: an arm may leave out {sorted(rules.nameable())}; a "
                          "dev-time set runs at dev time alone, and a derivation's defining set (decoupled, a "
-                         "scan's identities) makes its program, which no arm has without it")
+                         "scan's own identities) makes its program, which no arm has without it")
     with ALGEBRA(dataclasses.replace(ALGEBRA.value, on=on, target=target, without=frozenset(without))):
         yield
 
