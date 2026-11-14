@@ -390,8 +390,8 @@ def test_a_mark_the_plan_cannot_read_from_its_tests_decorator_is_refused(ci, tmp
     judges = [entry for entry in ci.plan(30.0, {}) if entry["python"] == "3.12" and "after" in entry]
     assert [(entry["split"], len(entry["after"])) for entry in judges] == [("TestSite.test_site", 3),
                                                                           ("TestSite.test_work", 4)]
-    assert ci.session.pytest_command(["pytest"], ["tests/test_site.py"], "TestSite.test_work.draws-24-30",
-                                     "") == [
+    assert ci.session.pytest_command(["pytest"], ["tests/test_site.py"],
+                                     "TestSite.test_work.draws-24-30") == [
         "pytest", "-p", "executed", "tests/test_site.py::TestSite::test_work"]
 
 
@@ -467,10 +467,8 @@ def test_sites_past_one_judges_jobs_inputs_together_are_planned_and_one_past_it_
     units = ci.MAX_INPUTS - 1
     written(tmp_path, {"test_a.py": marked(f"check1_shards(seeds={seeds}, per_task=1)"),
                        "test_b.py": marked(f"shards(units={units}, per_task=1)")})
-    # Cold, as the daily run plans every site on every Python.
-    monkeypatch.setenv("DEW_TEST_CACHE", "off")
-    monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
-    judges = [entry for entry in ci.plan(120.0, {}) if "after" in entry]
+    # Cold, as the census plans every site on every Python.
+    judges = [entry for entry in ci.plan(120.0, {}, census=True) if "after" in entry]
     assert len(judges) == 2 * len(ci.PYTHONS)
     assert sum(len(entry["after"]) for entry in judges) > ci.MAX_INPUTS
     assert max(len(entry["after"]) for entry in judges) <= ci.MAX_INPUTS
@@ -766,27 +764,6 @@ def test_a_judge_green_on_its_first_stage_is_kept_though_its_later_map_tasks_nev
     ran = replanned_once_its_draws_change(ci, tmp_path)
     [again] = [entry for entry in ran if "after" in entry]
     assert len(again["after"]) == 3 and len(ran) == 4
-
-
-def test_a_trains_fold_keeps_the_whole_suite_cells_its_batch_set_aside(ci, tmp_path):
-    """A train's batch sets its files' whole_suite cells aside (collected, not run: train CI never runs
-    them), and its fold keeps their recorded times while it takes the times of the tests it ran: only the
-    whole suite's run times a cell, and the next whole run plans it by them (row 4377: a train's fold
-    dropped a 1108 s cell, which the whole run then packed as 478 s). A whole verdict, which runs the
-    cell, times it."""
-    written(tmp_path, {"test_cells.py": "def test_light():\n    pass\n"})
-    git(tmp_path, "init", "-q")
-    git(tmp_path, "add", "tests")
-    git(tmp_path, "commit", "-qm", "the cells")
-    cell, light = "tests/test_cells.py::test_heavy", "tests/test_cells.py::test_light"
-    record = {light: 1.0, cell: 1108.0}
-    batch = {"sha": git(tmp_path, "rev-parse", "HEAD").strip(), "rows": [
-        {"name": "3.12:tests/test_cells.py", "exitCode": 0, "seconds": 2.0, "whole_suite": [cell],
-         "tests": {light: 1.0, "tests/test_cells.py::test_new": 1.0}}]}
-    assert ci.folded(record, batch, 120.0) == {**record, "tests/test_cells.py::test_new": 1.0}
-    whole = {**batch, "rows": [{**batch["rows"][0], "seconds": 1113.0,
-                                "tests": {light: 1.0, cell: 1110.0, "tests/test_cells.py::test_new": 1.0}}]}
-    assert ci.folded(record, whole, 120.0) == {light: 1.0, cell: 1110.0, "tests/test_cells.py::test_new": 1.0}
 
 
 def test_a_sites_judge_and_map_tasks_leave_its_files_cut_and_recorded_times_as_they_were(ci, tmp_path):
