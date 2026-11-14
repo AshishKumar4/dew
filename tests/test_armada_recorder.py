@@ -93,7 +93,11 @@ def test_a_python_child_uv_runs_over_this_environment_joins_its_files_record(ci,
     ci.task("3.12", ["tests/test_layered.py"], "", tmp_path / "verdict.json", 600.0)
     [row] = json.loads((tmp_path / "verdict.json").read_text())["rows"]
     assert row["exitCode"] == 0, row["output"]
-    assert reusable_now(ci, ["tests/test_layered.py"]) == [True], list(tmp_path.glob("**/*.jsonl"))
+    children = tmp_path / "verdict.json.lifetime.log.children"
+    told = {path.name: path.read_text()[-3000:] for path in children.glob("*")} if children.is_dir() else {}
+    events = [line for line in (tmp_path / "verdict.json.lifetime.log").read_text().splitlines()
+              if "start" in line or "follow" in line][:20]
+    assert reusable_now(ci, ["tests/test_layered.py"]) == [True], (told, events)
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
     assert reusable_now(ci, ["tests/test_layered.py"]) == [False]
 
