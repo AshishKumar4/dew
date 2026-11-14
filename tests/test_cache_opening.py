@@ -124,19 +124,24 @@ def test_prediction_depths_open_their_caches_as_their_steps_write_them(kind):
     assert_opens_as_it_decodes(model, variables, method="init_mtp_cache", decoded=stepped)
 
 
-def test_a_servers_start_traces_no_forward_for_its_free_slots_but_its_admissions_prefill():
-    """A server's start opens its free slots' cache as the model states it, tracing no forward for it,
-    and traces one forward for the rest of their state: its admissions' own prefill, at an admission it
-    runs, for the types that prefill leaves its rows (`serving_kernel.admitted_types`), where it traced a
-    blank prompt's prefill once for the slots' shapes and again for their program (JAX's public trace
-    events, `dew.telemetry.compiles`)."""
-    from model_support import serving_task
+def test_a_servers_free_slots_open_with_no_forward_traced():
+    """The program a server compiles and runs to open its free slots (`serving_kernel.opened`) holds no
+    product: their cache opens as the model states it, and the rest of their state takes the types its
+    admissions' prefill leaves (`StateTypes`, traced once at an admission the server runs), where it traced
+    a blank prompt's prefill for them, in that program."""
+    from jax.experimental import checkify
 
-    from dew.inference.serving import Server
-    from dew.telemetry.compiles import Compiles
+    from dew.nn.inputs import ModelInputs
+    from dew.inference.serving_kernel import StateTypes, opened
+    from dew.sampling.text import decode_ops, prefill_state
 
-    with Compiles(None) as heard:
-        Server.from_task(serving_task(), slots=4, capacity=32, admission=2)
-    prefills = [program.name for program in heard.programs
-                if program.kind == "traced" and "prefill" in program.name]
-    assert len(prefills) == 1 and "prefilled" in prefills[0], prefills
+    model, slots = decoder().clone(max_seq_len=32), 4
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, PROMPT), jnp.int32)))
+    prompts = ModelInputs(jnp.ones((ROWS, PROMPT), jnp.int32))
+    def prefilled(variables):
+        return prefill_state(model, variables, prompts, decode_ops(model, variables, 0, None))[0]
+
+    _, state = jax.eval_shape(checkify.checkify(prefilled, errors=checkify.user_checks), variables)
+    program = jax.make_jaxpr(lambda variables: opened(model, variables, 0, slots, 32,
+                                                      types=StateTypes.of(state)))(variables).jaxpr
+    assert not primitives(program) & PRODUCTS, primitives(program) & PRODUCTS
