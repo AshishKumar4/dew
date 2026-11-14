@@ -585,12 +585,28 @@ def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     return Partial(out, m, largest * summed)
 
 
-def rewalks(spec: Forward, maxima: jax.Array) -> tuple[jax.Array, Forward]:
-    """The rows a plain launch's fold guard walks again (`walked_launches`), from its rows' running `maxima`,
-    and the form they walk in (`rewalked_form`): those whose maximum passes `FOLD_REACH` (`reached`: a padded
-    query's -inf, a row that reads nothing, as a slice's of no keys). A launch's programs state them so of
-    their own rows."""
-    return reached(maxima, unseen=spec.form == "spans") >= FOLD_REACH, rewalked_form(spec)
+def rewalks(spec: Forward, maxima: jax.Array, rows: jax.Array | None = None) -> tuple[jax.Array, Forward]:
+    """The rows a plain launch's fold guard walks again (`walked_launches`), from its rows' running `maxima`
+    at their query `rows` (the last axis' own where None: a whole call's), and the form they walk in
+    (`rewalked_form`): those of the call's queries whose maximum passes `FOLD_REACH` (`reached`: a row that
+    reads nothing, as a slice's of no keys). A query past a full or causal call's own (`padded_queries`, a
+    padded tile's) walks nothing again: it sees no key, which `reached` reads, where every row sees one, as a
+    row whose products all passed fp32 below zero (a GH200's causal forward at 2048 queries over a 2112-row
+    padding rewalked its last tile in the natural form every call, 369 of its 1086 us, LF-PROF-sm90). A
+    launch's programs state them so of their own rows."""
+    walked = reached(maxima, unseen=spec.form == "spans") >= FOLD_REACH
+    if (queries := padded_queries(spec)) is not None:
+        rows = jax.lax.broadcasted_iota(jnp.int32, maxima.shape, maxima.ndim - 1) if rows is None else rows
+        walked = walked & (rows < queries)
+    return walked, rewalked_form(spec)
+
+
+def padded_queries(spec: Forward) -> int | None:
+    """The call's own queries where a launch of `spec` walks rows past them that see no key: a full or causal
+    call's padding, which `seen` keeps from every key (`Forward.queries`), its rows the walk's own; None for a
+    'spans' call, whose rows read their spans, a padded one none, which `reached` reads, or a call of no
+    padding."""
+    return None if spec.form == "spans" else spec.queries
 
 
 def rewalked_form(spec: Forward) -> Forward:
@@ -959,8 +975,8 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
         # A tile past the call's last key reads padding, a holder of a common walk wholly past it too.
         past = _keys_before(coords, spec.keys)
         visible = past if visible is None else visible & past
-    if spec.form != "spans" and spec.queries is not None:
-        rows = coords.q_pos < spec.queries
+    if (queries := padded_queries(spec)) is not None:
+        rows = coords.q_pos < queries
         visible = rows if visible is None else visible & rows
     return visible
 

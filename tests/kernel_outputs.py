@@ -15,6 +15,7 @@ import numpy as np
 from float64_terms import scanned_steps
 from jax._src.pallas import mpmd, pallas_call as pallas_call_module
 from jax.extend import core
+from jax.extend.core import primitives
 
 from dew.nn import programs
 
@@ -68,8 +69,8 @@ def _evaluated(jaxpr: core.Jaxpr, consts, args, found: list) -> list:
             found.append((str(label),
                           [np.asarray(jax.device_get(output)) for output in launched]))
             outs = list(launched)
-        elif name in LOOPS and any(_launches(inner) for inner in programs.bodies(equation)):
-            outs = LOOPS[name](equation, values, found)
+        elif equation.primitive in LOOPS and any(_launches(inner) for inner in programs.bodies(equation)):
+            outs = LOOPS[equation.primitive](equation, values, found)
         elif (body := programs.called(equation)) is not None:
             # A call runs its program on its operands one for one (`programs.called`): a jit's, a contracted
             # derivative's, a custom rule's, a Mosaic GPU kernel's `custom_vmap_call` around its `mpmd_map`.
@@ -122,9 +123,9 @@ def _cond(equation, values: list, found: list) -> list:
     return _evaluated(branch, closed, operands, found)
 
 
-LOOPS = {"while": _while, "scan": _scan, "cond": _cond}
-"""The control flow whose bodies the audit runs as the program would, by the primitive's name: a loop trip by
-trip, a branch as its index chooses, each launch inside run alone; a launch in any other body is refused."""
+LOOPS = {primitives.while_p: _while, primitives.scan_p: _scan, primitives.cond_p: _cond}
+"""The control flow whose bodies the audit runs as the program would, by its primitive: a loop trip by trip, a
+branch as its index chooses, each launch inside run alone; a launch in any other body is refused."""
 
 
 def _launches(jaxpr: core.Jaxpr) -> bool:

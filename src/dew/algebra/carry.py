@@ -92,7 +92,9 @@ def _carried():
     one = i64(1)
     shape = rules.shape
     # A matrix product's contraction's length's power: its left operand's columns'.
-    contracted = (eq(left).to(shape(x)), eq(length).to(rules.log2_of(left[i64(1)])))
+    # of the mode the plain products run in (`rules.mode_power`), as every product a rule here makes does.
+    contracted = (eq(left).to(shape(x)),
+                  eq(length).to(rules.log2_of(left[i64(1)]) + rules.mode_power(m)))
     transposed = x.shaped(String("transpose"), s)
     power = var("power", i64)
     sets = [
@@ -111,7 +113,8 @@ def _carried():
     sets.append(rule(eq(t).to(x.dot(y.dot(z, m), m)), rules.matrix_product(m), rules.matrix(x),
                      rules.matrix(y), rules.matrix(z), eq(reads(z)).to(one), *contracted, *facts,
                      *rules.dominated(power, "new"),
-                     eq(inner).to(shape(y)), eq(var("outer_length", i64)).to(rules.log2_of(inner[i64(1)])),
+                     eq(inner).to(shape(y)),
+                     eq(var("outer_length", i64)).to(rules.log2_of(inner[i64(1)]) + rules.mode_power(m)),
                      *outer[0],
                      *rules.dominated(outer[1], "outer")).then(
         union(t).with_(x.dot(y, m).dot(z, m)), *rules.made(x.dot(y, m), power)))
@@ -290,12 +293,16 @@ def _products(graph: EGraph, region: terms.Region) -> None:
         primitive, params = region.params[index]
         if jax.tree.map(int, params["dimension_numbers"]) != transposed:
             continue
-        if not graph.check_bool(rules.plain(i64(index))):
+        # In its operands' dtype, and of a mode whose rounding is stated (`rules.mode_power`), which the
+        # plain product it becomes runs in.
+        slack = terms.product_slack(region, index)
+        if slack is None or not graph.check_bool(rules.plain(i64(index))):
             continue
         # The plain product multiplies the transposed one's operands (`terms.Region.products`).
         made = region.interned(primitive, {**params, "dimension_numbers": plain}, region.products.get(index))
         swapped = region.interned(jax.lax.transpose_p, {"permutation": (1, 0)})
         graph.register(rules.plain(i64(made)), rules.matrix_product(i64(made)),
+                       set_(rules.mode_power(i64(made))).to(i64(slack)),
                        set_(plain_of(i64(index))).to(i64(made)), set_(swap_of(i64(index))).to(i64(swapped)))
 
 

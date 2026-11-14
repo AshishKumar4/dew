@@ -270,7 +270,8 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
     block's whole range (`full_lo` to `full_hi`) whose blocks carry one document, or which has no
     documents, has every entry visible, the padding past the call's queries and keys excluded from no
     tile; with no narrowing, every tile inside the call is whole, and a call of its own documents has
-    whole tiles inside them. Over runs the block visits only its ranges (`ranges`), each tile once, and every
+    whole tiles inside them. A key block's query range is its readers' own, its first and last query blocks
+    each reading it. Over runs the block visits only its ranges (`ranges`), each tile once, and every
     tile of its whole range, its widest run's tiles every query sees through that run, has every entry
     visible; a tile its queries see whole through other runs is not called whole, so the whole range over
     runs is sound, not exact."""
@@ -284,6 +285,13 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
     i, j = queries // block_q, keys // block_k
     assert np.all((lo[rows, i] <= j) & (j < hi[rows, i]))
     assert np.all((q_lo[rows, j] <= i) & (i < q_hi[rows, j]))
+    # A key block's query range is its readers' own: its first and last query blocks each read it.
+    ranges = (np.asarray(blocks.ranges) if blocks.ranges is not None
+              else np.stack([lo, hi], axis=-1)[:, :, None, :])
+    read_rows, read = np.nonzero(q_hi > q_lo)
+    for reader in (q_lo[read_rows, read], q_hi[read_rows, read] - 1):
+        own = ranges[read_rows, reader]
+        assert ((own[..., 0] <= read[:, None]) & (read[:, None] < own[..., 1])).any(axis=-1).all()
     if blocks.ranges is not None:
         ranges = np.asarray(blocks.ranges)
         # The ranges are sorted, disjoint, nonempty first: a walk of them visits each tile once.

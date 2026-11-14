@@ -87,7 +87,7 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
         # Every warpgroup a consumer, its value the program's, for a scope after the walk's.
         return Schedule((Role("consumer", consumers),))
 
-    def stream(self, streams, views: dict, lo, hi, *, adds: tuple | None = None) -> None:
+    def stream(self, streams, views: dict, lo, hi) -> None:
         raise NotImplementedError(f"{self.name}'s consumers feed their own rings (`fed`)")
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:

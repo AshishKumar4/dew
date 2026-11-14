@@ -219,3 +219,229 @@ def test_every_kept_sign_holds_every_value_its_operand_reaches(target, source, b
         converted = np.asarray(operand.astype(target)).astype(np.float64)
     positive = converted[converted > 0]
     assert not positive.size, f"{jnp.dtype(target).name} claims the sign of {positive[:4]} kept"
+
+
+FLOORS = (-10, -3, 0, 4)
+"""Each divisor's declared floor (`y >= 2**l`), its bound `2**(l + 6)` above it; beside them each dtype's
+least normal power and the floor whose interval ends at its largest (`_apart_cases`)."""
+EPSILON = 2.0 ** -10
+
+
+def _grouped(y):
+    return y.reshape(-1, 4)
+
+
+def _signed(value):
+    """A value at most 1 in magnitude where `value` is at least 0, which the region states where it reads
+    `value` so, and infinite where `value` is -2 or under: a sign the region claims falsely shows as a bound
+    an infinity breaks."""
+    return 1.0 / (jnp.maximum(value + 1.0, -1.0) + 1.0)
+
+
+def _negative_zero(x):
+    """A value at least 0 as the region reads it, a negative zero wherever `x` is above 0."""
+    return lax.neg(jnp.minimum(x, 0.0))
+
+
+APART = {
+    "quotient": lambda x, y: x / y,
+    "reciprocal root": lambda x, y: x * lax.rsqrt(y),
+    "root": lambda x, y: x / lax.sqrt(y),
+    "root of a magnitude": lambda x, y: lax.sqrt(lax.abs(x)) * y,
+    "logarithm": lambda x, y: x * lax.log(y),
+    "logarithm of two": lambda x, y: x * lax.log2(y),
+    "power": lambda x, y: lax.pow(y, x),
+    "negative integer power": lambda x, y: x * lax.integer_pow(y, -2),
+    "odd negative integer power": lambda x, y: x * lax.integer_pow(y, -3),
+    "over a negation": lambda x, y: x / lax.neg(y),
+    "over a product": lambda x, y: x / (y * y),
+    "over a square": lambda x, y: x / lax.square(y),
+    "over an integer power": lambda x, y: x / lax.integer_pow(y, 3),
+    "over a reciprocal": lambda x, y: x / lax.integer_pow(y, -1),
+    "over a reciprocal root": lambda x, y: x / lax.rsqrt(y),
+    "over an absolute value": lambda x, y: x / lax.abs(lax.neg(y)),
+    "over a square and a constant": lambda x, y: y / (lax.square(x) + EPSILON),
+    "over an absolute value and a constant": lambda x, y: y / (lax.abs(x) + EPSILON),
+    "over a logistic and a constant": lambda x, y: y / (lax.logistic(x) + EPSILON),
+    "over an exponential": lambda x, y: y / lax.exp(jnp.maximum(jnp.minimum(x, 8.0), -8.0)),
+    "over an exponential of two": lambda x, y: y / lax.exp2(jnp.maximum(jnp.minimum(x, 8.0), -8.0)),
+    "over a maximum with a constant": lambda x, y: y / jnp.maximum(x, EPSILON),
+    "over a maximum of negatives": lambda x, y: x / lax.max(lax.neg(y), lax.neg(y + y)),
+    "over a minimum": lambda x, y: x / lax.min(y, 2.0 * y),
+    "over a minimum with a negative": lambda x, y: x / jnp.minimum(lax.neg(y), x),
+    "over a selection": lambda x, y: x / lax.select(x > 0, y, y + y),
+    "over a quotient": lambda x, y: x / (y / (lax.abs(x) + 1.0)),
+    "over a sum along an axis": lambda x, y: _grouped(x) / jnp.sum(_grouped(y), axis=1, keepdims=True),
+    "over a least along an axis": lambda x, y: _grouped(x) / jnp.min(_grouped(y), axis=1, keepdims=True),
+    "over a largest along an axis": lambda x, y: _grouped(x) / jnp.max(_grouped(y), axis=1, keepdims=True),
+    "over a transposed layout": lambda x, y: _grouped(x) / jnp.squeeze(_grouped(y).T[None], 0).T,
+    "over a broadcast of a broadcast": lambda x, y: _grouped(x)[:, None] / jnp.broadcast_to(
+        jnp.broadcast_to(jnp.min(_grouped(y), axis=1, keepdims=True), _grouped(y).shape)[:, None],
+        (y.size // 4, 2, 4)),
+    "over a difference": lambda x, y: x / (y - lax.neg(y)),
+    "normalized": lambda x, y: _grouped(x) * lax.rsqrt(
+        jnp.sum(lax.square(_grouped(x)), axis=1, keepdims=True) / 4.0 + EPSILON),
+    "over a narrower float": lambda x, y: x / y.astype(jnp.float16).astype(x.dtype),
+    # A value that may have overflowed: nothing that shrinks it is bounded, and no floor is made of it.
+    "a square that may overflow, divided": lambda x, y: lax.square(lax.square(y)) / 32768.0,
+    "a square that may overflow, rooted": lambda x, y: lax.sqrt(lax.square(lax.square(y))),
+    "a square that may overflow, its logarithm": lambda x, y: lax.log(lax.square(lax.square(y))),
+    "a square that may overflow, to a half": lambda x, y: lax.pow(lax.square(lax.square(y)), 0.5 + 0.0 * x),
+    "over a quotient by a square that may overflow": lambda x, y: x / (y / lax.square(lax.square(y))),
+    "over a reciprocal root of a square that may overflow": lambda x, y: x / lax.rsqrt(
+        lax.square(lax.square(y))),
+    # A possible overflow outlives a conversion to a wider float, and so does the NaN two make.
+    "a narrow square that may overflow, widened and rooted": lambda x, y: lax.sqrt(
+        lax.square(y.astype(jnp.float16)).astype(y.dtype)),
+    "a square that may overflow, through an integer, divided": lambda x, y: (
+        lax.square(lax.square(y)) * EPSILON).astype(jnp.int32).astype(y.dtype) / y,
+    "over a maximum with a difference that may be no number": lambda x, y: x / jnp.maximum(
+        lax.square(lax.square(y)) - lax.square(lax.square(y)), 1.0),
+    # A root and a logarithm of a value that may be under zero are no numbers; a difference of one side's
+    # values may be zero.
+    "a root of a signed value": lambda x, y: y * lax.sqrt(x),
+    "a reciprocal root of a signed value": lambda x, y: y * lax.rsqrt(x),
+    "a logarithm of a signed value": lambda x, y: y * lax.log(x),
+    "over a difference of one side's values": lambda x, y: x / (y + y - y),
+    # A sign the region reads of each operation that makes or keeps one (`_signed`).
+    "the sign of a quotient": lambda x, y: y * _signed(lax.abs(x) / y),
+    "the sign of a reciprocal root": lambda x, y: y * _signed(lax.rsqrt(y)),
+    "the sign of a reciprocal": lambda x, y: y * _signed(lax.integer_pow(y, -1)),
+    "the sign of a root": lambda x, y: y * _signed(lax.sqrt(lax.abs(x))),
+    "the sign of a product": lambda x, y: y * _signed(lax.abs(x) * y),
+    "the sign of a negated negation": lambda x, y: y * _signed(lax.neg(lax.neg(y))),
+    "the sign of a minimum": lambda x, y: y * _signed(lax.min(lax.abs(x), y)),
+    "the sign of a sum along an axis": lambda x, y: _grouped(y) * _signed(
+        jnp.sum(lax.abs(_grouped(x)), axis=1, keepdims=True)),
+    # A zero is at least 0 with either sign, and its reciprocal takes its sign: no sign is read through one.
+    "the sign of a quotient by a zero": lambda x, y: y * _signed(y / _negative_zero(x)),
+    "the sign of a reciprocal root of a zero": lambda x, y: y * _signed(lax.rsqrt(_negative_zero(x))),
+    "the sign of a reciprocal of a zero": lambda x, y: y * _signed(lax.integer_pow(_negative_zero(x), -1)),
+    "the sign of a cubed reciprocal of a zero": lambda x, y: y * _signed(
+        lax.integer_pow(_negative_zero(x), -3)),
+}
+"""Programs of a signed `x` within its bound and a `y` at least its floor whose bound holds only where the
+value divided by, rooted or read by a logarithm is held away from zero, a number and finite: each
+operation `_apart_bound` bounds, each rule that carries a floor to a quotient (`terms._apart`), a value that
+may have overflowed under each equation that reads it, and each sign the region claims."""
+def _fourth_overflows(dtype, top: int) -> bool:
+    """Whether `square(square(y))` of a `y` up to `2**top` may overflow `dtype`."""
+    return 4 * top >= int(jnp.finfo(dtype).maxexp)
+
+
+OVERFLOWING = {
+    **dict.fromkeys((
+        "a square that may overflow, divided", "a square that may overflow, rooted",
+        "a square that may overflow, its logarithm", "a square that may overflow, to a half",
+        "over a reciprocal root of a square that may overflow",
+        "over a maximum with a difference that may be no number",
+        "a square that may overflow, through an integer, divided"), _fourth_overflows),
+    # Its divisor's floor is `y`'s (`2**(top - 6)`) less the fourth power's bound, kept as a normal power of
+    # the dtype alone: float16 holds none under `2**-14`.
+    "over a quotient by a square that may overflow": lambda dtype, top: _fourth_overflows(dtype, top) or (
+        top - 6 - 4 * top < int(jnp.finfo(dtype).minexp)),
+    # float16's square, whatever dtype reads it after.
+    "a narrow square that may overflow, widened and rooted":
+        lambda dtype, top: 2 * top >= int(jnp.finfo(jnp.float16).maxexp),
+}
+"""The programs no bound is stated of where a value of theirs may have overflowed, by whether it may for a
+`y` up to `2**top` in a dtype: what reads an infinity, or the NaN two make, is bounded by nothing; nor is a
+quotient by a value whose composed floor the dtype holds no normal power of."""
+NEVER = {"the sign of a quotient by a zero", "the sign of a reciprocal root of a zero",
+         "the sign of a reciprocal of a zero", "the sign of a cubed reciprocal of a zero",
+         "a root of a signed value", "a reciprocal root of a signed value", "a logarithm of a signed value",
+         "over a difference of one side's values"}
+"""The programs no bound is stated of at all: a sign read through a reciprocal of a value that may be a zero
+of either sign, a root or a logarithm of a value that may be under zero, a quotient by a difference that may
+be zero."""
+APART_DTYPES = (jnp.float16, jnp.bfloat16, jnp.float32, jnp.float64)
+
+
+def _apart_cases():
+    for name in APART:
+        for dtype in APART_DTYPES:
+            floats = jnp.finfo(dtype)
+            least, largest = int(floats.minexp), int(floats.maxexp) - 1
+            for floor in (*FLOORS, least, largest - 6):
+                for bound in (-3, 2, 7, largest):
+                    yield name, dtype, floor, bound
+
+
+APART_CASES = list(_apart_cases())
+
+
+@pytest.mark.parametrize(("name", "dtype", "floor", "bound"), APART_CASES,
+                         ids=[f"{name}-{jnp.dtype(dtype).name}-{floor}-{bound}"
+                              for name, dtype, floor, bound in APART_CASES])
+def test_every_bound_stated_from_a_floor_holds_every_output_its_operands_reach(name, dtype, floor, bound):
+    """A quotient's, a root's, a logarithm's and a power's bound, stated where the region holds the operand
+    it needs away from zero and finite (a declared interval above zero, and what each equation keeps of
+    one), holds each output over a signed `x` within `2**bound`, zeros of both signs among them, and every
+    `y` from `2**floor` to `2**(floor + 6)`, their edges and neighbours among them, from each dtype's least
+    normal power to its largest; the region states one for every program but `NEVER`'s, in every dtype,
+    at a floor of `2**-3` and a bound of 4, so no bound holds by being absent; and it states none of
+    `NEVER`'s anywhere, nor of `OVERFLOWING`'s where a value of theirs may have overflowed."""
+    fn = APART[name]
+    with jax.enable_x64(new_val=jnp.dtype(dtype).itemsize == 8):
+        signed = _values(dtype, bound, arity=2)
+        signed = np.concatenate([signed, -np.zeros(1, signed.dtype)])
+        positive = _values(dtype, floor + 6, arity=2).astype(np.float64)
+        positive = positive[positive >= 2.0 ** floor].astype(dtype)
+        grid = [np.ravel(axis) for axis in np.meshgrid(signed, positive, indexing="ij")]
+        operands = [jnp.asarray(np.repeat(axis, 4), dtype) for axis in grid]
+        closed = jax.make_jaxpr(fn)(*operands)
+        region = terms.region(closed, {0: 2.0 ** bound, 1: (2.0 ** floor, 2.0 ** (floor + 6))})
+        claimed = region.magnitudes.get(terms.key(region.outputs[0]))
+        unbounded = name in NEVER or (name in OVERFLOWING and OVERFLOWING[name](dtype, floor + 6))
+        if (floor, bound) == (-3, 2):
+            assert (claimed is None) == unbounded, (name, claimed)
+        if unbounded:
+            assert claimed is None, (name, claimed)
+        if claimed is None:
+            return
+        out = np.asarray(fn(*operands)).astype(np.float64)
+    finite = np.isfinite(out)
+    if claimed <= _reach(dtype):
+        assert finite.all(), f"{name} claims 2**{claimed} and makes {out[~finite][:4]}"
+    # A claim past float64's own largest power holds every finite float64.
+    limit = 2.0 ** claimed if claimed < 1024 else np.inf
+    assert (np.abs(out[finite]) <= limit).all(), (
+        f"{name} claims 2**{claimed} and makes {out[finite][np.abs(out[finite]) > limit][:4]}")
+
+
+@pytest.mark.parametrize("reduction", [lax.reduce_max, lax.reduce_min, lax.reduce_sum],
+                         ids=["max", "min", "sum"])
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.float32])
+def test_a_reduction_of_no_element_keeps_nothing_of_its_operand(reduction, dtype):
+    """A maximum, a minimum and a sum along an axis of no element are their identities (an infinity of
+    either sign, a zero), whatever their operand's declared interval: the region states no bound of a
+    program a magnitude, a sign or a floor of the operand's would bound, which is infinite at each."""
+    def fn(y):
+        reduced = reduction(y.reshape(1, 0), (1,))
+        return _signed(reduced) + 1.0 / lax.abs(reduced) + lax.abs(reduced)
+
+    operand = jnp.zeros((0,), dtype)
+    region = terms.region(jax.make_jaxpr(fn)(operand), {0: (1.0, 1.0)})
+    assert not np.isfinite(np.asarray(fn(operand))).any()
+    assert region.magnitudes.get(terms.key(region.outputs[0])) is None
+
+
+@pytest.mark.parametrize("value", [7.999999999999999, 8.0, 8.000000000000002, 2.0 ** -1022, 1e-320],
+                         ids=["under a power", "a power", "over a power", "the least normal", "a subnormal"])
+def test_a_constants_and_a_declared_intervals_powers_are_exact(value):
+    """A constant's bound and floor, and a declared interval's, are its exponent's exactly: the float under 8
+    is under `2**3` and at least `2**2`, and the one over it is over `2**3`, where a rounded logarithm reads
+    both as 8; so `x * c`, `x / c` and `x / y` are bounded by powers that hold them, and a quotient by a
+    normal float is bounded."""
+    constant = np.float64(value)
+    with jax.enable_x64(new_val=True):
+        ones, normal = jnp.ones(4, jnp.float64), value >= 2.0 ** -1022
+        for fn, operands, declared, bounded in (
+                (lambda x: x * constant, (ones,), {0: 1.0}, True),
+                (lambda x: x / constant, (ones,), {0: 1.0}, normal),
+                (lambda x, y: x / y, (ones, jnp.full(4, constant)), {0: 1.0, 1: (value, value)}, normal)):
+            region = terms.region(jax.make_jaxpr(fn)(*operands), declared)
+            claimed = region.magnitudes.get(terms.key(region.outputs[0]))
+            assert (claimed is not None) == bounded
+            if bounded:
+                assert float(np.max(np.abs(np.asarray(fn(*operands))))) <= 2.0 ** claimed, claimed

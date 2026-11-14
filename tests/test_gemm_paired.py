@@ -14,9 +14,9 @@ from jax.sharding import Mesh
 from reference_error import assert_as_exact, with_gradients
 from test_gemm_template import CASES, SEEDS, _dew, _draw, _drop, _rounded_through
 
-from dew.nn.kernels import gemm, generation, grouped_matmul
+from dew.nn.kernels import gemm, generation, xla_products
 from dew.nn.kernels.templates import mosaic_sm90, resources
-from dew.nn.kernels.templates.gemm import mosaic_gpu, triton_dense
+from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
 def swiglu(gate, up):
@@ -24,9 +24,6 @@ def swiglu(gate, up):
     activated gate again, as `activations.gated_product` rounds them."""
     gate, up = gate.astype(jnp.bfloat16), up.astype(jnp.bfloat16)
     return (jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16) * up).astype(jnp.float32)
-
-
-PAIRED_TILE = grouped_matmul.Tile(64, 128, 64, 4, 2)
 
 
 def test_a_grouped_call_no_cooperative_tile_holds_derives_one_consumer_alone():
@@ -40,36 +37,6 @@ def test_a_grouped_call_no_cooperative_tile_holds_derives_one_consumer_alone():
                               launch_of=lambda tile: resources.Launch(lambda stages: resources.Scope(),
                                                                       tile.warpgroups, 0), grouped=True)
     assert tile is not None and (tile.warpgroups, tile.cluster) == (1, 1)
-
-
-def test_a_paired_product_holds_check_1_against_its_two_products_combined():
-    """The two-source dense kernel (one `lhs` tile, two matrices, two accumulators) at a tile, with rows,
-    depth and width no tile divides: its SwiGLU of the two products on par with the plain two products'
-    combined by the same epilogue over the draws (check 1), truth the two products' SwiGLU in float64."""
-    rows, depth, width = 200, 300, 140
-    shapes = ((rows, depth), (depth, width), (depth, width))
-
-    def draw(seed):
-        keys = jax.random.split(jax.random.fold_in(jax.random.key(7), seed), 3)
-        return tuple(jax.random.normal(key, shape).astype(jnp.bfloat16)
-                     for key, shape in zip(keys, shapes, strict=True))
-
-    def run(lhs, gate, up):
-        [paired] = triton_dense.gmm(lhs, gate, paired=up, epilogue=swiglu, out_dtypes=("bfloat16",),
-                                    tile=PAIRED_TILE, transpose_rhs=False, interpret=True)
-        return paired
-
-    def plain(lhs, gate, up):
-        def product(matrix):
-            return jnp.dot(lhs, matrix, preferred_element_type=jnp.float32)
-        return swiglu(product(gate), product(up)).astype(jnp.bfloat16)
-
-    def truth(lhs, gate, up):
-        return jax.nn.silu(lhs @ gate) * (lhs @ up)
-
-    paired = run(*draw(0))
-    assert paired.shape == (rows, width) and paired.dtype == jnp.bfloat16
-    assert_as_exact(run, jax.jit(plain), draw, "paired product", seeds=SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
@@ -145,7 +112,7 @@ def test_a_paired_products_epilogue_reads_its_fp32_accumulators_in_every_mode(ge
                              out_dtype=jnp.float32, precision="default", interpret_on_cpu=True)
 
     def plain(x, gate, up, dtype=jnp.bfloat16):
-        g, u = (grouped_matmul.portable_projection(x, matrix, sizes, dtype, "default",
+        g, u = (xla_products.portable_projection(x, matrix, sizes, dtype, "default",
                                                    out_dtype=jnp.promote_types(dtype, jnp.float32))
                 for matrix in (gate, up))
         return g * u
@@ -174,7 +141,7 @@ def test_a_paired_product_at_a_named_compute_dtype_holds_check_1(generation_name
     projection's law: the operands rounded, the products summed wide and rounded once, each tangent
     through the rounded operands) as one paired product without an epilogue: its two outputs and every
     gradient (the rows' in fp32, both masters' in fp32) as exact as the two unfused projections'
-    (`grouped_matmul.portable_projection`) from float64 truth."""
+    (`xla_products.portable_projection`) from float64 truth."""
     rows, depth, width = 136, 128, 256
     sizes = jnp.asarray([70, 66], jnp.int32)
 
@@ -189,7 +156,7 @@ def test_a_paired_product_at_a_named_compute_dtype_holds_check_1(generation_name
                              out_dtypes=(jnp.bfloat16, jnp.bfloat16), interpret_on_cpu=True)
 
     def plain(x, gate, up, dtype=jnp.bfloat16):
-        return tuple(grouped_matmul.portable_projection(x, matrix, sizes, dtype, None)
+        return tuple(xla_products.portable_projection(x, matrix, sizes, dtype, None)
                      for matrix in (gate, up))
 
     def truth(x, gate, up):
@@ -236,32 +203,10 @@ def test_the_templates_paired_product_without_an_epilogue_holds_check_1(generati
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, cast=jnp.float64)))
 
 
-@pytest.mark.parametrize("generation_name", ["sm80", "sm86", "sm90"])
-def test_a_paired_dense_product_lowers_for_cuda(generation_name):
-    """The two-source dense kernel lowers for CUDA on the CPU."""
-    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    args = (bf16((1021, 200)), bf16((200, 300)), bf16((200, 300)))
-
-    def paired(lhs, gate, up):
-        return triton_dense.gmm(lhs, gate, paired=up, epilogue=swiglu, out_dtypes=("bfloat16",),
-                                tile=PAIRED_TILE, transpose_rhs=False, interpret=False)
-
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
-    with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(paired).trace(*args).lower(lowering_platforms=("cuda",))
-
-
-def test_a_paired_product_without_an_epilogue_is_refused():
-    lhs = jnp.zeros((64, 64), jnp.bfloat16)
-    with pytest.raises(ValueError):
-        triton_dense.gmm(lhs, lhs, paired=lhs, out_dtypes=("bfloat16",), tile=PAIRED_TILE,
-                         transpose_rhs=False, interpret=True)
-
-
 @lowers("sm90")
 def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper():
     """A side operand given back with its dimension of one, broadcast across its tile
-    (`grouped_matmul._unsqueezed`), which Mosaic's layout inference lays out where it found no layout for the
+    (`hooks._unsqueezed`), which Mosaic's layout inference lays out where it found no layout for the
     dimension of one itself (GMMGATE-h100-8): a Hopper call's forward and kernel gradient with such a
     prologue lower on the template's launch, named."""
     drawn = [jax.ShapeDtypeStruct(array.shape, array.dtype) for array in _draw(0)]

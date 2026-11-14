@@ -6,7 +6,7 @@ each site tests/fla_sites.py names, over the tests' own seeded draws.
     PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla> <unit> <site>...
     PYTHONPATH=src:tests:tools python tools/fla_gdn_reference.py --merge <unit>...
 
-on a GPU, Dew's environment recording and a second Python with torch, fla-core and tilelang (`--serve`, the
+on a GPU, Dew's environment recording and a second Python with torch and fla-core (`--serve`, the
 "fla" cohort, tools/reference_releases.py) running fla and its reference, each run a unit of named sites
 (`--list` names them all), the units then merged. What lands is tests/fixtures/fla/gdn_seeded.npz, a
 summary recording (`record_case(..., summary=True)`): per site, seed and
@@ -110,7 +110,7 @@ def serve() -> None:
     """The torch side (tools/reference_worker.py's protocol): each request a site's inputs with its `dtype`,
     `kind` ('kda' or 'gdn'), `scale` and `leaves` ('all', or 'forward' for the output and final memory
     alone), answered with fla's outputs and the reference's (`reference.<leaf>`, `truth.<leaf>`), after one
-    `ready` line of fla's and tilelang's versions and the device."""
+    `ready` line of fla's, torch's and Triton's releases and the device."""
     import reference_worker
     import torch
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
@@ -124,9 +124,10 @@ def serve() -> None:
     require("fla")
     from importlib.metadata import version
 
-    # On Hopper fla-core 0.5.2 refuses its Triton backward under Triton below 3.7.1 (fla #640, wrong results
-    # in chunk_bwd_dqkwg) and takes tilelang's there: the cohort's torch 2.8.0 carries Triton 3.4.
-    found = f"fla-core-{version('fla-core')}+tilelang-{version('tilelang')}"
+    # The releases fla's kernels run on: its Triton, torch's, past fla #640's Hopper miscompile (Triton 3.4 to
+    # 3.7.0, chunk_bwd_dqkwg) on the cohort's torch, so fla takes no tilelang backward there.
+    torch_release = version('torch').split('+')[0]
+    found = f"fla-core-{version('fla-core')}+torch-{torch_release}+triton-{version('triton')}"
 
     def answer(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         dtype, kind, leaves = (str(arrays.pop(name)) for name in ("dtype", "kind", "leaves"))

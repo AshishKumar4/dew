@@ -105,6 +105,28 @@ def test_a_float32_product_returns_the_dtype_asked():
     assert result.dtype == jnp.float32 and float(result[0, 0]) == 1.0
 
 
+def test_a_float64_product_where_x64_is_off_is_its_plain_product():
+    """Float64 operands formed under x64 keep their dtype where x64 is off, as JAX keeps them, and Dew's
+    product of them is their plain float64 product, called or traced, with nothing warned: the policy
+    asked JAX what dtype objects multiply in, which with x64 off is a request for float64 that JAX refuses
+    with a warning, the suite's error, where a carry's prepared product reached it inside a float64 walk
+    (Kimi Linear's truth, an SGD step's)."""
+    import warnings
+
+    rng = np.random.default_rng(0)
+    with jax.enable_x64(new_val=True):
+        lhs, rhs = jnp.asarray(rng.standard_normal((4, 8))), jnp.asarray(rng.standard_normal((8, 3)))
+    dims = (((1,), (0,)), ((), ()))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        called = float32_dot_general(lhs, rhs, dims)
+        traced = jax.jit(lambda lhs, rhs: float32_dot_general(lhs, rhs, dims))(lhs, rhs)
+        plain = jax.lax.dot_general(lhs, rhs, dims)
+    assert called.dtype == traced.dtype == plain.dtype == jnp.float64
+    np.testing.assert_array_equal(called, plain)
+    np.testing.assert_array_equal(traced, plain)
+
+
 @pytest.mark.parametrize("assumed_first", [True, False])
 def test_the_policy_is_the_executing_platforms_whatever_target_a_trace_assumed(assumed_first):
     """One jitted product, run on a CPU inside and outside `generation.assumed` in either order,
@@ -287,6 +309,29 @@ def test_a_portable_recurrence_product_sums_in_float64():
 
     lhs, rhs = CANCELLING[None], np.ones((3, 1), np.float32)
     assert np.asarray(jax.jit(lambda lhs, rhs: portable("product", lhs, rhs))(lhs, rhs)).tolist() == [[1.0]]
+
+
+def test_a_widened_reductions_wide_path_is_a_protected_span_of_its_own(monkeypatch):
+    """A reduction widened under the test setting (`widened_reduction`) called from plain math, outside any
+    protected span, holds its float64 path in one protected call (`dew.nn.derivatives.Protected`), which the
+    algebra pass keeps as traced; it computes the float64 sum rounded once, and differentiates. Its one
+    caller ran it inside a derivative declared protected, and the helper marked nothing of its own."""
+    from dew.nn.derivatives import Protected, marked_call_p
+    from dew.nn.precision import widened_reduction
+
+    monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    rows = np.random.default_rng(0).standard_normal((4, 64)).astype(np.float32)
+
+    def summed(x):
+        return widened_reduction(lambda x: (jnp.sum(x, -1),), x)[0]
+
+    closed = jax.make_jaxpr(lambda x: summed(x))(rows)
+    assert [equation.params["kind"] for equation in equations(closed)
+            if equation.primitive is marked_call_p] == [Protected()]
+    with jax.enable_x64(new_val=True):
+        wide = np.asarray(jnp.sum(jnp.asarray(rows, jnp.float64), -1).astype(jnp.float32))
+    np.testing.assert_array_equal(jax.jit(lambda x: summed(x))(rows), wide)
+    np.testing.assert_array_equal(jax.grad(lambda x: summed(x).sum())(rows), np.ones_like(rows))
 
 
 @pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])

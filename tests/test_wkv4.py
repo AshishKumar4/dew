@@ -41,3 +41,17 @@ def test_the_scan_is_as_exact_as_the_recurrence_a_token_at_a_time(packed):
     # took 11.5 GB and were killed, jsf-wkv4t1); one sequence holds no zero row, so none are traced either.
     assert_packed_on_par(wkv4, recurrent_wkv4, draw, 'wkv4', packed=packed, documents=DOCUMENTS,
                          length=LENGTH, seeds=SEEDS[packed], terms=False if packed else None)
+
+
+@pytest.mark.parametrize("wkv", [wkv4, recurrent_wkv4], ids=["scan", "recurrence"])
+def test_a_first_token_reads_its_own_value_whatever_its_key(wkv):
+    """A sequence's first token reads an empty past beside itself at its bonus, so its output is its own value
+    exactly whatever its key: a key of -2e38, below any finite maximum an empty past could stand at, among
+    them, its gradients finite."""
+    channel = np.zeros((1,), np.float32)
+    key, value = np.full((1, 1, 1), -2e38, np.float32), np.ones((1, 1, 1), np.float32)
+    out, _ = wkv(channel, channel, key, value)
+    np.testing.assert_array_equal(np.asarray(out), value)
+    grads = jax.grad(lambda *operands: wkv(*operands)[0].sum(), argnums=(0, 1, 2, 3))(channel, channel, key,
+                                                                                        value)
+    assert all(np.isfinite(np.asarray(grad)).all() for grad in grads)

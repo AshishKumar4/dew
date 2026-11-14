@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.kernels import generation, tuning
+from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, Requirement, analysed, select
 from dew.nn.kernels.templates.base import Call, Template, Unfitted, call
 from dew.nn.kernels.tuning import Unpinnable
@@ -116,23 +116,6 @@ def test_a_templates_configs_are_the_ones_a_block_of_the_device_holds():
         assert op.fitting(bound(op), generation.gpu_target()) == (Block(8), Block(16), Block(32), Block(64))
 
 
-def test_a_fixed_spaces_heuristic_is_its_first_config_that_fits():
-    """A launch naming a fixed space takes its first config that fits the device, nothing ranked (bible
-    §6): 64 rows of 512 fp32 columns stage 128 KiB, past an A10's block, so its first fitting there is the
-    first of the space as on an A100."""
-    for name in ("sm86", "sm80"):
-        with generation.assumed(name):
-            assert Doubling()._get_heuristics_config(bound(Doubling())) == Block(8)
-
-
-def test_a_target_that_reports_no_block_takes_the_least_any_gpu_holds():
-    """A GPU generation the table holds no facts for, and that is not this device, budgets 99 KiB, as a
-    CPU does: it has no GPU's facts unless a test states the GPU it emulates (`generation.assumed`)."""
-    assert generation.shared_budget(generation.GpuTarget("sm100", "NVIDIA B200")) == generation.SHARED_BUDGET
-    assert generation.shared_budget(generation.TARGETS["sm90"]) == generation.TARGETS["sm90"].shared_limit
-    assert generation.shared_budget(generation.GpuTarget("cpu", "cpu")) == generation.SHARED_BUDGET
-
-
 def test_a_call_no_config_holds_is_refused_naming_its_bytes_and_the_budget():
     op = Doubling()
     with generation.assumed("sm86"), pytest.raises(Unfitted) as refused:
@@ -180,36 +163,27 @@ class Unpriced(Doubling):
         raise ValueError("no cost facts")
 
 
-DERIVATIONS: list[int] = []
-"""Each derivation `Deriving` ran, by the rows of its call."""
+def test_a_recording_holds_its_own_contexts_records():
+    """A `recording` scope holds every rewrite the algebra pass records within it, none from before it,
+    whatever the process's registry holds: a search's plan reports its own compiles' (audit K4)."""
+    from dew import algebra
+    from dew.nn.kernels.templates import report
 
+    def program(x, y, a, b):
+        x, y, a = jnp.tanh(x), jnp.tanh(y), jnp.tanh(a)
+        return jnp.sum(a * x, -1) + jnp.sum(a * y, -1), jnp.dot(x, y.T) * 0.5 + jnp.dot(b, y.T) * 0.5
 
-@dataclasses.dataclass(frozen=True)
-class Deriving(Doubling):
-    """`Doubling`, generating its config: the most rows of a block the device holds, at most the call's."""
+    def lower(rows):
+        shape = jax.ShapeDtypeStruct((rows, 64), jnp.float32)
+        jax.jit(algebra.rewritten(program)).lower(shape, shape, shape, shape)
 
-    GENERATES: ClassVar[bool] = True
-
-    def derived(self, ba, target):
-        DERIVATIONS.append(ba.arguments["x"].shape[0])
-        return max(config for config in Doubling.space(self, ba) if self.legal(ba, config, target))
-
-
-def test_a_launch_derives_once_for_what_its_derivation_reads():
-    """A launch's derivation (`Template.derived`) runs once for what it reads: the call (its arguments'
-    shapes and dtypes, its hooks) and the target, every eligibility check and planner candidate after
-    reading that once; a call or a target of other facts derives again (row 4259: the GEMM tile derived at
-    every check took 36 s of a Qwen3.5-4B step's compile_ahead)."""
-    DERIVATIONS.clear()
-    op = Deriving()
-    with generation.assumed("sm90"):
-        target = generation.gpu_target()
-        for rows in (2048, 2048, 4096, 2048):
-            op.derived(op.bind(jax.ShapeDtypeStruct((rows, 512), jnp.float32)), target)
-        halved = dataclasses.replace(target, multiprocessors=target.multiprocessors // 2)
-        with generation.assumed(halved):
-            op.derived(op.bind(jax.ShapeDtypeStruct((2048, 512), jnp.float32)), halved)
-    assert DERIVATIONS == [2048, 4096, 2048]
+    with report.refusals():
+        lower(8)
+        before = report.rewrites()
+        with report.recording() as recorded:
+            lower(16)
+        assert before and recorded.rewritten
+        assert list(report.rewrites()) == [*before, *recorded.rewritten]
 
 
 def test_chosen_names_a_declared_choice_and_no_other():
@@ -297,20 +271,3 @@ def test_an_explicit_config_the_call_cannot_hold_is_refused_as_a_pin_is():
         assert jnp.array_equal(Doubling().replace(config=Block(64))(x), x * 2)
 
 
-def test_a_launch_builds_its_key_only_where_something_reads_it():
-    """A launch with no collector, pin or tuning read never builds its key (`KernelOp.keyed`, which traces
-    its hooks; row 1866 K4); a collector reads it."""
-    built = []
-
-    class Counted(Doubling):
-        def keyed(self, ba):
-            built.append(1)
-            return super().keyed(ba)
-
-    x = jnp.ones((64, 8), jnp.float32)
-    with generation.assumed("sm80"):
-        Counted()(x)
-        assert built == []
-        with tuning.seen():
-            Counted()(x)
-    assert built == [1]

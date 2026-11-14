@@ -23,7 +23,7 @@ import sys
 import tempfile
 import threading
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NamedTuple
@@ -38,6 +38,7 @@ from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from sharded import collective_axes
 
+from dew._builds import generation_builds
 from dew.nn.kernels import grouped_matmul
 from dew.nn.kernels.generation import assumed, capability, gpu_target
 from dew.nn.kernels.lowered import kernel_calls, triton_kernels
@@ -289,15 +290,23 @@ def _compiled(case, generation: str, record: dict,
     compile-only device of it: the custom kernels its executable launches (`report.launched_kernels`) and
     the lowered program's Triton calls by name
     (`triton_kernels`), or None, `record` holding why: the error, or the shared bytes of a block XLA
-    refused. Given a `directory`, its Mosaic GPU kernels' evidence too (`_printed`): `record['estimates']`
-    each one's resource estimate Pallas prints as it lowers, `record['binaries']` each one's binary
-    (`report.binaries`), `record['modules']` each one's kernel hash, by kernel name, and in `directory` the
-    PTX Mosaic prints as it compiles, a `<kernel>.ptx` each."""
+    refused. `record['modules']` holds each Mosaic GPU kernel's module (its kernel hash) by its name and
+    launch, and `record['certified']` each one certification compiled alone in the process
+    (`report.certifications`). Given a `directory`, its Mosaic GPU kernels' evidence too (`_printed`):
+    `record['estimates']` each one's resource estimate Pallas prints as it lowers, `record['binaries']` each
+    one's binary (`report.binaries`), and in `directory` the PTX Mosaic prints as it compiles, a
+    `<kernel>.ptx` each."""
     fn, args = case.call()
     expected = getattr(case, "expected", None)
-    estimating = _printed(MOSAIC_GPU_DUMP_RESOURCES="1") if directory else contextlib.nullcontext([])
+    # Each launch's derived config is certified as it traces, as a start on the GPU certifies it
+    # (`report.certified`), on a compile-only device of the generation: its kernels compiled then, each
+    # module once a process, so their PTX prints as the program lowers, not as it compiles. Here, in the
+    # process of the generation's capability (`compile_mosaic_kernels`), never in a bare lowering.
+    estimating = (_printed(MOSAIC_GPU_DUMP_RESOURCES="1", MOSAIC_GPU_DUMP_PTX="1") if directory
+                  else contextlib.nullcontext([]))
+    uncertified = report.uncertified()
     try:
-        with estimating as estimated:
+        with estimating as estimated, report.certifying(compile_only_gpus(generation)[0]):
             lowered = lowered_for(fn, args, generation, expected)
     except Exception as error:  # A case that does not lower is its own failure.
         # One a block's shared memory does not hold asks its bytes, as XLA's refusal of a Triton kernel does.
@@ -307,11 +316,19 @@ def _compiled(case, generation: str, record: dict,
         else:
             record["shared"] = int(refused.group(1))
         return None
+    # A launch the lowering could not certify (`report.certified`) is a failure of its own: its run would
+    # find its spills only as its whole program compiles.
+    record["uncertified"] = [f"{type(key[0]).__name__ if not isinstance(key[0], str) else key[0]} at "
+                             f"{key[1]}: {why}" for key, why in report.uncertified().items()
+                             if key not in uncertified]
     # Each kernel once, as JAX lowered it (a function's kernels however many calls reach them).
     calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]
     modules = kernel_modules(calls)
+    record["modules"] = modules
+    # Each kernel certification compiled alone in this process, by name and launch: its module.
+    record["certified"] = {name: module for found in report.certifications()
+                           for name, (module, _) in found.kernels.items()}
     if directory is not None:
-        record["modules"] = modules
         record["estimates"] = _estimates(calls, "".join(estimated))
     # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
     # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
@@ -329,7 +346,7 @@ def _compiled(case, generation: str, record: dict,
     if directory is not None:
         record["binaries"] = [dataclasses.asdict(found)
                               for found in report.binaries(executable, decoded=True)]
-        write_modules("".join(printed), directory)
+        write_modules("".join(estimated), "".join(printed), directory, modules)
     if expected is not None:
         record["route"] = _route(lowered, executable, _device(generation, expected.axes))
     return report.launched_kernels(executable), triton_kernels(lowered)
@@ -348,38 +365,49 @@ def kernel_modules(calls: list) -> dict[str, str]:
 
 def _estimates(calls: list, printed: str) -> dict[str, str]:
     """Each Mosaic GPU call's resource estimate by its kernel's name and launch (`report.launch_name`), from
-    what its lowering printed: Pallas prints one each time it lowers a kernel, in the order JAX lowers them,
-    which `calls` keep (`kernel_calls`: each call of a module, a function's where its first call is, one no
-    run reaches too). Calls of one module (a kernel hash, `call.config`: a launch over each block of the
-    value columns) print one estimate each where each lowers, or one between them where the later reuse the
-    first's lowering; either way every call of a module takes that module's estimate. A lowering JAX cached
-    prints none, its kernels' estimates kept by their module from the lowering that printed them
-    (`ESTIMATES`)."""
-    printed_estimates = ["Resources(" + part for part in printed.split("Resources(")[1:]]
-    modules = list(dict.fromkeys(call.config for call in calls))
-    if len(printed_estimates) == len(calls):
-        ESTIMATES.update(zip((call.config for call in calls), printed_estimates, strict=True))
-    elif len(printed_estimates) == len(modules):
-        ESTIMATES.update(zip(modules, printed_estimates, strict=True))
+    what its lowering printed: Mosaic prints one each time it builds a kernel's module, beside the hash that
+    names its kernel (`<name> <hash> Resources(...)`), which a call's `config` holds (its first 16 hex
+    digits). A module built once and reused (a lowering JAX cached, a launch certified as it traced,
+    `report.certified`) prints one, its estimate kept by its module (`ESTIMATES`)."""
+    for name, hashed, estimate in PRINTED_ESTIMATE.findall(printed):
+        del name
+        ESTIMATES[hashed[:16]] = estimate
     return {report.launch_name(call.name, call.launch): ESTIMATES[call.config] for call in calls
             if call.config in ESTIMATES}
+
+
+PRINTED_ESTIMATE = re.compile(r"^(\S+) ([0-9a-f]{64}) (Resources\(.*\))$", re.M)
+"""A Mosaic GPU kernel's resource estimate as it prints it (`core.py`'s dump: its module's name, its kernel's
+hash and the estimate)."""
 
 
 ESTIMATES: dict[str, str] = {}
 """Each Mosaic GPU kernel's resource estimate this process read, by its module (its kernel hash)."""
 
 
-def write_modules(printed: str, directory: str) -> None:
-    """Each PTX module Mosaic printed as it compiled (`PTX_MODULE`) into `directory` as `<kernel>.ptx`, its
-    kernel's name and launch its entry's (`report.kernel_of`, `report.launch_name`)."""
-    for part in printed.split(PTX_MODULE)[1:]:
-        entry = PTX_ENTRY.search(part)
-        if entry is None:
-            raise ValueError(f"a printed PTX module names no entry: {part[:200]}")
-        path = Path(directory, f"{report.launch_name(*report.kernel_of(entry.group(1)))}.ptx")
-        if path.exists():
-            raise ValueError(f"two PTX modules of {path.stem}")
-        path.write_text("//\n" + PTX_MODULE + part)
+def write_modules(lowering: str, compiling: str, directory: str, kernels: Collection[str]) -> None:
+    """Each PTX module of the program's `kernels` (by name and launch, `report.launch_name`) Mosaic printed
+    (`PTX_MODULE`) into `directory` as `<kernel>.ptx`, its kernel's name and launch its entry's
+    (`report.kernel_of`): one certification assembled as the program lowered (`report.certified`), which its
+    compile reuses, or one its compile assembled. A module the compile assembled supersedes certification's
+    of its name and launch, which the program does not run (a gradient's forward is another kernel than the
+    one certified, the recurrence template's); one of no kernel of the program is a config certification
+    refused. Two modules of one name and launch in one print raise."""
+    modules: dict[str, str] = {}
+    for printed in (lowering, compiling):
+        assembled: dict[str, str] = {}
+        for part in printed.split(PTX_MODULE)[1:]:
+            entry = PTX_ENTRY.search(part)
+            if entry is None:
+                raise ValueError(f"a printed PTX module names no entry: {part[:200]}")
+            name = report.launch_name(*report.kernel_of(entry.group(1)))
+            if name in assembled:
+                raise ValueError(f"two PTX modules of {name}")
+            assembled[name] = part
+        modules.update(assembled)
+    for name, part in modules.items():
+        if name in kernels:
+            Path(directory, f"{name}.ptx").write_text("//\n" + PTX_MODULE + part)
 
 
 def _route(lowered, executable, mesh: Mesh) -> dict:
@@ -629,9 +657,41 @@ def needed(kernel: dict, needs: dict[str, int | dict | None]) -> dict:
     return {**kernel, "need": NEEDS.get(kernel["module"])}
 
 
-_NVCC = importlib.util.find_spec("nvidia.cuda_nvcc")
-PTXAS = Path(next(iter(_NVCC.submodule_search_locations or ()))) / "bin" / "ptxas" if _NVCC else Path("ptxas")
-"""The ptxas of the CUDA toolchain this jaxlib's Mosaic GPU compiles with (the nvidia-cuda-nvcc wheel's)."""
+BUILD_NVCC = {"cuda12": ("nvidia.cuda_nvcc", "12.9"), "cuda13": ("nvidia.cu13", "13.0")}
+"""Each of JAX's CUDA builds (`dew._builds.CUDA_BUILDS`): the package of the nvcc wheel this environment
+installs (locks/cpu.txt) and the release of the build's PTX compiler, which it must report: the CUDA release
+the build's plugin was built against (Dew's JAX fork's .bazelrc, HERMETIC_CUDA_VERSION 13.0.0 and 12.9.1),
+whose PTX compiler, linked into the plugin (Mosaic GPU's `GetAssemblyToBinaryCompilationProvider`:
+libnvptxcompiler), compiles a Mosaic GPU kernel's PTX on a GPU running that build, whatever nvcc is installed
+beside it: a B200 compiled with 13.0 where 13.4 held kernels 13.0 spilled (rows 5671, 5759)."""
+
+
+@functools.cache
+def ptxas_of(build: str) -> Path:
+    """The ptxas that judges kernels as a GPU running JAX's CUDA `build` compiles them: its nvcc wheel's
+    (`BUILD_NVCC`), refused unless its release is the build's PTX compiler's (`BUILD_NVCC`), naming the
+    ptxas, its version and the build, so a relock that moves the wheel fails the gate rather than judging
+    with another compiler."""
+    package, release = BUILD_NVCC[build]
+    found = importlib.util.find_spec(package)
+    if found is None:
+        raise RuntimeError(f"no {package} in this environment: the gate judges {build}'s GPUs' kernels with "
+                           f"its ptxas, CUDA {release}'s")
+    ptxas = Path(next(iter(found.submodule_search_locations or ()))) / "bin" / "ptxas"
+    reported = subprocess.run([str(ptxas), "--version"], capture_output=True, text=True, check=False).stdout
+    if f"release {release}," not in reported:
+        version = reported.strip().splitlines()[-1] if reported.strip() else "no version"
+        raise RuntimeError(f"{ptxas} ({version}) would judge the kernels of every GPU running {build}, which "
+                           f"compiles them with CUDA {release}'s PTX compiler")
+    return ptxas
+
+
+def assemblers(generation: str) -> tuple[Path, ...]:
+    """The ptxas of each CUDA build a GPU of `generation` runs (`generation_builds`, newest first), the gate
+    judging its kernels under every one (`_compiled_reports`), its need scans reading the first's: a B200 runs
+    the cuda13 build alone, whose PTX compiler held kernels 12.9 spilled 4 to 16 bytes of and spilled kernels
+    12.9 held (rows 5671, 5759 and 5761)."""
+    return tuple(ptxas_of(build) for build in generation_builds(generation))
 
 ENTRY = re.compile(r"(\.maxntid[^\n]*\n)")
 OCCUPANCY = re.compile(r"\.minnctapersm[^\n]*\n")
@@ -664,17 +724,17 @@ def _ptxas(ptx: str, generation: str, *, cap: int | None, raised: int | None = N
     return read.registers, read.spilled, took
 
 
-def _ptxas_text(ptx: str, generation: str, relocatable: bool) -> tuple[str, bool]:
+def _ptxas_text(ptx: str, generation: str, relocatable: bool, ptxas: Path | None = None) -> tuple[str, bool]:
     """ptxas's own report (`-v`) on the kernel `ptx` for the CUDA `generation`, compiled relocatably or
-    whole-program (`_ptxas`), and whether it took the kernel."""
+    whole-program (`_ptxas`) by `ptxas` (`assemblers`' first by default), and whether it took the kernel."""
     major, minor = capability(generation) or (0, 0)
     arch = f"sm_{major}{minor}{'a' if major >= 9 else ''}"
     with tempfile.NamedTemporaryFile("w", suffix=".ptx") as source:
         source.write(ptx)
         source.flush()
         relocating = ("--compile-only",) if relocatable else ()
-        ran = subprocess.run([str(PTXAS), f"-arch={arch}", "-v", *relocating, source.name, "-o", os.devnull],
-                             capture_output=True, text=True, check=False)
+        ran = subprocess.run([str(ptxas or assemblers(generation)[0]), f"-arch={arch}", "-v", *relocating,
+                              source.name, "-o", os.devnull], capture_output=True, text=True, check=False)
     return ran.stdout + ran.stderr, ran.returncode == 0
 
 
@@ -704,7 +764,9 @@ def register_need(ptx: str, generation: str, honored: bool = resources.RAISES_HO
     least raise at which it spills nothing, or its use
     there where ptxas compiles past a raise below it. A cap holds only if its actual use fits too:
     C7507 can ignore a small raise entirely. Scan in order, since ptxas's spill decisions are not
-    monotone even once ignored raises are excluded. None where nothing holds it."""
+    monotone even once ignored raises are excluded. None where nothing holds it. The scan is one build's
+    ptxas (`assemblers`' first), a need the model's evidence reads, where a kernel's verdict is every build's
+    the gate judges it under (`_compiled_reports`)."""
     return least_spill_free(functools.partial(_assembled, ptx, generation, honored=honored),
                             raising=honored and bool(RAISE.search(ptx)))
 
@@ -772,16 +834,21 @@ def cap_decisions(assemble, model: resources.RegisterModel, *, raising: bool, ho
 
 def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
     """Each kernel's registers a thread and spilled bytes as the GPU compiles the PTX Mosaic printed into
-    `directory` (`_ptxas` at its own entry), by its name and launch (`report.launch_name`): its binary is its
-    compile in this process, which may not be the GPU's (`RELOCATABLE`)."""
+    `directory` (`_ptxas` at its own entry), by its name and launch (`report.launch_name`), the most of each
+    under every CUDA build the gate judges the generation under (`assemblers`) and every build's notes: its
+    binary is its compile in this process, which may not be the GPU's (`RELOCATABLE`)."""
     found = {}
     for path in Path(directory).glob("*.ptx"):
-        text, took = _ptxas_text(path.read_text(), generation, RELOCATABLE)
-        if not took:
-            raise RuntimeError(f"ptxas does not compile {path.name} for {generation}")
-        read = ptxas_read(text)
-        found[path.stem] = {"registers": read.registers, "spilled": read.spilled,
-                            "losses": read.losses, "ptxas": "the GPU's compile of its PTX"}
+        reads = []
+        for ptxas in assemblers(generation):
+            text, took = _ptxas_text(path.read_text(), generation, RELOCATABLE, ptxas)
+            if not took:
+                raise RuntimeError(f"{ptxas} does not compile {path.name} for {generation}")
+            reads.append(ptxas_read(text))
+        worst = max(reads, key=lambda read: (read.spilled, read.registers))
+        found[path.stem] = {"registers": worst.registers, "spilled": worst.spilled,
+                            "losses": tuple(dict.fromkeys(code for read in reads for code in read.losses)),
+                            "ptxas": "the GPU's compile of its PTX"}
     return found
 
 
@@ -877,7 +944,8 @@ def decisions(registers: int | dict | None, model: resources.RegisterModel,
 
 
 def mosaic_failures(found: list[dict]) -> list[str]:
-    """Compile errors, spills, missing or excessive shared/TMEM allocations, and a producer its schedule
+    """Compile errors, spills, missing or excessive shared/TMEM allocations, a launch its lowering did not
+    certify (`report.certified`), and a producer its schedule
     lowers to other registers than its model states (`setmaxnreg.dec` against `RegisterModel.producer`: a
     launch's plan and its emission one fact). A spill-free register model disagreement remains an advisory row
     until the model matches allocation."""
@@ -885,6 +953,8 @@ def mosaic_failures(found: list[dict]) -> list[str]:
     for record in found:
         if refused(record):
             continue
+        failed += [f"{record['name']}: a launch not certified, {why}"
+                   for why in record.get("uncertified", ())]
         if not record["kernels"]:
             failed.append(f"{record['name']}: no Mosaic GPU kernel compiled")
         for kernel in record.get("kernels", ()):
@@ -901,15 +971,21 @@ def mosaic_failures(found: list[dict]) -> list[str]:
 
 def producer_failures(found: list[dict]) -> list[str]:
     """Each kernel whose schedule lowers its producer to other registers than its model states, or none where
-    its model states a producer (`setmaxnreg.dec`, the record's `decreased`, against
-    `RegisterModel.producer`): a launch's plan and its emission one fact."""
+    its model states a producer whose program moves registers, or lowers it where its program moves none
+    (`setmaxnreg.dec`, the record's `decreased`, against `RegisterModel.producer` and `moves`): a launch's
+    plan and its emission one fact."""
     failed = []
     for record in found:
         for kernel in record.get("kernels", ()):
-            stated = record.get("models", {}).get(_report(kernel).kernel)
-            if stated is not None and stated["producer"] and kernel.get("decreased") != stated["producer"]:
-                failed.append(f"{record['name']} {kernel['kernel']}: its schedule lowers its producer to "
-                              f"{kernel.get('decreased')} registers, its model {stated['producer']}")
+            found_kernel = _report(kernel)
+            stated = record.get("stated_models", {}).get(found_kernel.traced,
+                                                          record.get("models", {}).get(found_kernel.kernel))
+            if stated is None or not stated["producer"]:
+                continue
+            lowered = stated["producer"] if stated.get("moves", True) else None
+            if kernel.get("decreased") != lowered:
+                failed.append(f"{record['name']} {found_kernel.kernel}: its schedule lowers its producer to "
+                              f"{kernel.get('decreased')} registers, its model {lowered}")
     return failed
 
 
@@ -1030,9 +1106,11 @@ def _head() -> str:
 
 @functools.cache
 def _ptxas_version() -> str:
-    """The version line of the ptxas the gate assembles with (`PTXAS`)."""
-    ran = subprocess.run([str(PTXAS), "--version"], capture_output=True, text=True, check=False)
-    return ran.stdout.strip()
+    """Each CUDA build's name and the version lines of the ptxas the gate judges its GPUs' kernels with
+    (`ptxas_of`)."""
+    return "\n".join(f"{build}: " + subprocess.run([str(ptxas_of(build)), "--version"], capture_output=True,
+                                                   text=True, check=False).stdout.strip()
+                     for build in BUILD_NVCC)
 
 
 TPU_TOPOLOGIES = {"v5e": "v5e:2x2", "v6e": "v6e:2x2"}

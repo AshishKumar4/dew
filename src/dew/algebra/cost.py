@@ -10,7 +10,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-import re
 from typing import Protocol
 
 import jax
@@ -22,11 +21,12 @@ from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
 from dew.algebra.rules import CONTRACTED, shape
 from dew.algebra.terms import EXPONENTIALS, RESCALE, Region, Term, integer, key, text
+from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost as kernel_cost
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.product import eight, half
-from dew.nn.precision import asks_default_precision, precision_names
+from dew.nn.precision import asks_default_precision
 
 
 def target(named: str | None = None) -> generation.GpuTarget:
@@ -81,7 +81,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         leaf = key(Term.leaf(args[0]))
         extent = region.extents.get(leaf)
         return Work() if extent is None else Work(
-            device_bytes=math.prod(extent) * np.dtype(region.dtypes[leaf]).itemsize)
+            device_bytes=math.prod(extent) * region.dtypes[leaf].itemsize)
     if (args := get_callable_args(node, Term.reduce)) is not None:
         return Work(operations=made(graph, args[:1], held), kernels=1.0)
     if (args := get_callable_args(node, Term.dot)) is not None:
@@ -100,7 +100,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         read = sum(math.prod(extent) * np.dtype(dtype).itemsize
                    for extent, dtype in zip((left, right), operands, strict=True))
         flops = 2.0 * math.prod(left[axis] for axis in batch) * free * length
-        mode, passes = _mode(params.get("precision"), set(operands))
+        mode, passes = _mode(params.get("precision"), *operands)
         return Work(shared_bytes=read, kernels=1.0, **{_MODES[mode]: flops * passes})
     if (args := get_callable_args(node, Term.convert)) is not None:
         return Work(conversions=made(graph, args[:1], held))
@@ -124,34 +124,22 @@ _MODES = {"16bit": "flops", "tf32": "tf32_flops", "8bit": "fp8_flops", "fp32": "
 """The `Work` field a product's mode's FLOPs are told in (`generation.Architecture`'s modes; IEEE fp32 is
 the CUDA cores')."""
 
-_ALGORITHM = re.compile(r"(BF16|F16|TF32)_\1_F32(?:_X(\d))?")
-"""A dot algorithm preset of a tensor-core mode, its passes (`BF16_BF16_F32_X3`: three 16-bit products)."""
-
-
-def _mode(precision, dtypes: set) -> tuple[str, int]:
-    """The mode a product of operands of `dtypes` at `precision` multiplies in, and its passes: its dot
-    algorithm's where it names one of the tensor cores' (its passes, an X3's three), by its preset's name
-    or, a `jax.lax.DotAlgorithm` (which JAX names no preset), by its fields (16-bit precision types, its
-    primitive operations), as JAX lowers both to one algorithm; 16-bit operands' 16-bit mode, FP8 operands'
-    8-bit mode (`product.eight`), fp32 operands' TF32 at the default precision (the product declaration's,
-    `product.declared`) and IEEE fp32 above it; any other operand's on the CUDA cores."""
-    # A dot algorithm is a named tuple itself: one, not a pair of precisions.
-    written = precision if isinstance(precision, tuple) and not isinstance(
-        precision, jax.lax.DotAlgorithm) else (precision,)
-    for algorithm in written:
-        if isinstance(algorithm, jax.lax.DotAlgorithm):
-            narrow = {jnp.dtype(algorithm.lhs_precision_type), jnp.dtype(algorithm.rhs_precision_type)}
-            if all(half(dtype) for dtype in narrow):
-                return "16bit", algorithm.num_primitive_operations
-            if all(eight(dtype) for dtype in narrow):
-                return "8bit", algorithm.num_primitive_operations
-            return "fp32", algorithm.num_primitive_operations
-    for name in precision_names(precision):
-        if (found := _ALGORITHM.fullmatch(name)) is not None:
-            return ("tf32" if found.group(1) == "TF32" else "16bit"), int(found.group(2) or 1)
-    if dtypes and all(half(dtype) for dtype in dtypes):
+def _mode(precision, lhs_dtype, rhs_dtype) -> tuple[str, int]:
+    """The mode a product of operands of those dtypes at `precision` multiplies in, and its passes: where
+    `precision` names a dot algorithm, that algorithm's as JAX lowers it (`programs.dot_arithmetic`: TF32's,
+    a 16-bit or an 8-bit precision's whatever the operands' storage, each over its primitive operations, an
+    X3's three; any other on the CUDA cores); else the operands': 16-bit operands' 16-bit mode, FP8
+    operands' 8-bit mode (`product.eight`), fp32 operands' TF32 at the default precision (the product
+    declaration's, `product.declared`) and IEEE fp32 above it; any other operand's on the CUDA cores."""
+    arithmetic = programs.dot_arithmetic(precision, lhs_dtype, rhs_dtype)
+    if arithmetic is not None:
+        bits = set(arithmetic.operand_bits)
+        mode = "tf32" if arithmetic.tf32 else "16bit" if bits == {16} else "8bit" if bits == {8} else "fp32"
+        return mode, arithmetic.operations
+    dtypes = {jnp.dtype(lhs_dtype), jnp.dtype(rhs_dtype)}
+    if all(half(dtype) for dtype in dtypes):
         return "16bit", 1
-    if dtypes and all(eight(dtype) for dtype in dtypes):
+    if all(eight(dtype) for dtype in dtypes):
         return "8bit", 1
     if dtypes == {jnp.dtype(jnp.float32)} and asks_default_precision(precision, configured=True):
         return "tf32", 1
@@ -163,7 +151,7 @@ def product_work(rows: int, depth: int, columns: int, *, count: int = 1, dtype=j
     """`count` products of `[rows, depth] @ [depth, columns]` operands of `dtype` at `precision` (the default
     where unstated), in their mode (`_mode`), each a kernel of XLA's fusion, its root (`work`'s products): a
     chunk form's products (`dew.algebra.linear_scan`, at the precision they run at), Dew's fp32 products."""
-    mode, passes = _mode(precision, {jnp.dtype(dtype)})
+    mode, passes = _mode(precision, dtype, dtype)
     return Work(kernels=float(count), **{_MODES[mode]: 2.0 * rows * depth * columns * count * passes})
 
 

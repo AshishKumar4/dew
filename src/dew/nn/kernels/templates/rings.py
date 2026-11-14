@@ -101,25 +101,13 @@ def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
             ring.load(ring.turn(counter + step), ring.viewed(views[name], step))
 
 
-def streamed(rings: tuple, views, lo, hi, *, adds: tuple | None = None) -> None:
+def streamed(rings: tuple, views, lo, hi) -> None:
     """A producer's loads of steps `lo` to `hi` into `rings`, each ring's step counted from `lo` and loaded
-    from its view of `views(step)`, then each ring drained; with `adds` (an `Outbox` and `targets(step)`, its
-    views of a step's sum), each step's sum added, a ring's depth behind its loads: a step's sum is staged
-    after its slots are released, so the producer waits for it no sooner than for the next load's slot."""
-    lag = min(ring.stages for ring in rings) if adds is not None else 0
-    if adds is not None:
-        adds[0].opened()
-
-    @pl.loop(lo, hi + lag)
+    from its view of `views(step)`, then each ring drained."""
+    @pl.loop(lo, hi)
     def _(index):
-        @pl.when(index < hi)
-        def _():
-            for ring, view in zip(rings, views(index), strict=True):
-                ring.load(ring.turn(index - lo), view)
-
-        if adds is not None:
-            box, targets = adds
-            pl.when(index - lag >= lo)(lambda: box.take(targets(index - lag)))
+        for ring, view in zip(rings, views(index), strict=True):
+            ring.load(ring.turn(index - lo), view)
 
     drain(rings, hi - lo)
 
