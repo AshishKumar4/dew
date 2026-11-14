@@ -11,7 +11,8 @@ from collections.abc import Sequence
 import jax
 from etils import epath
 
-from dew.checkpoints import frozen_entries, is_uri, step_artifact
+from dew._files import is_uri
+from dew.checkpoints import frozen_entries, step_artifact
 from dew.interop.saved_sources import step_records
 from dew.training.tracker import WandbTracker
 
