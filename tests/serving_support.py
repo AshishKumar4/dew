@@ -5,16 +5,18 @@ import functools
 import itertools
 from collections.abc import Callable, Mapping, Sequence
 
+import cache_roundings
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from reference_error import as_given, assert_as_exact, widened
+from reference_error import Followed, Rounded, as_given, assert_as_exact, widened
 
 from dew.batch import Variables
 from dew.inference.serving import Server
 from dew.inference.tasks import TextGeneration
 from dew.nn.inputs import ModelInputs
+from dew.nn.kv_cache import KVCache
 from dew.nn.visibility import with_served_blocks
 from dew.sampling import Sampling
 
@@ -297,3 +299,114 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
     # The lone task held to the same full forward: served and alone each on par with it, so with each other.
     lone = as_given(lambda row, drawn, scored: scored)
     assert_as_exact(lone, reference, drawn_alone, f"{label} alone", seeds=seeds[1], truth_fn=truth)
+
+
+def assert_served_through_its_cache_as_exact(task: TextGeneration, lengths: Sequence[int], label: str, *,
+                                             serving: dict, budget: int, seeds: int) -> None:
+    """Check 1 of a server over a quantized cache (`serving`'s `kv_cache`, `KVCache.quantized`; ledger 5681):
+    requests of the prompt `lengths` of a drawn row (`served_row`), served one a round, score their own draws'
+    raw log probabilities on par with the decoder's own cached decode of each prompt and its draws through
+    a cache of the same format. Each arm gives the values its cache rounded and the codes and scales it
+    stored (`cache_roundings`), and is held to the float64 forward over the request's tokens that reads the
+    codes and scales its own cache held (`Followed`): a float32 rounding a value within its noise of a
+    code's boundary decides it either way, so no truth that rounds for itself holds every arm
+    (docs/design/testing.md, a quantized computation's truth). A request starts its row's slots afresh in
+    a round of its own, so the roundings a round reports are its own (`Written.started`). `seeds` is the
+    site's declared count, sized paired by `seeds_for` on armada."""
+    quantized = serving["kv_cache"].quantized
+    decoder, variables, vocab = task.model, task.variables, task.model.vocab_size
+    width = max(lengths)
+
+    def named(prefix: str, held: dict) -> dict:
+        """A request's roundings by name as the site names them: its values under `rounded/<request>`, its
+        decisions under `<request>`."""
+        return {f"{prefix}/{name}": value for name, value in held.items()}
+
+    # One server for every draw, its programs traced once under the capture, each request in its own round.
+    with cache_roundings.traced():
+        server = Server.from_task(task, **serving)
+    services: dict[bytes, tuple[Rounded, tuple[np.ndarray, ...]]] = {}
+
+    def serve(row: np.ndarray) -> tuple[Rounded, tuple[np.ndarray, ...]]:
+        """The server's scores of `row`'s requests' draws with its cache's roundings, and the draws: each row
+        served once, as a deployment serves a prompt (`assert_served_as_exact`'s `serve`)."""
+        if (key := row.tobytes()) not in services:
+            scores, drawn, rounded, decisions = [], [], {}, {}
+            for index, length in enumerate(lengths):
+                with cache_roundings.traced(), cache_roundings.collected() as written:
+                    ticket = server.submit(served_inputs(row, Served(length), vocab), budget, key=index)
+                    server.run()
+                    generation, = to_budgets([ticket.result().host()], budget, label)
+                drawn.append(np.asarray(generation.tokens)[0, -budget:])
+                scores.append(np.asarray(generation.raw_log_probs[0], np.float32))
+                values, decided = written.held(written.started(), length + budget - 1)
+                rounded.update(named(f"rounded/{index}", values))
+                decisions.update(named(str(index), decided))
+            services[key] = Rounded({"scores": tuple(scores), **rounded}, decisions), tuple(drawn)
+        return services[key]
+
+    def draw(seed):
+        row = served_row(seed, vocab, width)
+        return row, serve(row)[1]
+
+    @as_given
+    def served(row, drawn):
+        del drawn
+        return serve(row)[0]
+
+    cached = decoder.with_kv_cache(KVCache(quantized=quantized))
+    opened = jax.jit(lambda weights: cached.apply(weights, 1, method="init_cache",
+                                                  mutable=["cache"])[1]["cache"])
+
+    @jax.jit
+    def stepped(weights, cache, tokens):
+        with cache_roundings.traced():
+            logits, held = cached.apply({**weights, "cache": cache}, tokens, mutable=["cache"], decode=True)
+        return jax.nn.log_softmax(logits[0, -1]), held["cache"]
+
+    @as_given
+    def reference(row, drawn):
+        """The decoder's own cached decode of each prompt and the tokens the server drew after it, a call a
+        token, and its cache's roundings."""
+        scores, rounded, decisions = [], {}, {}
+        for index, (length, tokens) in enumerate(zip(lengths, drawn, strict=True)):
+            with cache_roundings.collected() as written:
+                prompt = served_inputs(row, Served(length), vocab).tokens
+                read, cache = stepped(variables, opened(variables), prompt)
+                laws = [read]
+                for token in tokens[:-1]:
+                    read, cache = stepped(variables, cache, jnp.asarray([[token]], jnp.int32))
+                    laws.append(read)
+            scores.append(np.asarray(jnp.stack(laws))[np.arange(budget), tokens])
+            values, decided = written.held(0, length + budget - 1)
+            rounded.update(named(f"rounded/{index}", values))
+            decisions.update(named(str(index), decided))
+        return Rounded({"scores": tuple(scores), **rounded}, decisions)
+
+    wide = decoder.clone(dtype=jnp.float64, attention_impl="reference").with_kv_cache(
+        KVCache(quantized=quantized))
+
+    @jax.jit
+    def forward(weights, tokens, decided):
+        with cache_roundings.traced(decided):
+            cache = wide.apply(weights, 1, method="init_cache", mutable=["cache"])[1]["cache"]
+            logits, _ = wide.apply({**weights, "cache": cache}, tokens, mutable=["cache"], decode=True)
+        return jax.nn.log_softmax(logits[0])
+
+    @as_given
+    def truth(decisions, row, drawn):
+        """Each request's tokens through the float64 twin in one call, its cache reading the codes and scales
+        an arm's cache held (`decisions`), and the values its own roundings would have rounded."""
+        weights, scores, rounded = widened(variables), [], {}
+        for index, (length, tokens) in enumerate(zip(lengths, drawn, strict=True)):
+            whole = np.concatenate([row[:length], tokens[:-1]])[None]
+            own = {name.split("/", 1)[1]: held for name, held in decisions.items()
+                   if name.split("/", 1)[0] == str(index)}
+            with cache_roundings.collected() as written:
+                laws = forward(weights, jnp.asarray(whole, jnp.int32), own)
+            scores.append(np.asarray(laws[length - 1:])[np.arange(budget), tokens])
+            rounded.update(named(f"rounded/{index}", written.held(0, whole.shape[1])[0]))
+        return {"scores": tuple(scores), **rounded}
+
+    followed = Followed(truth, cache_roundings.rounds(quantized))
+    assert_as_exact(served, reference, draw, label, seeds=seeds, followed=followed)

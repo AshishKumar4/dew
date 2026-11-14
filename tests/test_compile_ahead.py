@@ -480,6 +480,43 @@ def test_a_run_resumed_mid_window_compiles_its_step_ahead_building_no_window_of_
     assert ahead.starts
 
 
+def test_a_fresh_runs_start_compiles_once_beside_its_steps_planning():
+    """A fresh run's start (`start_compiling`) compiles in a thread of its own while its step is planned,
+    and the start compiled ahead with the step is that compile: its program compiled once, its executable
+    among the run's starts, where it compiled after the step, in turn (a Qwen3.5-4B's 97 s after its
+    step's 110 s for an H100)."""
+    from dew.training.ahead import compile_ahead
+
+    trainer = fine_tune(MeshSpec().build(gpus("sm90")))
+    with Compiles("joined") as compiles:
+        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
+    assert compiles.count == 1 and ahead.starts
+
+
+def test_a_resume_compiled_ahead_steps_at_the_split_its_checkpoint_was_saved_at(tmp_path):
+    """A run saved at an update's end after updates of two microbatches, its window empty and so not kept
+    (`dew.state.without_empty_window`), resumes at that split, which a run stating none takes from its
+    state (`dew.training.compiler.resumed_stepping`): its step compiled ahead plans split 2, the program
+    the resume compiles, where it planned a split of its own (docs/design/training.md: a resumed run's at
+    its checkpoint's rung)."""
+    from dew.checkpoints import Checkpoints
+    from dew.training.ahead import compile_ahead
+
+    def run(**options):
+        model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
+        return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
+                       layout=Layout(min_shard=TINY_SHARD), checkpoints=Checkpoints(str(tmp_path / "run")),
+                       **options)
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    saved = run(split=2, mesh=MeshSpec().build(jax.devices()[:1]))
+    saved.fit(batch, steps=1, checkpoint_every=1)
+    saved.checkpoints.wait()
+    assert saved.checkpoints.window_size(1) == 2 and saved.checkpoints.accumulation_template(1) is None
+    ahead = compile_ahead(run(mesh=MeshSpec().build(gpus("sm90"))), batch)
+    assert record(ahead.plan, "plan")["split"] == 2
+
+
 def test_a_bfloat16_decoders_step_compiles_ahead_for_an_a100():
     """A bfloat16 decoder's training step compiles ahead for an A100 (`compile_only_gpus("sm80")`): its
     compile point keys each body's recognition by its equations' parameters, the custom VJP's rules its

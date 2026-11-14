@@ -438,6 +438,7 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
 
     from dew.data.dataset import Loader
     from dew.distributed.placement import placed_bytes
+    from dew.telemetry.compiles import Compiles
     from dew.training import Layout, MeshSpec, Trainer
 
     free, limit = 2 ** 39, 2 ** 40
@@ -462,15 +463,89 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
 
     state = held(copies=False)
     assert copies > 0 and held(copies=True) == state
-    # Devices whose allocator holds the state and half its copies, its step's free bytes between its needs.
+    run, _ = built()
+    # Devices whose allocator holds the state and half its copies, its step's free bytes between its needs
+    # beside the state: the plan made before the state is placed (`Trainer._planned_unplaced`), which reads
+    # those bytes as holding the state too, holds none, and the step is planned once the state is placed.
     free, limit = (with_copies + without) // 2, state + copies // 2
     assert limit > free, (limit, free)
-    run, _ = built()
     stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
     with chosen(narrow_copies='on'):
         run.fit(stream, steps=2)
     probes = run.plan["probes"]
     assert [(probe["narrow"], probe["fits"]) for probe in probes] == [(True, False), (False, True)]
+    # A pool grown to the state's size, half of it one free block, whose limit holds the state and the step
+    # with its copies in all, the step in what the pool can still take: a fresh GH200 4B run's (M-MC-3m).
+    # The step is planned before the state is placed on the pool's bytes in all, not on its largest block,
+    # which placing the state reshapes, and judged on the allocator once the state is on it: compiled once,
+    # beside the start, not again once the state is placed.
+    grown = {"bytes_limit": state + with_copies + state // 2, "bytes_in_use": 0, "pool_bytes": state,
+             "largest_free_block_bytes": state // 2}
+    monkeypatch.setattr(jax.Device, "memory_stats", lambda device: grown)
+    run, _ = built()
+    with chosen(narrow_copies='on'), Compiles("step") as steps:
+        run.fit(stream, steps=2)
+    assert [(probe["narrow"], probe["fits"]) for probe in run.plan["probes"]] == [(True, True)]
+    assert steps.count == 1
+
+
+def test_a_fresh_plan_its_placed_devices_refuse_records_no_rung(monkeypatch, tmp_path):
+    """A fresh run's first step planned before its state is placed records its rung (`keep_rung`) only once
+    the devices hold it with the state placed: a pool whose limit holds the step in all and that can give
+    it no block once the state is placed refuses the run, and leaves no record a later fresh run would start
+    its plan from, untraced."""
+    from token_support import repeated_token_batch
+
+    from dew.data.dataset import Loader
+    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training.planning import PlanRefused
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    held = {"bytes_limit": 2 ** 40, "bytes_in_use": 0, "pool_bytes": 2 ** 40, "largest_free_block_bytes": 0}
+    monkeypatch.setattr(jax.Device, "memory_stats", lambda device: held)
+    objective, _ = _decoder(remat="full")
+    run = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
+                  mesh=MeshSpec().build(jax.devices()[:1]), layout=Layout(min_shard=1, tolerance=1.0))
+    stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
+    with chosen(narrow_copies='off'), pytest.raises(PlanRefused):
+        run.fit(stream, steps=2)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits_it_in_two(monkeypatch):
+    """A fresh run's first step is planned before its state is placed, on the devices' free bytes in all,
+    and judged on their allocators once the state is on them (`StepCompiler.compile`). A pool whose limit
+    holds the state and the step whole, and whose largest block holds the step in two microbatches and not
+    in one, takes the unplaced plan's one microbatch, refuses it once the state is placed, and plans afresh
+    at the planner's own split, not the held plan's: two microbatches, where a run on the GH200 that
+    re-planned at the held plan's split was refused (M-MC-3n)."""
+    from token_support import repeated_token_batch
+
+    from dew.data.dataset import Loader
+    from dew.training import Layout, MeshSpec, Trainer
+
+    free, limit = 2 ** 39, 2 ** 40
+    monkeypatch.setattr(jax.Device, "memory_stats",
+                        lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
+    # One device, whose batch of 8 rows splits in two.
+    device = MeshSpec().build(jax.devices()[:1])
+    one, two = (free - _trained(optax.adam(1e-3), copies=False, steps=1, split=split, remat="full",
+                                mesh=device)[2].plan["probes"][0]["headroom"] for split in (1, 2))
+    assert two < one, (one, two)
+    objective, batch = _decoder(remat="full")
+    run = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=device,
+                  layout=Layout(min_shard=1, tolerance=1.0))
+    with chosen(narrow_copies='off'):
+        state = max(run.validate(batch).device_bytes.values())
+    room = (one + two) // 2
+    total = 2 * (state + one)
+    grown = {"bytes_limit": total, "bytes_in_use": 0, "pool_bytes": total - room,
+             "largest_free_block_bytes": room // 2}
+    monkeypatch.setattr(jax.Device, "memory_stats", lambda device: grown)
+    stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
+    with chosen(narrow_copies='off'):
+        run.fit(stream, steps=2)
+    assert run.plan["probes"][-1]["split"] == 2
 
 
 def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_dropped(monkeypatch):

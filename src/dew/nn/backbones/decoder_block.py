@@ -319,6 +319,12 @@ class Mixture:
                     "counts otherwise")
         return None
 
+    def dispatch_over(self, shards: int) -> str:
+        """The dispatch its layers run over `shards` expert shards (`moe.resolved_dispatch`): `'auto'` the
+        exchange where the shards divide the experts, the global dispatch anywhere else, either other as
+        named."""
+        return resolved_dispatch(self.dispatch, self.experts, shards)
+
     def generation_refusal(self) -> str | None:
         """Why a generation loop cannot run the layers this mixture builds, or None.
 
@@ -334,8 +340,7 @@ class Mixture:
                     "decode step, holding one token of its block, cannot: the step's routing would differ "
                     "from the full forward's. Generate by refining whole sequences (dew.diffusion.discrete) "
                     "or route without blocks")
-        shards = jax.sharding.get_abstract_mesh().shape.get(EXPERT_AXIS, 1)
-        if resolved_dispatch(self.dispatch, self.experts, shards) != 'exchange':
+        if self.dispatch_over(jax.sharding.get_abstract_mesh().shape.get(EXPERT_AXIS, 1)) != 'exchange':
             return None
         return ("generation cannot run dispatch='exchange' until jax fixes jax-ml/jax#40907: checkify, "
                 "which carries each draw's device checks into the next step's model call, fails on a "

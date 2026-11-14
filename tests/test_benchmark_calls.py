@@ -330,7 +330,9 @@ def test_a_timing_refuses_a_conditional_its_process_may_graph(monkeypatch):
     """A jitted call holding a conditional is refused a device time (`Ungraphed`) in a process whose XLA may
     run it as a command buffer's conditional node, whose taken branch's kernels CUPTI does not record (a B32
     decode on an RTX PRO 6000 read its reduces alone, G4-LF-2), and read in one that keeps conditionals out
-    of command buffers (`UNGRAPHED`), as a call without one is in either."""
+    of command buffers (`UNGRAPHED`), as a call without one is in either. Its branches are products, which
+    XLA:GPU keeps as a conditional; branches as cheap as an elementwise sin or cos it compiles to a select of
+    both, a program with no conditional, which is read (row 5908: a GH200's compile of `cond(sin, cos)`)."""
     from dew.telemetry.benchmark import UNGRAPHED, DeviceTime, Ungraphed
 
     class Read(Exception):
@@ -340,9 +342,9 @@ def test_a_timing_refuses_a_conditional_its_process_may_graph(monkeypatch):
         def measure(self, fn, aggregate):
             raise Read
 
-    branched = jax.jit(lambda x: jax.lax.cond(jnp.max(x) > 0, jnp.sin, jnp.cos, x))
+    branched = jax.jit(lambda x: jax.lax.cond(jnp.max(x) > 0, lambda a: a @ a, lambda a: a @ a.T, x))
     plain = jax.jit(jnp.sin)
-    x = jnp.ones(8)
+    x = jnp.ones((256, 256))
     session = DeviceTime(Cupti())
     monkeypatch.delenv("XLA_FLAGS", raising=False)
     with pytest.raises(Ungraphed):

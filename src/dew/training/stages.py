@@ -56,13 +56,12 @@ import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew.algebra.terms import parameter_key, parameters_key
-from dew.batch import unboxed
 from dew.mesh import STAGE_AXIS, LayoutRefused
 from dew.nn import programs
 from dew.nn.kernels.options import owned_program, program
 from dew.nn.kernels.templates.layout import entrywise
 from dew.nn.programs import branches, cumulative, reduction, scan_body
-from dew.nn.sharding import abstract, held_by_stage
+from dew.nn.sharding import held_by_stage
 
 if TYPE_CHECKING:
     from dew.checkpoints import Checkpoints
@@ -159,8 +158,8 @@ class StageLocal:
         stages = mesh.shape.get(STAGE_AXIS, 1)
         if not local:
             return cls((), mesh)
-        # The draw's shapes, its tree plain as a run holds it (`dew.batch.unboxed`).
-        shapes = unboxed(abstract(objective.initializer, jax.random.key(0)))
+        # The draw's shapes, its tree plain as a run holds it (`Objective.drawn_shapes`).
+        shapes = objective.drawn_shapes()
         declared = objective.stage_sites(shapes, stages)
         if not declared:
             if stages > 1:
@@ -312,13 +311,18 @@ class StageLocal:
             return placement_of(state)
         return self.state(placement_of(self.state(state, self.row_shapes)), self.placement)
 
+    def stacked_shapes(self, state: TrainState) -> TrainState:
+        """The shapes of `state`, a state given whole, as the step holds it, its runs stacked by stage
+        (`supplied`): what a run checks against its first batch before it places the state."""
+        return jax.eval_shape(functools.partial(self.state, convert=self.staged), state)
+
     def supplied(self, state: TrainState, validated: Callable[[TrainState], TrainState]
                  ) -> tuple[TrainState, TrainState]:
         """A state given whole, wherever its arrays are (one device's, another mesh's), its runs stacked by
         stage onto the placement `validated` gives the stacked state's shapes, and that placement: placed
         whole on this mesh first, as `validated` places it, and stacked there."""
         stack = functools.partial(self.state, convert=self.staged)
-        placement = validated(jax.eval_shape(stack, state))
+        placement = validated(self.stacked_shapes(state))
         if not self.sites:
             return jax.device_put(state, placement), placement
         whole = jax.device_put(state, validated(jax.eval_shape(lambda given: given, state)))

@@ -3,6 +3,7 @@ derivation walks the ladder from the base rung before anything compiles, and the
 climbs on as a correction. A run that starts from a plan, recorded or resumed, tries that plan first."""
 
 import cProfile
+import json
 import logging
 import pstats
 
@@ -529,6 +530,26 @@ def test_a_run_that_sets_its_remat_derives_its_own_rung_alone_and_compiles_there
             compiled(trainer)
         assert compiles.count == 1 and trainer.plan["remat"] == remat
         assert trainer.plan["derived"] and {entry["remat"] for entry in trainer.plan["derived"]} == {remat}
+
+
+def test_a_run_that_sets_its_remat_keeps_it_through_a_compile_that_misses(monkeypatch, tmp_path):
+    """A run that sets its remat keeps it where its compile misses (docs/design/training.md: every choice
+    the plan makes can be overridden): with room for the step under full recomputation and an eighth of
+    what 'minimal' needs past it, the run that sets 'minimal' is refused, every compile at 'minimal' (its
+    head's rungs among them), where a miss climbed it to recompute more than it asked."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    stated, recomputed = deep(REMAT_POLICIES["minimal"]), deep(REMAT_POLICIES["full"])
+    own = needs(monkeypatch, stated, lambda: compiled(stated))
+    full = needs(monkeypatch, recomputed, lambda: compiled(recomputed))
+    assert full < own, (full, own)
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, full + (own - full) // 8)
+    trainer = deep(REMAT_POLICIES["minimal"])
+    with pytest.raises(PlanRefused) as refused:
+        compiled(trainer)
+    assert refused.value.probes
+    assert {json.dumps(probe.rung["remat"]) for probe in refused.value.probes} == {
+        json.dumps(stated.plan["remat"])}
 
 
 @pytest.mark.mesh(devices=2)

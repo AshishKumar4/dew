@@ -64,14 +64,14 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Algebra
 
-- One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 1551, 705, 5234, 5235, 5239]
+- One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235, 5239]
 - Qwix's quantized convolution from its fork alone. [783]
 - Released checkpoints judged on GPUs. [1703, 1549]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Bit-level synthesis in dew.algebra. [3733]
-- RL batch-fill and microbatch-split invariants, rollout start/evaluation compilation and RL suite cost cuts. [5681]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
+- No check 1 cell serves a prompt that reads an earlier request's quantized prefix pages. [6007]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 
 ## Tutorials and docs
