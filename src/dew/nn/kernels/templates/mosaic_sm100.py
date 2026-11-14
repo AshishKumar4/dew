@@ -978,8 +978,11 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
     and tcgen05's products, so interpreted it runs the same."""
 
     name = "tcgen05.chunks"
-    # Mosaic GPU's tcgen05 lowering takes no TF32 operand ("Unsupported input element type: tf32",
-    # jsf-gate100b): an fp32 product takes bf16 parts.
+    # fp32 operands read as .kind::tf32, K-major or transposed (the fork's tcgen05-tf32, jax 0.12.0.1.post90);
+    # before it an fp32 product took two bf16 parts, 11% of a B200's Kimi Linear intra walk and twice its
+    # products' commits (an emulated B200's line map at 37ef70629d7).
+    takes_tf32 = True
+    transposes_tf32 = True
     fp8_formats = (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.float8_e5m2))
     takes_register_left = False
     # A B200's training forward on three consumers at 64 x 64, width 64, priced 158 of 160 registers with
