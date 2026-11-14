@@ -196,8 +196,8 @@ def _rows_of(ref, keys: int) -> jax.Array:
 
 
 def _intra_summed(call: Call, found: jax.Array, at, *, first) -> None:
-    """A key block's masked pairs `found` of an output (`algebra.pairs_masked`) added to its sum in shared
-    memory `at` (written at the first block), before the next output's are formed (a merged walk's)."""
+    """A key block's pairs `found` of an output added to its sum in shared memory `at` (written at the first
+    block), before the next output's are formed (a merged walk's)."""
     mosaic.synced(call.interpret)
 
     # The first block's written, the rest added, in branches: a scalar condition laid over a tile
@@ -284,13 +284,18 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                                             lambda up: operands.staged(family, up.astype(jnp.float32),
                                                                        keyed),
                                             _placed(call, placing), chunk=chunk, right=_pairs_right(call))
-            masked = []
+            # A key block's pairs are zero on and above the sub-chunks' diagonal blocks as formed
+            # (`algebra.key_block_pairs`: rows of a sub-chunk against an earlier one's keys alone), so they
+            # are summed as they come, the scores scaled each block (unscaled, two blocks' sums near fp32's
+            # largest overflow) and the system masked once at the last step (a row whose write gate
+            # overflows times a zero factor is a NaN there, which its strict mask clears).
+            formed = []
             for name, found in zip(products, pairs, strict=True):
-                masked.append(algebra.pairs_masked(found, strict=name == "system", scale=scale))
+                formed.append(found * scale if name == "scores" else found)
                 if summed_at is not None:
-                    _intra_summed(call, masked[-1], summed_at.at[len(masked) - 1], first=index == 0)
+                    _intra_summed(call, formed[-1], summed_at.at[len(formed) - 1], first=index == 0)
             if summed_at is None:
-                totals = (totals[0] + masked[0],)
+                totals = (totals[0] + formed[0],)
 
             @pl.when(index == steps - 1)
             def _():
@@ -298,7 +303,9 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
                     mosaic.synced(call.interpret)
                 found = (totals if summed_at is None
                          else tuple(family.tile_of(summed_at.at[o]) for o in range(outputs)))
-                intra_sums_stored(call, products, found, sums, landing, row=row, head=h, summed=summed_at)
+                masked = tuple(algebra.strictly_lower(total) if name == "system" else total
+                               for name, total in zip(products, found, strict=True))
+                intra_sums_stored(call, products, masked, sums, landing, row=row, head=h, summed=summed_at)
 
             return totals, accumulators
 

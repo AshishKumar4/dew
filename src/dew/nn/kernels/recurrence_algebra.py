@@ -785,17 +785,15 @@ def write_gated(tile: jax.Array, strengths: jax.Array) -> jax.Array:
     return tile * strengths[:, None]
 
 
-def pairs_masked(found: jax.Array, *, strict: bool, scale: float) -> jax.Array:
-    """An output's pairs `found` `[C, C]` (a key block's factored pairs) as its sum takes them: below the
-    diagonal where `strict` (the system), else on and below it and scaled (the scores); the sub-chunks' own
-    pairs' bands alike, in their form (`band_masked`)."""
-    lag = _lags(found.shape)
-    return jnp.where(lag > 0, found, 0.0) if strict else jnp.where(lag >= 0, found, 0.0) * scale
+def strictly_lower(found: jax.Array) -> jax.Array:
+    """A system's pairs `found` `[C, C]` below their diagonal, zero on and above it (`key_block_pairs`' are
+    zero there as formed, but for a row whose write gate overflows, a NaN where it meets a zero factor)."""
+    return jnp.where(_lags(found.shape) > 0, found, 0.0)
 
 
 def band_masked(band: jax.Array, *, strict: bool, scale: float) -> jax.Array:
-    """A band of own pairs as its output's sum takes it (`pairs_masked`'s rule in the band's form): its
-    column 0, a token's pair with itself, dropped where `strict` (the system), else kept and `scale`d."""
+    """A band of own pairs as its output's sum takes it: its column 0, a token's pair with itself, dropped
+    where `strict` (the system, strictly lower), else kept and `scale`d (the scores)."""
     lane = jax.lax.broadcasted_iota(jnp.int32, band.shape, 1)
     return jnp.where(lane > 0, band, 0.0) if strict else band * scale
 
