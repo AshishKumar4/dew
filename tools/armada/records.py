@@ -68,6 +68,14 @@ def green_key(python: str, row_name: str, held: str, key: str) -> str:
     return f"{CACHE_PREFIX}-green/{python}/{row_place(row_name, held)}/{key}"
 
 
+def main_key(commit: str, python: str, row_name: str, held: str) -> str:
+    """Where commit `commit`'s own run of row `row_name` on class `held` names its green run (its key, which
+    `green_key` keeps it by): written by every task that ran the row green or reused it at `commit`, so main's
+    commit, a train's tip that published, names each of its rows whatever later runs of other trees re-record
+    them (a lane's, on its branch: Main, 2026-11-14)."""
+    return f"{CACHE_PREFIX}-main/{commit}/{python}/{row_place(row_name, held)}"
+
+
 def epoch_key(python: str, row_name: str, held: str, common: str) -> str:
     """Where row `row_name`'s epoch on class `held` on shared inputs `common` is named (`epoch`)."""
     return f"{CACHE_PREFIX}-epochs/{python}/{common[:16]}/{row_place(row_name, held)}"

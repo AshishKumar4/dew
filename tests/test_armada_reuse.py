@@ -514,18 +514,22 @@ def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 2]
 
 
-def test_a_row_another_tree_ran_last_executing_another_set_runs_again_on_its_own_tree(
+def test_mains_own_run_of_a_row_is_found_behind_a_lanes_later_run_on_its_branch(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A row run green on a tree, then on another tree whose run executed another set of inputs (a helper its
-    test called there), runs again when the first tree is planned again: a lookup keys these inputs with the
-    last run's set alone, and the walk over a row's earlier sets that found the first tree's behind it is gone
-    (Main, 2026-11-14: it kept at most 93 rows of about 33,000 in ten trains and read about 39,000 records a
-    plan). Its other rows, which no other run re-recorded, are reused."""
+    """A row main's commit ran green, then a lane's branch ran executing another set of inputs (a helper its
+    test called there), which re-records the row: a tree on main again finds main's own run of it, named at
+    main's commit (`main_key`), and runs nothing (Main, 2026-11-14: a lane's later run hid main's record, and
+    a walk over each row's earlier sets dug it out at about seven reads a row). Off main, with no such name,
+    the row runs again."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    commit = {"head": "a" * 40}
+    monkeypatch.setattr(ci, "head_commit", lambda: commit["head"])
+    monkeypatch.setattr(ci, "mainline", lambda: "a" * 40)
     armada_task(ci, monkeypatch, verdict)
     test_a = tmp_path / "tests/test_a.py"
     main = test_a.read_text()
-    # Another tree: test_a calls a helper of its own, so its run executes a set this tree's never did.
+    # The lane's branch: test_a calls a helper of its own, so its run executes a set main's never did.
+    commit["head"] = "b" * 40
     helper = tmp_path / "tests/helper_other.py"
     helper.write_text("def value():\n    return 1\n")
     test_a.write_text("from helper_other import value\n"
@@ -533,11 +537,15 @@ def test_a_row_another_tree_ran_last_executing_another_set_runs_again_on_its_own
     armada_task(ci, monkeypatch, verdict)
     helper.unlink()
     test_a.write_text(main)
-    assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
+    commit["head"] = "c" * 40
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
     rows = armada_task(ci, monkeypatch, verdict)
     assert sorted((row["name"], row["exitCode"]) for row in rows) == [
         (f"3.12:tests/test_{name}.py", 0) for name in "abc"]
-    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [3, 1, 1]
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [2, 1, 1]
+    # A tree off main (no main of its own to read): the lane's record alone, which it does not match.
+    monkeypatch.setattr(ci, "mainline", lambda: None)
+    assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
 
 
 def test_of_two_trees_the_one_that_ran_a_row_last_reuses_it_and_a_changed_unit_of_its_set_runs_it(
