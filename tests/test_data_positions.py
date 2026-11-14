@@ -42,5 +42,6 @@ def test_a_manifest_holds_the_environment_its_process_runs_and_warns_of_none_of_
     from dew.data.plan import Manifest, environment_changes, running_environment
 
     recorded = Manifest.of({"sources": []}, ()).record()
-    assert {name: recorded[name] for name in running_environment()} == running_environment()
-    assert environment_changes(recorded) == ()
+    held = {name: recorded[name] for name in running_environment()}
+    assert held == running_environment()
+    assert environment_changes(held) == ()
