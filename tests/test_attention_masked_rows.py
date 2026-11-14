@@ -7,10 +7,11 @@ backward recomputes that uniform weight into its query's and its keys'
 gradients. Two ways a row sees no key: an explicit mask with an all-false
 row, and a packed row's padding (segment id 0), which `document_mask` keeps
 from every key. Each implementation is held to the float64 attention of
-tests/attention_oracle.py, which defines such a row as zero: in fp32 on par
-(check 1) with the fp32 reference attention over drawn operands, and in
-bf16 to the tolerance the Splash tests hold bf16 to. A row whose own key is
-cut but whose block runs on reads its block's later keys (`block_groups`).
+tests/attention_oracle.py, which defines such a row as zero: on par (check 1)
+with the reference attention at the drawn dtype, fp32 and the GPU kernels'
+bf16, every entry sized by its float64 terms (`attention_on_par`). A row
+whose own key is cut but whose block runs on reads its block's later keys
+(`block_groups`).
 """
 
 import contextlib
@@ -19,15 +20,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from attention_oracle import (
-    attention_terms,
-    exact_attention,
-    exact_value_and_grads,
-    packed_ids,
-    qkv,
-    value_and_grads,
-)
-from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
+from attention_oracle import attention_on_par, exact_value_and_grads, kept, packed_ids, qkv, value_and_grads
+from reference_error import FEWEST_SEEDS
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.precision import FP32_SUMS
@@ -61,17 +55,6 @@ def dead_rows(structure, dead):
         rows[:, dead] = True
         return rows
     return np.asarray(structure["segment_ids"]) == 0
-
-
-def kept(structure) -> np.ndarray:
-    """`[B or 1, 1, q, k]` the keys each query keeps under `structure` (`attention_terms`' `keep`): its mask,
-    or a packed row's own document's keys up to its own (none for its padding)."""
-    if "mask" in structure:
-        return np.asarray(structure["mask"], bool)
-    ids = np.asarray(structure["segment_ids"])
-    places = np.arange(ids.shape[1])
-    own = (ids[:, :, None] == ids[:, None, :]) & (ids[:, :, None] != 0)
-    return (own & (places[None, None, :] <= places[None, :, None]))[:, None]
 
 
 def run(implementation, case, dtype):
@@ -115,7 +98,7 @@ def _on_par(implementation: str, case: str, structure: dict, dtype, seeds: int) 
         def attend(q, k, v):
             return scaled_dot_product_attention(q, k, v, implementation=implementation, **structure,
                                                 **options)
-        return with_gradients(attend)
+        return attend
 
     def reference(*drawn):
         # The 'tpu' row interprets the TPU kernel on this CPU: its reference sums as the target does (fp32),
@@ -123,18 +106,11 @@ def _on_par(implementation: str, case: str, structure: dict, dtype, seeds: int) 
         with jax.default_matmul_precision(FP32_SUMS) if implementation == "tpu" else contextlib.nullcontext():
             return attended("reference", precision=jax.lax.Precision.HIGHEST)(*drawn)
 
-    exact = with_gradients(lambda q, k, v: exact_attention(q, k, v, anchored=True, **structure))
-    keep = kept(structure)
-
-    def terms(query, key, value, cotangent):
-        # Every arm's rows sized by their float64 terms (`attention_terms`): a document's first query keeps
-        # one key, so its logit gradient P (dP - delta) cancels to zero in float64 and its query gradient
-        # sums zero terms; it is held to delta's rounding against dP, not to its own zero.
-        out, dq, dk, dv = attention_terms(query, key, value, cotangent, keep)
-        return out, dq, dk, dv
-
-    assert_as_exact(attended(implementation, **extra), reference, draw, f"{implementation} {case}",
-                    seeds=seeds, truth_fn=exact, terms=terms)
+    # The truth attention written out over the keys each query keeps, every entry sized by its float64 terms
+    # (`attention_on_par`): a document's first query keeps one key, its query gradient held to delta's
+    # rounding against dP, not to its own zero.
+    attention_on_par(attended(implementation, **extra), reference, draw, f"{implementation} {case}",
+                     keep=kept(256, 256, **structure), seeds=seeds)
 
 
 @pytest.mark.parametrize("implementation, case", GPU, ids=[f"{i}-{c}" for i, c in GPU])
