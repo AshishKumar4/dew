@@ -108,20 +108,31 @@ def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, va
         streams = {**streams, **family.streams(once, 1, consumers, swizzles=swizzles)}
     return scoped, streams, after
 
-def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_of, whole, share, index, slots,
-             rows, accumulators):
+def _dq_step_of(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_of, whole, share, tile,
+                *, placed_coords) -> Callable:
+    """A dQ consumer's step (`_dq_step`), or a compute warpgroup's where its family places the products on a
+    role (`_placed_dq_step`, its tiles' coordinates `placed_coords`), each step's key tile its index but where
+    the walk is indexed (`tile`, `_Program.tile_of`)."""
+    if walk.program.family.places_on_role:
+        return functools.partial(_placed_dq_step, walk, stats, placed_coords, tile)
+    return functools.partial(_dq_step, walk, operands, stats, coords_of, params_of, whole, share, tile)
+
+
+def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_of, whole, share, tile, index,
+             slots, rows, accumulators):
     """A dQ consumer's key tile `index`: its scores and score cotangents from the key and value slots
     (`slots`) and its queries and output cotangents (`operands`) under its rows' statistics (`stats`), the
     tile's coordinates (`coords_of(k_first)`), its hook parameters (`params_of(like, k_first=k_first,
     slots=slots)`, those riding the keys' stream its slots') and
-    whether its block sees it whole (`whole(index)`). The row sums are carried (`rows`); dQ's and the keyed
-    sums' products are issued into `accumulators` in place (`gradient.dq_issued`)."""
+    whether its block sees it whole (`whole(index)`), the step's key tile its index but where the walk is
+    indexed (`tile`, `_Program.tile_of`). The row sums are carried (`rows`); dQ's and the keyed sums'
+    products are issued into `accumulators` in place (`gradient.dq_issued`)."""
     q, do = operands
     peak, prior, anchor, delta, chosen = stats
     family, tiles, empty = walk.program.family, walk.program.tiles, jnp.zeros((), jnp.float32)
     shape = (tiles.block_q, tiles.block_k)
     k_slot = slots["keys"]
-    k_first = index * tiles.block_k
+    k_first = (index if tile is None else tile(index)) * tiles.block_k
     s = family.product(q, k_slot.transpose((1, 0)), shape)
     dp = family.product(do, slots["values"].transpose((1, 0)), shape)
     slots.release("values")
@@ -186,17 +197,18 @@ QUERIES_FIRST = (mosaic.Product("keys", placed.SCORES, "queries", transposed=Tru
 writes over the cotangents' turn (`_placed_dq_step`)."""
 
 
-def _placed_dq_step(walk: _Backward, stats: tuple, coords_of, index, slots, rows, accumulators):
+def _placed_dq_step(walk: _Backward, stats: tuple, coords_of, tile, index, slots, rows, accumulators):
     """The compute warpgroup's key tile `index` of a walk whose family places its products on a role queries
     first (`placed.QUERIES`, `QUERIES_FIRST`): the tile's scores and their cotangents its issuer's
     (`awaited`, a query a thread's row in tensor memory's own layout), `PART` keys at a time under its rows'
-    statistics (`stats`) and coordinates (`coords_of(first key, shape=...)`), the row sums carried (`rows`,
+    statistics (`stats`) and coordinates (`coords_of(first key, shape=...)`), its key tile `tile(index)`
+    where the walk is indexed (`_Program.tile_of`), the row sums carried (`rows`,
     `gradient.dq_issued`) and the scaled score cotangents written narrowed over the part's own columns of the
     cotangents' turn, read already, then given to the issuer for dQ's product (`given`). The plain call's
     alone (`MosaicBackward._walked_legal`)."""
     family, tiles, empty = placed.walked(walk.program.family), walk.program.tiles, jnp.zeros((), jnp.float32)
     peak, prior, anchor, delta, chosen = stats
-    k_first = index * tiles.block_k
+    k_first = (index if tile is None else tile(index)) * tiles.block_k
     scores, cotangents = family.awaited(slots)
     pulled = family.turn_of(placed.COTANGENTS, slots.turn, narrowed=True)
     residual, mass, grads, weighed, keyed_mass, keyed_shift = rows
@@ -300,13 +312,11 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
                 _score_params, family, score_refs, kinds, row, head, first,
                 held=held_params(family, score_refs, kinds, row, head, first, block_q),
                 streamed=riding(family, kinds, "keys"), at=(index * block_q, 0))
-            if family.places_on_role:
-                step = functools.partial(_placed_dq_step, walk, stats, functools.partial(
-                    _coords, family, spans_of, row, first,
-                    draw=None if drop_of is None else drop_of.draw(row, head)))
-            else:
-                step = functools.partial(_dq_step, _relayed(walk, relay, index), operands, stats, coords_of,
-                                         params_of, whole, share)
+            step = _dq_step_of(_relayed(walk, relay, index), operands, stats, coords_of, params_of, whole,
+                               share, program.tile_of(first, spans_of, row),
+                               placed_coords=functools.partial(
+                                   _coords, family, spans_of, row, first,
+                                   draw=None if drop_of is None else drop_of.draw(row, head)))
             start = (nothing, nothing, (nothing,) * len(kinds), (nothing,) * len(kinds), nothing,
                      nothing + gradient.NO_SHIFT)
             # The tiles its partner reads around its own (`Family.walk_own`).

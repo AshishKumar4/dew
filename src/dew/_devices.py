@@ -129,15 +129,30 @@ def xla_flag(name: str) -> str | None:
     return _flag(os.environ.get('XLA_FLAGS', ''), name)
 
 
+def xla_flag_kinds(name: str) -> frozenset[str] | None:
+    """The kinds the list flag `--<name>` names in XLA_FLAGS, each occurrence folded in turn as XLA's parser
+    folds it: a list replaces the one before it, and a list of `+KIND`s and `-KIND`s amends it. None where
+    XLA's defaults hold: no list given, or only amendments of the defaults, which leave some kind on."""
+    kinds: set[str] | None = None
+    for value in _values(os.environ.get('XLA_FLAGS', ''), name):
+        listed = [kind.strip().upper() for kind in value.split(',') if kind.strip()]
+        if not (listed and all(kind[0] in '+-' for kind in listed)):
+            kinds = set(listed)
+        elif kinds is not None:
+            for kind in listed:
+                (kinds.add if kind[0] == '+' else kinds.discard)(kind[1:])
+    return None if kinds is None else frozenset(kinds)
+
+
 def _flag(flags: str, name: str) -> str | None:
-    """The value `--<name>` carries in `flags`, as `xla_flag` reads it."""
-    value = None
-    for token in flags.split():
-        if token == f"--{name}":
-            value = 'true'
-        elif token.startswith(f"--{name}="):
-            value = token.split('=', 1)[1]
-    return value
+    """The value `--<name>` carries in `flags`, as `xla_flag` reads it: its last occurrence's."""
+    return next(reversed(_values(flags, name)), None)
+
+
+def _values(flags: str, name: str) -> list[str]:
+    """Each value `--<name>` carries in `flags`, in order, a bare `--<name>` reading as 'true'."""
+    return ['true' if token == f"--{name}" else token.split('=', 1)[1] for token in flags.split()
+            if token == f"--{name}" or token.startswith(f"--{name}=")]
 
 
 def keep_roundings() -> None:

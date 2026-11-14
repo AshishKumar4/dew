@@ -148,12 +148,13 @@ class Flow:
         """The flow's parameters, float32, drawn once on the host's CPU (a GPU's normal transform differs from
         the CPU's in its last bits, so a draw on the GPU would be other parameters than its prepare's) where
         the flow prepares, or where no tier's store holds them; a run reads its prepare's (`PARAMS`), and
-        initializes no model."""
+        initializes no model. The initializer runs compiled, one program: run eagerly, it compiled each of
+        its operations apart, 1,416 programs and 70 s over the flows' prepare on armada."""
         if TRUTHS in os.environ and not preparing():
             return pickle.loads((store_of(self) / PARAMS).read_bytes())
         with jax.default_device(jax.devices("cpu")[0]):
             tokens = jnp.zeros((self.rows, self.length), jnp.int32)
-            return jax.device_get(self.model.init(jax.random.key(5461), tokens)["params"])
+            return jax.device_get(jax.jit(self.model.init)(jax.random.key(5461), tokens)["params"])
 
     @property
     def vocab(self) -> int:

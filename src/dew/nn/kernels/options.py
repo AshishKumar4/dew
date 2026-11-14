@@ -256,7 +256,9 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
     lowered = program.lower(*args, **kwargs)
     pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dew-compile-ahead")
     try:
-        return Compiling(program_digest(lowered), pool.submit(report.attempted, lowered, None))
+        # In this thread's context: the compile's target reads it (`report.for_devices`).
+        return Compiling(program_digest(lowered),
+                         pool.submit(contextvars.copy_context().run, report.attempted, lowered, None))
     finally:
         pool.shutdown(wait=False)
 
@@ -689,6 +691,13 @@ def _signature(leaf) -> Hashable:
         # A typed key array states no format: its placement is its sharding.
         return leaf.aval, leaf.sharding, leaf.committed
     return type(leaf), np.shape(leaf), np.result_type(leaf)
+
+
+UNGRAPHED_OPTIONS: Mapping[str, Option] = {"xla_gpu_enable_command_buffer": ""}
+"""The XLA options of a program compiled without CUDA command buffers (`program`'s `step`): a timed one's,
+whose command buffers CUPTI does not read whole (`dew.telemetry.benchmark.Ungraphed`), and a server's
+admitting step's, whose fresh inputs update a command buffer before it can replay
+(`dew.inference.serving_kernel.decode_programs`)."""
 
 
 def program[**P, R](function: Callable[P, R], *models: Held,

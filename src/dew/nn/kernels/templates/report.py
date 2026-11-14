@@ -733,8 +733,12 @@ an instruction no device run has tuned yet (config_assigner.cc's NotFound, sort_
 class Untuned(RuntimeError):
     """A compile without a device for a device to run (`for_devices`: a job's prepare,
     `dew.training.ahead.AheadTarget`) met an instruction no device run has tuned yet (`UNTUNED`): the
-    program is not preparable until one has, and its run compiles it on the device, which tunes it for the
-    next. No memory refusal: the plan's search stops at it."""
+    program (`lowered`) is not preparable until one has, and its run compiles it on the device,
+    which tunes it for the next. No memory refusal: the plan's search stops at it."""
+
+    def __init__(self, said: str, lowered: jax.stages.Lowered):
+        super().__init__(said)
+        self.lowered = lowered
 
 
 def untuned(code: str, message: str) -> bool:
@@ -750,7 +754,7 @@ def xla_compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOption
         return lowered.compile(targeted(lowered, options))
     except jax.errors.JaxRuntimeError as error:
         if untuned(error.error_code_string, str(error)):
-            raise Untuned(str(error)) from error
+            raise Untuned(str(error), lowered) from error
         raise
 
 
@@ -781,13 +785,31 @@ def for_devices() -> Iterator[None]:
         _FOR_DEVICES.reset(held)
 
 
-def autotuned(devices: Sequence) -> bool:
-    """Whether a program compiled for `devices` takes XLA's tuned choices (`targeted`): any device that
-    runs, or compile-only GPUs within `for_devices`; a deviceless GPU compile outside it is read at
-    autotune 0, its workspaces XLA's defaults, which a tuned convolution's on the device may exceed."""
+@contextlib.contextmanager
+def read_offline() -> Iterator[None]:
+    """Within the block, a deviceless GPU compile is one only read for its memory or text, whatever
+    `for_devices` holds around it (a call's plan judging a program no device runs, inside a prepare that
+    compiles a step ahead): it skips the autotuner and keeps XLA's sorts as they fall back (`offline`,
+    `targeted`'s offline compile), so it needs no device run's tuning."""
+    held = _FOR_DEVICES.set(False)
+    try:
+        yield
+    finally:
+        _FOR_DEVICES.reset(held)
+
+
+def offline(devices: Sequence) -> bool:
+    """Whether a program compiled for `devices` is read offline, for its memory or text alone, no device to
+    run it (`targeted`): compile-only GPUs outside `for_devices` (or within `read_offline`)."""
     device = next(iter(devices), None)
-    return (device is None or device.platform != "gpu" or not deviceless(device) or _FOR_DEVICES.get()
-            or xla_flag("xla_gpu_autotune_level") is not None)
+    return device is not None and device.platform == "gpu" and deviceless(device) and not _FOR_DEVICES.get()
+
+
+def autotuned(devices: Sequence) -> bool:
+    """Whether a program compiled for `devices` takes XLA's tuned choices, as `targeted` compiles it: for a
+    device to run (not `offline`), where the run's XLA_FLAGS leaves the autotuner on. One read offline skips
+    it, its workspaces XLA's defaults, which a tuned convolution's on the device may exceed."""
+    return not offline(devices) and xla_flag("xla_gpu_autotune_level") != "0"
 
 
 def targeted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
@@ -807,20 +829,18 @@ def targeted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
 
     lowering = lowered._lowering
     devices = lowering._device_list if isinstance(lowering, pxla.MeshComputation) else None
-    device = None if devices is None else next(iter(devices))
-    if device is None or device.platform != "gpu":
+    if devices is None or next(iter(devices)).platform != "gpu":
         return options
-    offline = deviceless(device) and not _FOR_DEVICES.get()
-    sorts = {} if offline or xla_flag("xla_gpu_deviceless_cub_mode") is not None else {
-        "xla_gpu_deviceless_cub_mode": CUB_NO_FALLBACK}
-    if sorts:
-        options = {**(options or {}), **sorts}
-    if not deviceless(device) or xla_flag("xla_gpu_autotune_level") is not None:
-        return options
-    if not offline:
+    device = next(iter(devices))
+    if offline(devices):
+        return options if xla_flag("xla_gpu_autotune_level") is not None else {
+            **(options or {}), "xla_gpu_autotune_level": 0}
+    if xla_flag("xla_gpu_deviceless_cub_mode") is None:
+        options = {**(options or {}), "xla_gpu_deviceless_cub_mode": CUB_NO_FALLBACK}
+    if deviceless(device) and xla_flag("xla_gpu_autotune_level") is None:
         return {**(options or {}), "xla_gpu_experimental_autotune_cache_mode": AUTOTUNE_CACHE_READ,
                 "xla_gpu_require_complete_aot_autotune_results": True}
-    return {**(options or {}), "xla_gpu_autotune_level": 0}
+    return options
 
 
 def attempts(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]]
@@ -831,7 +851,9 @@ def attempts(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOpt
     if len(programs) < 2:
         return [attempted(*program) for program in programs]
     with ThreadPoolExecutor(min(len(programs), COMPILE_THREADS), thread_name_prefix="dew-compile") as pool:
-        return [each.result() for each in [pool.submit(attempted, *program) for program in programs]]
+        # Each in the submitting thread's context: the compile's target reads it (`for_devices`).
+        return [each.result() for each in [pool.submit(contextvars.copy_context().run, attempted, *program)
+                                           for program in programs]]
 
 
 def reads_binaries(lowered: jax.stages.Lowered) -> bool:

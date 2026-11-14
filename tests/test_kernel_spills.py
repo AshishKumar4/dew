@@ -254,14 +254,15 @@ def test_a_handed_step_derives_for_its_target_on_a_gpu_that_runs_it_alone():
     from dew.training.ahead import AheadOfTime, Executable, handed
 
     canonical = gpu_target("sm90")
-    step = AheadOfTime("sm90", 1, {}, "", Executable(b"", ()), None, 0, 0, 0, 0, 0, {}, canonical)
+    step = AheadOfTime("sm90", 1, {}, "", Executable(b"", ()), None, 0, 0, 0, 0, 0, {}, tuned=True,
+                       target=canonical)
     h200 = dataclasses.replace(canonical, device_kind="NVIDIA H200")
     with assumed(h200):
         with handed(step):
             assert gpu_target() == canonical
         assert gpu_target() == h200
     # A step compiled ahead before steps recorded their GPU, unpickled with no target, is refused so too.
-    earlier = AheadOfTime("sm90", 1, {}, "", Executable(b"", ()), None, 0, 0, 0, 0, 0, {})
+    earlier = AheadOfTime("sm90", 1, {}, "", Executable(b"", ()), None, 0, 0, 0, 0, 0, {}, tuned=True)
     vars(earlier).pop("target")
     with assumed(h200), pytest.raises(ValueError), handed(earlier):
         pass

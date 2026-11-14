@@ -1358,6 +1358,34 @@ def test_the_backward_is_on_par_over_every_call_form_interpreted(case, form):
     _check_call_form(case, interpret=True, backward=True, form=form)
 
 
+def block_selected(tokens: int, block: int) -> np.ndarray:
+    """Runs `[1, tokens, 3, 2]` of a block-selected causal call (MoBA's, NSA's selected branch): each query
+    reads the keys of its own block up to its own, and two earlier blocks, its block's first and its
+    half-way one, whole; a block its query block does not select between them, so its walk's tiles are
+    the selected ones apart (`attention_mosaic_program.indexed_walk`)."""
+    runs = np.zeros((1, tokens, 3, 2), np.int32)
+    for query in range(tokens):
+        own = query // block
+        earlier = sorted({0, own // 2} - {own})
+        for index, chosen in enumerate(earlier):
+            runs[0, query, index] = (chosen * block, (chosen + 1) * block)
+        runs[0, query, len(earlier)] = (own * block, query + 1)
+    return runs
+
+
+@INTERPRETS
+@on_each_family_for(("width", "form"), [(64, "default"), (128, "default"), (64, "fused")], ids=str)
+def test_a_block_selected_call_holds_check_1_walking_its_selected_tiles_interpreted(width, form):
+    """A block-selected causal call over 512 tokens (`block_selected`: each query its own block and two
+    earlier blocks of 64, others between them unread), forward and backward under the interpreter at the
+    derived tiles, the backward in the form `form` names, on each GPU's family: on par with the reference
+    (check 1), its query blocks' walks stepping the selected tiles alone, each step's tile read through its
+    ranges (`_Program.tile_of`), which a wrong tile would miss."""
+    spans = template.spans(512, 512, 1, causal=True, runs=jnp.asarray(block_selected(512, 64)))
+    _check_spans("block-selected", spans, (1, 512, 2, 1), interpret=True, backward=True, width=width,
+                 form=form)
+
+
 @INTERPRETS
 @on_each_family_for(("case", "form"), _walked(RUN_CASES, ["forward", *BACKWARD_FORMS]), ids=str)
 def test_a_call_over_runs_is_on_par_interpreted(case, form):

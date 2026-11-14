@@ -336,16 +336,13 @@ def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_doe
                         truth_fn=truth)
 
 
-@pytest.mark.parametrize("encoder", ["table", "backbone"])
-def test_a_conditioned_run_logs_its_training_work_and_serves_with_its_context(encoder):
-    """Examples with a context trained through context layers, the context read through the source's
-    token table or its own frozen pass (`encode_context`, whose states a frozen trunk takes no gradient
-    of, row 6119): every logged step reports its training work, and beyond what its batch's rows cost
-    without their contexts by the cross-attention's work over them
-    (`test_the_context_layers_work_is_counted_in_a_conditioned_batch` holds the count itself), far past
-    the float32 sum the step logs it by. The gates move off zero and every frozen leaf stays as it was;
-    the run's task answers a request otherwise for another context."""
-    objective = conditioned(encoder=encoder)
+def test_a_conditioned_run_logs_its_training_work_and_serves_with_its_context():
+    """Examples with a context trained through context layers: every logged step reports its
+    training work, and beyond what its batch's rows cost without their contexts by the
+    cross-attention's work over them (`test_the_context_layers_work_is_counted_in_a_conditioned_batch`
+    holds the count itself), far past the float32 sum the step logs it by. The gates move off zero and
+    every frozen leaf stays as it was; the run's task answers a request otherwise for another context."""
+    objective = conditioned()
     data = decision_rows(examples(), 8, objective=objective.data())
     batches = list(itertools.islice(data.train(DataPartition()), 2))
     plain = [objective.training_flops(None, {name: value for name, value in batch.items()

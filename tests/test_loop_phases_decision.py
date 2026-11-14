@@ -206,8 +206,9 @@ def test_a_phased_runs_later_phase_compiles_ahead_as_the_run_lowers_it_at_its_bo
     run's row shards, so each reads its phases' rows as the run reads them), ending with status 0 and
     training nothing. Into the run's persistent cache, which a device's run reads as tuned, a step compiles
     only with every choice the GPU kind's runs tuned (`report.for_devices`): a host none ran on prepares
-    none, its run compiling them on the device (row 6046). Into a file, the step its resume would take
-    compiles as XLA compiles it untuned, its record saying so (`AheadOfTime.tuned`)."""
+    none, its run compiling them on the device (row 6046), each said by its program (`CompiledAhead.untuned`).
+    Into a file, the step its resume would take compiles as XLA compiles it untuned, its record saying so
+    (`AheadOfTime.tuned`): the program the prepare compiled for its phase."""
     from jax.experimental import topologies
 
     from dew.nn.kernels.generation import compile_only_gpus
@@ -224,14 +225,19 @@ def test_a_phased_runs_later_phase_compiles_ahead_as_the_run_lowers_it_at_its_bo
     # Into the cache, the phases named and, with no path, the first step and each later phase's: none
     # preparable on a host no H100's run left its tuned choices beside.
     prepared_target = AheadTarget("sm90", 8, topology=str(topology))
+    untuned = {}
     for name, target in (("ahead", phases_target), ("prepared", prepared_target)):
         with pytest.raises(CompiledAhead) as cached:
             trained(run(tmp_path, STEPS, data), tmp_path, name, trainer={"steps": 4, "compile_ahead": target})
         assert cached.value.code == 0 and cached.value.path is None and cached.value.ahead is None
         assert not (tmp_path / "runs" / name).exists()
+        untuned[name] = cached.value.untuned
+    # The phase's step, and the first step beside it.
+    assert len(untuned["ahead"]) == 1 and len(set(untuned["prepared"])) == 2
     trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 3, "checkpoint_every": 1})
     resumed_target = AheadTarget("sm90", 8, path=str(tmp_path / "resumed.ahead"), topology=str(topology))
     with pytest.raises(CompiledAhead) as resumed:
         trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 4,
                                                                          "compile_ahead": resumed_target})
     assert resumed.value.code == 0 and not resumed.value.ahead.tuned
+    assert untuned["ahead"] == (resumed.value.ahead.program,) and untuned["ahead"][0] in untuned["prepared"]
