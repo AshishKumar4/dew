@@ -533,6 +533,69 @@ def test_the_templates_forked_documents_are_as_exact_as_each_alone_interpreted(h
     the_templates_forked_documents_are_as_exact_as_each_alone(hooks)
 
 
+UNDELTA_HEADS = 8
+"""The value heads of the no-delta gradient check's draws: a skip's gradient a value of each head, two of them
+left a site unresolved at 512 draws, eight at 64 (`seeds_for`, paired, on armada at 40ba1d89c6f)."""
+
+# The forms without the delta rule the template's fast backward takes, a decay a head or none, each site's
+# seeds sized by `seeds_for` (paired, at `UNDELTA_HEADS`): a write gate's with and without a skip, Mamba2's
+# step gates over one sequence, and lightning attention's. Over packed documents the step gates', and the
+# rated scan's (its step's per-head rate), need past 512 draws interpreted, a head's gradient a sum of every
+# token's at fp32's rounding in either arm: the stability suite holds the rated scan's gradient natively
+# under the accurate forms (tests/test_recurrence_template_stability.py, `forms_of`). A form under an epilogue
+# reading the output, whose gradient is fp32, the template refuses (`mainloop_backward.fast_backward_form`).
+@pytest.mark.parametrize(('hooks', 'packed', 'seeds'), [
+    pytest.param(HOOKS[2], False, 8, id='write-one',
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
+    pytest.param(HOOKS[2], True, 8, id='write-packed',
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
+    pytest.param(HOOKS[6], False, 8, id='decayed-write-one',
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
+    pytest.param(HOOKS[6], True, 8, id='decayed-write-packed',
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
+    pytest.param(HOOKS[3], False, 64, id='write-skip-one',
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=4)),
+    pytest.param(HOOKS[3], True, 64, id='write-skip-packed',
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=4)),
+    pytest.param(HOOKS[7], False, 64, id='decayed-write-skip-one',
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=4)),
+    pytest.param(HOOKS[7], True, 64, id='decayed-write-skip-packed',
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=4)),
+    pytest.param(FORMED[1], False, 128, id='step-gates-one',
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=4)),
+    pytest.param(FORMED[8], False, 8, id='lightning-one',
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
+    pytest.param(FORMED[8], True, 8, id='lightning-packed',
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
+])
+def test_the_templates_gradient_without_the_delta_rule_is_as_exact_as_the_portable_maths_interpreted(
+        hooks, packed, seeds):
+    """A 16-bit call without the delta rule through the recurrence template interpreted under the accurate
+    forms (the rated scan's numbers mamba_ssm's under the fast ones, `recurrence_chunk.fast_rounding`), its
+    fast backward's intermediates held in fp32's three parts as its forward holds them
+    (`chunk_forward.prepared`'s `held`): its output, final memory and every operand's gradient on par from
+    float64 with the portable math's (check 1; the bar `recurrence_chunk.chunk_rounding` states for a form
+    with no port), the truth the recurrence a token at a time in float64."""
+    starts = draw(hooks, packed, 0, value_heads=UNDELTA_HEADS)[0].starts
+
+    def drawn(seed):
+        (operands,) = draw(hooks, packed, seed, value_heads=UNDELTA_HEADS)
+        # The documents' starts are the call's structure, which every arm closes over: no gradient.
+        operands = dataclasses.replace(operands, starts=None, **{
+            name: getattr(operands, name).astype(jnp.bfloat16) for name in ('query', 'key', 'value')})
+        return operands, cotangents(operands, seed)
+
+    def restarted(fn):
+        return jax.jit(with_gradients(lambda operands: fn(dataclasses.replace(operands, starts=starts))))
+
+    def on(kernel):
+        return restarted(functools.partial(chunk_on, kernel, hooks, chunk_size=CHUNK))
+
+    with generation.run_precision(dataclasses.replace(generation.numerics(), forms='accurate')):
+        assert_as_exact(on('mosaic_gpu'), on('xla'), drawn, f'{hooks} packed={packed} on the template',
+                        seeds=seeds, truth_fn=restarted(functools.partial(token_by_token, hooks)))
+
+
 def edge_draw(hooks, seed: int):
     """`draw`'s operands over a chunk's 64 tokens entering a memory of about 2^96, the largest `chunk` reads
     at its size through any decay, which each row's first token decays by exp2(-124.8), a normal fp32 whose

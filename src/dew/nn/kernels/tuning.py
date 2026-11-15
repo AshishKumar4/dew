@@ -592,7 +592,7 @@ class KernelOp(tokamax.Op):
     def _certified(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """The derived `config`, or, where its kernels spill as the GPU assembles them alone
         (`report.certified`), each refused (`report.refuse_launch`, so its legality
-        refuses it) and its misses recorded (`report.missed_spilling`: stepped where the next was derived),
+        refuses it) and its misses recorded (`report.missed`: stepped where the next was derived),
         and the next derived in turn: the first whose kernels hold. A derivation that offers a
         refused config again (its legality reads no refusal) has it kept, its program's compile left to read
         it (`report.settled`). A pinned or a tuned pick is a measured choice, not certified here: its
@@ -607,7 +607,7 @@ class KernelOp(tokamax.Op):
                 stepped = self._get_heuristics_config(ba)
             finally:  # a derivation left with no config raises: the last refused one stepped nowhere
                 for (refusal, its), later in zip(refused, [*refused[1:], None], strict=True):
-                    report.missed_spilling(self, ba, refusal, its, stepped=later is not None or (
+                    report.missed(self, ba, refusal, its, stepped=later is not None or (
                         stepped is not None and stepped not in seen))
             config = stepped
         return config
@@ -651,7 +651,7 @@ class KernelOp(tokamax.Op):
             if held is not None:
                 for rung, found in answers[held + 1:]:
                     if found:
-                        report.missed_spilling(self, ba, rung, found, stepped=False)
+                        report.missed(self, ba, rung, found, stepped=False)
                 return refused
             size = report.rung_round()
         return refused
@@ -796,8 +796,8 @@ class KernelOp(tokamax.Op):
                 else jnp.zeros(spec.shape, spec.dtype) for key, spec in zip(keys, specs, strict=True)]
 
 
-def lowered_once(static: tuple[str, ...], *, unless: Callable[[], bool] = lambda: False
-                 ) -> Callable[[Callable], Callable]:
+def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), at: str | None = None,
+                 unless: Callable[[], bool] = lambda: False) -> Callable[[Callable], Callable]:
     """A kernel launch jitted with the arguments its signature names among `static` static: JAX keys its
     program on them and on its operands' shapes and dtypes, so each configuration is traced and lowered
     once however many layers, passes and recomputations call it, and no operand is held (a model's layers'
@@ -807,7 +807,13 @@ def lowered_once(static: tuple[str, ...], *, unless: Callable[[], bool] = lambda
     named for its own, and a spill refuses the launch that compiled it (row 2941). A call whose static
     arguments reach a function closing over values (`holdable`), or one `unless` names (a plan tracing
     every call), runs the launch itself: jit's cache would keep the closure, and any array it reaches,
-    alive."""
+    alive. Its kernels are of the form all its static arguments state but the `configured` ones, those the
+    template says its launch's config carries (which its kernels' names read through `KernelOp.emitted`)
+    (`report.forming`): a launch whose statics differ outside its config (a forward keeping its inverses or
+    not, a training call's attention forward and a forward alone) traces each kernel of a name apart, and a
+    template that says nothing names every static. The static `at` names carries the config its kernels are
+    emitted at, a level of the launch's (a training call's tiles or its forward's), whose part each kernel's
+    name reads (`report.forming`'s `at`)."""
     def decorate(launch: Callable) -> Callable:
         signature = inspect.signature(launch)
         names = tuple(name for name in static if name in signature.parameters)
@@ -822,9 +828,13 @@ def lowered_once(static: tuple[str, ...], *, unless: Callable[[], bool] = lambda
         @functools.wraps(launch)
         def called(*args, **kwargs):
             bound = signature.bind(*args, **kwargs).arguments
-            if unless() or not all(holdable(bound[name]) for name in names if name in bound):
-                return launch(*args, **kwargs)
-            return jitted(report.launch_digest())(*args, **kwargs)
+            # Each static argument but those its config carries, keyed as a key kept beyond this process is.
+            form = opaque(parameter_key(tuple(
+                (name, bound[name]) for name in names if name in bound and name not in configured)))
+            with report.forming(form, at=None if at is None else bound.get(at)):
+                if unless() or not all(holdable(bound[name]) for name in names if name in bound):
+                    return launch(*args, **kwargs)
+                return jitted(report.launch_digest())(*args, **kwargs)
 
         return called
 

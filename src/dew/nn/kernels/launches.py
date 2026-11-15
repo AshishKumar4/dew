@@ -5,8 +5,10 @@ operands an automatic mesh axis splits, where every device would run the whole b
 
 import contextvars
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
+import jax
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
@@ -60,3 +62,21 @@ def _held(launch: Callable, name: str) -> Callable:
         return launch(*operands, **options)
 
     return launched
+
+
+def filled(shape: Sequence[int], dtype, anchor: jax.Array, *anchors: jax.Array, fill: float = 0.0
+           ) -> jax.Array:
+    """A buffer of `shape` filled with `fill` that one launch alone takes in place (a ref its programs add
+    into atomically: an accumulator's zeros, a state's start), its fill passed through an optimization
+    barrier with that launch's own operands (`anchor` and `anchors`, one at least) and broadcast after it:
+    each launch's broadcast has an operand of its own, which XLA's common-subexpression elimination cannot
+    merge with another's, as jax.checkpoint's `prevent_cse` passes a computation's inputs through a barrier
+    it then consumes. XLA merges every equal `broadcast(constant)` of one shape (HloCSE sets aside only
+    instructions with no operands or with side effects), and a barrier after the broadcast forwards its
+    buffer: unbound, one buffer served every layer's launch and lived from the first backward to the last
+    (the 4B's split-1 step: the shared-keys backward's dQ zeros, 805 MB, live from layer 31's backward to
+    layer 3's). The launch cannot zero its own target in its kernel: other programs add into it with no
+    grid-wide barrier before their first add, so the fill is made before the launch, each launch its own,
+    on every family (Mosaic's, Pallas-Triton's and the recurrence's alike)."""
+    value, _ = jax.lax.optimization_barrier((jnp.asarray(fill, dtype), (anchor, *anchors)))
+    return jnp.broadcast_to(value, tuple(shape))

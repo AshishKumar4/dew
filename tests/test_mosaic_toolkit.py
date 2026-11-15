@@ -735,7 +735,7 @@ def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
         jax.jit(apart).trace()
 
     def stacked():
-        refs = mosaic.stacked_zeros(shapes, groups)
+        refs = mosaic.stacked_zeros(shapes, groups, jnp.zeros(()))
         launched(*refs)
         return mosaic.stacked_read(refs, groups)
 
@@ -1563,6 +1563,18 @@ def _kept_sums(x, w, *, interpret):
                          interpret=interpret, name="chunks_kept")(x, w)
 
 
+def _stepped_once(family, rings, step, outs, shape, interpret):
+    """A consumer's walk of `rings` for one `step` from a fresh accumulator of `shape` an output of `outs`,
+    each sum stored into its output."""
+    def walked(wg):
+        del wg
+        found, _ = family.walk(rings, ((step, 0, 1),), (family.zeros(shape),) * len(outs), (), interpret)
+        for out_gmem, value in zip(outs, found, strict=True):
+            out_gmem[...] = value
+
+    return walked
+
+
 def _summed_together(x, w, *, interpret, awaiting: bool = False):
     """`x_0 @ w_0`, `x_1 @ w_1` and `x_0 @ w_1` (`x`'s and `w`'s two depth blocks, each a stream of its own)
     on tcgen05's chunks from shared memory, three groups of one width summed together in one step
@@ -1595,14 +1607,8 @@ def _summed_together(x, w, *, interpret, awaiting: bool = False):
                 readers = family.summed_together(((rows, columns),) * 3, tuple(issues))
                 return tuple(read() for read in readers), accumulators
 
-            def walked(wg):
-                del wg
-                found, _ = family.walk(rings, ((step, 0, 1),), (family.zeros((rows, columns)),) * 3, (),
-                                       interpret)
-                for out_gmem, value in zip(outs, found, strict=True):
-                    out_gmem[...] = value
-
-            family.scheduled(1, walked, lambda: family.stream(rings, views, 0, 1))
+            family.scheduled(1, _stepped_once(family, rings, step, outs, (rows, columns), interpret),
+                             lambda: family.stream(rings, views, 0, 1))
 
         family.scoped(scope, streams=family.streams(blocks, 2, 1),
                       products=(1, (), (), (), (), (columns,) * 3))
@@ -1630,29 +1636,82 @@ def test_groups_summed_together_on_tcgen05_issue_every_product_before_one_commit
     """Traced for a B200 (`summed_together` on tcgen05's chunks): the three groups' products are all issued
     before the role commits its tensor-core barrier once and waits on it once, no commit or wait between
     them, so no group's wait stands between another's issue and its own."""
-    from jax.extend.core import ClosedJaxpr, Jaxpr
+    from reference_error import equations
 
     keys = jax.random.split(jax.random.key(5))
     x = jax.random.randint(keys[0], (64, 2 * CHUNK_DEPTH), -4, 4).astype(jnp.bfloat16)
     w = jax.random.randint(keys[1], (2 * CHUNK_DEPTH, 128), -4, 4).astype(jnp.bfloat16)
     with generation.assumed("sm100"):
         traced = jax.make_jaxpr(lambda x, w: _summed_together(x, w, interpret=False))(x, w)
-    order = []
-
-    def walk(jaxpr):
-        for equation in jaxpr.eqns:
-            if equation.primitive.name in ("tcgen05_mma", "tcgen05_commit_arrive", "barrier_wait"):
-                order.append(equation.primitive.name)
-            for param in equation.params.values():
-                for inner in (param if isinstance(param, (tuple, list)) else (param,)):
-                    if isinstance(inner, ClosedJaxpr | Jaxpr):
-                        walk(inner.jaxpr if isinstance(inner, ClosedJaxpr) else inner)
-
-    walk(traced.jaxpr)
+    order = [equation.primitive.name for equation in equations(traced.jaxpr)
+             if equation.primitive.name in ("tcgen05_mma", "tcgen05_commit_arrive", "barrier_wait")]
     first = order.index("tcgen05_mma")
     issued = [index for index, name in enumerate(order) if name == "tcgen05_mma"]
     assert len(issued) == 3 and issued == list(range(first, first + 3)), order
     assert order[first + 3:first + 5] == ["tcgen05_commit_arrive", "barrier_wait"], order
+
+
+def _staged_together(x, w, *, interpret, shared: bool):
+    """`x_0 @ w_0` and `2 x_0 @ w_0` on tcgen05's chunks, summed together by one prepared-operand issuer
+    (`operands.Issuer.summed_together`): each group's left operand a register value its product name stages
+    into a shared tile of its buffers, one tile for both where `shared`, `w_0` the stream's slot; each read
+    where it is stored, in the program's together scratch alone."""
+    from dew.nn.kernels.templates import mosaic_sm100, operands
+    family = mosaic_sm100.CHUNKS
+    rows, columns = family.rows, w.shape[1]
+    call = _Call(family, interpret)
+
+    def body(x_gmem, w_gmem, *outs):
+        blocks = {'x': ((rows, CHUNK_DEPTH), jnp.bfloat16), 'w': ((CHUNK_DEPTH, columns), jnp.bfloat16)}
+
+        def scope(staging, other, *, streams):
+            rings = family.opened(streams)
+            views = {'x': (x_gmem, lambda j: (0, 0)), 'w': (w_gmem, lambda j: (0, 0))}
+
+            def step(index, slots, carry, accumulators):
+                del index, carry
+                slots.acquire_all()
+                held, right = family.tile_of(slots['x']), operands.Parts((slots['w'],), jnp.bfloat16)
+                issuer = operands.Issuer(call, {"left": (staging,), "twice": (staging if shared else other,)})
+                readers = issuer.summed_together([[("left", held, right)], [("twice", held * 2, right)]])
+                return tuple(read() for read in readers), accumulators
+
+            family.scheduled(1, _stepped_once(family, rings, step, outs, (rows, columns), interpret),
+                             lambda: family.stream(rings, views, 0, 1))
+
+        tile = plgpu.SMEM((rows, CHUNK_DEPTH), jnp.bfloat16)
+        family.scoped(scope, tile, tile, streams=family.streams(blocks, 2, 1),
+                      products=(1, (), (), (), (), (columns,) * 2))
+
+    out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
+    return family.kernel(body, out_type=(out, out), grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="staged_together")(x, w)
+
+
+@pytest.mark.parametrize("shared", [True, False], ids=["one tile", "a tile each"])
+def test_groups_summed_together_stage_no_operand_into_a_tile_a_product_in_flight_reads(shared):
+    """Traced for a B200: two groups summed by one issuer (`operands.Issuer.summed_together`), each left
+    operand a register value staged into a shared tile of its product's buffers, one tile for both or a tile
+    each, in the program's together scratch alone: no staging into shared memory stands between a product's
+    issue and the wait that retires it. A tcgen05 product reads its operands after it issues, until its
+    commit's barrier, so a group staged while another's product is in flight overwrites that product's
+    operand under it."""
+    from reference_error import equations
+
+    x = jnp.zeros((64, CHUNK_DEPTH), jnp.bfloat16)
+    w = jnp.zeros((CHUNK_DEPTH, 128), jnp.bfloat16)
+    with generation.assumed("sm100"):
+        traced = jax.make_jaxpr(lambda x, w: _staged_together(x, w, interpret=False, shared=shared))(x, w)
+    order = [equation.primitive.name if equation.primitive.name != "swap" else "staged"
+             for equation in equations(traced.jaxpr)
+             if equation.primitive.name in ("tcgen05_mma", "barrier_wait")
+             or (equation.primitive.name == "swap"
+                 and getattr(equation.invars[0].aval, "memory_space", None) == plgpu.SMEM)]
+    assert order.count("tcgen05_mma") == 2 and order.count("staged") >= 2, order
+    in_flight = False
+    for event in order:
+        assert not (in_flight and event == "staged"), order
+        in_flight = (in_flight or event == "tcgen05_mma") and event != "barrier_wait"
 
 
 def test_a_group_summed_together_that_awaits_its_own_products_is_refused():

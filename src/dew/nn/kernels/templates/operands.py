@@ -41,6 +41,12 @@ def staged(family: mosaic.Family, value: jax.Array, buffers: Sequence[mosaic.Ref
     return Parts(refs, value.dtype)
 
 
+def _in_memory(x) -> bool:
+    """Whether operand `x` is a tile in shared memory already (`Parts`, or one read transposed), which its
+    product reads staging nothing."""
+    return isinstance(x, Parts) or (isinstance(x, product.Transposed) and _in_memory(x.value))
+
+
 class Parts:
     """A tile in shared memory as the 16-bit parts its products take (one, or an fp32 tile's three,
     `product.formed`), each a view of a stream's slot, and `dtype` the tile's own."""
@@ -229,7 +235,10 @@ class Issuer:
         together where every product is unscaled, a pair of tiles in memory (no `product.Blocks`) with no
         register left operand (`Family.summed_together`: one wait for them all where products are awaited,
         tcgen05's), each its own accumulator; else each summed where it is read (`summed`), in the reader's
-        order, as `Family.summed_together`'s default is."""
+        order, as `Family.summed_together`'s default is. Groups an operand of which is staged as its product
+        issues (a register value, an exact one, one formed then) are issued apart, each awaited before the
+        next (`apart`): a staging waits for the products in flight that may read its tile (`_settle`) within
+        its group alone, so another group's product still reading the tile would read the new operand."""
         entries = [list(self._entries(group)) for group in groups]
         triples = [[entry for entry in found if not isinstance(entry, product.Blocks)] for found in entries]
         plain = (all(len(found) == len(entry) for found, entry in zip(triples, entries, strict=True))
@@ -246,8 +255,10 @@ class Issuer:
                 acc = family.issued(acc, left, right, interpret)
             return acc
 
+        staged = not all(_in_memory(lhs) and _in_memory(rhs) for found in triples for _, lhs, rhs in found)
         shapes = tuple((found[0][1].shape[0], found[0][2].shape[1]) for found in triples)
-        return family.summed_together(shapes, tuple(functools.partial(issued, found) for found in triples))
+        return family.summed_together(shapes, tuple(functools.partial(issued, found) for found in triples),
+                                      apart=staged)
 
     def _entries(self, products: Iterable):
         """`products` as `summed` issues them: a `product.Blocks` it loops over as it is, more than one block

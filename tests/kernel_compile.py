@@ -56,11 +56,10 @@ PTX_ENTRY = re.compile(r"\.entry\s+([A-Za-z_$][\w$]*)")
 """A PTX module's kernel function, `<kernel>_mosaic_gpu_kernel` (`report.KERNEL_FUNCTION`)."""
 REGISTERS = re.compile(r"Used (\d+) registers")
 SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
-LOSSES = {"C7507": "ignores its setmaxnreg, its warp roles' paths rejoining after the split",
-          **{f"C751{digit}": "serializes its warpgroup MMAs" for digit in range(6)}}
-"""ptxas's notes of a performance loss the gate fails a kernel for, by code: its register raises and decreases
-dropped, the threads left at the entry's registers (C7507, the kernel challenge's notes/ptxas-re.md §4), or
-its warpgroup MMAs serialized, each HGMMA waited for before the next issues (C7510 to C7515)."""
+LOSSES = report.SERIALIZED | {report.IGNORED_RAISE}
+"""ptxas's notes of a performance loss the gate fails a kernel for, as report.py states them: its warpgroup
+MMAs serialized (`report.SERIALIZED`, which a run refuses too), or its setmaxnreg ignored, its roles left at
+the entry's registers (`report.IGNORED_RAISE`, a derived kernel's structure the gate holds)."""
 LOSS = re.compile(r"\((C75\d\d)\) Potential Performance Loss: ")
 """A note of ptxas's of a performance loss, `ptxas_read`."""
 
@@ -85,16 +84,15 @@ def ptxas_read(text: str) -> Assembled:
 
 @dataclasses.dataclass(frozen=True)
 class Report:
-    """One Mosaic GPU kernel's reports: its name, the shared bytes and tensor memory columns it asks for
-    (its binary's launch and Mosaic's resource estimate, respectively), its registers a thread and its
-    spilled bytes as the GPU compiles its PTX
-    (`inherited`, their only source: None until it reads them), what the reports left `unread`: a kernel no
-    binary carries, or a field no report states, is no evidence the kernel is within its resources; and its
-    `module`, its kernel hash, which two compiles of one module share: Mosaic compiles a module once a
-    process, so a later compile of it prints no PTX of its own; the digest of the launch that traced it
-    (`launching`), which its name carried, or None; ptxas's notes of a performance loss it fails for
-    (`ptxas_read`, `LOSSES`); and what its machine code breaks of the SASS rules (`report.sass_findings`,
-    read where nvdisasm is installed)."""
+    """One Mosaic GPU kernel's reports: its name, the shared bytes and tensor memory columns it asks for (its
+    binary's launch and Mosaic's resource estimate, respectively), its registers a thread and its spilled
+    bytes as the GPU compiles its PTX (`inherited`, their only source: None until it reads them), what the
+    reports left `unread`: a kernel no binary carries, or a field no report states, is no evidence the kernel
+    is within its resources; and its `module`, its kernel hash, which two compiles of one module share: Mosaic
+    compiles a module once a process, so a later compile of it prints no PTX of its own; the digest its name
+    carries, its kernel's identity within the launch that traced it (`report.named`), or None; ptxas's notes
+    of a performance loss it fails for (`ptxas_read`, `LOSSES`); and what its machine code breaks of the SASS
+    rules (`report.sass_findings`, read where nvdisasm is installed)."""
     kernel: str
     shared: int | None
     tmem: int | None
@@ -105,6 +103,8 @@ class Report:
     launch: str | None = None
     losses: tuple[str, ...] = ()
     sass: tuple[str, ...] = ()
+    launched: str | None = None
+    """The digest of the launch that traced it (`report.Binary.launched`), None where no binary carries it."""
 
     @property
     def traced(self) -> str:
@@ -120,7 +120,9 @@ class Report:
         if self.unread:
             return f"its reports state no {', '.join(self.unread)}"
         if self.losses:
-            return "ptxas " + "; ".join(f"{LOSSES[code]} ({code})" for code in self.losses)
+            return "ptxas " + "; ".join(
+                ("ignores its setmaxnreg" if code == report.IGNORED_RAISE
+                 else "serializes its warpgroup MMAs") + f" ({code})" for code in self.losses)
         if self.sass:
             return "its machine code holds " + "; ".join(self.sass)
         if (self.shared is not None and self.tmem is not None and self.shared <= shared_limit
@@ -160,7 +162,8 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
             kernel, binary.shared if binary is not None else None,
             sum(map(int, tmem.groups())) if tmem else None,
             None, None, unread, (modules or {}).get(name), launch,
-            sass=tuple(binary.sass or ()) if binary is not None else ()))
+            sass=tuple(binary.sass or ()) if binary is not None else (),
+            launched=binary.launched if binary is not None else None))
     return found_reports
 
 
@@ -733,7 +736,8 @@ def _compiled_here(cases, generation: str) -> list[dict]:
             # its schedule lowers to (`producer_failures`).
             record["stated_models"] = {
                 report.launch_name(kernel["kernel"], kernel["launch"]): stated.record() for kernel in kernels
-                if kernel["launch"] is not None and (launch := report.traced(kernel["launch"])) is not None
+                if kernel["launched"] is not None
+                and (launch := report.traced(kernel["launched"])) is not None
                 and (stated := launch.kernels.get(kernel["kernel"])) is not None}
             compiled = _compiled_reports(directory, generation)
             record["kernels"] = [inherited(kernel, compiled) for kernel in kernels]

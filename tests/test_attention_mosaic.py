@@ -741,6 +741,81 @@ def test_an_absorbed_mla_forward_of_576_wide_keys_and_512_wide_values_is_on_par_
                    value_width=512, target=generation.gpu_target("sm90"))
 
 
+@INTERPRETS
+def test_an_absorbed_mla_forward_whose_values_are_its_keys_leading_columns_is_on_par_interpreted():
+    """An absorbed MLA call whose values are its keys' leading 512 columns (`MosaicForward.in_key`), the
+    key tile loaded once and the value tile a view of its columns, through the Mosaic forward an H100 runs,
+    interpreted: on par with the reference over the keys' columns sliced (check 1)."""
+    shape = SHAPES["interpreted"]
+    spans = template.spans(shape[1], shape[1], shape[0], **CALLS["causal"])
+    unsliced = _drawn(shape, jnp.bfloat16, width=576, value_width=576)
+
+    def draw(seed):
+        query, key, _, dout = unsliced(seed)
+        return query, key, dout
+
+    def ours(query, key, dout):
+        del dout
+        with _device(interpret=True, target=generation.gpu_target("sm90")):
+            return attention_mosaic.forward(query, key, key[..., :512], spans, natural=False, interpret=True,
+                                            in_key=True)
+
+    def reference(query, key, dout):
+        del dout
+        return template.reference(query, key, key[..., :512], spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "mosaic forward absorbed mla in key",
+                    seeds=SEEDS)
+
+
+@INTERPRETS
+def test_values_their_keys_columns_are_the_keys_as_given_under_a_key_prologue_interpreted():
+    """Values the keys' leading columns (`in_key`) are the keys as given, not their prologue's: zero queries
+    weigh every key alike, so keys and values of ones under a prologue doubling the keys give exactly ones,
+    as the reference gives over the keys' prologue and the given values (the in-key path read the prologue's
+    twos from the key's slot)."""
+    shape = (1, 64, 1, 64)
+    spans = template.spans(shape[1], shape[1], shape[0], causal=False)
+    hooks = template.Hooks(key_mod=lambda key, *_: key * 2)
+    query, key = jnp.zeros(shape, jnp.bfloat16), jnp.ones(shape, jnp.bfloat16)
+    with _device(interpret=True, target=generation.gpu_target("sm90")):
+        found = attention_mosaic.forward(query, key, key, spans, hooks, natural=False, interpret=True,
+                                         in_key=True)
+    np.testing.assert_array_equal(np.asarray(found, np.float32),
+                                  np.asarray(template.reference(query, key * 2, key, spans), np.float32))
+
+
+def test_a_trained_call_whose_values_are_its_keys_columns_is_declined_as_its_forward_runs_it():
+    """A call keeping its residuals streams its values as given (its anchored launches), so whose values are
+    its keys' columns is declined as its forward runs it, the slice it was handed (`reads_in_key`): values 48
+    of a 64-wide key's columns, no whole swizzle group, refused in the key's slot ('columns'), are not refused
+    where the call keeps its split residuals."""
+    shape = (1, 64, 1, 64)
+    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
+    query, key = jnp.zeros(shape, jnp.bfloat16), jnp.ones(shape, jnp.bfloat16)
+    with generation.assumed("sm90"):
+        declined = attention_mosaic.forward_declined(query, key, key[..., :48], spans, in_key=True,
+                                                     residuals=template.Kept.SPLIT)
+        unkeyed = attention_mosaic.forward_declined(query, key, key[..., :48], spans,
+                                                    residuals=template.Kept.SPLIT)
+    assert declined == unkeyed
+
+
+def test_a_call_whose_values_are_its_prologued_keys_columns_is_declined_as_its_forward_runs_it():
+    """Under a key prologue a call whose values are its keys' columns reads them from the slice it was
+    handed (`attention_mosaic.reads_in_key`), so its declination is the forward's of that slice: values 48
+    of a 64-wide key's columns, no whole swizzle group, refused in the key's slot ('columns'), are not
+    refused here."""
+    shape = (1, 64, 1, 64)
+    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
+    hooks = template.Hooks(key_mod=lambda key, *_: key * 2)
+    query, key = jnp.zeros(shape, jnp.bfloat16), jnp.ones(shape, jnp.bfloat16)
+    with generation.assumed("sm90"):
+        declined = attention_mosaic.forward_declined(query, key, key[..., :48], spans, hooks, in_key=True)
+        unkeyed = attention_mosaic.forward_declined(query, key, key[..., :48], spans, hooks)
+    assert declined == unkeyed
+
+
 @ON_EACH_FAMILY
 @INTERPRETS
 def test_the_backward_at_a_width_of_256_is_on_par_under_bidirectional_blocks_interpreted():
@@ -1104,15 +1179,49 @@ def test_a_relowering_that_launches_its_refused_config_again_keeps_the_program()
 
     with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm100")):
         first = jax.jit(forward).trace(shape, shape, shape).lower()
-    calls = [call for call in kernel_calls(first, unrun=True) if call.kind == "mosaic_gpu" and call.launch]
+    calls = [call for call in kernel_calls(first, unrun=True) if call.kind == "mosaic_gpu" and call.launched]
     assert calls
     # Every compile's kernels read as spilling, as a B200's ptxas read the 4B forward's.
-    spilled = [report.Binary(report.kernel_of(call.name)[0], call.launch, 255, 8) for call in calls]
+    spilled = [report.Binary(report.kernel_of(call.name)[0], call.launch, 255, 8, caller=call.caller)
+               for call in calls]
     with generation.assumed("sm100"), report.refusals():
         report.kept(first, relower=lambda: first, read=lambda executable: spilled)
         misses = report.misses()
         assert misses and not any(miss.stepped for miss in misses), misses
         assert report.refused_launches() == ()
+
+
+@COMPILES_ON_CPU
+def test_a_run_refuses_a_kernel_whose_warpgroup_products_ptxas_serialized_as_a_spilling_one():
+    """A run's compile (`report.kept`) whose kernels spill nothing but whose warpgroup MMAs ptxas noted
+    serialized (C7512, as the ranking's sm90 attention backward's were) refuses them as spilling ones: each is
+    recorded as a miss with its codes and no frame, its reason the serialization, as a plan states it."""
+    import kernel_compile
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.lowered import kernel_calls
+    from dew.nn.kernels.templates import report
+
+    mesh = kernel_compile._device("sm90")
+    spans = template.spans(512, 512, 1, causal=True)
+    shape = jax.ShapeDtypeStruct((1, 512, 2, 128), jnp.bfloat16,
+                                 sharding=NamedSharding(mesh, PartitionSpec()))
+
+    def forward(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None)
+
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm90")):
+        first = jax.jit(forward).trace(shape, shape, shape).lower()
+    calls = [call for call in kernel_calls(first, unrun=True) if call.kind == "mosaic_gpu" and call.launched]
+    assert calls
+    serialized = (report.AssemblerNote("C7512", "wgmma.mma_async instructions are serialized"),)
+    noted = [report.Binary(report.kernel_of(call.name)[0], call.launch, 168, 0, caller=call.caller,
+                           notes=serialized) for call in calls]
+    with generation.assumed("sm90"), report.refusals():
+        report.kept(first, relower=lambda: first, read=lambda executable: noted)
+        misses = report.misses()
+    assert misses and all(miss.serialized == ("C7512",) and not miss.frame for miss in misses), misses
+    assert all("serializes its warpgroup MMAs" in miss.reason for miss in misses), misses
 
 
 @pytest.mark.parametrize("residuals", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])

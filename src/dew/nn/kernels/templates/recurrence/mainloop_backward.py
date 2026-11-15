@@ -62,21 +62,29 @@ from dew.nn.kernels.templates.resources import largest_live_set
 from dew.nn.precision import compensated_sum
 
 
-def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = False) -> bool:
+def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = False,
+                       wide: bool = False) -> bool:
     """Whether the fast backward takes a call's form: the delta rule, fla's DAG at fla's rounding, a decay a
-    head's or a key dimension's (fla_kda's, `key_backward`); or a bf16 `rounded` call without it and a decay a
-    head (the SSD's under the run's fast forms, its route's), the same DAG without the delta rule's at
-    mamba_ssm's rounding (`prepared`), held to recorded mamba_ssm's bf16 case; either in fp32 under the run's
-    fast forms (`rounded`), its operands in two bf16 parts (`mainloop.FAST_PARTS`). An fp16 call without the
-    delta rule, which no recording holds, a decay a key dimension without it, and an fp32 call's three parts
-    (the accurate forms, or a form without the delta rule on its route, `recurrence_chunk.chunk_rounding`)
-    take none. A decay a key dimension's form takes each sub-chunk's own pairs each their own decay
-    (`algebra.key_diagonal_pairs_back`)."""
-    if jnp.dtype(dtype) == jnp.float32 and not rounded:
+    head's or a key dimension's (fla_kda's, `key_backward`); or a bf16 call without it and a decay a head or
+    none, the same DAG without the delta rule's: `rounded` (the SSD's under the run's fast forms, its route's)
+    at mamba_ssm's rounding (`prepared`), held to recorded mamba_ssm's bf16 case, else its intermediates in
+    fp32's three parts as its forward holds them (lightning attention's, a write gate's, the SSD's under the
+    accurate forms), held to the portable math; either in fp32 under the run's fast forms (`rounded`), its
+    operands in two bf16 parts (`mainloop.FAST_PARTS`). An fp16 call without the delta rule, which no
+    recording holds, a decay a key dimension without it, an fp32 call's three parts (the accurate forms, or a
+    form without the delta rule on its route, `recurrence_chunk.chunk_rounding`), and a bf16 call's held in
+    three parts whose output is fp32 (`wide`: an epilogue reads it, Mamba2's gated norm), its gradient fp32
+    where the launches read it in bf16 (rounded so, Mamba2's step's gradient under its norm was 2.2e-3 from
+    float64 against the portable math's 3.1e-7), take none. A decay a key dimension's form takes each
+    sub-chunk's own pairs each their own decay (`algebra.key_diagonal_pairs_back`)."""
+    dtype = jnp.dtype(dtype)
+    if dtype == jnp.float32 and not rounded:
         return False
-    if per_key:
-        return delta
-    return delta or (rounded and jnp.dtype(dtype) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)))
+    if delta:
+        return True
+    if per_key or dtype == jnp.float16:
+        return False
+    return rounded or not wide
 
 
 class Kept(NamedTuple):
@@ -131,7 +139,7 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                   skip=None,
                   forked: ForkedTable | None = None) -> tuple[tuple, "Kept | key_backward.KeyKept"]:
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
-    call, or of a `rounded` call without it (the SSD's under the run's fast forms, `fast_backward_form`):
+    call, or of a call without it whose form it takes (`fast_backward_form`):
     `(dq, dk, dv, dg, dbeta, dh0, dskip, dentries)` for the output's and final memory's gradients `do`,
     `dfinal`, fla's
     DAG (recomputing the forward's values, as fla does) through the algebra's backward tile functions:
@@ -139,21 +147,24 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     decay's gradient summed token by token (`algebra.summed_pairs`, `algebra.summed_ranges`) and the memory's
     decay's term added, a key head's value heads summed; the forward's `inverse` and `kept` values where given
     (`kept_forward`'s) rather than computed again, its states launch at the forward's `tiles` where they are
-    not. Its rounding is fla's (mamba_ssm's without the delta rule); the accurate backward is the portable
-    math's token adjoint. Without the delta rule there is no system: the corrected values are the values
-    gated, `u = v beta`, whose gradient `du` (the reverse walk's) gives `dv = du beta` and `dbeta = sum(v
-    du)`, and the memory walks back with no `w^T dv`; a `skip` `[HV]` (Mamba2's `D`,
+    not. Its rounding is fla's (mamba_ssm's for a `rounded` call without the delta rule; another holds its
+    intermediates in fp32's three parts, as its forward holds them). Without the delta rule there is no
+    system: the corrected values are the values gated, `u = v beta`, whose gradient `du` (the reverse walk's)
+    gives `dv = du beta` and `dbeta = sum(v du)`, and the memory walks back with no `w^T dv`; a `skip` `[HV]`
+    (Mamba2's `D`,
     `chunk_forward.forward`'s) adds `D do` to `dv`, its own gradient `sum(v do)` (`dskip`, None without a
     skip). Returns them with each launch's outputs as stored (`Kept`; a decay a key dimension's,
     `key_backward.KeyKept`), the forward's `kept_forward` beside it. A `forked` call's
     (`chunk_forward.ForkedTable`) `dh0` is its given memories' and `dentries` its entry write's
     (`_tabled_gradients`, `_entered_gradient`), None for another."""
-    if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v), per_key=g.ndim == 4):
-        raise NotImplementedError("the fast backward takes the delta rule, or a rounded call without it "
-                                  "under the run's fast forms, an fp32 call's under them alone")
+    dtype = jnp.result_type(q, k, v)
+    if not fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=jnp.dtype(do.dtype) != dtype):
+        raise NotImplementedError("the fast backward takes the delta rule, or a bf16 call without it and a "
+                                  "decay a head (its output's gradient bf16 where it is not rounded), an "
+                                  "fp32 call's under the run's fast forms alone")
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
-                   firsts=firsts, rounded=rounded, ranged=ranged, forked=forked)
+                   firsts=firsts, rounded=rounded, ranged=ranged, forked=forked, skipped=skip is not None)
     call = run.call
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
     laid_do = call.given.split(run.laid(zero_padded(do.astype(run.dtype), 3, columns)).reshape(rows, -1))
@@ -315,9 +326,12 @@ def _local_back_staged(call: Call, vb: int) -> tuple:
 @lowered_once
 def _local_back(q, k, do, hi, lo, taken, call: Call, *, scale: float):
     """`[R, HV * Dv]` in `_value_grads`' form: the corrected values' gradient from each chunk's own output
-    (`algebra.local_gradient`, fla's chunk_bwd_dv_local), rounded as fla's, a program a chunk and value head
-    (persistent): apart from the memory's reverse walk (`_reverse`), whose tiles beside these spilled 80
-    bytes a thread on an H100's."""
+    (`algebra.local_gradient`, fla's chunk_bwd_dv_local), its scores in the held operand's form (fla's
+    rounding under the delta rule and mamba_ssm's for a rounded call; fp32's three parts for an unrounded call
+    without the delta rule, as its forward's output holds them: rounded to the operands' 16 bits, its write
+    gate's gradient `sum(v du)` was 1.4e-3 from float64 against the portable math's 9e-8), a program a chunk
+    and value head (persistent): apart from the memory's reverse walk (`_reverse`), whose tiles beside these
+    spilled 80 bytes a thread on an H100's."""
     chunk = call.chunk
     width, value_width, family = call.width, call.value_width, call.family
     given, grads = call.given, _value_grads(call)
@@ -360,7 +374,7 @@ def _local_back(q, k, do, hi, lo, taken, call: Call, *, scale: float):
                 functools.partial(block, "keys"), functools.partial(block, "queries"), width // call.block,
                 gate, low, lambda j: stream_tile(slots, "out", given, columns=pl.ds(j * vb, vb)),
                                    value_width // vb,
-                scale, given.dtype, issue, issue.summed, emit=stored, laid=laid)
+                scale, call.held.dtype, issue, issue.summed, emit=stored, laid=laid)
             return carry, accumulators
 
         return mosaic.Walk(views, step, prologue=None if streamed else lambda: read(None))
@@ -458,6 +472,23 @@ def _reverse_views(call: Call, q_ref, k_ref, w_ref, do_ref, local_ref, v_ref, h,
                            if v_ref is not None else {}))
 
 
+def _entered_views(call: Call, entered_ref, h, walked, walked_width: int) -> dict:
+    """The per-key reverse walk's streams of the memory each chunk entered (`memory`, the forward's, in
+    `call.memories`' form), a key slice `entered{i}` each, value head `h`'s `walked_width` columns from
+    `walked`: step `f` the chunk `chunks - 1 - f`'s slice, as `_reverse_views`' steps, its ring prefetching it
+    for the memory decay's sum. Read from global memory in the step, its load stalled the walk's consumer a
+    quarter of Kimi Linear's reverse walk on an emulated B200 (754k cycles, a load of the accumulator's layout
+    at the walk's every key slice, HS's tip2 ranking, nvgpu-lean run 20261114203056-aebe0292)."""
+    slices = call.width // call.block
+    whole = call.memories.views(entered_ref, 0, call.chunks * call.heads * call.width, walked, walked_width)
+    views: dict = {}
+    for i in range(slices):
+        # The slice's block of rows: chunk-major, then head, then key slice (`memory`'s rows).
+        views |= stream_views(lambda f, i=i: (((call.chunks - 1 - f) * call.heads + h) * slices + i, 0),
+                              **{f"entered{i}": whole})
+    return views
+
+
 def _reverse_keyed(call: Call, h) -> tuple[Operand, object]:
     """The form and columns of the queries and keys `_reverse` takes for value head `h`: the key head's as
     given under a decay a head; under one a key dimension each value head's own, gated (`key_gated`'s
@@ -492,6 +523,10 @@ def _reverse_launched(program, call: Call, tiles: Tiles, batch: int, sequences: 
                            out=((chunk, walked_width), given),
                            local=((chunk, walked_width), _value_grads(call)),
                            **({"values": ((chunk, walked_width), given)} if gates else {}))
+    if call.per_key:
+        # The memory each chunk entered, a key slice a stream (`_entered_views`).
+        blocks |= stream_blocks(**{f"entered{i}": ((call.block, walked_width), call.memories)
+                                   for i in range(width // call.block)})
     finals = stream_blocks(**{f"final{i}": ((call.block, walked_width), final)
                               for i in range(width // call.block)})
     out_type = (*out_type, *(() if table is None else table_returned(call, table, batch)))
@@ -569,6 +604,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
 
         views = _reverse_views(call, q_ref, k_ref, w_ref, do_ref, local_ref, v_ref if gates else None, h,
                                walked, walked_width)
+        if entered_ref is not None:
+            views |= _entered_views(call, entered_ref, h, walked, walked_width)
         final_views = stream_views(**{f"final{i}": final.views(dht_ref, memory(row, i), call.block, walked,
                                                                walked_width) for i in range(slices)})
         walked_streams = family.opened(streams["walked"], views)
@@ -598,9 +635,9 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                 memories.store(dh_ref, part, memory(n, i), call.block, column, bv, family=family,
                                smem=lands[f"memory{i}"], wait=False)
                 if entered_ref is not None:
-                    rows = pl.ds(memory(n, i), call.block)
-                    gated_ref[0].at[column // bv, rows][...] = algebra.key_memory_decay(
-                        family.tile_of(entered_ref.at[rows, pl.ds(column, bv)]), part)
+                    entered = stream_tile(slots, f"entered{i}", call.memories, columns=columns)
+                    gated_ref[0].at[column // bv, pl.ds(memory(n, i), call.block)][...] = (
+                        algebra.key_memory_decay(entered.value(), part))
 
             out = stream_tile(slots, "out", given, columns=columns)
             grad, dv = _reverse_carried(call, slots, grad, out, columns, issue, (hi_ref, lo_ref), h, n,

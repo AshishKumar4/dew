@@ -12,10 +12,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 from generation_support import COMPILES_ON_CPU, INTERPRETS
-from kernel_compile import gate_generations
+from kernel_compile import gate_generations, lowered_for
 from test_attention_mosaic import BACKWARD_HOOKS, SHAPES, _check_backward, _residuals
 from test_attention_triton import SCORE_HOOKS, score_hooks
 
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
@@ -161,7 +162,6 @@ weights staged for the values' product: the Blackwell fold's H1)."""
 def _template_step(query, key, value):
     """A training step's attention on the public call's template route, causal: its output's sum's gradients
     in the query, key and value."""
-    from dew.nn.attention import scaled_dot_product_attention
 
     def loss(query, key, value):
         out = scaled_dot_product_attention(query, key, value, implementation="template", causal=True)
@@ -731,3 +731,46 @@ def test_a_start_runs_the_kernels_its_launches_certified():
     record, = found
     run = record["modules"]
     assert run and {name: record["certified"].get(name) for name in run} == run
+
+
+STACK = (1, 4096, 16, 4, 256, 8192)
+"""A checkpointed layer's batch, tokens, query heads, key heads, head width and MLP width: the 4B's
+grouped 256-wide heads, whose backward on an H100 adds its dQ and dK/dV into accumulators in place."""
+
+
+def _stack_temp(layers: int) -> int:
+    """The temporaries of a training step of `layers` checkpointed layers (each a grouped causal attention
+    through the template, then a wide MLP), compiled for a compile-only H100."""
+    batch, tokens, heads, groups, width, hidden = STACK
+
+    def layer(x, weights):
+        keys, up, down = weights
+        k = jnp.einsum("bshd,hg->bsgd", x, keys).astype(jnp.bfloat16)
+        attended = scaled_dot_product_attention(x, k, k, causal=True, implementation="template")
+        flat = attended.reshape(batch, tokens, heads * width)
+        return (jnp.tanh(flat @ up) @ down).reshape(x.shape).astype(jnp.bfloat16)
+
+    def loss(x, stack):
+        for weights in stack:
+            x = jax.checkpoint(layer)(x, weights)
+        return jnp.sum(x.astype(jnp.float32))
+
+    x = jax.ShapeDtypeStruct((batch, tokens, heads, width), jnp.bfloat16)
+    one = (jax.ShapeDtypeStruct((heads, groups), jnp.bfloat16),
+           jax.ShapeDtypeStruct((heads * width, hidden), jnp.bfloat16),
+           jax.ShapeDtypeStruct((hidden, heads * width), jnp.bfloat16))
+    with generation.assumed("sm90"):
+        compiled = lowered_for(jax.grad(loss, argnums=(0, 1)), (x, (one,) * layers), "sm90").compile()
+    return compiled.memory_analysis().temp_size_in_bytes
+
+
+@COMPILES_ON_CPU
+def test_a_stack_of_layers_holds_no_launchs_accumulator_past_its_own_layer():
+    """Two checkpointed layers' training step on a compile-only H100 holds no more temporaries than one
+    layer's step and the second layer's input it saves for its backward: each backward launch's in-place
+    accumulators its own (`launches.filled`), made before it and freed after it. Where every layer's equal
+    zeros were one value to XLA, the step held the shared buffer across both layers' backwards (269 MB
+    against one layer's 179 MB; the 4B's split-1 step, 805 MB across 28 layers)."""
+    batch, tokens, heads, _, width, _ = STACK
+    saved = batch * tokens * heads * width * jnp.dtype(jnp.bfloat16).itemsize
+    assert _stack_temp(2) <= _stack_temp(1) + saved

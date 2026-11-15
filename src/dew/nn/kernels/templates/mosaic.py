@@ -158,12 +158,15 @@ def stacked_groups(shapes: Sequence[tuple[int, ...]]) -> tuple[tuple[int, ...], 
     return tuple(tuple(group) for group in grouped.values())
 
 
-def stacked_zeros(shapes: Sequence[tuple[int, ...]], groups: tuple[tuple[int, ...], ...]) -> list:
+def stacked_zeros(shapes: Sequence[tuple[int, ...]], groups: tuple[tuple[int, ...], ...], anchor: jax.Array,
+                  *anchors: jax.Array) -> list:
     """Zeroed fp32 refs a launch adds into in place, one for each of `shapes`, a ref a group of one shape
     (`stacked_groups`), a leading axis of them: two refs of equal zeros are one value to XLA, which a
     dynamic-slice fusion wrapping the launch passes once for both aliased operands, so both were one buffer
-    (row 3180; `checked` refuses two such refs)."""
-    return [jax.new_ref(jnp.zeros((len(group), *shapes[group[0]]), jnp.float32)) for group in groups]
+    (row 3180; `checked` refuses two such refs); each bound to the launch's operands, `anchor` and `anchors`
+    (`launches.filled`), so no other launch's zeros are its."""
+    return [jax.new_ref(launches.filled((len(group), *shapes[group[0]]), jnp.float32, anchor, *anchors))
+            for group in groups]
 
 
 def stacked_views(refs, groups: tuple[tuple[int, ...], ...]) -> list:
@@ -1180,13 +1183,17 @@ class Issuer[Accumulator](abc.ABC):
         accumulator is a ref scopes (wgmma's)."""
         return issue(self.zeros(shape))
 
-    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple) -> tuple[Callable, ...]:
+    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False
+                        ) -> tuple[Callable, ...]:
         """Groups of products none of which reads another's sum, each `issues[i](acc) -> acc` into a fresh
         fp32 accumulator of `shapes[i]`: a reader of each group's value, which its caller calls where it uses
         it, so no more sums are held in registers at once than it reads together. Where the issuer awaits its
         products (tensor memory's), every group is issued before any is awaited, one wait for them all, and a
-        reader reads its group's accumulator (`Tcgen05ChunksIssuer`'s); elsewhere a reader sums its group
-        where it is read (`summed`), in the caller's order."""
+        reader reads its group's accumulator (`Tcgen05ChunksIssuer`'s); `apart`, each group's products
+        awaited before the next group issues, as groups that stage their operands into shared tiles need (a
+        group's staging would overwrite a tile another group's product in flight reads). Elsewhere a reader
+        sums its group where it is read (`summed`), in the caller's order, each group done before the next."""
+        del apart
         return tuple(functools.partial(self.summed, shape, issue)
                      for shape, issue in zip(shapes, issues, strict=True))
 
