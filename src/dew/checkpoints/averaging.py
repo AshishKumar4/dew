@@ -43,8 +43,8 @@ def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None =
     (`SavedRun.at`, with `trust`), and `ema` as its loaders read them (`averaged_pinned`)."""
     from dew.inference.tasks import SavedRun
 
-    return averaged_pinned([SavedRun.at(str(epath.Path(run)), step, trust) for run in runs], ema=ema,
-                           mesh=mesh, layout=layout)
+    return averaged_pinned([SavedRun.at(str(epath.Path(run)), step, trust, mesh=mesh, layout=layout)
+                            for run in runs], ema=ema, mesh=mesh, layout=layout)
 
 
 def averaged_pinned(runs: Sequence[SavedRun], *, ema: bool | None = None, mesh=None, layout=None) -> Averaged:

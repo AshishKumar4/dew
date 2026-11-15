@@ -779,10 +779,14 @@ class Trainer(Generic[Loss, Effects]):
         `__main__` or a function, or holding what no record carries) still checkpoints: the record says
         why, a loader raises that, and the first checkpoint warns it. Any other error is the record's own
         bug, and raises."""
+        from dew.interop.saved_sources import with_release_sources
+
         artifact: JSON
         reason = None
         try:
-            artifact = self.objective.inference_record()
+            # The releases of saved runs its paths lie within, each mapped to the saved run it holds, so a
+            # host lacking one writes its own (`dew.interop.saved_sources.with_release_sources`).
+            artifact = with_release_sources(self.objective.inference_record())
         except Unrecordable as error:
             reason = f"{type(self.objective).__name__}: {error}"
             artifact = {'unrecorded': reason}

@@ -523,8 +523,8 @@ def pinned_classes() -> list[str]:
             ([cpu] if isinstance(cpu, dict) else cpu or [])]
 
 
-def reusable(python: str, rows: list[tuple[str, str]], common: str,
-             missed: dict[str, int]) -> dict[tuple[str, str], str]:
+def reusable(python: str, rows: list[tuple[str, str]], common: str, missed: dict[str, int],
+             last_inputs: dict[tuple[str, str], list[str]] | None = None) -> dict[tuple[str, str], str]:
     """The rows of `rows` (each a file and its group, "" for the whole file) that ran green on exactly these
     inputs (`common`, and each file's own, `fresh`) on any class the tasks run on (`pinned_classes`), which a
     task of theirs could land on, read at plan time with the cache's read token (`READ_TOKEN`): a task of
@@ -547,7 +547,8 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str,
         name, group = each_row
         for each in held:
             found = green_record(python, name, group, common, token, [each], reading,
-                                 misses.setdefault(each_row, []))
+                                 misses.setdefault(each_row, []),
+                                 None if last_inputs is None else last_inputs.setdefault(each_row, []))
             # Kept only where its green run is kept by its key, as the task reads it.
             if found is not None and recorded(
                     green_key(python, row(python, name, group), each, found[0]["key"]), token) is not None:
@@ -638,7 +639,8 @@ def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[st
 
 
 def green_record(python: str, name: str, split: str, common: str, token: str, classes: list[str],
-                 reading: Reading | None, why: list[str]) -> tuple[dict, str] | None:
+                 reading: Reading | None, why: list[str],
+                 inputs: list | None = None) -> tuple[dict, str] | None:
     """The record of test file `name`'s row (in `split`'s group) that ran green on exactly these inputs on one
     of `classes`, the first found, with its class; else None. The plan (`reusable`) and a task (`reused`) read
     it alike, from one reading of the inputs (`Reading`). A row's key hashes the inputs its run executed, so
@@ -665,6 +667,8 @@ def green_record(python: str, name: str, split: str, common: str, token: str, cl
         # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of exactly
         # these, kept by that key (`green_key`) whatever ran since; why it was not, the class's word.
         recorded_set = None if found is None else found["depends"]
+        if inputs is not None and not inputs and found is not None and (found.get("read") or recorded_set):
+            inputs.extend(found.get("read") or recorded_set)
         key = None if recorded_set is None else cache_key(common, name, split, recorded_set, reading)
         why.append(records.missed(found, key, current))
         if key is not None:
@@ -1140,7 +1144,7 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
     return entries
 
 
-def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
+def plan(target: float, timings: dict, census: bool = False, reach: dict | None = None) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has timed
     runs alone, so however long it takes it holds up no other file, and its time is known from then on. Files
     marked `torchax` (`APART`) share tasks only with one another. Each entry carries the test cache's policy,
@@ -1187,7 +1191,10 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
             (name, group) for name, cut in groups.items() for group, _ in cut] + [
             (name, test) for name, held in marked.items() for test in held]
         missed: dict[str, int] = {}
-        found = reusable(python, rows_of, shared(python), missed) if cache != "off" else {}
+        last: dict[tuple[str, str], list[str]] = {}
+        found = reusable(python, rows_of, shared(python), missed, last) if cache != "off" else {}
+        if reach is not None:  # reach.py's: the rows, those kept (None off "on"), their last inputs
+            reach[python] = (rows_of, found if cache == "on" else None, last)
         print(f"plan: {python}: kept {len(found)} of {len(rows_of)}; not kept: {missed}", file=sys.stderr)
         # A lookup a row, in seconds: a kept task's weight is its container's start and those lookups.
         tasks: list[tuple[list[tuple[str, str]], float]] = [
@@ -1819,7 +1826,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
     row has none, so a later run never reuses an earlier green row of its file; nor has one that read a file
     the task's processes wrote (`changed`, `watched.changed`), whose key would hash the bytes they left, not
     those it read (row 2559). A check-1 site's judge keeps its map tasks' inputs with its own
-    (`site_inputs`)."""
+    (`site_inputs`). A row whose key keeps no inputs keeps what its run read (`read`, reach.py's)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return
@@ -1832,6 +1839,9 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
         ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
+        site = session.SITE.fullmatch(parsed_row(row_["name"])[2])  # a check-1 judge reads not as its site
+        read = (None if ran["depends"] is None or (site is not None and site["start"] is None) else
+                sorted({*ran["depends"], *(opened or ())}))
         if ran["depends"] is not None:
             inputs = None if opened is None else sorted({*ran["depends"], *opened})
             ran = {**ran, "depends": None if inputs is None or wrote_inputs(inputs, changed) else inputs}
@@ -1858,6 +1868,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             current = begun(python, row_["name"], held, common, token, fresh_only=True)
         body = json.dumps({"key": key,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
+                           **({"read": read} if ran["depends"] is None and read is not None else {}),
                            "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"],
                            "epoch": current}).encode()
         # The record under these inputs, which `reused` reads, and the last run's, which the GPU tier and
