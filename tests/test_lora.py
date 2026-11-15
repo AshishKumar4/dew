@@ -710,7 +710,7 @@ def test_a_lora_run_served_quantized_decodes_with_its_trained_factors(decoder, l
 
     task = TextGeneration.from_run(str(tmp_path / "run"), ema=False)
     served = task.quantized(Quantization())
-    drawn = served(tokens[:1, :4], 4, key=0)
+    drawn = served(tokens[:1, :4], 4, key=0, n=1)
     assert np.asarray(drawn.tokens).shape == (1, 8)
     factors = {name: leaf for name, leaf in flat_tree(thaw(task.variables)).items()
                if name.rsplit(".", 1)[-1] in lora.FACTORS}
