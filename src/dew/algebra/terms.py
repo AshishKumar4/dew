@@ -311,6 +311,9 @@ class Region[Node: (Term, Skeleton)]:
     """Each literal's term's key (`literals`' terms)."""
     indexed: dict[Hashable, int] = dataclasses.field(default_factory=dict)
     """Each interned entry of `params` by what makes two entries one (`interned`)."""
+    held: dict[jcore.Var, Magnitude | None] = dataclasses.field(default_factory=dict)
+    """Each value's magnitude (`magnitudes`') by the jaxpr's variable that names it: what a window cut from
+    the jaxpr declares of its inputs (`dew.algebra.program._windowed`)."""
     extents: dict[Hashable, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
@@ -659,7 +662,8 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     stock = {name: param(primitive, values) for name, (primitive, values) in stocked().items()}
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
                   max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products,
-                  frozenset(key(forms.literal(index)) for index in range(len(literals))), indexed)
+                  frozenset(key(forms.literal(index)) for index in range(len(literals))), indexed,
+                  {var: magnitudes.get(key(node)) for var, node in env.items()})
 
 
 BOUNDED = _symbols(lambda operation: operation.bounded)
