@@ -243,11 +243,11 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
                     gated = family.columns_of(beta_ref.at[h, span]) if call.gated_keys else None
                     scored = algebra.chunk_scores(
                         queries.__getitem__, keys.__getitem__, width // call.block, gate, low, held.dtype,
-                        Issuer(call), laid=laid, column_scale=gated)
+                        Issuer(call).summed, laid=laid, column_scale=gated)
                     operands.staged(family, scored, staged)
 
                 out = algebra.chunk_output(queries.__getitem__, entered, width // call.block, gate, low,
-                                           Parts(staged, held.dtype), value, scale, Issuer(call))
+                                           Parts(staged, held.dtype), value, scale, Issuer(call).summed)
             if skip_ref:
                 out = out + skip_ref[0][h] * value.value().astype(jnp.float32)
             view = o_ref.at[span, pl.ds(h * value_width + index * bv, bv)]
