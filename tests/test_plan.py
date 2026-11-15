@@ -474,14 +474,21 @@ def test_a_step_compiled_ahead_is_profiled_on_a_trial_under_autopgle(tmp_path, s
     beside it, where its compile is given no trials, which the caller then steps as a run without
     AutoPGLE does; and under `fit`, whose admission keeps its first fitting plan
     and profiles it all the same. XLA's profile of a CPU holds nothing, so each plan keeps the executable
-    it admitted."""
+    it admitted and steps as the run without AutoPGLE does, bit for bit; a GPU's holds its program's
+    timings, some bytes whose count is the profile's own (89 and 278 on an H100, row 4990), and its run
+    steps through the program the profile guides, another program."""
     unguided, _ = stepped(lm(split=split))
     with autopgle(2):
         trainer, fitted = lm(split=split), windowed(tmp_path, split)
         guided, _ = stepped(trainer)
         fitted.fit(windows(token_files(tmp_path)), steps=1, checkpoint_every=None)
-    assert trainer.plan["pgle"] == fitted.plan["pgle"] == {"runs": 2, "bytes": 0}
+    profiles = [trainer.plan["pgle"], fitted.plan["pgle"]]
+    assert [profile["runs"] for profile in profiles] == [2, 2], profiles
     assert int(guided.step) == 3
+    if jax.default_backend() != "cpu":
+        assert all(profile["bytes"] for profile in profiles), profiles
+        return
+    assert [profile["bytes"] for profile in profiles] == [0, 0], profiles
     for guided_leaf, unguided_leaf in zip(jax.tree.leaves(guided.variables),
                                           jax.tree.leaves(unguided.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(guided_leaf), np.asarray(unguided_leaf))
