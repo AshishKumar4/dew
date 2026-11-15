@@ -139,8 +139,8 @@ def test_a_routed_or_hybrid_model_writes_its_release_from_its_own_fields_and_rea
 def test_a_decoders_layout_traces_its_parameters_once_a_record():
     """Every writer asks `source_layout` of the model it writes (a decision format, a bundle, its export,
     each draw of a parity rule): a decoder's parameter tree is traced once whatever module holds its
-    record (each trace a miss of `_abstract_variables`, whose body is the trace), and a decoder of another
-    record traces its own."""
+    record (each trace a miss of `_abstract_variables`, whose body is the trace), a decoder of another
+    record traces its own, and one no record carries is traced uncached."""
     from dew.interop import layouts
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -153,6 +153,9 @@ def test_a_decoders_layout_traces_its_parameters_once_a_record():
     assert layouts._abstract_variables.cache_info().misses == 1
     deeper = source_layout(decoder.clone(num_layers=4))
     assert deeper and deeper.config["num_hidden_layers"] == 4
+    assert layouts._abstract_variables.cache_info().misses == 2
+    # A decoder no run record carries (a NumPy scalar field) has no record to key it by: traced uncached.
+    assert source_layout(decoder.clone(dropout_rate=np.float32(0.1)))
     assert layouts._abstract_variables.cache_info().misses == 2
 
 
