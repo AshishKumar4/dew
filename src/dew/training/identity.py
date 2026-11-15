@@ -622,17 +622,27 @@ def _file(name: str) -> Path:
 
 def _own_source(name: str | None) -> bool:
     """Whether the module `name` is a user's own code: loaded from a file no distribution versions and
-    Dew's digest does not hold (`Process.sources`), or the script the process runs."""
+    Dew's digest does not hold (`Process.sources`), or the script the process runs. Read once a loaded
+    module (`_OWN`): a module loaded again is read again."""
     if name == "__main__":
         return getattr(sys.modules[name], "__file__", None) is not None
     if name is None or name not in sys.modules:
         return False
+    module = sys.modules[name]
+    held = _OWN.get(name)
+    if held is not None and held[0] is module:
+        return held[1]
     path = _recorded(name)
-    if path is None:
-        return False
-    placed = _within(path, _installed())
-    owned = placed and name.partition(".")[0] in _distributed()
-    return not owned and (placed or not _within(path, _standard()))
+    placed = path is not None and _within(path, _installed())
+    own = path is not None and not (placed and name.partition(".")[0] in _distributed()) and (
+        placed or not _within(path, _standard()))
+    _OWN[name] = (module, own)
+    return own
+
+
+_OWN: dict[str, tuple[object, bool]] = {}
+"""Each loaded module's verdict (`_own_source`) beside the module it was read of: a program's identity
+asks it of every function it states, its file's path resolved and placed each time (13% of a small fit)."""
 
 
 @functools.cache
