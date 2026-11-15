@@ -1673,40 +1673,38 @@ def _reverse_walk_certified(op=None) -> list:
     return _step_certified('sm100', 1, packed=False, op=op)
 
 
-def _certifications_of(certified: list, kernel: str) -> list:
-    """Those of `certified` that compiled `kernel`."""
-    return [each for each in certified if any(binary.kernel == kernel for _, binary in each.kernels.values())]
-
-
-class AtTheLeast(type(template.MOSAIC)):
-    """The template with every launch's first config at setmaxnreg's least producer, as it was before a
-    derivation asked its consumers' stated share first (`Mosaic._stated`): a ladder a cell walks."""
-
-    def _stated(self, ba, tiles, target):
-        return tiles
+def _certified_bodies(certified: list, kernel: str) -> list:
+    """`kernel`'s bodies `certified` compiled (each distinct module once, in order) with the binary its
+    certification read of each."""
+    found: dict[str, object] = {}
+    for each in certified:
+        for module, binary in each.kernels.values():
+            if binary.kernel == kernel:
+                found.setdefault(module, binary)
+    return list(found.items())
 
 
 @lowers('sm100')
-def test_a_reverse_walk_starts_in_one_certification_unspilled():
-    """The 4B training step on a compile-only B200 (`_reverse_walk_certified`) certifies its reverse walk
-    once, the kernel it keeps unspilled: the walk's first config gives its consumers what their statement
-    holds and its producer the rest (`Mosaic._stated`). At the least the producer spilled 40 bytes and the
-    walk took a second certification; from the ladder's foot up, eight, 95 s of the 4B's cold start."""
+def test_a_reverse_walk_starts_in_two_certifications_unspilled():
+    """The 4B training step on a compile-only B200 (`_reverse_walk_certified`) certifies its reverse walk at
+    most twice, the kernel it keeps unspilled: spilling 40 bytes at its producer's least, it takes its
+    consumers' statement's share next (`resources.stated_producer`). From the ladder's foot up it took eight,
+    95 s of the 4B's cold start."""
     certified, _ = _reverse_walk_certified()
-    walked = _certifications_of(certified, 'recurrence_reverse')
-    assert len(walked) == 1 and not walked[0].refused, walked
+    bodies = _certified_bodies(certified, 'recurrence_reverse')
+    assert len(bodies) <= 2 and not bodies[-1][1].refused, bodies
 
 
 @lowers('sm90')
-def test_a_training_steps_output_walk_starts_in_one_certification_unspilled():
+def test_a_training_steps_output_walk_starts_in_two_certifications_unspilled():
     """The 4B training step over four packed rows on a compile-only H100 (`_step_certified`) certifies its
-    output walk once, the kernel it keeps unspilled. With its producer at the least, the walk's consumers,
-    raised to the whole pool, spilled its tile index around the scores' warpgroup MMAs where their
-    statement's share held, and its start took ten certifications in three rounds to the share it holds
-    (row 6743)."""
+    output walk at most twice, the kernel it keeps unspilled: with its consumers raised to the whole pool
+    beside the least producer, ptxas spilled the walk's tile index around the scores' warpgroup MMAs, which
+    their statement's share holds, the rung it takes next. From the top down its start took ten certifications
+    in three rounds (row 6743)."""
     certified, _ = _step_certified('sm90', 4, packed=True)
-    walked = _certifications_of(certified, 'recurrence_output')
-    assert len(walked) == 1 and not walked[0].refused, walked
+    bodies = _certified_bodies(certified, 'recurrence_output')
+    assert len(bodies) <= 2 and not bodies[-1][1].refused, bodies
 
 
 @lowers('sm90')
@@ -1738,7 +1736,7 @@ def test_a_launch_past_its_ladders_foot_is_certified_at_a_program_fewer():
     assert held == [2], walked
 
 
-TOP_RUNG_LOWERED = """
+RUNG_LOWERED = """
 import collections, json
 from jax._src import monitoring
 from dew.training.runtime import ready_process
@@ -1748,26 +1746,26 @@ served = collections.Counter()
 monitoring.register_event_listener(
     lambda event, **_: served.update([event.rsplit("/", 1)[-1]]) if "lowering_cache" in event else None)
 ready_process()
-certified, _ = gate._reverse_walk_certified(gate.AtTheLeast())
+certified, _ = gate._reverse_walk_certified()
 print(json.dumps({"served": dict(served), "kernels": [len(each.kernels) for each in certified],
                   "raised": [each.config.producers.of("recurrence_reverse") for each in certified]}))
 """
 """A process configured as a run's (`ready_process`: its compilation cache and its kernels' lowerings kept
-beside it) certifying the 4B reverse walk from its producer's least (`_reverse_walk_certified`,
-`AtTheLeast`), which spills there and takes its ladder's top: the lowering cache's hits and misses, each
-certification's kernels and its reverse walk's producer."""
+beside it) certifying the 4B reverse walk (`_reverse_walk_certified`), which spills at its producer's least
+and takes its ladder's next rung: the lowering cache's hits and misses, each certification's kernels and its
+reverse walk's producer."""
 
 
 @lowers('sm100')
-def test_a_ladders_top_reads_every_kernel_but_the_raised_one_from_the_lowering_cache(tmp_path):
-    """In a process that keeps its lowerings as a run does (`TOP_RUNG_LOWERED`), the reverse walk's top
+def test_a_ladders_rung_reads_every_kernel_but_the_raised_one_from_the_lowering_cache(tmp_path):
+    """In a process that keeps its lowerings as a run does (`RUNG_LOWERED`), the reverse walk's next
     rung lowers only the kernel its producer changed: every other kernel of the launch is the module it was
     at the floor (its identity, `report.named`), read back from the Pallas lowering cache, whose key holds no
     caller metadata (Dew's JAX build, post93). Named by their launch's whole config, each rung lowered all
     nine of the launch's kernels again in Python."""
     from process_support import fresh
 
-    found = fresh(TOP_RUNG_LOWERED, cache_dir=tmp_path / "cache", platforms="cpu")
+    found = fresh(RUNG_LOWERED, cache_dir=tmp_path / "cache", platforms="cpu")
     assert found["raised"][1:] and found["raised"][-1] is not None, found
     assert found["served"].get("hit", 0) >= found["kernels"][-1] - 1, found
 
@@ -1842,7 +1840,7 @@ def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
     certification could not read (`report.certified`'s None)."""
     from dew.nn.kernels.templates import resources
 
-    class PastItsTop(AtTheLeast):
+    class PastItsTop(type(template.MOSAIC)):
         def rungs(self, ba, config):
             for cap in (232, 128):
                 yield template._limited(config, producers=resources.Producers((('recurrence_reverse', cap),)),

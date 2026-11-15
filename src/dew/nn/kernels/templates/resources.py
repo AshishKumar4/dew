@@ -66,19 +66,22 @@ class Producers:
         return dict(self.raised_to).get(launch)
 
     def stepped(self, tops: Mapping[str, int], stated: Mapping[str, int]) -> "Producers | None":
-        """These, with each of `tops`' launches' producers at the next rung of its ladder, which runs from its
-        top down a setmaxnreg step at a time to a step above the least: an unraised producer, or one at its
-        `stated` cap (its consumers' statement's, `stated_producer`, the first a derivation asks), to its top
-        (its program's entry share, where every role holds the same and no register moves: past it the roles'
-        setmaxnreg moves invert, the producer's drop a rise, and the assembler rejects the kernel), a raised
-        one a step lower, past its stated cap, asked already; None where one is a step above the least
-        already, or its top is not above it."""
+        """These, with each of `tops`' launches' producers at the next rung of its ladder: from the least, its
+        `stated` cap (where its consumers' statement leaves the producer more than the least,
+        `stated_producer`), then its top (its program's entry share, where every role holds the same and no
+        register moves: past it the roles' setmaxnreg moves invert, the producer's drop a rise, and the
+        assembler rejects the kernel), then down a setmaxnreg step at a time past the stated cap, asked
+        already, to a step above the least; None where one is a step above the least already, or its top is
+        not above it."""
         steps, held = facts().raises(), dict(self.raised_to)
         for launch, top in tops.items():
             cap, start, first = held.get(launch), min(top, steps.highest), stated.get(launch)
-            lower = start if cap is None or cap == first != start else cap - steps.step
-            if lower == first != start:
-                lower -= steps.step
+            if cap is None:
+                lower = start if first is None else first
+            else:
+                lower = start if cap == first != start else cap - steps.step
+                if lower == first != start:
+                    lower -= steps.step
             if lower <= steps.lowest:
                 return None
             held[launch] = lower
@@ -695,12 +698,13 @@ def stated_producer(registers: int | None, warpgroups: int, consumers: int, prog
     its stated `registers` a thread (a program of `warpgroups` warpgroups, `programs` of it a multiprocessor):
     the most of setmaxnreg's steps below the program's entry share that leaves the consumers that many
     (`consumer_registers`), the rest of the pool the producer's; None where none above the least does, or the
-    registers are unstated. Raised to the whole pool beside the least, consumers are planned past their need,
-    where ptxas's own allocation spilled what their statement's share held: the 4B gated delta net's training
-    forward's output walk on an H100, stated at 176 of a two-warpgroup program held two to a multiprocessor,
-    spilled its tile index at 232 and 216 and held from 208 down to 176 (jsf-out4bcaps); and a producer at the
-    least spilled what the rest of the pool held: its reverse walk on a B200, stated at 149, spilled 40 bytes
-    at the least and none from 80 up (jsf-revcaps)."""
+    registers are unstated. A launch spilling at the least takes it before its top: the 4B gated delta net's
+    training forward's output walk on an H100, stated at 176 of a two-warpgroup program held two to a
+    multiprocessor, spilled its tile index with its consumers at 232 and 216 and held from 208 down to 176
+    (jsf-out4bcaps), and its reverse walk on a B200, stated at 149, spilled 40 bytes with its producer at the
+    least and none from 80 up (jsf-revcaps). Not before the least: a statement short of what ptxas holds
+    spills at its share where the least holds (a B200's recurrence_solved and recurrence_output, an H100's
+    recurrence_scores_back, jsf-theme-cells)."""
     if registers is None:
         return None
     steps = facts().raises()
