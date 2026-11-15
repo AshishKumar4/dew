@@ -170,6 +170,38 @@ def test_a_plain_programs_product_runs_the_template_its_call_names(layer, forms)
     assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in passed)
 
 
+def test_a_starts_forward_nothing_reads_is_never_written_as_a_kernel():
+    """A start-like program (row 6783): a region that makes a parameter and computes a grouped product from
+    it, as a flax init's block makes its parameters inside its forward (here a checkpointed one), the
+    product's result read by nothing. Through `dew.jit` on an H100 whose template a call names, no route is
+    taken and no launch traced for it, so nothing of it is certified or built; the same program reading the
+    product runs the template's launch."""
+    import dew
+    from dew.nn.kernels import tuning
+
+    def start(read: bool):
+        def program(x, w, bias, other):
+            def block(x, w):
+                made = w * 2
+                return made, grouped(x, made, bias, other)
+
+            made, out = jax.checkpoint(block)(x, w)
+            return (made, out) if read else made
+        return program
+
+    operands = draw()
+    taken = []
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        for read in (True, False):
+            with generation.routes() as found, tuning.seen() as launches:
+                dew.jit(start(read)).trace(*operands)
+            took = any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in found)
+            taken.append((took, len(launches)))
+    (read, launched), (unread, unlaunched) = taken
+    assert read and launched
+    assert not unread and not unlaunched
+
+
 def test_a_steps_relowering_traces_none_of_its_written_regions_again():
     """A step lowered again in one process (a planner's candidate, a relowering after a launch spilled: each
     lowering's records fresh, so JAX traces the step again) writes its regions from the traces its first
