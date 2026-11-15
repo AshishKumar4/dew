@@ -225,8 +225,11 @@ CHECK1_SHARDS = "CHECK1_SHARDS"
 def declared(tree: ast.Module, found: dict[str, tuple[str, dict[str, int], int]], read: set[int]) -> None:
     """The sites of a test file's module-level `CHECK1_SHARDS` literal, {"test[id]": {"seeds": S,
     "per_task": P}} (its parsed `tree`), into `found`: each of a literal id, its counts above zero, the
-    dict's line its line; and the marks its code builds from it, `pytest.mark.check1_shards(**...)`,
-    counted `read`, as the dict states their counts. An entry otherwise refuses the file, naming it."""
+    dict's line its line; and the marks its code builds from it, `pytest.mark.check1_shards(**...)` whose
+    counts come from the dict (`drawn_from`), counted `read`, as the dict states their counts. An entry
+    otherwise refuses the file, naming it, as does a mark built from counts of its own: CI's selection sets
+    every marked test aside, and no site would plan it (row 6595: `**{"seeds": 128, ...}` beside an empty
+    dict left a test unrun)."""
     literal = next((node for node in tree.body if isinstance(node, ast.Assign) and [
         target.id for target in node.targets if isinstance(target, ast.Name)] == [CHECK1_SHARDS]), None)
     if literal is None:
@@ -248,8 +251,35 @@ def declared(tree: ast.Module, found: dict[str, tuple[str, dict[str, int], int]]
         found[site] = ("check1_shards", counts, literal.lineno)
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and ast.unparse(node.func).endswith("mark.check1_shards")
-                and not node.args and [keyword.arg for keyword in node.keywords] == [None]):
+                and not node.args and [keyword.arg for keyword in node.keywords] == [None]
+                and drawn_from(node.keywords[0].value, tree)):
             read.add(id(node.func))
+
+
+def drawn_from(counts: ast.expr, tree: ast.Module) -> bool:
+    """Whether expression `counts` (a built mark's `**` argument) is drawn from the file's `CHECK1_SHARDS`:
+    it names the dict, or a name some assignment in the file binds to an expression drawn from it, followed
+    through names (`held = shards.get(...)`, `shards = CHECK1_SHARDS if ... else shards`)."""
+    bound: dict[str, list[ast.expr]] = {}
+    for node in ast.walk(tree):
+        # Each binding's names to what it binds them from: an assignment's value, a loop's or a
+        # comprehension's iterable (`for form, counts in held.items()`).
+        pairs = ([(target, node.value) for target in node.targets] if isinstance(node, ast.Assign) else
+                 [(node.target, node.iter)] if isinstance(node, ast.For | ast.comprehension) else
+                 [(node.target, node.value)] if isinstance(node, ast.NamedExpr) else [])
+        for target, value in pairs:
+            for name in (each.id for each in ast.walk(target) if isinstance(each, ast.Name)):
+                bound.setdefault(name, []).append(value)
+    seen: set[str] = set()
+    pending = [counts]
+    while pending:
+        for name in (each.id for each in ast.walk(pending.pop()) if isinstance(each, ast.Name)):
+            if name == CHECK1_SHARDS:
+                return True
+            if name not in seen:
+                seen.add(name)
+                pending.extend(bound.get(name, []))
+    return False
 
 
 def site_name(node: str, sites: Container[str]) -> str:
