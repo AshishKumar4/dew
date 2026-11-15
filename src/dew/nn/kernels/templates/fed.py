@@ -38,7 +38,8 @@ class Feed:
 
     @property
     def stages(self) -> int:
-        return min(ring.stages for ring in self.rings.values())
+        # A walk whose every operand is a once stream rotates no ring: one step deep, as `_walked` takes it.
+        return min((ring.stages for ring in self.rings.values()), default=1)
 
     def load(self, index) -> None:
         for name, ring in self.rings.items():

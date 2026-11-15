@@ -1707,8 +1707,10 @@ class Transport[Allocated, Opened](abc.ABC):
     def held_once(self, allocated: Allocated, views: dict, once: Allocated, once_views: dict
                   ) -> tuple[Opened, dict, dict]:
         """`walked_once`'s streams where the walk has once streams: by default folded into its walked ones
-        (`folded`), each step's block the one block."""
-        merged = {**views, **once_views}
+        (`folded`), each step's block the one block, its view's at step zero (`loaded_once`'s)."""
+        firsts = {name: (ref, lambda step, index=index: index(0))
+                  for name, (ref, index) in once_views.items()}
+        merged = {**views, **firsts}
         return self.opened(self.folded(allocated, once), merged), merged, {}
 
     def folded(self, allocated: Allocated, once: Allocated) -> Allocated:

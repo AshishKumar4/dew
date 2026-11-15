@@ -1822,11 +1822,17 @@ def test_a_product_issued_within_a_staged_block_is_refused():
         mosaic.committed()
 
 
-def _walked_once(x, w, *, family, interpret):
+ONCE_BUNDLES = [pytest.param("wgmma", marks=INTERPRETS), pytest.param("fed", marks=INTERPRETS), "mxu"]
+"""The ways a family walks a once stream: held beside a ring, held by a consumer-fed bundle's loader, and a
+TPU core's fold, its kernels interpreted on any host."""
+
+
+def _walked_once(x, w, *, family, interpret, all_once=False):
     """`x[:, :PERSISTED_DEPTH] @` the sum of `w`'s `PERSISTED_STEPS` step blocks through one plain walk
-    (`Transport.run`) on `family`'s roles: `x`'s first block a once stream (`Walk.once`), loaded once outside
-    the ring and read by every step beside `w`'s ringed blocks, the walk's sums read out after its last
-    step (`Walk.read`)."""
+    (`Transport.run`) on `family`'s roles: `x`'s block a once stream (`Walk.once`), its view's at step zero
+    though its index map moves with the step, loaded once outside the ring and read by every step beside
+    `w`'s ringed blocks, the walk's sums read out after its last step (`Walk.read`). `all_once`, `w`'s first
+    block a once stream too: every step reads the two once blocks, and the walk rotates no ring."""
     rows, columns = family.rows, w.shape[1]
     family = family.specialized(rows, columns)
     shape = (rows, columns)
@@ -1838,12 +1844,17 @@ def _walked_once(x, w, *, family, interpret):
                 for first, (value,) in family.chunks(sums):
                     o_gmem[:, pl.ds(first, value.shape[1])] = value
 
-            walk = mosaic.Walk({'w': (w_gmem, lambda j: (j, 0))}, _multiplying(family, 'x', 'w', interpret),
-                               steps=PERSISTED_STEPS, sums=(shape,), read=read,
-                               once={'x': (x_gmem, lambda j: (0, 0))})
+            once = {'x': (x_gmem, lambda j: (0, j))}
+            views = {'w': (w_gmem, lambda j: (j, 0))}
+            if all_once:
+                once, views = {**once, **views}, {}
+            walk = mosaic.Walk(views, _multiplying(family, 'x', 'w', interpret), steps=PERSISTED_STEPS,
+                               sums=(shape,), read=read, once=once)
             family.run(streams["walked"], walk, interpret, once=streams["once"])
 
         ringed, held = {'w': ((PERSISTED_DEPTH, columns), w.dtype)}, {'x': ((rows, PERSISTED_DEPTH), x.dtype)}
+        if all_once:
+            ringed, held = {}, {**held, **ringed}
         family.scoped(scope, streams={"walked": family.streams(ringed, 2, 1),
                                       "once": family.streams(held, 1, 1)})
 
@@ -1852,23 +1863,45 @@ def _walked_once(x, w, *, family, interpret):
                          interpret=interpret, name="walked_once")(x, w)
 
 
-@INTERPRETS
-@pytest.mark.parametrize("bundle", ["wgmma", "fed"])
+@pytest.mark.parametrize("bundle", ONCE_BUNDLES)
 def test_a_walks_once_stream_loads_once_and_every_step_reads_it(bundle):
-    """Interpreted: a plain walk whose left operand is a once stream (`Walk.once`), on each way a family
-    holds one: warpgroup MMA's producer loading it beside the ring, and its consumer-fed bundle's loading
-    consumer before the walk (`fed.ConsumerFed.taken_once`); every step reads it with its own ringed
+    """Interpreted: a plain walk whose left operand is a once stream (`Walk.once`), its index map moving with
+    the step, on each way a family holds one: warpgroup MMA's producer loading it beside the ring, its
+    consumer-fed bundle's loading consumer before the walk (`fed.ConsumerFed.taken_once`), and a TPU core
+    folding it into its walked streams (`folded`); every step reads its step-zero block with its own ringed
     block, so the walk sums that block times every step's: exactly, small integers in fp32. (tcgen05's plain
     walks' accumulators are their persist's or their launch's tensor memory, which this one scopes none of;
     mma.sync's pipeline refuses a once stream, `test_a_cp_async_walk_refuses_a_once_stream`.)"""
-    from dew.nn.kernels.templates import mosaic_sm90
-    family, target = {"wgmma": (mosaic_sm90.WGMMA, "sm90"), "fed": (mosaic_sm90.FED, "sm90")}[bundle]
+    family, target, interpret = _once_bundle(bundle)
     x, w = _persisted_operands(family.rows)
     x = x[:family.rows]
     with generation.assumed(target):
-        got = np.asarray(_walked_once(x, w, family=family, interpret=INTERPRETED))
+        got = np.asarray(_walked_once(x, w, family=family, interpret=interpret))
     blocks = np.asarray(w, np.float32).reshape(PERSISTED_STEPS, PERSISTED_DEPTH, -1).sum(axis=0)
     np.testing.assert_array_equal(got, np.asarray(x, np.float32)[:, :PERSISTED_DEPTH] @ blocks)
+
+
+@pytest.mark.parametrize("bundle", ONCE_BUNDLES)
+def test_a_walk_whose_every_operand_is_a_once_stream_reads_them_at_each_step(bundle):
+    """Interpreted: a plain walk of two operands both once streams, no ring to rotate (a consumer-fed
+    bundle's loading consumer one step deep, as a ring family's walk is): every step reads the two step-zero
+    blocks, so the walk sums their product once a step."""
+    family, target, interpret = _once_bundle(bundle)
+    x, w = _persisted_operands(family.rows)
+    x = x[:family.rows]
+    with generation.assumed(target):
+        got = np.asarray(_walked_once(x, w, family=family, interpret=interpret, all_once=True))
+    first = np.asarray(x, np.float32)[:, :PERSISTED_DEPTH] @ np.asarray(w, np.float32)[:PERSISTED_DEPTH]
+    np.testing.assert_array_equal(got, PERSISTED_STEPS * first)
+
+
+def _once_bundle(bundle: str):
+    """`bundle`'s family, the target it is assumed on, and how its kernel is interpreted: a GPU family's by
+    Mosaic GPU's interpreter, a TPU core's by Pallas's."""
+    from dew.nn.kernels.templates import mosaic_sm90, mosaic_tpu
+    if bundle == "mxu":
+        return mosaic_tpu.MXU, "v5e", True
+    return {"wgmma": mosaic_sm90.WGMMA, "fed": mosaic_sm90.FED}[bundle], "sm90", INTERPRETED
 
 
 @INTERPRETS
