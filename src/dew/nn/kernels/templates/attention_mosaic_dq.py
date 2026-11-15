@@ -15,6 +15,7 @@ from dew.nn.kernels.templates import (
     attention_gradient as gradient,
     mosaic,
     mosaic_sm100,
+    outputs,
     placed,
     stores,
     swizzling,
@@ -26,6 +27,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _coords,
     _rows,
     _Spans,
+    column_share,
     held_params,
     issued_into,
     modelled,
@@ -359,8 +361,10 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after),
                       **products)
 
-    sums = jax.ShapeDtypeStruct((batch, queries, heads, share[1]), jnp.float32)
-    stats_shape = jax.ShapeDtypeStruct((rows_count, batch, heads, queries), jnp.float32)
+    # Its outputs as its query's axes (`outputs.Output`): dQ's share of the columns, and its rows' statistics.
+    rows, positions, heads_of = (outputs.axis(query, index) for index in range(3))
+    sums = outputs.output(jnp.float32, rows, positions, heads_of, column_share(query, share[1]))
+    stats_shape = outputs.output(jnp.float32, rows_count, rows, heads_of, positions)
     out = family.kernel(
         entry, out_type=(sums, sums, stats_shape) if walk.accurate else (sums, stats_shape),
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
