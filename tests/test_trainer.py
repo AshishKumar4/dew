@@ -1942,6 +1942,38 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     assert int(state.microstep) == 2 * accum
 
 
+
+class Targeted(Objective):
+    """A scalar `p` at 0 and the squared error of each row's `target`, the mean over its rows."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"p": jnp.zeros(())}}
+
+    def loss(self, variables, batch, step):
+        return jnp.square(batch["target"] - variables["params"]["p"]).mean(), Aux({})
+
+
+def test_a_split_step_whose_window_commits_before_its_last_part_logs_that_updates_loss():
+    """A step read in two microbatches whose window commits at its first part logs that update's loss, its
+    window pooled, not the step's own batch's (training.md, the logged loss): the first step's first part
+    overflows and is rejected, its second (target 1, loss 1) opens the window, the second step's first part
+    (target 3, loss 9) commits it at (1 + 9) / 2 = 5, and its second part (target 5) opens the next. The
+    step logged its own batch's (9 + 25) / 2 = 17 (spec alignment 2026-11-15, its first finding)."""
+    rows = 2 * jax.device_count()
+    trainer = Trainer(Targeted(), optax.sgd(0.0), key=jax.random.key(0), split=2, dynamic_scale=True)
+    state = trainer.initial_state()
+
+    def batch(first, second):
+        # A part reads every second row from its index (`transaction.example_places`).
+        return {"target": jnp.asarray([first, second] * (rows // 2), jnp.float32)}
+
+    step = trainer.compile(state, batch(1.0, 1.0))
+    state, _, _, _, accepted, _ = step(state, batch(1e20, 1.0))
+    assert not bool(accepted)
+    state, loss, _, _, _, committed = step(state, batch(3.0, 5.0))
+    assert int(committed.count) == 1
+    assert float(loss) == 5.0
+
 # --------------------------------------------------------------------------
 # The collections an objective writes back
 # --------------------------------------------------------------------------
