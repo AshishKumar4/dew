@@ -32,6 +32,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from arm_arithmetic import Truth
 from attention_oracle import exact_attention
 from reference_error import as_given, assert_as_exact, widened, with_gradients
 
@@ -1015,12 +1016,15 @@ def assert_finite(dew_fn, truth_fn, draw, label: str, *, seeds: int) -> None:
     """The stability rule's finiteness over `seeds` draws: each leaf of `dew_fn`'s outputs finite wherever the
     float64 truth (`truth_fn` on the inputs widened) rounded to the leaf's dtype is. A reference computing
     in the call's own dtype is no measure of it: fp16's written-out attention at `logits near 1e4` gives a
-    key gradient of -45376 where the truth's, -68612, rounds past fp16's largest (FS-F16-DK1)."""
-    truth_of = jax.jit(truth_fn)
+    key gradient of -45376 where the truth's, -68612, rounds past fp16's largest (FS-F16-DK1). The truth runs
+    on the host's CPU device, as the lane runs float64 references (tests/lane_environment.py): a family's
+    draws are small, and XLA:GPU compiled each truth in 7.3 s where XLA:CPU takes 0.2 (MAINGPU-0243234e8's
+    part 2 on an H100: 25 truths, 182 s)."""
+    truth_of = Truth(truth_fn, jax.local_devices(backend="cpu")[0])
     for seed in range(seeds):
         inputs = draw(seed)
         with jax.enable_x64(new_val=True):
-            truth = jax.tree.leaves(truth_of(*widened(inputs)))
+            truth = jax.tree.leaves(truth_of(*widened(jax.device_get(inputs))))
         found = jax.tree_util.tree_leaves_with_path(dew_fn(*inputs))
         for (path, mine), wide in zip(found, truth, strict=True):
             mine = np.asarray(mine)
