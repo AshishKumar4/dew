@@ -558,14 +558,21 @@ def constrain(x: jax.Array, axes: LogicalAxes) -> jax.Array:
     matrices that read it: every projection then sums partial products
     across the fsdp axis, rounded before the sum, instead of gathering the
     weight. With it fsdp gathers weights and splits rows, as fully sharded
-    data parallelism is defined. No mesh in context leaves `x` as it is, and
-    under a pipeline's vmap the stage axis takes the vmapped dimension. An
-    Explicit axis stays where `x`'s type places it (`auto_part`), so a mesh
-    of Explicit axes alone leaves `x` as it is too."""
+    data parallelism is defined. Under a pipeline's vmap the stage axis takes
+    the vmapped dimension (`constrained` says where it leaves `x` as it is)."""
+    return constrained(x, lambda: logical_spec(axes, x.shape))
+
+
+def constrained[T](x: T, spec: jax.sharding.PartitionSpec | Callable[[], jax.sharding.PartitionSpec]) -> T:
+    """`x` constrained to `spec` (or what it returns) over the Auto axes of the mesh in context
+    (`auto_part`): an Explicit axis stays where `x`'s type places it, a Manual one is a `shard_map`'s own.
+    No mesh, one of no Auto axis, or one whose every axis holds one device leaves `x` as it is: a
+    constraint there places nothing, and one device's step carried 1,525 of them (row 5855). The one
+    rule every placement constraint of Dew's goes through."""
     mesh = jax.sharding.get_abstract_mesh()
-    if mesh.empty or mesh.are_all_axes_explicit:
+    if mesh.empty or not mesh.auto_axes or math.prod(mesh.axis_sizes) == 1:
         return x
-    return jax.lax.with_sharding_constraint(x, auto_part(logical_spec(axes, x.shape), mesh))
+    return jax.lax.with_sharding_constraint(x, auto_part(spec() if callable(spec) else spec, mesh))
 
 
 def auto_part(spec: jax.sharding.PartitionSpec,
