@@ -102,12 +102,11 @@ def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
             ring.load(ring.turn(counter + step), ring.viewed(views[name], step))
 
 
-def loaded_once(rings: dict, done, views: dict) -> None:
-    """A producer's loads of a walk's or a persistent tile's once streams (`Walk.once`, `Family.persist`'s
-    `once`): each its block, which every step reads, into its one-deep ring at the turn `done` (a tile's:
-    the active tiles before it)."""
+def loaded_once(rings: dict, views: dict) -> None:
+    """A producer's loads of a walk's once streams (`Walk.once`): each its block, which every step reads,
+    into its one-deep ring's slot."""
     for name, ring in rings.items():
-        ring.load(ring.turn(done), ring.viewed(views[name], 0))
+        ring.load(ring.turn(0), ring.viewed(views[name], 0))
 
 
 def streamed(rings: tuple, views, lo, hi) -> None:
@@ -381,9 +380,8 @@ class WholeSlots:
 
 
 class Beside:
-    """A step's slots (`Slots`) beside its walk's or its persistent tile's once streams' (`Walk.once`,
-    `Family.persist`'s `once`), by stream name: a once stream's the slot every step reads, which the walk or
-    tile gives back, every other the step's own."""
+    """A step's slots (`Slots`) beside its walk's once streams' (`Walk.once`), by stream name: a once
+    stream's the slot every step reads, which the walk gives back, every other the step's own."""
 
     def __init__(self, slots: "Slots", once: dict):
         self._slots, self._once = slots, once
@@ -413,7 +411,7 @@ class Beside:
 
 
 def besides(slots: "Slots", once: dict | None):
-    """A step's `slots` beside its walk's or tile's once streams' (`Beside`), as they are where none."""
+    """A step's `slots` beside its walk's once streams' (`Beside`), as they are where none."""
     return Beside(slots, once) if once else slots
 
 

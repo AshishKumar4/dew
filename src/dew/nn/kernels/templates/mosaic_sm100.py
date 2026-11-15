@@ -705,38 +705,32 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), summed: int = 0,
                 prepared: Callable | None = None, producer: int | None = None,
-                pingpong: bool = False, once=None) -> None:
+                pingpong: bool = False) -> None:
         """`mosaic.Family.persist`, its tiles' accumulators turning in tensor memory, no ping-pong
-        (`takes_pingpong`); a tile's `once` streams loaded by its load warp at the tile's start and read by
-        its product warp, which gives each back by its tile's last commit. With `prepared`, `prepared(tile,
-        index, slots)` rewrites each step's slots before its products read them (a kernel gradient's
-        neighbouring groups' rows zeroed), run by a role of its own past the consumers (`warpgroups`: the
-        launch's consumers one more): it waits for each step's loads, rewrites them, publishes them to the
-        tensor cores and arrives at the step's `masked` barrier, which the product warp waits for in the
-        loads' place (a ring of three parties: the producer's loads, the rewrite, the products). With
-        `summed`, an exactly summed launch's (`exact_sums`): each tile's steps `summed` at a time, a window,
-        each window's products into a turn's partials of their own (its first product not accumulating), which
-        the epilogue warpgroup promotes into the tile's running sums in tensor memory (`promoted`: each chunk
-        of the partial and the running sum out, an IEEE add, the sum back) once their commit arrives, freeing
-        the turn for the window after next; the tile's store reads the running sums. Each window is a turn
-        (`persistent.tiled`'s `turns`), so the products of a window run while the epilogue promotes the one
-        before."""
+        (`takes_pingpong`). With `prepared`, `prepared(tile, index, slots)` rewrites each step's slots before
+        its products read them (a kernel gradient's neighbouring groups' rows zeroed), run by a role of its
+        own past the consumers (`warpgroups`: the launch's consumers one more): it waits for each step's
+        loads, rewrites them, publishes them to the tensor cores and arrives at the step's `masked` barrier,
+        which the product warp waits for in the loads' place (a ring of three parties: the producer's loads,
+        the rewrite, the products). With `summed`, an exactly summed launch's (`exact_sums`): each tile's
+        steps `summed` at a time, a window, each window's products into a turn's partials of their own (its
+        first product not accumulating), which the epilogue warpgroup promotes into the tile's running sums in
+        tensor memory (`promoted`: each chunk of the partial and the running sum out, an IEEE add, the sum
+        back) once their commit arrives, freeing the turn for the window after next; the tile's store reads
+        the running sums. Each window is a turn (`persistent.tiled`'s `turns`), so the products of a window
+        run while the epilogue promotes the one before."""
         self.pingponged(pingpong)
         if not accumulators:
             raise ValueError(f"{self._HOME}: a persistent launch states their shapes (`accumulators`)")
-        if self.topology.paired and (summed or prepared is not None or once is not None):
-            raise NotImplementedError("a pair's tiles are a plain product's: no exact sums, rewritten steps "
-                                      "or once streams")
-        if once is not None and (summed or prepared is not None):
-            raise NotImplementedError("a tile's once streams turn by its tiles, not by an exactly summed "
-                                      "tile's windows nor a rewrite's role")
+        if self.topology.paired and (summed or prepared is not None):
+            raise NotImplementedError("a pair's tiles are a plain product's: no exact sums or rewritten "
+                                      "steps")
         rows = {shape[0] for shape in accumulators}
         if rows != {self.rows}:
             raise ValueError(f"a tcgen05 accumulator is {self.rows} rows on one CTA, not {sorted(rows)}")
         del in_flight  # the products' commit releases each step's slots
         opened = self.opened(streams)
-        held_once = {} if once is None else self.opened(once)
-        for ring in (*opened.values(), *held_once.values()):
+        for ring in opened.values():
             ring.initialized()
         staging = self.output_staging(outputs, consumers)
         rewrites = () if prepared is None else tuple(ring.stages for ring in opened.values())
@@ -767,7 +761,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                             for offset, shape in zip(offsets, accumulators, strict=True)) if summed else ()
 
             products = self._issued(issued, issue, tensor, held, running, summed=summed, interpret=interpret,
-                                    unrolled=unrolled, once=held_once)
+                                    unrolled=unrolled)
 
             def epilogue(index):
                 visit = self._read_out(self._stores(smems, index), index, tensor, held, running, issue,
@@ -776,13 +770,9 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                 plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
             def load():
-                def loads(counter, active, steps, views, tile, done):
-                    pl.when(active)(lambda: rings.loaded_once(held_once, done, views))
-                    rings.loads(opened, counter, active, steps, views, tile, done)
-
-                loaded, tiled = persistent.tiled(tiles, schedule, loads, axis=axis)
+                loads = functools.partial(rings.loads, opened)
+                loaded, _ = persistent.tiled(tiles, schedule, loads, axis=axis)
                 rings.drain(opened.values(), loaded)
-                rings.drain(held_once.values(), tiled)
 
             def issue_all():
                 _, computed = persistent.tiled(tiles, schedule, products, axis=axis, turns=windows)
@@ -834,11 +824,10 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         return visit
 
     def _issued(self, opened: dict, issue: Callable, tensor: "Tensor", held: Callable, running: tuple, *,
-                summed: int, interpret: bool, unrolled: bool, once: dict) -> Callable:
+                summed: int, interpret: bool, unrolled: bool) -> Callable:
         """`persist`'s product warp's visit of a tile (`persistent.tiled`'s): each active tile's windows (its
         steps, where not `summed`) into a turn's accumulators once the window `turns` back has been read out
-        of them, each window then a commit the epilogue waits on; its `once` streams' slots, awaited at its
-        start, among every step's slots, and given back by the commit after its last product."""
+        of them, each window then a commit the epilogue waits on."""
         def products(counter, active, steps, views, tile, done_turns):
             del views
 
@@ -848,12 +837,10 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                 turn = None if summed else tensor.turn(done_turns)
                 if turn is not None:
                     tensor.freed(turn)
-                # A tile not summed turns its once streams at its own turn: its count among the active tiles.
-                once_slots = {name: ring.acquire(ring.turn(done_turns)) for name, ring in once.items()}
 
                 def walked(lo, hi, start, shapes, accumulators: tuple, step):
                     def stepped(at, slots, carry, accs):
-                        return step(at - counter, rings.besides(slots, once_slots), carry, accs)
+                        return step(at - counter, slots, carry, accs)
 
                     return self.walk(opened, ((stepped, lo, hi),), start, shapes, interpret,
                                      initial=accumulators, unrolled=unrolled)
@@ -882,8 +869,6 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                     issue(0, tile, walk, active=True)
                     if turn is not None:
                         tensor.issued(turn)
-                    for ring in once.values():
-                        ring.release(ring.turn(done_turns))
 
         return products
 

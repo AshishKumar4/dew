@@ -80,7 +80,7 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
 
     def taken_once(self, held: dict, views: dict, wg) -> dict:
         # Its loads its loading consumer's: a walk's once streams too, before the walk's first step.
-        pl.when(wg == self.loader)(lambda: loaded_once(held, 0, views))
+        pl.when(wg == self.loader)(lambda: loaded_once(held, views))
         return super().taken_once(held, views, wg)
     feeds_itself = True
     gathers_rows = True  # the loading consumer, a whole warpgroup, gathers a step's rows (`gathered.Ring`)
