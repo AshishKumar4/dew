@@ -36,7 +36,7 @@ from __future__ import annotations
 import collections
 import threading
 from collections.abc import Callable, Hashable, Sequence
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -46,6 +46,9 @@ from jax.extend import core as jcore
 from dew.nn.kernels import generation
 from dew.nn.nested import nested
 from dew.nn.programs import RaggedLayout, entrywise, ragged_layout
+
+if TYPE_CHECKING:
+    from dew.nn.kernels import tuning
 
 CAPTURED = (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p)
 """The layout equations a region takes of a captured operand only it reads (a bias broadcast over rows), so
@@ -351,13 +354,13 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
 
 class _Trace(NamedTuple):
     """A region's written program (`_traced`): its one equation, the inputs it reads them by, and the routes
-    and launches (each its op and keyed arguments, `tuning.Seen`'s) its trace reported, which each program
-    it is written into reports."""
+    and launches (each its op and keyed arguments, and the config it took, `tuning.Seen.held`) its trace
+    reported, which each program it is written into reports."""
 
     equation: jcore.JaxprEqn
     invars: tuple[jcore.Var, ...]
     routes: tuple
-    launches: tuple
+    launches: tuning.Seen
 
 
 _traces: collections.OrderedDict[Hashable, _Trace] = collections.OrderedDict()
@@ -383,7 +386,7 @@ def _traced(region: Written) -> _Trace:
         with generation.routes(alone=True) as routes, tuning.seen() as seen:
             traced = jax.make_jaxpr(nested(region.call))(*_shapes(region.inputs))
         (equation,) = traced.jaxpr.eqns
-        held = _Trace(equation, tuple(traced.jaxpr.invars), tuple(routes), tuple(seen))
+        held = _Trace(equation, tuple(traced.jaxpr.invars), tuple(routes), seen.held())
         with _TRACES_LOCK:
             _traces[key] = held
             if len(_traces) > DECISIONS_HELD:

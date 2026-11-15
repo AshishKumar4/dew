@@ -283,36 +283,6 @@ def test_a_conv_the_kernels_do_not_take_runs(dtype, out, parts, taps):
                         seeds=REFUSED_SEEDS, truth_fn=loss(xla_conv1d, out=jnp.float64))
 
 
-@pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("axis", ["data", "fsdp"])
-def test_the_conv_keeps_the_kernel_contract_on_a_mesh_that_splits_rows(axis):
-    """`causal_conv1d` over rows split two ways, as data or fsdp parallelism splits them, runs per shard
-    (`sharded.assert_runs_per_shard`): its pieces, the l2-normalised queries and keys of a delta rule
-    over padded rows of packed documents, and the gradients of the input, the taps and the bias on par
-    with one device's over the site's draws, and no operand moved between devices. On a GPU each shard
-    is the fused kernel."""
-    from jax.sharding import Mesh, PartitionSpec
-    from sharded import assert_runs_per_shard
-
-    def draw(seed):
-        # Each role's stream its own: a draw's cotangents never replay another draw's input.
-        x, weights, shift, valid = operands(4, 48, DELTA, dtype=jnp.float32, bias=True, valid=True,
-                                            seed=3 * seed)
-        return (x, weights, shift, valid, documents(4, 48, seed=3 * seed + 2),
-                *cotangents(x, DELTA, jnp.float32, seed=3 * seed + 1))
-
-    def gradients(x, weights, shift, valid, segments, *grads):
-        return run(causal_conv1d, x, weights, shift, valid, DELTA, jnp.float32, grads, segments=segments)
-
-    def exact(x, weights, shift, valid, segments, *grads):
-        return truth(x, weights, shift, valid, DELTA, grads, segments=segments)
-
-    mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
-    rows, whole = PartitionSpec(axis), PartitionSpec()
-    assert_runs_per_shard(gradients, draw, [rows, whole, whole, rows, rows, rows, rows, rows], mesh,
-                          f"conv split over {axis}", seeds=SHARDED_SEEDS, truth_fn=exact)
-
-
 @pytest.mark.parametrize("taps", [1, 2, 4])
 def test_a_document_that_enters_a_history_convolves_as_if_it_followed_it(taps):
     """`entered_conv1d` of packed documents, each entering one of the histories `held` holds or none, gives

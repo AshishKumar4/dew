@@ -243,11 +243,14 @@ def keeping(kept: Kept) -> Iterator[None]:
 
 @dataclasses.dataclass(frozen=True)
 class Compiling:
-    """A program's first compile running in a thread of its own (`compiling`), by its lowering's digest
-    (`program_digest`): what the program's compile through Dew's compile point takes in its place where it
-    lowers the same program (`attempting`)."""
+    """A program's first compile running in a thread of its own (`compiling`): the program, what its call
+    lowered from (`OuterProgram.abstract_of`, None for a plain jit) and its lowering, which the program's
+    compile through Dew's compile point takes where it compiles the same program over the same, lowering
+    nothing again, else where it lowers the same program (`program_digest`) (`attempting`)."""
 
-    digest: str
+    program: Callable
+    abstract: Hashable | None
+    lowered: jax.stages.Lowered
     attempt: Future
 
 
@@ -273,7 +276,8 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
             attempt.set_exception(error)
 
     threading.Thread(target=attempted, name="dew-compile-ahead", daemon=True).start()
-    return Compiling(program_digest(lowered), attempt)
+    abstract = program.abstract_of(args, kwargs) if isinstance(program, OuterProgram) else None
+    return Compiling(program, abstract, lowered, attempt)
 
 
 _ATTEMPTING: contextvars.ContextVar[Compiling | None] = _cache.untraced(
@@ -284,7 +288,8 @@ _ATTEMPTING: contextvars.ContextVar[Compiling | None] = _cache.untraced(
 def attempting(begun: Compiling | None) -> Iterator[None]:
     """Within the block, a program compiled through Dew's compile point whose lowering is `begun`'s takes
     its first compile from that thread (`compiling`), waiting for it there, and keeps it as one it compiled
-    itself (`report.compiled`'s `first`); any other compiles as it would. None begins nothing."""
+    itself (`report.compiled`'s `first`): the same program over the same abstract inputs takes the begun
+    lowering too, tracing nothing again; any other compiles as it would. None begins nothing."""
     token = _ATTEMPTING.set(begun)
     try:
         yield
@@ -634,13 +639,20 @@ class OuterProgram:
         from dew.nn.kernels.templates import report
 
         relowered: Relowered = []
-        lowered = self.lower(*args, **kwargs)
+        # A call whose first compile was begun in a thread of its own (`compiling`), the same program over
+        # the same abstract inputs, lowers nothing again: the begun lowering is its.
+        begun = _ATTEMPTING.get()
+        if begun is not None and begun.program is self and begun.abstract == self.abstract_of(args, kwargs):
+            lowered = begun.lowered
+        else:
+            lowered = self.lower(*args, **kwargs)
         # A program compiled ahead for this target runs as it was compiled (`taking`).
         if (taken := _TAKEN.get()) and (ahead := taken.get(program_digest(lowered))) is not None:
             return ahead()
-        # Its first compile begun in a thread of its own where it was (`compiling`).
-        begun, first = _ATTEMPTING.get(), None
-        if begun is not None and begun.digest == program_digest(lowered):
+        # Its first compile from that thread, where it lowers the program begun there.
+        first = None
+        if begun is not None and (lowered is begun.lowered
+                                  or program_digest(begun.lowered) == program_digest(lowered)):
             first = begun.attempt.result()
         executable = report.compiled(lowered,
                                      relower=functools.partial(self._relowered, args, kwargs, relowered),
@@ -665,9 +677,20 @@ class OuterProgram:
         ones dropped. It holds what jit keys on: the trace context, with its abstract mesh, and the
         concrete mesh in place (`jax.sharding.get_mesh`), so a mesh of the same shape over other devices
         compiles its own executable."""
+        return self._keyed(args, kwargs, _signature)
+
+    def abstract_of(self, args: tuple, kwargs: dict) -> Hashable:
+        """What a call over these arguments lowers from, arrays or their shapes alike: `key_of`'s key with
+        each array or shape as its shape, dtype, weak type and sharding (`shapes_of`). Two calls of the
+        program alike in it lower one program, so a begun compile's lowering serves both (`attempting`)."""
+        return self._keyed(args, kwargs, _abstract_signature)[0]
+
+    def _keyed(self, args: tuple, kwargs: dict, signature: Callable[..., Hashable]
+               ) -> tuple[Hashable, tuple, dict]:
+        """`key_of`'s key with each dynamic leaf as `signature` states it."""
         if not self.numbers and not self.names:
             leaves, structure = jax.tree.flatten((args, kwargs))
-            return (len(args), ((), ()), structure, tuple(map(_signature, leaves)),
+            return (len(args), ((), ()), structure, tuple(map(signature, leaves)),
                     jax_config.trace_context(), jax.sharding.get_mesh()), args, kwargs
         numbers = {number % len(args) for number in self.numbers if -len(args) <= number < len(args)}
         dynamic = tuple(arg for number, arg in enumerate(args) if number not in numbers)
@@ -677,7 +700,7 @@ class OuterProgram:
         statics = (tuple((number, type(args[number]), args[number]) for number in sorted(numbers)),
                    tuple(sorted(((name, type(value), value) for name, value in kwargs.items()
                                  if name in self.names), key=lambda static: static[0])))
-        return (len(args), statics, structure, tuple(map(_signature, leaves)),
+        return (len(args), statics, structure, tuple(map(signature, leaves)),
                 jax_config.trace_context(), jax.sharding.get_mesh()), dynamic, named
 
 
@@ -731,6 +754,20 @@ def _signature(leaf) -> Hashable:
     if isinstance(leaf, jax.Array):
         # A typed key array states no format: its placement is its sharding.
         return leaf.aval, leaf.sharding, leaf.committed
+    return type(leaf), np.shape(leaf), np.result_type(leaf)
+
+
+def _abstract_signature(leaf) -> Hashable:
+    """What a lowering reads of an argument (`OuterProgram.abstract_of`): an array's or a shape's shape,
+    dtype and weak type (its abstract value, a key array's among them) and its sharding, which a call over
+    arrays and one over their shapes (`shapes_of`) share; another value's type, shape and dtype. An array
+    no one committed to its devices (a fresh `jax.random.key`) lowers as an unplaced shape does: jit places
+    it, so its sharding is none here, as an unplaced shape's is."""
+    if isinstance(leaf, jax.Array):
+        placed = leaf.sharding if leaf.committed else None
+        return leaf.aval.shape, leaf.aval.dtype, leaf.aval.weak_type, placed
+    if isinstance(leaf, jax.ShapeDtypeStruct):
+        return leaf.shape, leaf.dtype, leaf.weak_type, leaf.sharding
     return type(leaf), np.shape(leaf), np.result_type(leaf)
 
 

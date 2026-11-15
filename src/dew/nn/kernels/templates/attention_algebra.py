@@ -33,6 +33,7 @@ import numpy as np
 
 from dew.algebra import derive, rewritten
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
+from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.kernels.templates import bodies, layout, product
 from dew.nn.kernels.templates.attention import (
     LN2,
@@ -592,13 +593,78 @@ def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     (`finish`'s `normalized`); a state of no key adds nothing."""
     m = jnp.max(stacked.m, axis=axis)
     weights = carried(spec, stacked.m, jnp.expand_dims(m, axis)) * stacked.total
-    # Each weight over the largest, so their sum is at most the states' count whatever the masses.
+    largest, summed = _normalized(weights, axis)
+    return Partial(_mean(weights, stacked.acc, axis), m, largest * summed)
+
+
+def _normalized(weights: jax.Array, axis: int) -> tuple[jax.Array, jax.Array]:
+    """`weights`' largest on `axis` and their sum over it, each weight over the largest first, so the sum is
+    at most their count whatever the masses (1 where none holds mass)."""
     largest = jnp.max(weights, axis=axis)
-    weights = weights / jnp.expand_dims(jnp.where(largest > 0, largest, 1.0), axis)
-    summed = jnp.sum(weights, axis=axis)
-    shares = weights * jnp.expand_dims(1.0 / jnp.where(summed > 0, summed, 1.0), axis)
-    out = jnp.sum(expand(shares, stacked.acc) * stacked.acc, axis=axis)
-    return Partial(out, m, largest * summed)
+    largest = jnp.where(largest > 0, largest, 1.0)
+    return largest, jnp.sum(weights / jnp.expand_dims(largest, axis), axis=axis)
+
+
+def _mean_value(weights: jax.Array, outputs: jax.Array, axis: int) -> jax.Array:
+    """`outputs` (each state's, `[..., Dv]`) weighed by their states' masses `weights` (`[...]`, each a
+    carried factor times a denominator) over their sum on `axis`: the merge's convex combination
+    (`_convex`). Its derivative is the mean's own (`_mean_tangent`), not its sum's roundings' and holds'."""
+    largest, summed = _normalized(weights, axis)
+    shares = weights / jnp.expand_dims(largest * jnp.where(summed > 0, summed, 1.0), axis)
+    return _convex(expand(shares, outputs), outputs, axis)
+
+
+def _mean_tangent(axis: int, primals: tuple, tangents: tuple) -> tuple[jax.Array, jax.Array]:
+    """The mean's derivative, d out = sum(dw (o - out)) / W + sum(w do) / W, its masses' coefficients
+    (o - out) / W formed from the primals at a scale that passes fp32's largest only where they do: a gap
+    of an output or the mean reaching `HALVED` at half its size, over the largest mass and then their sum
+    (`_normalized`), doubled after; the rest exact. A coefficient as to a mass, never one as to a weight
+    over the largest, which passes fp32 where outputs of both signs are near it ((o - out) over their sum
+    -1.125 times fp32's largest at weights 1 and 1/3, a denominator's derivative L/8 returned as inf, row
+    6827). Each case's operands are selected before its arithmetic; the derivative is linear in its
+    tangents, so a reverse pass forms the same coefficients."""
+    weights, outputs = primals
+    dweights, doutputs = tangents
+    out = _mean(weights, outputs, axis)
+    largest, summed = _normalized(weights, axis)
+    largest, summed = (jnp.expand_dims(x, axis) for x in (largest, jnp.where(summed > 0, summed, 1.0)))
+    mean = jnp.broadcast_to(jnp.expand_dims(out, axis), outputs.shape)
+    large = (jnp.abs(outputs) >= HALVED) | (jnp.abs(mean) >= HALVED)
+    halved = (jnp.where(large, outputs, 0.0) * 0.5 - jnp.where(large, mean, 0.0) * 0.5)
+    exact = jnp.where(large, 0.0, outputs) - jnp.where(large, 0.0, mean)
+    over = expand(largest, outputs), expand(summed, outputs)
+    coefficients = jnp.where(large, halved / over[0] / over[1] * 2, exact / over[0] / over[1])
+    shares = weights / (largest * summed)
+    return out, (jnp.sum(expand(dweights, outputs) * coefficients, axis=axis)
+                 + jnp.sum(expand(shares, outputs) * doutputs, axis=axis))
+
+
+_mean = contracted("test_the_finished_merges_mean_holds_every_order")(
+    declared_tangent(Protected(), _mean_value, _mean_tangent, nondiff_argnums=(2,)))
+
+
+def _convex(shares: jax.Array, outputs: jax.Array, axis: int) -> jax.Array:
+    """`outputs` weighed by `shares` (summing to 1 on `axis`, or all 0) and summed: a convex combination,
+    bounded by the outputs of some share. Its sum's roundings may pass that bound, and past fp32's largest
+    where outputs are near it (two slices' outputs at fp32's largest, shares 29/30 and 1/30, summed to inf):
+    the terms of outputs whose magnitude reaches `HALVED` are summed at half their size, exact, apart from
+    the rest, which are summed as they are (a term near fp32's least normal keeps its bits), and the two
+    joined as the half sum twice over the rest, then held at the outputs' bounds by selection, so a rounding
+    passes neither. Each case's operands are selected before its arithmetic."""
+    some = shares > 0
+    high = jnp.max(jnp.where(some, outputs, -jnp.inf), axis=axis)
+    low = jnp.min(jnp.where(some, outputs, jnp.inf), axis=axis)
+    held = jnp.any(some, axis=axis)
+    large = jnp.abs(outputs) >= HALVED
+    half = jnp.sum(shares * jnp.where(large, outputs * 0.5, 0.0), axis=axis)
+    rest = jnp.sum(shares * jnp.where(large, 0.0, outputs), axis=axis)
+    out = half + (half + rest)
+    return jnp.where(held & (out > high), high, jnp.where(held & (out < low), low, out))
+
+
+HALVED = 2.0 ** 126
+"""The magnitude from which a convex combination's terms are summed at half their size (`_convex`): the
+terms of smaller outputs sum below fp32's largest."""
 
 
 def rewalks(spec: Forward, maxima: jax.Array, rows: jax.Array | None = None) -> tuple[jax.Array, Forward]:

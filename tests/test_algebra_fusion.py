@@ -170,18 +170,53 @@ def test_a_plain_programs_product_runs_the_template_its_call_names(layer, forms)
     assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in passed)
 
 
+def test_a_starts_forward_nothing_reads_is_never_written_as_a_kernel():
+    """A start-like program (row 6783): a region that makes a parameter and computes a grouped product from
+    it, as a flax init's block makes its parameters inside its forward (here a checkpointed one), the
+    product's result read by nothing. Through `dew.jit` on an H100 whose template a call names, no route is
+    taken and no launch traced for it, so nothing of it is certified or built; the same program reading the
+    product runs the template's launch."""
+    import dew
+    from dew.nn.kernels import tuning
+
+    def start(read: bool):
+        def program(x, w, bias, other):
+            def block(x, w):
+                made = w * 2
+                return made, grouped(x, made, bias, other)
+
+            made, out = jax.checkpoint(block)(x, w)
+            return (made, out) if read else made
+        return program
+
+    operands = draw()
+    taken = []
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        for read in (True, False):
+            with generation.routes() as found, tuning.seen() as launches:
+                dew.jit(start(read)).trace(*operands)
+            took = any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in found)
+            taken.append((took, len(launches)))
+    (read, launched), (unread, unlaunched) = taken
+    assert read and launched
+    assert not unread and not unlaunched
+
+
 def test_a_steps_relowering_traces_none_of_its_written_regions_again():
     """A step lowered again in one process (a planner's candidate, a relowering after a launch spilled: each
     lowering's records fresh, so JAX traces the step again) writes its regions from the traces its first
     lowering made (`fusion._traced`): the second traces nothing but the step itself (JAX's trace events, by
     the function each traced), where the first traced its fused products' calls too, and it writes the
-    program the first did, reporting the routes it did. One lowered under other state a trace reads (a
-    context variable of Dew's set, attention's forward mode) traces its regions again."""
+    program the first did, reporting the routes it did and the launches it did, each beside the config it
+    took (`tuning.seen`, whose launches and configs pair one to one: a tuner's and a test's reads, row
+    6572). One lowered under other state a trace reads (a context variable of Dew's set, attention's
+    forward mode) traces its regions again."""
     from jax._src import dispatch
 
     import dew
     from dew.algebra import program
     from dew.nn.attention import forward_mode_attention
+    from dew.nn.kernels import tuning
 
     traced: list[str] = []
 
@@ -198,16 +233,18 @@ def test_a_steps_relowering_traces_none_of_its_written_regions_again():
         with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
             for state in (contextlib.nullcontext(), contextlib.nullcontext(), forward_mode_attention()):
                 traced.clear()
-                with state, generation.routes() as found:
+                with state, generation.routes() as found, tuning.seen() as launches:
                     made = step.trace(*operands)
+                assert [op for op, _ in launches] == [ba.op for _, ba in launches.taken]
+                took = [(ba, config) for (_, ba), (config, _) in zip(launches, launches.taken, strict=True)]
                 lowerings.append((set(traced), program.structure(made.jaxpr.jaxpr),
-                                  [(route.choice, route.kernel) for route in found]))
+                                  [(route.choice, route.kernel) for route in found], took))
     finally:
         jax.monitoring.unregister_event_duration_listener(heard)
-    (first, written, routes), (again, rewritten, rerouted), (other, _, _) = lowerings
+    (first, written, routes, took), (again, rewritten, rerouted, retook), (other, _, _, _) = lowerings
     assert first > {chained.__name__} and again == {chained.__name__}, (first, again)
-    assert ("grouped_matmul", "mosaic") in routes
-    assert rewritten == written and rerouted == routes
+    assert ("grouped_matmul", "mosaic") in routes and took
+    assert rewritten == written and rerouted == routes and retook == took
     assert other > {chained.__name__}, other
 
 
@@ -737,30 +774,6 @@ def checkpointed_swiglu(a, b):
     return (widened * jax.checkpoint(jax.nn.sigmoid)(widened)).astype(a.dtype) * b
 
 
-def test_a_swiglu_region_never_crosses_a_checkpoint():
-    """A SwiGLU written around a checkpointed sigmoid (`checkpointed_swiglu`) runs as written through
-    `dew.jit` on an H100, its checkpoint kept, where the same product without it runs Dew's fused kernel: a
-    call written across the checkpoint would remove the boundary the program states, changing what its
-    derivative saves (§6.2)."""
-    from jax.extend.core import primitives
-
-    import dew
-    from dew.nn.programs import equations
-
-    shapes = [jax.ShapeDtypeStruct(ROWS, jnp.bfloat16)] * 2
-
-    def traced(program):
-        with generation.routes() as found:
-            made = dew.jit(program).trace(*shapes)
-        return made, any(route.choice == "swiglu" and route.kernel != "xla" for route in found)
-
-    with generation.assumed("sm90"):
-        _, fused = traced(gated_product_of)
-        checkpointed, crossed = traced(checkpointed_swiglu)
-    assert fused and not crossed
-    assert any(equation.primitive is primitives.remat_p for equation in equations(checkpointed.jaxpr.jaxpr))
-
-
 def _rows_inverse(x):
     """Each row's inverse root mean square, fp32 `[rows]`, the feature axis reduced."""
     widened = x.astype(_wide(x))
@@ -1033,27 +1046,40 @@ def test_a_norm_whose_epsilon_an_enclosing_trace_closes_over_compiles_through_de
     np.testing.assert_array_equal(np.asarray(through(epsilon)), np.asarray(written(epsilon)))
 
 
-def test_a_gated_product_whose_activation_has_its_own_batching_rule_is_never_fused():
-    """A SwiGLU whose SiLU carries a custom batching rule of its own (`jax.custom_batching.custom_vmap`, one a
-    fused call written in its place would not keep) runs as written through `dew.jit` on an H100, where the
-    same product without the rule runs Dew's fused kernel."""
+def batched_by_its_rule(a, b):
+    """A SwiGLU whose SiLU carries a custom batching rule of its own (`jax.custom_batching.custom_vmap`),
+    one a fused call written in its place would not keep."""
     from jax.custom_batching import custom_vmap
-
-    import dew
 
     silu = custom_vmap(jax.nn.silu)
     silu.def_vmap(lambda size, batched, x: (jax.nn.silu(x) + 1, batched[0]))
+    return silu(a.astype(jnp.float32)).astype(a.dtype) * b
 
-    def batched_by_its_rule(a, b):
-        return silu(a.astype(jnp.float32)).astype(a.dtype) * b
+
+def swiglu_traced(program):
+    """`program` over two bf16 operands traced through `dew.jit` on an assumed H100: its trace, and whether
+    a SwiGLU in it runs Dew's fused kernel (`generation.routes`)."""
+    import dew
 
     shapes = [jax.ShapeDtypeStruct(ROWS, jnp.bfloat16)] * 2
+    with generation.assumed("sm90"), generation.routes() as found:
+        made = dew.jit(program).trace(*shapes)
+    return made, any(route.choice == "swiglu" and route.kernel != "xla" for route in found)
 
-    def fused(program) -> bool:
-        with generation.routes() as found:
-            dew.jit(program).trace(*shapes)
-        return any(route.choice == "swiglu" and route.kernel != "xla" for route in found)
 
-    with generation.assumed("sm90"):
-        assert fused(gated_product_of)
-        assert not fused(batched_by_its_rule)
+@pytest.mark.parametrize("barred", [checkpointed_swiglu, batched_by_its_rule],
+                         ids=["a checkpointed sigmoid", "an activation's own batching rule"])
+def test_a_gated_product_across_a_barrier_is_never_fused(barred):
+    """A SwiGLU across a barrier runs as written through `dew.jit` on an H100, where the same product
+    without it runs Dew's fused kernel: a checkpoint (`checkpointed_swiglu`), whose boundary decides what
+    its derivative saves (§6.2), its program keeping the checkpoint; and an activation's own batching rule
+    (`batched_by_its_rule`), which a fused call written in its place would not keep."""
+    from jax.extend.core import primitives
+
+    from dew.nn.programs import equations
+
+    _, fused = swiglu_traced(gated_product_of)
+    made, crossed = swiglu_traced(barred)
+    assert fused and not crossed
+    if barred is checkpointed_swiglu:
+        assert any(equation.primitive is primitives.remat_p for equation in equations(made.jaxpr.jaxpr))

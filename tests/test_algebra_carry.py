@@ -133,3 +133,36 @@ def test_association_keeps_finite_carried_contraction_products(compiled, overflo
         np.testing.assert_array_equal(expected, jnp.zeros_like(expected))
         actual, = rewritten(h)
         np.testing.assert_array_equal(actual, expected)
+
+
+def state_summed(h, x):
+    """A product with a reduction of the state: its column sums, one row, against an operand."""
+    return (jnp.sum(h, axis=0)[None, :] @ x,)
+
+
+def test_a_product_of_a_reduction_of_the_state_computes_through_the_split():
+    """`sum(h, 0) @ x`: the reduction reads the state as every term of the language over it does
+    (`carry._carrying`, from `terms.LANGUAGE`), and the split computes the function."""
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.standard_normal((3, 4)), jnp.float32),
+                jnp.asarray(rng.standard_normal((4, 2)), jnp.float32))
+
+    assert_as_exact(jax.jit(split_run(state_summed, (0,))), jax.jit(state_summed), draw,
+                    "a reduction of the state's product", seeds=8)
+
+
+def test_a_reduction_of_the_state_reads_it():
+    """A reduction of the state (`sum(h, 0)`) reads it, as every term of the language over it does
+    (`carry.CARRYING`, from `terms.LANGUAGE`), so its product with an operand is priced as carried work,
+    never as a product the split runs in parallel (row 6674)."""
+    from egglog import EGraph, Vec, eq, i64, set_
+
+    from dew.algebra import terms
+
+    state = terms.Term.leaf(i64(0))
+    summed = state.reduce("sum", Vec[i64](i64(0)), i64(0))
+    graph = EGraph()
+    graph.register(summed, set_(carry.reads(state)).to(i64(1)))
+    graph.run(carry.CARRYING.saturate())
+    assert graph.check_bool(eq(carry.reads(summed)).to(i64(1)))

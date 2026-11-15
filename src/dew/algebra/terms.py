@@ -37,7 +37,13 @@ from egglog import (
     i64Like,
     method,
 )
-from egglog.declarations import Declarations, HasDeclarations
+from egglog.declarations import (
+    Declarations,
+    FunctionSignature,
+    HasDeclarations,
+    TypeOrVarRef,
+    TypeRefWithVars,
+)
 from egglog.runtime import RuntimeExpr
 from jax._src import core as jax_core
 from jax._src.literals import TypedNdArray
@@ -411,6 +417,25 @@ def parameters_key(primitive: jcore.Primitive, values: Mapping) -> tuple[jcore.P
     return primitive, tuple((name, parameter_key(value)) for name, value in sorted(values.items()))
 
 
+@functools.lru_cache(maxsize=1 << 16)
+def _abstract_key(value: ShapedArray) -> Hashable:
+    """An abstract value's key (`parameter_key`'s): its shape, dtype, weak type, placement, memory space,
+    layout and manual axes, kept for each abstract value (JAX's own value equality and hash), which every
+    window's structure reads of its every equation's outputs: a program's few distinct types, keyed once each,
+    where each read built the key anew (2.27 million keys of a Qwen3.5-4B start's 40 passes, row 6782). Its
+    placement by its partitions and its mesh's axes and memory, not the kind of device the mesh was made of,
+    which a step compiled ahead for a GPU and the run on that GPU share no name of."""
+    sharding, manual = value.sharding, value.manual_axis_type
+    mesh = sharding.mesh
+    placement = (parameter_key(sharding.spec), parameter_key(mesh.axis_sizes),
+                 parameter_key(mesh.axis_names), parameter_key(mesh.axis_types),
+                 parameter_key(sharding.memory_kind))
+    # Its dtype by its name, a PRNG key's extended one's too (`key<fry>`).
+    return ("abstract", parameter_key(value.shape), ("dtype", value.dtype.name), value.weak_type,
+            placement, parameter_key(value.memory_space), parameter_key(value.layout),
+            parameter_key((manual.varying, manual.unreduced, manual.reduced, manual.unreduced_kind)))
+
+
 def parameter_key(value) -> Hashable:
     """An equation's parameter as what it is, the one structural key the algebra pass (`parameters_key`,
     `program.structure`) and the kernel tuner (`dew.nn.kernels.tuning.program`) read: plain data, the same in
@@ -446,17 +471,7 @@ def parameter_key(value) -> Hashable:
         return ("array", str(value.dtype), array.shape, str(array.dtype),
                 hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
     if isinstance(value, ShapedArray):
-        # Its placement by its partitions and its mesh's axes and memory, not the kind of device the mesh was
-        # made of, which a step compiled ahead for a GPU and the run on that GPU share no name of.
-        sharding, manual = value.sharding, value.manual_axis_type
-        mesh = sharding.mesh
-        placement = (parameter_key(sharding.spec), parameter_key(mesh.axis_sizes),
-                     parameter_key(mesh.axis_names), parameter_key(mesh.axis_types),
-                     parameter_key(sharding.memory_kind))
-        # Its dtype by its name, a PRNG key's extended one's too (`key<fry>`).
-        return ("abstract", parameter_key(value.shape), ("dtype", value.dtype.name), value.weak_type,
-                placement, parameter_key(value.memory_space), parameter_key(value.layout),
-                parameter_key((manual.varying, manual.unreduced, manual.reduced, manual.unreduced_kind)))
+        return _abstract_key(value)
     if value is Layout.AUTO:
         # The layout XLA chooses, one singleton.
         return "layout", "auto"
@@ -1464,9 +1479,44 @@ def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, le
     raise ValueError(f"a term of no known constructor: {term}")
 
 
-LANGUAGE = (Term.binary, Term.compare, Term.unary, Term.convert, Term.shaped, Term.reduce, Term.dot,
-            Term.select)
-"""The language's constructors that read terms, a leaf's and a literal's none."""
+def _sort(declared: TypeOrVarRef) -> type[BaseExpr]:
+    """The sort an argument is declared of (egglog's type reference): its class by its module and name, a
+    parameterized one (`Vec[i64]`) given its parameters."""
+    import importlib
+
+    if not isinstance(declared, TypeRefWithVars):
+        raise TypeError(f"{declared} is a type variable, no sort a term's argument takes")
+    sort = getattr(importlib.import_module(declared.ident.module or "egglog"), declared.ident.name)
+    parameters = tuple(map(_sort, declared.args))
+    return sort[parameters[0] if len(parameters) == 1 else parameters] if parameters else sort
+
+
+def _arguments(constructor) -> tuple[type[BaseExpr], ...]:
+    """The sorts of the arguments `constructor` takes after the term it is called on, as `Term` declares its
+    method (egglog's signature of it)."""
+    signature = declarations(Term).get_callable_decl(constructor.__egg_ref__).signature
+    if not isinstance(signature, FunctionSignature):
+        raise TypeError(f"{constructor} is declared by {signature!r}, no signature of its arguments")
+    return tuple(map(_sort, signature.arg_types[1:]))
+
+
+LANGUAGE: Mapping = {constructor: _arguments(constructor)
+                     for constructor in (getattr(Term, written.constructor) for written in WRITTEN.values())}
+"""The language's constructors that read terms (a leaf's and a literal's none: each kind's, `WRITTEN`), each
+by the sorts of the arguments it takes after the term it is called on, as `Term` declares them: the one
+inventory every reader of the language walks (`subterms`, `pattern`)."""
+
+
+def pattern(constructor, name: str) -> tuple[Term, tuple[Term, ...]]:
+    """`constructor` (a `LANGUAGE` entry) over fresh variables named from `name`: the pattern, and the terms
+    it reads, the one it is called on first."""
+    from egglog import var
+
+    called = var(f"{name}_called", Term)
+    kinds = LANGUAGE[constructor]
+    arguments = [var(f"{name}_{index}", kind) for index, kind in enumerate(kinds)]
+    read = tuple(argument for argument, kind in zip(arguments, kinds, strict=True) if kind is Term)
+    return constructor(called, *arguments), (called, *read)
 
 
 def subterms(form: Term) -> Iterator[Term]:

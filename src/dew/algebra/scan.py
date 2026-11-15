@@ -140,15 +140,22 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     if len(shape) != 2:
         raise Refused("a state of rank other than two (keys by values) has no chunk form here")
 
-    decomposed: dict = {}  # the token's affine map by its operands' types, its e-graph saturated once
+    # The token's affine map by its operands' types and what its derivation reads where it runs
+    # (`derive.context`: the mesh, the target, the numerics, the matmul precision its products' parameters
+    # hold), its e-graph saturated once for each, the latest `derive.FORMS_HELD` kept.
+    decomposed: collections.OrderedDict = collections.OrderedDict()
 
     def affine_of(chunk: Mapping):
-        types = tuple((tuple(chunk[name].shape), str(chunk[name].dtype)) for name in names)
-        if types not in decomposed:
-            decomposed[types] = linear_scan.parts(_traced(declaration, declaration.update, names, chunk),
-                                                   _traced(declaration, declaration.readout, names, chunk),
-                                                   saturation)
-        return decomposed[types]
+        key = (tuple((tuple(chunk[name].shape), str(chunk[name].dtype)) for name in names), derive.context())
+        if key in decomposed:
+            decomposed.move_to_end(key)
+            return decomposed[key]
+        affine = decomposed[key] = linear_scan.parts(_traced(declaration, declaration.update, names, chunk),
+                                                     _traced(declaration, declaration.readout, names, chunk),
+                                                     saturation)
+        if len(decomposed) > derive.FORMS_HELD:
+            decomposed.popitem(last=False)
+        return affine
 
     def parts(chunk: Mapping):
         affine = affine_of(chunk)
