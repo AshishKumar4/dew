@@ -28,8 +28,9 @@ def test_a_program_that_compiles_in_its_measured_run_is_refused(tmp_path):
     # Its program needs a compile on every run: the process keeps nothing in the cache it was given.
     program = tmp_path / "program.py"
     program.write_text(PROGRAM.format(setup="jax.config.update('jax_enable_compilation_cache', False)"))
-    with pytest.raises(peak_memory.CompiledWhileMeasured):
+    with pytest.raises(peak_memory.CompiledWhileMeasured) as raised:
         peak_memory.measured([str(program)])
+    assert raised.value.compiled >= 1
 
 
 def test_a_program_that_fails_is_refused_with_its_error(tmp_path):

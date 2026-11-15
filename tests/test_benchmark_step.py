@@ -246,8 +246,24 @@ def test_a_case_is_measured_in_processes_of_its_own_inside_the_cases_context_alo
     row = peak_row(tmp_path, "cpu", "--within", "marking:marked", settings={"XDG_CACHE_HOME": str(own)})
     assert row["devices"] == 1 and len(row["peak_bytes_by_device"]) == 1 and row["planned_device_bytes"] > 0
     assert row["ms_per_step"] > 0 and row["compile_seconds"] > 0 and row["ahead_step"] is False
+    assert row["compiled_while_measured"] == 0 and row["compile_cached"] is False
     assert len(set((tmp_path / "entered").read_text().split())) == 2, "the case's two processes alone"
     assert not list(own.rglob("jit_*"))
+
+
+def test_a_case_whose_measured_run_compiled_keeps_its_timing_with_no_peak(tmp_path):
+    """A program the measured run did not load from its cache (its cache switched off there alone) is compiled
+    there: its compile joined the high-water, so the row has no peak and counts the compiles, its timing kept."""
+    (tmp_path / "uncached.py").write_text(
+        "import contextlib, os, jax\n"
+        "@contextlib.contextmanager\n"
+        "def uncached():\n"
+        "    if os.environ.get('DEW_PEAK_STAGE') == 'measure':\n"
+        "        jax.config.update('jax_enable_compilation_cache', False)\n"
+        "    yield\n")
+    row = peak_row(tmp_path, "cpu", "--within", "uncached:uncached")
+    assert row["compiled_while_measured"] >= 1 and row["peak_device_bytes"] is None
+    assert row["peak_bytes_by_device"] is None and row["ms_per_step"] > 0 and row["finite"]
 
 
 def test_a_cache_its_caller_names_keeps_what_the_step_compiled(tmp_path):

@@ -58,7 +58,12 @@ device's high-water written as it exits."""
 
 class CompiledWhileMeasured(RuntimeError):
     """The measured process compiled a program its cache did not hold, whose compile, and autotuning,
-    joined the high-water it read: the program compiles otherwise on its second run than its first."""
+    joined the high-water it read: the program compiles otherwise on its second run than its first.
+    `compiled` is how many it compiled."""
+
+    def __init__(self, message: str, compiled: int):
+        super().__init__(message)
+        self.compiled = compiled
 
 
 def keeps_high_water() -> bool:
@@ -105,5 +110,5 @@ def measured(argv: list[str]) -> list[int | None]:
         report = json.loads(out.read_text())
     if report["compiled"]:
         raise CompiledWhileMeasured(f"{' '.join(argv)}: {report['compiled']} programs compiled in its "
-                                    "measured run, which the cache did not give it")
+                                    "measured run, which the cache did not give it", report["compiled"])
     return report["peaks"]

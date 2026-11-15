@@ -393,23 +393,32 @@ def rates(trainer: Trainer, rows: int, steps: int, elapsed: float,
 
 def measured_row(case: Case, config: BenchmarkConfig) -> Row:
     """A case's row, measured in processes of its own (tools/peak_memory.py), its step handed to both where
-    `ahead` holds it: the first compiles the rest into a cache, its compile the row's; the second loads every
-    program from it, compiling nothing, times the step, profiles it, and reads each device's high-water as it
-    exits. This process opens no backend, which would hold the device the case needs."""
+    `ahead` holds it: the first compiles the rest into a cache, its compile the row's (`compile_cached` where
+    that cache gave it its programs: a later round of a gate's arm); the second loads every program from it,
+    times the step, profiles it, and reads each device's high-water as it exits. Where the second compiled a
+    program its cache did not give it, its row stands with no peak, the compiles counted
+    (`compiled_while_measured`): the compile joined the high-water, and its warm-up the timing's. This process
+    opens no backend, which would hold the device the case needs."""
+    compiled = 0
     with tempfile.TemporaryDirectory(prefix="dew-step-") as directory:
         out = os.path.join(directory, "rows.json")
-        peaks = peak_memory.measured(
-            [os.path.abspath(__file__), "--cases", cases_to_json([case]),
-             "--dtype", config.dtype, "--attention-impl", config.attention_impl, "--warmup", str(config.warmup),
-             "--steps", str(config.steps), "--fixed-batch" if config.fixed_batch else "--no-fixed-batch",
-             "--json-out", out, *(["--xla-flags", config.xla_flags] if config.xla_flags else []),
-             *(["--within", config.within] if config.within else []),
-             *(["--ahead", config.ahead] if config.ahead else []),
-             *(["--profile-dir", config.profile_dir, "--profile-steps", str(config.profile_steps)]
-               if config.profile_dir else []), "--peak-run"])
+        try:
+            peaks = peak_memory.measured(
+                [os.path.abspath(__file__), "--cases", cases_to_json([case]),
+                 "--dtype", config.dtype, "--attention-impl", config.attention_impl, "--warmup",
+                 str(config.warmup), "--steps", str(config.steps),
+                 "--fixed-batch" if config.fixed_batch else "--no-fixed-batch", "--json-out", out,
+                 *(["--xla-flags", config.xla_flags] if config.xla_flags else []),
+                 *(["--within", config.within] if config.within else []),
+                 *(["--ahead", config.ahead] if config.ahead else []),
+                 *(["--profile-dir", config.profile_dir, "--profile-steps", str(config.profile_steps)]
+                   if config.profile_dir else []), "--peak-run"])
+        except peak_memory.CompiledWhileMeasured as missed:
+            peaks, compiled = None, missed.compiled
         (warm,), (row,) = (json.loads(Path(f"{out}.{stage}").read_text()) for stage in ("warm", "measure"))
-    measured = None if None in peaks else max(peaks)
-    return {**row, "compile_seconds": warm["compile_seconds"], "peak_device_bytes": measured,
+    return {**row, "compile_seconds": warm["compile_seconds"], "compile_cached": warm["compile_cache_hits"] > 0,
+            "compiled_while_measured": compiled,
+            "peak_device_bytes": None if peaks is None or None in peaks else max(peaks),
             "peak_bytes_by_device": peaks}
 
 
@@ -742,8 +751,12 @@ def run(config: BenchmarkConfig, apart: bool) -> list[Row]:
     # Every process of a pool measures its own devices; process 0 speaks.
     speaker = apart or jax.process_index() == 0
     out = config.json_out
-    if config.peak_run and out:
-        out = f"{out}.{os.environ.get(peak_memory.PEAK_STAGE, 'measure')}"
+    stage = os.environ.get(peak_memory.PEAK_STAGE, "measure") if config.peak_run else None
+    if stage and out:
+        out = f"{out}.{stage}"
+    if stage == "warm":
+        # Filling the cache: each window's one step runs every program the measured run times.
+        config = dataclasses.replace(config, steps=1)
     for case in build_cases(config):
         # The trainer narrates state generation and input shapes per case,
         # which buries the numbers this tool exists to print.
