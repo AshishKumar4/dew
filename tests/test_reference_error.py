@@ -807,6 +807,26 @@ def test_a_torch_arms_bfloat16_output_comes_out_through_float32():
     np.testing.assert_array_equal(gradient, np.full(4, 3, np.float32))
 
 
+NORMAL_SEEDS = 8
+"""Draws of 4,096 recorded-site normals each, their deciles' counts pooled."""
+
+
+def test_a_recorded_sites_normals_follow_the_normal_law():
+    """`normals`, the draw a recorded site takes on every host alike, follows the standard normal law: the
+    counts of its values in each tenth of the law's mass (the normal CDF of each, by `math.erf`), pooled
+    over `NORMAL_SEEDS` draws, are as a fair sampler of ten equal chances draws them (the sampling gate)."""
+    import math
+
+    from recorded_inputs import normals
+    from sampling_gate import assert_draws_as_declared
+
+    def counts_of(seed):
+        mass = 0.5 * (1 + np.vectorize(math.erf)(normals(seed, (4096,), np.float64) / math.sqrt(2)))
+        return np.bincount(np.minimum((mass * 10).astype(np.int64), 9), minlength=10)
+
+    assert_draws_as_declared(counts_of, np.full(10, 0.1), "recorded-site normals' tenths", seeds=NORMAL_SEEDS)
+
+
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
     """Dew doubles a row of 5s beside rows of 1e8 that the reference rounds by 8. Every
     tensor-wide distance passes it: its RMS error, 3.5, sits under twice the reference's, 5.7.
