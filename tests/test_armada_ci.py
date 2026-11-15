@@ -597,6 +597,26 @@ def test_the_scenario_suites_coverage_items_are_its_tasks_alone(ci, tmp_path):
     assert ran == sorted(ci.SCENARIO_SUITE)
 
 
+def test_a_changes_reach_is_the_rows_whose_recorded_inputs_it_wrote(ci):
+    """A change's reach (`reached`): a row whose own file it changed, one whose last run's inputs hold a file it
+    changed (an executed unit of it, or an import lookup that finds its name), and one whose last run recorded no
+    inputs (unknown, counted); never a row the cache keeps, nor one whose inputs it left alone, whatever the
+    cache's state for it (Main, 2026-11-15: a planner's misses read as reach named 547 files for a one-space
+    change)."""
+    followed = ci.followed
+
+    rows = [("tests/test_a.py", ""), ("tests/test_b.py", "1/2"), ("tests/test_b.py", "2/2"),
+            ("tests/test_c.py", ""), ("tests/test_d.py", ""), ("tests/test_e.py", ""), ("tests/test_f.py", "")]
+    last = {("tests/test_b.py", "1/2"): [f"src/dew/x.py{followed.CODE}f"],
+            ("tests/test_b.py", "2/2"): [f"src/dew/y.py{followed.CODE}g"],
+            ("tests/test_c.py", ""): [f"{followed.LOOKUP}src/dew/x"],
+            ("tests/test_d.py", ""): ["src/dew/y.py"],
+            ("tests/test_f.py", ""): [f"src/dew/x.py{followed.CODE}f"]}
+    reach = ci.reached(rows, {("tests/test_f.py", "")}, last, {"tests/test_a.py", "src/dew/x.py"})
+    assert reach == {"files": ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py", "tests/test_e.py"],
+                     "unknown": 2}
+
+
 def test_a_coverage_task_has_a_deadline_for_tracing(ci, tmp_path):
     """Branch tracing slows a task several times over: each coverage item runs by COVERAGE_DEADLINE,
     not a CI task's."""

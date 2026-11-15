@@ -523,8 +523,8 @@ def pinned_classes() -> list[str]:
             ([cpu] if isinstance(cpu, dict) else cpu or [])]
 
 
-def reusable(python: str, rows: list[tuple[str, str]], common: str,
-             missed: dict[str, int]) -> dict[tuple[str, str], str]:
+def reusable(python: str, rows: list[tuple[str, str]], common: str, missed: dict[str, int],
+             last_inputs: dict[tuple[str, str], list[str]] | None = None) -> dict[tuple[str, str], str]:
     """The rows of `rows` (each a file and its group, "" for the whole file) that ran green on exactly these
     inputs (`common`, and each file's own, `fresh`) on any class the tasks run on (`pinned_classes`), which a
     task of theirs could land on, read at plan time with the cache's read token (`READ_TOKEN`): a task of
@@ -547,7 +547,8 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str,
         name, group = each_row
         for each in held:
             found = green_record(python, name, group, common, token, [each], reading,
-                                 misses.setdefault(each_row, []))
+                                 misses.setdefault(each_row, []),
+                                 None if last_inputs is None else last_inputs.setdefault(each_row, []))
             # Kept only where its green run is kept by its key, as the task reads it.
             if found is not None and recorded(
                     green_key(python, row(python, name, group), each, found[0]["key"]), token) is not None:
@@ -560,6 +561,26 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str,
         found = {each: kept for each, kept in zip(rows, pool.map(hit, rows), strict=True) if kept}
     missed.update(Counter(misses[e][0] for e in rows if e not in found))
     return found
+
+
+def reached(rows: list[tuple[str, str]], kept: Container[tuple[str, str]],
+            last: dict[tuple[str, str], list[str]], changed: set[str]) -> dict:
+    """Which of a Python's `rows` (each a file and its group) a change of the files `changed` reaches, read
+    from the keys the cache keeps (`reach`): none it keeps (`kept`, green on exactly these inputs); one whose
+    own file changed; one whose last run's inputs (`last`, the record `cache_key` hashed) hold a changed file
+    (`wrote_inputs`); and one whose last run recorded none, unknown, which runs. A row the change leaves
+    unread is no reach of it, whatever the cache's state for it (a red run since its green one, a miss of
+    the cache's own). {"files": every reached row's file, "unknown": the rows with no recorded inputs}."""
+    files: set[str] = set()
+    unknown = 0
+    for name, group in rows:
+        if (name, group) in kept:
+            continue
+        inputs = last.get((name, group))
+        unknown += not inputs
+        if name in changed or not inputs or wrote_inputs(inputs, changed):
+            files.add(name)
+    return {"files": sorted(files), "unknown": unknown}
 
 
 def eager_sites(python: str, sites: Sequence[tuple[str, str]]) -> set[tuple[str, str]]:
@@ -638,7 +659,8 @@ def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[st
 
 
 def green_record(python: str, name: str, split: str, common: str, token: str, classes: list[str],
-                 reading: Reading | None, why: list[str]) -> tuple[dict, str] | None:
+                 reading: Reading | None, why: list[str],
+                 inputs: list | None = None) -> tuple[dict, str] | None:
     """The record of test file `name`'s row (in `split`'s group) that ran green on exactly these inputs on one
     of `classes`, the first found, with its class; else None. The plan (`reusable`) and a task (`reused`) read
     it alike, from one reading of the inputs (`Reading`). A row's key hashes the inputs its run executed, so
@@ -665,6 +687,9 @@ def green_record(python: str, name: str, split: str, common: str, token: str, cl
         # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of exactly
         # these, kept by that key (`green_key`) whatever ran since; why it was not, the class's word.
         recorded_set = None if found is None else found["depends"]
+        # The last run's inputs, as `reach` reads them: the first class's that recorded any.
+        if inputs is not None and recorded_set is not None and not inputs:
+            inputs.extend(recorded_set)
         key = None if recorded_set is None else cache_key(common, name, split, recorded_set, reading)
         why.append(records.missed(found, key, current))
         if key is not None:
@@ -1140,7 +1165,8 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
     return entries
 
 
-def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
+def plan(target: float, timings: dict, census: bool = False,
+         reach: dict[str, dict] | None = None) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has timed
     runs alone, so however long it takes it holds up no other file, and its time is known from then on. Files
     marked `torchax` (`APART`) share tasks only with one another. Each entry carries the test cache's policy,
@@ -1150,7 +1176,8 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
     policy "off" or "cold" every task that runs a file carries COLD_SECONDS, so armada sizes the pool by the
     work, not the longest task, as warm estimates did. A site marked one of `session.SHARDS` runs as armada's
     map and judge, apart from its file's tasks (`site_entries`). The `census` (check 1's CENSUS) is the whole
-    suite with the cache off, whatever this environment says, each entry carrying it to its task."""
+    suite with the cache off, whatever this environment says, each entry carrying it to its task. With a
+    `reach` (`reached`), each Python's rows the checkout's change from its base reaches go into it."""
     cache = "off" if census else os.environ.get("DEW_TEST_CACHE") or "on"
     # What every entry carries to its task (.armada.json's command): the cache's policy and the census.
     stamped = {"cache": cache, "census": "1" if census else "0"}
@@ -1187,7 +1214,12 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
             (name, group) for name, cut in groups.items() for group, _ in cut] + [
             (name, test) for name, held in marked.items() for test in held]
         missed: dict[str, int] = {}
-        found = reusable(python, rows_of, shared(python), missed) if cache != "off" else {}
+        last: dict[tuple[str, str], list[str]] = {}
+        found = reusable(python, rows_of, shared(python), missed, last) if cache != "off" else {}
+        # A change every key covers, or none places (the policy cold or off), reaches every row.
+        if reach is not None:
+            reach[python] = (reached(rows_of, found, last, reach["changed"]) if cache == "on" else
+                             {"files": sorted({name for name, _ in rows_of}), "unknown": 0})
         print(f"plan: {python}: kept {len(found)} of {len(rows_of)}; not kept: {missed}", file=sys.stderr)
         # A lookup a row, in seconds: a kept task's weight is its container's start and those lookups.
         tasks: list[tuple[list[tuple[str, str]], float]] = [
@@ -2464,8 +2496,21 @@ def main() -> int:
         print(policy(args.base))
         return 0
     if args.operation == "plan":
-        print(json.dumps({"include": plan(args.target, json.loads(args.timings.read_text())
-                                          if args.timings.is_file() else {}, census=args.census)}))
+        timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
+        if args.reach:
+            # The change's reach from its base (`reached`), each Python's, under the cache's policy for it:
+            # one that leaves the cache cold or off reaches every file.
+            base = subprocess.run(["git", "merge-base", "HEAD", args.reach], capture_output=True, text=True,
+                                  check=True).stdout.strip()
+            changed = set(subprocess.run(["git", "diff", "--name-only", "--no-renames", f"{base}...HEAD"],
+                                         capture_output=True, text=True, check=True).stdout.split())
+            os.environ["DEW_TEST_CACHE"] = cache = policy(base)  # the plan's, as a run's scope sets it
+            reach: dict = {"changed": changed}
+            plan(args.target, timings, reach=reach)
+            print(json.dumps({"base": base, "policy": cache, "changed": sorted(changed),
+                              **{python: reach[python] for python in reach if python != "changed"}}))
+            return 0
+        print(json.dumps({"include": plan(args.target, timings, census=args.census)}))
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
