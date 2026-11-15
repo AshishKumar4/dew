@@ -210,7 +210,7 @@ def _stepped(out: Path) -> tuple:
     return step["ms_per_step"], peak(step), None if mfu is None else 100.0 * mfu
 
 
-STALL = 1.5
+STALL = 1.5  # benchmark_step's STALL, which keeps the stalled parts' stacks
 """How many times its window's median a part of a step's timed window takes to be said stalled (`stalled`)."""
 
 
@@ -486,7 +486,8 @@ def run(args: argparse.Namespace) -> int:
             return measure(path, pythons[tree], args, head_path / "tools", arm == "head" and round_ == 0,
                            Path(caches) / arm, settings=settings if arm == "head" else None)
 
-        rounds(args, results, sample)
+        # A timed step's window warms first (`rounds`); a compile's or a server's, measured cold, needs none.
+        rounds(args, results, sample, warm=any(row.name.startswith("step ") for row in rows))
     return report(argparse.Namespace(results=args.out, table=None, claim=True)) if claiming else 0
 
 
@@ -513,11 +514,13 @@ def environments(trees: tuple[tuple[str, Path], ...], lock: str, cache: str) -> 
     return pythons, unbuilt
 
 
-def rounds(args: argparse.Namespace, results: dict, sample: Callable[[str, int], dict]) -> None:
+def rounds(args: argparse.Namespace, results: dict, sample: Callable[[str, int], dict],
+           warm: bool = False) -> None:
     """`results`' arms sampled `--rounds` rounds (`sample` of an arm and a round), each round's arms in an
     order drawn at random and kept (`orders`), so no arm holds one place in every round and the rounds'
-    ratios fall either side of their medians as the judgment reads them (`verdict`); the results written
-    after each arm, so an interrupted run reports what it measured, partial."""
+    ratios fall either side of their medians as the judgment reads them (`verdict`), with `warm` after a warm
+    arm before the first round, which the judgment never reads (results' `warm`); the results written after
+    each arm, so an interrupted run reports what it measured, partial."""
     from dew._files import write_atomically
 
     places = secrets.SystemRandom()
@@ -525,6 +528,14 @@ def rounds(args: argparse.Namespace, results: dict, sample: Callable[[str, int],
         order = places.sample(list(results["samples"]), len(results["samples"]))
         results["orders"].append(order)
         began = time.perf_counter()
+        # A warm arm before the run's first round, discarded: the run's first arm lost a window part as
+        # the GPU settled, software power-capped below its locked clock (2026-11-15,
+        # PK-PERF-PROOF-warm-3e781a5f5: 121 ms against 27.6 ms a step, 1620-1815 MHz, reason 0x4), so no
+        # judged arm runs first. Its reading is kept apart, a diagnostic (`warm`); the base's tree runs it.
+        if warm and round_ == 0:
+            results.setdefault("warm", []).append(sample("alone", round_))
+            write_atomically(args.out, json.dumps(results, indent=2))
+            print(f"round {round_ + 1}: warm arm measured (discarded)", flush=True)
         for arm in order:
             results["samples"][arm].append(sample(arm, round_))
             write_atomically(args.out, json.dumps(results, indent=2))
