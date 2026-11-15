@@ -216,14 +216,14 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     others hidden from every query as the document ids hide them: an invalid key takes id 0, the padding
     id no query matches, after every place a cross call's alignment reads is taken from the ids as given,
     and a call of no documents takes 1 for its queries and its valid keys. `runs` `[B, Q, R, 2]` are each
-    query's key intervals `[lo, hi)`, R of them (none, R = 0, one empty run), static, whose union it may see,
-    intersected with all the rest: a window over `positions` is searched within each run alone, whose key
-    places never decrease (its builder's contract: a layout whose places restart, as a decision row's options
-    do, splits its runs there), so the spans keep R intervals a query `[B, Q, R]`, but one run a query, which
-    is one interval `[B, Q]` as every mainloop walks it. `slots` `[B, Q]` are the queries' own keys' indices,
-    a cache call's slots (by default each query's index, or a cross call's aligned place): causality ends a
-    query's keys at its slot, a window or a chunk without `positions` counts keys from it and a block reads
-    the block holding it; a negative slot (padding) sees no key. Lengths, starts and slots are int32 token
+    query's key intervals `[lo, hi)`, R of them, static, whose union it may see, intersected with all the
+    rest: a window over `positions` is searched within each run alone, whose key places never decrease
+    (its builder's contract: a layout whose places restart, as a decision row's options do, splits its
+    runs there), so the spans keep R intervals a query `[B, Q, R]`, but one run a query, which is one
+    interval `[B, Q]` as every mainloop walks it. `slots` `[B, Q]` are the queries' own keys' indices, a cache
+    call's slots (by default each query's index, or a cross call's aligned place): causality ends a query's
+    keys at its slot, a window or a chunk without `positions` counts keys from it and a block reads the
+    block holding it; a negative slot (padding) sees no key. Lengths, starts and slots are int32 token
     coordinates; places and ids keep their own dtypes."""
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
     from dew.nn.visibility import chunk_of, window_sides
@@ -291,14 +291,9 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
             numbers = jnp.take_along_axis(by_places[-1][0], order, axis=1)
             start, end = _narrowed(start, end, order, run_lo, run_hi, numbers, wanted, wanted)
     if runs is not None:
-        runs = jnp.asarray(runs, jnp.int32)
-        if runs.shape[-2] == 0:
-            # No run a query (a selection of nothing) is one empty run `[0, 0)`, no key: every path reads one
-            # representation of it, the reductions over runs (`block_map`'s) none of an empty axis.
-            runs = jnp.zeros((*runs.shape[:-2], 1, 2), jnp.int32)
         sides = None if sliding_window is None or positions is None else window_sides(causal, sliding_window)
-        start, end = _read_runs(runs, start, end, keys, (by_places, sides, positions),
-                                (place, own, block_groups))
+        start, end = _read_runs(jnp.asarray(runs, jnp.int32), start, end, keys,
+                                (by_places, sides, positions), (place, own, block_groups))
     # The call's hard bounds last, once, on every path: a block widens a query's keys past its causal and
     # window bounds alone (`_grouped`, `_whole_blocks`), never past its row's lengths or starts.
     if lengths is not None:
@@ -353,7 +348,11 @@ def _read_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int, nar
     """`spans`' intervals over its key `runs` (`_within_runs`), each narrowed by places (`narrowings`, the
     spans' `by_places` and a window's sides over the call's `positions`, None for none), then the block
     holding each query's own key whole within its run (`blocks`, `(place, own, block_groups)`,
-    `_whole_blocks`) where the call has block groups."""
+    `_whole_blocks`) where the call has block groups. No run a query (R = 0, a selection of nothing) is one
+    empty run `[0, 0)`, no key, so every path reads one representation of it and no reduction over runs
+    (`block_map`'s, the reference's) is over an empty axis."""
+    if runs.shape[-2] == 0:
+        runs = jnp.zeros((*runs.shape[:-2], 1, 2), runs.dtype)
     by_places, windowed, positions = narrowings
     if windowed is not None:
         before, after = windowed
