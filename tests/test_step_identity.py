@@ -232,12 +232,12 @@ def test_a_notebooks_step_compiles_and_reads_its_rows(monkeypatch):
 
 
 @pytest.mark.parametrize("saved", ["without held", "held in its code list"])
-def test_a_position_saved_before_held_code_resumes_exactly_and_refuses_a_change(tmp_path, monkeypatch, saved):
-    """A position saved before steps' held code was saved apart resumes an unchanged run exactly: one saved
-    before held code at all (`without held`, train 898's review: the held digests appended to the code list
-    refused every such position), whose step's code it never held, so a change to it is not compared, and
-    one main saved for an hour, each step's held code appended to its code list (`held in its code list`),
-    which refuses a change to that code."""
+def test_a_position_saved_before_held_code_is_held_to_what_it_saved(tmp_path, monkeypatch, saved):
+    """A position saved before steps' held code was saved apart: one main saved for an hour, each step's held
+    code appended to its code list (`held in its code list`), resumes an unchanged run exactly and refuses
+    a change; one saved before held code at all (`without held`) holds nothing that proves its callable's
+    code unchanged, so its exact resume is refused, changed or not, and a relaxed one reads on naming the
+    step (Main: missing evidence is not proof of unchanged code)."""
     import json
 
     module = tmp_path / f"shift_{uuid4().hex}.py"
@@ -245,9 +245,9 @@ def test_a_position_saved_before_held_code_resumes_exactly_and_refuses_a_change(
     monkeypatch.syspath_prepend(str(tmp_path))
     shift = importlib.import_module(module.stem)
 
-    def reader():
+    def reader(resume="exact"):
         pipeline = Pipeline(ROWS).map(Calling(shift.Shifting())).shuffle(0).repeat().batch(2)
-        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+        return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
 
     place = json.loads(saved_after_one(reader))[_position.ENVELOPE]
     plan = {name: value for name, value in place["plan"].items() if name != "held"}
@@ -255,11 +255,14 @@ def test_a_position_saved_before_held_code_resumes_exactly_and_refuses_a_change(
         plan["code"] = [[*code, *held] for code, held in zip(plan["code"], place["plan"]["held"],
                                                                strict=True)]
     position = json.dumps({_position.ENVELOPE: {**place, "plan": plan}}).encode()
+    if saved == "without held":
+        with pytest.raises(ValueError):
+            resumed_changes(reader(), position)
+        (changed,) = resumed_changes(reader("relaxed"), position)
+        assert changed.startswith("code.")
+        return
     assert resumed_changes(reader(), position) == ()
     module.write_text(SHIFT.format(by=10))
     importlib.reload(shift)
-    if saved == "without held":
-        assert resumed_changes(reader(), position) == ()
-        return
     with pytest.raises(ValueError):
         resumed_changes(reader(), position)
