@@ -453,8 +453,9 @@ def test_a_gate_keeps_each_arms_compiles_apart_and_places_its_arms_at_random_eac
     and a peak cache of its own beside its results (made where absent) that it keeps across its rounds and
     removes at its end; each round's arms in an order drawn at random and kept, every arm in every round,
     every row each round, each beside its probe's seconds; the first round's seconds and the later rounds'
-    apart. Each round begins with a warm arm, the base's tree, which no judgment reads (`warm`): a round's
-    first arm lost a part of its window to a host stall its later arms did not (2026-11-14)."""
+    apart. The run's first round begins with a warm arm, the base's tree, which no judgment reads
+    (`warm`): the run's first arm lost a part of its window as the GPU settled below its locked clock
+    (2026-11-15)."""
     from types import SimpleNamespace
 
     _, rows = standing_in_environments(gate, monkeypatch)
@@ -478,12 +479,12 @@ def test_a_gate_keeps_each_arms_compiles_apart_and_places_its_arms_at_random_eac
     assert set(results["samples"]) == {"base", "head", "alone"}
     assert all(sorted(order) == sorted(results["samples"]) for order in results["orders"])
     assert len(results["orders"]) == 6
-    assert len(results["warm"]) == 6 and all("step lm-dense 4x1024" in sample for sample in results["warm"])
-    # Every round's warm arm runs before its judged arms: the alone arm's cache counts twice its rounds.
-    assert sum(Path(env["JAX_COMPILATION_CACHE_DIR"]).name == "alone" for _, _, env in rows
-               if "JAX_COMPILATION_CACHE_DIR" in env) == 2 * sum(
-        Path(env["JAX_COMPILATION_CACHE_DIR"]).name == "base" for _, _, env in rows
-        if "JAX_COMPILATION_CACHE_DIR" in env)
+    assert len(results["warm"]) == 1 and "step lm-dense 4x1024" in results["warm"][0]
+    # The one warm arm runs before the first round's judged arms: the alone arm's cache counts one more
+    # than its rounds, and first of all.
+    cached = [Path(env["JAX_COMPILATION_CACHE_DIR"]).name for _, _, env in rows
+              if "JAX_COMPILATION_CACHE_DIR" in env]
+    assert cached[0] == "alone" and cached.count("alone") == cached.count("base") + 1
     for arm, taken in results["samples"].items():
         assert all("step lm-dense 4x1024" in sample for sample in taken) and len(taken) == 6, arm
         # Each probe's process timed beside its rows: where a run's minutes went, probe by probe.
