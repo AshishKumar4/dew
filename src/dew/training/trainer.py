@@ -16,6 +16,7 @@ import dataclasses
 import datetime
 import functools
 import gc
+import hashlib
 import logging
 import os
 import sys
@@ -237,6 +238,12 @@ def refuse_non_finite(state: TrainState, step: int, latest: Callable[[], int | N
         said = "no checkpoint" if kept is None else f"the latest checkpoint, step {kept}"
         raise RuntimeError(f"step {step}'s state holds a non-finite value at {first}, so no checkpoint of it "
                            f"is written and {said} is the one a resume finds")
+
+def program_digest(signature: Hashable) -> str:
+    """The digest of a step's batch signature (`batch_signature`, keyed by its phase's passes), which names
+    the program compiled for it in a run's records (`StepCompiled.program`, `ProfileTraced.program`)."""
+    return hashlib.sha256(repr(signature).encode()).hexdigest()[:16]
+
 
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
@@ -2186,8 +2193,11 @@ class Trainer(Generic[Loss, Effects]):
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}
             self._report(StepCompiled(seconds, recompute_record(self.objective), links, self.memory,
-                                      self.plan), int(trials.state.step) if reported is None else reported)
+                                      self.plan, program_digest(signature)),
+                         int(trials.state.step) if reported is None else reported)
             self._unproven = True
+        # The program this step runs, which a profile window that stops after it names (`ProfileTraced`).
+        run.program = program_digest(signature)
         return (*compiled[signature], trials.state)
 
     def _saved_checkpoint(

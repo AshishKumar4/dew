@@ -220,7 +220,7 @@ def _exported_under(profiler: "Profiler") -> None:
 
 
 def reported_window(report: Callable[[Record, int], None], note: Callable[[str], None],
-                    profiled: tuple[int, int, str] | None,
+                    profiled: tuple[int, int, str, str | None] | None,
                     error: BaseException | None) -> BaseException | None:
     """Report a fit's window that stopped, `profiled` its steps traced, the step it stopped at and the
     directory its capture is in, once every rank's export is written and the pool agreed the run's
@@ -229,9 +229,9 @@ def reported_window(report: Callable[[Record, int], None], note: Callable[[str],
     none, noted on one that had."""
     if profiled is None:
         return error
-    traced, step, directory = profiled
+    traced, step, directory, program = profiled
     try:
-        report(ProfileTraced(directory, traced), step)
+        report(ProfileTraced(directory, traced, program), step)
         wrote = f"Wrote profile for {traced} steps to {directory}"
         agreed("profile announcement", lambda: note(wrote))
     except BaseException as failure:
@@ -342,11 +342,17 @@ class ProfileReport:
         logged = {key: value for step, scalars in LocalTracker(run / "tracking").scalars()
                   if step == warmup + steps for key, value in scalars.items()}
         records = (run / "tracking" / "records.jsonl").read_text().splitlines()
-        compiled = [entry for entry in map(json.loads, records) if entry["type"] == "StepCompiled"]
+        entries = list(map(json.loads, records))
+        compiled = [entry for entry in entries if entry["type"] == "StepCompiled"]
         compiles = [entry["value"]["seconds"] for entry in compiled]
-        # The program the window ran: the latest compiled by its last step (a run compiles one a batch
-        # signature, a phased run's later phase its own).
-        ran = [entry["value"] for entry in compiled if entry["step"] <= traced[-1]]
+        # The program the window ran: the one its last step ran, by its batch signature's digest
+        # (`ProfileTraced.program`), compiled then or earlier, a signature read again after another's
+        # reusing its program (row 6822).
+        window = next((entry["value"] for entry in reversed(entries) if entry["type"] == "ProfileTraced"),
+                      {})
+        program = window.get("program")
+        ran = [entry["value"] for entry in compiled
+               if program is not None and entry["value"].get("program") == program]
         plan = ran[-1].get("plan") if ran else None
         kernels = plan.get("kernels") if isinstance(plan, dict) else None
         manifest = json.loads((capture / "manifest.json").read_text())

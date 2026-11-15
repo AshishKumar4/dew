@@ -408,9 +408,13 @@ class FitRun:
     emptied: Emptied | None = None
     """A pooled run's batches of the pool's tree with nothing in them, which a share that ran out steps
     with (`pooled_read`)."""
-    profiled: tuple[int, int, str] | None = None
-    """The steps a stopped profile window traced and the step it stopped at, whose export the run's
-    cleanup waits for before it reports the window (`Trainer._exported_profile`)."""
+    profiled: tuple[int, int, str, str | None] | None = None
+    """The steps a stopped profile window traced, the step it stopped at, its directory and the program its
+    last step ran (`program`), whose export the run's cleanup waits for before it reports the window
+    (`Trainer._exported_profile`)."""
+    program: str | None = None
+    """The program the run's latest step ran, by its batch signature's digest
+    (`dew.training.trainer.program_digest`)."""
     best: HeldBest = dataclasses.field(default_factory=HeldBest)
     """The log taken at the latest logging step and not yet read."""
     stepped: tuple[jax.Array, dict[str, jax.Array], jax.Array] | None = None
@@ -465,7 +469,7 @@ class FitRun:
         if not self.window_paused:
             stop_capture(profiler, self.loss, wait=self.window_waits)
         self.window, self.window_paused = None, False
-        self.profiled = (self.traced, self.current, str(profiler.directory))
+        self.profiled = (self.traced, self.current, str(profiler.directory), self.program)
 
     def committed_examples(self, interval: Interval, points: Sequence[int], state: TrainState,
                            window: int) -> tuple[int, int]:
