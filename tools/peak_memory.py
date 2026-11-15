@@ -12,6 +12,10 @@ A probe measures one row a process, so the high-water is that row's.
 
     peaks = measured(["tools/benchmark_step.py", "--cases", ..., "--peak-run"])
 
+Each run is told its stage (`PEAK_STAGE`), so a program that measures more than its peak does that in the
+measured run alone, the one whose programs all came from the cache (tools/benchmark_step.py times its step
+there, reading the high-water only as it exits, after its timed windows).
+
 A device whose allocator keeps no high-water (JAX's CPU devices, as this JAX builds them) reports None,
 which a caller may know before it runs a process (`keeps_high_water`).
 """
@@ -54,7 +58,12 @@ device's high-water written as it exits."""
 
 class CompiledWhileMeasured(RuntimeError):
     """The measured process compiled a program its cache did not hold, whose compile, and autotuning,
-    joined the high-water it read: the program compiles otherwise on its second run than its first."""
+    joined the high-water it read: the program compiles otherwise on its second run than its first.
+    `compiled` is how many it compiled."""
+
+    def __init__(self, message: str, compiled: int):
+        super().__init__(message)
+        self.compiled = compiled
 
 
 def keeps_high_water() -> bool:
@@ -69,6 +78,9 @@ def keeps_high_water() -> bool:
     return jax.config.jax_platforms != "cpu"
 
 
+PEAK_STAGE = "DEW_PEAK_STAGE"
+"""The environment variable naming each run its stage, "warm" (filling the cache) or "measure" (loading
+from it, its high-water read)."""
 PEAK_CACHE = "DEW_PEAK_CACHE"
 """The environment variable naming a compile cache the peak runs keep across calls (tools/perf_gate.py
 names one an arm, so each of its rounds' first runs loads what its first round compiled); a cache of the
@@ -88,8 +100,8 @@ def measured(argv: list[str]) -> list[int | None]:
                        "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "-1"}
         out = Path(directory, "peaks.json")
         for stage in ("warm", "measure"):
-            done = subprocess.run([sys.executable, "-c", MEASURED, stage, str(out), *argv], env=environment,
-                                  capture_output=True, text=True)
+            done = subprocess.run([sys.executable, "-c", MEASURED, stage, str(out), *argv],
+                                  env={**environment, PEAK_STAGE: stage}, capture_output=True, text=True)
             try:
                 done.check_returncode()
             except subprocess.CalledProcessError as error:
@@ -98,5 +110,5 @@ def measured(argv: list[str]) -> list[int | None]:
         report = json.loads(out.read_text())
     if report["compiled"]:
         raise CompiledWhileMeasured(f"{' '.join(argv)}: {report['compiled']} programs compiled in its "
-                                    "measured run, which the cache did not give it")
+                                    "measured run, which the cache did not give it", report["compiled"])
     return report["peaks"]

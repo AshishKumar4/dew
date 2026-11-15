@@ -408,5 +408,5 @@ def test_a_profiled_benchmark_case_writes_the_reports_attribute_step_reads(tmp_p
     from test_benchmark_step import peak_row
 
     peak_row(tmp_path, "cuda", "--profile-dir", str(tmp_path / "traces"), "--profile-steps", "1")
-    (case,) = [path for path in (tmp_path / "traces").iterdir() if path.name != "peak-run"]
+    (case,) = (tmp_path / "traces").iterdir()
     assert (attribute.capture_of(case) / "reports" / "hlo_stats.json").is_file()

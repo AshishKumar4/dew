@@ -364,8 +364,9 @@ def _run(tree: Path, python: Path, tool: str, argv: list[str], newer: Path, time
         # The arm's own compile cache, empty at the gate's start: its first round compiles cold, its later
         # rounds load what that round compiled, and no arm loads another's programs. Every program is kept,
         # however quickly it compiled or small it is (the cache's write thresholds, which Dew's own cache
-        # setup clears too); a later round still traces and lowers, then loads. Its measured peaks' processes
-        # keep a cache of their own across its rounds too (tools/peak_memory.py's PEAK_CACHE).
+        # setup clears too); a later round still traces and lowers, then loads. The processes a measured peak
+        # runs in (a step's whole measurement, tools/benchmark_step.py's `measured_row`) keep a cache of their
+        # own across its rounds too (tools/peak_memory.py's PEAK_CACHE).
         env.update(JAX_ENABLE_COMPILATION_CACHE="true", JAX_COMPILATION_CACHE_DIR=str(cache),
                    JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="0",
                    JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES="-1",

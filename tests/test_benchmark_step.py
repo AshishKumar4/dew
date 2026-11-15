@@ -145,7 +145,7 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
                                   warmup=1, steps=2, dtype='float32', fixed_batch=fixed_batch)
     (case,) = tool.build_cases(config)
 
-    row = tool.measure(case, config, None)
+    row = tool.measure(case, config)
 
     assert row["finite"] and np.isfinite(row["loss"])
     assert row["measured_steps"] == 2 and row["fixed_batch"] is fixed_batch
@@ -214,8 +214,8 @@ def test_a_steps_count_some_launches_work_is_missing_from_reads_as_a_lower_bound
 
 def peak_row(tmp_path, platform: str, *arguments: str, settings: dict[str, str] | None = None) -> dict:
     """The causal_transformer smoke case's row, the tool run as a person runs it on one device of
-    `platform` with `arguments` and the environment's `settings`, its peak measured in a process of the
-    case's own."""
+    `platform` with `arguments` and the environment's `settings`, the case measured in processes of its
+    own."""
     out = tmp_path / "rows.json"
     environment = outside_suite(os.environ) | (settings or {})
     tool = str(REPO_ROOT / "tools/benchmark_step.py")
@@ -230,11 +230,12 @@ def peak_row(tmp_path, platform: str, *arguments: str, settings: dict[str, str] 
     return row
 
 
-def test_a_cases_peak_is_read_in_a_process_of_its_own_inside_the_cases_context_alone_and_cold(tmp_path):
-    """The tool's peak memory comes from a process of the case's own that loaded every program from a cache
-    and compiled nothing (a compile there refuses the run), one high-water a device, the bytes XLA planned
-    beside it; that process runs inside the context a diagnostic names (`--within`), as the case does. Run
-    alone, the tool compiles cold, writing nothing to Dew's own cache (row 1577)."""
+def test_a_case_is_measured_in_processes_of_its_own_inside_the_cases_context_alone_and_cold(tmp_path):
+    """The tool's row comes from processes of the case's own: the first compiles, its compile the row's,
+    the second loads every program from its cache and compiles nothing (a compile there refuses the run),
+    timing the step and reading one high-water a device, the bytes XLA planned beside it; both run inside
+    the context a diagnostic names (`--within`) and the tool's own process runs no case. Run alone, the
+    tool compiles cold, writing nothing to Dew's own cache (row 1577)."""
     own = tmp_path / "home-cache"
     (tmp_path / "marking.py").write_text(
         "import contextlib, os\n"
@@ -244,18 +245,34 @@ def test_a_cases_peak_is_read_in_a_process_of_its_own_inside_the_cases_context_a
         "    yield\n")
     row = peak_row(tmp_path, "cpu", "--within", "marking:marked", settings={"XDG_CACHE_HOME": str(own)})
     assert row["devices"] == 1 and len(row["peak_bytes_by_device"]) == 1 and row["planned_device_bytes"] > 0
-    assert len(set((tmp_path / "entered").read_text().split())) == 3, "this process and both peak processes"
+    assert row["ms_per_step"] > 0 and row["compile_seconds"] > 0 and row["ahead_step"] is False
+    assert row["compiled_while_measured"] == 0 and row["compile_cached"] is False
+    assert len(set((tmp_path / "entered").read_text().split())) == 2, "the case's two processes alone"
     assert not list(own.rglob("jit_*"))
 
 
+def test_a_case_whose_measured_run_compiled_keeps_its_timing_with_no_peak(tmp_path):
+    """A program the measured run did not load from its cache (its cache switched off there alone) is
+    compiled there: its compile joined the high-water, so the row has no peak and counts the compiles, its
+    timing kept."""
+    (tmp_path / "uncached.py").write_text(
+        "import contextlib, os, jax\n"
+        "@contextlib.contextmanager\n"
+        "def uncached():\n"
+        "    if os.environ.get('DEW_PEAK_STAGE') == 'measure':\n"
+        "        jax.config.update('jax_enable_compilation_cache', False)\n"
+        "    yield\n")
+    row = peak_row(tmp_path, "cpu", "--within", "uncached:uncached")
+    assert row["compiled_while_measured"] >= 1 and row["peak_device_bytes"] is None
+    assert row["peak_bytes_by_device"] is None and row["ms_per_step"] > 0 and row["finite"]
+
+
 def test_a_cache_its_caller_names_keeps_what_the_step_compiled(tmp_path):
-    """perf_gate names each tree's compile cache, so its later rounds load what its first compiled: the step
-    compiled into it (run alone, the tool writes nothing to Dew's own cache:
-    `test_a_cases_peak_is_read_in_a_process_of_its_own_inside_the_cases_context_alone_and_cold`)."""
-    named, own = tmp_path / "tree-cache", tmp_path / "home-cache"
-    peak_row(tmp_path, "cpu", settings={
-        "JAX_COMPILATION_CACHE_DIR": str(named), "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
-        "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "-1", "XDG_CACHE_HOME": str(own)})
+    """perf_gate names each arm's case cache (tools/peak_memory.py's PEAK_CACHE), so its later rounds load
+    what its first compiled: the step compiled into it (run alone, the tool writes nothing to Dew's own
+    cache: `test_a_case_is_measured_in_processes_of_its_own_inside_the_cases_context_alone_and_cold`)."""
+    named, own = tmp_path / "arm-cache", tmp_path / "home-cache"
+    peak_row(tmp_path, "cpu", settings={"DEW_PEAK_CACHE": str(named), "XDG_CACHE_HOME": str(own)})
     assert [entry for entry in named.iterdir() if entry.name.startswith("jit_")]
 
 
@@ -264,7 +281,9 @@ def a_cases_measured_peak_holds_at_least_the_bytes_xla_planned(tmp_path):
     workspaces and its profiled steps included (their traces apart): at least what XLA planned."""
     row = peak_row(tmp_path, "cuda", "--profile-dir", str(tmp_path / "traces"), "--profile-steps", "1")
     assert row["peak_device_bytes"] == row["peak_bytes_by_device"][0] >= row["planned_device_bytes"] > 0
-    assert any((tmp_path / "traces/peak-run").rglob("*.xplane.pb"))
+    # The measuring process profiles; the one that filled its cache does not.
+    (traced,) = (tmp_path / "traces").iterdir()
+    assert any(traced.rglob("*.xplane.pb")) and "device_busy_percent" in row
 
 
 @pytest.mark.parametrize(("steps", "parts"), [(30, [5] * 6), (2, [1, 1]), (7, [2, 1, 1, 1, 1, 1]), (1, [1])])
