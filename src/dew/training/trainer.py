@@ -67,7 +67,7 @@ from dew.held_updates import waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
-from dew.nn.kernels.options import Compiling, attempting, owned_program
+from dew.nn.kernels.options import Compiling, attempting, owned_program, program
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, tracing
 from dew.objectives.base import (
@@ -225,7 +225,7 @@ def refuse_non_finite(state: TrainState, step: int, latest: Callable[[], int | N
     leaves = [(f"{name}{jax.tree_util.keystr(path)}", leaf) for name, tree in trees.items()
               for path, leaf in jax.tree_util.tree_leaves_with_path(tree)
               if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)]
-    finite = jax.device_get(_finite_flags([leaf for _, leaf in leaves]))
+    finite = jax.device_get(program(_finite_flags)([leaf for _, leaf in leaves]))
     first = next((path for (path, _), held in zip(leaves, finite, strict=True) if not held), None)
     if first is not None:
         kept = latest()
@@ -234,7 +234,6 @@ def refuse_non_finite(state: TrainState, step: int, latest: Callable[[], int | N
                            f"is written and {said} is the one a resume finds")
 
 
-@jax.jit
 def _finite_flags(leaves: list[jax.Array]) -> jax.Array:
     """Whether each of `leaves` is finite throughout, one flag a leaf from one program."""
     return jnp.stack([jnp.isfinite(leaf).all() for leaf in leaves]) if leaves else jnp.zeros((0,), bool)
