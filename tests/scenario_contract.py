@@ -3,7 +3,8 @@ touches", §Scenarios), each one function a scenario or a capability-matrix cell
 made: a claim its own run can show costs no second run, and a claim that needs one (a learning claim, over
 independent runs) is paid once a scenario."""
 
-from collections.abc import Callable, Iterable, Mapping
+import itertools
+from collections.abc import Callable, Iterable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -44,3 +45,16 @@ def held_out_losses(objective, optimizer, loader_of: Callable[[int], object],
         before.append(float(objective.scalar_loss(start.variables, held_out, HELD_OUT)[0]))
         after.append(float(objective.scalar_loss(state.variables, held_out, HELD_OUT)[0]))
     return np.asarray(before), np.asarray(after)
+
+
+def covering(axes: Mapping[str, Sequence]) -> list[dict]:
+    """A small covering set over a scenario's settings axes (docs/design/testing.md, settings and devices),
+    chosen pairwise: the fewest of every combination of the axes' values (greedy, in the combinations'
+    order, so a scenario's cells are the same each run) that hold every value and every two values of two
+    axes, as the GPU tier chooses its cells (`gpu_flow.greedy`)."""
+    from gpu_flow import greedy, held
+
+    names = list(axes)
+    combinations = [dict(zip(names, values, strict=True)) for values in itertools.product(*axes.values())]
+    return [combinations[index]
+            for index in greedy(combinations, set().union(*(held(cell) for cell in combinations)))]

@@ -48,6 +48,14 @@ Each scenario runs a small covering set over the settings axes, chosen pairwise,
 - data read: memory, indexed, streamed;
 - decision runs: head, context, consistency, and bound kind (examples, a share of them).
 
+The cells are generated from each scenario's declared axes, the values it takes on the CPU tier
+(`scenario_contract.covering`): `tests/test_scenario_runs.py` runs one short run a cell, `dew train` or the
+scenario's own API in a fresh process that sees the cell's devices, held to the contracts its flow touches
+(every update's gradient finite; its run reloading, generating or sampling as its checkpoint does), and the
+decision workflow's cells are its axes' (`tests/test_decision_workflow.py`). fp8 needs widths a multiple of
+128 and the GPU mesh a fleet, so neither is a CPU tier's axis; the published pipelines' and a quantized
+file's scenarios take their own axes (family and dtype; format and use).
+
 Implementations come from their registries. A new implementation cannot opt out by being absent from a hand-kept test list.
 
 **CPU tier (every CI run):** real architectures from their real configs, scaled down (layers, width), plus small real checkpoints that fit (for example SmolLM2-135M). Each scenario takes minutes. Multiprocess and multihost behavior uses real processes, readers and meshes. A single-process mesh simulation is useful evidence for that simulation only. The GPU mesh axis (`tests/test_gpu_mesh.py`, and the mesh-marked `gpu` cells of `tests/test_attention_route.py` and `tests/test_kernel_spills.py`) runs on no fleet of Dew's, whose GPUs are single (owner, 2026-10-30, ledger 2221): NCCL collectives, sharded cuDNN attention and a mesh's FFI calls are unqualified by Dew's CI, and a CPU multi-device mesh qualifies the sharding logic alone.
