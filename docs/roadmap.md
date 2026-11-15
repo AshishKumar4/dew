@@ -45,6 +45,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - Sm90 lightning attention (MiniMax-Text-01, 64 heads of 128, bf16) packed forward, the gate's two-roles variant. [6495]
 - The interpreter (Pallas Mosaic GPU interpret mode, the CPU suite's) takes about 8 times as long a draw for a tcgen05. [6521]
 - A 4B decision start's cold fit spends 152.8 s. [6593]
+- For the owner's choice: pay for the range now, pay less after a kernel route, or restate it. [6655]
+- On main today, both arms: the chunked op's backward forms the local scores' gradient do v^T before the key's product, so a cotangent of 2^110 through values of…. [6656]
 
 ## Models and interop
 
@@ -78,6 +80,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - Training and serving efficiency. [3330, 1880, 5292]
+- DeepSeek V4's attention declares its kv_proj kernels. [6654]
 - Dory: the release qualified and its tests' oracles. [596]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
 - A decoder computing in no dtype of its own. [6215]
