@@ -1293,6 +1293,19 @@ def test_programs_saved_before_executables_were_one_type_are_refused_to_compile_
         AheadPrograms.load(path)
 
 
+@pytest.mark.parametrize("generation", ["sm80", "sm90", "sm100"])
+def test_a_generations_abstract_mesh_is_its_compile_only_gpus(generation):
+    """A mesh traced for a GPU on any host (`generation.gpu_mesh`) is the abstract mesh of compile-only GPUs
+    of that generation: one statement of the GPU in every key reading it (the Pallas lowering cache's, a
+    program lowered for the GPU), not `cuda` and no cores beside the compile-only GPU's `gpu` and its
+    multiprocessors."""
+    from dew.nn.kernels.generation import compile_only_gpus, gpu_mesh
+
+    devices = compile_only_gpus(generation)
+    host = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",))
+    assert gpu_mesh(host, generation) == jax.sharding.Mesh(np.array(devices[:1]), ("data",)).abstract_mesh
+
+
 def test_compiling_ahead_takes_a_mesh_of_compile_only_gpus():
     """A trainer whose mesh is this host's own devices runs its step here; compiling it ahead is
     refused, as XLA's CPU executable, loaded again, finds none of its fused functions."""
