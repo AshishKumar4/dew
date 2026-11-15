@@ -2311,19 +2311,12 @@ def test_cli_exports_a_recorded_chain_whose_step_its_trust_names_in_a_fresh_proc
     assert source(str(tmp_path / "out2")).records("indexed")[0] == {"text": "QUIET"}
 
 
-def _first_read(data, partition=None, rows=None) -> list[BaseException | object]:
-    """The outcome of `data`'s first training batch, or of `rows`' first row where given (a dataset of
-    `streamed`'s), read on a thread of its own for at most 120 s: the batch, or what refused it; empty where
-    the read never returned."""
+def _first_read(data, partition=None) -> list[BaseException | object]:
+    """The outcome of `data`'s first training batch, read on a thread of its own for at most 120 s: the
+    batch, or what refused it; empty where the read never returned."""
     outcome: list[BaseException | object] = []
 
     def first() -> None:
-        if rows is not None:
-            try:
-                outcome.append(next(iter(rows)))
-            except BaseException as refusal:
-                outcome.append(refusal)
-            return
         stream = data.train(partition or DataPartition())
         try:
             outcome.append(next(iter(stream)))
@@ -2382,20 +2375,17 @@ def test_an_endless_read_of_files_some_empty_reads_the_rows_the_others_hold(tmp_
     assert len(read_ids) == 40 and set(read_ids) <= set(range(64))
 
 
-@pytest.mark.parametrize("seed", [None, 0], ids=["in order", "shuffled"])
-def test_an_endless_read_of_one_share_of_empty_files_is_refused(tmp_path, seed):
-    """A share of an endless read of eight header-only CSV files, whose store counts no rows, is refused,
-    whatever its order: the reader is refused once it has found every place it can read empty, four of a
-    share of two in order, all eight where a seed deals each pass its own order. It waited for eight,
-    which a share in order never reads, and its first pull never returned (the evening audit's product
-    read, row 6700)."""
+def test_an_endless_read_of_one_share_of_empty_files_is_refused(tmp_path):
+    """One share of two of an endless read of eight header-only CSV files, whose store counts no rows, is
+    refused once it has found empty every place it can read, which a seed deals each pass its own order of
+    (`dew.data.shards._ShardPass.reachable`; row 6700)."""
     paths = []
     for index in range(8):
         path = tmp_path / f"empty{index}.csv"
         path.write_text("id\n")
         paths.append(str(path))
-    rows = streamed(Files(tuple(paths)).manifest(), seed=seed, partition=DataPartition(0, 2), epochs=None,
-                    loading=Loading(workers=0, threads=1, read_buffer=1))
-    (outcome,) = _first_read(None, rows=rows)
+    (outcome,) = _first_read(compile(Files(tuple(paths)).repeat().batch(1), read="streamed",
+                                     loading=Loading(workers=0, threads=1, read_buffer=1)),
+                             DataPartition(0, 2))
     assert isinstance(outcome, ValueError), outcome
 

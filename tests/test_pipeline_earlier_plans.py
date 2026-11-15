@@ -219,3 +219,35 @@ def test_a_stream_its_store_cuts_into_other_shards_is_refused():
                 assert _ids(stream, 2) == after
         finally:
             stream.close()
+
+
+SAVED_BEFORE_REACHED = Path(__file__).with_name("fixtures") / "positions" / "main-2880fce66"
+"""A position main saved at 2880fce66 of `saved_positions_support.taken`, whose configured step (`Scaled`)
+is a class of the user's: its plan holds the class's text under `held`, before Dew held the code a step's
+own code reaches (`reached`)."""
+
+
+def test_a_position_saved_before_reached_code_is_refused_exact_and_read_on_relaxed():
+    """A position main saved holding a step's class text under `held` holds nothing that proves the code that
+    step reaches unchanged, so its exact resume is refused, naming the step, and a relaxed one reads on from
+    where it stopped onto the rows a read of the same chain reads next. It read as 'the code of data step
+    changed' for unchanged code (train 909's F8)."""
+    import saved_positions_support
+
+    from dew._position import PlanChanged
+
+    loader, steps = saved_positions_support.SAVED["taken"]
+    saved = (SAVED_BEFORE_REACHED / "taken.position").read_bytes()
+    exact = loader().train(DataPartition())
+    try:
+        with pytest.raises(PlanChanged) as refused:
+            exact.set_state(saved)
+    finally:
+        exact.close()
+    assert [part.split(".")[0] for part in refused.value.differs] == ["code"]
+    relaxed = dataclasses.replace(loader(), resume="relaxed").train(DataPartition())
+    try:
+        relaxed.set_state(saved)
+        assert _ids(relaxed, 2) == _read(loader(), steps, 2)
+    finally:
+        relaxed.close()
