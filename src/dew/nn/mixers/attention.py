@@ -1844,7 +1844,7 @@ class CausalSelfAttention(nn.Module):
         reads the pool through the page table from each row's `starts` under a window; the gathered keys
         go unread and XLA drops the gather. A row whose query is padding (`positions` -1) reads one key
         (`held_reads`)."""
-        reads = held_reads(self.get_variable("cache", "cache_index"), positions)
+        reads = held_reads(self.get_variable("cache", CURSOR), positions)
         out = append.store.decode(query[:, 0], reads, kernel, self.ctx.attn_logit_softcap, starts, sinks)
         return checkpoint_name(out[:, None], Residual.CONTEXT)
 
