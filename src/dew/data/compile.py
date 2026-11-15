@@ -789,6 +789,7 @@ def compile(
             resume=resume,
             steps=steps,
             budget=tokens,
+            widths=widths,
         )
         return dataclasses.replace(phased, resume=resume)
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
@@ -1487,7 +1488,10 @@ def _compile_phases(
     resume: DataResume,
     steps: int | None = None,
     budget: int | None = None,
+    widths: Mapping[str, object] | None = None,
 ) -> Loader:
+    """`train`'s phases, each compiled on its own, every phase and the validation binding the run's
+    `widths` (`run_widths`), measured over every phase and held chain, one program for them all."""
     source = train.source
     if not isinstance(source, Phases):
         raise TypeError("phased compilation needs a Phases source")
@@ -1501,7 +1505,8 @@ def _compile_phases(
         `_stamped`)."""
         phase = _staged(_continued(source.pipelines[index], consumed)._then(*train.stages),
                         validation if index == 0 else None, objective=objective, read=read,
-                        provision=provision, loading=loading, seed=seed, rejections=rejections)
+                        provision=provision, loading=loading, seed=seed, rejections=rejections,
+                        widths=widths)
         return _skipping(_stamped(phase, members or {}), consumed, source.pipelines[index])
 
     tokens = source.clock == "tokens"
@@ -2197,13 +2202,20 @@ def fitted[Entry](
         # epochs' passes over its examples (`_staged`).
         trained = chain if examples is not None or epochs is not None else _endless(chain)
         read = trained.mode or _preferred_read((trained,), provision=True)
-        # A run of phases compiles each phase on its own (`_compile_phases`), so its measure is its own.
-        measured = (None if not scored or (isinstance(trained.source, Phases) and examples is None) else
+        # A run of phases compiles each phase on its own (`_compile_phases`), each binding the widths
+        # measured over every phase and held chain (data.md §10, `run_widths`).
+        phased = isinstance(trained.source, Phases) and examples is None
+        measured = (None if not scored or phased else
                     _training_measure(trained, None, objective=objective, read=read, provision=True,
                                       loading=trained._loading or _DEFAULT_LOADING, examples=examples,
                                       epochs=epochs if examples is None else None))
-        widths = (run_widths([*([measured] if measured else []), *scored.values()], objective)
-                  if scored else {})
+        phases = ([_training_measure(phase._then(*trained.stages), None, objective=objective, read=read,
+                                     provision=True, loading=trained._loading or _DEFAULT_LOADING,
+                                     examples=None)
+                   for phase in trained.source.pipelines] if phased and isinstance(trained.source, Phases)
+                  else [])
+        widths = (run_widths([*([measured] if measured else []), *phases, *scored.values()], objective)
+                  if scored or phases else {})
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
                          widths=widths, read=read, measured=measured,
                          epochs=epochs if examples is None else None,
