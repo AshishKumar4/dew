@@ -840,6 +840,15 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     # assembler's to certify (`template.Mosaic._raised`), not the model's.
     found, programs, planning = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
                                       consumers=consumers, entry=held.entry(family))
+    if persistent and tiles > programs:
+        # A program walking more tiles than the launch's programs carries its next tile across the walk
+        # (`_persisted`): its index, its coordinates a grid axis each and its liveness, a register each.
+        # Unstated, the 4B gated delta net's packed output, its walk looping, stated 168 a consumer and
+        # spilled 16 bytes there on an H100, none at 176, and none at 168 where its programs held every
+        # tile (jsf-out4b9: its SASS 56 SYNCS and 50 branches against 32 and 15; row 6495).
+        registers += len(grid) + 2
+        found, programs, planning = _laid(call, scope, registers, tiles, stages=None, consumers=consumers,
+                                          entry=held.entry(family))
     # Where no multiprocessor holds the launch, its record says so (`Launch.resident` zero), which the
     # template's legality refuses, and it builds at its shallowest depth, as a probe of the config compiles
     # it.
