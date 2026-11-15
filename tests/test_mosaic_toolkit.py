@@ -639,6 +639,82 @@ def test_a_sum_of_three_part_products_holds_one_accumulator_a_term_one_at_a_time
     assert not any(accumulator(inner) for scope in scopes for inner in equations(scope.params["jaxpr"]))
 
 
+def _mixed_sums(a, b, c, d, *, interpret, together=False):
+    """Sums of products of two forms through one prepared-operand issuer (`operands.Issuer.summed`) on
+    warpgroup MMA: `a @ b` of three parts each (fp32 tiles' parts in shared memory) and `c @ d` of one
+    (bfloat16 tiles): `a @ b + c @ d`, then `c @ d + a @ b`, then `c @ d` from a deferred left operand an
+    issuer of no buffers forms (a callable giving a tile in memory). `together`, `a @ b` alone through
+    `summed_together`'s reader instead."""
+    from dew.nn.kernels.templates import mosaic_sm90, operands, product
+
+    family = mosaic_sm90.FED  # one warpgroup, no producer
+    wide = plgpu.SMEM((ISSUED, ISSUED), jnp.bfloat16)
+
+    def body(a_gmem, b_gmem, c_gmem, d_gmem, *outs):
+        def scoped(*refs):
+            a_parts, b_parts, (c_smem, d_smem) = refs[:3], refs[3:6], refs[6:]
+            for held, value in ((a_parts, a_gmem[...]), (b_parts, b_gmem[...])):
+                for ref, part in zip(held, product.formed(value, 3), strict=True):
+                    ref[...] = part
+            c_smem[...], d_smem[...] = c_gmem[...], d_gmem[...]
+            a, b = operands.Parts(a_parts, jnp.float32), operands.Parts(b_parts, jnp.float32)
+            c, d = operands.Parts((c_smem,), jnp.bfloat16), operands.Parts((d_smem,), jnp.bfloat16)
+            issuer = operands.Issuer(_Call(family, interpret))
+            if together:
+                (read,) = issuer.summed_together([[("wide", a, b)]])
+                outs[0][...] = read()
+                return
+            outs[0][...] = issuer.summed([("wide", a, b), ("narrow", c, d)], (ISSUED, ISSUED))
+            outs[1][...] = issuer.summed([("narrow", c, d), ("wide", a, b)], (ISSUED, ISSUED))
+            outs[2][...] = issuer.summed([("deferred", lambda: c, d)], (ISSUED, ISSUED))
+
+        pl.run_scoped(scoped, *(wide for _ in range(8)), collective_axes="wg")
+
+    out = jax.ShapeDtypeStruct((ISSUED, ISSUED), jnp.float32)
+    count = 1 if together else 3
+    return family.kernel(body, out_type=(out,) * count, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="mixed")(a, b, c, d)
+
+
+@INTERPRETS
+def test_a_sum_of_products_of_two_forms_is_one_sum_in_either_order():
+    """Interpreted: a product of three parts beside one of one part sum to `a @ b + c @ d` in either order,
+    each form summed as it is (the three-part one a term at a time), and a deferred operand an issuer of no
+    buffers forms (a tile in memory) is read as it is."""
+    from reference_error import assert_fp32_reduction_bound
+
+    a, b = (x[0] for x in _termwise_operands())
+    keys = jax.random.split(jax.random.key(5))
+    c, d = (jax.random.randint(key, (ISSUED, ISSUED), -4, 4).astype(jnp.bfloat16) for key in keys)
+    first, second, deferred = _mixed_sums(a, b, c, d, interpret=INTERPRETED)
+    wide = [np.asarray(x, np.float64) for x in (a, b, c, d)]
+    expected = wide[0] @ wide[1] + wide[2] @ wide[3]
+    magnitudes = np.abs(wide[0]) @ np.abs(wide[1]) + np.abs(wide[2]) @ np.abs(wide[3])
+    for found in (first, second):
+        assert_fp32_reduction_bound(found, expected, magnitudes, terms=ISSUED * 7)
+    np.testing.assert_array_equal(np.asarray(deferred), wide[2] @ wide[3])
+
+
+def test_groups_summed_together_take_a_three_part_products_terms_apart():
+    """Traced for an H100: a group of a product of three parts summed by `summed_together`'s reader takes
+    each of its six terms into an accumulator of its own, one at a time, as `summed` does (`_termwise`), not
+    every term into one."""
+    from reference_error import equations
+
+    a, b = (x[0] for x in _termwise_operands())
+    c = d = jnp.zeros((ISSUED, ISSUED), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        traced = jax.make_jaxpr(lambda *xs: _mixed_sums(*xs, interpret=False, together=True))(a, b, c, d)
+
+    def accumulator(equation) -> bool:
+        return equation.primitive.name == "run_scoped" and any(
+            "Accumulator" in type(var.aval).__name__ for var in equation.params["jaxpr"].invars)
+
+    scopes = [equation for equation in equations(traced.jaxpr) if accumulator(equation)]
+    assert len(scopes) == 6, len(scopes)
+    assert not any(accumulator(inner) for scope in scopes for inner in equations(scope.params["jaxpr"]))
+
+
 def _carried_sums(a, b, c, d):
     """`a @ b + c @ d` issued in place into one accumulator a walk carries (`Issuer.summed`'s `into`),
     interpreted: `a` a register left operand its product takes in registers (its buffers a count, wgmma's
