@@ -24,15 +24,18 @@ class Affine(nn.Module):
 
 
 class Regression(Objective):
-    """Squared error of an affine map against `2 * x[:, :2]`, its trace keyed by what it reads (`traced`, its
-    EMA's constant decay), so a refit in the same process reads the step an equal one traced (row 3873)."""
-
-    traced = ("probe",)
+    """Squared error of an affine map against `2 * x[:, :2]`, its trace keyed by what it reads (its own
+    `trace_key`: whether it reports its probe, beside its model and its EMA's constant decay), so a refit in
+    the same process reads the step an equal one traced (row 3873)."""
 
     def __init__(self, ema_decay=0.5, *, probe=True):
         self.model = Affine()
         self.ema = EMASpec.constant(ema_decay)
         self.probe = probe
+
+    def trace_key(self):
+        # A class of a test's own states its key itself (`stated_trace`): its loss reads its probe alone.
+        return self.traced_by({"probe": self.probe})
 
     def fresh_variables(self, key, held):
         return nn.unbox(self.model.init(key, jnp.zeros((1, FEATURES))))
