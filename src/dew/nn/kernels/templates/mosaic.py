@@ -128,11 +128,9 @@ def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | 
     `out_type` states its outputs as its operands' axes (`outputs.Output`), the dimensions each descends from
     (`outputs.OUTPUT_DIMS`), which a compile's live buffers read."""
     declared = {} if model_flops is None else {MODEL_FLOPS: str(model_flops)}
-    dimensioned = outputs.dimensioned(out_type)
 
     def launch(*operands):
-        stated = {**declared, **({outputs.OUTPUT_DIMS: outputs.stated(out_type, operands)} if dimensioned
-                                 else {})}
+        stated = {**declared, **outputs.declared(out_type, operands)}
         if stated:
             with set_xla_metadata(**stated):
                 return checked_launch(*operands)

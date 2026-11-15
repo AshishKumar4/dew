@@ -50,7 +50,7 @@ class KernelCall:
     """The launch that traced a Mosaic GPU kernel, as its call's caller states it (`report.launch_metadata`),
     beside its name; None where its call states none."""
     output_dims: str | None = None
-    """The dimensions a Mosaic GPU kernel's outputs descend from, as its call states them
+    """The dimensions a Mosaic GPU or Triton kernel's outputs descend from, as its call states them
     (`outputs.OUTPUT_DIMS`); None where it states none."""
 
     @property
@@ -336,7 +336,8 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
         config = ir.DictAttr(attributes["mhlo.backend_config"])
         return KernelCall(kind, ir.StringAttr(config["name"]).value, ir.StringAttr(config["ir"]).value_bytes,
                           f"warps={ir.IntegerAttr(config['num_warps']).value} "
-                          f"stages={ir.IntegerAttr(config['num_stages']).value}", None)
+                          f"stages={ir.IntegerAttr(config['num_stages']).value}", None,
+                          output_dims=_frontend(attributes).get(OUTPUT_DIMS))
     if kind == "mosaic_gpu":
         config = ir.DictAttr(attributes["mhlo.backend_config"])
         stated = (json.loads(ir.StringAttr(config["cost_estimate_json"]).value)
