@@ -1485,6 +1485,19 @@ def test_a_refusal_applies_only_to_the_target_capacities_that_generated_its_kern
             assert not report.refused(launch, arguments, tile)
 
 
+def test_a_trace_held_by_its_state_is_held_in_any_recordings_scope():
+    """The state a held trace is keyed by (`dew._cache.traced_state`, the algebra's written regions') is the
+    same in two fresh recordings (`generation.recording`): a recording is what a trace records into, no
+    trace reads it, so identical regions traced in two of them share one trace (row 6668)."""
+    from dew import _cache
+
+    with generation.recording():
+        first = _cache.traced_state()
+    with generation.recording():
+        second = _cache.traced_state()
+    assert first == second
+
+
 def test_a_recording_holds_while_the_refusals_its_trace_read_answer_alike():
     """A trace's read of a launch's refusals (its legality's, `report.refused`) is recorded with its answer
     (`generation.recording`): the record holds while that launch's refusals stay as they were, a refusal of
