@@ -190,6 +190,8 @@ REFUSED = {
     "attention written out, masked a key ahead": lambda tokens: attention(*(embedded(tokens),) * 3,
                                                                          causal=True, ahead=1),
     "attention masked by a bias too small to vanish": lambda tokens: biased_attention(tokens, -1.0),
+    "attention masked by a finite bias short of its dtype's lowest": lambda tokens: biased_attention(
+        tokens, -1e9),
     "a token's top routing weights taken from the next token's": lambda tokens: routed(tokens, shift=1),
     "attention masked by its dtype's lowest, cast through bytes": lambda tokens: cast_attention(tokens),
     "attention less a maximum of other rows": shuffled_maximum,
@@ -243,6 +245,21 @@ def test_a_program_whose_positions_read_no_later_one_is_admitted(name):
 @pytest.mark.parametrize("name", sorted(REFUSED))
 def test_a_program_reading_a_later_position_or_unproven_is_refused(name):
     assert refusal(REFUSED[name]) is not None
+
+
+def test_a_verdict_on_a_mask_at_its_dtypes_lowest_names_the_bound_it_rests_on():
+    """A program whose attention is causal by a mask at its dtype's lowest rests on its values staying
+    below half an ulp of that dtype's largest, which the verdict names; one masked by minus infinity rests
+    on nothing past finiteness."""
+    from dew.interop.sequence_causality import causality
+
+    def verdict(bias):
+        program = jax.make_jaxpr(lambda tokens: biased_attention(tokens, bias))(jnp.zeros((1, 11), jnp.int32))
+        return causality(program, 0, 11, (0,))
+
+    lowest, infinite = verdict(float(jnp.finfo(jnp.float32).min)), verdict(-jnp.inf)
+    assert lowest.refusal is None and lowest.bounded == ("float32",) and "float32" in lowest.assumption()
+    assert infinite.refusal is None and infinite.bounded == () and not infinite.assumption()
 
 
 def test_another_librarys_operation_named_as_one_of_jaxs_reads_its_operands_whole():

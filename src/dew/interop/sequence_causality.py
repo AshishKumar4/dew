@@ -173,10 +173,27 @@ def _reads(value: Held) -> Reads | None:
     return value.collapsed() if isinstance(value, Pair) else value
 
 
-def causality_refusal(closed: core.Jaxpr, tokens: int, length: int,
-                      positional: Sequence[int]) -> str | None:
-    """Why the program `closed` is not provably causal at `length` tokens (its input `tokens`, `[B, S]`,
-    the sequence on axis 1), or None where each of its `positional` outputs (by index, each holding its
+@dataclasses.dataclass(frozen=True)
+class Causality:
+    """A walk's verdict on a program (`causality`): why it is not provably causal, None where it is, and
+    the dtypes whose largest finite value it took as a mask (`Pair`: the values the tokens reach below
+    half an ulp of it, where adding it leaves it), the assumption a causal verdict rests on."""
+
+    refusal: str | None
+    bounded: tuple[str, ...]
+
+    def assumption(self) -> str:
+        """The assumption a causal verdict rests on, in words; empty where it rests on none past
+        finiteness."""
+        if not self.bounded:
+            return ""
+        return (f"causal where its values stay below half an ulp of {', '.join(self.bounded)}'s largest, as "
+                "its masks at the dtype's lowest are in transformers")
+
+
+def causality(closed: core.Jaxpr, tokens: int, length: int, positional: Sequence[int]) -> Causality:
+    """The walk's verdict on the program `closed` at `length` tokens (its input `tokens`, `[B, S]`, the
+    sequence on axis 1): causal where each of its `positional` outputs (by index, each holding its
     positions on axis 1: a forward's logits and states) reads at a position that position and earlier
     ones alone. It holds for this program alone: another length's, or another call's, may compute
     otherwise, so a caller proves each program it runs (`torchax_fallback.TorchGraph`)."""
@@ -189,12 +206,21 @@ def causality_refusal(closed: core.Jaxpr, tokens: int, length: int,
     # mesh's devices run nothing here: `programs.on_host`).
     with on_host():
         outputs, _ = walk.run(closed.jaxpr, held, [None] * len(closed.jaxpr.invars), consts)
+    bounded = tuple(sorted(walk.bounded))
     for index in positional:
         output = _reads(outputs[index])
         if output is not None and _later(output, length):
             where = f"; first at {walk.first}" if walk.first else ""
-            return f"its output {index}'s entry reads a later position at {length} tokens{where}"
-    return None
+            return Causality(f"its output {index}'s entry reads a later position at {length} tokens{where}",
+                             bounded)
+    return Causality(None, bounded)
+
+
+def causality_refusal(closed: core.Jaxpr, tokens: int, length: int,
+                      positional: Sequence[int]) -> str | None:
+    """Why the program `closed` is not provably causal at `length` tokens, or None where it is
+    (`causality`)."""
+    return causality(closed, tokens, length, positional).refusal
 
 
 def _ahead(value: Reads, length: int) -> bool:
@@ -252,6 +278,8 @@ class _Walk:
         self.first = ""
         """The first operation whose output's entry at a position reads a later position, for the
         refusal's account."""
+        self.bounded: set[str] = set()
+        """The dtypes whose largest finite value a held operand took as a mask (`_absorbed`)."""
         self.partial: dict[int, np.ma.MaskedArray] = {}
         """The entries the walk holds of an integer value the tokens reach in part, by the value's
         variable's identity: a concatenation of indices it holds beside ones the tokens decide (a
@@ -453,7 +481,7 @@ def _paired(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
     if positionwise(primitive) and all(_shape(var) == shape for var in eqn.outvars) and all(
             _fits(_shape(var), shape) for var, value in zip(eqn.invars, given, strict=True)
             if isinstance(value, Reads | Pair)):
-        entrywise = _pair_entrywise(eqn, given, operands, shape)
+        entrywise = _pair_entrywise(walk, eqn, given, operands, shape)
         if entrywise is None:
             return None
         combined: list[Held] = [entrywise] * len(eqn.outvars)
@@ -498,7 +526,7 @@ def _kept_axis(axis: int, before: tuple[int, ...], after: tuple[int, ...]) -> in
     return None
 
 
-def _pair_entrywise(eqn: core.JaxprEqn, given: list[Held], operands: list[np.ndarray | None],
+def _pair_entrywise(walk: _Walk, eqn: core.JaxprEqn, given: list[Held], operands: list[np.ndarray | None],
                     shape: tuple[int, ...]) -> Pair | None:
     """An operation entry by entry over pairs alike and values the walk holds or reads along either axis:
     an entry every operand of which is held is held at the operation's value of theirs, computed as the
@@ -523,6 +551,8 @@ def _pair_entrywise(eqn: core.JaxprEqn, given: list[Held], operands: list[np.nda
         latest, held, value = _selected(reads, helds, values, latest, held, value)
     else:
         absorbed, taken = _absorbed(eqn, helds, values)
+        if np.any(absorbed & ~every & np.isfinite(taken)) and eqn.primitive in (jax.lax.add_p, jax.lax.sub_p):
+            walk.bounded.add(str(_dtype(eqn.outvars[0])))
         held |= absorbed
         value = np.where(absorbed & ~every, taken, value)
     return Pair(axes, np.where(held, NONE, latest), held, np.where(held, value, 0.0))

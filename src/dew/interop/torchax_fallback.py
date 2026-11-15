@@ -60,6 +60,7 @@ from dew.interop.sequence_causality import (
     STATED_ATTENTION,
     TOKENWISE,
     attested,
+    causality,
     causality_refusal,
 )
 from dew.interop.streaming import SourceLeaf
@@ -117,6 +118,9 @@ class TorchAdmission:
     reasons: Mapping[str, str]
     attends: bool = False
     why: str = ""
+    assumes: str = ""
+    """What its causality rests on past its values' finiteness (`sequence_causality.Causality.assumption`),
+    which its load's warning names; empty where nothing."""
 
 
 def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
@@ -172,16 +176,19 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     graph = TorchGraph(jittable, (), attention_impl=None if why else "reference")
     inference, _, _ = graph.traced(params, buffers, ids, None, train=False)
     training, _, draws = graph.traced(params, buffers, ids, jax.random.key(0), train=True)
+    assumed = set()
     for program, forward in ((inference, "forward"), (training, "training forward")):
-        refusal = causality_refusal(program, len(params) + len(buffers), ids.shape[1], (0, 1))
-        if refusal is not None:
+        verdict = causality(program, len(params) + len(buffers), ids.shape[1], (0, 1))
+        if verdict.refusal is not None:
             raise ValueError(f"model_type {model_type!r} as configured is not causal by its {forward}'s "
-                             f"program ({refusal}), and tier 3 runs causal LMs")
+                             f"program ({verdict.refusal}), and tier 3 runs causal LMs")
+        assumed.add(verdict.assumption())
     if draws.host:
         raise ValueError(f"model_type {model_type!r}'s training forward draws on the host ({draws.host} "
                          "draws, BioGPT's layer drop among them), which a traced step would fix for every "
                          "step, and tier 3 trains the models it loads")
-    return TorchAdmission(model_type, dict(unmapped.reasons), attends=not why, why=why)
+    return TorchAdmission(model_type, dict(unmapped.reasons), attends=not why, why=why,
+                          assumes="; ".join(sorted(filter(None, assumed))))
 
 
 type Traceable = jax.typing.ArrayLike | jax.ShapeDtypeStruct
@@ -1694,6 +1701,7 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
         f"{versions['torch']}; "
         + ("its attention on Dew's, packed rows and Dew's decode cache included; " if attends
            else "its attention transformers' own, no packing or decode cache; ")
+        + (f"{admission.assumes}; " if admission is not None and admission.assumes else "")
         + f"placed by its tensor-parallel plan (TorchLayout); {_host_cost(weights, by_name)}",
         TransformersTierWarning, stacklevel=3)
     built = {**config, "dtype": dtype, "fallback": "torchax", **versions}
