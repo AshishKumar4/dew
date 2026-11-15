@@ -164,7 +164,6 @@ from dew.training.distributed import (
     placed_start,
     ruled,
     stage_microbatches,
-    start_build,
     start_compiling,
     step_reads,
     traced_start,
@@ -720,8 +719,7 @@ class Trainer(Generic[Loss, Effects]):
             abstract = self._staging.state(abstract.with_window(checkpoints.accumulation_template(step)),
                                           self._staging.staged_shapes)
         shardings, validation = self._validated(abstract)
-        return Start(initializer, key, abstract, through, step, shardings, build, validation.device_bytes,
-                     start_build(build, initializer, shardings, through))
+        return Start(initializer, key, abstract, through, step, shardings, build, validation.device_bytes)
 
     def _placed(self, start: Start, *, positioned: bool
                 ) -> tuple[TrainState, Placement[TrainState], bytes | None]:
