@@ -334,7 +334,8 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     # float64).
     held = given if delta or rounded else Operand(rows, product.EXACT_PARTS, jnp.dtype(jnp.float32))
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
-                interpret, generation.gpu_target(), tiles.chunk, ranged=ranged, producers=tiles.producers)
+                interpret, generation.gpu_target(), tiles.chunk, ranged=ranged, producers=tiles.producers,
+                residents=tiles.residents)
     table = None if forked is None else tabled(forked, width, columns)
     # A skip reads the values a launch holds as given (`Call.gated_keys`); else it is added after them.
     landed = jnp.dtype(jnp.float32 if skipped and not call.gated_keys else out_dtype or dtype)

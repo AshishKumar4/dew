@@ -610,10 +610,12 @@ class Mosaic(base.Template[mainloop.Tiles]):
         A spill at the top is the consumers', the producer holding there all it may; a rung below holds
         wherever the producer's need and the consumers' meet. Tiles still spilling at the ladder's foot their
         derivation refuses (`_chunked`). From the foot up, the 4B's reverse walk took eight compiles of a
-        B200's cold start, 95 s, to the 80 registers its producer holds; its top, 128, holds in one."""
+        B200's cold start, 95 s, to the 80 registers its producer holds; its top, 128, holds in one. Past its
+        ladder's foot, a launch takes a program fewer a multiprocessor, its producer at the least and its
+        ladder run again there (`_stepped`)."""
         while (spilled := _refused_kernels(self, ba, tiles)) and (
-                raised := self._raised(ba, tiles, spilled, target)) is not None:
-            tiles = _producing(tiles, raised)
+                stepped := self._stepped(ba, tiles, spilled, target)) is not None:
+            tiles = stepped
         return tiles
 
     def emitted(self, config: Hashable, kernel: str) -> Hashable:
@@ -626,26 +628,56 @@ class Mosaic(base.Template[mainloop.Tiles]):
             return config
 
         def own(tiles: mainloop.Tiles) -> mainloop.Tiles:
-            # The cap its emission reads: its launch's by its name, which the launch passes to `report.named`
-            # and to `Call.producers` alike.
-            cap = tiles.producers.of(kernel)
-            return dataclasses.replace(tiles, producers=resources.Producers(
-                () if cap is None else ((kernel, cap),)))
+            # The caps its emission reads: its launch's by its name, which the launch passes to `report.named`
+            # and to `Call.producers` and `Call.residents` alike.
+            cap, held = tiles.producers.of(kernel), tiles.residents.of(kernel)
+            return dataclasses.replace(
+                tiles, producers=resources.Producers(() if cap is None else ((kernel, cap),)),
+                residents=resources.Residents(() if held is None else ((kernel, held),)))
 
         forward = None if config.forward is None else own(config.forward)
         return dataclasses.replace(own(config), forward=forward)
 
     def rungs(self, ba: tokamax.BoundArguments, config: Hashable) -> Iterator[mainloop.Tiles]:
-        """The tiles a refused `config`'s spilling launches' producers step through (`_raised`): each one's
-        top first, then a setmaxnreg step lower a rung, each planned as it is asked for: the ladder `_settled`
-        takes a compile at a time, which certification asks its top alone and then a round at a time
+        """The tiles a refused `config`'s spilling launches step through (`_stepped`): each one's producer's
+        top first, then a setmaxnreg step lower a rung, and past its foot a program fewer a multiprocessor
+        with its producer's ladder run again, each planned as it is asked for: the ladder `_settled` takes a
+        compile at a time, which certification asks its top alone and then a round at a time
         (`tuning.KernelOp._climbed`)."""
         if not self._typed(config):
             return
         target, spilled, rung = generation.gpu_target(), _refused_kernels(self, ba, config), config
-        while spilled and (raised := self._raised(ba, rung, spilled, target)) is not None:
-            rung = _producing(rung, raised)
+        while spilled and (stepped := self._stepped(ba, rung, spilled, target)) is not None:
+            rung = stepped
             yield rung
+
+    def _stepped(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
+                 target: generation.GpuTarget) -> mainloop.Tiles | None:
+        """`joined`'s next rung for its `spilled` launches: their producers a rung down their ladders
+        (`_raised`), or, past a ladder's foot, those launches a program fewer a multiprocessor with their
+        producers at the least again (`_fewer`), whose ladders then run at that residency; None past one
+        program."""
+        if (raised := self._raised(ba, joined, spilled, target)) is not None:
+            return _limited(joined, producers=raised, residents=joined.residents)
+        return self._fewer(ba, joined, spilled, target)
+
+    def _fewer(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
+               target: generation.GpuTarget) -> mainloop.Tiles | None:
+        """`joined` with its `spilled` launches whose producers' ladders ran out (`_moving`: a launch that
+        moves no registers has no ladder, and its tiles are refused as before) a program fewer a
+        multiprocessor than they plan now (`resources.Residents.fewer`), each the fewest its instances plan
+        (the training call's and the forward alone's, each at its own tiles), their producers at the least;
+        None where one plans one program already. Every role of a launch takes a larger share there, where
+        the assembler may hold what no rung of its producer's ladder gave its consumers (row 6718)."""
+        planned: dict[str, int] = {}
+        for launch in self._moving(ba, joined, spilled, target):
+            planned[launch.name] = min(planned.get(launch.name, launch.resident), launch.resident)
+        residents = joined.residents.fewer(planned) if planned else None
+        if residents is None:
+            return None
+        producers = resources.Producers(tuple((name, cap) for name, cap in joined.producers.raised_to
+                                              if name not in planned))
+        return _limited(joined, producers=producers, residents=residents)
 
     def _raised(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                 target: generation.GpuTarget) -> resources.Producers | None:
@@ -659,17 +691,24 @@ class Mosaic(base.Template[mainloop.Tiles]):
         assembler's, a compile that spills them refusing it."""
         family = bundle(target, _dtype(ba))
         assert family is not None
-        launches = (*self.launches(ba, joined, target, backward=True),
-                    *self.launches(ba, joined.forward or joined, target, backward=False))
-        owned = _owners(spilled, launches)
-        # Every instance of a raised launch (a name the training call's backward and the forward alone can
-        # each plan at their own tiles), each judged at its own schedule and residency.
-        moving = [launch for launch in launches if launch.name in owned
-                  and resources.moves_registers(launch.registers, (launch.family or family).warpgroups(
-                      launch.consumers), launch.consumers, launch.resident)]
+        moving = self._moving(ba, joined, spilled, target)
         tops = {launch.name: resources.entry_registers(
             (launch.family or family).warpgroups(launch.consumers), launch.resident) for launch in moving}
         return joined.producers.stepped(tops) if moving else None
+
+    def _moving(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
+                target: generation.GpuTarget) -> list[mainloop.Launch]:
+        """Every instance of `joined`'s `spilled` launches (each kernel's own, `_owners`: a name the training
+        call's backward and the forward alone can each plan at their own tiles) whose program moves registers
+        from its producer (`resources.moves_registers`), each judged at its own schedule and residency."""
+        family = bundle(target, _dtype(ba))
+        assert family is not None
+        launches = (*self.launches(ba, joined, target, backward=True),
+                    *self.launches(ba, joined.forward or joined, target, backward=False))
+        owned = _owners(spilled, launches)
+        return [launch for launch in launches if launch.name in owned
+                and resources.moves_registers(launch.registers, (launch.family or family).warpgroups(
+                    launch.consumers), launch.consumers, launch.resident)]
 
     def _derive(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, chunk: int, *,
                 training: bool, refused: Set[mainloop.Tiles] = frozenset()) -> mainloop.Tiles | None:
@@ -872,8 +911,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
         beside = [self._staged(ba, blocks[index], target, config.chunk) for index in (at - 1, at + 1)
                   if 0 <= index < len(blocks)]
         other = dataclasses.replace(config, stages=config.stages - 1 if config.stages > 1 else 2)
-        # Each at the derived config's producers, raised past its own compiles' spills (`_settled`).
-        return [self._settled(ba, _producing(tiles, config.producers), target)
+        # Each at the derived config's producers and residents, stepped past its own compiles' spills
+        # (`_settled`).
+        return [self._settled(ba, _limited(tiles, producers=config.producers, residents=config.residents),
+                              target)
                 for tiles in (*beside, other) if tiles is not None]
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: mainloop.Tiles,
@@ -926,10 +967,14 @@ def _owners(kernels: Iterable[str], launches: Iterable[mainloop.Launch]) -> froz
     return frozenset(owner for kernel in kernels if (owner := _owner(kernel, names)))
 
 
-def _producing(tiles: mainloop.Tiles, producers: resources.Producers) -> mainloop.Tiles:
-    """`tiles`, its forward's too, its launches' producers lowered to `producers`."""
-    forward = None if tiles.forward is None else dataclasses.replace(tiles.forward, producers=producers)
-    return dataclasses.replace(tiles, producers=producers, forward=forward)
+def _limited(tiles: mainloop.Tiles, *, producers: resources.Producers,
+             residents: resources.Residents) -> mainloop.Tiles:
+    """`tiles`, its forward's too, its launches' producers lowered to `producers` and held to `residents`'
+    programs a multiprocessor."""
+    def held(each: mainloop.Tiles) -> mainloop.Tiles:
+        return dataclasses.replace(each, producers=producers, residents=residents)
+
+    return dataclasses.replace(held(tiles), forward=None if tiles.forward is None else held(tiles.forward))
 
 
 MOSAIC = Mosaic()
