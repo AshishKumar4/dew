@@ -573,15 +573,28 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [64, 128])
 def test_an_fp16_backward_compiles_spill_free_as_its_model_decides(width):
-    """An fp16 call's backward at its derived tiles of a causal call `width` wide (the one launch's two parts
-    at running scales, `attention_mosaic_fused._sixteen_step`, where its registers hold it), lowered and
-    compiled by ptxas for an H100 on this CPU: within its shared memory, spilling nothing."""
+    """An fp16 call's backward of a causal call `width` wide (the one launch's two parts at running scales,
+    `attention_mosaic_fused._sixteen_step`, where its registers hold it), certified as the route certifies it
+    (`MosaicBackward.uncertified`: a config the GPU's assembler refuses, spilling or serializing its
+    warpgroup MMAs, stepped past) and lowered and compiled by ptxas for an H100 on this CPU: within its
+    shared memory, spilling nothing, its warpgroup MMAs unserialized."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    op, ba, config = _gated_backward("sm90", width, accurate=False, dtype=jnp.float16)
+    queries = 512
+    spans = template.spans(queries, queries, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.float16)
+    key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.float16)
+    shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype),
+                          _residuals(query.shape))
+
+    def backward(query, key, value, dout, residuals):
+        grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals)
+        return grads.query, grads.key, grads.value
+
     with generation.assumed("sm90"):
-        found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config))], "sm90")
+        found = compile_mosaic_kernels(
+            [KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)))], "sm90")
     failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
