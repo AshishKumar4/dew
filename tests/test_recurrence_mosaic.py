@@ -1065,9 +1065,13 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
         bound = template.MOSAIC.bind(*operands, None, None, firsts=None, skip=None, recomputed=True,
                                      **options)
         assert report._identity(template.MOSAIC, bound) == identity
+        # Each derived tiles refused with every rung of its ladder at once (`Mosaic.rungs`): refused a rung a
+        # derivation, the walk derived 355 times, 281 s (row 6551), 598 s once a ladder's foot took a program
+        # fewer (row 6855).
         while (tiles := template.MOSAIC.derived(bound, target)) is not None:
             names = {launch.name for launch in template.MOSAIC.launches(bound, tiles, target, backward=True)}
             report.refuse([(identity, tiles, names)])
+            report.refuse([(identity, rung, names) for rung in template.MOSAIC.rungs(bound, tiles)])
         with pytest.raises(KernelRefused) as refused:
             named()
         assert refused.value.refusals[0].code == 'launch'
