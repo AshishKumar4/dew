@@ -48,12 +48,10 @@ import json
 import logging
 import os
 import platform
-import site
 import sys
-import sysconfig
 import threading
 import types
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping
 from pathlib import Path
 
 import jax
@@ -61,7 +59,7 @@ import numpy as np
 from jax._src import config as jax_config
 from jax.experimental.layout import Format, Layout
 
-from dew import _cache, _hashing
+from dew import _cache, _hashing, _sources
 from dew._records import JSON
 from dew.algebra import terms
 from dew.nn.kernels.generation import TRACED_FACTS
@@ -163,11 +161,11 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) 
         raise Unestablished(f"{at}: an array of JAX's, a constant of the program")
     if isinstance(value, types.ModuleType):
         # A module of the user's is everything it holds: code that names it may read any of it.
-        held = _module_state(value, at, known, walking) if _own_source(value.__name__) else None
+        held = _module_state(value, at, known, walking) if _sources.own_source(value.__name__) else None
         return ["module", _coded(value.__name__, at), held]
     if isinstance(value, logging.Logger):
         return ["logger", value.name]
-    if isinstance(value, (types.FunctionType, type)) and _own_source(value.__module__):
+    if isinstance(value, (types.FunctionType, type)) and _sources.own_source(value.__module__):
         return _own(value, at, known, walking)
     if _hand_written(getattr(value, "__wrapped__", None)):
         # A callable that is no function and wraps one of the user's (a cache, a jitted function): what
@@ -317,7 +315,7 @@ def _read(function: types.FunctionType, at: str, known: Mapping[int, JSON] = _NO
     names = _names(code)
     held = {name: function.__globals__[name] for name in names if name in function.__globals__}
     imported = {name: sys.modules[name] for name in names - held.keys()
-                if name in sys.modules and _own_source(name)}
+                if name in sys.modules and _sources.own_source(name)}
     return {"closure": {name: _stated(value, f"{at} ({named}'s closure, {name})", known, within)
                         for name, value in sorted(cells.items())},
             "globals": {name: _stated(value, f"{at} ({named}'s global {name})", known, within)
@@ -327,12 +325,12 @@ def _read(function: types.FunctionType, at: str, known: Mapping[int, JSON] = _NO
 
 
 def _own(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) -> JSON:
-    """A function or a class of a user's own code (`_own_source`) by its name there, with what it reads: a
-    function's reads (`_read`); a class's data, each attribute its body or other code set on it, and its
-    members' reads (`_members`), its bases' of the user's code among them. Such code reaches the program
-    through a name alone, and what it reads at run time (a module's setting another module assigned) is
-    nothing its source states, so it is walked, through every function, class and module of the user's
-    it names in turn; one met again within its own walk is itself, stated once."""
+    """A function or a class of a user's own code (`dew._sources.own_source`) by its name there, with what
+    it reads: a function's reads (`_read`); a class's data, each attribute its body or other code set on
+    it, and its members' reads (`_members`), its bases' of the user's code among them. Such code reaches
+    the program through a name alone, and what it reads at run time (a module's setting another module
+    assigned) is nothing its source states, so it is walked, through every function, class and module of
+    the user's it names in turn; one met again within its own walk is itself, stated once."""
     module = _coded(value.__module__, at)
     stated_name = ["own", module, value.__qualname__, *_main(module)]
     if id(value) in walking:
@@ -343,7 +341,7 @@ def _own(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) -> 
         return [*stated_name, _code(value.__code__), _read(value, at, known, walking)]
     within = walking | {id(value)}
     return [*stated_name, {held.__qualname__: _members(held, at, known, within)
-                           for held in value.__mro__ if _own_source(held.__module__)}]
+                           for held in value.__mro__ if _sources.own_source(held.__module__)}]
 
 
 def _members(held, at: str, known: Mapping[int, JSON], walking: frozenset[int]) -> JSON:
@@ -383,7 +381,7 @@ def _hand_written(member) -> bool:
         seen.add(id(member))
         if isinstance(member, types.FunctionType):
             defined = member.__globals__
-            if (_own_source(defined.get("__name__"))
+            if (_sources.own_source(defined.get("__name__"))
                     and member.__code__.co_filename == defined.get("__file__")):
                 return True
         member = getattr(member, "__wrapped__", None)
@@ -525,18 +523,18 @@ class Process:
     def here() -> Process:
         """This process's record, read now: after its programs traced, every module a trace imported is
         loaded and so among them."""
-        installed, standard, packages = _installed(), _standard(), _distributed()
+        installed, standard, packages = _sources.installed(), _sources.standard(), _sources.distributed()
         distributions: dict[str, str] = {}
         sources: dict[str, str] = {}
         for name in sorted(sys.modules):
-            path = _recorded(name)
+            path = _sources.recorded(name)
             if path is None:
                 continue
-            placed = _within(path, installed)
+            placed = _sources.within(path, installed)
             owners = packages.get(name.partition(".")[0], ()) if placed else ()
             if owners:
                 distributions.update((owner, importlib.metadata.version(owner)) for owner in owners)
-            elif placed or not _within(path, standard):
+            elif placed or not _sources.within(path, standard):
                 sources[name] = _source(path)
         return Process(platform.python_version(), _cache.package_digest(),
                        tuple(sorted(distributions.items())), tuple(sorted(sources.items())),
@@ -557,7 +555,7 @@ class Process:
             differing.update({f"{kind} {name}": f"{recorded.get(name)!r}, not {held.get(name)!r}"
                               for name in sorted(recorded.keys() | held.keys())
                               if recorded.get(name) != held.get(name)})
-        installed = {owner for owners in _distributed().values() for owner in owners}
+        installed = {owner for owners in _sources.distributed().values() for owner in owners}
         for distribution, version in self.distributions:
             found = importlib.metadata.version(distribution) if distribution in installed else None
             if found != version:
@@ -573,18 +571,6 @@ class Process:
         if differing := self.differences():
             raise ValueError("these programs were traced by another process's code or settings than this "
                              f"one's: {'; '.join(f'{name} {said}' for name, said in differing.items())}")
-
-
-def _recorded(name: str) -> Path | None:
-    """The file whose source a process record holds for the loaded module `name` (`_file`), None for one
-    it holds none of: a module of no file, a frozen one (the interpreter's own, whatever file it names),
-    Dew's (its package digest's) and `__main__` (stated where a call names it)."""
-    module = sys.modules[name]
-    frozen = getattr(getattr(module, "__spec__", None), "origin", None) == "frozen"
-    if (getattr(module, "__file__", None) is None or frozen or name in ("dew", "__main__")
-            or name.startswith("dew.")):
-        return None
-    return _file(name)
 
 
 def _found(name: str) -> Path | None:
@@ -605,70 +591,6 @@ def _qualified(function) -> str:
 def called(program: OuterProgram) -> str:
     """`program`'s function by its module and name, as a refusal names it."""
     return _qualified(program.function)
-
-
-def _file(name: str) -> Path:
-    """The file the loaded module `name` is code of: its own, or, where the file it names is none (a
-    module an extension makes of itself), its nearest package's that is one; refused where none is, as
-    nothing then states its code."""
-    names = name.split(".")
-    for parts in range(len(names), 0, -1):
-        file = getattr(sys.modules.get(".".join(names[:parts])), "__file__", None)
-        if file is not None and Path(file).is_file():
-            return Path(file).resolve()
-    raise ValueError(f"the loaded module {name} names no file of its code, so no record of this process "
-                     "can state it")
-
-
-def _own_source(name: str | None) -> bool:
-    """Whether the module `name` is a user's own code: loaded from a file no distribution versions and
-    Dew's digest does not hold (`Process.sources`), or the script the process runs. Read once a loaded
-    module (`_OWN`): a module loaded again is read again."""
-    if name == "__main__":
-        return getattr(sys.modules[name], "__file__", None) is not None
-    if name is None or name not in sys.modules:
-        return False
-    module = sys.modules[name]
-    held = _OWN.get(name)
-    if held is not None and held[0] is module:
-        return held[1]
-    path = _recorded(name)
-    placed = path is not None and _within(path, _installed())
-    own = path is not None and not (placed and name.partition(".")[0] in _distributed()) and (
-        placed or not _within(path, _standard()))
-    _OWN[name] = (module, own)
-    return own
-
-
-_OWN: dict[str, tuple[object, bool]] = {}
-"""Each loaded module's verdict (`_own_source`) beside the module it was read of: a program's identity
-asks it of every function it states, its file's path resolved and placed each time (13% of a small fit)."""
-
-
-@functools.cache
-def _distributed() -> Mapping[str, list[str]]:
-    """The installed distributions each top-level package belongs to (`packages_distributions`), read
-    once: a process installs none while it runs."""
-    return importlib.metadata.packages_distributions()
-
-
-@functools.cache
-def _installed() -> tuple[Path, ...]:
-    """The directories this interpreter installs distributions into."""
-    paths = sysconfig.get_paths()
-    return tuple({Path(path).resolve() for path in (paths["purelib"], paths["platlib"],
-                                                    *site.getsitepackages(), site.getusersitepackages())})
-
-
-@functools.cache
-def _standard() -> tuple[Path, ...]:
-    """The directories of this interpreter's standard library, whose code its version states."""
-    paths = sysconfig.get_paths()
-    return tuple({Path(paths["stdlib"]).resolve(), Path(paths["platstdlib"]).resolve()})
-
-
-def _within(path: Path, directories: Sequence[Path]) -> bool:
-    return any(path.is_relative_to(directory) for directory in directories)
 
 
 def _source(path: Path) -> str:

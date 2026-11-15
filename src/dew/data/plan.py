@@ -13,13 +13,12 @@ import platform
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import Enum
-from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import jax
 import numpy as np
 
-from dew import _checkout
+from dew import _checkout, _sources
 from dew._hashing import array_header
 from dew._position import PER_SHARE, PlanChanged, unplaced
 from dew._records import (
@@ -237,14 +236,9 @@ class StepIdentity:
         exact = bool(declared) or (not stating and not unstable and holdable
                                    and (frozen or inspect.isfunction(step)))
         external = not module.startswith("dew.")
-        path = (
-            None if inspect.isbuiltin(step) or kind.__module__ == "builtins" else inspect.getsourcefile(kind)
-        )
-        modules = (
-            (hashlib.sha256(Path(path).read_bytes()).hexdigest(),)
-            if external and path is not None and Path(path).is_file()
-            else ()
-        )
+        path = (None if inspect.isbuiltin(step) or kind.__module__ == "builtins"
+                else _sources.source_file(kind))
+        modules = (hashlib.sha256(path.read_bytes()).hexdigest(),) if external and path is not None else ()
         config = re.sub(r" at 0x[0-9a-fA-F]+", "", config)
         dependencies = (
             step.dependencies()
@@ -288,52 +282,63 @@ class StepIdentity:
 
 
 def _code_digest(holder: Callable | type) -> str:
-    """The digest of what `holder`'s code is: a function's module's bytes (row 3938), a class's own source,
-    so an edit to its module outside it decides no rows (row 5862), or its module's where Python finds no
-    source of it apart."""
-    place = Path(inspect.getsourcefile(holder) or "")
+    """The digest of what `holder`'s code is (`_held`, which finds its file): a function's module's bytes
+    (row 3938), a class's own source, so an edit to its module outside it decides no rows (row 5862), or its
+    module's where Python finds no source of it apart (a class `type` made)."""
+    place = _sources.source_file(holder)
+    assert place is not None, "a holder of code has a file (`_held`)"
     if not isinstance(holder, type):
         return hashlib.sha256(place.read_bytes()).hexdigest()
     try:
         source = inspect.getsource(holder)
     except OSError:
-        # A class whose source Python cannot find apart (made by `type`) is its module's.
         source = place.read_text()
     return hashlib.sha256(source.encode()).hexdigest()
 
 
+def _held(holder: Callable | type) -> tuple[list[Callable | type], bool]:
+    """`holder`, a function or a class a step runs, as `_held_code` holds it: by its own code where it is the
+    user's (`dew._sources.own_source`), by nothing where Dew's, the standard library's or an installed
+    distribution's (the environment versions it), and refused where it is the user's with no file to hold
+    (a notebook's, a REPL's)."""
+    module = holder.__module__
+    if module.startswith("dew.") or module == "builtins":
+        return [], True
+    if module != "__main__" and not _sources.own_source(module):
+        return [], True
+    return ([holder], True) if _sources.source_file(holder) is not None else ([], False)
+
+
 def _held_code(value, seen: set[int]) -> tuple[list[Callable | type], bool]:
-    """The external code `value`, a step or a part of one, runs where it declares no identity, each
-    function or class whose code it is (`_code_digest`), and whether every part of it that runs code is
-    held so: a function outside Dew, a bound method by its function and its object, a dataclass by its own
-    class where that is outside Dew and by its fields, a `functools.partial` by its function and arguments, a
-    wrapped function by what it wraps, a container by its entries'. A part that runs code no file holds, a
-    lambda or a callable object of the user's own class that is no dataclass, is not (`StepIdentity`'s
-    rule: every external step is held by its code, declares an identity or is refused)."""
-    if id(value) in seen or isinstance(value, type) or inspect.isbuiltin(value):
+    """The user's code `value`, a step or a part of one, runs where it declares no identity, each function or
+    class whose code it is (`_held`, `_code_digest`), and whether every part of it that runs code is held
+    so: a function, a class a field holds (which the step calls), a dataclass by its own class and its
+    fields, a bound method by its function and its object, a `functools.partial` by its function and
+    arguments, a wrapped function by what it wraps, a container by its entries. A lambda, and an object of
+    the user's own class that is no dataclass, callable or not, whose state no description holds, are not
+    (`StepIdentity`'s rule: every external step is held by its code, declares an identity or is refused)."""
+    if id(value) in seen or inspect.isbuiltin(value):
         return [], True
     seen.add(id(value))
     if isinstance(value, _DeclaredIdentity) and value.identity:
         return [], True
+    if isinstance(value, type):
+        return _held(value)
     if inspect.isfunction(value):
-        if "<lambda>" in value.__qualname__:
-            return [], False
-        place = None if value.__module__.startswith("dew.") else inspect.getsourcefile(value)
-        return ([value] if place is not None and Path(place).is_file() else []), True
+        return ([], False) if "<lambda>" in value.__qualname__ else _held(value)
     if inspect.ismethod(value):
         function, held = _held_code(value.__func__, seen)
         owner, also = _held_code(value.__self__, seen)
         return [*function, *owner], held and also
     if dataclasses.is_dataclass(value):
-        kind = type(value)
-        place = None if kind.__module__.startswith("dew.") else inspect.getsourcefile(kind)
-        files, holdable = ([kind] if place is not None and Path(place).is_file() else []), True
+        files, holdable = _held(type(value))
         for field in dataclasses.fields(value):
             more, held = _held_code(getattr(value, field.name), seen)
             files, holdable = [*files, *more], holdable and held
         return files, holdable
-    if isinstance(value, _Dependencies):
-        # A configured object a step calls (a tokenizer) is what its dependencies state (`structured`).
+    if isinstance(value, _Dependencies | Enum):
+        # A configured object a step calls (a tokenizer) is what its dependencies state, an enum member
+        # by its name (`structured`).
         return [], True
     if isinstance(value, functools.partial):
         found = [_held_code(part, seen) for part in (value.func, value.args, value.keywords)]
@@ -345,23 +350,9 @@ def _held_code(value, seen: set[int]) -> tuple[list[Callable | type], bool]:
     if isinstance(value, _Wrapping):
         # A wrapped function (`jax.jit`'s, `functools.wraps`') runs the code it wraps.
         return _held_code(value.__wrapped__, seen)
-    if callable(value) and _user_code(type(value)):
-        # A callable object of the user's own class that is no dataclass: its rows follow state no
-        # description holds, so no file holds them.
-        return [], False
-    return [], True
-
-
-def _user_code(kind: type) -> bool:
-    """Whether `kind` is the user's own code: defined in a file of no installed distribution and not
-    Dew's, where a library's (a NumPy ufunc's, a tokenizer's) is versioned by the environment."""
-    if kind.__module__.startswith("dew.") or kind.__module__ == "builtins":
-        return False
-    try:
-        place = inspect.getsourcefile(kind)
-    except TypeError:
-        return False
-    return place is not None and not any(part in place for part in ("site-packages", "dist-packages"))
+    files, holdable = _held(type(value))
+    # An object of the user's own class that is no dataclass: its rows follow state no description holds.
+    return [], not files and holdable
 
 
 @runtime_checkable
@@ -641,11 +632,15 @@ class Manifest:
     def code(self) -> list[list[JSON]]:
         """What decides a step's rows that its identity does not state: each step's module digests at its
         own code's places (`StepIdentity.code`), a function outside Dew that declares no identity being what
-        its code computes, then the digests of the callable objects it runs (`StepIdentity.held`), a step
-        that declares one none; the steps a memory read ran, then the plan's
+        its code computes, a step that declares one none; the steps a memory read ran, then the plan's
         (row 5862)."""
-        return [[*(step.modules[place] for place in step.code), *step.held]
-                for step in (*self.ran, *self.steps)]
+        return [[step.modules[place] for place in step.code] for step in (*self.ran, *self.steps)]
+
+    def held(self) -> list[list[str]]:
+        """The digests of the user's code each step runs beside its own module's (`StepIdentity.held`), the
+        steps a memory read ran, then the plan's, which an exact resume compares where its position holds
+        them (`Plan.check`)."""
+        return [list(step.held) for step in (*self.ran, *self.steps)]
 
     @property
     def canonical(self) -> bytes:
@@ -929,6 +924,7 @@ class Plan:
             "lowering": self.lowering,
             "manifest": manifest,
             "code": json_value(self.manifest.code(), "code"),
+            "held": json_value(self.manifest.held(), "held"),
             "order": referenced(self.spelled_order(), _identities(manifest["steps"])),
             "derived": json_value(self.derived, "derived"),
             "topology": json_value(self.topology, "topology"),
@@ -960,7 +956,7 @@ class Plan:
         reads, which only the position it saves keeps: the manifest's parts each apart, and a list's entries,
         such as each source's content and each step's identity, one by one."""
         recorded = self.record()
-        for name in ("order", "code", "manifest", "version"):
+        for name in ("order", "code", "held", "manifest", "version"):
             del recorded[name]
         recorded["topology"] = json_value(
             {name: value for name, value in self.topology.items() if name != "share"}, "topology"
@@ -1068,12 +1064,23 @@ class Plan:
             # A function outside Dew that declares no identity, a step's or the factory's that configured
             # it, is what its code computes: its module's bytes changed, it may make other rows from the
             # same records (row 3938), which an exact resume refuses and a relaxed one reads on over, naming
-            # each such step (`code.<step>`). A step whose saved code is none, where it holds some now, was
-            # saved before its kind was held by its code (a callable object's), so nothing is compared.
+            # each such step (`code.<step>`).
             saved_code = _saved_code(saved, (*self.manifest.ran, *self.manifest.steps))
-            rewritten = [step.name for step, before, now in zip(
-                (*self.manifest.ran, *self.manifest.steps), saved_code, self.manifest.code(), strict=False)
-                if before is not None and before != now and before != []]
+            steps = (*self.manifest.ran, *self.manifest.steps)
+            # A position main saved for an hour (2026-11-15) holds each step's held code after its own in its
+            # code list, and no `held`: read as the two it is.
+            appended = "held" not in saved
+            rewritten = [step.name for step, before, now, held in zip(
+                steps, saved_code, self.manifest.code(), self.manifest.held(), strict=False)
+                if before is not None and before != now and not (appended and before == [*now, *held])]
+            # The user's code a step runs beside its module's (`Manifest.held`), where its position holds it:
+            # a position saved before it held none compares none.
+            if "held" in saved:
+                saved_held = listed(saved["held"], "saved data held code", read=json_value,
+                                    what="each step's held code")
+                rewritten += [step.name for step, before, now in zip(steps, saved_held, self.manifest.held(),
+                                                                     strict=False)
+                              if before != now and step.name not in rewritten]
             if rewritten and resume != "relaxed":
                 raise PlanChanged(
                     tuple(f"code.{name}" for name in rewritten),
