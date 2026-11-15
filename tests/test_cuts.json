@@ -1432,7 +1432,7 @@
 ],
 "tests/test_in_backward.py": [
 "tests/test_in_backward.py::test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time[adamw]",
-"tests/test_in_backward.py::test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time[frozen scalar]",
+"tests/test_in_backward.py::test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time[frozen-scalar]",
 "tests/test_in_backward.py::test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time[groups]",
 "tests/test_in_backward.py::test_a_scanned_steps_runs_train_under_each_update[8-bit]"
 ],

@@ -397,19 +397,20 @@ def test_a_scanned_decoder_reads_every_layers_kernels_through_copies_with_the_sa
 
 # Each cell a site of its own, its map tasks compiling its arms alone: one site over the six, each task
 # compiling every cell's arms for its draws, took 470 to 560 s a task in CI, setting each train's wall
-# (rows 6237, 6332, 4765).
+# (rows 6237, 6332, 4765). On armada a pooled cell's four draws take 50 to 80 s a task, a replayed (mixture)
+# cell's two draws about 100, each clearing its routing margin first.
 @pytest.mark.parametrize(("accumulation", "split", "mixture", "fsdp"), [
     pytest.param(2, 1, False, 1, id="accumulated-pooled",
                  marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
-    pytest.param(1, 2, True, 1, id="split-replayed", marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
+    pytest.param(1, 2, True, 1, id="split-replayed", marks=pytest.mark.check1_shards(seeds=8, per_task=2)),
     pytest.param(2, 1, True, 2, id="accumulated-replayed-fsdp2",
-                 marks=[pytest.mark.mesh(devices=2), pytest.mark.check1_shards(seeds=8, per_task=4)]),
+                 marks=[pytest.mark.mesh(devices=2), pytest.mark.check1_shards(seeds=8, per_task=2)]),
     pytest.param(1, 2, False, 2, id="split-pooled-fsdp2",
                  marks=[pytest.mark.mesh(devices=2), pytest.mark.check1_shards(seeds=8, per_task=4)]),
     pytest.param(2, 1, False, 8, id="accumulated-pooled-fsdp8",
                  marks=[pytest.mark.mesh(devices=8), pytest.mark.check1_shards(seeds=8, per_task=4)]),
     pytest.param(1, 2, True, 8, id="split-replayed-fsdp8",
-                 marks=[pytest.mark.mesh(devices=8), pytest.mark.check1_shards(seeds=8, per_task=4)]),
+                 marks=[pytest.mark.mesh(devices=8), pytest.mark.check1_shards(seeds=8, per_task=2)]),
 ])
 def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
         accumulation, split, mixture, fsdp):
