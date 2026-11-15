@@ -346,3 +346,48 @@ def test_an_exact_resume_holds_the_code_a_steps_methods_reach(tmp_path, monkeypa
         resumed_changes(reader(), state)
     (changed,) = resumed_changes(reader("relaxed"), state)
     assert changed.startswith("code.")
+
+
+HELPERS = """import re
+from pathlib import Path
+
+ROOT = Path("/data")
+PATTERN = re.compile("[a-z]+")
+WORDS = {{"alpha", "beta", "gamma", "delta", "epsilon", "zeta"}}
+
+
+def delta():
+    return {by}
+"""
+
+
+def _held_in_a_process(directory, seed: str) -> str:
+    """The held code of a function step that names `HELPERS`' module, read in a fresh process whose string
+    hashing is seeded by `seed`."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import helping, stepping; "
+              "from dew.data.plan import StepIdentity; "
+              "named = StepIdentity.of(stepping.shifted); print(json.dumps([named.exact, list(named.held)]))")
+    ran = subprocess.run([sys.executable, "-c", script, str(directory)], capture_output=True, text=True,
+                         check=True, env={**os.environ, "PYTHONHASHSEED": seed})
+    return json.loads(ran.stdout.splitlines()[-1])
+
+
+def test_a_function_step_naming_a_module_is_held_by_what_it_reads_of_it_alike_in_every_process(tmp_path):
+    """A function step that names a module of the user's (`helping.delta()`, `helping.WORDS`) is held by the
+    attributes it reads of it, alike in two processes of other string hashing (a set of words stated in its
+    statements' order), and exact beside members it never reads that no statement holds (a path, a compiled
+    pattern); `delta` changed, its held code changes. Every process stated the set in its own order, and the
+    module's every member was stated, its pattern refusing the step (train 912's review, F3 and F4)."""
+    (tmp_path / "helping.py").write_text(HELPERS.format(by=1))
+    (tmp_path / "stepping.py").write_text(
+        "import helping\n\n\ndef shifted(row):\n"
+        "    return {**row, 'id': row['id'] + helping.delta() + len(helping.WORDS)}\n")
+    first, second = (_held_in_a_process(tmp_path, seed) for seed in ("1", "2"))
+    assert first == second and first[0] is True and first[1]
+    (tmp_path / "helping.py").write_text(HELPERS.format(by=10))
+    assert _held_in_a_process(tmp_path, "1")[1] != first[1]

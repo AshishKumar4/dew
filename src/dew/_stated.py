@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib
+import json
 import logging
 import sys
 import types
@@ -96,9 +97,10 @@ def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN) -> JSON:
     its code is the process record's, `Process`), and one of a user's own code with what it reads (`_own`);
     a function no module holds (a lambda, a local one) is its code (`_code`) with what it reads (`reads`); a
     dataclass its type and fields; a number its type and bits, an array of NumPy's its dtype, shape and
-    bytes; a mapping's pairs and a set's members in the order it holds them, which a trace may read; a
-    module of the user's everything it holds (`_module_state`); an enumeration's member,
-    a mesh, a sharding and a partition as the algebra's structural key states them
+    bytes; a mapping's pairs in the order it holds them, which a trace may read, and a set's members in
+    their statements' order, which no process's string hashing decides; a module by its file's code, the
+    attributes a function reads of it beside (`reads`); an enumeration's member, a mesh, a sharding and a
+    partition as the algebra's structural key states them
     (`dew.algebra.terms.parameter_key`, the one owner of a placement as plain data); JAX's other values of
     a call's key (an abstract value, a tree's structure node by node, a format, a device) by their parts. A
     value among `known` (by its `id`) is what its caller says of it (`call_identity`).
@@ -123,9 +125,9 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) 
     if isinstance(value, jax.Array):
         raise Unestablished(f"{at}: an array of JAX's, a constant of the program")
     if isinstance(value, types.ModuleType):
-        # A module of the user's is everything it holds: code that names it may read any of it.
-        held = _module_state(value, at, known, walking) if _sources.own_source(value.__name__) else None
-        return ["module", _coded(value.__name__, at), held]
+        # A module of the user's is its file's code (a function reading it states the attributes it names,
+        # `reads`); another module its version.
+        return ["module", _coded(value.__name__, at), *_main(value.__name__)]
     if isinstance(value, logging.Logger):
         return ["logger", value.name]
     if isinstance(value, (types.FunctionType, type)) and _sources.own_source(value.__module__):
@@ -150,9 +152,9 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) 
         return ["sequence", again(type(value), at=at),
                 [again(each, at=f"{at}[{index}]") for index, each in enumerate(value)]]
     if isinstance(value, (set, frozenset)):
-        # In the order it holds them, as a mapping's: a trace that iterates it reads that order, which
-        # for strings is another in each process unless its hash seed is set.
-        return ["set", again(type(value), at=at), [again(each, at=at) for each in value]]
+        # By their statements' order, which no process's string hashing decides.
+        members = sorted((again(each, at=at) for each in value), key=lambda stated: json.dumps(stated))
+        return ["set", again(type(value), at=at), members]
     if isinstance(value, Mapping):
         # In the order it holds them: a trace that iterates it reads that order.
         return ["map", again(type(value), at=at),
@@ -258,10 +260,19 @@ def reads(function: types.FunctionType, at: str, known: Mapping[int, JSON] = _NO
     within = walking | {id(function)}
     named = function.__qualname__
     cells, read = _sources.function_reads(function)
+    names = _sources.names_read(function.__code__)
+
+    def global_read(name: str, value) -> JSON:
+        # A module of the user's the body names: the attributes of it the body names too, as each is
+        # stated, beside its file's code; every other value as stated.
+        stated_value = _stated(value, f"{at} ({named}'s global {name})", known, within)
+        if not (isinstance(value, types.ModuleType) and _sources.own_source(value.__name__)):
+            return stated_value
+        return [stated_value, _module_state(value, names, f"{at} ({named}'s global {name})", known, within)]
+
     return {"closure": {name: _stated(value, f"{at} ({named}'s closure, {name})", known, within)
                         for name, value in sorted(cells.items())},
-            "globals": {name: _stated(value, f"{at} ({named}'s global {name})", known, within)
-                        for name, value in sorted(read.items())},
+            "globals": {name: global_read(name, value) for name, value in sorted(read.items())},
             "defaults": _stated((function.__defaults__, function.__kwdefaults__),
                                 f"{at} ({named}'s defaults)", known, within)}
 
@@ -294,13 +305,16 @@ def _members(held, at: str, known: Mapping[int, JSON], walking: frozenset[int]) 
             for name, member in _sources.members(held)}
 
 
-def _module_state(module: types.ModuleType, at: str, known: Mapping[int, JSON],
+def _module_state(module: types.ModuleType, names: set[str], at: str, known: Mapping[int, JSON],
                   walking: frozenset[int]) -> JSON:
-    """Everything a module of the user's holds (`_members`), for code that names the module itself and so
-    may read any of it; a module met again within its own walk is itself."""
+    """The attributes of a module of the user's that code naming the module names too (`names`, its read
+    names), as an identity states each: a member the code never names (a path, a compiled pattern beside
+    the function it calls) is no part of it; a module met again within its own walk is itself."""
     if id(module) in walking:
         return "itself"
-    return _members(module, at, known, walking | {id(module)})
+    within = walking | {id(module)}
+    return {name: _stated(member, f"{at} ({module.__name__}.{name})", known, within)
+            for name, member in _sources.members(module) if name in names}
 
 
 def _tree(tree, at: str, again: Callable[..., JSON]) -> JSON:
