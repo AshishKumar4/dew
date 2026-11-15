@@ -90,13 +90,17 @@ class Book(NamedTuple):
     norms: jax.Array
     commits: jax.Array
     scored: jax.Array
+    unfinite_layer: jax.Array
+    """The first layer the latest step updating in its backward met a gradient not finite at in its walk
+    (`dew.training.transaction.Applied.unfinite_layer`), since the last check, -1 for none."""
 
 
 def _zeros(loss: jax.Array | jax.ShapeDtypeStruct) -> tuple[np.ndarray, ...]:
     """A fresh interval's counters (`Book`'s fields) for a step whose loss is `loss`, on the host."""
     dtype = at_least_fp32(loss.dtype)
     return (np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32), np.zeros((), dtype),
-            np.zeros((2,), np.uint32), np.zeros((), dtype), np.zeros((), np.int32), np.zeros((2,), np.uint32))
+            np.zeros((2,), np.uint32), np.zeros((), dtype), np.zeros((), np.int32), np.zeros((2,), np.uint32),
+            np.full((), -1, np.int32))
 
 
 def fresh_book(loss: jax.Array) -> Book:
@@ -135,12 +139,14 @@ def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committe
     """
     bad_run = jnp.where(finite, 0, book.bad_run + 1)
     dtype = at_least_fp32(loss.dtype)
-    norms, commits = book.norms, book.commits
+    norms, commits, layer = book.norms, book.commits, book.unfinite_layer
     if committed is not None:
         norms, commits = norms + committed.norm.astype(dtype), commits + committed.count
+        if committed.unfinite_layer is not None:
+            layer = jnp.where(committed.unfinite_layer >= 0, committed.unfinite_layer, layer)
     return Book(book.loss + loss.astype(dtype), bad_run, jnp.maximum(book.worst_bad_run, bad_run),
                 book.training + training, TokenCount.add(book.tokens, tokens), norms, commits,
-                TokenCount.add(book.scored, scored))
+                TokenCount.add(book.scored, scored), layer.astype(jnp.int32))
 
 
 @dataclasses.dataclass
@@ -258,8 +264,10 @@ class Interval:
         the devices, and start it over; None before the first step."""
         if self.book is None or self.fresh is None:
             return None
-        worst, self.book = self.book.worst_bad_run, self.book._replace(worst_bad_run=self.fresh.worst_bad_run)
-        return worst
+        worst, layer = self.book.worst_bad_run, self.book.unfinite_layer
+        self.book = self.book._replace(worst_bad_run=self.fresh.worst_bad_run,
+                                       unfinite_layer=self.fresh.unfinite_layer)
+        return jnp.stack([worst, layer])
 
     def check_finite(self, step: int, display: TrainingDisplay) -> None:
         """Check the longest streak since the last check now (`checked_streak`):
@@ -267,7 +275,8 @@ class Interval:
         and this is the check at the end of a run."""
         streak = self.streak()
         if streak is not None:
-            checked_streak(int(on_host(streak, step)), step, display)
+            worst, layer = (int(value) for value in on_host(streak, step))
+            checked_streak(worst, step, display, layer)
 
     @classmethod
     def resumed(cls, control: dict, *, last_saved: int | None) -> Interval:
@@ -456,7 +465,9 @@ class Reading(NamedTuple):
     loss: Number
     aux: Mapping[str, Number]
     accepted: Number
-    streak: Number | None
+    streak: jax.Array | None
+    """The longest streak of non-finite steps and the first layer a backward walk met a gradient not finite
+    at (`Interval.streak`)."""
     rate: Number | None
     scale: Number | None
     rollout: Mapping[str, Number | float]
@@ -516,7 +527,8 @@ class Taken(NamedTuple):
         # A log read late is done no earlier than the one read before it.
         done = max(done, since or 0.0)
         if read.streak is not None:
-            checked_streak(int(read.streak), self.step, display)
+            worst, layer = (int(value) for value in read.streak)
+            checked_streak(worst, self.step, display, layer)
         return read, done - (self.counts.last_log_time if since is None else since), done
 
 
@@ -660,19 +672,22 @@ def on_host[TreeT](counters: TreeT, step: int) -> TreeT:
                            "at the loss counters that read its loss (jit_bookkeep)") from error
 
 
-def checked_streak(streak: int, step: int, display: TrainingDisplay) -> None:
+def checked_streak(streak: int, step: int, display: TrainingDisplay, layer: int = -1) -> None:
     """Raise RuntimeError once the loss has been non-finite for
     BAD_LOSS_STEPS steps ending at `step`, and note a shorter streak.
 
     Checked at the logging cadence so the step loop never synchronises;
     detection is late by at most that many steps, never missed.
     """
+    # A step updating in its backward moved the layers its walk reached before a gradient not finite.
+    walked = (f"; its backward walk first met a gradient not finite at layer {layer}, the layers above it "
+              "updated" if layer >= 0 else "")
     if streak >= BAD_LOSS_STEPS:
         raise RuntimeError(
             f"Loss has been non-finite for {streak} consecutive steps "
-            f"ending near step {step}, stopping")
+            f"ending near step {step}, stopping{walked}")
     if streak:
-        display.note(f"Non-finite loss for {streak} step(s) before {step}", style="red")
+        display.note(f"Non-finite loss for {streak} step(s) before {step}{walked}", style="red")
 
 
 def real_token_share(scored: int | None, computed: int | None) -> dict[str, float]:
