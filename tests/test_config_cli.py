@@ -148,8 +148,8 @@ def profiled(report_file: Path) -> dict:
     """A profile's report, held to the capture it names: the steps the capture's training annotations
     hold are exactly the two after its warmup of two, the steps its log covers; its kernels the plan's
     record of the program its window ran, the run's latest compiled before it (rows 6665, 6715); its
-    losses at most three of the step's shares, largest first, a device's wait on a batch counted once,
-    as the input wait (row 6714)."""
+    losses at most three of the step's shares, disjoint, largest first: where the capture holds a device
+    track, the device's own idle shares in place of the loop's input wait (row 6714)."""
     from dew.training.profiling import traced_steps
 
     report = json.loads(report_file.read_text())

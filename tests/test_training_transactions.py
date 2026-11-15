@@ -642,3 +642,18 @@ def test_an_unscaled_non_finite_step_leaves_the_parameters_as_they_were(optimize
         pairs = zip(jax.tree.leaves(state.variables), jax.tree.leaves(skipped.variables), strict=True)
         for got, want in pairs:
             np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def test_a_step_whose_loss_is_finite_and_its_gradient_not_is_reported_not_finite():
+    """A step with no loss scale whose loss is finite and its gradient not (a square root's derivative at
+    zero) trains nothing and is reported not finite, so a run's streak of such steps stops it (training.md,
+    a step that is not finite): it was reported finite, by its loss, and the streak reset on it (the theme's
+    head review, F2)."""
+    stepper = Trainer(Tiny(), optax.sgd(0.1), key=jax.random.PRNGKey(9))
+    state = stepper.initial_state()
+    bad = batches()[1]
+    step = stepper.compile(state, bad)
+    advanced, loss, _, finite, _, committed = step(state, bad)
+    assert bool(jnp.isfinite(loss)) and not bool(finite) and int(committed.count) == 0
+    np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]),
+                                  np.asarray(state.variables["params"]["w"]))

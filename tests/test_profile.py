@@ -353,7 +353,8 @@ def test_a_profile_counts_overlapped_collectives_once_and_the_gaps_as_idle():
     later = [(name, start + 15_000_000, end + 15_000_000) for name, start, end in step]
     figures = device_figures([step + later, later + step], steps=2)
     assert figures == {"device_window_ms": 12.5, "compute_ms": 10.0, "communication_ms": 10.0,
-                       "exposed_communication_ms": 0.0, "device_idle_ms": 2.5, "host_idle_ms": 2.5}
+                       "exposed_communication_ms": 0.0, "device_idle_ms": 2.5, "input_idle_ms": 0.0,
+                       "host_idle_ms": 2.5}
     report = ProfileReport("profile", 2, 2, (2, 3), "capture", 15.0, 1.0, 3.0, **figures, flops=None,
                            mfu=None, hfu=None, tokens_per_s=None, device=None)
     # The lines carry the figures: the idle gap, and compute's share of a step, the largest.
