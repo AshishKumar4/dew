@@ -117,23 +117,23 @@ class TorchAdmission:
     reasons: Mapping[str, str]
     attends: bool = False
     why: str = ""
-    per_geometry: bool = False
-    """Whether its causality is proven per program it runs (`TorchGraph.certify`): a source qualified on
-    its full config without its probe (`qualified`), whose program at one length or in one call says
-    nothing of another's."""
 
 
 def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     """Tier 3's decision on an unregistered model_type no registered convention computes, on the
     probe's shrunken config with random weights (`verify.scatter_weights`), before any weight
-    downloads: transformers builds the type as a causal LM (`AutoModelForCausalLM`); its inference and
-    training forwards trace as tier 3 traces them (`TorchGraph.traced`), the training one drawing
-    nothing on the host; and the forward tier 3 runs is causal, so changing a row's last token leaves
-    every earlier position's logits bit for bit (a decoder configured bidirectionally, BERT's with
-    is_decoder False, is not). An operation whose output's shape or value the traced values decide (a
-    `nonzero`, an `item()`) fails that trace with JAX's own error, naming it. Each refusal names its
-    cause."""
+    downloads: transformers builds the type as a causal LM (`AutoModelForCausalLM`); its forward asks
+    the attention interface what Dew's attention computes in every decoder layer, or runs its own
+    (`attends`, `_Probe`); and the model tier 3 runs on that attention (`load`), its inference and
+    training forwards traced as tier 3 traces them (`TorchGraph.traced`), is causal by its programs
+    (`sequence_causality.causality_refusal`: each output position reads no later input through every
+    operation, on any backend, from the program alone), the training one drawing nothing on the host. A
+    decoder configured bidirectionally (BERT's with is_decoder False) is not. An operation whose output's
+    shape or value the traced values decide (a `nonzero`, an `item()`) fails that trace with JAX's own
+    error, naming it. Each program the model then runs is proven before it runs (`TorchGraph.certify`):
+    a trace at one length says nothing of another's. Each refusal names its cause."""
     import torch
+    from torchax.interop import JittableModule, extract_all_buffers
     from transformers import AutoConfig, AutoModelForCausalLM
     from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
@@ -150,40 +150,33 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=False, dtype=torch.float32,
                                              attn_implementation=_PROBE).eval()
     verify.scatter_weights(model)
-    ids = torch.from_numpy(verify.probe_ids(int(config.vocab_size)).astype(np.int64))
+    ids = verify.probe_ids(int(config.vocab_size)).astype(np.int32)
     probe = _Probe()
     with torch.no_grad(), probe.recording():
-        model(input_ids=ids, use_cache=False)
-    # Its inference and training forwards traced as tier 3 traces them; the training one's dropout and
-    # any layer drop run only there, and a draw on the host would be fixed for every step.
-    from torchax.interop import JittableModule, extract_all_buffers
-
-    functional_parts(model)
-    jittable = JittableModule(model)
+        model(input_ids=torch.from_numpy(ids.astype(np.int64)), use_cache=False)
+    why = probe.kept_from_dew(int(config.num_hidden_layers))
+    # The model tier 3 runs (`load`): on Dew's attention where every layer asks for what it computes, on
+    # its own otherwise, its parts functional; its experts at static shapes (`functional_parts`), so one
+    # token's route rounds no other's products (ledger 3125).
+    ran = AutoModelForCausalLM.from_config(config, trust_remote_code=False, dtype=torch.float32,
+                                           **({} if why else {"attn_implementation": _ATTENTION})).eval()
+    verify.scatter_weights(ran)
+    functional_parts(ran)
+    jittable = JittableModule(ran)
     params = {name: host_view(leaf, name) for name, leaf in jittable.params.items()}
-    buffers = {name: host_view(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
-    graph = TorchGraph(jittable, ())
-    # Causal as tier 3 runs it, its experts at static shapes (`functional_parts`): transformers' own
-    # forward runs Longcat Flash's experts over the tokens each routes, so one token's route rounds
-    # another's products, which is no attention to later tokens (ledger 3125). On the host's CPU, whose
-    # every sum is in one order on every call: a GPU's scattered sums land in the order its threads finish,
-    # which moved Longcat Flash's earlier logits between two calls and refused it there (rows 4952, 5150).
-    cpu = jax.devices("cpu")[0]
-    with jax.default_device(cpu):
-        placed = {name: jax.device_put(np.asarray(leaf), cpu) for name, leaf in params.items()}
-        held = {name: jax.device_put(np.asarray(leaf), cpu) for name, leaf in buffers.items()}
-        tokens = jnp.asarray(ids.numpy(), jnp.int32)
-        changed = tokens.at[:, -1].set((tokens[:, -1] + 1) % int(config.vocab_size))
-        logits, moved = (np.asarray(graph(placed, held, row, train=False)[0]) for row in (tokens, changed))
-    if not np.array_equal(logits[:, :-1], moved[:, :-1]):
-        raise ValueError(f"model_type {model_type!r} as configured attends to later tokens (its earlier "
-                         "positions' logits move with a row's last token), and tier 3 runs causal LMs")
-    _, _, draws = graph.traced(params, buffers, ids.numpy().astype(np.int32), jax.random.key(0), train=True)
+    buffers = {name: host_view(leaf, name) for name, leaf in extract_all_buffers(ran)[1].items()}
+    graph = TorchGraph(jittable, (), attention_impl=None if why else "reference")
+    inference, _, _ = graph.traced(params, buffers, ids, None, train=False)
+    training, _, draws = graph.traced(params, buffers, ids, jax.random.key(0), train=True)
+    for program, forward in ((inference, "forward"), (training, "training forward")):
+        refusal = causality_refusal(program, len(params) + len(buffers), ids.shape[1], (0, 1))
+        if refusal is not None:
+            raise ValueError(f"model_type {model_type!r} as configured is not causal by its {forward}'s "
+                             f"program ({refusal}), and tier 3 runs causal LMs")
     if draws.host:
         raise ValueError(f"model_type {model_type!r}'s training forward draws on the host ({draws.host} "
                          "draws, BioGPT's layer drop among them), which a traced step would fix for every "
                          "step, and tier 3 trains the models it loads")
-    why = probe.kept_from_dew(int(config.num_hidden_layers))
     return TorchAdmission(model_type, dict(unmapped.reasons), attends=not why, why=why)
 
 
@@ -208,8 +201,8 @@ def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable
     `QUALIFYING` tokens is causal by its program (`sequence_causality.causality_refusal`: each output
     position reading no later input through every operation); and its training forward draws nothing on
     the host. Each refusal names its cause. torchax holds no symbolic length (its tensors' torch sizes
-    are integers), so no one trace proves every length: the admission is per geometry (`per_geometry`),
-    each program the model then runs proven before it runs (`TorchGraph.certify`)."""
+    are integers), so no one trace proves every length: each program the model then runs is proven before it
+    runs (`TorchGraph.certify`)."""
     from transformers import AutoConfig
     from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
@@ -247,7 +240,7 @@ def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable
         raise ValueError(f"model_type {model_type!r}'s training forward draws on the host ({trained.host} "
                          "draws), which a traced step would fix for every step, and tier 3 trains the "
                          "models it loads")
-    return TorchAdmission(model_type, {"probe": str(unavailable)}, attends=True, per_geometry=True)
+    return TorchAdmission(model_type, {"probe": str(unavailable)}, attends=True)
 
 
 def _abstract(source, attention: str, length: int, *, train: bool):
@@ -966,9 +959,9 @@ class TorchGraph:
     """Its parameters' logical axes by their torch names, its tensor-parallel plan's (`planned_axes`),
     which its placement reads (`TorchCausalLM.placement`)."""
     certified: dict[tuple, str | None] | None = None
-    """For a source admitted per geometry (`TorchAdmission.per_geometry`): each program specialization it
-    has run, by the refusal its walk gave (None where causal); None for a probed source, whose causality
-    its probe decided (`certify`)."""
+    """For a source tier 3 admitted (`admitted`, `qualified`): each program specialization it has run, by
+    the refusal its walk gave (None where causal); None for one loaded by `fallback="torchax"`, whose
+    causality its caller vouches for (`certify`)."""
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None,
@@ -1024,8 +1017,8 @@ class TorchGraph:
         return outputs
 
     def certify(self, traced, arguments: tuple, *, train: bool, max_segments: int) -> None:
-        """For a source admitted per geometry (`certified`), prove the program about to run, `traced`
-        over `arguments`, causal before it runs: its logits and states (its first two outputs) read at a
+        """For a source tier 3 admitted (`certified`), prove the program about to run, `traced` over
+        `arguments`, causal before it runs: its logits and states (its first two outputs) read at a
         position no later token (`sequence_causality.causality_refusal`), once a specialization (its
         arguments' structure, shapes and dtypes, train or not, its documents' bound). Refused where an
         output position reads a later one."""
@@ -1039,8 +1032,8 @@ class TorchGraph:
             self.certified[signature] = causality_refusal(traced, tokens, int(arguments[2].shape[1]), (0, 1))
         refusal = self.certified[signature]
         if refusal is not None:
-            raise ValueError(f"tier 3 qualified this source without its probe, causal in each program its "
-                             f"own walk proves, and this one is not: {refusal}")
+            raise ValueError(f"tier 3 runs this source causal in each program its walk proves, and this one "
+                             f"is not: {refusal}")
 
     def traced(self, params: Mapping[str, Traceable], buffers: Mapping[str, Traceable], tokens: Traceable,
                key: jax.Array | None,
@@ -1673,7 +1666,7 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     torch.nn.Module.to(model, "meta")
     graph = TorchGraph(jittable, persistent, attention_impl=attention_impl if attends else None,
                        shapes={"params": _shapes(params), "buffers": _shapes(buffers)}, axes=axes,
-                       certified={} if admission is not None and admission.per_geometry else None)
+                       certified=None if admission is None else {})
     # The decode cache's slots: the load's, else the source's own context as its config class reads it
     # (an alias, CTRL's `n_positions`, included).
     named = type(model.config).attribute_map.get("max_position_embeddings", "max_position_embeddings")

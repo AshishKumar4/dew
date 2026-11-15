@@ -4,7 +4,10 @@ at 11 and 13 tokens, it admits each one whose every output position reads no lat
 operations it composes, and refuses each one that reads a later position or that it cannot show reads
 none; a program that computes otherwise past a length is proven below it and refused above. Dew's own
 attention and token-wise programs are read by their rules where Dew's code bound them (`attested`); a
-program merely named like one is walked inside."""
+program merely named like one is walked inside. Attention written out (transformers' own) is causal where
+its mask zeroes each later key's weight, by minus infinity or its dtype's lowest, and not where a key ahead
+is seen, a query sees none, or a bias is too small to vanish; a token's routing weights taken by its own
+row, keys assembled by slice assignment and halves unstacked and stacked keep each position's own."""
 
 import jax
 import jax.numpy as jnp
@@ -27,12 +30,59 @@ def conv(states, padding):
                                         dimension_numbers=("NWC", "WIO", "NWC"), feature_group_count=D)
 
 
-def attention(q, k, v, causal: bool):
+def attention(q, k, v, causal: bool, *, ahead: int = 0, first_sees: bool = True):
+    """Attention written out, each query's scores over keys masked to minus infinity past `ahead` keys
+    after its own where `causal` (the first query seeing none where not `first_sees`)."""
     length = q.shape[1]
     scores = jnp.einsum("bqd,bkd->bqk", q, k)
     if causal:
-        scores = jnp.where(jnp.tril(jnp.ones((length, length), bool)), scores, -jnp.inf)
+        scores = jnp.where(visible(length, ahead, first_sees), scores, -jnp.inf)
     return jnp.einsum("bqk,bkd->bqd", jax.nn.softmax(scores, axis=-1), v)
+
+
+def visible(length: int, ahead: int = 0, first_sees: bool = True):
+    """Which keys each query sees: its own and earlier ones, and `ahead` later ones."""
+    seen = jnp.tril(jnp.ones((length, length), bool), k=ahead)
+    return seen if first_sees else seen & (jnp.arange(length) > 0)[:, None]
+
+
+def biased_attention(tokens, bias: float, *, dropout: bool = False):
+    """Transformers' eager attention: scaled scores plus a mask of `bias` past each query's own key, a
+    float32 softmax, its weights dropped out where `dropout`, over the values."""
+    q = k = v = embedded(tokens)
+    length = tokens.shape[1]
+    scores = jnp.einsum("bqd,bkd->bqk", q, k) * D ** -0.5
+    weights = jax.nn.softmax(scores + jnp.where(visible(length), 0.0, bias), axis=-1)
+    if dropout:
+        weights = weights * jax.random.bernoulli(jax.random.key(0), 0.9, weights.shape) / 0.9
+    return jnp.einsum("bqk,bkd->bqd", weights, v)
+
+
+def routed(tokens, shift: int = 0):
+    """Each token's two top routing weights, taken from the token `shift` later's, scaling its state."""
+    states = embedded(tokens)[0]
+    length = tokens.shape[1]
+    weights = jax.nn.softmax(states @ jnp.arange(D * 4, dtype=jnp.float32).reshape(D, 4), axis=-1)
+    _, chosen = jax.lax.top_k(weights, 2)
+    rows = (jnp.arange(length) + shift) % length
+    taken = weights[rows[:, None], chosen]
+    return (taken.sum(axis=-1, keepdims=True) * states)[None]
+
+
+def assembled(tokens, shift: int = 0):
+    """Each position's keys assembled by slice assignment, its two halves from the position `shift`
+    later's."""
+    states = embedded(tokens)
+    if shift:
+        states = jnp.zeros_like(states).at[:, :-shift].set(states[:, shift:])
+    return jnp.zeros((1, tokens.shape[1], 2 * D)).at[:, :, :D].set(states).at[:, :, D:].set(2 * states)
+
+
+def rotated(tokens):
+    """Each position's state rotated by halves interleaved, unstacked and stacked again (Cohere's)."""
+    states = embedded(tokens).reshape(1, tokens.shape[1], D // 2, 2)
+    first, second = jnp.unstack(states, axis=-1)
+    return jnp.stack([-second, first], axis=-1).reshape(1, tokens.shape[1], D)
 
 
 def named(function, name):
@@ -89,6 +139,15 @@ ADMITTED = {
                                                   embedded(tokens), jnp.ones((3, D, D)))[0],
     "a token's own random bits": lambda tokens: jax.vmap(jax.vmap(lambda token: jax.random.bits(
         jax.random.fold_in(jax.random.key(0), token), ())))(tokens)[..., None],
+    "attention written out, masked to minus infinity": lambda tokens: attention(
+        *(embedded(tokens),) * 3, causal=True),
+    "attention written out, masked by its dtype's lowest added": lambda tokens: biased_attention(
+        tokens, float(jnp.finfo(jnp.float32).min)),
+    "attention masked by its dtype's lowest, its weights dropped out": lambda tokens: biased_attention(
+        tokens, float(jnp.finfo(jnp.float32).min), dropout=True),
+    "a token's top routing weights taken by its row": routed,
+    "keys assembled by slice assignment": assembled,
+    "halves rotated through an unstack and a stack": rotated,
 }
 
 REFUSED = {
@@ -103,7 +162,13 @@ REFUSED = {
     "next token": lambda tokens: embedded(tokens)[:, jnp.minimum(jnp.arange(tokens.shape[1]) + 1,
                                                                 tokens.shape[1] - 1)],
     "plain attention": lambda tokens: attention(*(embedded(tokens),) * 3, causal=False),
-    "masked attention outside Dew's": lambda tokens: attention(*(embedded(tokens),) * 3, causal=True),
+    "attention written out, masked a key ahead": lambda tokens: attention(*(embedded(tokens),) * 3,
+                                                                         causal=True, ahead=1),
+    "attention whose first query sees no key": lambda tokens: attention(*(embedded(tokens),) * 3,
+                                                                       causal=True, first_sees=False),
+    "attention masked by a bias too small to vanish": lambda tokens: biased_attention(tokens, -1.0),
+    "a token's top routing weights taken from the next token's": lambda tokens: routed(tokens, shift=1),
+    "keys assembled by slice assignment from the next position": lambda tokens: assembled(tokens, shift=1),
     "a left shift named as Dew's attention": lambda tokens: named(lambda q, k, v: shifted_left(v),
                                                                   CAUSAL_ATTENTION)(*(embedded(tokens),) * 3),
     "a left shift named token-wise": lambda tokens: named(lambda x: shifted_left(x[None])[0], TOKENWISE)(
