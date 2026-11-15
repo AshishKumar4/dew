@@ -1016,8 +1016,8 @@ class Trainer(Generic[Loss, Effects]):
     def _planned_unplaced(self, start: Start, batch: Batch) -> None:
         """A fresh run's first step planned and compiled over its state's shapes (`start`'s) before the
         state is placed, held for the run's first compile over `batch` (`StepCompiler.planned_unplaced`),
-        which takes it where the devices hold it once the state is placed and otherwise plans afresh, at the
-        split the run was given or the planner's own, not the held plan's:
+        which takes it where the devices hold it once the state is placed and otherwise plans from the held
+        plan's rung and split (`StepCompiler._plans`):
         built at the pass count of the phase its batch was read in (`PhasePasses.scoped`), as `compile`
         builds it, its admission counting the bytes the start will place in a device's own memory beside it:
         the state's as the layout validates it (`Start.held`), none of a field kept in the host's, but for

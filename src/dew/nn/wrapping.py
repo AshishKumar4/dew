@@ -158,11 +158,6 @@ class DecoderWrapper(nn.Module):
         return None if decoder is None else self._over(decoder)
 
     @nn.nowrap
-    def recompute_half(self) -> Self | None:
-        decoder = self._decoder.recompute_half()
-        return None if decoder is None else self._over(decoder)
-
-    @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:
         return self._over(self._decoder.restore_recompute(record))
 

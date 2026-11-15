@@ -32,8 +32,9 @@ from token_support import write_token_corpus
 
 from dew import _cache
 from dew.checkpoints import Checkpoints
-from dew.data import Loading, presets
+from dew.data import Loading, Memory, presets
 from dew.data.compile import compile
+from dew.data.pipeline import Pipeline
 from dew.data.sources.tokens import TokenFiles
 from dew.diffusion.discrete import MDLM
 from dew.distributed.placement import Layout, MeshSpec, placed_bytes
@@ -58,7 +59,7 @@ from dew.training.memory import (
     recompute_more,
     rung_record,
 )
-from dew.training.planning import Trials, planned, splits
+from dew.training.planning import Trials, splits, walked
 
 ROWS, SEQ = 32, 16
 BATCH = {"text": jnp.asarray((np.arange(ROWS * (SEQ + 1)).reshape(ROWS, SEQ + 1) * 7) % 64, jnp.int32)}
@@ -66,45 +67,35 @@ BATCH = {"text": jnp.asarray((np.arange(ROWS * (SEQ + 1)).reshape(ROWS, SEQ + 1)
 
 @pytest.mark.parametrize("fitting, first, computed, plan, asked", [
     # The batch whole fits: one compile.
-    (lambda rung, split: True, 0, {}, (0, 1), [(0, 1)]),
+    (lambda split: True, 0, {}, 1, [1]),
     # The whole batch's miss computes two microbatches, which fit: two compiles.
-    (lambda rung, split: split >= 2, 0, {(0, 1): 1}, (0, 2), [(0, 1), (0, 2)]),
+    (lambda split: split >= 2, 0, {1: 1}, 2, [1, 2]),
     # It computes four, which fit, past two not asked: two is asked, and fits, the fewest.
-    (lambda rung, split: split >= 2, 0, {(0, 1): 2}, (0, 2), [(0, 1), (0, 4), (0, 2)]),
+    (lambda split: split >= 2, 0, {1: 2}, 2, [1, 4, 2]),
     # Four fit and two miss: four, the fewest.
-    (lambda rung, split: split >= 4, 0, {(0, 1): 2}, (0, 4), [(0, 1), (0, 4), (0, 2)]),
-    # Its miss computes two, whose program misses too, and that miss computes four: the third compile,
-    # where the next program held otherwise than the one that missed read.
-    (lambda rung, split: split >= 4, 0, {(0, 1): 1, (0, 2): 2}, (0, 4), [(0, 1), (0, 2), (0, 4)]),
-    # No split is asked past a miss: the next rung, from the batch whole, whose miss there computes two.
-    (lambda rung, split: rung >= 1 and split >= 2, 0, {(1, 1): 1}, (1, 2), [(0, 1), (1, 1), (1, 2)]),
+    (lambda split: split >= 4, 0, {1: 2}, 4, [1, 4, 2]),
+    # Its miss computes two, whose program misses too, and that miss computes four.
+    (lambda split: split >= 4, 0, {1: 1, 2: 2}, 4, [1, 2, 4]),
+    # Its miss computes none, and the finest, asked, misses: the rung cannot fit.
+    (lambda split: False, 0, {1: 3}, None, [1, 8]),
     # A recorded plan is asked first and kept where it fits.
-    (lambda rung, split: split >= 2, 2, {}, (0, 4), [(0, 4)]),
-    # One that misses at its rung: the next rung asks the batch whole, fewer microbatches than the plan's.
-    (lambda rung, split: rung >= 1, 2, {}, (1, 1), [(0, 4), (1, 1)]),
-    # Nothing fits: each rung's batch whole, then no plan.
-    (lambda rung, split: False, 0, {}, None, [(0, 1), (1, 1), (2, 1)]),
+    (lambda split: split >= 2, 2, {}, 4, [4]),
 ])
-def test_the_plan_asks_what_each_miss_computes_then_climbs(fitting, first, computed, plan, asked):
-    """Candidates are (rung, split), rung-major: the first asked, then, past each miss, the split that
-    miss computes as the first to fit (`after`, an index into the candidates), until one fits, then each
-    split before it not asked until one misses; none named, the next rung."""
-    rung, compiled = [0], []
+def test_a_rungs_splits_are_asked_as_each_miss_computes(fitting, first, computed, plan, asked):
+    """At one rung the split asked first, then, past each miss, the split that miss computes as the first
+    that can fit (`after`, an index into the candidates, the finest where it computes none), until one fits,
+    then each split before it not asked until one misses."""
+    compiled = []
     candidates = [1, 2, 4, 8]
 
     def fits(split):
-        compiled.append((rung[0], split))
-        return fitting(rung[0], split)
+        compiled.append(split)
+        return fitting(split)
 
     def after(index):
-        return computed.get((rung[0], candidates[index]))
+        return computed.get(candidates[index])
 
-    def climb():
-        rung[0] += 1
-        return rung[0] < 3
-
-    split = planned(candidates, first, fits, climb, after)
-    assert (None if split is None else (rung[0], split)) == plan
+    assert walked(candidates, first, fits, after) == plan
     assert compiled == asked
 
 
@@ -133,6 +124,30 @@ def test_every_process_gathers_the_split_asked_after_each_miss():
     assert FitSearch.after(search({("rung", 1): MemoryMiss(1, 90, 50, 1)}), candidates, 0) == 2
     assert gathered == [1, 2]
     assert FitSearch.after(search({}), candidates, 3) is None and gathered == [1, 2]
+    # A miss whose figures leave no split above it room asks the finest, XLA's compile the judge of it.
+    assert FitSearch.after(search({("rung", 1): MemoryMiss(1, 30, 50, 1)}), candidates, 0) == 3
+
+
+def test_every_process_keeps_or_drops_the_narrow_copies_together():
+    """Whether the ladder keeps the narrow copies (`FitSearch.copies_freed`) is every process's verdict
+    gathered: a process whose step without them fell less short, beside one whose fell no less short,
+    keeps them as that one does, so no two processes lower different steps and enter different compiles'
+    collectives; and where every process's drop freed bytes, every one keeps them dropped."""
+    from types import SimpleNamespace
+
+    from dew.training.memory import MemoryMiss
+    from dew.training.planning import FitSearch
+
+    def search(without: int, others: bool):
+        misses = {("with", 1): MemoryMiss(1, 50, 50, 1), ("without", 1): MemoryMiss(1, 50, without, 1)}
+        return SimpleNamespace(misses=misses, gather=lambda held: [held, others])
+
+    # This process's drop helped (40 short, where 50 with them); another's did not: both keep the copies.
+    assert FitSearch.copies_freed(search(40, others=True), "with", "without") is False
+    # Neither process's drop left it no less short: both keep them dropped.
+    assert FitSearch.copies_freed(search(40, others=False), "with", "without") is True
+    # This process's drop did not help: it keeps them, whatever another's did.
+    assert FitSearch.copies_freed(search(60, others=False), "with", "without") is False
 
 
 def test_a_miss_computes_the_split_its_temporaries_leave_room_at():
@@ -1093,67 +1108,59 @@ def asked(trainer) -> list[tuple[int, str | None, bool]]:
     return [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]]
 
 
-def assert_searched(probes, chosen, *, half=None):
-    """`probes`, a search that settled on `chosen` (split, remat): the batch whole asked first, no
-    compile asked twice, every split that missed at no recomputation asked at the `half` rung next, every
-    one below the plan missed, a plan at the half
-    rung missed at no recomputation before, and no optional frontier is asked. Which splits between are
-    asked follows the memory each compile that missed read, which differs between devices: ascending from
-    each miss (`after`) to the first that fits, then descending from it to one that misses."""
-    assert probes[0][:2] == (1, None) and not probes[0][2]
-    assert len({probe[:2] for probe in probes}) == len(probes)
-    assert (*chosen, True) in probes
-    assert all(remat in (None, half) for _, remat, _ in probes)
-    for index, (split, remat, fits) in enumerate(probes[:-1]):
-        if half is not None and remat is None and not fits:
-            assert probes[index + 1] == (split, half, probes[index + 1][2])
-    splits = list(dict.fromkeys(split for split, _, _ in probes))
-    fitted = next(index for index, split in enumerate(splits) if (split, chosen[1], True) in probes
-                  or (split, None, True) in probes)
-    assert splits[:fitted + 1] == sorted(splits[:fitted + 1])
-    assert splits[fitted:] == sorted(splits[fitted:], reverse=True)
-    assert not any(fits for split, _, fits in probes if split < chosen[0])
-    if half is not None and chosen[1] == half:
-        # A plan at the half rung missed at no recomputation first.
-        assert probes.index((chosen[0], None, False)) < probes.index((*chosen, True))
+def assert_searched(trainer, chosen):
+    """`trainer`'s plan, a search that settled on `chosen` (split, remat): the batch whole asked first, no
+    compile asked twice (a split at a rung, its head and options), and no split asked at the plan's rung
+    below the plan's but missed. Which splits are asked follows the memory each compile that missed read,
+    which differs between devices: ascending from each miss to the first its figures leave room at
+    (`after`)."""
+    probes = trainer.plan["probes"]
+    keys = [tuple(probe[name] for name in ("split", "remat", "head_tile", "head_fused", "xla_defaults",
+                                            "narrow")) for probe in probes]
+    assert keys[0][:2] == (1, None) and not probes[0]["fits"]
+    assert len(set(keys)) == len(keys), keys
+    assert (trainer.plan["split"], trainer.plan["remat"]) == chosen
+    fitted = next(key for key, probe in zip(keys, probes, strict=True)
+                  if probe["fits"] and key[:2] == chosen)
+    assert not any(probe["fits"] for key, probe in zip(keys, probes, strict=True)
+                   if key[1:] == fitted[1:] and key[0] < chosen[0])
 
 
 DELTA = {"mixer": mixers.build("gated_delta_net", linear_num_key_heads=2, linear_num_value_heads=2,
                                linear_key_head_dim=8, linear_value_head_dim=8)}
-"""A decoder of one gated delta net layer, whose ladder holds the half rung 'all_but_delta_memory'."""
+"""A decoder of one gated delta net layer, whose ladder's first rung above none is 'all_but_delta_memory'."""
 
 HALVED = {"seq": 256, "width": 64, "layers": 2, **DELTA}
 """A decoder of two gated delta net layers over 256 tokens, the delta rule's memory a share of the step
-that its half rung saves: at four microbatches of 32 rows the rung needs 3.4 to 3.7 MB less than no
+that that rung saves: at four microbatches of 32 rows the rung needs 3.4 to 3.7 MB less than no
 recomputation on an A100 and an H100, where the one-layer, sixteen-token decoder's needs 512 bytes more
 (row 3341's GPU cell)."""
 HALVED_BATCH = {"text": jnp.asarray((np.arange(ROWS * 257).reshape(ROWS, 257) * 7) % 64, jnp.int32)}
 
 
-def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monkeypatch):
+def a_step_that_fits_once_its_delta_rule_recomputes_its_memory_plans_at_that_rung(monkeypatch):
     """With room for four microbatches when a delta rule recomputes its memory alone, which no
-    recomputation needs more than, the plan is four at that half rung: no plan splits the batch further
-    at a rung where the half rung fits it, and the search asks each split there after it misses. The
-    decoder's delta rule holds a share of the step the half rung saves (`HALVED`), which the cell checks
-    first. The delta rule runs its port (`port_support.row_names_port`), whatever the generation's row
-    names: the half rung recomputes the memory the port names (`checkpoint_name`), and the portable route,
-    an A10's, names none."""
-    half = "all_but_delta_memory"
+    recomputation needs more than, the plan is four at that rung ('all_but_delta_memory', the ladder's
+    first above none): the search finds it bisecting the ladder, no compile asked twice. The decoder's
+    delta rule holds a share of the step the rung saves (`HALVED`), which the cell checks first. The delta
+    rule runs its port (`port_support.row_names_port`), whatever the generation's row names: the rung
+    recomputes the memory the port names (`checkpoint_name`), and the portable route, an A10's, names
+    none."""
+    rung = "all_but_delta_memory"
     with row_names_port("gated_delta_rule", "fla"):
         def measured(**fields) -> int:
             trainer = lm(split=4, **HALVED, **fields)
             return needs(monkeypatch, trainer, lambda: trained(trainer, steps=0, batch=HALVED_BATCH))
 
-        room = measured(remat=half)
-        assert room < measured(), "the half rung saves memory at four microbatches"
+        room = measured(remat=rung)
+        assert room < measured(), "the rung saves memory at four microbatches"
         free(monkeypatch, room)
         trainer = lm(**HALVED)
         state, _, _ = trainer.place()
         trials = Trials(state, HALVED_BATCH)
         trainer.compile(state, HALVED_BATCH, trials)
-        assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
-    assert trainer.objective.model.remat == REMAT_POLICIES[half]
-    assert_searched(asked(trainer), (4, half), half=half)
+    assert trainer.objective.model.remat == REMAT_POLICIES[rung]
+    assert_searched(trainer, (4, rung))
 
 
 def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypatch):
@@ -1169,15 +1176,15 @@ def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypat
     assert "frontier" not in trainer.plan
 
 
-def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monkeypatch):
-    """Without a delta rule no rung is a half rung: the search asks the batch whole and the splits that
-    find the fewest microbatches that fit, each at no recomputation, and stops there."""
+def test_a_decoder_that_fits_split_asks_its_splits_at_no_recomputation(monkeypatch):
+    """A step that fits at four microbatches with no recomputation: the search asks the batch whole and
+    the splits its misses compute, each at no recomputation, and stops there."""
     free(monkeypatch, needs(monkeypatch, lm(split=4)))
     trainer = lm()
     state, _, _ = trainer.place()
     trials = Trials(state, BATCH)
     trainer.compile(state, BATCH, trials)
-    assert_searched(asked(trainer), (4, None))
+    assert_searched(trainer, (4, None))
     assert all(remat is None for _, remat, _ in asked(trainer))
 
 
@@ -1423,3 +1430,53 @@ def test_a_run_that_sets_its_remat_compiles_its_step_once(monkeypatch, tmp_path)
     assert compiles.count == 1
     assert [probe["remat"] for probe in trainer.plan["probes"]] == ["full"]
     assert trainer.plan["remat"] == "full" and trainer.objective.model.remat == REMAT_POLICIES["full"]
+
+
+LONG = 64
+"""Rows of 64 tokens: a four-layer decoder's activations, which recomputation frees, outweigh its state."""
+LONG_BATCH = {"text": jnp.asarray((np.arange(ROWS * (LONG + 1)).reshape(ROWS, LONG + 1) * 7) % 64, jnp.int32)}
+
+
+def lowered_and_compiled(run: Callable[[], object]) -> tuple[int, int]:
+    """How many times `run` lowered the step (JAX's lowering of `jit(step)`) and compiled it (`Compiles`)."""
+    lowered = []
+
+    def lowering(event, seconds, *, fun_name=None, **_):
+        if event == "/jax/core/compile/jaxpr_to_mlir_module_duration" and fun_name == "jit(step)":
+            lowered.append(seconds)
+
+    jax.monitoring.register_event_duration_secs_listener(lowering)
+    try:
+        with Compiles("step") as compiles:
+            run()
+    finally:
+        jax.monitoring.unregister_event_duration_listener(lowering)
+    return len(lowered), compiles.count
+
+
+@pytest.mark.parametrize("stated", [False, True], ids=["planned", "remat-stated"])
+def test_a_fit_whose_step_fits_only_recomputing_searches_it_once_and_compiles_its_plan_once(monkeypatch,
+                                                                                           stated):
+    """A 9B decision run's start on two H100s (2026-11-14), and on four (11-15): a step no
+    recomputation fits, and 'minimal' does, with room for the state beside it. A fit searches its step
+    once, before its state is placed, and its first compile takes that plan: each candidate the search
+    asked is lowered once and compiled once, and the plan's executable, compiled once, is the step the
+    run takes. It searched twice, the second time from the ladder's foot over the placed state, every
+    candidate lowered again (seven candidates, fourteen lowerings; the 9B run's 18 compiles, 71 minutes). A
+    run that states the rung its search ends on lowers and compiles its step once."""
+    fields = {"seq": LONG, "width": 32, "layers": 4, "split": 4}
+
+    def measured(**more) -> int:
+        trainer = lm(**fields, **more)
+        return needs(monkeypatch, trainer, lambda: trained(trainer, steps=0, batch=LONG_BATCH))
+
+    recomputing, whole = measured(remat=REMAT_POLICIES["minimal"]), measured()
+    free(monkeypatch, (recomputing + whole) // 2)
+    trainer = lm(**fields, **({"remat": REMAT_POLICIES["minimal"]} if stated else {}))
+    data = Pipeline(Memory({"text": np.asarray(LONG_BATCH["text"])})).repeat().batch(ROWS)
+    lowered, compiled = lowered_and_compiled(lambda: trainer.fit(data, steps=1))
+    probes = trainer.plan["probes"]
+    assert trainer.plan["remat"] is not None and probes[-1]["fits"]
+    assert lowered == compiled == len(probes) == (1 if stated else len(probes)), (lowered, compiled, probes)
+    if not stated:
+        assert probes[0]["remat"] is None and not probes[0]["fits"]

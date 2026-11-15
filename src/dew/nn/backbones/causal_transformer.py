@@ -2363,15 +2363,6 @@ class CausalTransformer(LinearProducts):
         return self.clone(remat=REMAT_POLICIES['minimal_offloaded'])
 
     @nn.nowrap
-    def recompute_half(self) -> Self | None:
-        """The decoder one rung up where that rung recomputes only the residuals it names
-        (`RematPolicy.recompute`, a delta rule's memory), else None."""
-        stronger = self.recompute_more()
-        if stronger is None or stronger.remat is None or not stronger.remat.recompute:
-            return None
-        return stronger
-
-    @nn.nowrap
     def marked_residuals(self) -> frozenset[str]:
         """The `RESIDUALS` this decoder's layers can mark: each layer's mixer kind's
         (`MixerBase.marks`, every name where a kind does not say) and, where a layer, its

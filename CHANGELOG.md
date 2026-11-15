@@ -7,6 +7,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A fit searches its step's plan once: the search made before the state is placed keeps the plan it finds
+  even where candidates missed on the way, and the run's first compile takes it, its executable compiled
+  once, where a second search from the ladder's foot over the placed state lowered every candidate again
+  (and on a GPU compiled several again): a 9B decision run on two H100s compiled its step 18 times, 71
+  minutes, before its first step. Where no split fits at the step's own rung the search bisects the remat
+  rungs instead of climbing them one compile a rung, then asks the head rungs of the remat rung it finds
+  in the climb's order; the half rung that a split's miss once compiled at the same split is gone. The loss's shape-only trace runs once a split and rung.
+
 - A run handed a step file compiled without its GPU kind's tuned choices (`AheadOfTime.tuned` false: one
   compiled on compile-only GPUs outside a prepare) no longer runs it: it compiles its step on its own
   devices as a run without a file does, keeps their tuned choices beside its compilation cache, and says

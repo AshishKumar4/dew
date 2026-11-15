@@ -570,8 +570,11 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
     with chosen(narrow_copies='on'):
         run.fit(stream, steps=2)
+    # It trains without its copies, at its own rung: dropping them freed what it was short, and nothing is
+    # recomputed for it.
     probes = run.plan["probes"]
-    assert [(probe["narrow"], probe["fits"]) for probe in probes] == [(True, False), (False, True)]
+    assert run.plan["narrow"] is False and probes[-1]["fits"] is True
+    assert run.plan["remat"] == probes[0]["remat"] and not probes[0]["fits"]
     # A pool grown to the state's size, half of it one free block, whose limit holds the state and the step
     # with its copies in all, the step in what the pool can still take: a fresh GH200 4B run's (M-MC-3m).
     # The step is planned before the state is placed on the pool's bytes in all, not on its largest block,
@@ -583,8 +586,7 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     run, _ = built()
     with chosen(narrow_copies='on'), Compiles("step") as steps:
         run.fit(stream, steps=2)
-    assert [(probe["narrow"], probe["fits"]) for probe in run.plan["probes"]] == [(True, True)]
-    assert steps.count == 1
+    assert run.plan["narrow"] is True and steps.count == 1
     # What it placed beside the step's temporaries counts the state it was planned before placing.
     assert run.plan["probes"][0]["beside"] >= state
 
@@ -665,13 +667,19 @@ def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_only_where_dropping_t
     free -= max(base["headroom"], trained(copies=False)[2].plan["probes"][0]["headroom"]) + 1
     state, _, trainer = trained(copies=True)
     probes, plan = trainer.plan["probes"], trainer.plan
-    assert [(probe["narrow"], probe["fits"]) for probe in probes[:2]] == [(True, False), (False, False)]
     rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults")
-    planned = {key: plan[key] for key in rung}
-    last = probes[-1]
-    kept = probes[1]["headroom"] <= probes[0]["headroom"]
-    assert planned != {key: base[key] for key in rung}
-    assert {key: last[key] for key in rung} == planned and (last["narrow"], last["fits"]) == (kept, True)
+    at_base = {key: base[key] for key in rung}
+    # Its own rung, with its copies and without them, both short: what dropping them freed, before any
+    # recomputation was asked.
+    own = {probe["narrow"]: probe for probe in probes if {key: probe[key] for key in rung} == at_base}
+    with_copies, without = own[True], own[False]
+    assert not with_copies["fits"] and not without["fits"]
+    recomputing = [index for index, probe in enumerate(probes) if probe["remat"] != base["remat"]]
+    assert probes.index(without) < min(recomputing)
+    # The plan, a rung above, holds them dropped where dropping them left the step less short, and back where
+    # it did not, and the run trains on the plan it found.
+    kept = without["headroom"] <= with_copies["headroom"]
+    assert {key: plan[key] for key in rung} != at_base and probes[-1]["fits"] is True
     assert plan["narrow"] is kept and (state.compute is None) is not kept
 
 
