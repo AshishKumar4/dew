@@ -221,11 +221,12 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) 
 
 def _data(value, at: str) -> JSON | None:
     """An array or a scalar of NumPy's, a float, a complex, bytes or a dtype by its type and bits: an
-    array or a NumPy scalar (a 0-d array, as a trace makes it) by its fingerprint
-    (`_hashing.array_fingerprint`: its dtype, shape and bytes), a float by its bits. One whose storage holds
-    pointers (an array of objects, a structured scalar with an object field) is refused as that fingerprint
-    refuses it: its bytes stay the same when what it points to changes. None for a value that is none of
-    them."""
+    array or a NumPy scalar by its kind and its fingerprint (`_hashing.array_fingerprint`: its dtype, shape
+    and bytes), a float by its bits. A scalar and a 0-d array of one value fingerprint alike, and a trace
+    may branch on which it holds, so each keeps its own tag: nested in a record no type field beside it
+    tells them apart. One whose storage holds pointers (an array of objects, a structured scalar with an
+    object field) is refused as that fingerprint refuses it: its bytes stay the same when what it points to
+    changes. None for a value that is none of them."""
     # NumPy's scalars first: several are subclasses of Python's own (a float64 is a float).
     if isinstance(value, np.generic | np.ndarray):
         hasher = hashlib.sha256()
@@ -233,7 +234,7 @@ def _data(value, at: str) -> JSON | None:
             _hashing.array_fingerprint(hasher, np.asarray(value))
         except TypeError as refusal:
             raise Unestablished(f"{at}: {refusal}") from None
-        return ["array", hasher.hexdigest()]
+        return ["scalar" if isinstance(value, np.generic) else "array", hasher.hexdigest()]
     if type(value) is float:
         return ["float", value.hex()]
     if type(value) is complex:

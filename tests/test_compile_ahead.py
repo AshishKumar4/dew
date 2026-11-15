@@ -361,6 +361,35 @@ def test_a_kept_program_that_is_not_its_calls_is_found_by_verifying(tmp_path):
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
+class Factor:
+    """A static argument whose field holds a NumPy scalar or a 0-d array of one value."""
+    value: np.generic | np.ndarray
+
+
+def by_factor_kind(held: Factor, values: jax.Array) -> jax.Array:
+    """`values` twice where the static argument holds a scalar, three times where it holds an array."""
+    return values * (2 if isinstance(held.value, np.generic) else 3)
+
+
+def test_a_program_kept_over_a_numpy_scalar_is_not_handed_for_a_0d_array_of_its_value(tmp_path):
+    """A static argument's record holding `np.float32(1)` and one holding `np.array(1, np.float32)` state
+    the same bytes, and a trace may branch on which it holds: a program kept over the scalar is not handed
+    to a call over the array, which runs its own trace (main gave the scalar's executable back, 2 * x for
+    3 * x)."""
+    from dew.nn.kernels.options import owned_program
+    from dew.training.ahead import keeping, kept
+
+    values = jnp.ones(3)
+    path = tmp_path / "programs.dew-aot"
+    fresh = functools.partial(owned_program, by_factor_kind, static_argnums=(0,))
+    with keeping() as programs:
+        assert fresh()(Factor(np.float32(1)), values).tolist() == [2.0] * 3
+    programs.save(path)
+    with kept(path):
+        assert fresh()(Factor(np.array(1, np.float32)), values).tolist() == [3.0] * 3
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
 class Scales:
     """A static argument whose field holds dictionaries through NumPy's storage of pointers."""
     table: np.ndarray | np.void
