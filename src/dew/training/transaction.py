@@ -63,7 +63,7 @@ from dew.objectives.base import (
 )
 from dew.objectives.routing import refuse_fixed_routers
 from dew.optim import clips_qk, post_step_order, stepped
-from dew.state import Accumulation, TokenCount, TrainState, apart, occupancy, together
+from dew.state import Accumulation, ReplicaState, TokenCount, TrainState, apart, occupancy, together
 from dew.training.distributed import microbatch
 from dew.training.inspection import Inspection, Summaries, stacked, summaries
 from dew.training.model_flops import step_counts
@@ -511,10 +511,11 @@ def _descending(gradient: jax.Array, parameter: jax.Array) -> jax.Array:
     return (jnp.conj(gradient) if jnp.iscomplexobj(gradient) else gradient).astype(parameter.dtype)
 
 
-def checked(state: TrainState) -> dict[str, Variables | optax.OptState | None]:
-    """The trees of `state` a finite step keeps finite and a save refuses non-finite: the parameters, the
-    optimizer state and the averages. The one statement of them, which the step's acceptance
-    (`finish_attempt`) and a save's refusal (`dew.training.trainer.refuse_non_finite`) read."""
+def checked(state: TrainState | ReplicaState) -> dict[str, Variables | optax.OptState | None]:
+    """The trees of `state` (a run's, or DiLoCo's replicas' inner copies) a finite step keeps finite and a
+    save refuses non-finite: the parameters, the optimizer state and the averages. The one statement of
+    them, which the step's acceptance (`finish_attempt`) and a save's refusal
+    (`dew.training.trainer.refuse_non_finite`) read."""
     return {"variables": state.variables, "opt_state": state.opt_state, "ema": state.ema}
 
 
@@ -553,8 +554,8 @@ def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
                 flags[index] = bool(program(_finite)(fetched(leaf, leaf.sharding)))
             continue
         read = jax.device_get(program(_finite_each)([leaves[index] for index in members]))
-        for index, flag in zip(members, read, strict=True):
-            flags[index] = bool(flag)
+        for index, finite in zip(members, read, strict=True):
+            flags[index] = bool(finite)
     return flags
 
 
