@@ -1219,6 +1219,7 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
 
     fields: dict[str, tuple[str, ...]] = {}
     bounds: dict[str, int] = {}
+    laid: dict[str, bool] = {}
     unseen = False
 
     def declare(pack: Pack, most: int | None) -> None:
@@ -1226,6 +1227,8 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
         fields[ids] = tuple(dict.fromkeys((*fields.get(ids, ()), *pack.fields)))
         bound = pack.seq_len if most is None else max(1, min(pack.seq_len, most))
         bounds[ids] = max(bounds.get(ids, 0), bound)
+        # A field's windows laid out by the read unless a pack of it says its objective lays them out.
+        laid[ids] = laid.get(ids, True) and pack.laid_out
 
     def walk(pipeline: Pipeline, *, packed: bool) -> None:
         nonlocal unseen
@@ -1253,7 +1256,8 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
 
     for pipeline in pipelines:
         walk(pipeline, packed=False)
-    return tuple(Coordinated(fields[ids], None if unseen else bound) for ids, bound in bounds.items())
+    return tuple(Coordinated(fields[ids], None if unseen else bound, laid[ids])
+                 for ids, bound in bounds.items())
 
 
 def _held_coordinated(validation: Pipeline, training: tuple[Coordinated, ...]) -> tuple[Coordinated, ...]:
@@ -1262,7 +1266,8 @@ def _held_coordinated(validation: Pipeline, training: tuple[Coordinated, ...]) -
     validation source may hold packed windows whose packing it does not show."""
     held = _coordinated(validation)
     declared = {step.fields[0] for step in held}
-    return held + tuple(Coordinated(step.fields, None) for step in training if step.fields[0] not in declared)
+    return held + tuple(Coordinated(step.fields, None, step.laid_out) for step in training
+                        if step.fields[0] not in declared)
 
 
 def _floor(pipeline: Pipeline, at: int, pack: Pack) -> int | None:

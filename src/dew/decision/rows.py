@@ -786,7 +786,7 @@ def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, g
               *(("streams",) if streamed else ()), *(("forked",) if forked else ()),
               *(("forked_parents",) if chained else ()),
               *(("row",) if grouped else ()))
-    return Pack(layout.max_len, fields, segments=bounds.segments, along=along)
+    return Pack(layout.max_len, fields, segments=bounds.segments, along=along, laid_out=False)
 
 
 def _rows(batch: Batch, spans_in_context: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

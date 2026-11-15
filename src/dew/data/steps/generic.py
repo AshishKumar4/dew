@@ -72,10 +72,12 @@ class Coordinated(grain.MapTransform):
     None (static, so a compiled step is specialized to it). A window holding
     more than its read declared is refused, which a sequence kernel would run
     into its neighbours' sequences. `ids` is the packed ids field, the first
-    of `fields`."""
+    of `fields`. A read whose objective lays its windows out itself (`Pack.laid_out` false: a decision's
+    rows) states their bound alone (`dew.batch.SegmentBound`), as `<ids>_bound`."""
 
     fields: tuple[str, ...]
     max_segments: int | None
+    laid_out: bool = True
 
     def map(self, element: Batch) -> Batch:
         from dew.batch import SegmentBound, coordinates
@@ -90,10 +92,12 @@ class Coordinated(grain.MapTransform):
             raise ValueError(f"a packed {ids} window holds {held} documents, past the {self.max_segments} "
                              "its read declares (Coordinates.max_segments)")
         packing = {f"{field}_{part}" for field in self.fields for part in ("segment_ids", "positions")}
-        if f"{ids}_positions" not in element:
-            # A read whose consumer lays its rows out itself states the bound alone (`SegmentBound`).
+        if not self.laid_out:
             return {**{name: value for name, value in element.items() if name not in packing},
                     f"{ids}_bound": SegmentBound(self.max_segments)}
+        if f"{ids}_positions" not in element:
+            raise ValueError(f"a packed {ids} window holds its segment ids and no positions, which its "
+                             "model's coordinates are laid out by")
         laid = coordinates(segments=segments, positions=element[f"{ids}_positions"],
                            max_segments=self.max_segments, right_padded=True, xp=np)
         return {**{name: value for name, value in element.items() if name not in packing},

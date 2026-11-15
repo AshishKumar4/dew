@@ -810,6 +810,12 @@ class Pack:
     segments: int | None = None
     along: tuple[tuple[str, int], ...] = ()
     overlap: int = 0
+    laid_out: bool = dataclasses.field(default=True, metadata={ADDED: True})
+    """Whether a read lays each window's documents out as its model reads them, on the host
+    (`dew.data.steps.generic.Coordinated`, `Coordinates`); False where the objective's own packed steps lay
+    them out (a decision's rows, `dew.decision.rows.PackedRows`), the read stating their bound alone
+    (`dew.batch.SegmentBound`). Added since runs were saved, so a pack that lays them out records as it
+    did."""
 
     @property
     def packed(self) -> tuple[str, ...]:
