@@ -558,6 +558,23 @@ def _retired_rate(tree) -> bool:
     return isinstance(tree, list | tuple) and any(_retired_rate(value) for value in tree)
 
 
+def _written(state_tree: Mapping[str, StateLeaf], placed: Mapping[str, str]) -> Mapping[str, StateLeaf]:
+    """`state_tree` without the arrays a local step did not write (`placed`, its leaves' `placement` by
+    path): leaves a restore's template holds made, which the restore keeps as they are (`restore`), so
+    where they lie is no step's (row 5628)."""
+    def kept(path: jax.tree_util.KeyPath, leaf):
+        unwritten = isinstance(leaf, jax.Array) and jax.tree_util.keystr(path) not in placed
+        return None if unwritten else leaf
+
+    return jax.tree_util.tree_map_with_path(kept, dict(state_tree))
+
+
+def _merged(written: Mapping[str, StateLeaf], whole: Mapping[str, StateLeaf]) -> dict:
+    """`written` (`_written`'s, a leaf the step never wrote None) with each such leaf `whole`'s."""
+    return jax.tree.map(lambda leaf, given: given if leaf is None else leaf, dict(written), dict(whole),
+                        is_leaf=lambda leaf: leaf is None)
+
+
 def _check_template(template, metadata, stored, *, mapping: bool) -> None:
     """Refuse a train-state template the checkpoint at hand cannot fill.
 
@@ -2208,22 +2225,24 @@ class Checkpoints:
         """Refuse a pool's local step written for another placement of the state: each process holds its
         own shards of it, so another placement would read a shard no process's directory holds. A step one
         process wrote holds every shard in its directory, and restores onto any placement of this one
-        process's devices (its host's included: `variables(on_host=True)`)."""
+        process's devices (its host's included: `variables(on_host=True)`). Only the leaves the step wrote
+        are read from it: a leaf the template holds made, which the step lacks (a scheduled solver's
+        horizons, of a step written before a state held them), is kept where it is (row 5628)."""
         with region("checkpoint.validate"):
             written = self._open_local().metadata(step).custom_metadata or {}
             processes = written.get('processes')
             if processes == jax.process_count() == 1:
                 return
-            wanted = placement(state_tree)
-            moved = [path for path in wanted if written.get('placement', {}).get(path) != wanted[path]]
+            placed = self._placement(step)
+            wanted = placement(_written(state_tree, placed))
+            moved = [path for path in wanted if placed.get(path) != wanted[path]]
             if processes == jax.process_count() and not moved:
                 return
             if processes != jax.process_count():
                 difference = (f"written by {counted_processes(processes or 0)}, and this run has "
                               f"{counted_processes(jax.process_count())}")
             else:
-                difference = (f"written with {moved[0]} placed as "
-                              f"{written.get('placement', {}).get(moved[0])}, and this run "
+                difference = (f"written with {moved[0]} placed as {placed.get(moved[0])}, and this run "
                               f"places it as {wanted[moved[0]]}")
             raise ValueError(
                 f"The local checkpoint at {self.local_path} holds step {step} {difference}; "
@@ -2249,8 +2268,15 @@ class Checkpoints:
             if _at(checked, path) is not None:
                 checked = _with(checked, path, _plane_template(_at(checked, path), planes)[0])
         _refuse_reshaped(checked, metadata, where)
-        # A key's zeros typed as its holders' read is (`_placed`), so the replicas recover one key alike.
-        return _placed(jax.tree.map(_zeros, state_tree), state_tree, _keys(snapshot)), held
+        # A key's zeros typed as its holders' read is (`_placed`), so the replicas recover one key alike; a
+        # leaf the step never wrote, which the template holds made, is kept as made (`_written`).
+        written = _written(state_tree, self._placement(step))
+        zeros = _placed(jax.tree.map(_zeros, written), written, _keys(snapshot))
+        return _merged(zeros, state_tree), held
+
+    def _placement(self, step: int) -> Mapping[str, str]:
+        """Where local `step`'s writer placed each leaf it wrote (`placement`), by its path."""
+        return (self._step_metadata(step, local=True).custom_metadata or {}).get('placement', {})
 
     def _recovered(self, step: int, restored: dict, *, positioned: bool) -> dict:
         """`restored`, local `step` as each process read it, each shard the first holder's where some
@@ -2261,7 +2287,8 @@ class Checkpoints:
             return restored
         _, holders, grid = recovery
         table = restored.pop('position', None)
-        restored = _from_replicas(restored, grid, holders)
+        # The leaves the step wrote, from their holders; one it never wrote is each process's own as made.
+        restored = _merged(_from_replicas(_written(restored, self._placement(step)), grid, holders), restored)
         if positioned:
             restored['position'] = _from_table_record(self._from_holder(
                 holders, lambda: _table_record(jax.tree.map(np.asarray, dict(table or {})))))
@@ -2269,11 +2296,12 @@ class Checkpoints:
 
     def _check_recovered(self, step: int, state_tree: Mapping[str, StateLeaf]) -> None:
         """Refuse a local step this process lost where this run places the state otherwise than the
-        processes holding it wrote it: its replicas hold the shards of that placement alone."""
+        processes holding it wrote it: its replicas hold the shards of that placement alone. A leaf the
+        template holds made, which the step lacks, every process holds as made (`_written`)."""
         recovery = self._recovery
         written = (self._step_metadata(step, local=True).custom_metadata or {})
         if recovery is not None and written.get('processes') == jax.process_count() and (
-                Grid.of(state_tree) == recovery[2]):
+                Grid.of(_written(state_tree, self._placement(step))) == recovery[2]):
             return
         raise ValueError(
             f"This process lost its copy of local step {step}, which the processes "

@@ -267,10 +267,11 @@ def test_a_deviceless_compile_stores_nothing_a_device_run_reads(tmp_path):
     (MC-UNTUNEDKEY4-post94-f74e55896, MC-UNTUNEDKEY4-post95-16d207cc1), so a JAX that loses that key turns
     this red."""
     (tmp_path / "aliased.py").write_text(ALIASED)
-    # None of this process's JAX or XLA settings handed down (a lane's name its own tuning and cache), as a
-    # user's process runs.
+    # None of this process's JAX settings or XLA flags handed down (a lane's name its own tuning and cache),
+    # as a user's process runs; its client's memory settings kept (`XLA_PYTHON_CLIENT_*`: a packed job's
+    # share of a GPU others share).
     environment = {name: value for name, value in environment_of(tmp_path).items()
-                   if not name.startswith(("JAX_", "XLA_"))}
+                   if not name.startswith("JAX_") and name != "XLA_FLAGS"}
     cache, topology = str(tmp_path / "cache"), str(tmp_path / "topology.bin")
 
     def ran(mode: str, *arguments: str, **variables: str) -> dict:

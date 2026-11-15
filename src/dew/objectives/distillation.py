@@ -82,7 +82,8 @@ FeatureLoss = Literal["cosine", "l2"]
 
 
 def _schedule(value: Weight) -> optax.Schedule:
-    """Wrap a constant as the step-indexed schedule every weight is read as."""
+    """A weight as the step-indexed schedule its loss reads: a constant as one that holds it, a schedule as
+    itself. The objective holds each as given, so a constant is the value its trace key states."""
     # MaxText's anneals: distillation_utils.py:165-194.
     return value if callable(value) else optax.constant_schedule(value)
 
@@ -178,7 +179,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
                                  "temperature above 0, beta at least 0")
         self.student = student
         self.teacher = teacher
-        self.alpha, self.temperature, self.beta = _schedule(alpha), _schedule(temperature), _schedule(beta)
+        self.alpha, self.temperature, self.beta = alpha, temperature, beta
         self.features = tuple((teacher_layer, student_layer) for teacher_layer, student_layer in features)
         if not self.features and beta:
             raise ValueError(
@@ -368,7 +369,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         statistics, aux, student, teacher = self._predictions(variables, batch, step)
         # The terms' dtype: the losses', at least fp32, so a float64 run keeps float64 throughout.
         dtype = at_least_fp32(jnp.result_type(student.losses, teacher.losses))
-        alpha, temperature, beta = (jnp.asarray(schedule(step.step), dtype) for schedule in
+        alpha, temperature, beta = (jnp.asarray(_schedule(weight)(step.step), dtype) for weight in
                                     (self.alpha, self.temperature, self.beta))
         # Every term is summed with the student's weights and divided by its
         # mass, the teacher's reported loss included (MaxText's

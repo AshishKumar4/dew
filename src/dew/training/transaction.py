@@ -33,7 +33,7 @@ from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, FROZEN, Batch, Variables, dicts, leaves_by_path, merge
 from dew.data.dataset import rows_of
 from dew.gauss_newton import solves_equations
-from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
+from dew.held_updates import holds_back, holds_state, input_taken, refuse_untold, update_applied
 from dew.nn import in_backward
 from dew.nn.inspection import (
     PROBES,
@@ -266,12 +266,23 @@ def optimizer_update(optimizer: optax.GradientTransformation, gradient, opt_stat
     it (`Transaction.commit`) and as the planner traces it (`leaf_local`): an update taking extra arguments
     is handed the attention logits' maxima (`qk`), the run's `progress` where it has one (a run bounded in
     examples), and its loss's `statistics` only where it solves the update's system
-    (`dew.gauss_newton`)."""
-    if not isinstance(optimizer, optax.GradientTransformationExtraArgs):
-        return optimizer.update(gradient, opt_state, params)
+    (`dew.gauss_newton`). An update its type declares to take none, a plain transformation wrapping the
+    clip, is handed the logits' maxima where its state holds a QK-Clip, which reads the step's own and
+    would otherwise step unclipped (row 6552); never the statistics, so a solver in it refuses
+    (`dew.gauss_newton`) rather than solve one step's system for the window's update. A QK-Clip inside an
+    accumulating wrapper (`optax.MultiSteps`) is refused as the step traces: the wrapper hands its inner
+    update one step's maxima at the window's end, where the window's update trained on every step's; the
+    trainer's own accumulation (`Trainer(accumulation=k)`) pools them."""
+    if clips_qk(opt_state) and holds_state(opt_state, optax.MultiStepsState):
+        raise ValueError("a QK-Clip inside optax.MultiSteps would be handed its window's last step's "
+                         "attention logit maxima alone, not every step's its update trained on: accumulate "
+                         "with the trainer (`Trainer(accumulation=k)`), which pools them")
     clocked = {} if progress is None else {"progress": progress}
-    solved = {"statistics": statistics} if solves_equations(opt_state) else {}
-    return optimizer.update(gradient, opt_state, params, qk_stats=qk, **solved, **clocked)
+    if isinstance(optimizer, optax.GradientTransformationExtraArgs):
+        solved = {"statistics": statistics} if solves_equations(opt_state) else {}
+        return optimizer.update(gradient, opt_state, params, qk_stats=qk, **solved, **clocked)
+    clipped = {"qk_stats": qk} if clips_qk(opt_state) else {}
+    return optimizer.update(gradient, opt_state, params, **clipped)
 
 
 def leaf_local(optimizer: optax.GradientTransformation, gradients, state, *, progressed: bool) -> bool:

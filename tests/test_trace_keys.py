@@ -112,11 +112,11 @@ class Other:
     name: str
 
 
-KEYLESS = frozenset({"diffusion", "distillation", "flow_grpo", "guidance_distillation", "ladd", "mean_flow",
-                     "rcm", "shortcut", "run diffusion"})
+KEYLESS = frozenset({"diffusion", "flow_grpo", "guidance_distillation", "ladd", "mean_flow", "rcm",
+                     "shortcut", "run diffusion"})
 """The registered objectives that state no key, so a refit of theirs traces its step again: each holds what
-states no value and no class leaves out (a diffusion process, its grid's class, a distillation's
-schedules; rows 6297 and 6303)."""
+states no value and no class leaves out (a diffusion process, its grid's class, its inputs' encoders; row
+6297)."""
 
 
 def rolled_out(name: str, batch):
@@ -327,7 +327,7 @@ def test_an_ema_of_another_decay_traces_apart_and_one_given_as_a_function_keeps_
 @pytest.mark.parametrize("kind", ["decision", "lettered", "shared"])
 def test_a_decision_runs_refit_reads_the_step_its_first_fit_traced(tmp_path, kind):
     """A decision run fitted again in the same process, its trainer and objective built anew from its
-    config, traces no step: it reads the one its first fit traced (`DecisionObjective.traced`, row 6253),
+    config, traces no step: it reads the one its first fit traced (`Objective.trace_key`, row 6253),
     over a question layout, a letter readout, and a request's questions over one copy of its state
     (`shared_for`)."""
     import run_kinds

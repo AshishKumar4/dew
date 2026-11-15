@@ -1159,7 +1159,7 @@ def later_phases[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batc
     """The data phases after the one `batch`, the run's first step's as its loop read it (its work counted
     and its rows marked, `step_batch`'s but for its host fields), was read in whose steps are other
     programs than its and each other's, each by its first phase: a phase's step is the trainer's own key of
-    the batch it delivers (`phase_batch`, `PhasePasses.key` at its pass count); none for a run of no
+    the batch it delivers (`phase_batch`, `PhasePasses.key_at` its pass count); none for a run of no
     phases. Its work is counted once, as its loop counted it: counted again, its telemetry columns were
     refused as reserved, before a 4B run's first step (M-MC-3gB)."""
     from dew.batch import PHASE
@@ -1170,7 +1170,8 @@ def later_phases[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batc
         return ()
 
     def program(phase: int) -> Hashable:
-        return batch_signature(split_fields(phase_batch(trainer, batch, phase))[0]), counts[phase]
+        delivered = split_fields(phase_batch(trainer, batch, phase))[0]
+        return trainer.phase_passes.key_at(batch_signature(delivered), counts[phase])
 
     first = batch[PHASE].index
     firsts: dict[Hashable, int] = {program(first): first}
@@ -1267,9 +1268,7 @@ def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Train
 
     phases = trainer.phase_passes.apart(passes)
     compiler = StepCompiler(phases.base, trainer._compiler.links(trainer.device_mesh), None, phases)
-    stepping = trainer._stepping(phases.base, compiler)
-    stepping = dataclasses.replace(stepping, shape=dataclasses.replace(stepping.shape,
-                                                                       split=trainer._given_split))
+    stepping = dataclasses.replace(trainer._stepping(phases.base, compiler), shape=trainer._afresh_shape())
     executables: dict = {}
     try:
         compiler._plan(stepping, state, batch, None, executables=executables)
