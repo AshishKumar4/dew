@@ -1066,15 +1066,18 @@ class Plan:
             # same records (row 3938), which an exact resume refuses and a relaxed one reads on over, naming
             # each such step (`code.<step>`).
             saved_code = _saved_code(saved, (*self.manifest.ran, *self.manifest.steps))
-            rewritten = [step.name for step, before, now in zip(
-                (*self.manifest.ran, *self.manifest.steps), saved_code, self.manifest.code(), strict=False)
-                if before is not None and before != now]
+            steps = (*self.manifest.ran, *self.manifest.steps)
+            # A position main saved for an hour (2026-11-15) holds each step's held code after its own in its
+            # code list, and no `held`: read as the two it is.
+            appended = "held" not in saved
+            rewritten = [step.name for step, before, now, held in zip(
+                steps, saved_code, self.manifest.code(), self.manifest.held(), strict=False)
+                if before is not None and before != now and not (appended and before == [*now, *held])]
             # The user's code a step runs beside its module's (`Manifest.held`), where its position holds it:
             # a position saved before it held none compares none.
             if "held" in saved:
                 saved_held = listed(saved["held"], "saved data held code", read=json_value,
                                     what="each step's held code")
-                steps = (*self.manifest.ran, *self.manifest.steps)
                 rewritten += [step.name for step, before, now in zip(steps, saved_held, self.manifest.held(),
                                                                      strict=False)
                               if before != now and step.name not in rewritten]

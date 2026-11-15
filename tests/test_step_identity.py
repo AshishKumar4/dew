@@ -249,3 +249,30 @@ def test_a_position_saved_before_held_code_resumes_an_unchanged_run_exactly(tmp_
     earlier = {**saved, "dew_data_plan": {name: value for name, value in saved["dew_data_plan"].items()
                                           if name != "held"}}
     assert resumed_changes(reader(), json.dumps(earlier).encode()) == ()
+
+
+def test_a_position_saved_with_held_code_in_its_code_list_resumes_an_unchanged_run_exactly(tmp_path,
+                                                                                         monkeypatch):
+    """A position main saved for an hour, each step's held code appended to its code list and no `held` of
+    its own, resumes an unchanged run exactly, and one whose step's code changed is refused."""
+    import json
+
+    module = tmp_path / f"shift_{uuid4().hex}.py"
+    module.write_text(SHIFT.format(by=1))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    shift = importlib.import_module(module.stem)
+
+    def reader():
+        pipeline = Pipeline(ROWS).map(Calling(shift.Shifting())).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ).train(DataPartition())
+
+    saved = json.loads(saved_after_one(reader))
+    plan = saved["dew_data_plan"]
+    appended = {name: value for name, value in plan.items() if name != "held"}
+    appended["code"] = [[*code, *held] for code, held in zip(plan["code"], plan["held"], strict=True)]
+    position = json.dumps({**saved, "dew_data_plan": appended}).encode()
+    assert resumed_changes(reader(), position) == ()
+    module.write_text(SHIFT.format(by=10))
+    importlib.reload(shift)
+    with pytest.raises(ValueError):
+        resumed_changes(reader(), position)
