@@ -1309,7 +1309,8 @@ class RunConfig:
 
         if pretrained is None or not is_saved_run(pretrained) or isinstance(self.source.step, int):
             return self
-        step = SavedRun.pinned(pretrained, self.source.step).step
+        # The step alone, from the run's records: the loader writes what it reads, where it places it.
+        step = SavedRun.selected(pretrained, self.source.step).step
         return dataclasses.replace(self, source=dataclasses.replace(self.source, step=step))
 
     def profile(self, directory: str | None = None, *, warmup: int = 20, steps: int = 10,
