@@ -83,9 +83,10 @@ def gpus(generation: str, count: int = 1, limit: int = 2**36) -> tuple:
 
 
 def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, split=1, remat=None,
-              inspection=None, tracker=None):
+              inspection=None, tracker=None, dtype: str | None = None):
     fields = {**TINY_DECODER, **({} if width is None else {"emb_features": width}),
-              **({"attention_impl": "xla"} if xla else {}), **({} if remat is None else {"remat": remat})}
+              **({"attention_impl": "xla"} if xla else {}), **({} if remat is None else {"remat": remat}),
+              **({} if dtype is None else {"dtype": dtype})}
     model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
                    layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead, inspection=inspection,
@@ -903,6 +904,25 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
                                                                              plan["head_fused"])
 
 
+def test_a_fused_tiled_head_compiles_its_offloaded_frontier(tmp_path, monkeypatch):
+    """A fused tiled head compiles its offloaded sibling and restores the admitted plan."""
+    from dew.training.ahead import compile_ahead
+    from dew.training.memory import head_fused_of, head_tile_of, recompute_record
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=650_000)), split=None, remat="full")
+    trainer.objective.tile_head()
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
+    plan = record(ahead.plan, "plan")
+    assert plan["remat"] == "full"
+    assert plan["head_fused"] and plan["head_tile"] is not None
+    assert recompute_record(trainer.objective) == plan["remat"]
+    tile = head_tile_of(trainer.objective)
+    assert tile is not None and list(tile) == plan["head_tile"]
+    assert head_fused_of(trainer.objective) == plan["head_fused"]
+    assert trainer.plan == ahead.plan
+
+
 def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can_time(monkeypatch):
     """Every program compiled for compile-only GPUs takes autotuning off at Dew's compile point
     (`report.targeted`), a step and the programs a run compiles ahead beside it alike, its programs' bytes
@@ -1109,52 +1129,55 @@ def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gp
 
 
 GATED_DELTA_AHEAD = """
-import sys
-sys.path[:0] = [f"{sys.argv[1]}/src", f"{sys.argv[1]}/tests"]
-import jax
-import optax
-from token_support import token_rows
+import dataclasses, json, sys
+from pathlib import Path
+from run_kinds import lm
+from dew.config.lm import LMRunConfig
+from dew.nn.kernels.generation import routes
+from dew.registry import ModelConfig
+from dew.training.ahead import AheadOfTime, CompiledAhead
 
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
-from dew.objectives.lm import LMObjective
-from dew.training import Layout, MeshSpec, Trainer
-from dew.nn.kernels.generation import compile_only_gpus
-from dew.training.ahead import compile_ahead
-
-mixer = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=64,
-                           linear_value_head_dim=64)
-model = CausalTransformer(vocab_size=64, emb_features=128, num_layers=1, num_heads=2, head_dim=64,
-                          mlp_features=256, max_seq_len=128, dtype="bfloat16", mixer=mixer)
-trainer = Trainer(LMObjective(model, 128), optax.adam(1e-3), key=jax.random.key(0),
-                  mesh=MeshSpec().build(compile_only_gpus("sm80", 1, 2**35)), layout=Layout(min_shard=256))
-compile_ahead(trainer, token_rows(64, 2, 129))
+root = Path(sys.argv[1])
+model = ModelConfig("causal_transformer", {
+    "emb_features": 128, "num_layers": 1, "num_heads": 2, "head_dim": 64, "mlp_features": 256,
+    "dtype": "bfloat16", "layer_types": ["linear_attention"], "kinds": {"linear_attention": {"mixer": {
+        "class": "gated_delta_net", "fields": {"linear_num_key_heads": 2, "linear_num_value_heads": 2,
+                                               "linear_key_head_dim": 64, "linear_value_head_dim": 64}}}}})
+run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(root / "runs"),
+                       "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm80",
+                       "--trainer.compile-ahead.devices", "1",
+                       "--trainer.compile-ahead.path", str(root / "step"),
+                       "--trainer.compile-ahead.capacity-gib", "32"],
+                      default=dataclasses.replace(lm(root, drawn=False), model=model))
+with routes() as taken:
+    try:
+        run.run()
+    except CompiledAhead as ended:
+        assert ended.code == 0
+saved = AheadOfTime.load(root / "step")
+print(json.dumps({"generation": saved.generation, "kernels": sorted({(route.choice, route.kernel)
+                                                                      for route in taken})}))
 """
-"""A bf16 gated-delta decoder's step compiled ahead for a compile-only A100, in a process of its own: its
-checkout is its argument."""
+"""A bf16 gated-delta decoder's run compiled ahead for a compile-only A100 by its command's options, as a user
+asks it, in a process of its own (`process_support.fresh`): its directory is its argument; it prints the
+saved step's generation and every kernel its routes took."""
 
 
-def test_a_gated_delta_steps_mosaic_kernels_compile_ahead_for_the_gpu_it_targets():
-    """A bf16 gated-delta decoder's step compiled ahead for a compile-only A100 (`compile_only_gpus("sm80")`)
-    lowers its Mosaic GPU kernels for the architecture its trace's abstract device states, the A100's 8.0
-    (row 3885): a mesh's abstract device stated none, so Mosaic lowered for an H100's, and its
-    `nvvm.elect.sync` failed sm80's LLVM instruction selection and aborted the process, every A100 prepare
-    of a model with a Mosaic route among them. The compile runs in a process of its own, as Mosaic compiles
-    for one capability a process (`kernel_compile.compile_mosaic_kernels`)."""
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    root = str(Path(__file__).resolve().parents[1])
-    # Its compile took 45 to 75 s on armada; past ten minutes it is stuck, not slow.
-    ran = subprocess.run([sys.executable, "-c", GATED_DELTA_AHEAD, root], capture_output=True, text=True,
-                         timeout=600, check=False)
-    assert ran.returncode == 0, ran.stderr[-3000:]
+def test_a_gated_delta_steps_mosaic_kernels_compile_ahead_for_the_gpu_it_targets(tmp_path):
+    """A bf16 gated-delta decoder's run compiled ahead for a compile-only A100 by its command
+    (`--trainer.compile-ahead.generation sm80`, rows 3916, 3977) saves a step for sm80 whose gated delta
+    rule runs its Mosaic GPU recurrence, lowered for the architecture its trace's abstract device states,
+    the A100's 8.0 (row 3885): a mesh's abstract device stated none, so Mosaic lowered for an H100's, and
+    its `nvvm.elect.sync` failed sm80's LLVM instruction selection and aborted the process, every A100
+    prepare of a model with a Mosaic route among them. A process of its own, as Mosaic compiles for one
+    capability a process (`kernel_compile.compile_mosaic_kernels`)."""
+    found = process_support.fresh(GATED_DELTA_AHEAD, str(tmp_path), platforms="cpu")
+    assert found["generation"] == "sm80"
+    assert ("gated_delta_rule", "mosaic_gpu") in {tuple(kernel) for kernel in found["kernels"]}, found
 
 
 EVERY_TEMPLATE_AHEAD = """
 import json, sys
-sys.path[:0] = [f"{sys.argv[1]}/src", f"{sys.argv[1]}/tests"]
 import jax
 import optax
 from token_support import token_rows
@@ -1174,7 +1197,7 @@ model = models.build(
         "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 64,
         "linear_value_head_dim": 64, "linear_conv_kernel_dim": 4}}}},
     mixture={"experts": 4, "top_k": 2, "layers": (1,)})
-mesh = MeshSpec(fsdp=2).build(compile_only_gpus(sys.argv[2], 2, 2**36))
+mesh = MeshSpec(fsdp=2).build(compile_only_gpus(sys.argv[1], 2, 2**36))
 trainer = Trainer(LMObjective(model, 512), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
                   layout=Layout(min_shard=256))
 with routes() as taken:
@@ -1182,8 +1205,8 @@ with routes() as taken:
 print(json.dumps({"kernels": sorted({(route.choice, route.kernel) for route in taken})}))
 """
 """A hybrid MoE decoder whose step runs every template, compiled ahead for two compile-only GPUs of a
-generation, in a process of its own: its checkout and the generation are its arguments; it prints every
-kernel its routes took."""
+generation, in a process of its own (`process_support.fresh`): the generation is its argument; it prints
+every kernel its routes took."""
 
 
 @pytest.mark.parametrize("generation", gate_generations())
@@ -1197,15 +1220,7 @@ def test_a_step_running_every_template_compiles_ahead_over_two_compile_only_gpus
     computes a constant eagerly under the step's mesh places it on devices that run nothing here and fails
     the compile ("'Executable' has no 'local_devices'": the balanced tail's walk, 6be12fce5b1; the
     algebra's masks, b520fda9c59). Its own process, as Mosaic compiles for one capability a process."""
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    root = str(Path(__file__).resolve().parents[1])
-    ran = subprocess.run([sys.executable, "-c", EVERY_TEMPLATE_AHEAD, root, generation], capture_output=True,
-                         text=True, timeout=1500, check=False)
-    assert ran.returncode == 0, ran.stderr[-3000:]
-    found = json.loads(ran.stdout.strip().splitlines()[-1])
+    found = process_support.fresh(EVERY_TEMPLATE_AHEAD, generation, platforms="cpu")
     kernels = {tuple(kernel) for kernel in found["kernels"]}
     assert {("attention", "template"), ("gated_delta_rule", "mosaic_gpu"),
             ("grouped_matmul", "mosaic")} <= kernels, kernels

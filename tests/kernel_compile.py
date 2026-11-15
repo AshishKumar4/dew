@@ -639,6 +639,10 @@ def ptxas_of(build: str) -> Path:
         raise RuntimeError(f"no {package} in this environment: the gate judges {build}'s GPUs' kernels with "
                            f"its ptxas, CUDA {release}'s")
     ptxas = Path(next(iter(found.submodule_search_locations or ()))) / "bin" / "ptxas"
+    if not ptxas.is_file():
+        # A namespace another of its wheels installs (a CUDA library's) holds no assembler.
+        raise RuntimeError(f"no ptxas in {package} here ({ptxas}): the gate judges {build}'s GPUs' kernels "
+                           f"with CUDA {release}'s")
     reported = subprocess.run([str(ptxas), "--version"], capture_output=True, text=True, check=False).stdout
     if f"release {release}," not in reported:
         version = reported.strip().splitlines()[-1] if reported.strip() else "no version"

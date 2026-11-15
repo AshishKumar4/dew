@@ -162,7 +162,8 @@ class Recorded:
     passes: list[float] = dataclasses.field(default_factory=list)
 
 
-_RECORDING: contextvars.ContextVar[tuple[Recorded, ...]] = contextvars.ContextVar("recording", default=())
+_RECORDING: contextvars.ContextVar[tuple[Recorded, ...]] = _cache.untraced(contextvars.ContextVar("recording",
+                                                                                                  default=()))
 """The `recording` scopes open in this context, innermost last."""
 
 
@@ -373,6 +374,14 @@ def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
     """Whether a compile of this process refused `op`'s launch of `arguments` at `config`: its kernel
     spilled (`compiled`). A template's legality reads it, so its derivation takes the next config."""
     return bool(spilled(op, arguments, config))
+
+
+def refused_state() -> frozenset:
+    """Every launch config this context's compiles refused (`refused`), with the kernels that spilled at it:
+    what a template's legality reads as it traces, so a trace held by its state (`dew._cache.traced_state`)
+    is traced again once a compile refuses another config."""
+    with _GUARD:
+        return frozenset(_registry().refused.items())
 
 
 def spilled(op, arguments: tokamax.BoundArguments, config: Hashable) -> frozenset[str]:
@@ -619,8 +628,11 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
         specs = [jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=placed) for shape in shapes]
 
         def pulled_back(*operands):
+            # Its outputs too, as a step reads them: dropped, the kernels writing only them were dead code
+            # to XLA and went uncertified (the 4B decision step's recurrence_output, LF-PROMO3, whose
+            # program then stepped its producer down a whole-step relowering a rung).
             out, pullback = jax.vjp(launch, *operands)
-            return pullback(jax.tree.map(_unit_cotangent, out))
+            return out, pullback(jax.tree.map(_unit_cotangent, out))
 
         lowered = owned_program(pulled_back if reverse else launch).trace(*specs).lower()
     # A Mosaic GPU kernel compiled alone is the one its program loads (Mosaic compiles a module once a

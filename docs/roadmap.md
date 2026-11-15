@@ -8,12 +8,13 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- Cached and block visibility on the template's spans. [1495, 245, 5392, 5437]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
+- Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 295, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
 - One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427, 1701, 5739]
 - The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293, 5368]
+- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 5895, 5988, 6008, 6010, 6536]
 - Inference through the templates. [3424, 3602]
 - Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5322, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 5900]
 - The kernel challenge's lessons in the templates. [5271]
@@ -24,13 +25,11 @@ This page is generated from the maintainers' findings ledger as each change land
 - Gemm.in_layer deleted; gemm's reverse mode and the plain projection call derivatives.with_gradients_formed, the one statement. [6472]
 - Kernel-templates.md section 10. [6473]
 - The contract's guard, tests/test_declared_cells_memory.py, runs over every instruction family a GPU target claims. [6474]
-- The recurrence suite's wall: every case within CI's group target. [6480, 6481, 6482, 6483, 6484, 6485, 6486, 6487, 6488, 6489, 6490, 6491, 6529, 6530, 6531, 6532, 6533, 6534]
+- The resource gate, now compiling a training case's forward with its kept memories as Mosaic.launches(backward=True) plans. [6553]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
-- Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822, 5391]
+- Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
 - Native TPU GEMM dispatch. [1560]
-- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 5895, 5988, 6008, 6010]
-- MoE transport, role-aware low precision and observability. [4515]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product. [4860]
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5278, 5327]
 - Derived resources: tiles, registers, residency and issued work. [5567]
@@ -40,6 +39,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm. [6030]
 - A Hopper kernel gradient's cluster along its output's columns. [6318]
 - Exact on every path, every edge and every derivative order. [2656]
+- MoE transport, role-aware low precision and observability. [4515]
 - The suite's wall. [5478]
 - Resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
 - Sm90 lightning attention (MiniMax-Text-01, 64 heads of 128, bf16) packed forward, the gate's two-roles variant. [6495]
@@ -48,15 +48,15 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Models and interop
 
 - Every recurrence transition and state family. [1300, 1448, 1449, 1450, 1451, 1452, 1453, 1454, 1455, 1456, 1457, 1458, 1459, 1460, 1646, 1446]
-- Saved runs carried across. [1622, 1641, 2791, 2792]
+- Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [1506, 1437]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548, 2534, 2535]
 - Looped residuals: InfiLoop on Dory. [1314]
-- Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [1506, 1437]
 - Stacks, scans and looped models. [1568]
+- Saved runs carried across. [1622, 1641, 2791, 2792]
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
-- Every nn and interop primitive, seam, contract and derivative has one owner. [5450, 5625]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
+- Every nn and interop primitive, seam, contract and derivative has one owner. [5450, 5625]
 - Prepared_embeddings sits in call_metadata.py, the per-call data beside the residual, to keep causal_transformer.py under 2500 lines. [6189]
 - Src/dew/interop/config_records.py:48-57 hand-copies PretrainedConfig().to_dict()'s field names. [6496]
 
@@ -65,36 +65,37 @@ This page is generated from the maintainers' findings ledger as each change land
 - Time to first step: the compile path's re-derivations. [5556, 5558]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
-- CI time: every test within 120 seconds. [6351, 6443]
-- Training & Data's tests on check 1. [708]
+- CI time: every test within 120 seconds. [6351]
 - XLA:CPU edges. [1591]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
-- The frontier's offloaded sibling. [6526]
 
 ## Data
 
-- Metamorphic run flows: a run equals its saved, reloaded and restarted self. [4511]
 - The diffusion kinds' starts keep no record and their refits trace again. [6297]
 - A distillation objective states no trace key, so its refits and warm starts trace their step again. [6303]
 
 ## RL and serving
 
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
-- Dory: the release qualified and its tests' oracles. [596]
 - Training and serving efficiency. [3330, 1880, 5292]
+- Dory: the release qualified and its tests' oracles. [596]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
 - A decoder computing in no dtype of its own. [6215]
 
 ## Algebra
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235, 5239]
-- Qwix's quantized convolution from its fork alone. [783]
-- Released checkpoints judged on GPUs. [1703, 1549]
-- Every model comparison on check 1. [2300, 3722, 5212]
 - Every MAINPERF measurement since 2026-11-09. [6045]
-- Reference comparisons held by derived bounds. [1719, 2094]
 - Bit-level synthesis in dew.algebra. [3733]
+- Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
+- VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
+- Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
+- Qwix's quantized convolution from its fork alone. [783]
+- Tools/layout_parity.py:816-839 keeps a second accuracy policy. [793]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
+- Released checkpoints judged on GPUs. [1703, 1549]
+- Reference comparisons held by derived bounds. [1719, 2094]
+- Every model comparison on check 1. [2300, 3722, 5212]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 
 ## Tutorials and docs

@@ -18,7 +18,7 @@ import functools
 import inspect
 import logging
 import os
-from collections.abc import Callable, Hashable, Iterator, Mapping
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -1225,6 +1225,16 @@ def routes(*, alone: bool = False) -> Iterator[list[Route]]:
     enclosing = () if alone else _cache.KERNEL_ROUTES.value
     with _cache.KERNEL_ROUTES((*enclosing, collected)):
         yield collected.found
+
+
+def reported(found: Sequence[Route]) -> None:
+    """Report `found`, routes a trace's dispatches reported, to every open `routes` block, as each of its
+    dispatches did (`route`): a trace held and reused (`dew.algebra.fusion`'s regions) reports the routes it
+    took where its program is written."""
+    from dew import _cache
+
+    for collected in _cache.KERNEL_ROUTES.value:
+        collected.found.extend(found)
 
 
 def _site() -> str:

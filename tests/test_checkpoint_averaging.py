@@ -184,7 +184,8 @@ def test_runs_trained_under_other_remat_and_dropout_average_and_other_computatio
     device and batch) and training under dropout, the other neither, average to float64's mean of their
     weights rounded to fp32: their records differ in fields that say how the model runs or trains alone
     (`dew._records.RUNS`), and the average's record is the first run's. A run that computes another model
-    of the same weights' shapes (another head count or norm) or another width is refused, by the field
+    of the same weights' shapes (another head count or norm), another width, or one trained toward another
+    masked-diffusion corruption id (`_records.TRAINS`, row 6476) is refused, by the field
     that differs (`registry.computing_differences`), each the one field it differs in. Main refused the
     first pair as another model."""
     first = trained(tmp_path / "planned", 2, adapted=False, remat="minimal", dropout_rate=0.1)
@@ -196,7 +197,7 @@ def test_runs_trained_under_other_remat_and_dropout_average_and_other_computatio
         assert np.array_equal(np.asarray(leaf), halves.astype(np.float32))
     built = average.model.build()
     assert built.dropout_rate == 0.1 and built.remat is not None
-    for name, value in (("num_heads", 4), ("norm_type", "layer"), ("mlp_features", 32)):
+    for name, value in (("num_heads", 4), ("norm_type", "layer"), ("mlp_features", 32), ("mask_token_id", 5)):
         other = trained(tmp_path / name, 1, adapted=False, **{name: value})
         with pytest.raises(ValueError):
             averaged([first, other])
