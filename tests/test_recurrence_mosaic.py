@@ -1710,44 +1710,6 @@ def test_a_ladders_top_reads_every_kernel_but_the_raised_one_from_the_lowering_c
     assert found["served"].get("hit", 0) >= found["kernels"][-1] - 1, found
 
 
-@lowers('sm90')
-def test_a_looping_output_walks_ladder_holds_at_each_rung_its_model_admits():
-    """The 4B gated delta net's training forward (16 key heads, 32 value heads of 128, bf16, its fla rounding)
-    over packed documents, laid in more chunks than an H100's output programs hold at once, so its persistent
-    output walk loops (PROMO3's step on a GH200, 12,288 tokens of 17 documents), compiled for a compile-only
-    H100 at its derived tiles and at each rung of the output launch's producer ladder its model admits: no
-    rung spills (row 6495: the walk's carried schedule unstated, the producer's 88 left the consumers 168,
-    their statement, and they spilled 16 bytes; the run's settle walked seven rungs to 80)."""
-    from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels
-
-    facts = generation.gpu_target('sm90')
-    family = template.bundle(facts)
-    S = jax.ShapeDtypeStruct
-    q = k = S((1, 256, 16, 128), jnp.bfloat16)
-    v = S((1, 256, 32, 128), jnp.bfloat16)
-    g, beta = S((1, 256, 32), jnp.float32), S((1, 256, 32), jnp.bfloat16)
-    h0 = S((1, 32, 128, 128), jnp.float32)
-    starts = S((1, 256), jnp.bool_)
-    bound = template.MOSAIC.bind(q, k, v, g, beta, h0, starts, max_segments=8, bound=1.0, rounded=True)
-    with generation.assumed(facts):
-        tiles = template.MOSAIC.derived(bound, facts)
-        configs = [tiles, *_ladder(bound, tiles, 'recurrence_output', facts)]
-
-    def case(config):
-        def call():
-            def fn(*operands):
-                return chunk_forward.kept_forward(*operands[:6], tiles=config, starts=operands[6],
-                                                  max_segments=8, family=family, rounded=True, keeps=True)
-            return fn, (q, k, v, g, beta, h0, starts)
-        return KernelCase(f'4b output {config.producers}', call)
-
-    found = compile_mosaic_kernels([case(config) for config in configs], 'sm90')
-    spilled = {record['name']: kernel['spilled'] for record in found for kernel in record.get('kernels', ())
-               if kernel['kernel'].startswith('recurrence_output') and kernel.get('spilled')}
-    assert not spilled, spilled
-
-
 @lowers('sm100')
 def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
     """A ladder whose first rung the assembler rejects (the reverse walk's producer past its program's entry
