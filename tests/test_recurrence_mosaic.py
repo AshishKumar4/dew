@@ -1835,21 +1835,21 @@ def test_a_programs_refusal_is_stored_as_its_own_configs_verdict_whatever_body_n
 @lowers('sm100')
 def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
     """A ladder whose first rung the assembler rejects (the reverse walk's producer past its program's entry
-    share, the roles' setmaxnreg moves inverted: ptxas refuses the kernel) and whose next holds: the rejected
-    rung is refused as a spilling one is, and the derivation takes the one below it, never the one
-    certification could not read (`report.certified`'s None)."""
+    share, the roles' setmaxnreg moves inverted: ptxas refuses the kernel), the template's own rungs after it:
+    the rejected rung is refused as a spilling one is, and the derivation takes the template's rung that
+    holds, never the one certification could not read (`report.certified`'s None)."""
     from dew.nn.kernels.templates import resources
 
     class PastItsTop(type(template.MOSAIC)):
         def rungs(self, ba, config):
-            for cap in (232, 128):
-                yield template._limited(config, producers=resources.Producers((('recurrence_reverse', cap),)),
-                                        residents=config.residents)
+            yield template._limited(config, producers=resources.Producers((('recurrence_reverse', 232),)),
+                                    residents=config.residents)
+            yield from super().rungs(ba, config)
 
     certified, refused = _reverse_walk_certified(PastItsTop())
-    assert [each.config.producers.of('recurrence_reverse') for each in certified] == [None, 128], certified
+    taken = [each.config.producers.of('recurrence_reverse') for each in certified]
     caps = {config.producers.of('recurrence_reverse') for config in refused}
-    assert 232 in caps and 128 not in caps, caps
+    assert 232 in caps and 232 not in taken and not certified[-1].refused, (taken, caps)
 
 
 def _named_bodies(bound, config, target: str, *, training: bool) -> dict[str, str]:
