@@ -83,9 +83,10 @@ def gpus(generation: str, count: int = 1, limit: int = 2**36) -> tuple:
 
 
 def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, split=1, remat=None,
-              inspection=None, tracker=None):
+              inspection=None, tracker=None, dtype: str | None = None):
     fields = {**TINY_DECODER, **({} if width is None else {"emb_features": width}),
-              **({"attention_impl": "xla"} if xla else {}), **({} if remat is None else {"remat": remat})}
+              **({"attention_impl": "xla"} if xla else {}), **({} if remat is None else {"remat": remat}),
+              **({} if dtype is None else {"dtype": dtype})}
     model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
                    layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead, inspection=inspection,

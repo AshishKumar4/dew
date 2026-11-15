@@ -325,7 +325,7 @@ def trained_record(record: Path, settings: Mapping[str, object], devices: int | 
     that sees `devices` CPU devices (`process_support.worker_env`), a run's device count being its
     process's, fixed as its backend opens. It writes where its trainer names (`TrainerConfig.directory`),
     its record's name and directory under those `settings` sets: a run resumed from its record its own."""
-    trainer = RunConfig.load(str(record)).trainer
+    trainer = RunConfig.load(str(record), trust=trust).trainer
     directory = dataclasses.replace(trainer, checkpoint_dir=str(settings.get(
         "trainer.checkpoint_dir", trainer.checkpoint_dir))).directory(str(settings.get("trainer.name",
                                                                                          trainer.name)))

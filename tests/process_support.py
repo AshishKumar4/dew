@@ -298,8 +298,18 @@ def worker_outputs(pool: Sequence[subprocess.Popen[str]]) -> str:
     return "\n".join(outputs)
 
 
-def stuck(pool: Sequence[subprocess.Popen[str]], what: str) -> str:
-    """Abort workers for faulthandler stacks before killing their whole sessions."""
+class Stuck(pytest.fail.Exception):
+    """A pool that did not `what` in time (`stuck`): its message every worker's output, and `exits` each
+    worker's exit status once aborted, in the pool's order, a worker's place its rank."""
+
+    def __init__(self, message: str, exits: tuple[int | None, ...]):
+        super().__init__(message)
+        self.exits = exits
+
+
+def stuck(pool: Sequence[subprocess.Popen[str]], what: str) -> Stuck:
+    """The failure of a pool that did not `what` in time, to raise: its workers aborted for their faulthandler
+    stacks before their whole sessions are killed."""
     for process in pool:
         with contextlib.suppress(ProcessLookupError):
             os.kill(process.pid, signal.SIGABRT)
@@ -310,16 +320,16 @@ def stuck(pool: Sequence[subprocess.Popen[str]], what: str) -> str:
             terminate(process)
     for process in pool:
         terminate(process)
-    return f"the pool did not {what}\n" + worker_outputs(pool)
+    return Stuck(f"the pool did not {what}\n" + worker_outputs(pool),
+                 tuple(process.returncode for process in pool))
 
 
 def report_of(process: subprocess.Popen[str], out: Path, timeout: float = 600,
               pool: Sequence[subprocess.Popen[str]] | None = None) -> dict:
     try:
         log = output(process, timeout)
-    except subprocess.TimeoutExpired:
-        pytest.fail(stuck([process] if pool is None else pool,
-                          f"let {out.name} finish within {timeout}s"))
+    except subprocess.TimeoutExpired as late:
+        raise stuck([process] if pool is None else pool, f"let {out.name} finish within {timeout}s") from late
     assert process.returncode == 0, f"{out.name} exited {process.returncode}\n{log}"
     return json.loads(out.read_text())
 
