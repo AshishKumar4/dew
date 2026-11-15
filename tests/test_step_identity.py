@@ -266,3 +266,66 @@ def test_a_position_saved_before_held_code_is_held_to_what_it_saved(tmp_path, mo
     importlib.reload(shift)
     with pytest.raises(ValueError):
         resumed_changes(reader(), position)
+
+REACHING = """import dataclasses
+
+
+def delta():
+    return {by}
+
+
+def unread():
+    return {other}
+
+
+@dataclasses.dataclass(frozen=True)
+class Reaching:
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + delta()}}
+"""
+
+
+CHILD = """import dataclasses
+
+from {base} import Base
+
+
+@dataclasses.dataclass(frozen=True)
+class Child(Base):
+    pass
+"""
+
+
+@pytest.mark.parametrize("kind", ["a helper it calls", "an inherited method"])
+def test_an_exact_resume_holds_the_code_a_steps_methods_reach(tmp_path, monkeypatch, kind):
+    """A step of the user's own class is held by the code its methods reach, not its class's text alone:
+    its `__call__` calls a module-level `delta` (`a helper it calls`), or it inherits `__call__` from a
+    base of another module of the user's that does (`an inherited method`); `delta` changed from returning
+    1 to 2, an exact resume is refused, naming the step, where the class's unchanged source let it resume
+    with other rows (the evening audit's CROSS-01 and its inherited case); a change to a function of the
+    module no method reaches (`unread`) refuses nothing (row 5862)."""
+    module = tmp_path / f"reaching_{uuid4().hex}.py"
+    module.write_text(REACHING.format(by=1, other=1))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    reaching = importlib.import_module(module.stem)
+    child = tmp_path / f"child_{uuid4().hex}.py"
+    child.write_text(CHILD.replace("{base}", module.stem).replace("Base", "Reaching"))
+    children = importlib.import_module(child.stem)
+
+    def reader(resume="exact"):
+        step = reaching.Reaching() if kind == "a helper it calls" else children.Child()
+        pipeline = Pipeline(ROWS).map(step).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
+
+    state = saved_after_one(reader)
+    module.write_text(REACHING.format(by=1, other=10))
+    importlib.reload(reaching)
+    importlib.reload(children)
+    assert resumed_changes(reader(), state) == ()
+    module.write_text(REACHING.format(by=10, other=10))
+    importlib.reload(reaching)
+    importlib.reload(children)
+    with pytest.raises(ValueError):
+        resumed_changes(reader(), state)
+    (changed,) = resumed_changes(reader("relaxed"), state)
+    assert changed.startswith("code.")

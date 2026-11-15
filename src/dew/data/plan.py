@@ -11,8 +11,10 @@ import json
 import logging
 import platform
 import re
+import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import jax
@@ -233,6 +235,11 @@ class StepIdentity:
         # part that runs code no file holds (a partial, a callable that is no dataclass, a lambda) leaves it
         # inexact, which an exact resume refuses (data.md §10).
         held, holdable = ([], True) if declared else _held_code(step, set())
+        # Each held class or function by the code its methods or body reach (`_code_digest`), where that
+        # reaches what no statement holds (`_Unheld`) leaving the step inexact.
+        reached = [_code_digest(holder) for holder in dict.fromkeys(held) if holder is not step]
+        digests = [digest for digest in reached if isinstance(digest, str)]
+        holdable = holdable and len(digests) == len(reached)
         exact = bool(declared) or (not stating and not unstable and holdable
                                    and (frozen or inspect.isfunction(step)))
         external = not module.startswith("dew.")
@@ -251,7 +258,7 @@ class StepIdentity:
             config = json.dumps(structured(step), sort_keys=True)
         code = (0,) if inspect.isfunction(step) and declared is None and modules else ()
         named = cls(name, config, exact, modules, declared, dependencies, code,
-                    tuple(_code_digest(holder) for holder in dict.fromkeys(held) if holder is not step))
+                    tuple(digests))
         if cache and not named.keyable(function=inspect.isfunction(step), external=external):
             raise ValueError(f"cache prefix step {name} needs identity='name@version'")
         return named
@@ -281,19 +288,84 @@ class StepIdentity:
         return {name: value for name, value in self.record().items() if name != "modules"}
 
 
-def _code_digest(holder: Callable | type) -> str:
-    """The digest of what `holder`'s code is (`_held`, which finds its file): a function's module's bytes
-    (row 3938), a class's own source, so an edit to its module outside it decides no rows (row 5862), or its
-    module's where Python finds no source of it apart (a class `type` made)."""
-    place = _sources.source_file(holder)
-    assert place is not None, "a holder of code has a file (`_held`)"
-    if not isinstance(holder, type):
-        return hashlib.sha256(place.read_bytes()).hexdigest()
+def _code_digest(holder: Callable | type) -> str | _Unheld:
+    """The digest of the code `holder`, a function or a class of the user's (`_held`), runs: what its body,
+    or its methods and its bases' (an inherited `__call__` among them), reach (`_reached`), so a helper they
+    call that changes changes it, and an edit to its module that nothing reached touches leaves it as it
+    was (row 5862); where that reaches a value no statement holds, what it is (`_Unheld`)."""
     try:
-        source = inspect.getsource(holder)
-    except OSError:
-        source = place.read_text()
-    return hashlib.sha256(source.encode()).hexdigest()
+        reached = _reached(holder, frozenset())
+    except _Unheld as unheld:
+        return unheld
+    return hashlib.sha256(json.dumps(reached, sort_keys=True).encode()).hexdigest()
+
+
+class _Unheld(Exception):
+    """What a step's code reaches holds a value no statement of `_reached` holds."""
+
+
+def _reached(value, walking: frozenset[int]) -> JSON:
+    """The code a function or a class of the user's runs, as plain data, by the one statement of what code
+    reads (`dew._sources`): a function by its code (its instructions, constants and names), its defaults and
+    each value its body reads (`function_reads`); a class by the members of every class of the user's it is
+    made of (`own_classes`, `members`); one met again within its own walk is itself. A value it reaches is
+    the user's code walked in turn, a module of the user's by its file's bytes (code that names it may read
+    any of it), Dew's, the standard library's or an installed distribution's by its name, which the
+    environment versions, and plain data as itself; anything else is refused (`_Unheld`)."""
+    if id(value) in walking:
+        return ["itself", value.__qualname__]
+    within = walking | {id(value)}
+    if isinstance(value, type):
+        return ["class", value.__qualname__,
+                {kind.__qualname__: {name: _reached_value(member, within) for name, member in
+                                     _sources.members(kind)} for kind in _sources.own_classes(value)}]
+    cells, read = _sources.function_reads(value)
+    return ["function", value.__qualname__, _code_statement(value.__code__),
+            _reached_value((value.__defaults__, value.__kwdefaults__), within),
+            {name: _reached_value(held, within) for name, held in sorted((cells | read).items())}]
+
+
+def _code_statement(code: types.CodeType) -> JSON:
+    """`code` as plain data: its instructions, its constants (a nested function's code by this in turn) and
+    the names it reads."""
+    constants = [_code_statement(constant) if isinstance(constant, types.CodeType) else repr(constant)
+                 for constant in code.co_consts]
+    return [code.co_code.hex(), constants, list(code.co_names)]
+
+
+def _reached_value(value, walking: frozenset[int]) -> JSON:
+    """A value a step's code reaches (`_reached`), as plain data."""
+    if value is None or isinstance(value, bool | int | float | str | bytes):
+        return [type(value).__name__, repr(value)]
+    if isinstance(value, list | tuple):
+        return [type(value).__name__, [_reached_value(entry, walking) for entry in value]]
+    if isinstance(value, Mapping):
+        entries: list[JSON] = [[repr(key), _reached_value(value[key], walking)]
+                               for key in sorted(value, key=repr)]
+        return ["mapping", entries]
+    if isinstance(value, types.ModuleType):
+        if not _sources.own_source(value.__name__):
+            return ["module", value.__name__]
+        place = vars(value).get("__file__")
+        if place is None:
+            raise _Unheld(value.__name__)
+        return ["module", value.__name__, hashlib.sha256(Path(place).read_bytes()).hexdigest()]
+    if isinstance(value, type | types.FunctionType):
+        if _sources.own_source(value.__module__) or value.__module__ == "__main__":
+            if "<lambda>" in value.__qualname__ or _sources.source_file(value) is None:
+                raise _Unheld(value.__qualname__)
+            return _reached(value, walking)
+        return ["named", value.__module__, value.__qualname__]
+    if dataclasses.is_dataclass(value):
+        return ["dataclass", _reached_value(type(value), walking),
+                [[field.name, _reached_value(getattr(value, field.name), walking)]
+                 for field in dataclasses.fields(value)]]
+    if isinstance(value, Enum):
+        return ["enum", type(value).__module__, type(value).__qualname__, value.name]
+    if callable(value) and not _sources.own_source(type(value).__module__):
+        # A library's callable (a ufunc, a builtin) by its type and name, which the environment versions.
+        return ["callable", type(value).__module__, type(value).__qualname__, repr(value)]
+    raise _Unheld(type(value).__qualname__)
 
 
 def _held(holder: Callable | type) -> tuple[list[Callable | type], bool]:
@@ -347,19 +419,12 @@ def _held_code(value, seen: set[int]) -> tuple[list[Callable | type], bool]:
         entries = value.values() if isinstance(value, Mapping) else value
         found = [_held_code(entry, seen) for entry in entries]
         return [place for files, _ in found for place in files], all(held for _, held in found)
-    if isinstance(value, _Wrapping):
+    if isinstance(value, _sources.Wrapping):
         # A wrapped function (`jax.jit`'s, `functools.wraps`') runs the code it wraps.
         return _held_code(value.__wrapped__, seen)
     files, holdable = _held(type(value))
     # An object of the user's own class that is no dataclass: its rows follow state no description holds.
     return [], not files and holdable
-
-
-@runtime_checkable
-class _Wrapping(Protocol):
-    """A function that runs another, which it names (`functools.wraps`, `jax.jit`)."""
-
-    __wrapped__: Callable
 
 
 @runtime_checkable

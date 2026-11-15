@@ -167,7 +167,7 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) 
         return ["logger", value.name]
     if isinstance(value, (types.FunctionType, type)) and _sources.own_source(value.__module__):
         return _own(value, at, known, walking)
-    if _hand_written(getattr(value, "__wrapped__", None)):
+    if _sources.hand_written(getattr(value, "__wrapped__", None)):
         # A callable that is no function and wraps one of the user's (a cache, a jitted function): what
         # it holds beside the function (its cache, its options) is its type's, which nothing here states.
         raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} wrapping a "
@@ -286,40 +286,19 @@ def _plain(key: Hashable, at: str) -> JSON:
                         "form an identity can state")
 
 
-def _names(code: types.CodeType) -> set[str]:
-    """Every name `code` and the code nested in it (a lambda, a comprehension, a local function) reads."""
-    names = set(code.co_names)
-    for constant in code.co_consts:
-        if isinstance(constant, types.CodeType):
-            names |= _names(constant)
-    return names
-
-
 def _read(function: types.FunctionType, at: str, known: Mapping[int, JSON] = _NONE_KNOWN,
           walking: frozenset[int] = frozenset()) -> JSON:
-    """What `function`'s body reads outside its arguments, as an identity states it (`stated`): the cells
-    it closed over, its defaults, and each name its code or the code nested in it reads (`_names`) that
-    its globals hold or that is a loaded module of the user's (one its body imports). A name is every use
-    of it, an attribute's among them, so more is stated than is read, never less. A trace bakes each such
+    """What `function`'s body reads outside its arguments (`dew._sources.function_reads`), as an identity
+    states it (`stated`): the cells it closed over, its defaults, and each name its code or the code nested
+    in it reads that its globals hold or that is a loaded module of the user's. A trace bakes each such
     value into its program, so one that differs is another call."""
-    code = function.__code__
     within = walking | {id(function)}
     named = function.__qualname__
-    cells = {}
-    for name, cell in zip(code.co_freevars, function.__closure__ or (), strict=True):
-        try:
-            cells[name] = cell.cell_contents
-        except ValueError:
-            # A cell nothing has filled yet: the function reads no value through it.
-            cells[name] = None
-    names = _names(code)
-    held = {name: function.__globals__[name] for name in names if name in function.__globals__}
-    imported = {name: sys.modules[name] for name in names - held.keys()
-                if name in sys.modules and _sources.own_source(name)}
+    cells, read = _sources.function_reads(function)
     return {"closure": {name: _stated(value, f"{at} ({named}'s closure, {name})", known, within)
                         for name, value in sorted(cells.items())},
             "globals": {name: _stated(value, f"{at} ({named}'s global {name})", known, within)
-                        for name, value in sorted((held | imported).items())},
+                        for name, value in sorted(read.items())},
             "defaults": _stated((function.__defaults__, function.__kwdefaults__),
                                 f"{at} ({named}'s defaults)", known, within)}
 
@@ -341,51 +320,15 @@ def _own(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) -> 
         return [*stated_name, _code(value.__code__), _read(value, at, known, walking)]
     within = walking | {id(value)}
     return [*stated_name, {held.__qualname__: _members(held, at, known, within)
-                           for held in value.__mro__ if _sources.own_source(held.__module__)}]
+                           for held in _sources.own_classes(value)}]
 
 
 def _members(held, at: str, known: Mapping[int, JSON], walking: frozenset[int]) -> JSON:
-    """What a class or a module of the user's holds, each under its name, as an identity states it
-    (`stated`): a method by the function its descriptor wraps (`_wrapped`), anything else by its value, a
-    partial or a bound method whole. Of Python's own entries (`__dict__`, `__doc__`, `__annotations__`) it
-    holds the methods the user wrote (`__call__`), which a trace runs; the rest are its machinery's, the
-    methods a dataclass makes among them, which the source states."""
-    stated_members = {}
-    for name, member in sorted(vars(held).items()):
-        member = _wrapped(member)
-        if name.startswith("__") and name.endswith("__") and not _hand_written(member):
-            continue
-        stated_members[name] = _stated(member, f"{at} ({held.__name__}.{name})", known, walking)
-    return stated_members
-
-
-def _wrapped(member):
-    """The function a class's descriptor wraps: a static or class method's, a property's getter, a cached
-    property's. Any other member is itself."""
-    if isinstance(member, (staticmethod, classmethod)):
-        return member.__func__
-    if isinstance(member, property):
-        return member.fget
-    if isinstance(member, functools.cached_property):
-        return member.func
-    return member
-
-
-def _hand_written(member) -> bool:
-    """Whether `member` is, or wraps (`__wrapped__`), a function a file of the user's own code wrote: the
-    file of the globals it was defined in, as against one made for the class (a dataclass's `__init__`,
-    whose code is no file's, and its `__repr__`, which a wrapper of Python's own holds). By its globals,
-    not the module it names: a decorator's wrapper names the module of the function it wraps."""
-    seen: set[int] = set()
-    while member is not None and id(member) not in seen:
-        seen.add(id(member))
-        if isinstance(member, types.FunctionType):
-            defined = member.__globals__
-            if (_sources.own_source(defined.get("__name__"))
-                    and member.__code__.co_filename == defined.get("__file__")):
-                return True
-        member = getattr(member, "__wrapped__", None)
-    return False
+    """What a class or a module of the user's holds, each under its name (`dew._sources.members`), as an
+    identity states it (`stated`): a method by the function its descriptor wraps, anything else by its
+    value, a partial or a bound method whole."""
+    return {name: _stated(member, f"{at} ({held.__name__}.{name})", known, walking)
+            for name, member in _sources.members(held)}
 
 
 def _module_state(module: types.ModuleType, at: str, known: Mapping[int, JSON],

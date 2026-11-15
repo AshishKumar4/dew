@@ -56,9 +56,10 @@ def streamed(
     nothing = (functools.partial(_holds_nothing, manifest, loading.threads)
                if epochs is None and manifest.counted is not None else None)
     root = _dealt(shards, seed=seed, epochs=epochs)[partition.cut()]
+    on_run = epochs is None and manifest.counted is None
     return _ShardPass(root, manifest.reader, cycle_length, loading, described, quota,
                       None if nothing is None else (nothing, 2 * len(shards)),
-                      len(shards) if epochs is None and manifest.counted is None else None)
+                      (seed is not None, len(shards)) if on_run else None)
 
 
 def _holds_nothing(manifest: ShardManifest, reads: int) -> bool:
@@ -180,11 +181,25 @@ class _ShardPass[Place](grain.IterDataset):
 
     def __init__(self, root: grain.MapDataset, reader: Callable[..., grain.IterDataset], cycle: int,
                  loading: Loading, name: str, quota: int | None = None,
-                 nothing: tuple[Callable[[], bool], int] | None = None, uncounted: int | None = None):
+                 nothing: tuple[Callable[[], bool], int] | None = None,
+                 uncounted: tuple[bool, int] | None = None):
         super().__init__(root)
         self.root, self.reader = root, reader
         self.cycle, self.loading, self.name, self.quota, self.nothing = cycle, loading, name, quota, nothing
         self.uncounted = uncounted
+
+    def reachable(self) -> int | None:
+        """The distinct places an endless read of shards no store counts can read on this reader (and this
+        loading worker's slice), which a run of empty ones must cover to refuse it (`_EmptyRun`): every
+        shard of the store where a seed deals each pass its own order, so a share's slots reach each in
+        turn; else the shards of one period of its fixed slots, which repeat within a pass's length of
+        places. None for any other read."""
+        if self.uncounted is None:
+            return None
+        seeded, shards = self.uncounted
+        if seeded:
+            return shards
+        return len({self.root[index] for index in range(min(len(self.root), shards))})
 
     def set_slice(self, selection: slice, sequential_slice: bool = False) -> None:
         self.root = self.root[selection]
@@ -196,7 +211,7 @@ class _ShardPass[Place](grain.IterDataset):
             # A worker dealt no place or no row of the bound reads nothing (Grain's interleave of no dataset
             # raises).
             return _Passing(None)
-        reader = _Reader(self.reader, _EmptyRun(self.name, self.nothing, self.uncounted), self.loading)
+        reader = _Reader(self.reader, _EmptyRun(self.name, self.nothing, self.reachable()), self.loading)
         rows = (_Sequential(self.root, reader, self.loading) if self.cycle == 1
                 else interleaved(self.root, reader, self.cycle, self.loading))
         limited = rows if self.quota is None else experimental.LimitIterDataset(rows, self.quota)
@@ -326,8 +341,9 @@ class _EmptyRun:
     its store holds no row and a run long enough to hold every shard the read reads (twice the store's,
     whatever pass it starts in), an endless read of shards that state no rows is refused once such a run
     finds its store holds none, as one of shards that state none is (`streamed`), where it would read
-    nothing forever; the store is asked once. Given `uncounted`, the shards an endless read of a store that
-    counts none reads, it is refused once the run has found every one of them empty, by its place."""
+    nothing forever; the store is asked once. Given `uncounted`, the distinct places an endless read of a
+    store that counts none can read on this reader (`_ShardPass.reachable`), it is refused once the run has
+    found every one of them empty, by its place."""
 
     def __init__(self, name: str, nothing: tuple[Callable[[], bool], int] | None = None,
                  uncounted: int | None = None):
