@@ -1784,6 +1784,17 @@ def _ladders(target: str, group: tuple) -> list:
     return found
 
 
+def _dealt(ladders: list, shards: int, shard: int) -> list:
+    """The `shard`-th of `shards` tasks' share of `ladders` (`_ladders`'), dealt by their configs, the longest
+    first to the task holding fewest: dealt in turn, an sm90 Kimi training task took 167 s and another 5."""
+    loads, taken = [0] * shards, [[] for _ in range(shards)]
+    for ladder in sorted(ladders, key=lambda ladder: -len(ladder[3])):
+        lightest = loads.index(min(loads))
+        taken[lightest].append(ladder)
+        loads[lightest] += len(ladder[3])
+    return taken[shard]
+
+
 def _reach(target: str, group: tuple) -> set:
     """What the identity test reaches through the gate's `group` on `target` (`_ladders`, model alone): each
     launch it lowers, a training case's forward-apart launches, and the axes that change a kernel's form or
@@ -1844,8 +1855,8 @@ def test_the_identity_groups_reach_all_the_gate_reaches(target):
     for target in gate_generations(scoped=True) for group in IDENTITY_GROUPS
     for shard in range(IDENTITY_SHARDS.get(group, 1))])
 def test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes(target, group, shard):
-    """The `shard`-th of the gate's `group`'s ladders on `target` (`_ladders`, dealt in turn among
-    `IDENTITY_SHARDS`), each config's kernels lowered afresh through their real names (`_named_bodies`, a
+    """The `shard`-th of the gate's `group`'s ladders on `target` (`_ladders`, dealt among `IDENTITY_SHARDS`'
+    tasks, `_dealt`), each config's kernels lowered afresh through their real names (`_named_bodies`, a
     config once however many ladders hold it): one name is one body across every config, each ladder holding
     its case's tiles beside its rungs, and along a ladder one body keeps one name, so a rung's unchanged
     kernels keep their modules and their names (`Mosaic.emitted`)."""
@@ -1853,8 +1864,8 @@ def test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes(target,
     bodies: dict[str, set[str]] = collections.defaultdict(set)
     lowered: dict[tuple, dict[str, str]] = {}
     with generation.assumed(facts), report.refusals():
-        ladders = _ladders(target, group)
-        for label, bound, pulled, configs in ladders[shard::IDENTITY_SHARDS.get(group, 1)]:
+        dealt = _dealt(_ladders(target, group), IDENTITY_SHARDS.get(group, 1), shard)
+        for label, bound, pulled, configs in dealt:
             named = []
             for config in configs:
                 if (label, pulled, config) not in lowered:
