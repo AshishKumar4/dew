@@ -1452,7 +1452,8 @@ class _Build:
         # Its end is its indexed read's where every member's length is known, in one order (`mix_end`).
         lengths = [member_length(child, analyzed)
                    for child, analyzed in zip(children(pipeline), self.lowering.children, strict=True)]
-        end = None if partition.count > 1 or None in lengths else mix_end(lengths, source)
+        known = [length for length in lengths if length is not None]
+        end = mix_end(known, source) if partition.count == 1 and len(known) == len(lengths) else None
         return KeyedMix(streams, source.weights, keys, source.seed, stamped=self.stamped, end=end)
 
     def counted_members(self, pipeline: Pipeline) -> tuple[tuple[str, str, str], ...]:
