@@ -23,7 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.derivatives import KernelGlue, contracted
+from dew.nn.derivatives import KernelGlue, contracted, with_gradients_formed
 
 from . import generation
 from .generation import INHERENT, Choice
@@ -120,7 +120,10 @@ def _backward(x, taps, bias, valid, documents, cotangents, parts, activation: bo
 
     dx, dw, db = conv.backward(x, taps, bias, valid, documents, tuple(cotangents), parts=tuple(parts),
                                activation=activation, eps=eps, **_launched(interpret))
-    return dx, dw.T.astype(taps.dtype), None if bias is None else db.astype(bias.dtype)
+    # The taps' and bias's gradients formed in their dtypes before the input's cotangent leaves (row 6027).
+    dx, (d_taps, d_bias) = with_gradients_formed(
+        dx, (dw.T.astype(taps.dtype), None if bias is None else db.astype(bias.dtype)))
+    return dx, d_taps, d_bias
 
 
 def conv(x, taps, bias, valid, documents, parts, *, activation: bool, eps: float, dtype, interpret: bool):

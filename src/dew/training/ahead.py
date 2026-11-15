@@ -325,6 +325,11 @@ class AheadOfTime:
     step traces with these in place of its own (`Trainer`'s `ahead`), which could spread a projection
     the step does not and lower another program, and its checkpoints record their bandwidths
     (`link_figures`)."""
+    live_bytes: int | None = None
+    """The most one device's buffers hold at once over the step, as XLA's heap simulation states it
+    (`CompiledMemory.live`): where a value held too long shows, apart from the room the temporaries'
+    packing takes (`temp_bytes`, the one allocation the fit check places). None where the backend states
+    none."""
     target: GpuTarget | None = None
     """The facts of the GPU its kernels' launches were derived for (`gpu_target` within `assumed`), which a
     run handed the step reproduces it under (`handed`, `derived_for`): another SKU of the generation, its
@@ -1415,7 +1420,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         Executable.of(compiled),
         flops=step_flops(compiled),
         argument_bytes=memory.argument, output_bytes=memory.output, alias_bytes=memory.alias,
-        temp_bytes=memory.temp, code_bytes=memory.generated_code, plan=trainer.plan, planned_seconds=seconds,
+        temp_bytes=memory.temp, code_bytes=memory.generated_code, live_bytes=memory.live, plan=trainer.plan,
+        planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices), capacity, topology=topology),
         refusals=report.refused_launches(), sampled=sampled, starts=starts)

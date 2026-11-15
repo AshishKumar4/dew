@@ -25,7 +25,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from dew._hashing import fmix32
-from dew.nn.derivatives import KernelGlue, Protected, contracted
+from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.kernels import launches
 from dew.nn.precision import (
     at_least_fp32,
@@ -403,7 +403,10 @@ def _skip_backward(saved, operands, grad):
               else jax.sharding.NamedSharding(placed.mesh, jax.typeof(skip).sharding.spec))
     leading = 'abcdefg'[:value.ndim - 2]
     summed = jnp.einsum(f'{leading}hv,{leading}hv->h', grad, value, out_sharding=stated)
-    return summed.astype(skip.dtype), (grad * skip[:, None]).astype(value.dtype)
+    # `D`'s gradient formed in its dtype before the value's cotangent leaves (row 6027).
+    d_value, d_skip = with_gradients_formed((grad * skip[:, None]).astype(value.dtype),
+                                            summed.astype(skip.dtype))
+    return d_skip, d_value
 
 
 _skip = contracted("test_the_decode_step_holds_every_order")(
@@ -496,7 +499,12 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
 
     def pulled(saved, operands, cotangent):
         del saved
-        return jax.vjp(portable, *operands)[1](cotangent)
+        # The step's cotangents leave together (`with_gradients_formed`): its gates', skip's and taps'
+        # parameters beside the state and the token.
+        (pulled_operands,) = jax.vjp(portable, *operands)[1](cotangent)
+        first, *rest = jax.tree.leaves(pulled_operands)
+        first, rest = with_gradients_formed(first, tuple(rest))
+        return (jax.tree.unflatten(jax.tree.structure(pulled_operands), [first, *rest]),)
 
     launched = functools.partial(_launched, hooks, dtype=dtype)
     return contracted("test_the_decode_step_holds_every_order")(

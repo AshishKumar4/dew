@@ -42,7 +42,7 @@ import numpy as np
 from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
 
-from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
+from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_gradients_formed
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block
 from dew.nn.kernels.templates import axes as side_axes_of, mosaic_sm100
@@ -55,6 +55,9 @@ from dew.nn.programs import read_by
 from dew.nn.sharding import seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
+"""The launch axes each hook's side operands may follow; `groups` too beside them (`_split`), which a launch
+reads at its tile's group (`axes.GROUPS`) and XLA's program at each row (`axes.at_rows`)."""
+
 
 _UNBUILT: contextvars.ContextVar[bool] = contextvars.ContextVar('gemm_unbuilt', default=False)
 """Whether the calls traced here are weighed, not built (`unbuilt`)."""
@@ -71,8 +74,6 @@ def unbuilt():
         yield
     finally:
         _UNBUILT.reset(token)
-"""The launch axes each hook's side operands may follow; `groups` too beside them (`_split`), which a launch
-reads at its tile's group (`axes.GROUPS`) and XLA's program at each row (`axes.at_rows`)."""
 
 
 def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None = None, *,
@@ -241,29 +242,18 @@ def _pulled(call: "_Call", operands, cotangent, live) -> tuple:
                                        {**held, 'tables': (gather, read)})
                  for place, d_product, matrix, work, each in zip(places, d_products, matrices, works,
                                                                  narrow, strict=True)]
-    d_lhs, gradients = in_layer(d_lhs, gradients)
+    # Every parameter gradient formed in its stored dtype before the rows' cotangent leaves.
+    d_sides = tuple(_as_cotangent(d, a) for d, a in zip(d_epilogue, epilogue_arrays, strict=True))
+    d_lhs, (gradients, d_prologue, d_sides) = with_gradients_formed(d_lhs, (gradients, d_prologue, d_sides))
     leaves = [d_lhs, gradients[0], zero_from_primal(group_sizes),
               *(d_prologue or (None,) * len(prologue_arrays)),
-              *(_as_cotangent(d, a) for d, a in zip(d_epilogue, epilogue_arrays, strict=True)),
+              *d_sides,
               *gradients[1:], *(() if first is None else (zero_from_primal(first),)),
               *(() if gather is None else (zero_from_primal(gather),)),
               *(() if scatter is None else (zero_from_primal(scatter),)),
               # Held still (`stop_gradient`): its derivative is the prologue's, through `lhs` and the sides.
               *(() if applied is None else (None,))]
     return tuple(leaves[index] for index in live)
-
-
-def in_layer[R, G](d_rows: R, gradients: G) -> tuple[R, G]:
-    """A product's reverse mode's cotangents, leaving together: the rows' cotangent, which the layer below
-    reads at once, only with the matrices' gradients formed (`jax.lax.optimization_barrier`, the primitive
-    `jax.checkpoint` orders its own recomputation with), so each kernel gradient consumes the output's
-    cotangent inside its layer, whichever route takes it, never put off to the step's end with every layer's
-    cotangents held to it. Row 6027: XLA's dot of the 4B's up and gate kernel gradients beside the template's
-    input gradients, put off so, held every layer's fused SwiGLU backward pair, a four-row step's temporaries
-    80.50 GB on a compile-only GH200 against its parent's 20.42; on two devices with every product XLA's, a
-    gated stack held three cotangents a layer. The one rule `gemm`'s reverse mode and a projection XLA's
-    product takes (`dew.nn.kernels.projections`) both follow."""
-    return jax.lax.optimization_barrier((d_rows, gradients))
 
 
 def _scattered_cotangent(cotangent, scatter, *, epilogue, first) -> tuple:

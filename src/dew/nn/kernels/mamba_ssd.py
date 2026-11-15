@@ -1360,8 +1360,11 @@ def _scan_bwd(chunk: int, interpret: bool, held: int, residual, cotangent):
     ddocuments = None if documents is None else (
         dforked[0].reshape(documents[0].shape).astype(documents[0].dtype), None, None,
         dforked[1].reshape(documents[3].shape).astype(documents[3].dtype) if entered else None)
-    return (dx, ddt.astype(dt.dtype), dA.astype(A.dtype), db, dc, dd.astype(d.dtype),
-            dh0.reshape(shape).astype(h0.dtype), None, ddocuments)
+    # The inputs' cotangents leave only with A's and D's gradients formed (`with_gradients_formed`).
+    (dx, ddt, db, dc, dh0, ddocuments), (dA, dd) = derivatives.with_gradients_formed(
+        (dx, ddt.astype(dt.dtype), db, dc, dh0.reshape(shape).astype(h0.dtype), ddocuments),
+        (dA.astype(A.dtype), dd.astype(d.dtype)))
+    return dx, ddt, dA, db, dc, dd, dh0, None, ddocuments
 
 
 ssd_scan = derivatives.contracted("test_the_ssd_port_holds_its_orders")(

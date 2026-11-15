@@ -39,7 +39,7 @@ from dew import quantization
 from dew.batch import Variables, leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
-from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent
+from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, with_tangents_formed
 from dew.nn.residuals import Residual
 
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
@@ -977,8 +977,13 @@ def _stored_primal_jvp(run, primals, tangents):
     if not live:
         output = forward()
         return output, SymbolicZero(jax.typeof(output))
-    return jax.jvp(forward, tuple(leaves[index] for index in live),
-                   tuple(directions[index] for index in live))
+    moving = tuple(directions[index] for index in live)
+    if live[0] == 0 and len(live) > 1:
+        # `x` and some expert parameter move: through the rule's dual (`with_tangents_formed`), reverse mode
+        # returns `x`'s cotangent only with the experts' gradients formed.
+        first, rest = with_tangents_formed(moving[0], moving[1:])
+        moving = (first, *rest)
+    return jax.jvp(forward, tuple(leaves[index] for index in live), moving)
 
 
 _stored_primal = contracted("test_a_stored_expert_primal_holds_every_order")(

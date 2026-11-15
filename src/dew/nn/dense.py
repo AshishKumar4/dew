@@ -33,7 +33,7 @@ from flax.typing import Array
 
 from dew._cache import INTERCEPTED
 
-from .derivatives import KernelGlue, contracted, declared_tangent
+from .derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed
 from .kernels import projections
 from .precision import accumulated, biased, float32_dot_general, refuse_recipe
 from .sharding import declared
@@ -141,6 +141,9 @@ def _widened_tangent(dimensions, precision, primals, tangents):
 
     inputs, kernel = primals
     d_inputs, d_kernel = tangents
+    if not any(isinstance(direction, SymbolicZero) for direction in tangents):
+        # Its reverse mode returns the inputs' cotangent only with the kernel's gradient formed.
+        d_inputs, d_kernel = with_tangents_formed(d_inputs, d_kernel)
     value = _widened_value(inputs, kernel, dimensions, precision)
     terms = [jax.lax.dot_general(left, right, dimensions, precision=precision).astype(jnp.float32)
              for left, right, direction in ((d_inputs, kernel, d_inputs), (inputs, d_kernel, d_kernel))

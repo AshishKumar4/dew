@@ -39,7 +39,7 @@ from dew.algebra.derive import FORMS_HELD
 from dew.algebra.scan import RESET_DECAY
 from dew.batch import document_firsts
 from dew.nn.attention_masks import repeat_kv_heads
-from dew.nn.derivatives import KernelGlue, Protected, contracted
+from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
 from dew.nn.inputs import cu_seqlens
 from dew.nn.nested import nested
 from dew.nn.precision import asks_default_precision, at_least_fp32, exact_products, l2norm, rounds_products
@@ -994,7 +994,11 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
 
     def pulled(pullback, operands, cotangent):
         del operands
-        return pullback(cotangent)
+        # The operands' cotangents leave together (`with_gradients_formed`): a skip's, a rate's, A's and D's
+        # beside the tokens' and the state's.
+        first, *rest = pullback(cotangent)
+        first, rest = with_gradients_formed(first, tuple(rest))
+        return (first, *rest)
 
     return contracted("test_the_chunked_op_holds_every_order")(
         generation.linear_tangent(functools.partial(jax.vjp, training), pulled, portable, primal=primal,

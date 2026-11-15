@@ -713,17 +713,49 @@ def at_its_plan(plan, probes) -> None:
     assert not any(probe["split"] < plan["split"] and probe["fits"] is True for probe in own), own
 
 
-NEEDING_MICROBATCHES = 600_000
-"""Bytes a compile-only GPU states for `fine_tune`'s step to need several microbatches: four, with a rung
-above it at two (a sweep at base/kernels e4d702a55 with the split computed from the compile that missed,
-2cb8d0bb4: from 500 kB to 600 kB the plan takes four or eight, at 650 kB and 700 kB two, at 800 kB one)."""
+ROOMY = 2**36
+"""The bytes a compile-only GPU states (`gpus`' default) where a step's need is measured: room for any of
+`fine_tune`'s compiles, so its need does not depend on it (`memory.step_fits`)."""
+
+
+def _need(split: int, *, up: bool = False) -> int:
+    """What `fine_tune`'s step needs beside what a device holds, as its plan's search reads it (`limit -
+    headroom`, `memory.step_fits`): compiled ahead at `split` microbatches on its own rung, or with `up` the
+    rung above it, its search's first climb (`memory.recompute_more`: the head's tile, before any remat),
+    under `ROOMY`."""
+    from dew.training.ahead import compile_ahead
+    from dew.training.memory import recompute_more
+
+    trainer = fine_tune(MeshSpec().build(gpus("sm90")), split=split)
+    if up:
+        assert recompute_more(trainer.objective)
+    plan = record(compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1)).plan, "plan")
+    return ROOMY - listed(plan["probes"], "probes", read=record, what="probes")[0]["headroom"]
 
 
 @pytest.fixture(scope="module")
-def admitted(tmp_path_factory):
-    """`fine_tune`'s step compiled ahead on GPUs of `NEEDING_MICROBATCHES`, its plan kept beside the
+def needing_microbatches(tmp_path_factory) -> int:
+    """Bytes a compile-only GPU states for `fine_tune`'s step to need several microbatches at its own rung
+    with a rung above it fitting at fewer, read from the step's own compiles (`_need`): the larger of its
+    own rung's need at two microbatches and the rung above's whole, where its own rung's need whole is more
+    (the scenario's condition, which the step's figures state or the cell says they do not). The needs are
+    measured under `ROOMY`, where XLA's scheduler, which reads the memory a target states, may need more
+    than under the limit; the admitted search under the limit is the judge (`plan["split"] > 1`, a frontier),
+    and where it goes red the three needs are measured again under the limit, never a margin added."""
+    with pytest.MonkeyPatch.context() as patch:
+        lane_environment.per_test_settings(patch, tmp_path_factory.mktemp)
+        patch.setenv("DEW_RUNG_RECORDS", str(tmp_path_factory.mktemp("needs")))
+        whole, halves, above = _need(1), _need(2), _need(1, up=True)
+    limit = max(halves, above)
+    assert whole > limit, (whole, halves, above)
+    return limit
+
+
+@pytest.fixture(scope="module")
+def admitted(tmp_path_factory, needing_microbatches):
+    """`fine_tune`'s step compiled ahead on GPUs of `needing_microbatches`, its plan kept beside the
     compilation cache as every search keeps its own (`DEW_RUNG_RECORDS`): the records' directory, the
-    trainer and its `AheadOfTime`, admitted once for the module."""
+    trainer and its `AheadOfTime`, admitted once for the module, and the limit."""
     from dew.training.ahead import compile_ahead
 
     records = tmp_path_factory.mktemp("rungs")
@@ -731,9 +763,9 @@ def admitted(tmp_path_factory):
         # The module's own data and Hub caches, as each test's (`own_settings`), its rung records `records`.
         lane_environment.per_test_settings(patch, tmp_path_factory.mktemp)
         patch.setenv("DEW_RUNG_RECORDS", str(records))
-        trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=NEEDING_MICROBATCHES)), split=None)
+        trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=needing_microbatches)), split=None)
         ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
-    return records, trainer, ahead
+    return records, trainer, ahead, needing_microbatches
 
 
 def cache_key_of(lowered: jax.stages.Lowered, device, overrides: dict | None = None) -> str:
@@ -851,7 +883,7 @@ def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admit
     from dew._devices import pool_share
     from dew.training.memory import recompute_record
 
-    _, trainer, ahead = admitted
+    _, trainer, ahead, limit = admitted
     plan = record(ahead.plan, "plan")
     probes = listed(plan["probes"], "probes", read=record, what="probes")
     assert plan["split"] > 1
@@ -859,7 +891,7 @@ def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admit
     assert trainer.plan == ahead.plan and recompute_record(trainer.objective) == plan["remat"]
     pool = record(plan["pool"], "pool")
     assert pool["source"] == "compile_only" and pool["share"] == pool_share()
-    assert pool["limit"] == NEEDING_MICROBATCHES
+    assert pool["limit"] == limit
     assert not ahead.tuned and plan["autotuned"] is False
 
 
@@ -876,9 +908,9 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
     from dew.training.ahead import compile_ahead
     from dew.training.memory import recompute_record
 
-    records, _, earlier = admitted
+    records, _, earlier, limit = admitted
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
-    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=NEEDING_MICROBATCHES)), split=None)
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=limit)), split=None)
     ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
     probes = listed(plan["probes"], "probes", read=record, what="probes")

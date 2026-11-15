@@ -310,8 +310,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         # A forked call's given memories' gradient its table's first, its slots' none.
         tabled_grads = None if table is None else dataclasses.replace(table, given=dh0, loads=None,
                                                                        stores=None, entries=dentries)
-        return (*grads, None if state is None else dh0, None, None,
-                None if dskip is None else dskip.astype(skip.dtype), tabled_grads)
+        # The skip's gradient formed in its dtype before the inputs' cotangents leave (row 6027).
+        (grads, dh0, tabled_grads), dskip = derivatives.with_gradients_formed(
+            (grads, dh0, tabled_grads), None if dskip is None else dskip.astype(skip.dtype))
+        return (*grads, None if state is None else dh0, None, None, dskip, tabled_grads)
 
     rule = derivatives.contracted("test_the_template_rule_holds_its_orders")(
         derivatives.declared_derivative(derivatives.KernelGlue(), primal, forward, backward))

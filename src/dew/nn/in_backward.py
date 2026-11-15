@@ -27,7 +27,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.derivatives import Surrogate, contracted, declared_derivative
+from dew.nn.derivatives import Surrogate, contracted, declared_derivative, with_gradients_formed
 from dew.nn.programs import holes
 
 type Tree = Mapping[str, object]
@@ -139,6 +139,15 @@ def _written(tree, layer, index):
                                                                               index, 0), tree, layer)
 
 
+def _pulled(back: Callable, dx):
+    """`back(dx)`, a layer's VJP: its parameters' gradients, the layer below's cotangent and the flowed
+    state's, the cotangent returned only with the gradients formed (`with_gradients_formed`, row 6027), which
+    the update reads at once."""
+    gradient, dx, dflowed = back(dx)
+    dx, (gradient, dflowed) = with_gradients_formed(dx, (gradient, dflowed))
+    return gradient, dx, dflowed
+
+
 def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: Tree | None,
                 moments: Mapping[str, Tree], norms: Tree, x: jax.Array, per_layer: tuple | jax.Array | None,
                 shared: Sequence[object]) -> jax.Array:
@@ -222,7 +231,7 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
             stored = iter([leaf[index] for leaf in kept])
             back = jax.tree_util.tree_unflatten(treedef, [given[slot[0]][slot[1]] if slot is not None
                                                           else next(stored) for slot in slots])
-            gradient, dx, dflowed = back(dx)
+            gradient, dx, dflowed = _pulled(back, dx)
             dshared = jax.tree.map(jnp.add, dshared, dflowed)
             held = _sliced(moving, index)
             held_moments = {name: _sliced(tree, index) for name, tree in moments.items()}

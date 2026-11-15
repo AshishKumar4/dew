@@ -19,7 +19,10 @@ from dew.nn.kernels import gemm, generation
 from dew.nn.sharding import placing
 
 LAYERS, ROWS, WIDTH = 4, 4096, 2048
-FAMILIES = {"sm80": "mma.sync", "sm90": "wgmma", "sm100": "tcgen05"}
+FAMILIES = {family: name for name in reversed(generation.TARGETS)
+            if (family := generation.family(name)) is not None and family != "tpu"}
+"""Each instruction family a GPU target claims (`generation.TARGETS`, `generation.family`), at its first
+generation in the table: a family added there is a family the contract's tests run on."""
 
 
 def _step_temp(generation_name: str, chosen: dict) -> int:
@@ -37,7 +40,7 @@ def _step_temp(generation_name: str, chosen: dict) -> int:
             ).memory_analysis().temp_size_in_bytes
 
 
-@pytest.mark.parametrize("generation_name", list(FAMILIES))
+@pytest.mark.parametrize("generation_name", sorted(FAMILIES.values()))
 def test_a_generations_declared_cells_hold_no_more_of_a_steps_memory_than_their_receipts_state(
         generation_name):
     """A stack of `LAYERS` dense bf16 products, `ROWS` x `WIDTH` by `WIDTH` x `WIDTH`, forward and reverse:
@@ -75,7 +78,7 @@ def _gated_temp(generation_name: str, layers: int, configuration: str) -> int:
     """The temporaries a device's share of a `layers`-deep gated stack takes, forward and reverse, under the
     generation's declared cells, on compile-only devices of `generation_name` (`GATED`'s configuration),
     each layer rematerialized (`jax.checkpoint`, as a model's `remat` keeps its input alone)."""
-    from jax.sharding import NamedSharding, PartitionSpec
+    from jax.sharding import PartitionSpec
     from kernel_compile import _device
 
     devices, layout = GATED[configuration]
@@ -91,10 +94,7 @@ def _gated_temp(generation_name: str, layers: int, configuration: str) -> int:
     # Dew's role axes, the rules' (`DEFAULT_RULES`), each of one device but the data axis splitting the rows.
     mesh = _device(generation_name, tuple((name, devices if name == "data" else 1) for name in MESH_AXES))
 
-    def placed(leaf, spec=None):
-        spec = PartitionSpec() if spec is None else spec
-        return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=NamedSharding(mesh, spec))
-
+    placed = functools.partial(_placed, mesh)
     stack = tuple(jax.tree.map(placed, params) for _ in range(layers))
     x = placed(jax.ShapeDtypeStruct(rows, jnp.bfloat16), PartitionSpec("data"))
     with (generation.assumed(generation_name), jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES),
@@ -104,7 +104,7 @@ def _gated_temp(generation_name: str, layers: int, configuration: str) -> int:
 
 
 @pytest.mark.parametrize("configuration", list(GATED))
-@pytest.mark.parametrize("generation_name", list(FAMILIES))
+@pytest.mark.parametrize("generation_name", sorted(FAMILIES.values()))
 def test_a_gated_stacks_backward_holds_no_layers_outputs_past_its_layer(generation_name, configuration):
     """A rematerialized gated stack (each layer's gate and up products, their SwiGLU product and its down
     product, the 4B's MLP), forward and reverse under its generation's declared cells, on one device and on
@@ -125,3 +125,11 @@ def test_a_gated_stacks_backward_holds_no_layers_outputs_past_its_layer(generati
     weights = 3 * GATED_WIDTH * HIDDEN * 2
     grown = _gated_temp(generation_name, 4, configuration) - _gated_temp(generation_name, 2, configuration)
     assert grown <= 2 * (residual + weights) + hidden, (grown, residual, weights, hidden)
+
+
+def _placed(mesh, leaf, spec=None):
+    """`leaf`'s shape and dtype placed on `mesh` by `spec`, whole where None."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    spec = PartitionSpec() if spec is None else spec
+    return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=NamedSharding(mesh, spec))
