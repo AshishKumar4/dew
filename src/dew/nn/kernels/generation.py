@@ -45,7 +45,9 @@ identity (`dew.training.identity`)."""
 
 _RECORDINGS: contextvars.ContextVar[tuple[dict[Hashable, tuple[Callable[[], Hashable], Hashable]], ...]] = (
     contextvars.ContextVar("fact_recordings", default=()))
-"""The facts read within each open `recording`, innermost last."""
+"""The facts read within each open `recording`, innermost last: what a trace records into, no trace reads, so
+a trace held by its state (`dew._cache.traced_state`) is held in any recording's scope (`recording` registers
+it `dew._cache.untraced` as it first sets it; generation imports no JAX as it loads)."""
 
 
 def stated(value) -> Hashable:
@@ -89,6 +91,9 @@ def recording() -> Iterator[dict[Hashable, tuple[Callable[[], Hashable], Hashabl
     """Each fact read within the block (`traced_fact`), by its reader and question, with the answer it got
     (`stated`): what a trace kept for a later one read, which holds where each answers as it did (`still`).
     Recordings nest; a read records into each open one."""
+    from dew import _cache
+
+    _cache.untraced(_RECORDINGS)
     reads: dict[Hashable, tuple[Callable[[], Hashable], Hashable]] = {}
     token = _RECORDINGS.set((*_RECORDINGS.get(), reads))
     try:
