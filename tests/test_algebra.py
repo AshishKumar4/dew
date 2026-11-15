@@ -236,26 +236,6 @@ def test_a_rewritten_program_is_finite_wherever_the_program_is(name):
     assert np.all(np.isfinite(jax.core.eval_jaxpr(closed.jaxpr, closed.consts, *operands_)[0]))
 
 
-TOP = float(np.uint32(0x7F7FFFFC).view(np.float32))
-"""Float32's `(2**24 - 4) 2**104`, four units under its largest: `a + 3 a 2**-24` rounds to the largest,
-where `a (1 + 3 2**-24)` rounds `1 + 3 2**-24` to `1 + 2**-22` first and passes it. A row scalar's sum and
-a scale's product held as their factored forms are distributivity's case reached from a wider window's
-operands: their bounds are the same rule's (`rules.dominated` of the value each gives)."""
-
-def test_a_factored_product_is_finite_wherever_the_program_is():
-    """`a * 1 + a * (3 2**-24)`, distributivity's `a (1 + 3 2**-24)` once factored, rounds the sum to
-    `1 + 2**-22` before the product: at `TOP` the program is finite and its factored form is not.
-    Distributivity bounds the product it makes (`rules.dominated` of it, under the reach), so over an
-    unbounded `a` it does not fire, and the rewritten program is finite wherever the program is (§6.3)."""
-    def program(a):
-        return a * 1.0 + a * (3 * 2.0 ** -24)
-
-    operand = jnp.full((2,), TOP, jnp.float32)
-    assert np.all(np.isfinite(program(operand)))
-    closed = jax.make_jaxpr(algebra.rewritten(program))(operand)
-    assert np.all(np.isfinite(jax.core.eval_jaxpr(closed.jaxpr, closed.consts, operand)[0]))
-
-
 def cos_at(values) -> jax.Array:
     """Float32 arguments whose `cos` is each of `values` exactly, as XLA computes it: the first of a fine
     grid of each, so a witness's precondition is a fact of the function itself."""

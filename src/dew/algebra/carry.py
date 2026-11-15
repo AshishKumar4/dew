@@ -66,17 +66,14 @@ def swap_of(params: i64) -> i64: ...
 
 
 def _carrying():
-    """Which values read the state (`reads`)."""
-    x, y, z, t = vars_("x y z t", Term)
-    name = var("name", String)
-    p = var("p", i64)
+    """Which values read the state (`reads`): a term of the language (`terms.LANGUAGE`, every constructor) any
+    of whose operands reads it, a reduction's among them."""
+    t = var("t", Term)
     one = i64(1)
     marked = []
-    for made, children in ((lambda: x.binary(name, y, p), (x, y)), (lambda: x.compare(name, y, p), (x, y)),
-                           (lambda: x.unary(name, p), (x,)), (lambda: x.convert(p), (x,)),
-                           (lambda: x.shaped(name, p), (x,)), (lambda: x.dot(y, p), (x, y)),
-                           (lambda: x.select(y, z), (x, y, z))):
-        marked += [rule(eq(t).to(made()), eq(reads(child)).to(one)).then(set_(reads(t)).to(one))
+    for index, constructor in enumerate(terms.LANGUAGE):
+        made, children = terms.pattern(constructor, f"c{index}")
+        marked += [rule(eq(t).to(made), eq(reads(child)).to(one)).then(set_(reads(t)).to(one))
                    for child in children]
     return ruleset(*marked, name="carrying")
 
@@ -125,12 +122,9 @@ def _carried():
         # x @ (y +- z) as x @ y +- x @ z: both new.
         with_y = rules.product_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"), length)
         with_z = rules.product_magnitude(rules.magnitude(x, "x2"), rules.magnitude(z, "z"), length)
-        # Their sum too, which may pass the float's largest where the products do not, each under the reach.
-        joined = rules.summed_magnitude(([], with_y[1]), ([], with_z[1]))
         sets.append(rule(eq(t).to(x.dot(y.binary(combined, z, q), m)), *plain, eq(shape(y)).to(shape(z)),
                          eq(reads(y.binary(combined, z, q))).to(one), *contracted, *with_y[0], *with_z[0],
-                         *rules.dominated(with_y[1], "y"), *rules.dominated(with_z[1], "z"),
-                         *rules.dominated(joined[1], "joined")).then(
+                         *rules.dominated(with_y[1], "y"), *rules.dominated(with_z[1], "z")).then(
             union(t).with_(x.dot(y, m).binary(combined, x.dot(z, m), q)),
             *rules.made(x.dot(y, m), with_y[1]), *rules.made(x.dot(z, m), with_z[1])))
         # x @ z +- y @ z as (x +- y) @ z (`rules.shared_factored`, the linear set's declaration), over

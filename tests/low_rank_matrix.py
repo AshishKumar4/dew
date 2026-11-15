@@ -115,6 +115,18 @@ def _step(model, variables, kernel: str):
     return with_gradients(projected)
 
 
+def _truth(case: dict[str, str], variables):
+    """The same projection's training step in float64: the measured arms' frozen base weights and bias
+    widened, not another projection initialised in float64, both formed within the truth's x64 scope
+    (`assert_as_exact`), where float64 exists."""
+    def truth(*inputs):
+        wide_model, _ = _adapted(case, jnp.float64)
+        wide_variables = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), variables)
+        return _step(wide_model, wide_variables, "xla")(*inputs)
+
+    return truth
+
+
 def _drawn(case: dict[str, str], variables):
     """A seed's factors (each drawn small, B nonzero), input and cotangent, in the case's dtype."""
     dtype = jnp.dtype(case["dtype"])
@@ -140,15 +152,7 @@ def an_adapted_projections_training_step_is_on_par(case: tuple[str, ...]) -> Non
     projection in float64. The routes it records run `low_rank` `fused` and every other choice at XLA."""
     combination = dict(zip(AXES["low_rank"], case, strict=True))
     model, variables = _adapted(combination)
-
-    def truth(*inputs):
-        # The same projection in float64: the measured arms' frozen base weights and bias widened, not
-        # another projection initialised in float64, both formed within the truth's x64 scope
-        # (`assert_as_exact`), where float64 exists.
-        wide_model, _ = _adapted(combination, jnp.float64)
-        wide_variables = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), variables)
-        return _step(wide_model, wide_variables, "xla")(*inputs)
-
+    truth = _truth(combination, variables)
     draw = _drawn(combination, variables)
     with generation.routes() as routes:
         assert_as_exact(jax.jit(_step(model, variables, "fused")), jax.jit(_step(model, variables, "xla")),
@@ -156,3 +160,24 @@ def an_adapted_projections_training_step_is_on_par(case: tuple[str, ...]) -> Non
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
     assert ("low_rank", "fused") in recorded and not unnamed, (sorted(recorded), unnamed)
+
+
+def per_shard(choice: str, kernel: str) -> dict:
+    """`kernel`'s per-shard cells (`sharded.Shard`, tests/test_per_shard.py): the adapted projection of the
+    first case its generation runs interpreted (`CASES`, an sm90's) over rows a two-device data axis splits,
+    its factors and frozen base whole, its base product and update fused (`kernel`, interpreted on the CPU's
+    devices): the output and the gradients of the factors and the input on par with one device's from the
+    projection in float64."""
+    from flax import linen as nn
+    from jax.sharding import PartitionSpec
+    from sharded import Shard
+
+    from dew.mesh import DEFAULT_RULES
+
+    del choice
+    case = dict(zip(AXES["low_rank"], next(case for case in CASES if case[0] == "sm90"), strict=True))
+    model, variables = _adapted(case)
+    return {"data": Shard(_step(model, variables, kernel), _drawn(case, variables),
+                          lambda mesh: [PartitionSpec(), PartitionSpec("data"), PartitionSpec("data")],
+                          _truth(case, variables),
+                          SEEDS, "data", context=lambda: nn.logical_axis_rules(DEFAULT_RULES))}

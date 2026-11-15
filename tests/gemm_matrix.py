@@ -23,17 +23,22 @@ kernels' contract (`_cutlass_takes`).
 """
 
 import contextlib
+import functools
+import os
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from gpu_flow import cell
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from kernel_matrix import AXES
 from reference_error import assert_as_exact, with_gradients
 
+from dew.mesh import DEFAULT_RULES
 from dew.nn.kernels import gemm, generation, grouped_matmul, selection
+from dew.nn.sharding import placing
 
 ROWS, DEPTH, WIDTH = 256, 256, 384
 SIZES = (100, 0, 156)
@@ -274,3 +279,94 @@ def a_gemm_training_step_is_on_par(case: tuple[str, ...]) -> None:
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
     assert ("grouped_matmul", combination["kernel"]) in recorded and not unnamed, (sorted(recorded), unnamed)
+
+
+def _projection_scope():
+    """The scope a model's projections trace in (tests/test_projection_shards.py): the default logical axis
+    rules, Dew's layout splitting every weight, the axes the projections declare."""
+    import test_projection_shards as projections
+
+    stack = contextlib.ExitStack()
+    for context in (nn.logical_axis_rules(DEFAULT_RULES), placing(projections.LAYOUT),
+                    projections._declared()):
+        stack.enter_context(context)
+    return stack
+
+
+def _launches_here(name: str, kernel: str) -> bool:
+    """Whether `kernel` takes the projection case `name` (tests/test_projection_shards.py's `CASES`) per
+    shard: the case's training step, traced as an H100's (`generation.assumed`) over two of this process's
+    devices in a run's mesh splitting its axis, the kernel named, in the projections' scope
+    (`_projection_scope`), launches it (`generation.routes`): none where the kernel refuses the case by its
+    own requirements (`selection.KernelRefused`, CUTLASS's depth a multiple of eight among them) or where no
+    launch takes the product per shard (a tensor axis's, the partitioner's; a weight stored in fp32, which the
+    layer rounds once); one this host cannot lower for the GPU (`selection.Unlowerable`) decided there,
+    launched."""
+    import test_projection_shards as projections
+
+    from dew.distributed.placement import MeshSpec
+
+    case = projections.CASES[name]
+    mesh = MeshSpec(**({} if case["axis"] == "data" else {case["axis"]: 2})).build(jax.devices()[:2])
+    arguments = projections._draw(case)(0)
+    shapes = [jax.ShapeDtypeStruct(np.shape(argument), argument.dtype,
+                                   sharding=jax.NamedSharding(mesh, spec))
+              for argument, spec in zip(arguments, projections._specs(case, mesh), strict=True)]
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel), _projection_scope(),
+          jax.set_mesh(mesh), generation.routes() as routes):
+        try:
+            jax.jit(with_gradients(projections._call(case))).trace(*shapes)
+        except selection.KernelRefused:
+            return False
+        except selection.Unlowerable:
+            return True
+    return kernel in {found.kernel for found in routes if found.choice == generation.Choice.GROUPED_MATMUL}
+
+
+def launched_here() -> list[list[str]]:
+    """Every `[case, kernel]` of the projection cases and the GEMM kernels whose case the kernel takes per
+    shard (`_launches_here`), in this process."""
+    import test_projection_shards as projections
+
+    return [[name, kernel] for name in projections.CASES for named in KERNELS.values()
+            for kernel in sorted(named) if _launches_here(name, kernel)]
+
+
+LAUNCHED = """import json
+import dew  # before jaxlib loads
+import gemm_matrix
+print(json.dumps(gemm_matrix.launched_here()))
+"""
+"""The process the GEMM kernels' per-shard cases are read in where this one has no two CPU devices
+(`launched`)."""
+
+
+@functools.cache
+def launched() -> frozenset[tuple[str, str]]:
+    """Every `(case, kernel)` whose case the GEMM kernel takes per shard (`launched_here`), read in a process
+    of two CPU devices: this one where it is one, else a fresh one, so a host of one accelerator collects
+    the cells its tests then skip (the `mesh` mark)."""
+    if jax.default_backend() == "cpu" and jax.device_count() >= 2:
+        return frozenset(map(tuple, launched_here()))
+    from lane_environment import without_flags
+    from process_support import fresh
+
+    devices = "--xla_force_host_platform_device_count"
+    flags = f"{without_flags(os.environ.get('XLA_FLAGS', ''), devices)} {devices}=2".strip()
+    return frozenset(map(tuple, fresh(LAUNCHED, flags=flags, platforms="cpu")))
+
+
+def per_shard(choice: str, kernel: str) -> dict:
+    """`kernel`'s per-shard cells (`sharded.Shard`, tests/test_per_shard.py): each projection case it
+    launches per shard (`launched`, tests/test_projection_shards.py's `CASES`), a bf16 Dense, or two
+    joined, its rows split over the case's axis under Dew's layout, each device's launch on its own rows,
+    an fsdp weight gathered whole into the map."""
+    import test_projection_shards as projections
+    from sharded import Shard
+
+    del choice
+    return {name: Shard(with_gradients(projections._call(case)), projections._draw(case),
+                        functools.partial(projections._specs, case), projections._exact(case.get("join")),
+                        projections.SEEDS, case["axis"], ("all-gather",) if case["axis"] == "fsdp" else (),
+                        _projection_scope)
+            for name, case in projections.CASES.items() if (name, kernel) in launched()}
