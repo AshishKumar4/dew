@@ -1333,11 +1333,18 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                            for ref, param in zip(hooked.output, hooks.output_params, strict=True))
         if isinstance(state.acc, mosaic.Kept):
             # Sums its issuer keeps past the walk (`Issuer.accumulated`'s `mosaic.Kept`: a plain walk's, its
-            # hooks refused and its rows all its own, `MosaicForward._placed_refusal`): the walk's ratio
-            # (`finish`'s), each row's factor its store takes in place a block of columns at a time
-            # (`Family.stored`).
+            # hooks refused and its rows all its own, `MosaicForward._placed_refusal`): the walk's ratio, as
+            # `algebra.quotient` takes it (a subnormal kept interpreted, row 6302), its store taking each
+            # block of columns in place (`Family.stored`), zero in a row that saw no key, whose sums its walk
+            # never wrote.
             maximum, denominator = algebra.finished_rows(spec, state, initial=False)
-            kept = state.acc.scaled(algebra.inverse(state.total))
+            total, factor = state.total, algebra.inverse(state.total)
+
+            def ratio(block: jax.Array) -> jax.Array:
+                taken = algebra.quotient(lambda held: held * factor[:, None], block, total)
+                return jnp.where(factor[:, None] != 0, taken, 0.0)
+
+            kept = state.acc.scaled(ratio)
             out_stage(lambda stage: family.stored((kept,), (out_view,), smem=stage))
         else:
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
