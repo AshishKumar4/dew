@@ -2310,3 +2310,32 @@ def test_cli_exports_a_recorded_chain_whose_step_its_trust_names_in_a_fresh_proc
 
     assert source(str(tmp_path / "out2")).records("indexed")[0] == {"text": "QUIET"}
 
+
+
+def test_an_endless_read_of_files_whose_whole_pass_yields_no_row_is_refused(tmp_path):
+    """A repeated stream whose complete pass yields nothing is refused (data.md §10), whether or not its
+    store counts its rows: a header-only CSV, whose shards state no count, read streamed and repeated
+    endlessly. Its first batch never came: the read reopened the empty file forever (spec alignment
+    2026-11-15, data.md's fourth finding)."""
+    from dew.data.compile import compile
+
+    path = tmp_path / "rows.csv"
+    path.write_text("id,text\n")
+    data = compile(Files(str(path)).repeat().batch(1), read="streamed",
+                   loading=Loading(workers=0, threads=1, read_buffer=1))
+    outcome: list[BaseException | object] = []
+
+    def first() -> None:
+        stream = data.train(DataPartition())
+        try:
+            outcome.append(next(iter(stream)))
+        except BaseException as refusal:
+            outcome.append(refusal)
+        finally:
+            stream.close()
+
+    reader = threading.Thread(target=first, daemon=True)
+    reader.start()
+    reader.join(120)
+    assert not reader.is_alive(), "the read of an empty repeated stream never returned"
+    assert isinstance(outcome[0], ValueError), outcome

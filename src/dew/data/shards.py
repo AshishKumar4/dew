@@ -49,13 +49,23 @@ def streamed(
         reader = _Taken(manifest.reader)
         return _ShardPass(grain.MapDataset.source(places), reader, cycle_length, loading, described)
     shards = _shards(manifest, partition=partition, loading=loading)
-    # Shards whose store counts their rows only where asked (a Parquet store's files) are counted once a read
-    # of them finds every one it reads empty (`_EmptyRun`), as a store of empty shards is refused above.
-    nothing = (functools.partial(_holds_nothing, manifest, loading.threads)
-               if epochs is None and manifest.counted is not None else None)
+    # An endless read whose run of empty shards covers a whole pass of its shards reads nothing forever
+    # (data.md §10: a repeated stream whose complete pass yields nothing is refused): shards whose store
+    # counts their rows only where asked (a Parquet store's files) are counted then, as a store of empty
+    # shards is refused above, and shards no store counts (a CSV's, a JSONL file's) are read empty by that
+    # run itself, every one of them in it, so it is refused then (`_EmptyRun`).
+    nothing = (None if epochs is not None
+               else _read_empty if manifest.counted is None
+               else functools.partial(_holds_nothing, manifest, loading.threads))
     root = _dealt(shards, seed=seed, epochs=epochs)[partition.cut()]
     return _ShardPass(root, manifest.reader, cycle_length, loading, described, quota,
                       None if nothing is None else (nothing, 2 * len(shards)))
+
+
+def _read_empty() -> bool:
+    """That a run of empty shards covering a whole pass of shards no store counts read them all empty: the run
+    itself is the count (`streamed`)."""
+    return True
 
 
 def _holds_nothing(manifest: ShardManifest, reads: int) -> bool:
