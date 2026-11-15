@@ -228,10 +228,15 @@ def test_each_rings_gathered_kernel_gradient_reads_its_operands_rows_where_their
                                       ((table, slots), tokens[table], cotangent[slots])):
             np.testing.assert_array_equal(np.asarray(gradient(tokens, cotangent, gather=tables)),
                                           np.asarray(gradient(rows, columns)))
+        np.testing.assert_array_equal(
+            np.asarray(gradient(tokens[table], cotangent, gather=(None, slots))),
+            np.asarray(gradient(tokens[table], cotangent[slots])))
 
 
 @pytest.mark.parametrize("generation_name", KERNEL_GRADIENT_TILES)
-def test_each_rings_gathered_kernel_gradient_lowers_for_cuda(generation_name):
+@pytest.mark.parametrize("gather_operands", [(True, False), (False, True), (True, True)],
+                         ids=("lhs", "rhs", "both"))
+def test_each_rings_gathered_kernel_gradient_lowers_for_cuda(generation_name, gather_operands):
     """A kernel gradient of gathered tokens and a scattered product's cotangent on a compile-only H100 and
     B200 lowers through Mosaic GPU: each operand's ring its producer's gather, by the gradient's depth or
     width."""
@@ -241,10 +246,11 @@ def test_each_rings_gathered_kernel_gradient_lowers_for_cuda(generation_name):
     def gathered(tokens, cotangent, table, slots):
         return mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=KERNEL_GRADIENT_TILES[generation_name],
                                out_dtype=jnp.float32, multiprocessors=target.multiprocessors, interpret=False,
-                               gather=(table, slots))
+                               gather=(table if gather_operands[0] else None,
+                                       slots if gather_operands[1] else None))
 
     with generation.assumed(generation_name):
-        jax.jit(gathered).trace(jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
+        jax.jit(gathered).trace(jax.ShapeDtypeStruct((1024 if gather_operands[0] else 2048, 512), jnp.bfloat16),
                                 jax.ShapeDtypeStruct((2048, 256), jnp.bfloat16),
                                 *(jax.ShapeDtypeStruct((2048,), jnp.int32),) * 2).lower(
                                     lowering_platforms=("cuda",))
