@@ -286,7 +286,7 @@ def _backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation:
     # (`x`'s tokens over `tokens`), the taps' count and the channels.
     row, spans, channel = outputs.axis(x, 0), outputs.axis(x, 1).ceil_div(tokens), outputs.axis(x, 2)
     out_type = (outputs.output(x.dtype, row, outputs.axis(x, 1), channel),
-                outputs.output(jnp.float32, row, spans, outputs.axis(operands[1], 1), channel),
+                outputs.output(jnp.float32, row, spans, outputs.axis(operands[1], 0), channel),
                 outputs.output(jnp.float32, row, spans, channel))
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, blocks, channels // lanes_),
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
