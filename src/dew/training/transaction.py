@@ -488,14 +488,15 @@ class Applied:
 def _formed(before: Variables, slots_before: optax.OptState, after: Variables, slots_after: optax.OptState
             ) -> tuple[Variables, optax.OptState, jax.Array]:
     """The parameters `after` and optimizer state `slots_after` a step formed from `before` and
-    `slots_before`, each leaf kept as it was where its candidate is not finite: a parameter with the copies
-    of it its optimizer's state holds (`_param_copies`, Adam's moments), together, and every other leaf of
-    the state by its own; and whether every leaf was written. A leaf's gate reads that leaf alone, so the
-    step holds no state beside another's (training.md, a step that is not finite)."""
-    def finite(leaf) -> jax.Array:
+    `slots_before`, each value kept as it was where its candidate is not finite: a parameter's element with
+    the same element of each copy of it its optimizer's state holds (`_param_copies`, Adam's moments),
+    together, and every other leaf of the state element by element; and whether every value was written. The
+    gate reads each element where it is formed, in the update's own fused pass, so the step holds no state
+    beside another's (training.md, a step that is not finite)."""
+    def finite(leaf) -> jax.Array | bool:
         # An array's own; a masked group's placeholder (`optax.MaskedNode`) holds no value.
         inexact = isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)
-        return jnp.isfinite(leaf).all() if inexact else jnp.asarray(a=True)
+        return jnp.isfinite(leaf) if inexact else True
 
     def chosen(flag, new, old):
         return jnp.where(flag, new, old) if isinstance(new, jax.Array) else new
@@ -507,9 +508,9 @@ def _formed(before: Variables, slots_before: optax.OptState, after: Variables, s
     slots = _with_copies(slots_after, after, lambda index, copy: jax.tree.map(
         chosen, flags, copy, copies_before[index]))
     slots = jax.tree.map(lambda new, old: chosen(finite(new), new, old), slots, slots_before)
-    # Every leaf written, the hyperparameters injected beside a state aside (`checked`'s view).
+    # Every value written, the hyperparameters injected beside a state aside (`checked`'s view).
     held = [*jax.tree.leaves(flags), *map(finite, jax.tree.leaves(_numerical(slots_after)))]
-    every = functools.reduce(jnp.logical_and, held, jnp.asarray(a=True))
+    every = functools.reduce(jnp.logical_and, [jnp.all(flag) for flag in held], jnp.asarray(a=True))
     return kept, slots, every
 
 
