@@ -412,7 +412,8 @@ def _target():
     compile_only_gpus("sm80", 1)
     device = topologies.TopologyDescription.deserialize(Path(os.environ[TOPOLOGY]).read_bytes()).devices[0]
     return generation.runtime_facts(generation.gpu_target(device.device_kind), device,
-                                    read=lambda ordinal, attribute: None)
+                                    read=lambda ordinal, attribute: None,
+                                    place=lambda ordinal, programs: None)
 
 
 def programs_of(flow: Flow) -> dict[str, tuple[Callable, list]]:

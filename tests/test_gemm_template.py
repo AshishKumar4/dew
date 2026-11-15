@@ -2161,14 +2161,14 @@ def test_a_tile_states_a_schedule_the_kernels_run():
                                 "family": "wgmma"} | fields)
 
 
-def pinned_gradient(tile: mosaic_gpu.Tiles, sizes):
-    """The kernel gradient of a Hopper's template pinned to `tile`, of groups `sizes` (dense where None),
-    interpreted."""
+def pinned_gradient(tile: mosaic_gpu.Tiles, sizes, gather: tuple | None = None):
+    """The kernel gradient of a Hopper's template pinned to `tile`, of groups `sizes` (dense where None), its
+    operands' rows read through `gather`'s tables where given, interpreted."""
     def dew(x, dy):
         with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
                 {grouped_matmul.MosaicTgmm: tile}):
             return gemm.gemm_t(x, dy, None if sizes is None else jnp.asarray(sizes), out_dtype=jnp.float32,
-                               interpret_on_cpu=True)
+                               interpret_on_cpu=True, gather=gather)
     return dew
 
 

@@ -471,7 +471,8 @@ class GpuTarget:
     persistent launch's grid of every multiprocessor runs as a second wave of whole walks (M-EM-52-gh200:
     a 2 x 2 kernel gradient's 132 CTAs read 1.10 waves, a 2 x 4's 128 1.07, 1.63x the pair's time;
     cuBLASLt's 2 x 4 launched 120, 1 wave). The driver's `cudaOccupancyMaxActiveClusters` states it on the
-    part; unknown for a part of another count of multiprocessors."""
+    part, which an attached device's target reads in place of the table's (`runtime_facts`); unknown for a
+    part of another count of multiprocessors."""
     l2_bytes: int | None = None
     """The L2 cache's bytes, which a launch whose operands are re-read across its programs (a split
     contraction's) holds its re-read footprint against: the datasheet's, where NVIDIA's tuning guide states
@@ -1039,19 +1040,38 @@ def _one_kind(devices) -> None:
                          "be of one kind")
 
 
-def runtime_facts(target: GpuTarget, device, *, read: Callable[[int, int], int | None] | None = None
-                  ) -> GpuTarget:
+def runtime_facts(target: GpuTarget, device, *, read: Callable[[int, int], int | None] | None = None,
+                  place: Callable[[int, int], int | None] | None = None) -> GpuTarget:
     """`target` with the facts a real CUDA `device` reports of itself in place of the table's: its
     multiprocessors, its block's shared memory, its clock, memory bandwidth and L2 cache from the CUDA
-    driver (`_driver_facts`, read by `read`, `dew._devices.gpu_attribute` by default), read free at
-    runtime, its family's facts its capability's (`architecture`). A GPU the table does not name so
-    keeps every resource a kernel's requirements and cost read."""
+    driver (`_driver_facts`, read by `read`, `dew._devices.gpu_attribute` by default), and the
+    multiprocessors its clusters of four and eight place on (`_placed`, read by `place`,
+    `dew.nn.kernels.clusters.cluster_placement` by default), read free at runtime, its family's facts its
+    capability's (`architecture`). A GPU the table does not name so keeps every resource a kernel's
+    requirements and cost read."""
     if read is None:
         from dew._devices import gpu_attribute
         read = gpu_attribute
+    if place is None:
+        from dew.nn.kernels.clusters import cluster_placement
+        place = cluster_placement
     facts = {'multiprocessors': _multiprocessors(device), 'shared_limit': _shared_memory(device),
              **dict(_driver_facts(device.local_hardware_id, read))}
-    return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None})
+    attached = dataclasses.replace(target, **{name: value for name, value in facts.items()
+                                              if value is not None})
+    placed = _placed(device.local_hardware_id, attached.multiprocessors, place)
+    return dataclasses.replace(attached, cluster_placed=dict(placed)) if placed else attached
+
+
+@functools.cache
+def _placed(ordinal: int, multiprocessors: int | None, place: Callable[[int, int], int | None]
+            ) -> tuple[tuple[tuple[int, int], int], ...]:
+    """The visible GPU `ordinal`'s placement of clusters of four and of eight (`GpuTarget.cluster_placed`,
+    keyed by its `multiprocessors`), as `place` reads it, once a process; none where it reads none."""
+    if multiprocessors is None:
+        return ()
+    read = ((programs, place(ordinal, programs)) for programs in (4, 8))
+    return tuple(((multiprocessors, programs), placed) for programs, placed in read if placed is not None)
 
 
 SHARED_BUDGET = 99 * 1024
