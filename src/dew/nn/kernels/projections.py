@@ -367,28 +367,41 @@ def rows_split(lhs: jax.Array) -> jax.sharding.PartitionSpec | None:
 def mapped_shards(lhs: jax.Array, matrices: tuple[jax.Array, ...], paths: tuple, out_dtype,
                   precision: PrecisionLike) -> tuple[jax.sharding.PartitionSpec, dict] | None:
     """Where a projection of `lhs` by `matrices` (one, or a joined projection's kernels side by side, each
-    the parameter at its variables `path`) runs per shard, as fully sharded data parallelism defines one:
-    the rows as `rows_split` splits them and each matrix where the traced program's layout places it
-    (`placing`, `Layout.leaf_spec`), gathered whole in the map (`on_shards`' `gathered`), so its gradient
-    leaves the map reduce-scattered back to that placement; where a launch takes the product of a device's
-    own rows (`launched`'s decision, reported once inside the map). None elsewhere, the product the
-    partitioner's: no rows split alone, no layout traced under, or a product no launch takes per device
-    (an XLA-declared cell, a CPU or a TPU), which runs as it ran before (train 816 F3)."""
+    the parameter at its variables `path`) runs per shard, as fully sharded data parallelism defines one
+    (`shard_placement`): the rows as `rows_split` splits them and each matrix where the traced program's
+    layout places it (`placing`, `Layout.leaf_spec`), gathered whole in the map (`on_shards`' `gathered`),
+    so its gradient leaves the map reduce-scattered back to that placement; where a launch takes the product
+    of a device's own rows (`launched`'s decision, reported once inside the map). None elsewhere, the
+    product the partitioner's: no rows split alone, no layout traced under, or a product no launch takes per
+    device (an XLA-declared cell, a CPU or a TPU), which runs as it ran before (train 816 F3)."""
+    placement = shard_placement(lhs, matrices, paths)
+    if placement is None:
+        return None
+    split, gathered, rows = placement
+    matrix = jax.ShapeDtypeStruct((lhs.shape[-1], sum(each.shape[1] for each in matrices)), matrices[0].dtype)
+    product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
+    taken, _ = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole=True,
+                        target=generation.gpu_target(), choices=_cache.KERNEL_CHOICES.value,
+                        pins=_cache.KERNEL_PINS.value)
+    return (split, gathered) if taken else None
+
+
+def shard_placement(lhs: jax.Array, matrices: tuple[jax.Array, ...], paths: tuple
+                    ) -> tuple[jax.sharding.PartitionSpec, dict, jax.ShapeDtypeStruct] | None:
+    """How products of `lhs` by `matrices` (each the parameter at its variables `path`) run per shard where
+    they do, whichever launch takes them (`mapped_shards`' for one projection, `dew.nn.gated_mlp`'s for a
+    fused MLP's three): the rows as `rows_split` splits them, each matrix where the traced program's layout
+    places it (`placing`, `Layout.leaf_spec`), by its index among the map's operands after the rows, gathered
+    whole in the map (`on_shards`' `gathered`), and the rows each shard holds, flattened to a matrix's;
+    None where no rows split alone or no layout is traced under."""
     split, layout = rows_split(lhs), placed_layout()
     if split is None or layout is None:
         return None
     mesh = jax.sharding.get_abstract_mesh()
     shards = math.prod(mesh.shape[axis] for entry in split for axis in mesh_axes(entry))
     rows = jax.ShapeDtypeStruct((math.prod(lhs.shape[:-1]) // shards, lhs.shape[-1]), lhs.dtype)
-    matrix = jax.ShapeDtypeStruct((lhs.shape[-1], sum(each.shape[1] for each in matrices)), matrices[0].dtype)
-    product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
-    taken, _ = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole=True,
-                        target=generation.gpu_target(), choices=_cache.KERNEL_CHOICES.value,
-                        pins=_cache.KERNEL_PINS.value)
-    if not taken:
-        return None
     return split, {1 + index: layout.leaf_spec(mesh, path, each)
-                   for index, (path, each) in enumerate(zip(paths, matrices, strict=True))}
+                   for index, (path, each) in enumerate(zip(paths, matrices, strict=True))}, rows
 
 
 def kernel_path(layer) -> tuple:

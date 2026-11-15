@@ -34,7 +34,7 @@ from dew.nn.kernels import gemm, grouped_matmul, projections
 from dew.nn.kernels.generation import INHERENT, Choice, device_generation, gpu_target
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
 from dew.nn.precision import recipe_role
-from dew.nn.sharding import seen_whole
+from dew.nn.sharding import on_shards, seen_whole
 
 FUSION_ROW = 'ledger 1958'
 """The row tracking the fused MLP's reach: a projection it does not reproduce, and its receipts."""
@@ -123,24 +123,38 @@ def gated_case(x: jax.Array, projections_: Sequence[nn.Module], activation: str,
                limit: float | None = None) -> GatedCase:
     """The `GatedCase` of a gated MLP's `projections_` (gate, up, down) over its input `x`, its gated product
     `activation`'s clamped at `limit`."""
-    gate, _, down = projections_
+    gate = projections_[0]
     found = projections_of(projections_)
     # A kernel a wrapper owns the products of (a served model's quantized kernel, `found.intercepted`) is
     # the wrapper's to read, never an array of the products' dtype.
-    kernels = ([meta.unbox(projection.get_variable('params', 'kernel')) for projection in (gate, down)]
+    kernels = (tuple(meta.unbox(projection.get_variable('params', 'kernel')) for projection in projections_)
                if found.held and not found.intercepted else None)
-    dtype = canonicalize_dtype(x, *(kernels or ()), dtype=gate.dtype)
+    # The gate's and the down projection's kernels promote with the rows, as `gated_mlp` promotes them.
+    dtype = canonicalize_dtype(x, *(() if kernels is None else (kernels[0], kernels[2])), dtype=gate.dtype)
+    # Where the rows run per shard (`_placement`), the products are each shard's, of its rows and the
+    # kernels gathered whole in the map.
+    placement = None if kernels is None else _placement(x, projections_, kernels)
+    rows = (x.size // x.shape[-1], x.shape[-1]) if placement is None else placement[2].shape
     return GatedCase(
         projections=found,
         uniform=len({(projection.dtype, projection.precision, projection.promote_dtype)
                      for projection in projections_}) == 1,
         biased=any(projection.use_bias for projection in projections_),
         recipe=recipe_role() is not None,
-        rows=jax.ShapeDtypeStruct((x.size // x.shape[-1], x.shape[-1]), dtype),
+        rows=jax.ShapeDtypeStruct(rows, dtype),
         kernels=None if kernels is None else (jax.ShapeDtypeStruct(kernels[0].shape, dtype),
-                                              jax.ShapeDtypeStruct(kernels[1].shape, dtype)),
-        whole=seen_whole(x) and all(seen_whole(kernel) for kernel in kernels or ()),
+                                              jax.ShapeDtypeStruct(kernels[2].shape, dtype)),
+        whole=placement is not None or (seen_whole(x)
+                                        and all(seen_whole(kernel) for kernel in kernels or ())),
         precision=gate.precision, hook=activations.gated_hook(activation, limit))
+
+
+def _placement(x: jax.Array, projections_: Sequence[nn.Module], kernels: tuple[jax.Array, ...]):
+    """Where a gated MLP of `x` through `projections_` (gate, up, down), of `kernels`, runs per shard
+    (`projections.shard_placement`): its rows split alone on the mesh, each kernel gathered whole in the
+    map from where the traced program's layout places it, as a projection's product maps its rows
+    (`projections.mapped_shards`); None elsewhere."""
+    return projections.shard_placement(x, kernels, tuple(map(projections.kernel_path, projections_)))
 
 
 def fuses(projections_: Sequence[nn.Module], rows: jax.Array, activation: str,
@@ -161,10 +175,21 @@ def gated_mlp(x: jax.Array, projections_: Sequence[nn.Dense], activation: str, *
     promoted = [_promoted(projection, x, meta.unbox(projection.get_variable('params', 'kernel')), None)
                 for projection in projections_]
     inputs = promoted[0][0]
-    gate, up, down = (kernel for _, kernel, _ in promoted)
-    out = fused_products(inputs.reshape(-1, inputs.shape[-1]), (gate, up, down), activation, limit=limit,
-                         precision=projections_[0].precision, names=names)
-    return out.reshape(*inputs.shape[:-1], out.shape[-1])
+    kernels = tuple(kernel for _, kernel, _ in promoted)
+
+    def products(inputs, gate, up, down):
+        out = fused_products(inputs.reshape(-1, inputs.shape[-1]), (gate, up, down), activation, limit=limit,
+                             precision=projections_[0].precision, names=names)
+        return out.reshape(*inputs.shape[:-1], out.shape[-1])
+
+    # On a mesh splitting its rows alone, each device's rows are its own products' (`_placement`, as
+    # `fuses` read them), its kernels gathered whole there, so each one's gradient leaves the map
+    # reduce-scattered back to its placement.
+    placement = _placement(x, projections_, kernels)
+    if placement is None:
+        return products(inputs, *kernels)
+    split, gathered, _ = placement
+    return on_shards(products, split, (inputs, *kernels), gathered=gathered)
 
 
 def fused_products(rows: jax.Array, kernels: tuple[jax.Array, jax.Array, jax.Array], activation: str, *,

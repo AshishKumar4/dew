@@ -102,6 +102,35 @@ def test_a_gated_mlp_runs_fused_where_named_and_its_products_apart_where_no_rece
         assert kernels(plain, gated_mlp="fused") == ["apart"]
 
 
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("generation_name", generations("sm90", "sm100"))
+def test_a_gated_mlp_named_fused_on_a_data_split_mesh_runs_its_products_per_shard(generation_name):
+    """A `GatedMLP` named fused on a mesh whose data axis splits its rows alone, traced as a training step
+    traces it (the trainer's layout, `placing`, under the default rules), runs its three products fused on
+    each device's own rows (`gated_mlp._placement`: a map per shard, its kernels gathered whole there), as
+    a projection's product maps its rows (`projections.mapped_shards`), where the template's launch was
+    refused the split rows (row 6594). Its numerics per shard are the matrix's (tests/gated_mlp_matrix.py)."""
+    from flax import linen as nn
+    from jax.sharding import Mesh
+
+    from dew.distributed.placement import Layout
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn.mlp import GatedMLP
+    from dew.nn.sharding import placing
+
+    layer = GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((2, 64, FEATURES), jnp.bfloat16)
+    params = jax.eval_shape(layer.init, jax.random.key(0), x)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:2]), ("data",)), generation_name)
+    with (generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh),
+          nn.logical_axis_rules(DEFAULT_RULES), placing(Layout(min_shard=1)),
+          generation.chosen(grouped_matmul="mosaic", gated_mlp="fused"), generation.routes() as routes):
+        traced = jax.make_jaxpr(layer.apply)(params, x)
+    assert [route.kernel for route in routes if route.choice == "gated_mlp"] == ["fused"]
+    assert traced.out_avals[0].shape == (2, 64, FEATURES)
+    assert "shard_map" in str(traced)
+
+
 def test_a_gated_mlps_case_runs_at_the_dtype_its_products_run_and_asks_nothing_apart():
     """The fused MLP's selector reads the dtype its products run at, the promotion of the input and the
     kernels (`gated_case`, `canonicalize_dtype`): fp32 for bf16 rows over fp32 kernels with no dtype set,
