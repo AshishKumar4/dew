@@ -2030,10 +2030,11 @@ served = collections.Counter()
 monitoring.register_event_listener(
     lambda event, **_: served.update([event.rsplit("/", 1)[-1]]) if "lowering_cache" in event else None)
 ready_process()
-# A step on one B200, compiled ahead for it: its program's mesh one compile-only device's.
+# A step on one B200, compiled ahead for it: its program set on one compile-only device's mesh, as a trainer
+# sets its step's (`jax.set_mesh`).
 device = compile_only_gpus("sm100")[0]
 mesh = jax.sharding.Mesh(np.array([device]), ("data",))
-with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+with jax.set_mesh(mesh):
     certified, _ = gate._reverse_walk_certified()
 bodies = {kernel_hash for each in certified for kernel_hash, _ in each.kernels.values()}
 print(json.dumps({"served": dict(served), "bodies": len(bodies)}))
@@ -2045,7 +2046,7 @@ and the kernel bodies its certifications compiled."""
 
 @lowers('sm100')
 def test_a_program_on_one_gpu_reads_back_every_kernel_its_certification_lowered(tmp_path):
-    """A training call certified on its own GPU and lowered in a program on that one GPU's mesh
+    """A training call certified on its own GPU and lowered in a program set on that one GPU's mesh
     (`PROGRAM_LOWERED`): each kernel body is lowered once in Python, by its certification on the program's
     mesh (`report._certifying_placement`), and the program reads it back from the lowering cache. On a mesh
     of its own, certification lowered the call's nine kernels to jaxprs of other abstract values, and the
