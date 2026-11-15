@@ -118,10 +118,15 @@ def free_port() -> int:
 
 
 def worker_env(devices: int) -> dict[str, str]:
-    """This checkout's source, CPU devices and faulthandler in each worker."""
-    return {**os.environ, "JAX_PLATFORMS": "cpu",
-            "PYTHONPATH": str(REPO_ROOT / "src"), "PYTHONFAULTHANDLER": "1",
-            "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}"}
+    """This checkout's source, `devices` CPU devices and faulthandler in each worker, which keeps the lane's
+    other XLA flags (`lane_environment`: its CPU collectives' memory-optimized schedule, row 5397, and no
+    excess precision)."""
+    from lane_environment import without_flags
+
+    count = "--xla_force_host_platform_device_count"
+    flags = f"{without_flags(os.environ.get('XLA_FLAGS', ''), count)} {count}={devices}".strip()
+    return {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(REPO_ROOT / "src"),
+            "PYTHONFAULTHANDLER": "1", "XLA_FLAGS": flags}
 
 
 class Drained:

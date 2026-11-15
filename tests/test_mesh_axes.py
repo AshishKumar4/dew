@@ -939,4 +939,4 @@ def test_a_mesh_of_one_device_lowers_a_decoders_gradient_with_no_placement_const
         variables = jax.jit(model.init)(jax.random.key(0), tokens)
         text = jax.jit(jax.grad(lambda v: model.apply(v, tokens).astype(jnp.float32).mean())).lower(
             variables).as_text()
-    assert "@Sharding" not in text
+    assert text.count("sharding_constraint") + text.count("@Sharding") == 0, text.count("sharding_constraint")

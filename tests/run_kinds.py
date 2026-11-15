@@ -301,7 +301,8 @@ def saved_record(run: RunConfig, root: Path, name: str) -> Path:
     return record
 
 
-def cli_settings(root: Path, name: str, assigned: Mapping[str, str] = MappingProxyType({})) -> dict[str, str]:
+def cli_settings(root: Path, name: str, assigned: Mapping[str, object] = MappingProxyType({})
+                 ) -> dict[str, object]:
     """`dew train`'s settings (`--set path=value`) for a run named `name` under `root`: one step, no
     evaluation or checkpoint between steps, one host, its programs compiled into the suite's cache, which a
     run naming its own would leave the training process holding; each of `assigned` over them."""
@@ -322,17 +323,19 @@ def trained_record(record: Path, settings: Mapping[str, object], devices: int | 
     """The run directory `dew train` writes for the run saved at `record` with `settings` set and `trust`
     trusted, as a user's command trains it: in this process where `devices` is None, else in a fresh one
     that sees `devices` CPU devices (`process_support.worker_env`), a run's device count being its
-    process's, fixed as its backend opens. A run named with its checkpoint directory in `settings` writes
-    there; any other where its record names (the record's own directory where it resumes from it)."""
+    process's, fixed as its backend opens. It writes where its trainer names (`TrainerConfig.directory`),
+    its record's name and directory under those `settings` sets: a run resumed from its record its own."""
+    trainer = RunConfig.load(str(record)).trainer
+    directory = dataclasses.replace(trainer, checkpoint_dir=str(settings.get(
+        "trainer.checkpoint_dir", trainer.checkpoint_dir))).directory(str(settings.get("trainer.name",
+                                                                                         trainer.name)))
     arguments = [str(record / "run.json"), *cli_arguments(settings, trust)]
     if devices is None:
         assert main(["train", *arguments]) == 0
     else:
         dew_train(REPO_ROOT, {**worker_env(devices), "PYTHONPATH": os.pathsep.join(
             (str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")))}, *arguments)
-    if {"trainer.name", "trainer.checkpoint_dir"} <= set(settings):
-        return Path(str(settings["trainer.checkpoint_dir"])) / str(settings["trainer.name"])
-    return record
+    return Path(directory)
 
 
 def trained_by_cli(run: RunConfig, root: Path, name: str, assigned: dict[str, str]) -> Path:
