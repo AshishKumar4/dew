@@ -160,7 +160,8 @@ compile_ahead planned 425 (row 4260's profile), and every plan kept for the proc
 geometry a derivation ever tried (row 4390)."""
 
 _PLANS: collections.OrderedDict = collections.OrderedDict()
-"""`_planned`'s plans by their call, tiles, bundle and target's facts, the most recently read last."""
+"""`_planned`'s plans by their call, tiles, bundle and target's facts, the most recently read last: each the
+call's launches by the depth they were planned at, its trace's at one stage."""
 _PLANNING = threading.Lock()
 
 
@@ -176,7 +177,9 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
     (`Tiles.stages`) moves only the launches whose ring is the tiles' (`mainloop.Launch.ring`): the call is
     traced once at one stage and those launches planned at the tiles' depth (`Launch.deepened`). Traced at
     each depth, the derivation took 2.0 s of a CPU's time for Kimi Linear's delta attention on sm100, 30
-    traces of 66 ms (jsf-dtime at 0cbc7f8f1d9)."""
+    traces of 66 ms (jsf-dtime at 0cbc7f8f1d9); each depth's launches are kept beside the trace's, as a
+    derivation asks one tiles' plan again for every rule it reads (replanned at each ask, 1.6 million rings
+    deepened over a refusal walk's 296 derivations, 461 of its 842 profiled seconds, row 6551)."""
     facts = (target.generation, target.device_kind, target.shared_limit, target.multiprocessors)
     # A backward's plan holds the training call's forward: one key for it.
     training_forward = training_forward and not backward
@@ -184,19 +187,22 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
     key = (shapes, traced, family, facts, max_segments, delta, backward, training_forward, rounded, wide,
            ranged, skip, forked)
     with _PLANNING:
-        found = _PLANS.get(key)
-        if found is not None:
+        depths = _PLANS.get(key)
+        if depths is not None:
             _PLANS.move_to_end(key)
-    if found is None:
+            if (found := depths.get(tiles.stages)) is not None:
+                return found
+    if depths is None:
         *operands, starts = shapes
-        found = planned(*operands, tiles=traced, family=family, starts=starts, max_segments=max_segments,
-                        delta=delta, backward=backward, training_forward=training_forward, target=target,
-                        rounded=rounded, wide=wide, ranged=ranged, skip=skip, forked=forked)
-        with _PLANNING:
-            _PLANS[key] = found
-            while len(_PLANS) > PLANS_KEPT:
-                _PLANS.popitem(last=False)
-    return tuple(launch.deepened(tiles.stages, target) for launch in found)
+        depths = {1: planned(*operands, tiles=traced, family=family, starts=starts, max_segments=max_segments,
+                             delta=delta, backward=backward, training_forward=training_forward, target=target,
+                             rounded=rounded, wide=wide, ranged=ranged, skip=skip, forked=forked)}
+    found = tuple(launch.deepened(tiles.stages, target) for launch in depths[1])
+    with _PLANNING:
+        _PLANS[key] = {**_PLANS.get(key, depths), tiles.stages: found}
+        while len(_PLANS) > PLANS_KEPT:
+            _PLANS.popitem(last=False)
+    return found
 
 
 def _shaped(forked: chunk_forward.ForkedTable | None) -> chunk_forward.ForkedTable | None:
