@@ -26,9 +26,21 @@ import numpy as np
 import pytest
 from map_judge import sharded
 from option_witness import SETTINGS, TASK_RUNS, same, saved_with, witnessed_on
-from run_kinds import ADAPTED, DEFAULT_METRICS, KINDS, RATE, TINY_LAYA, decision, dreamed, scalars, trained
+from run_kinds import (
+    ADAPTED,
+    DEFAULT_METRICS,
+    KINDS,
+    RATE,
+    TINY_LAYA,
+    cli_settings,
+    decision,
+    dreamed,
+    saved_record,
+    scalars,
+    trained,
+    trained_record,
+)
 
-from dew._cli.main import main
 from dew.batch import FROZEN
 from dew.config import SourceOptions, TrainerConfig
 from dew.lora import LoRA
@@ -48,19 +60,13 @@ def test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set(
     logged and scored on the held split, with no metric the kind would score by default and the
     summary named formed from the scores; and every step's checkpoint is kept, four, where the
     default keeps the latest two and the best, in the directory named."""
-    record = tmp_path / "record"
-    KINDS[kind](tmp_path, drawn=False).save(str(record))
-    runs = tmp_path / "runs"
-    settings = {"trainer.name": "set", "trainer.checkpoint_dir": str(runs), "trainer.steps": "4",
-                "trainer.accumulation": "2", "trainer.log_every": "1", "trainer.eval_every": "1",
-                "trainer.checkpoint_every": "1", "trainer.keep": "4", "model.dtype": "float16",
-                "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None",
-                "optim.learning_rate": str(RATE), "val_metrics": "[]",
-                "val_summaries": json.dumps([{"name": "board", "weights": {"val/loss": 1},
-                                              "better": "lower"}])}
-    assert main(["train", str(record / "run.json"),
-                 *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
-    run = runs / "set"
+    record = saved_record(KINDS[kind](tmp_path, drawn=False), tmp_path, "set")
+    run = trained_record(record, cli_settings(tmp_path, "set", {
+        "trainer.steps": "4", "trainer.accumulation": "2", "trainer.log_every": "1",
+        "trainer.eval_every": "1", "trainer.checkpoint_every": "1", "trainer.keep": "4",
+        "model.dtype": "float16",
+        "optim.learning_rate": str(RATE), "val_metrics": "[]",
+        "val_summaries": json.dumps([{"name": "board", "weights": {"val/loss": 1}, "better": "lower"}])}))
     logged = scalars(run)
     assert {step for step, row in logged.items() if "train/loss" in row} == {1, 2, 3, 4}
     committed = sorted(step for step, row in logged.items() if "train/grad_norm" in row)

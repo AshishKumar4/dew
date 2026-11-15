@@ -14,8 +14,8 @@ import jax
 import numpy as np
 import pytest
 from objective_data import IMAGES
+from run_kinds import cli_settings, saved_record, trained_record
 
-from dew._cli.main import main
 from dew.checkpoints import Checkpoints
 from dew.config import ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig, FlowRolloutConfig
@@ -169,18 +169,11 @@ def test_dew_train_trains_an_inpainting_pipeline_through_its_masks(inpainting, o
     assert masks.shape == (8, SIZE, SIZE, 1) and set(np.unique(masks)) <= {0.0, 1.0}
     assert len({mask.tobytes() for mask in masks}) > 1, "each image draws its own mask"
 
-    record = tmp_path / "record"
-    run.save(str(record))
-    runs = tmp_path / "runs"
-    settings = {"trainer.name": "inpainting", "trainer.checkpoint_dir": str(runs), "trainer.steps": "1",
-                "trainer.log_every": "1", "trainer.eval_every": "None", "trainer.checkpoint_final": "True",
-                "trainer.checkpoint_every": "None", "trainer.multi_host": "False",
-                "trainer.compilation_cache_dir": "None",
-                "optim.learning_rate": "0.05"}
-    assert main(["train", str(record / "run.json"),
-                 *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
+    settings = cli_settings(tmp_path, "inpainting", {"trainer.log_every": "1", "optim.learning_rate": "0.05",
+                                                     "trainer.checkpoint_final": "True"})
+    directory = trained_record(saved_record(run, tmp_path, "inpainting"), settings)
 
-    trained = Checkpoints(str(runs / "inpainting")).variables(ema=False)
+    trained = Checkpoints(str(directory)).variables(ema=False)
     published = load_diffusion_source(str(pipeline), dtype="float32", attention_impl="xla",
                                       size=(SIZE, SIZE)).variables
     moved = [not np.array_equal(np.asarray(after), np.asarray(before)) for after, before in zip(
@@ -212,18 +205,12 @@ def test_an_inpainting_run_validates_through_its_held_out_images_masks(inpaintin
         run = DiffusionRunConfig(pretrained=str(inpainting["ddim"]), preset=None, model=precision(),
                                  data=masked_images(), validation=masked_images(rejects=False, ratio=ratio),
                                  val_metrics=(), **fields)
-        record = tmp_path / name
-        run.save(str(record))
-        runs = tmp_path / "runs"
-        settings = {"trainer.name": name, "trainer.checkpoint_dir": str(runs), "trainer.steps": "2",
-                    "trainer.log_every": "1", "trainer.eval_every": "1", "trainer.checkpoint_final": "False",
-                    "trainer.checkpoint_every": "None", "trainer.multi_host": "False",
-                    "trainer.compilation_cache_dir": "None", "optim.learning_rate": "0.05"}
-        flags = [flag for path, value in settings.items() for flag in ("--set", f"{path}={value}")]
-        assert main(["train", str(record / "run.json"), *flags]) == 0
+        directory = trained_record(saved_record(run, tmp_path, name), cli_settings(tmp_path, name, {
+            "trainer.steps": "2", "trainer.log_every": "1", "trainer.eval_every": "1",
+            "trainer.checkpoint_final": "False", "optim.learning_rate": "0.05"}))
         from dew.training import LocalTracker
 
-        rows = [values for _, values in LocalTracker(runs / name / "tracking").scalars()]
+        rows = [values for _, values in LocalTracker(directory / "tracking").scalars()]
         assert [row["train/loss"] for row in rows if "train/loss" in row]
         return [value for row in rows for key, value in sorted(row.items())
                 if key.startswith("val/") and key.endswith("loss")]
