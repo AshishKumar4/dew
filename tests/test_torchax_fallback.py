@@ -21,7 +21,10 @@ import functools
 import itertools
 import json
 import math
+import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import jax
@@ -1568,6 +1571,33 @@ def test_experts_transformers_loops_over_run_at_static_shapes_as_transformers_co
     assert identity.any() and not identity.all()
     assert_as_exact(ours, theirs(reference), draw, "longcat logits", seeds=LONGCAT_SEEDS,
                     truth_fn=theirs(wide, float64))
+
+
+def a_tier_three_source_runs_in_a_process_with_no_cpu_backend(tmp_path):
+    """A tiny Longcat Flash, admitted to tier 3, loads and runs in a process of this GPU alone
+    (`JAX_PLATFORMS=cuda`, no CPU backend): its admission decides its causality from its programs
+    (`sequence_causality`), on no device, where it ran the probe's forwards on the host's CPU and raised
+    in such a process (PM-PRODUCT-01): its logits over drawn ids, finite at the source's vocabulary."""
+    torch.manual_seed(0)
+    model = transformers.LongcatFlashForCausalLM(transformers.LongcatFlashConfig(**LONGCAT)).eval()
+    model.save_pretrained(tmp_path / "source")
+    tokens = np.random.default_rng(0x6776).integers(0, LONGCAT["vocab_size"], (2, 12)).astype(np.int32)
+    np.save(tmp_path / "tokens.npy", tokens)
+    script = (
+        "import sys, warnings\n"
+        "import jax, numpy as np\n"
+        "from dew.interop import Pretrained\n"
+        "assert {device.platform for device in jax.devices()} == {'gpu'}\n"
+        "assert 'cpu' not in jax.config.jax_platforms\n"
+        "with warnings.catch_warnings():\n"
+        "    warnings.simplefilter('ignore')\n"
+        "    loaded = Pretrained.load(sys.argv[1], dtype='float32')\n"
+        "logits = loaded.model.apply(loaded.variables, np.load(sys.argv[2]))\n"
+        "np.save(sys.argv[3], np.asarray(logits))\n")
+    subprocess.run([sys.executable, "-c", script, str(tmp_path / "source"), str(tmp_path / "tokens.npy"),
+                    str(tmp_path / "logits.npy")], env={**os.environ, "JAX_PLATFORMS": "cuda"}, check=True)
+    logits = np.load(tmp_path / "logits.npy")
+    assert logits.shape == (*tokens.shape, LONGCAT["vocab_size"]) and np.isfinite(logits).all()
 
 
 def test_a_documents_reach_is_its_largest_place_in_any_order():

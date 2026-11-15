@@ -11,7 +11,11 @@ causality as the whole set of positions read would. Slices, concatenations, pads
 indices the program computes without the tokens, reshapes, broadcasts, cumulative operations, convolutions and
 scans (step by step, their carries and initial state included) each move those positions as they move the
 entries; a contraction, reduction, sort or selection across the positions' axis gives every entry the latest
-of all, as does any operation the walk holds no rule for (`_RULES`, `dew.nn.programs.positionwise`). Dew's
+of all, as does any operation the walk holds no rule for (`_RULES`, `dew.nn.programs.positionwise`). A
+contraction of two values along their positions on two axes of its own (attention's scores written out)
+reads along both (`Pair`), each value the tokens reach taken as finite and below half an ulp of its
+dtype's largest, so a mask that takes each later key's score to minus infinity or its dtype's lowest zeroes
+its softmax there, and the weighted values read no later key. Dew's
 causal attention (`CAUSAL_ATTENTION`) gives each query its own position's latest and its keys' up to its own;
 attention under a visibility its caller states (`STATED_ATTENTION`) gives each position its own query's, key's
 and value's, the caller's visibility being the call's and not the source's; a computation Dew states is token
@@ -26,11 +30,13 @@ the sequence's length), so each program a model runs is proven on its own."""
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 import weakref
 from collections.abc import Callable, Sequence
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.core import ShapedArray
 from jax.extend import core
@@ -126,32 +132,95 @@ def _read_at(latest: np.ndarray, rows: np.ndarray) -> np.ndarray:
     return np.where(rows >= 0, latest[np.clip(rows, 0, len(latest) - 1)], NONE)
 
 
-type Held = Reads | None
+@dataclasses.dataclass(frozen=True)
+class Pair:
+    """A value whose entries read along two of its axes (`axes`, a query's and a key's): its entry at
+    (i, j) along them reads none past `latest[i, j]`, and where `held[i, j]` its value is `value[i, j]`
+    whatever the tokens, reading nothing. A contraction of two values the tokens reach along their
+    positions on two axes makes one (attention's scores), none of its entries held. The walk takes every
+    value a program computes from the tokens as finite and below half an ulp of its dtype's largest in
+    magnitude (2^103 in float32, 2^119 in bfloat16): the values for which a mask at the dtype's lowest,
+    added, leaves the lowest, as it rounds, so transformers' masks are causal exactly there. So a score plus
+    minus infinity, or plus the lowest, is that mask; its exponential, less the row's maximum, zero; and zero
+    times a value the later key reads zero (masked attention written out, transformers' own). An operation
+    the walk holds no such rule for reads it as `collapsed`."""
+
+    axes: tuple[int, int]
+    latest: np.ndarray
+    held: np.ndarray
+    value: np.ndarray
+
+    @property
+    def last(self) -> int:
+        return int(self.latest.max(initial=NONE))
+
+    def collapsed(self) -> Reads:
+        """Its reads along its first axis alone, each index the latest of its row."""
+        return Reads(self.axes[0], self.latest.max(axis=1, initial=NONE))
+
+    @classmethod
+    def unheld(cls, axes: tuple[int, int], latest: np.ndarray) -> Pair:
+        """A pair reading `latest`, no entry held."""
+        return cls(axes, latest, np.zeros(latest.shape, bool), np.zeros(latest.shape))
+
+
+type Held = Reads | Pair | None
 """What the walk knows of a value: the positions it reads, or None where the tokens do not reach it."""
 
 
-def causality_refusal(closed: core.Jaxpr, tokens: int, length: int,
-                      positional: Sequence[int]) -> str | None:
-    """Why the program `closed` is not provably causal at `length` tokens (its input `tokens`, `[B, S]`,
-    the sequence on axis 1), or None where each of its `positional` outputs (by index, each holding its
+def _reads(value: Held) -> Reads | None:
+    """`value`'s reads along one axis at most: a `Pair` `collapsed`."""
+    return value.collapsed() if isinstance(value, Pair) else value
+
+
+@dataclasses.dataclass(frozen=True)
+class Causality:
+    """A walk's verdict on a program (`causality`): why it is not provably causal, None where it is, and
+    the dtypes whose largest finite value it took as a mask (`Pair`: the values the tokens reach below
+    half an ulp of it, where adding it leaves it), the assumption a causal verdict rests on."""
+
+    refusal: str | None
+    bounded: tuple[str, ...]
+
+    def assumption(self) -> str:
+        """The assumption a causal verdict rests on, in words; empty where it rests on none past
+        finiteness."""
+        if not self.bounded:
+            return ""
+        return (f"causal where its values stay below half an ulp of {', '.join(self.bounded)}'s largest, as "
+                "its masks at the dtype's lowest are in transformers")
+
+
+def causality(closed: core.Jaxpr, tokens: int, length: int, positional: Sequence[int]) -> Causality:
+    """The walk's verdict on the program `closed` at `length` tokens (its input `tokens`, `[B, S]`, the
+    sequence on axis 1): causal where each of its `positional` outputs (by index, each holding its
     positions on axis 1: a forward's logits and states) reads at a position that position and earlier
     ones alone. It holds for this program alone: another length's, or another call's, may compute
     otherwise, so a caller proves each program it runs (`torchax_fallback.TorchGraph`)."""
     held: list[Held] = [None] * len(closed.jaxpr.invars)
     held[tokens] = Reads(1, np.arange(length, dtype=np.int64))
     walk = _Walk(length)
-    consts = [np.asarray(const) if _small_integer(const) else None for const in closed.consts]
+    consts = [np.asarray(const) if _small_held(const) else None for const in closed.consts]
     # The values it evaluates (indices, their tests) computed now on this host, also where a trace and its
     # mesh enclose the walk (a program proven as it is traced, `torchax_fallback.TorchGraph`; a compile-only
     # mesh's devices run nothing here: `programs.on_host`).
     with on_host():
         outputs, _ = walk.run(closed.jaxpr, held, [None] * len(closed.jaxpr.invars), consts)
+    bounded = tuple(sorted(walk.bounded))
     for index in positional:
-        output = outputs[index]
+        output = _reads(outputs[index])
         if output is not None and _later(output, length):
             where = f"; first at {walk.first}" if walk.first else ""
-            return f"its output {index}'s entry reads a later position at {length} tokens{where}"
-    return None
+            return Causality(f"its output {index}'s entry reads a later position at {length} tokens{where}",
+                             bounded)
+    return Causality(None, bounded)
+
+
+def causality_refusal(closed: core.Jaxpr, tokens: int, length: int,
+                      positional: Sequence[int]) -> str | None:
+    """Why the program `closed` is not provably causal at `length` tokens, or None where it is
+    (`causality`)."""
+    return causality(closed, tokens, length, positional).refusal
 
 
 def _ahead(value: Reads, length: int) -> bool:
@@ -170,10 +239,10 @@ def _later(value: Reads, length: int) -> bool:
     return _ahead(value, length)
 
 
-def _small_integer(value) -> bool:
-    """Whether a program's constant is an integer or boolean array of at most `CONCRETE` entries, which
-    the walk holds as its value."""
-    return (isinstance(value, np.ndarray | jax.Array) and _indexing(value.dtype)
+def _small_held(value) -> bool:
+    """Whether a program's constant is an integer, boolean or float array of at most `CONCRETE` entries,
+    which the walk holds as its value."""
+    return (isinstance(value, np.ndarray | jax.Array) and _held_dtype(value.dtype)
             and math.prod(value.shape) <= CONCRETE)
 
 
@@ -195,12 +264,45 @@ def _rule(*operations: core.Primitive) -> Callable[[_Rule], _Rule]:
     return registered
 
 
+
+@functools.cache
+def _stop_gradient() -> core.Primitive:
+    """The primitive `jax.lax.stop_gradient` binds, which computes its operand: as a trace of it shows."""
+    (eqn,) = jax.make_jaxpr(jax.lax.stop_gradient)(jnp.zeros(1)).eqns
+    return eqn.primitive
+
+
 class _Walk:
     def __init__(self, length: int):
         self.length = length
         self.first = ""
         """The first operation whose output's entry at a position reads a later position, for the
         refusal's account."""
+        self.bounded: set[str] = set()
+        """The dtypes whose largest finite value a held operand took as a mask (`_absorbed`)."""
+        self.partial: dict[int, np.ma.MaskedArray] = {}
+        """The entries the walk holds of an integer value the tokens reach in part, by the value's
+        variable's identity: a concatenation of indices it holds beside ones the tokens decide (a
+        gather's row coordinates beside its routed ones)."""
+    def followed(self, eqn: core.JaxprEqn, given: list[Held], operands: list[np.ndarray | None]) -> None:
+        """Keeps the entries the walk holds of a concatenation of indices the tokens reach in part, each
+        unheld one masked, in the concatenation's own dtype."""
+        if (eqn.primitive is jax.lax.concatenate_p and any(isinstance(value, Reads) for value in given)
+                and any(operand is not None for operand in operands)
+                and all(isinstance(var.aval, ShapedArray) and _indexing(var.aval.dtype) for var in eqn.invars)
+                and math.prod(_shape(eqn.outvars[0])) <= CONCRETE):
+            aval = eqn.outvars[0].aval
+            assert isinstance(aval, ShapedArray)
+            dtype = aval.dtype
+            parts = [np.ma.masked_array(np.zeros(_shape(var), dtype), mask=True) if operand is None
+                     else np.ma.masked_array(np.broadcast_to(operand, _shape(var)).astype(dtype), mask=False)
+                     for var, operand in zip(eqn.invars, operands, strict=True)]
+            self.partial[id(eqn.outvars[0])] = np.ma.concatenate(parts, axis=eqn.params["dimension"])
+
+    def run_reads(self, jaxpr: core.Jaxpr, inputs: Sequence[Held],
+                  values: Sequence[np.ndarray | None]) -> list[Reads | None]:
+        """`run`'s outputs' reads along one axis at most (`_reads`), as a loop or a branch joins them."""
+        return [_reads(value) for value in self.run(jaxpr, inputs, values)[0]]
 
     def run(self, jaxpr: core.Jaxpr, inputs: Sequence[Held], values: Sequence[np.ndarray | None],
             consts: Sequence[np.ndarray | None] = ()) -> tuple[list[Held], list[np.ndarray | None]]:
@@ -216,9 +318,10 @@ class _Walk:
             outputs, evaluated = self.equation(eqn, given, operands)
             held.update(zip(eqn.outvars, outputs, strict=True))
             known.update(zip(eqn.outvars, evaluated, strict=True))
+            self.followed(eqn, given, operands)
             if not self.first and any(isinstance(value, Reads) and value.axis is not None
                                       and len(value.latest) == self.length and _ahead(value, self.length)
-                                      for value in outputs):
+                                      for value in map(_reads, outputs)):
                 self.first = eqn.primitive.name
         return ([None if isinstance(var, core.Literal) else held.get(var) for var in jaxpr.outvars],
                 [np.asarray(var.val) if isinstance(var, core.Literal) else known.get(var)
@@ -229,8 +332,16 @@ class _Walk:
         primitive = eqn.primitive
         if primitive.inlined_call:
             return _call(self, eqn, given, operands)
-        if not any(isinstance(value, Reads) for value in given):
+        if not any(isinstance(value, Reads | Pair) for value in given):
             return [None] * len(eqn.outvars), self.evaluated(eqn, operands)
+        if primitive is _stop_gradient():
+            # Its operand, unchanged.
+            return list(given), [None]
+        if any(isinstance(value, Pair) for value in given):
+            paired = _paired(self, eqn, given, operands)
+            if paired is not None:
+                return paired, [None] * len(eqn.outvars)
+            given = [_reads(value) for value in given]
         # An operation is known by its object: one of another library's reads its operands whole, whatever
         # its name.
         rule = _RULES.get(primitive) or (_reduce if reduction(primitive) else _cumulative if cumulative(
@@ -246,10 +357,10 @@ class _Walk:
 
     def evaluated(self, eqn: core.JaxprEqn, operands: list[np.ndarray | None]) -> list[np.ndarray | None]:
         """The outputs' values of an operation the tokens do not reach whose operands the walk holds,
-        where they are integers or booleans of at most `CONCRETE` entries: the indices a gather, a slice
-        or an update reads, and the tests that choose them."""
+        where they are integers, booleans or floats of at most `CONCRETE` entries: the indices a gather, a
+        slice or an update reads, the tests that choose them, and a mask's values."""
         if (any(operand is None for operand in operands) or bodies(eqn)
-                or not all(isinstance(var.aval, ShapedArray) and _indexing(var.aval.dtype)
+                or not all(isinstance(var.aval, ShapedArray) and _held_dtype(var.aval.dtype)
                            and math.prod(_shape(var)) <= CONCRETE for var in eqn.outvars)):
             return [None] * len(eqn.outvars)
         bound = eqn.primitive.bind(*operands, **eqn.params)
@@ -258,6 +369,12 @@ class _Walk:
 
 def _shape(var) -> tuple[int, ...]:
     return tuple(var.aval.shape) if isinstance(var.aval, ShapedArray) else ()
+
+
+def _held_dtype(dtype: np.dtype | jax.typing.DTypeLike) -> bool:
+    """Whether the walk holds a value of `dtype` it computes without the tokens: an integer's, a
+    boolean's or a real float's."""
+    return _indexing(dtype) or jnp.issubdtype(dtype, jnp.floating)
 
 
 def _indexing(dtype: np.dtype | jax.typing.DTypeLike) -> bool:
@@ -304,6 +421,8 @@ def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
     that rule, any other walked inside."""
     program = called(eqn)
     rule = _ATTESTED.get(program) if eqn.primitive is primitives.jit_p and program is not None else None
+    if rule is not None or program is None:
+        given = [_reads(value) for value in given]
     if rule in (CAUSAL_ATTENTION, STATED_ATTENTION) and any(isinstance(value, Reads) for value in given):
         return _attended(eqn, given, causal=rule == CAUSAL_ATTENTION), [None] * len(eqn.outvars)
     if rule == TOKENWISE and any(isinstance(value, Reads) for value in given):
@@ -315,7 +434,7 @@ def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
         return [_flat(given)] * len(eqn.outvars), [None] * len(eqn.outvars)
     if program is None:
         return [_flat(given) if any(given) else None] * len(eqn.outvars), [None] * len(eqn.outvars)
-    consts = [np.asarray(const) if _small_integer(const) else None for const in program.consts]
+    consts = [np.asarray(const) if _small_held(const) else None for const in program.consts]
     return walk.run(program, given, operands, consts)
 
 
@@ -340,6 +459,253 @@ def _attended(eqn: core.JaxprEqn, given: list[Held], *, causal: bool) -> list[He
     flat = _flat(given)
     return [Reads(1, rows) if len(_shape(var)) > 1 and _shape(var)[1] == length else flat
             for var in eqn.outvars]
+
+
+def _paired(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
+            operands: list[np.ndarray | None]) -> list[Held] | None:
+    """The outputs' reads of an operation over a `Pair`, where the walk keeps its two axes through it: a
+    move of its axes, a reduction, a contraction, or an operation entry by entry; None elsewhere, where
+    the pair is read `collapsed`."""
+    primitive = eqn.primitive
+    if primitive is jax.lax.dot_general_p:
+        return _pair_dot(eqn, given)
+    if primitive in (jax.lax.reduce_max_p, jax.lax.reduce_sum_p):
+        return _pair_reduced(eqn, given)
+    if primitive in (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.transpose_p, jax.lax.squeeze_p):
+        moved = _pair_moved(eqn, given[0])
+        if moved is None:
+            return None
+        kept: list[Held] = [moved]
+        return kept
+    shape = _shape(eqn.outvars[0])
+    if positionwise(primitive) and all(_shape(var) == shape for var in eqn.outvars) and all(
+            _fits(_shape(var), shape) for var, value in zip(eqn.invars, given, strict=True)
+            if isinstance(value, Reads | Pair)):
+        entrywise = _pair_entrywise(walk, eqn, given, operands, shape)
+        if entrywise is None:
+            return None
+        combined: list[Held] = [entrywise] * len(eqn.outvars)
+        return combined
+    return None
+
+
+def _pair_moved(eqn: core.JaxprEqn, value: Held) -> Pair | None:
+    """A pair through a broadcast, a reshape, a transpose or a squeeze that keeps each of its axes whole
+    (as many entries, in their order), its entries as they are."""
+    assert isinstance(value, Pair)
+    primitive, before, after = eqn.primitive, _shape(eqn.invars[0]), _shape(eqn.outvars[0])
+    if primitive is jax.lax.transpose_p:
+        order = tuple(eqn.params["permutation"])
+        axes = tuple(order.index(axis) for axis in value.axes)
+    elif primitive is jax.lax.broadcast_in_dim_p:
+        dims = eqn.params["broadcast_dimensions"]
+        axes = tuple(dims[axis] for axis in value.axes)
+        if any(after[axis] != before[old] for axis, old in zip(axes, value.axes, strict=True)):
+            return None
+    elif primitive is jax.lax.squeeze_p:
+        dims = eqn.params["dimensions"]
+        if any(axis in dims for axis in value.axes):
+            return None
+        axes = tuple(axis - sum(1 for dim in dims if dim < axis) for axis in value.axes)
+    else:
+        if eqn.params.get("dimensions") is not None:
+            return None
+        axes = tuple(_kept_axis(axis, before, after) for axis in value.axes)
+        if None in axes:
+            return None
+    return dataclasses.replace(value, axes=axes)
+
+
+def _kept_axis(axis: int, before: tuple[int, ...], after: tuple[int, ...]) -> int | None:
+    """The axis of a row-major reshape from `before` to `after` holding `axis`'s entries in their order,
+    whole, or None."""
+    count, outer = before[axis], math.prod(before[:axis])
+    for index, width in enumerate(after):
+        if width == count and math.prod(after[:index]) == outer:
+            return index
+    return None
+
+
+def _pair_entrywise(walk: _Walk, eqn: core.JaxprEqn, given: list[Held], operands: list[np.ndarray | None],
+                    shape: tuple[int, ...]) -> Pair | None:
+    """An operation entry by entry over pairs alike and values the walk holds or reads along either axis:
+    an entry every operand of which is held is held at the operation's value of theirs, computed as the
+    program computes it; one whose held operands decide it whatever the others' finite values are
+    (`_absorbed`) is held and reads nothing; any other reads what its operands' entries read."""
+    pairs = [value for value in given if isinstance(value, Pair)]
+    axes = pairs[0].axes
+    size = (shape[axes[0]], shape[axes[1]])
+    if any(value.axes != axes or value.latest.shape != size for value in pairs):
+        return None
+    entries = [_entries(value, operand, shape, axes) for value, operand in zip(given, operands, strict=True)]
+    if any(entry is None for entry in entries):
+        return None
+    reads, helds, values = (list(group) for group in zip(*entries, strict=True))
+    every = np.logical_and.reduce(helds)
+    computed = eqn.primitive.bind(*(np.asarray(value).astype(_dtype(var))
+                                    for value, var in zip(values, eqn.invars, strict=True)), **eqn.params)
+    native = np.asarray(computed[0] if eqn.primitive.multiple_results else computed)
+    value, exact = _exactly(native)
+    latest = np.maximum.reduce(reads)
+    held = every & exact
+    if eqn.primitive is jax.lax.select_n_p:
+        latest, held, value = _selected(reads, helds, values, latest, held, value)
+    else:
+        absorbed, taken = _absorbed(eqn, helds, values)
+        if np.any(absorbed & ~every & np.isfinite(taken)) and eqn.primitive in (jax.lax.add_p, jax.lax.sub_p):
+            walk.bounded.add(str(_dtype(eqn.outvars[0])))
+        held |= absorbed
+        value = np.where(absorbed & ~every, taken, value)
+    return Pair(axes, np.where(held, NONE, latest), held, np.where(held, value, 0.0))
+
+
+def _dtype(var) -> np.dtype:
+    aval = var.aval
+    assert isinstance(aval, ShapedArray)
+    return aval.dtype
+
+
+def _entries(value: Held, operand: np.ndarray | None, shape: tuple[int, ...],
+             axes: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """An operand's entries along `axes` of an operation entry by entry over a pair: what each reads,
+    whether the walk holds its value, and that value; a value the tokens do not reach is held along `axes`
+    where it is one across its other axes; None where it reads along another axis."""
+    size = (shape[axes[0]], shape[axes[1]])
+    unheld = np.zeros(size, bool), np.zeros(size)
+    if isinstance(value, Pair):
+        return value.latest, value.held, value.value
+    if isinstance(value, Reads):
+        if value.axis is None:
+            reads = np.full(size, value.last, np.int64)
+        elif value.axis == axes[0] and len(value.latest) == size[0]:
+            reads = np.broadcast_to(value.latest[:, None], size)
+        elif value.axis == axes[1] and len(value.latest) == size[1]:
+            reads = np.broadcast_to(value.latest[None, :], size)
+        else:
+            return None
+        return reads, *unheld
+    reads = np.full(size, NONE, np.int64)
+    if operand is None:
+        return reads, *unheld
+    wide, exact = _exactly(np.asarray(operand))
+    full = np.moveaxis(np.broadcast_to(np.where(exact, wide, np.nan), shape), axes, (0, 1))
+    flat = full.reshape(*size, -1)
+    low, high = flat.min(axis=2), flat.max(axis=2)
+    # One value across its other axes, each exact (NaN, an inexact one's, never equal to itself).
+    held = low == high
+    return reads, held, np.where(held, low, 0.0)
+
+
+def _exactly(native: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """`native`'s values in float64, and where float64 holds each exactly (an integer past 2^53 it does
+    not, nor a NaN, whose comparisons say nothing): the entries a pair may hold."""
+    value = native.astype(np.float64)
+    with np.errstate(invalid="ignore"):
+        exact = value.astype(native.dtype) == native
+    return value, np.asarray(exact)
+
+
+def _absorbed(eqn: core.JaxprEqn, helds: list[np.ndarray],
+              values: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Where an operation's held operands decide its value whatever the other's value is (`Pair`: finite,
+    below half an ulp of its dtype's largest), and that value: a sum with an infinite term or one at the
+    dtype's largest magnitude (which such a term leaves as it is, as it rounds), a difference from or of
+    one, a product with a zero factor, a quotient of a zero or by an infinity; nowhere for any other
+    operation."""
+    primitive = eqn.primitive
+    size = helds[0].shape
+    nowhere = np.zeros(size, bool), np.zeros(size)
+    if len(helds) != 2:
+        return nowhere
+    (left, right), (first, second) = helds, values
+    only_left, only_right = left & ~right, right & ~left
+    dtype = _dtype(eqn.outvars[0])
+    if primitive in (jax.lax.add_p, jax.lax.sub_p) and jnp.issubdtype(dtype, jnp.floating):
+        largest = float(jnp.finfo(dtype).max)
+        # A term at the largest magnitude, or past it, absorbs one below half its ulp.
+        kept = (only_left & (np.abs(first) >= largest)) | (only_right & (np.abs(second) >= largest))
+        sign = -1.0 if primitive is jax.lax.sub_p else 1.0
+        return kept, np.where(only_left, first, sign * second)
+    with np.errstate(invalid="ignore"):
+        if primitive is jax.lax.mul_p:
+            return (only_left & (first == 0)) | (only_right & (second == 0)), np.zeros(size)
+        if primitive is jax.lax.div_p:
+            # A finite quotient of a zero, or by an infinity, is zero.
+            return (only_left & (first == 0)) | (only_right & np.isinf(second)), np.zeros(size)
+    return nowhere
+
+
+def _selected(reads: list[np.ndarray], helds: list[np.ndarray], values: list[np.ndarray], latest: np.ndarray,
+              held: np.ndarray, value: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A choice among cases by a predicate: where the walk holds the predicate, each entry its chosen
+    case's reads, holding and value; elsewhere every case's reads and the predicate's."""
+    chooser = helds[0]
+    cases = len(reads) - 1
+    case = np.where(chooser, values[0], 0).astype(np.int64).clip(0, cases - 1) + 1
+    chosen = np.take_along_axis(np.stack(reads[1:]), case[None] - 1, axis=0)[0]
+    kept = np.take_along_axis(np.stack(helds[1:]), case[None] - 1, axis=0)[0]
+    taken = np.take_along_axis(np.stack(values[1:]), case[None] - 1, axis=0)[0]
+    return (np.where(chooser, chosen, latest), np.where(chooser, kept, held),
+            np.where(chooser & kept, taken, value))
+
+
+def _pair_reduced(eqn: core.JaxprEqn, given: list[Held]) -> list[Held] | None:
+    """A maximum or a sum over a pair's axes: along its second axis, each row reads its entries' reads
+    (a held one's none), kept along its first; along its first, each column alike; along both, the
+    latest of all; along neither, a pair of its remaining axes, an entry held where it was and a maximum,
+    or a sum of a zero or an infinity."""
+    value, axes = given[0], tuple(eqn.params["axes"])
+    assert isinstance(value, Pair)
+    first, second = value.axes
+    if second in axes and first not in axes:
+        return [Reads(first - sum(1 for dim in axes if dim < first), value.latest.max(axis=1, initial=NONE))]
+    if first in axes and second not in axes:
+        columns = value.latest.max(axis=0, initial=NONE)
+        return [Reads(second - sum(1 for dim in axes if dim < second), columns)]
+    if first in axes:
+        return [_everywhere(value.last)]
+    moved = (first - sum(1 for dim in axes if dim < first), second - sum(1 for dim in axes if dim < second))
+    held = value.held
+    if eqn.primitive is jax.lax.reduce_sum_p:
+        # A sum of one value over the other axes is that value only where it is a zero or an infinity.
+        held = held & ((value.value == 0) | np.isinf(value.value))
+    return [Pair(moved, np.where(held, NONE, value.latest), held, np.where(held, value.value, 0.0))]
+
+
+def _pair_dot(eqn: core.JaxprEqn, given: list[Held]) -> list[Held] | None:
+    """A contraction of a pair along one of its axes with a value whose positions lie on the contracted
+    axis (attention's weights with its values): each entry along the pair's other axis reads its row's
+    entries but its zeros, and the values' positions those entries meet."""
+    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = eqn.params["dimension_numbers"]
+    pairs = [index for index, value in enumerate(given[:2]) if isinstance(value, Pair)]
+    if len(pairs) != 1:
+        return None
+    side = pairs[0]
+    pair, other = given[side], given[1 - side]
+    assert isinstance(pair, Pair)
+    contract, other_contract = ((lhs_contract, rhs_contract) if side == 0 else (rhs_contract, lhs_contract))
+    batch = (lhs_batch, rhs_batch)[side]
+    first, second = pair.axes
+    # A held zero times any finite value the other side reads is zero.
+    latest, zero = pair.latest, pair.held & (pair.value == 0)
+    if first in contract and second not in contract:
+        first, second, latest, zero = second, first, latest.T, zero.T
+    if second not in contract or first in contract or first in batch:
+        return None
+    matched = other_contract[list(contract).index(second)]
+    extra = NONE
+    if isinstance(other, Reads) and other.axis == matched and len(other.latest) == latest.shape[1]:
+        cols = other.latest
+    elif other is None or (isinstance(other, Reads) and other.axis is None):
+        cols = _none(latest.shape[1])
+        extra = NONE if other is None else other.last
+    else:
+        return None
+    rows = np.where(zero, NONE, np.maximum(latest, cols[None, :])).max(axis=1, initial=NONE)
+    ranks = len(_shape(eqn.invars[0])), len(_shape(eqn.invars[1]))
+    free = [dim for dim in range(ranks[side]) if dim not in contract and dim not in batch]
+    start = len(lhs_batch) + (0 if side == 0 else ranks[0] - len(lhs_contract) - len(lhs_batch))
+    return [Reads(start + free.index(first), np.maximum(rows, extra))]
 
 
 @_rule(jax.lax.broadcast_in_dim_p)
@@ -486,6 +852,12 @@ def _dot_general(walk: _Walk, eqn, given, operands) -> list[Held]:
             placed.append(Reads(start + free[side].index(value.axis), value.latest))
     if not placed:
         return [_everywhere(extra)]
+    if (len(placed) == 2 and placed[0].axis != placed[1].axis
+            and len(placed[0].latest) * len(placed[1].latest) <= CONCRETE):
+        # Each side's positions on an axis of its own (a query's and a key's): a score.
+        rows, cols = placed
+        latest = np.maximum(np.maximum(rows.latest[:, None], cols.latest[None, :]), extra)
+        return [Pair.unheld((rows.axis, cols.axis), latest)]
     base = placed[0]
     for other in placed[1:]:
         if other.axis == base.axis:
@@ -623,6 +995,9 @@ def _gather(walk: _Walk, eqn, given, operands) -> list[Held]:
     out = _shape(eqn.outvars[0])
     batch_out = [dim for dim in range(len(out)) if dim not in tuple(numbers.offset_dims)]
     if isinstance(indices, Reads):
+        routed = _routed(walk, eqn, operand, indices, batch_out)
+        if routed is not None:
+            return [routed]
         if isinstance(operand, Reads) or indices.axis is None:
             return [_flat(given)]
         vector = len(_shape(eqn.invars[1])) - 1
@@ -643,13 +1018,50 @@ def _gather(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [_decided(taken, operand.latest)]
 
 
+def _routed(walk: _Walk, eqn: core.JaxprEqn, operand: Held, indices: Reads,
+            batch_out: list[int]) -> Reads | None:
+    """A gather from an operand along its positions, by indices the tokens reach whose coordinate on that
+    axis the walk holds (`_Walk.partial`: each token's row beside its routed expert, a top-k's weights
+    taken per token): each output entry reads the row it takes and what its index read, kept along the
+    output's axis the indices' positions lie on. None where no such coordinate is held."""
+    numbers = eqn.params["dimension_numbers"]
+    held = walk.partial.get(id(eqn.invars[1]))
+    if (held is None or not isinstance(operand, Reads) or operand.axis is None
+            or operand.axis not in numbers.start_index_map or numbers.operand_batching_dims
+            or eqn.params["slice_sizes"][operand.axis] != 1):
+        return None
+    vector = held.ndim - 1
+    coordinate = held[..., list(numbers.start_index_map).index(operand.axis)]
+    if np.ma.is_masked(coordinate) or indices.axis == vector:
+        return None
+    shape = _shape(eqn.invars[0])
+    if math.prod(shape) > CONCRETE or math.prod(_shape(eqn.outvars[0])) > CONCRETE:
+        return None
+    ids = np.broadcast_to(np.arange(shape[operand.axis]).reshape(
+        [-1 if dim == operand.axis else 1 for dim in range(len(shape))]), shape)
+    # Its other coordinates read as row 0: the row along the operand's positions is the held one's alone.
+    taken = np.asarray(jax.lax.gather(ids, held.filled(0), numbers, eqn.params["slice_sizes"],
+                                      mode=eqn.params["mode"], fill_value=-1))
+    read = _read_at(operand.latest, taken)
+    if indices.axis is None:
+        return _along(np.maximum(read, indices.last))
+    axis = batch_out[indices.axis]
+    along = indices.latest.reshape([-1 if dim == axis else 1 for dim in range(read.ndim)])
+    read = np.maximum(read, along)
+    return Reads(axis, np.moveaxis(read, axis, 0).reshape(read.shape[axis], -1).max(axis=1, initial=NONE))
+
+
 def _decided(ids: np.ndarray, latest: np.ndarray) -> Reads:
-    """Reads of a value whose entries hold the operand rows `ids` (-1 for none): along its axis whose
-    index decides the rows, each index's latest; the axis giving the earliest where none does alone."""
-    read = _read_at(latest, ids)
+    """Reads of a value whose entries hold the operand rows `ids` (-1 for none) (`_along`)."""
+    return _along(_read_at(latest, ids))
+
+
+def _along(read: np.ndarray) -> Reads:
+    """Reads of a value whose entries read up to `read`'s positions: along its axis whose index decides
+    them, each index's latest; the axis giving the earliest where none does alone."""
     best: Reads | None = None
-    for axis in range(ids.ndim):
-        rows = np.moveaxis(read, axis, 0).reshape(ids.shape[axis], -1).max(axis=1, initial=NONE)
+    for axis in range(read.ndim):
+        rows = np.moveaxis(read, axis, 0).reshape(read.shape[axis], -1).max(axis=1, initial=NONE)
         if best is None or _tighter(rows, best.latest):
             best = Reads(axis, rows)
     return _everywhere(int(read.max(initial=NONE))) if best is None else best
@@ -672,6 +1084,30 @@ def _top_k(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [value] * len(eqn.outvars)
 
 
+@_rule(jax.lax.stack_p)
+def _stack(walk: _Walk, eqn, given, operands) -> list[Held]:
+    """A stack: its operands, alike in shape, side by side along a new axis `axis`, each operand's positions
+    on the axis they held (one past it from `axis` on), joined where they share it."""
+    axis = eqn.params["axis"]
+    moved = [value if not isinstance(value, Reads) or value.axis is None
+             else Reads(value.axis + (value.axis >= axis), value.latest) for value in given]
+    return [_combined(moved, _shape(eqn.outvars[0]))]
+
+
+@_rule(jax.lax.unstack_p)
+def _unstack(walk: _Walk, eqn, given, operands) -> list[Held]:
+    """An unstack: its operand's slices along `axis`, each its own result: along the positions, each
+    slice reads its own position's; otherwise each its operand's positions on the axis they held (one
+    before it past `axis`)."""
+    value, axis = given[0], eqn.params["axis"]
+    assert isinstance(value, Reads)
+    if value.axis is None:
+        return [value] * len(eqn.outvars)
+    if value.axis == axis:
+        return [_everywhere(int(latest)) for latest in value.latest]
+    return [Reads(value.axis - (value.axis > axis), value.latest)] * len(eqn.outvars)
+
+
 @_rule(jax.lax.split_p)
 def _split(walk: _Walk, eqn, given, operands) -> list[Held]:
     value = given[0]
@@ -686,7 +1122,53 @@ def _split(walk: _Walk, eqn, given, operands) -> list[Held]:
 
 
 def _scatter(walk: _Walk, eqn, given, operands) -> list[Held]:
-    return [_flat(given)]
+    """A scatter (an update, or one that combines, an add's or a max's): by indices the walk holds, each
+    output entry reads its operand entry's positions and those of every update entry landing on it,
+    placed as the scatter places them, kept along the operand's axis its operands' positions lie on
+    (`_placed`), or the axis that decides them (`_along`); by indices the tokens reach, or too many entries
+    to place, the latest of all."""
+    operand, indices, updates = given[0], given[1], given[2]
+    out = _shape(eqn.outvars[0])
+    held = operands[1]
+    if (isinstance(indices, Reads) or held is None or len(eqn.invars) != 3
+            or math.prod(out) > CONCRETE or math.prod(_shape(eqn.invars[2])) > CONCRETE):
+        return [_flat(given)]
+    numbers = eqn.params["dimension_numbers"]
+    landed = np.asarray(jax.lax.scatter_max(
+        _spread(operand, out), held, _spread(updates, _shape(eqn.invars[2])), numbers,
+        indices_are_sorted=eqn.params["indices_are_sorted"], unique_indices=eqn.params["unique_indices"],
+        mode=eqn.params["mode"]))
+    placed = _placed(operand, updates, numbers, len(out))
+    if not placed:
+        return [_along(landed)]
+    kept = [Reads(axis, np.moveaxis(landed, axis, 0).reshape(out[axis], -1).max(axis=1, initial=NONE))
+            for axis in placed]
+    return [min(kept, key=lambda value: (value.latest.mean(), -len(value.latest)))]
+
+
+def _placed(operand: Held, updates: Held, numbers: jax.lax.ScatterDimensionNumbers, rank: int) -> set[int]:
+    """The output axes a scatter keeps its operands' positions on: the operand's own, and the axis an
+    update's window dimension holding its positions lands on (`update_window_dims`, in order, onto the
+    operand's dimensions neither inserted nor batched); an update's positions on a scattered dimension
+    land where its indices say, on no one axis."""
+    axes = set()
+    if isinstance(operand, Reads) and operand.axis is not None:
+        axes.add(operand.axis)
+    if isinstance(updates, Reads) and updates.axis is not None and updates.axis in numbers.update_window_dims:
+        windowed = [dim for dim in range(rank) if dim not in numbers.inserted_window_dims
+                    and dim not in numbers.operand_batching_dims]
+        axes.add(windowed[list(numbers.update_window_dims).index(updates.axis)])
+    return axes
+
+
+def _spread(value: Held, shape: tuple[int, ...]) -> np.ndarray:
+    """The latest position each entry of a value of `shape` reads (`NONE` where it reads none)."""
+    if not isinstance(value, Reads):
+        return np.full(shape, NONE, np.int64)
+    if value.axis is None:
+        return np.full(shape, value.last, np.int64)
+    along = value.latest.reshape([-1 if dim == value.axis else 1 for dim in range(len(shape))])
+    return np.broadcast_to(along, shape).copy()
 
 
 def _scan_groups(eqn: core.JaxprEqn) -> tuple[int, int]:
@@ -699,7 +1181,7 @@ def _scan_groups(eqn: core.JaxprEqn) -> tuple[int, int]:
     return consts, carried
 
 
-def _joined(held: Held, found: Held) -> Held:
+def _joined(held: Reads | None, found: Reads | None) -> Reads | None:
     """The reads of a loop's carried value over two passes: each entry the join of both."""
     if held is None or found is None:
         return found if held is None else held
@@ -708,20 +1190,21 @@ def _joined(held: Held, found: Held) -> Held:
     return _flat([held, found])
 
 
-def _settled(walk: _Walk, body: core.Jaxpr, consts: list[Held], carried: list[Held], rest: list[Held],
-             values: Sequence[np.ndarray | None]) -> tuple[list[Held], list[Held]]:
+def _settled(walk: _Walk, body: core.Jaxpr, consts: list[Held], carried: list[Reads | None],
+             rest: list[Held],
+             values: Sequence[np.ndarray | None]) -> tuple[list[Reads | None], list[Reads | None]]:
     """A loop's carried values over every number of passes, none included (each the join of its initial
     reads and every pass's, which only grow over finitely many positions), and `body`'s outputs past its
     carries over those values."""
     while True:
-        out, _ = walk.run(body, [*consts, *carried, *rest], values)
+        out = walk.run_reads(body, [*consts, *carried, *rest], values)
         grown = [_joined(held, found) for held, found in zip(carried, out[:len(carried)], strict=True)]
         if all(_same(held, found) for held, found in zip(grown, carried, strict=True)):
             return grown, out[len(carried):]
         carried = grown
 
 
-def _same(first: Held, second: Held) -> bool:
+def _same(first: Reads | None, second: Reads | None) -> bool:
     if first is None or second is None:
         return first is second
     return first.axis == second.axis and np.array_equal(first.latest, second.latest)
@@ -740,13 +1223,13 @@ def _scan(walk: _Walk, eqn, given, operands) -> list[Held]:
     length = params["length"]
     values = [None] * len(body.invars)
     if any(isinstance(value, Reads) and value.axis == 0 for value in xs):
-        steps: list[list[Held]] = []
+        steps: list[list[Reads | None]] = []
         order = range(length - 1, -1, -1) if params["reverse"] else range(length)
         for step in order:
             sliced = [value if not isinstance(value, Reads) else
                       Reads(None, value.latest[step:step + 1]) if value.axis == 0 else
                       Reads(None if value.axis is None else value.axis - 1, value.latest) for value in xs]
-            out, _ = walk.run(body, [*fixed, *carried, *sliced], values)
+            out = walk.run_reads(body, [*fixed, *carried, *sliced], values)
             carried = list(out[:carries])
             steps.append(list(out[carries:]))
         if params["reverse"]:
@@ -779,16 +1262,17 @@ def _while(walk: _Walk, eqn, given, operands) -> list[Held]:
     # Its state on exit, after any number of passes, none included.
     out, _ = _settled(walk, body, list(given[cond_consts:cond_consts + body_consts]), carried, [],
                       [None] * len(body.invars))
-    cond, _ = walk.run(predicate, [*given[:cond_consts], *out], [None] * len(predicate.invars))
+    cond = walk.run_reads(predicate, [*given[:cond_consts], *out], [None] * len(predicate.invars))
     if any(isinstance(value, Reads) for value in [*cond, *given[:cond_consts]]):
         # How many passes run is the tokens' to decide: every carried entry may read every one.
         return [_flat([*given, *out])] * len(out)
-    return out
+    settled: list[Held] = list(out)
+    return settled
 
 
 @_rule(jax.lax.cond_p)
 def _cond(walk: _Walk, eqn, given, operands) -> list[Held]:
-    outs = [walk.run(branch.jaxpr, given[1:], operands[1:])[0] for branch in branches(eqn)]
+    outs = [walk.run_reads(branch.jaxpr, given[1:], operands[1:]) for branch in branches(eqn)]
     merged = []
     for values in zip(*outs, strict=True):
         held: Held = None
