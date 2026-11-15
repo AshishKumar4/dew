@@ -719,8 +719,7 @@ class Tcgen05Walked(Tcgen05Placed):
 def walked_launch(family: mosaic.Family) -> str:
     """The backward launch a walked placement is written for: keys first the dK/dV launch's (`"dkv"`),
     queries first the dQ launch's (`"dq"`); raises for any other family."""
-    found = walked(family)
-    return "dkv" if isinstance(found, Tcgen05KeysFirst) else "dq"
+    return "dkv" if walked(family).holds_keys else "dq"
 
 
 def walked(family: mosaic.Family) -> "Tcgen05Walked":
@@ -738,6 +737,7 @@ class Tcgen05KeysFirst(Tcgen05Walked):
 
     name = "tcgen05.keys"
     consumers = COMPUTE
+    holds_keys = True
     kept_sums = (DK, DV)
 
 

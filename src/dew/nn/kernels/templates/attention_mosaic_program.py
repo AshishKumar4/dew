@@ -544,14 +544,20 @@ def most_consumers(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> int
     return family.consumers if isinstance(tiles, Tiles) else min(family.consumers, BACKWARD_CONSUMERS)
 
 
+def held_walked(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> tuple[int, int]:
+    """The rows a program of `family` at `tiles` holds and the tile it walks a step: its key block and its
+    query tiles where its family holds keys (`Family.holds_keys`, a keys-first placement), else its query
+    block and its key tiles."""
+    return (tiles.block_k, tiles.block_q) if family.holds_keys else (tiles.block_q, tiles.block_k)
+
+
 def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:
     """Whether a program of `family` takes `tiles`: its query tiles positive whole multiples of the rows a
     role's products cover (`Family.rows`), its key tiles of the rows a walked tile comes in
     (`Family.walked_rows`), and one to its launch's count of consumers (`most_consumers`), whose turns its
     walks are written for; a family whose products a role issues (`Issuer.places_on_role`) one product's
     rows, a row a consumer thread: a keys-first walk's its key block (`placed.KEYS`)."""
-    keys_first = isinstance(family, placed.Tcgen05KeysFirst)
-    held, walked = (tiles.block_k, tiles.block_q) if keys_first else (tiles.block_q, tiles.block_k)
+    held, walked = held_walked(family, tiles)
     rows = held == family.rows if family.places_on_role else held % family.rows == 0
     return (0 < tiles.consumers <= most_consumers(family, tiles) and tiles.block_q > 0 and tiles.block_k > 0
             and rows and walked % family.walked_rows == 0)

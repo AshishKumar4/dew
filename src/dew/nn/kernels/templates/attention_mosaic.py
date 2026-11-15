@@ -86,6 +86,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     few_rows,
     fewer_rows,
     fuses,
+    held_walked,
     holders,
     hook_reduces,
     launch_scope,
@@ -1318,16 +1319,15 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         and of their cotangents, a step's walked tile each, beside its kept sums' shares of their columns
         (`BackwardTiles.columns`)."""
         query = ba.arguments["query"]
-        keys_first = isinstance(family, placed.Tcgen05KeysFirst)
         # Its operands 16-bit of one part (bf16: fp16's weights and cotangents two scaled parts, whose
         # products no placed walk issues), a fused walk's dQ products a 64- or 128-row tile of its queries
         # (tcgen05's M).
         if (jnp.dtype(query.dtype) != jnp.dtype(jnp.bfloat16) or self.accurate or self.score_kinds
                 or ba.arguments["drop"] is not None or self.per_span > 1 or config.staged_logits
                 or config.shared_keys or tiles.consumers != family.consumers
-                or (config.fused and (not keys_first or tiles.block_q not in (64, 128)))):
+                or (config.fused and (not family.holds_keys or tiles.block_q not in (64, 128)))):
             return False
-        held, walked = (tiles.block_k, tiles.block_q) if keys_first else (tiles.block_q, tiles.block_k)
+        held, walked = held_walked(family, tiles)
         if held != family.rows:
             return False
         # Its scratch as its launch allocates it (`placed_scratch`, the head widths as staged, `_width`).
@@ -1335,7 +1335,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                               for name in ("query", "value"))
         halves = dq_halves(width * config.columns) if config.fused else ()
         products = placed_scratch(family, walked, query.dtype, halves,
-                                  (width, value_width) if keys_first else (width,))["products"]
+                                  (width, value_width) if family.holds_keys else (width,))["products"]
         return family.product_columns(products) <= (target.tmem_columns or 0)
 
     def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:

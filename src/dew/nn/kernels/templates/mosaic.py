@@ -1948,6 +1948,11 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
 
+    holds_keys = False
+    """Whether its programs hold a block of keys, a key a row, and walk the queries a tile a step (a
+    keys-first placement's, `placed.KEYS`); every other family's hold queries and walk the keys
+    (`held_walked`)."""
+
     @property
     def register_step(self) -> int:
         """The allocator's registers per thread in one step (`generation.Multiprocessor.register_step`,
