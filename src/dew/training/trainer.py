@@ -164,6 +164,7 @@ from dew.training.distributed import (
     placed_start,
     ruled,
     stage_microbatches,
+    start_build,
     start_compiling,
     step_reads,
     traced_start,
@@ -720,7 +721,8 @@ class Trainer(Generic[Loss, Effects]):
             abstract = self._staging.state(abstract.with_window(checkpoints.accumulation_template(step)),
                                           self._staging.staged_shapes)
         shardings, validation = self._validated(abstract)
-        return Start(initializer, key, abstract, through, step, shardings, build, validation.device_bytes)
+        return Start(initializer, key, abstract, through, step, shardings, build, validation.device_bytes,
+                     start_build(build, initializer, shardings, through))
 
     def _placed(self, start: Start, *, positioned: bool
                 ) -> tuple[TrainState, Placement[TrainState], bytes | None]:
@@ -763,8 +765,8 @@ class Trainer(Generic[Loss, Effects]):
                 from dew.training.execution import placed_host
                 return (placed_host(self.objective, lambda: self._staged_start(initializer, key),
                                     self.state_mesh, self.device_mesh, shardings), shardings, None)
-            return (placed_start(start.build, initializer, key, abstract, shardings, start.through,
-                                 self.device_mesh), shardings, None)
+            return (placed_start(start.placing, initializer, key, abstract, shardings, self.device_mesh),
+                    shardings, None)
         if self.host_master:
             from dew.training.execution import banked_frozen
             abstract = dataclasses.replace(abstract, variables=banked_frozen(
@@ -1645,8 +1647,8 @@ class Trainer(Generic[Loss, Effects]):
         if self._compiler.ahead is not None or self.host_master or pgle_runs():
             return None
         key = jax.ShapeDtypeStruct(fresh.key.shape, fresh.key.dtype)
-        begun = start_compiling(fresh.build, fresh.initializer, key, fresh.abstract, fresh.shardings,
-                                fresh.through, self.device_mesh)
+        begun = start_compiling(fresh.placing, fresh.initializer, key, fresh.abstract, fresh.shardings,
+                                self.device_mesh)
         self.phase_passes.at(first)
         with run.startup.phase("compile", "compiling the step"), run.held():
             # As the loop hands its step the batch (`read_batch`): on the examples clock, marked whether

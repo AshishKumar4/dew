@@ -1401,8 +1401,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
             from dew.training.distributed import start_compiling
 
             begun = None if start.resume is not None or trainer.host_master else start_compiling(
-                start.build, start.initializer, jax.ShapeDtypeStruct(start.key.shape, start.key.dtype),
-                start.abstract, start.shardings, start.through, trainer.device_mesh)
+                start.placing, start.initializer, jax.ShapeDtypeStruct(start.key.shape, start.key.dtype),
+                start.abstract, start.shardings, trainer.device_mesh)
             planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, frontier)
             with attempting(begun):
                 starts = started(trainer, start, planned, plan)
@@ -1445,9 +1445,9 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
     candidate = planned.candidate
     with collecting() as collected:
         if start.resume is None and not trainer.host_master:
-            start_compiled(start.build, start.initializer,
+            start_compiled(start.placing, start.initializer,
                            jax.ShapeDtypeStruct(start.key.shape, start.key.dtype), start.abstract,
-                           start.shardings, start.through, trainer.device_mesh)
+                           start.shardings, trainer.device_mesh)
         if candidate.copies:
             # The variables as the run's first step holds them, placed as its start placed them.
             variables = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
