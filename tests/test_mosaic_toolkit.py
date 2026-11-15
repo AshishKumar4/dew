@@ -1837,12 +1837,22 @@ def _walked_once(x, w, *, family, interpret, all_once=False):
     family = family.specialized(rows, columns)
     shape = (rows, columns)
 
+    from jax.experimental.pallas import tpu as pltpu
+
+    from dew.nn.kernels.templates import mosaic_tpu
+
+    # A TPU core's program writes an output in HBM by a copy from VMEM, a GPU's in place.
+    staging = [pltpu.VMEM(shape, jnp.float32)] if isinstance(family, mosaic_tpu.VmemRings) else []
+
     def body(x_gmem, w_gmem, o_gmem):
-        def scope(*, streams):
+        def scope(*staged, streams):
             def read(carry, sums):
                 del carry
+                out = staged[0] if staged else o_gmem
                 for first, (value,) in family.chunks(sums):
-                    o_gmem[:, pl.ds(first, value.shape[1])] = value
+                    out[:, pl.ds(first, value.shape[1])] = value
+                if staged:
+                    pltpu.sync_copy(out, o_gmem)
 
             once = {'x': (x_gmem, lambda j: (0, j))}
             views = {'w': (w_gmem, lambda j: (j, 0))}
@@ -1855,8 +1865,8 @@ def _walked_once(x, w, *, family, interpret, all_once=False):
         ringed, held = {'w': ((PERSISTED_DEPTH, columns), w.dtype)}, {'x': ((rows, PERSISTED_DEPTH), x.dtype)}
         if all_once:
             ringed, held = {}, {**held, **ringed}
-        family.scoped(scope, streams={"walked": family.streams(ringed, 2, 1),
-                                      "once": family.streams(held, 1, 1)})
+        family.scoped(scope, *staging, streams={"walked": family.streams(ringed, 2, 1),
+                                                "once": family.streams(held, 1, 1)})
 
     out = jax.ShapeDtypeStruct(shape, jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
