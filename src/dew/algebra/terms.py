@@ -14,7 +14,9 @@ import enum
 import functools
 import hashlib
 import math
+import threading
 import types
+import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import Literal, NamedTuple, overload
 
@@ -206,66 +208,78 @@ class Term(Expr):
     def finished(self) -> Term: ...
 
 
-class _Form(tuple):
-    """A skeleton's form (`Skeleton.form`): a tuple that hashes once. A form holds its operands' forms, so a
-    program's value read by many others is one form many hold, and a plain tuple's hash, recomputed through
-    every operand at each read, grows with the paths through that sharing: a whole program's bounds
-    (`dew.algebra.program._held`) of a LAMB step's forms never finished hashing. Kept, each read is one."""
-
-    def __hash__(self) -> int:
-        held = self.__dict__.get("hashed")
-        if held is None:
-            held = self.__dict__["hashed"] = tuple.__hash__(self)
-        return held
-
-
-@dataclasses.dataclass(frozen=True)
 class Skeleton:
-    """A term's structure without its egglog expression: `Term`'s constructors over plain tuples, equal
-    exactly where the terms are (`region`'s `forms`). What the pass reads of a window to decide whether a rule
-    may fire in it (`rules.reorderable`), at a fraction of its terms' cost: a Dory-4B training step's 1018
-    windows, every one refused, spent most of the pass building their terms (FS-OVERHEAD-DORY-ON-P3). Its
-    form hashes once (`_Form`)."""
+    """A term's structure without its egglog expression: `Term`'s constructors over plain tuples (`form`: its
+    constructor's name, its operands' skeletons and its other arguments), equal exactly where the terms are
+    (`region`'s `forms`). What the pass reads of a window to decide whether a rule may fire in it
+    (`rules.reorderable`), and of a whole program to bound its windows' inputs (`dew.algebra.program._held`),
+    at a fraction of its terms' cost: a Dory-4B training step's 1018 windows, every one refused, spent most of
+    the pass building their terms (FS-OVERHEAD-DORY-ON-P3).
 
-    form: tuple
+    Hash-consed: a skeleton is made once for its form (`made`, the process's table of the skeletons alive), so
+    two equal skeletons are one object, compared by identity and hashed by it, in constant time. A program's
+    value read by many others is one skeleton many forms hold, and equal values traced apart (a computation
+    traced twice over the same inputs, which JAX does not merge) one skeleton too: compared as plain nested
+    tuples, each comparison walked every path through that sharing, 2**depth of them (a LAMB step's whole
+    program never finished; train 902 F1)."""
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.form, _Form):
-            object.__setattr__(self, "form", _Form(self.form))
+    __slots__ = ("__weakref__", "form")
+
+    def __init__(self, form: tuple) -> None:
+        self.form = form
+
+    def __repr__(self) -> str:
+        return f"Skeleton{self.form!r}"
+
+    @classmethod
+    def made(cls, form: tuple) -> Skeleton:
+        """The one skeleton of `form` (its operands' skeletons in it, each already one): the live one where
+        the process holds it, else a new one, held while it lives."""
+        with _MAKING:
+            held = _MADE.get(form)
+            if held is None:
+                held = _MADE[form] = cls(form)
+            return held
 
     @classmethod
     def leaf(cls, index: int) -> Skeleton:
-        return cls(("leaf", index))
+        return cls.made(("leaf", index))
 
     @classmethod
     def literal(cls, index: int) -> Skeleton:
-        return cls(("literal", index))
+        return cls.made(("literal", index))
 
     def binary(self, name: str, other: Skeleton, params: int) -> Skeleton:
-        return Skeleton(("binary", self.form, name, other.form, params))
+        return Skeleton.made(("binary", self, name, other, params))
 
     def compare(self, name: str, other: Skeleton, params: int) -> Skeleton:
-        return Skeleton(("compare", self.form, name, other.form, params))
+        return Skeleton.made(("compare", self, name, other, params))
 
     def unary(self, name: str, params: int) -> Skeleton:
-        return Skeleton(("unary", self.form, name, params))
+        return Skeleton.made(("unary", self, name, params))
 
     def select(self, false: Skeleton, true: Skeleton) -> Skeleton:
-        return Skeleton(("select", self.form, false.form, true.form))
+        return Skeleton.made(("select", self, false, true))
 
     def convert(self, params: int) -> Skeleton:
-        return Skeleton(("convert", self.form, params))
+        return Skeleton.made(("convert", self, params))
 
     def shaped(self, name: str, params: int) -> Skeleton:
-        return Skeleton(("shaped", self.form, name, params))
+        return Skeleton.made(("shaped", self, name, params))
 
     def reduce(self, monoid: str, axes: Vec[i64], params: int) -> Skeleton:
         # The reduced axes are among the parameters `params` indexes.
         del axes
-        return Skeleton(("reduce", self.form, monoid, params))
+        return Skeleton.made(("reduce", self, monoid, params))
 
     def dot(self, other: Skeleton, params: int) -> Skeleton:
-        return Skeleton(("dot", self.form, other.form, params))
+        return Skeleton.made(("dot", self, other, params))
+
+
+_MADE: weakref.WeakValueDictionary[tuple, Skeleton] = weakref.WeakValueDictionary()
+"""Each live skeleton by its form (`Skeleton.made`): a form's operands are skeletons, hashed and compared by
+identity, so a form's hash and its comparison take its own arguments alone."""
+_MAKING = threading.Lock()
 
 
 def reduce_of(term: Term | Skeleton) -> tuple[str, Hashable] | None:
@@ -368,9 +382,9 @@ class Region[Node: (Term, Skeleton)]:
 def key(term: BaseExpr | Skeleton) -> Hashable:
     """`term` as a dictionary's key: its declaration, which egglog builds it from, equal wherever two terms
     are (its text is black's formatting of it, about a millisecond a term: a third of a gemma3n training
-    step's pass); a skeleton's form (`Skeleton`)."""
+    step's pass); a skeleton itself, one object for its form (`Skeleton`)."""
     if isinstance(term, Skeleton):
-        return term.form
+        return term
     if not isinstance(term, RuntimeExpr):
         raise TypeError(f"{term!r} is no egglog term")
     return term.__egg_typed_expr__

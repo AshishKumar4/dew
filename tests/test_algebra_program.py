@@ -454,6 +454,25 @@ def two_products_summed(a, x, y):
     return jnp.sum(a * x, axis=-1) + jnp.sum(a * y, axis=-1)
 
 
+def test_a_deep_computation_traced_twice_passes_through_the_pass():
+    """A computation of 40 squarings traced twice over one input (JAX merges no equal values, so the two are
+    apart), its results added (a distributivity head, so the pass bounds the whole program's values,
+    `program._held`): the pass rewrites it and its program computes what the function does, bit for bit. Its
+    skeletons are one object for each form (`terms.Skeleton.made`): compared as nested tuples, each equal
+    pair walked every path through their sharing, 2**40 of them, past the test's deadline (train 902 F1)."""
+    def doubled(x):
+        a = b = x
+        for _ in range(40):
+            a = a * a
+        for _ in range(40):
+            b = b * b
+        return a + b
+
+    x = jnp.linspace(0.5, 1.0, 8, dtype=jnp.float32)
+    np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(doubled))(x)),
+                                  np.asarray(jax.jit(doubled)(x)))
+
+
 def test_a_region_no_rule_may_fire_in_is_recorded_unpriced():
     """A window whose values the program bounds none of builds no terms (`rules.reorderable`), so nothing
     prices it: its record holds no price where one a rule fires in holds both (row 5340: its 0.0 before and
