@@ -2399,3 +2399,18 @@ def test_a_mix_ends_after_its_first_exhausted_members_last_record_whatever_its_r
     finally:
         passed.close()
     assert read_ids == [0, 1, 1000]
+
+
+def test_a_streamed_training_read_of_a_mix_reads_each_member_on_without_end():
+    """A training read of a streamed mix reads each of its members on without end, past the mix's one end
+    where a read that saves no position stops (`mix_end`): corpora of 100 rows and 1 at weights 2 and 1 read
+    A, A, B, A, A, B. So no position a training read saves meets that end, and one saved before it was
+    made the mix's (spec alignment 2026-11-15) continues as it did (row 6702)."""
+    many = Memory([{"id": index} for index in range(100)])
+    one = Memory([{"id": 1000}])
+    reader = compile(mix([many, one], weights=[2, 1]).batch(1), read="streamed",
+                     loading=READ).train(DataPartition())
+    try:
+        assert [int(batch["id"][0]) for batch in itertools.islice(reader, 6)] == [0, 1, 1000, 2, 3, 1000]
+    finally:
+        reader.close()
