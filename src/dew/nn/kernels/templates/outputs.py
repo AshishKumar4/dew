@@ -96,10 +96,14 @@ class Output:
     dtype: jax.typing.DTypeLike
 
     @property
+    def shape(self) -> tuple[int, ...]:
+        """Its sizes, its dimensions' (`Dim.size`), as a `jax.ShapeDtypeStruct`'s are read."""
+        return tuple(dim if isinstance(dim, int) else dim.size for dim in self.dims)
+
+    @property
     def struct(self) -> jax.ShapeDtypeStruct:
-        """Its shape and dtype, its sizes its dimensions' (`Dim.size`)."""
-        return jax.ShapeDtypeStruct(tuple(dim if isinstance(dim, int) else dim.size for dim in self.dims),
-                                    self.dtype)
+        """Its shape and dtype."""
+        return jax.ShapeDtypeStruct(self.shape, self.dtype)
 
 
 def output(dtype: jax.typing.DTypeLike, *dims: Dim | int) -> Output:

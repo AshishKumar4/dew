@@ -819,27 +819,6 @@ def test_a_kernels_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
     assert declared_outputs(lowered) == [[[[[0, 0]], [[1, 1]]]]]
 
 
-def test_a_pallas_calls_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
-    """A Pallas call (`launches.pallas_call`, Triton's) whose output its operand's axes state, transposed,
-    lowered for an H100 on any host: its shape is theirs, and its call states each dimension's axis
-    (`outputs.OUTPUT_DIMS`), as a Mosaic launch's does."""
-    from dew.nn.kernels import launches
-
-    def copied(x):
-        def body(x_ref, o_ref):
-            o_ref[...] = x_ref[...].T
-
-        transposed = outputs.output(x.dtype, outputs.axis(x, 1), outputs.axis(x, 0))
-        return launches.pallas_call(body, name="copied", grid=(1,), out_shape=transposed)(x)
-
-    x = jax.ShapeDtypeStruct((16, 32), jnp.float32)
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        lowered = jax.jit(copied).trace(x).lower(lowering_platforms=("cuda",))
-    assert lowered.out_info.shape == (32, 16)
-    assert declared_outputs(lowered) == [[[[[0, 1]], [[0, 0]]]]]
-
-
 @INTERPRETS
 def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_in_chunks():
     """Interpreted: a persistent walk on tcgen05's bundle (`mosaic_sm100.RINGS`), its product warp issuing

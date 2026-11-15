@@ -905,8 +905,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                              swizzles=SCALE_SWIZZLES if step_scales is not None
                                              else None, **_gathered(gather, tiles, lhs.dtype, interpret)))
 
-    out_type = _declared(lhs if gather is None else gather, rhs, (m, n, stored), tiles.splits, dtypes,
-                         transposed=(transpose_lhs and gather is None, transpose_rhs))
+    out_type = _declared(lhs, rhs, gather, (m, n, stored), tiles.splits, dtypes, transpose_lhs, transpose_rhs)
     operands = _gmm_operands(lhs, rhs, paired, scales, step_scales, mx_scales, gather, scatter, joined)
     kernel = family.kernel(body, out_type=out_type,
                            grid=(multiprocessors // pair,), grid_names=("programs",),
@@ -915,8 +914,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                            resident=tiles.programs, scalars=0 if dense else 1, registers=registers,
                            producer=tiles.producers.of(GMM), shared=shared, moves=MOVES,
                            cost=unit_cost.estimate(2 * m * n * k * len(matrices), *operands,
-                                                   *prologue_operands, *epilogue_operands,
-                                                   *outputs.structs(out_type)),
+                                                   *prologue_operands, *epilogue_operands, *out_type),
                            **_prefetched(tiles, grid, k // block_k, transpose_rhs, interpret,
                                          dense=dense, parts=(tail, scales, mx_scales, gather)))
     return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands,
@@ -973,11 +971,11 @@ def _prefetched(tiles: Tiles, grid: tuple, steps: int, transpose_rhs: bool, inte
     return {'prefetched': prefetched}
 
 
-def _declared(rows_of, rhs, shape: tuple[int, int, int | None], splits: int, dtypes: tuple, *,
-              transposed: tuple[bool, bool]) -> tuple:
+def _declared(lhs, rhs, gather, shape: tuple[int, int, int | None], splits: int, dtypes: tuple,
+              transpose_lhs: bool, transpose_rhs: bool) -> tuple:
     """Dew: a `gmm` launch's outputs, `[rows, n]` each, a depth split's each run's partial a slice of its own
-    (`[splits, rows, n]`), stated as its operands' axes (`outputs.output`): its rows `rows_of`'s (the walked
-    rows, or a gathered product's table), its columns `rhs`'s width (each as `transposed` lays it). A
+    (`[splits, rows, n]`), stated as its operands' axes (`outputs.output`): its rows `lhs`'s (a gathered
+    product's table's, `gather`), its columns `rhs`'s width (each as its transpose lays it). A
     scattered product declares its stored rows alone, which its table's entries land on, each once: its padded
     rows land nowhere, so rows past them would be declared and never written (NSNAN-2); that count is its
     call's, no operand axis of the launch, so its outputs state their shapes alone."""
@@ -985,9 +983,9 @@ def _declared(rows_of, rhs, shape: tuple[int, int, int | None], splits: int, dty
     if stored is not None:
         return tuple(jax.ShapeDtypeStruct((stored, n) if splits == 1 else (splits, stored, n), dtype)
                      for dtype in dtypes)
-    transpose_lhs, transpose_rhs = transposed
     # Its rows the walked rows' less their extension past the last tile (`_walked_rows`), sized by the launch.
-    rows = outputs.axis(rows_of, 1 if transpose_lhs else 0).sized(m)
+    rows = outputs.axis(lhs, 1 if transpose_lhs else 0) if gather is None else outputs.axis(gather, 0)
+    rows = rows.sized(m)
     width = outputs.axis(rhs, 1 if transpose_rhs else 2)
     if width.size != n:
         raise ValueError(f"a gmm's outputs are its matrix's width, {n}, not {width.size}")
@@ -1994,6 +1992,18 @@ def _stored_chunks(family: mosaic.Family, summed, store: Callable, place: tuple)
 @tuning.lowered_once(('shape', 'tiles', 'out_dtype', 'multiprocessors', 'interpret', 'prologue',
                       'prologue_axes', 'exact_sums', 'tail', 'k_major', 'unstaged', 'registers',
                       'shared'))
+def _tgmm_declared(lhs, rhs, sizes, shape: tuple[int, int, int], dtype, k_major: bool):
+    """Dew: a `tgmm` launch's output, each group's depth by width, stated as its operands' axes
+    (`outputs.output`): its groups `sizes`', its depth `lhs`'s and its width `rhs`'s, each where `k_major`
+    lays it, at the sizes the launch computes of them (its operands padded past them)."""
+    g, m, n = shape
+    out_type = outputs.output(dtype, outputs.axis(sizes, 0), outputs.axis(lhs, 0 if k_major else 1).sized(m),
+                              outputs.axis(rhs, 0 if k_major else 1).sized(n))
+    if out_type.shape[0] != g:
+        raise ValueError(f"a tgmm's outputs are its {g} groups, not its sizes' {out_type.shape[0]}")
+    return out_type
+
+
 def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles, out_dtype,
                    multiprocessors: int, interpret, prologue, prologue_operands: tuple, prologue_axes: tuple,
                    exact_sums: bool, tail=None, k_major: bool = False, step_scales=None,
@@ -2105,21 +2115,13 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                                              swizzles=SCALE_SWIZZLES if step_scales is not None else None,
                                              **_tgmm_gathered(tables, allocations.blocks, bool(interpret))))
 
-    # Each group's depth by width, stated as its operands' axes (`outputs.output`): the groups the sizes', the
-    # depth `lhs`'s and the width `rhs`'s, each where `k_major` lays it, at the sizes the launch computes of
-    # them (their operands padded past them).
-    out_type = outputs.output(out_dtype, outputs.axis(groups[0], 0),
-                              outputs.axis(lhs, 0 if k_major else 1).sized(m),
-                              outputs.axis(rhs, 0 if k_major else 1).sized(n))
-    if out_type.struct.shape[0] != g:
-        raise ValueError(f"a tgmm's outputs are its {g} groups, not its sizes' {out_type.struct.shape[0]}")
+    out_type = _tgmm_declared(lhs, rhs, groups[0], (g, m, n), out_dtype, k_major)
     kernel = family.kernel(body, out_type=out_type,
                            grid=(1 if interpret else multiprocessors // pair,), grid_names=("programs",),
                            consumers=consumers + rewritten, interpret=interpret, approx_math=False,
                            name=TGMM, cluster=pair, registers=registers, producer=tiles.producers.of(TGMM),
                            shared=shared, moves=MOVES, resident=tiles.programs, scalars=len(groups),
-                           cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands,
-                                                   out_type.struct))
+                           cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
     return kernel(*groups, lhs, rhs, *(table for table in tables if table is not None), *(step_scales or ()),
                   *prologue_operands, *_workspace(tail, (multiprocessors, 2, consumers, *part), interpret))
 
