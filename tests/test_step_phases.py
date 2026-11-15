@@ -435,7 +435,7 @@ def test_a_profile_window_in_a_phase_that_reads_an_earlier_phases_batches_names_
     from dew.telemetry.records import ProfileTraced, StepCompiled
     from dew.training import ProfileWindow
 
-    data = compile(phases((_budget(1, 256), 2), (_budget(2, 128), 2), (_budget(3, 256), None)),
+    data = compile(phases((_budget(1, 256), 2), (_budget(2, 128), 4), (_budget(3, 256), None)),
                    read="indexed", loading=READ)
     tracker = RecordingTracker()
     Trainer(Counted(), optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
