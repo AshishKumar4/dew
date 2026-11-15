@@ -1485,6 +1485,31 @@ def test_a_refusal_applies_only_to_the_target_capacities_that_generated_its_kern
             assert not report.refused(launch, arguments, tile)
 
 
+def test_a_recording_holds_while_the_refusals_its_trace_read_answer_alike():
+    """A trace's read of a launch's refusals (its legality's, `report.refused`) is recorded with its answer
+    (`generation.recording`): the record holds while that launch's refusals stay as they were, a refusal of
+    another launch among them, and not once its own launch is refused another config (`generation.still`)."""
+    from dew.nn.kernels.templates import report
+
+    launch = grouped_matmul.MosaicGmm()
+    x = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
+    weights = jax.ShapeDtypeStruct((8, 2048, 4096), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
+    arguments = launch.bind(x, weights, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+    other = launch.bind(x, jax.ShapeDtypeStruct((8, 2048, 2048), jnp.bfloat16), sizes, out_dtype="bfloat16",
+                        trans_rhs=False, interpret=False)
+    target = generation.TARGETS["sm90"]
+    with report.refusals(), generation.assumed(target):
+        tile = launch.derived(arguments, target)
+        with generation.recording() as reads:
+            assert not report.refused(launch, arguments, tile)
+        assert reads and generation.still(reads)
+        report.refuse([(report._identity(launch, other), launch.derived(other, target), {"dew_gmm"})])
+        assert generation.still(reads)
+        report.refuse([(report._identity(launch, arguments), tile, {"dew_gmm"})])
+        assert not generation.still(reads)
+
+
 def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
     """A shared compilation cache is not a shared derivation registry. A fresh process sees no foreign
     refusals; a handed plan can seed exactly the refusals it exported."""
