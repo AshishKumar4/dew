@@ -1073,14 +1073,29 @@ class Plan:
             rewritten = [step.name for step, before, now, held in zip(
                 steps, saved_code, self.manifest.code(), self.manifest.held(), strict=False)
                 if before is not None and before != now and not (appended and before == [*now, *held])]
-            # The user's code a step runs beside its module's (`Manifest.held`), where its position holds it:
-            # a position saved before it held none compares none.
+            # The user's code a step runs beside its module's (`Manifest.held`), where its position holds it.
             if "held" in saved:
                 saved_held = listed(saved["held"], "saved data held code", read=json_value,
                                     what="each step's held code")
                 rewritten += [step.name for step, before, now in zip(steps, saved_held, self.manifest.held(),
                                                                      strict=False)
                               if before != now and step.name not in rewritten]
+            # A position saved before held code was saved holds none of it, and nothing it saved proves that
+            # code unchanged (its module digests are no part of a position since row 5862): a step that holds
+            # such code (a callable object of the user's, a class or one a field holds) is refused an exact
+            # resume rather than read as unchanged; a function step's code places were always saved.
+            unproven = [step.name for step, before, held in zip(steps, saved_code, self.manifest.held(),
+                                                                 strict=False)
+                        if appended and held and step.name not in rewritten
+                        and before != [*self.manifest.code()[steps.index(step)], *held]]
+            if unproven and resume != "relaxed":
+                raise PlanChanged(
+                    tuple(f"code.{name}" for name in unproven),
+                    f"the position was saved before Dew saved the code of the callable objects a data step "
+                    f"runs, so nothing it holds proves the code of {', '.join(unproven)} unchanged; declare "
+                    "the step's identity (identity='name@version') to resume exactly, or resume relaxed "
+                    "(`data_resume='relaxed'`)")
+            rewritten += unproven
             if rewritten and resume != "relaxed":
                 raise PlanChanged(
                     tuple(f"code.{name}" for name in rewritten),
