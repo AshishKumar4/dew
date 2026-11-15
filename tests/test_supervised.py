@@ -17,20 +17,18 @@ from affine_run import BATCH, Affine, Counting, Replaying, dataset
 from flax import linen as nn
 from learning_gate import assert_learns
 from recording import RecordingTracker
-from scenario_contract import held_out_losses
+from scenario_contract import HELD_OUT, held_out_losses
 
 from dew.batch import VALID_ROWS
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
 from dew.data.dataset import Loader
 from dew.data.pipeline import DeviceStep
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import Step
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
 from dew.registry import ModelConfig
 from dew.training import Trainer
 
 INPUTS = InputSpec(Field("x", (3,)))
-STEP = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
 
 
 def squared(outputs, batch):
@@ -155,10 +153,10 @@ def test_a_decorated_flax_call_trains_through_its_actual_calling_convention():
     objective = Supervised(model, squared, inputs=INPUTS)
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(0))
     initial = trainer.initial_state()
-    before = float(objective.scalar_loss(initial.variables, sample, STEP)[0])
+    before = float(objective.scalar_loss(initial.variables, sample, HELD_OUT)[0])
     trained, _, _, _, accepted, _ = trainer.compile(initial, sample)(initial, sample)
     assert bool(accepted) and int(trained.updates) == 1
-    assert float(objective.scalar_loss(trained.variables, sample, STEP)[0]) < before
+    assert float(objective.scalar_loss(trained.variables, sample, HELD_OUT)[0]) < before
 
 
 def test_the_loss_is_the_mean_over_the_real_rows_and_metrics_report_by_name():
@@ -170,8 +168,8 @@ def test_the_loss_is_the_mean_over_the_real_rows_and_metrics_report_by_name():
     real = batch(6)
     padded = {name: np.concatenate([value, value[:2]]) for name, value in real.items()}
     padded[VALID_ROWS] = np.arange(8) < 6
-    alone, aux = objective.scalar_loss(variables, real, STEP)
-    np.testing.assert_allclose(objective.scalar_loss(variables, padded, STEP)[0], alone, rtol=1e-6)
+    alone, aux = objective.scalar_loss(variables, real, HELD_OUT)
+    np.testing.assert_allclose(objective.scalar_loss(variables, padded, HELD_OUT)[0], alone, rtol=1e-6)
     outputs = Affine().apply(variables, real["x"])
     np.testing.assert_allclose(aux.metrics["accuracy"],
                                np.mean(np.argmax(outputs, -1) == real["label"]), rtol=1e-6)
@@ -190,8 +188,8 @@ def test_the_run_record_builds_the_same_objective_again():
     rebuilt = RunConfig.from_dict(record)
     original, again = (config.objective.build(model=config.model.build()) for config in (run, rebuilt))
     variables = original.init(jax.random.key(0))
-    np.testing.assert_array_equal(again.scalar_loss(variables, batch(), STEP)[0],
-                                  original.scalar_loss(variables, batch(), STEP)[0])
+    np.testing.assert_array_equal(again.scalar_loss(variables, batch(), HELD_OUT)[0],
+                                  original.scalar_loss(variables, batch(), HELD_OUT)[0])
     assert record["objective"]["fields"]["loss"] == {
         "class": "dew.objectives.supervised:CrossEntropy", "fields": {"labels": "label", "output": []}}
 

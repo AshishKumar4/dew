@@ -19,6 +19,7 @@ import pytest
 from real_tokenizers import backbone_reading
 from reference_error import assert_fp32_reduction_bound
 from run_kinds import scalars
+from scenario_contract import assert_steps_finite, covering
 
 import dew
 from dew._cli.main import main
@@ -116,26 +117,18 @@ class Cell:
         return self.head == "joint"
 
 
-CELLS = tuple(Cell(head, context=context, consistency=consistency, bound=bound)
-              for head, context, consistency, bound in (
-                  ("joint", False, 0.0, "examples"), ("joint", True, 0.5, "share"),
-                  ("question", False, 0.5, "share"), ("question", True, 0.0, "examples"),
-                  ("letters", False, 0.5, "examples"), ("letters", True, 0.0, "share")))
-"""Six cells, in which every pair of two axes' values meets (`test_the_cells_cover_every_pair`): the head
-by each of the others, and each two of context, consistency and bound."""
+AXES = {"head": ("joint", "question", "letters"), "context": (False, True), "consistency": (0.0, 0.5),
+        "bound": ("examples", "share")}
+"""The workflow's settings axes (docs/design/testing.md, decision runs): the head, whether the backbone reads
+each example's context, the consistency term's weight, and the bound kind."""
+
+CELLS = tuple(Cell(**cell) for cell in covering(AXES))
+"""The workflow's covering set over its axes (`scenario_contract.covering`): every pair of two axes' values
+meets in a cell."""
 
 HEADS = {"joint": JointShape(width=32, routing_layers=1, layers=1, heads=2, feedforward=64), "question": None,
          "letters": Letters()}
 HEAD_KINDS = {"joint": JointSchemaHead, "question": DecisionHead, "letters": LabelReadout}
-
-
-def test_the_cells_cover_every_pair():
-    """Every pair of values of two axes meets in some cell, the head's three each of the others' two."""
-    axes = [{getattr(cell, field.name) for cell in CELLS} for field in dataclasses.fields(Cell)]
-    assert [len(values) for values in axes] == [3, 2, 2, 2]
-    for one, other in [(a, b) for a in range(4) for b in range(a + 1, 4)]:
-        met = {(dataclasses.astuple(cell)[one], dataclasses.astuple(cell)[other]) for cell in CELLS}
-        assert met == {(a, b) for a in axes[one] for b in axes[other]}
 
 
 @pytest.fixture(scope="module")
@@ -196,6 +189,7 @@ def test_a_cell_of_the_workflow_holds_the_conservation_contract(cell, backbone, 
     run = trained(cell, backbone, tmp_path)
     task = dew.pipeline(str(run))
     logged = scalars(run)
+    assert_steps_finite(logged.items(), cell.name)
     last = logged[max(logged)]
     consumed = int(last["train/examples_consumed"])
     # Each planted example is refused for its planted reason by the run's own layout, every other one fits:
