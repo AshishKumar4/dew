@@ -95,7 +95,7 @@ from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.gemma3n import AltUp
-from dew.registry import constructor_fields, from_record, towers
+from dew.registry import computing_differences, computing_fields, from_record, towers
 
 if TYPE_CHECKING:
     from dew.nn.multimodal import MultimodalTransformer
@@ -1565,21 +1565,16 @@ def refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object]) 
 def refuse_rebuilt(model: CausalTransformer, rebuilt: CausalTransformer, model_type: str) -> None:
     """Refuse a decoder whose written config reads back as `rebuilt`, another computation than `model`,
     naming the fields that differ."""
-    lost: dict[str, tuple[str, str]] = {}
-    # A Flax module's place in its tree aside (`constructor_fields`), and every field that says how the model
-    # runs, not what it computes (`dew._records.RUNS`).
-    for declared in constructor_fields(type(model)):
-        if declared.metadata.get(_records.RUNS):
-            continue
-        resolve = _RESOLVED.get(declared.name, operator.attrgetter(declared.name))
-        ours, theirs = resolve(model), resolve(rebuilt)
-        if ours != theirs:
-            lost[declared.name] = (repr(theirs), repr(ours))
+    # Each field that says what the model computes (`registry.computing_fields`), read as `_RESOLVED` does.
+    names = computing_fields(type(model))
+    ours, theirs = ({name: _RESOLVED.get(name, operator.attrgetter(name))(held) for name in names}
+                    for held in (model, rebuilt))
+    lost = computing_differences(type(model), ours, theirs)
     if lost:
         raise ExportRefused(
             f"{sorted(lost)} would not survive an export as {model_type}: its config reads back "
-            f"{', '.join(f'{name}={read}' for name, (read, _) in lost.items())} where this model has "
-            f"{', '.join(f'{name}={held}' for name, (_, held) in lost.items())}, "
+            f"{', '.join(f'{name}={read!r}' for name, (_, read) in lost.items())} where this model has "
+            f"{', '.join(f'{name}={held!r}' for name, (held, _) in lost.items())}, "
             "so transformers would compute "
             "another model; no exported family carries this computation"
         )

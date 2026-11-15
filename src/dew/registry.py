@@ -71,6 +71,7 @@ import tyro
 from jax.typing import DTypeLike
 from typing_extensions import Format, get_annotations, is_protocol
 
+from dew import _records
 from dew._records import JSON
 
 if TYPE_CHECKING:
@@ -1257,6 +1258,33 @@ def constructor_fields(member: type) -> tuple[dataclasses.Field, ...]:
     rebuilding an instance under another class (a wrapper's, `wrapper_layers`) passes on."""
     return tuple(field for field in dataclasses.fields(member)
                  if field.init and field.name not in ("parent", "name"))
+
+
+def computing_fields(member: type | Callable[..., Configured], *, kept: Collection[str] = ()
+                     ) -> tuple[str, ...]:
+    """The fields of `member`, a model's class, that say what it computes (`member_fields`): every one but
+    those it marks `dew._records.RUNS`, which say how it runs or trains (its dtype, precision and kernels,
+    remat, dropout, the initialization loaded weights replace), a field also marked one of the metadata
+    keys `kept` (`_records.NUMBERS`, `_records.ROUNDS`) among them. The one statement of what makes two
+    models one (`computing_differences`)."""
+    held = record_class(member)
+    runs = () if held is None else {field.name for field in constructor_fields(held)
+                                    if field.metadata.get(_records.RUNS)
+                                    and not any(field.metadata.get(key) for key in kept)}
+    return tuple(name for name, _, _ in member_fields(member) if name not in runs)
+
+
+def computing_differences(member: type | Callable[..., Configured], ours: Mapping[str, object],
+                          theirs: Mapping[str, object], *, kept: Collection[str] = ()
+                          ) -> dict[str, tuple[object, object]]:
+    """Each field of `member` that says what a model computes (`computing_fields`, with `kept`) on which
+    `ours` and `theirs`, two models' fields by name, differ, as its two values, ours first; a field one of
+    them lacks is None there. Empty where the two are one model, whatever runs or trains them: a saved
+    run's weights average with another's (`dew.checkpoints.averaged`), an export reads back as the model
+    (`dew.interop.hf_decoders.refuse_rebuilt`), a run resumes on other devices (`RunConfig.check_resume`,
+    which keeps the numbers it trains in)."""
+    return {name: (ours.get(name), theirs.get(name)) for name in computing_fields(member, kept=kept)
+            if ours.get(name) != theirs.get(name)}
 
 
 def rebuilt[Built](member: Callable[..., Built], model: DataclassInstance) -> Built:
