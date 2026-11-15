@@ -132,8 +132,9 @@ def test_a_gated_mlp_named_fused_on_a_data_split_mesh_runs_its_products_per_shar
         lowered = lowered_for(layer.apply, (params, x), generation_name, mesh)
     assert [route.kernel for route in routes if route.choice == "gated_mlp"] == ["fused"]
     read = {shape for call in kernel_calls(lowered) if call.kind == "mosaic_gpu" for shape in call.operands}
-    assert {(64, FEATURES), (FEATURES, HIDDEN), (HIDDEN, FEATURES)} <= read, read
-    assert (128, FEATURES) not in read, read
+    # A device's 64 rows of the 128 and its hidden rows; each kernel whole, the template's one group of it.
+    assert {(64, FEATURES), (64, HIDDEN), (1, FEATURES, HIDDEN), (1, HIDDEN, FEATURES)} <= read, read
+    assert not {(128, FEATURES), (128, HIDDEN)} & read, read
 
 
 def test_a_gated_mlps_case_runs_at_the_dtype_its_products_run_and_asks_nothing_apart():
