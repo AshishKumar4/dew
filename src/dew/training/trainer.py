@@ -307,8 +307,9 @@ class Trainer(Generic[Loss, Effects]):
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
+        # A config's groups take what the objective draws fresh, as a run's do (`OptimConfig.claiming`).
         self._config, self._optimizer = ((None, declaring(objective.optimizer(optimizer), self._boxed_axes))
-                                         if built else (optimizer, None))
+                                         if built else (optimizer.claiming(*objective.fresh_trained()), None))
         from dew.nn.inputs import seed_of
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None

@@ -150,6 +150,7 @@ class Objective()  [dew.objectives.base]
   .evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None
   .evaluation_variables(self, variables: Variables, step: Step) -> Variables
   .fresh_modules(self) -> tuple[str, ...]
+  .fresh_trained(self) -> tuple[tuple[str, ...], tuple[str, ...]]
   .fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables
   .held_variables(self) -> Variables | None
   .inference_record(self) -> JSON
@@ -251,6 +252,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None
   .evaluation_variables(self, variables: Variables, step: Step) -> Variables
   .fresh_modules(self) -> tuple[str, ...]
+  .fresh_trained(self) -> tuple[tuple[str, ...], tuple[str, ...]]
   .fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables
   .held_variables(self) -> Variables | None
   .inference_record(self) -> JSON

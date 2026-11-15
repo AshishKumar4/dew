@@ -9,12 +9,13 @@ import optax
 import pytest
 from affine_run import FEATURES, Affine, Counting, dataset
 from recording import RecordingTracker
-from test_trainer import PaddedTokenRegression, TokenRegression, make_trainer
+from test_trainer import PaddedTokenRegression, Targeted, TokenRegression, make_trainer
 
 from dew.data.dataset import Loader
 from dew.held_updates import phased
 from dew.objectives.base import Aux, Objective
 from dew.optim import power_profiles
+from dew.training import Trainer
 
 
 def held_optimizer(held: str, rate: float = 0.1):
@@ -238,3 +239,25 @@ def test_an_optimizer_whose_held_updates_no_state_tells_is_refused_before_any_st
                                      "critic": optax.conditionally_mask(sgd, critic)}, kernel_apart))
     assert int(make_trainer(objective=Effected(), optimizer=phases).fit(dataset(), steps=2,
                                                                         log_every=1).updates) == 2
+
+
+def test_an_unsplit_step_whose_optimizer_holds_its_update_logs_its_own_batchs_loss():
+    """A step read whole whose window of two closes while its optimizer holds the update back (`MultiSteps`
+    of two) commits no update and logs its own batch's loss, not its window's pooled (training.md, the
+    logged loss): targets 1 then 3 log 1 and 9, where the second logged (1 + 9) / 2 = 5, as a split step
+    logs its own; the next window, 5 then 7, closes on the update the optimizer applies and logs it,
+    (25 + 49) / 2 = 37 (spec alignment 2026-11-15, the evening pass's second finding)."""
+    rows = jax.device_count()
+    held = optax.MultiSteps(optax.sgd(0.0), 2).gradient_transformation()
+    trainer = Trainer(Targeted(), held, key=jax.random.key(0), accumulation=2)
+    state = trainer.initial_state()
+
+    def batch(target):
+        return {"target": jnp.full((rows,), target, jnp.float32)}
+
+    step = trainer.compile(state, batch(1.0))
+    logged = []
+    for target in (1.0, 3.0, 5.0, 7.0):
+        state, loss, _, _, _, committed = step(state, batch(target))
+        logged.append((float(loss), int(committed.count)))
+    assert logged == [(1.0, 0), (9.0, 0), (25.0, 0), (37.0, 1)]

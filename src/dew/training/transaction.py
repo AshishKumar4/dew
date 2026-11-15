@@ -1240,6 +1240,13 @@ class Transaction:
             held = TokenCount.add(state.deferred, jnp.where(taken, held, 0).astype(jnp.uint32))
             waiting = jnp.where(due & accepted & ~done, held, jnp.where(counted, 0, state.deferred))
             advanced = dataclasses.replace(advanced, deferred=waiting.astype(jnp.uint32))
+        if self.split == 1:
+            # A step that commits no update, a window still filling or one its optimizer holds back
+            # (`update_applied`), logs its own batch's loss, its window's pooled at one that commits
+            # (training.md, the logged loss); a step read in several parts pools its parts' own
+            # (`whole_step`).
+            own = self.objective.reduce_loss(pending.own)[0].astype(loss.dtype)
+            loss = jnp.where(counted, loss, own)
         return advanced, loss, aux, Committed(
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
             jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted),
