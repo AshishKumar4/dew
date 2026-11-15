@@ -2013,7 +2013,9 @@ def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, valu
     batch, queries, heads, width = query.shape
     owned_value = 0 if peaks else value_width
     owned_query = 0 if training and not peaks else width
-    cost = (stated(spec, batch, heads, query, key, value,
+    # The key buffer counted once where it is the values' too (`MosaicForward.in_key`, one stream).
+    streamed = (query, key) if value is key else (query, key, value)
+    cost = (stated(spec, batch, heads, *streamed,
                    tile_walk=TileWalk((queries, keys_count), (tiles.block_q, tiles.block_k), tiles.consumers,
                                       common=family.feeds_itself)) if counted
             else estimate(0))

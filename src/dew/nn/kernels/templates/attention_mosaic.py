@@ -1064,7 +1064,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     """
     # The key prologue taken as XLA's program before the launch (`key_prologue_taken`); the query's where the
     # call's consumers cannot take it (`_forward_call`).
-    in_key = reads_in_key(in_key, hooks)
+    in_key = reads_in_key(in_key, hooks, residuals)
     key, hooks = key_prologue_taken(key, Hooks() if hooks is None else hooks)
     if residuals is Kept.SPLIT:
         # The training walk reads an interval a query (`KeySpans.per_query`); the inference walk by position.
@@ -1082,18 +1082,19 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     """Why `forward` runs no call of these arrays compiled on this device, or None
     (`MosaicForward.declined`)."""
     spans = spans.per_query() if residuals is Kept.SPLIT else spans
-    in_key = reads_in_key(in_key, hooks)
+    in_key = reads_in_key(in_key, hooks, residuals)
     key, hooks = key_prologue_taken(key, Hooks() if hooks is None else hooks)
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
                              residuals=residuals, in_key=in_key)
     return op.declined(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target())
 
 
-def reads_in_key(in_key: bool, hooks: Hooks | None) -> bool:
+def reads_in_key(in_key: bool, hooks: Hooks | None, residuals: Kept = Kept.NONE) -> bool:
     """Whether a call whose values are its keys' leading columns (`in_key`) reads them from the key's slot:
-    not under a key prologue, whose keys the slot holds, the values being the keys as given (such a call
-    reads them from the slice it was handed)."""
-    return in_key and (hooks is None or hooks.key_mod is None)
+    not under a key prologue, whose keys the slot holds, the values being the keys as given, nor where it
+    keeps residuals, whose anchored training launches stream the values as given (`_trained_forward`); such
+    a call reads them from the slice it was handed."""
+    return in_key and residuals is Kept.NONE and (hooks is None or hooks.key_mod is None)
 
 
 def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,

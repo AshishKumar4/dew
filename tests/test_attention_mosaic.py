@@ -785,6 +785,22 @@ def test_values_their_keys_columns_are_the_keys_as_given_under_a_key_prologue_in
                                   np.asarray(template.reference(query, key * 2, key, spans), np.float32))
 
 
+def test_a_trained_call_whose_values_are_its_keys_columns_is_declined_as_its_forward_runs_it():
+    """A call keeping its residuals streams its values as given (its anchored launches), so whose values are
+    its keys' columns is declined as its forward runs it, the slice it was handed (`reads_in_key`): values 48
+    of a 64-wide key's columns, no whole swizzle group, refused in the key's slot ('columns'), are not refused
+    where the call keeps its split residuals."""
+    shape = (1, 64, 1, 64)
+    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
+    query, key = jnp.zeros(shape, jnp.bfloat16), jnp.ones(shape, jnp.bfloat16)
+    with generation.assumed("sm90"):
+        declined = attention_mosaic.forward_declined(query, key, key[..., :48], spans, in_key=True,
+                                                     residuals=template.Kept.SPLIT)
+        unkeyed = attention_mosaic.forward_declined(query, key, key[..., :48], spans,
+                                                    residuals=template.Kept.SPLIT)
+    assert declined == unkeyed
+
+
 def test_a_call_whose_values_are_its_prologued_keys_columns_is_declined_as_its_forward_runs_it():
     """Under a key prologue a call whose values are its keys' columns reads them from the slice it was
     handed (`attention_mosaic.reads_in_key`), so its declination is the forward's of that slice: values 48
