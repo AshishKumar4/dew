@@ -18,6 +18,7 @@ from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
 from dew.nn.kernels.templates import report
+from dew.nn.kernels.templates.outputs import OUTPUT_DIMS
 from dew.telemetry.instrumentation import MODEL_FLOPS, call_weights, counted_trips, custom_call_kind
 
 
@@ -48,6 +49,9 @@ class KernelCall:
     caller: str | None = None
     """The launch that traced a Mosaic GPU kernel, as its call's caller states it (`report.launch_metadata`),
     beside its name; None where its call states none."""
+    output_dims: str | None = None
+    """The dimensions a Mosaic GPU kernel's outputs descend from, as its call states them
+    (`outputs.OUTPUT_DIMS`); None where it states none."""
 
     @property
     def launched(self) -> str | None:
@@ -343,7 +347,7 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
         # A call whose location names no kernel is named by its kernel's hash, apart from every other.
         return KernelCall(kind, named[0] if named else hashed, ir.StringAttr(config["module"]).value_bytes,
                           hashed, stated.get("flops"), named[1] if named else None, _model_flops(attributes),
-                          caller=caller)
+                          caller=caller, output_dims=_frontend(attributes).get(OUTPUT_DIMS))
     if kind == "mosaic_tpu":
         config = json.loads(ir.StringAttr(attributes["backend_config"]).value)["custom_call_config"]
         return KernelCall(kind, ir.StringAttr(attributes["kernel_name"]).value, config["body"].encode(), "",
@@ -351,13 +355,19 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
     return KernelCall(kind, target, b"", "", None)
 
 
+def _frontend(attributes) -> dict[str, str]:
+    """A call's frontend attributes, each its string."""
+    if "mhlo.frontend_attributes" not in attributes:
+        return {}
+    return {named.name: ir.StringAttr(named.attr).value
+            for named in ir.DictAttr(attributes["mhlo.frontend_attributes"])}
+
+
 def _model_flops(attributes) -> float | None:
     """The model's FLOPs a call's frontend attributes declare (`instrumentation.MODEL_FLOPS`), None where
     they declare none."""
-    if "mhlo.frontend_attributes" not in attributes:
-        return None
-    frontend = ir.DictAttr(attributes["mhlo.frontend_attributes"])
-    return float(ir.StringAttr(frontend[MODEL_FLOPS]).value) if MODEL_FLOPS in frontend else None
+    declared = _frontend(attributes).get(MODEL_FLOPS)
+    return None if declared is None else float(declared)
 
 
 def _kernel_name(location: ir.Location) -> tuple[str, str | None] | None:
