@@ -252,8 +252,9 @@ def test_a_case_is_measured_in_processes_of_its_own_inside_the_cases_context_alo
 
 
 def test_a_case_whose_measured_run_compiled_keeps_its_timing_with_no_peak(tmp_path):
-    """A program the measured run did not load from its cache (its cache switched off there alone) is compiled
-    there: its compile joined the high-water, so the row has no peak and counts the compiles, its timing kept."""
+    """A program the measured run did not load from its cache (its cache switched off there alone) is
+    compiled there: its compile joined the high-water, so the row has no peak and counts the compiles, its
+    timing kept."""
     (tmp_path / "uncached.py").write_text(
         "import contextlib, os, jax\n"
         "@contextlib.contextmanager\n"

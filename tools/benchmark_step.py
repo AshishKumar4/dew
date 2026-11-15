@@ -416,8 +416,8 @@ def measured_row(case: Case, config: BenchmarkConfig) -> Row:
         except peak_memory.CompiledWhileMeasured as missed:
             peaks, compiled = None, missed.compiled
         (warm,), (row,) = (json.loads(Path(f"{out}.{stage}").read_text()) for stage in ("warm", "measure"))
-    return {**row, "compile_seconds": warm["compile_seconds"], "compile_cached": warm["compile_cache_hits"] > 0,
-            "compiled_while_measured": compiled,
+    return {**row, "compile_seconds": warm["compile_seconds"],
+            "compile_cached": warm["compile_cache_hits"] > 0, "compiled_while_measured": compiled,
             "peak_device_bytes": None if peaks is None or None in peaks else max(peaks),
             "peak_bytes_by_device": peaks}
 
@@ -754,9 +754,6 @@ def run(config: BenchmarkConfig, apart: bool) -> list[Row]:
     stage = os.environ.get(peak_memory.PEAK_STAGE, "measure") if config.peak_run else None
     if stage and out:
         out = f"{out}.{stage}"
-    if stage == "warm":
-        # Filling the cache: each window's one step runs every program the measured run times.
-        config = dataclasses.replace(config, steps=1)
     for case in build_cases(config):
         # The trainer narrates state generation and input shapes per case,
         # which buries the numbers this tool exists to print.
