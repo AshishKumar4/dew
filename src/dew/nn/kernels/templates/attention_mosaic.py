@@ -1092,9 +1092,10 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 def reads_in_key(in_key: bool, hooks: Hooks | None, residuals: Kept = Kept.NONE) -> bool:
     """Whether a call whose values are its keys' leading columns (`in_key`) reads them from the key's slot:
     not under a key prologue, whose keys the slot holds, the values being the keys as given, nor where it
-    keeps residuals, whose anchored training launches stream the values as given (`_trained_forward`); such
-    a call reads them from the slice it was handed."""
-    return in_key and residuals is Kept.NONE and (hooks is None or hooks.key_mod is None)
+    keeps split residuals, whose anchored training launches stream the values as given
+    (`_trained_forward`); such a call reads them from the slice it was handed. A plain forward keeping its
+    rows (`Kept.OUTPUT`, a split decode step's slices) reads the key's slot as one keeping none."""
+    return in_key and residuals is not Kept.SPLIT and (hooks is None or hooks.key_mod is None)
 
 
 def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,

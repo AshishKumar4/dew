@@ -147,6 +147,31 @@ def test_an_absorbed_mla_decode_step_whose_values_are_its_keys_leading_columns_i
 
 
 @INTERPRETS
+def test_a_split_absorbed_mla_decode_step_whose_values_are_its_keys_leading_columns_is_on_par_interpreted():
+    """An absorbed MLA decode step over 512 keys whose plan cuts its row into slices (`plan`: a split launch
+    keeps its rows, `Kept.OUTPUT`), its values its keys' leading 512 columns read from the key's slot
+    (`reads_in_key`), merged by their masses: on par with the reference path over the keys' columns sliced
+    (check 1), as an H100 runs it under the interpreter."""
+    keys = 512
+    spans = template.spans(1, keys, 1, lengths=jnp.asarray([keys], jnp.int32))
+
+    def ours(query, key):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, key[..., :512], spans, interpret=True, in_key=True)
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 2)
+        return (jax.random.normal(streams[0], (1, 1, 16, 576), jnp.bfloat16),
+                jax.random.normal(streams[1], (1, keys, 1, 576), jnp.bfloat16))
+
+    def reference(query, key):
+        return template.reference(query, key, key[..., :512], spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template decode absorbed MLA in key split",
+                    seeds=SEEDS)
+
+
+@INTERPRETS
 @pytest.mark.parametrize("width", [32, 192])
 @pytest.mark.parametrize("device", ["sm90", "sm80"])
 def test_a_decode_step_is_on_par_at_head_widths_interpreted(device, width):
