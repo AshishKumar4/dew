@@ -41,6 +41,8 @@ from test_recurrence_chunk import (
     chunk_on,
     draw,
     hosted,
+    oracle,
+    release,
     token_by_token,
 )
 from upstream_support import upstream_arm
@@ -70,10 +72,10 @@ FLA_LAYERS = {"gated delta net": "gdn", "kimi delta attention": "kda"}
 """fla's own layer each delta rule form is (`delta_rule_support.FLA_LAYER_SIDE`): Qwen3.5's gated delta net
 and Kimi Linear's."""
 
-FORM_RELEASES = {**dict.fromkeys(FLA_LAYERS, "fla"), "rated scan": "mamba_ssm"}
-"""The upstream library each form's family has a release of (testing.md: a cell's oracle is that release's
-own code): fla's layers for the delta rule's forms, mamba_ssm's scan for Mamba-2's rated scan; the step
-write gate's form has none."""
+FORM_RELEASES = {form: found for form, hooks in FORMS.items() if (found := release(hooks)) is not None}
+"""The upstream library each form's family has a release of (`test_recurrence_chunk.release`): fla's layers
+for the delta rule's forms, mamba_ssm's scan for Mamba-2's rated scan; the step write gate's form has
+none."""
 
 
 def _fla(named: dict[str, str], leaves: dict, cotangents: tuple, starts) -> dict:
@@ -205,15 +207,13 @@ def _routed(case: tuple[tuple[str, str], ...], kernel: str) -> frozenset | None:
 
 def _reference(case: dict[str, str]) -> str:
     """`case`'s family's independent oracle at its dtype: the upstream's own code (`upstream <library>`,
-    `UPSTREAMS`) where its form's family has a release (`FORM_RELEASES`) and the run's declaration admits
-    that release's products for the dtype (`recurrence_chunk.upstream_precision`: fp32's TF32 at no more than
-    the default), whatever kernel the cell names; else the recurrence a token at a time ('token': a step
-    write gate's form, which no release runs, and a call declared above what the release computes,
-    testing.md). Taken from whether Dew's port routed the call, a released family's cell would have dropped
-    its upstream wherever the port refused for any other reason (row 6150)."""
-    release = FORM_RELEASES.get(case["form"])
-    taken = release is not None and recurrence_chunk.upstream_precision(case["dtype"])
-    return f"upstream {release}" if taken else "token"
+    `UPSTREAMS`) where its form's family has a release the run's declaration admits for the dtype
+    (`test_recurrence_chunk.oracle`), whatever kernel the cell names; else the recurrence a token at a time
+    ('token': a step write gate's form, which no release runs, and a call declared above what the release
+    computes, testing.md). Taken from whether Dew's port routed the call, a released family's cell would have
+    dropped its upstream wherever the port refused for any other reason (row 6150)."""
+    found = oracle(FORMS[case["form"]], case["dtype"])
+    return "token" if found is None else f"upstream {found}"
 
 
 def supported(case: dict[str, str]) -> bool:
@@ -322,14 +322,13 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> No
     if upstream is not None and not os.environ.get(INTERPRETERS[upstream]):
         _on_par_recorded(named, step, with_gradients(truth), upstream, seeds)
         return
-    oracle = jax.jit(with_gradients(truth)) if upstream is None else _upstream(named, (1 + REDRAW) * seeds)
-    if named["kernel"] != "xla":
-        distance = against_the_portable_math(_step(named, named["kernel"]), _step(named, "xla"),
-                                             functools.partial(_drawn, named), with_gradients(truth),
-                                             FEWEST_SEEDS)
+    held_to = jax.jit(with_gradients(truth)) if upstream is None else _upstream(named, (1 + REDRAW) * seeds)
+    if named["kernel"] != "xla" and (distance := against_the_portable_math(
+            "-".join(case), _step(named, named["kernel"]), _step(named, "xla"),
+            functools.partial(_drawn, named), with_gradients(truth), FEWEST_SEEDS)) is not None:
         print(f"{'-'.join(case)} under the {generation.numerics().forms} forms, its distance against Dew's "
               f"own chunk math's: {distance}", flush=True)
-    assert_as_exact(step, oracle, functools.partial(_drawn, named), "-".join(case), seeds=seeds,
+    assert_as_exact(step, held_to, functools.partial(_drawn, named), "-".join(case), seeds=seeds,
                     truth_fn=with_gradients(truth))
 
 
