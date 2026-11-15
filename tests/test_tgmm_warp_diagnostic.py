@@ -12,6 +12,13 @@ def test_gathered_gradient_load_source():
         test_gemm_gather.test_each_rings_gathered_kernel_gradient_lowers_for_cuda("sm100", (True, True))
     except ValueError as error:
         evidence = [str(error)]
+        cause = error.__cause__
+        while cause is not None:
+            for location in traceback.extract_tb(cause.__traceback__):
+                if "/dew/nn/" in location.filename and location.name in (
+                        "staged_at", "_staged_halves", "zeroed", "tile_of"):
+                    evidence.append(f"FAILING_GET_ORIGIN {location}")
+            cause = cause.__cause__
         current = error.__traceback__
         while current is not None:
             frame = current.tb_frame
