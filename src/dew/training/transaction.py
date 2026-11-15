@@ -45,7 +45,7 @@ from dew.nn.inspection import (
     probes_of,
     unscaled,
 )
-from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.options import owned_program, program
 from dew.nn.moe import fixed_routers
 from dew.nn.precision import at_least_fp32
 from dew.nn.programs import called, computed
@@ -511,11 +511,51 @@ def _descending(gradient: jax.Array, parameter: jax.Array) -> jax.Array:
     return (jnp.conj(gradient) if jnp.iscomplexobj(gradient) else gradient).astype(parameter.dtype)
 
 
+def checked(state: TrainState) -> dict[str, Variables | optax.OptState | None]:
+    """The trees of `state` a finite step keeps finite and a save refuses non-finite: the parameters, the
+    optimizer state and the averages. The one statement of them, which the step's acceptance
+    (`finish_attempt`) and a save's refusal (`dew.training.trainer.refuse_non_finite`) read."""
+    return {"variables": state.variables, "opt_state": state.opt_state, "ema": state.ema}
+
+
+def _finite(leaf: jax.Array) -> jax.Array:
+    """Whether `leaf` is finite throughout."""
+    return jnp.isfinite(leaf).all()
+
+
 def _all_finite(tree) -> jax.Array:
+    """Whether every leaf of `tree` is finite (`_finite`), within a traced program."""
     finite = jnp.asarray(a=True)
     for leaf in jax.tree.leaves(tree):
-        finite = finite & jnp.all(jnp.isfinite(leaf))
+        finite = finite & _finite(leaf)
     return finite
+
+
+def _finite_each(leaves: list[jax.Array]) -> list[jax.Array]:
+    """Whether each of `leaves` is finite throughout, one program over them."""
+    return [_finite(leaf) for leaf in leaves]
+
+
+def finite_flags(leaves: Sequence[jax.Array]) -> list[bool]:
+    """Whether each of `leaves`, arrays placed anywhere, is finite throughout (`_finite`), read outside a
+    step: one program for each placement the leaves share (their devices and memory kind), as no one
+    program spans two meshes (a CPU-owned run's host companion and its accelerator); a leaf in host memory
+    (a layout's pinned-host field) brought to its devices' memory one leaf at a time (`fetched`)."""
+    groups: dict[tuple, list[int]] = {}
+    for index, leaf in enumerate(leaves):
+        sharding = leaf.sharding
+        groups.setdefault((frozenset(sharding.device_set), sharding.memory_kind), []).append(index)
+    flags: list[bool] = [True] * len(leaves)
+    for (_, memory), members in groups.items():
+        if memory not in (None, "device"):
+            for index in members:
+                leaf = leaves[index]
+                flags[index] = bool(program(_finite)(fetched(leaf, leaf.sharding)))
+            continue
+        read = jax.device_get(program(_finite_each)([leaves[index] for index in members]))
+        for index, flag in zip(members, read, strict=True):
+            flags[index] = bool(flag)
+    return flags
 
 
 def compact_qk(tree):
@@ -1174,7 +1214,7 @@ class Transaction:
         inspected = {**inspected, **self.watched_summaries(aux, probed)}
         finite = finite & native_finite
         if scale is not None:
-            accepted = finite & _all_finite((numerical.variables, numerical.opt_state, numerical.ema))
+            accepted = finite & _all_finite(checked(numerical))
         if previous is not None:
             numerical = dataclasses.replace(
                 numerical, accumulation=self._retained_window(state, batch, pending, attempt, read))

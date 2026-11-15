@@ -67,7 +67,7 @@ from dew.held_updates import waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
-from dew.nn.kernels.options import Compiling, attempting, owned_program, program
+from dew.nn.kernels.options import Compiling, attempting, owned_program
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, tracing
 from dew.objectives.base import (
@@ -188,7 +188,9 @@ from dew.training.transaction import (
     PassesProgress,
     Transaction,
     batch_statistics_shapes,
+    checked,
     compact_qk,
+    finite_flags,
     loss_scale,
     pooled_by_mean,
     refuse_unpassed_progress,
@@ -216,28 +218,24 @@ _DEFAULT_LAYOUT = Layout()
 
 
 def refuse_non_finite(state: TrainState, step: int, latest: Callable[[], int | None]) -> None:
-    """Refuse to save a `state` whose parameters, optimizer state or averages hold a non-finite value, on any
-    tier: no checkpoint is written and none rotated out, and the run stops, naming the step and the first
-    such leaf, so the checkpoint a resume finds is the last finite one (`latest`, read only to say so).
-    One compiled reduction gives a flag a leaf, which every process reads alike (training.md, checkpoints
-    and resume)."""
-    trees = {"variables": state.variables, "opt_state": state.opt_state, "ema": state.ema}
+    """Refuse to save a `state` whose checked trees (`transaction.checked`: the parameters, optimizer state
+    and averages, and under DiLoCo each replica's inner copy of them, which the next meeting averages into
+    the outer model) hold a non-finite value, on any tier: no checkpoint is written and none rotated out,
+    and the run stops, naming the step and the first such leaf, so the checkpoint a resume finds is the
+    last finite one (`latest`, read only to say so). Read wherever the leaves are placed
+    (`transaction.finite_flags`), the same on every process (training.md, checkpoints and resume)."""
+    trees = {**checked(state), **({} if state.inner is None else
+                                  {f"inner.{name}": tree for name, tree in checked(state.inner).items()})}
     leaves = [(f"{name}{jax.tree_util.keystr(path)}", leaf) for name, tree in trees.items()
               for path, leaf in jax.tree_util.tree_leaves_with_path(tree)
               if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)]
-    finite = jax.device_get(program(_finite_flags)([leaf for _, leaf in leaves]))
+    finite = finite_flags([leaf for _, leaf in leaves])
     first = next((path for (path, _), held in zip(leaves, finite, strict=True) if not held), None)
     if first is not None:
         kept = latest()
         said = "no checkpoint" if kept is None else f"the latest checkpoint, step {kept}"
         raise RuntimeError(f"step {step}'s state holds a non-finite value at {first}, so no checkpoint of it "
                            f"is written and {said} is the one a resume finds")
-
-
-def _finite_flags(leaves: list[jax.Array]) -> jax.Array:
-    """Whether each of `leaves` is finite throughout, one flag a leaf from one program."""
-    return jnp.stack([jnp.isfinite(leaf).all() for leaf in leaves]) if leaves else jnp.zeros((0,), bool)
-
 
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
