@@ -79,8 +79,9 @@ rounded twice to nearest."""
 PAIR_FRACTION = 2.0 ** -21
 """What `algebra.decayed` rounds off a pair's exponent: each side's fraction (where the side is under one, its
 distance from its floor rounds), their difference and its sum with the low halves', each under 2."""
-PAIR_FLOOR = recurrence_algebra.PAIR_FLOOR
-"""A pair whose integers differ by less weighs zero (`algebra.PAIR_FLOOR`)."""
+ZERO_WHOLE = -127
+"""A pair whose integers differ by this or less weighs zero (`algebra.between`'s exact power of two at its
+zero exponent bits, `attention_algebra.exact_power2`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -142,14 +143,14 @@ def raised_exponent(exponents: Iv, lane: Lane) -> Iv:
 def between(later, later_bound, earlier, earlier_bound, lane: Lane) -> Iv:
     """`algebra.between` of two separated prefixes, `exp2(later - earlier)` (broadcasting): each side's
     exponent within its bound of exact, their fractions' difference rounded (`PAIR_FRACTION`), exp2 at the
-    lane's reach and scaled by the wholes' difference exactly, zero where the integers' difference may pass
-    `PAIR_FLOOR`."""
+    lane's reach and scaled by the wholes' difference exactly (a product below fp32's normal range among its
+    subnormals unless the lane flushes them), zero where the integers' difference may reach `ZERO_WHOLE`."""
     difference = later - earlier
     spread = later_bound + earlier_bound + 2.0 ** -46 * (np.abs(later) + np.abs(earlier)) + PAIR_FRACTION
     found = raised_exponent(outward(difference - spread, np.minimum(difference + spread, 126.0)), lane)
     # The integers' difference lies within two of the exponent's.
-    lo = np.where(difference - spread < PAIR_FLOOR + 2, 0.0, found.lo)
-    return Iv(lo, np.where(difference + spread < PAIR_FLOOR - 2, 0.0, found.hi))
+    lo = np.where(difference - spread < ZERO_WHOLE + 2, 0.0, found.lo)
+    return Iv(lo, np.where(difference + spread < ZERO_WHOLE - 2, 0.0, found.hi))
 
 
 def _lags(size: int) -> np.ndarray:
@@ -365,50 +366,56 @@ SUB = recurrence_algebra.SUB
 """The sub-chunk a decay a key dimension's pairs factor over (`algebra.key_block_pairs`)."""
 
 
-def key_pairs(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
+def key_pairs(rows: Iv, k, exponents: Exponents, lane: Lane, scale: float = 1.0) -> Iv:
     """`algebra.key_block_pairs` `[C, C]` under a decay a key dimension, the pairs of sub-chunks before each
     row's (zero within it, `key_diagonal`'s): `sum_k r_ik k_jk exp2(E_ik - E_jk)` factored at row `i`'s
-    sub-chunk's first token `G_s` and key `j`'s last `E_t`, the rows gated down (`exp2(E_i - G_s)`) and by
-    the middle factor (`exp2(G_s - E_t)`), the keys up (`exp2(E_t - E_j)`), each an fp32 product taken as
-    its operand form (`operand`), the products' sum over every key block within one native sum's bound of
-    its terms (a key block's sum and its adds into the total, at most as many roundings as the width's
-    terms). The caller masks the lags."""
+    sub-chunk's first token `G_s`, the rows gated down (`exp2(E_i - G_s)`) and every earlier key up
+    (`exp2(G_s - E_j)`, `algebra.gated_up`), the gated rows then `scale`d, each an fp32 product taken as its
+    operand form (`operand`), a
+    sub-chunk's rows against the keys before it one product over every key block, summed in one native
+    sum's bound of its terms (each pair one sub-chunk's product's; the others add its exact zeros)."""
     exact, bound = exponents.exact, exponents.bound
     size = np.shape(k)[0]
-    sub_of = np.arange(size) // SUB
-    firsts, lasts = sub_of * SUB, sub_of * SUB + SUB - 1
+    firsts = np.arange(size) // SUB * SUB
     down = between(exact, bound, exact[firsts], bound[firsts], lane)
-    gated = fp32(mul(rows, down), lane)
-    up = operand(fp32(mul(point(k), between(exact[lasts], bound[lasts], exact, bound, lane)), lane), lane,
-                 lane.pairing)
-    found = point(np.zeros((size, size)))
-    for t in range(size // SUB):
-        reached = sub_of > t
-        middle = between(exact[firsts], bound[firsts], exact[t * SUB + SUB - 1][None, :],
-                         bound[t * SUB + SUB - 1][None, :], lane)
-        middle = where(reached[:, None], middle, point(np.zeros(middle.lo.shape)))
-        left = operand(fp32(mul(gated, middle), lane), lane, lane.pairing)
-        columns = slice(t * SUB, (t + 1) * SUB)
-        # Each operand its pairing form (`operand`), the product over its parts' issued pairs.
-        product = dot(left, Iv(up.lo[columns].T, up.hi[columns].T), lane, FLOAT32,
+    gated = fp32(mul(fp32(mul(rows, down), lane), point(np.float32(scale))), lane)
+    gated = operand(gated, lane, lane.pairing)
+    lo, hi = np.zeros((size, size)), np.zeros((size, size))
+    for place in range(SUB, size, SUB):
+        up = between(exact[place][None, :], bound[place][None, :], exact[:place], bound[:place], lane)
+        keyed = operand(fp32(mul(point(np.asarray(k)[:place]), up), lane), lane, lane.pairing)
+        mine = slice(place, place + SUB)
+        product = dot(Iv(gated.lo[mine], gated.hi[mine]), Iv(keyed.lo.T, keyed.hi.T), lane, FLOAT32,
                       parts=(lane.pairing, lane.pairing))
-        found = Iv(np.concatenate([found.lo[:, :t * SUB], product.lo, found.lo[:, (t + 1) * SUB:]], 1),
-                   np.concatenate([found.hi[:, :t * SUB], product.hi, found.hi[:, (t + 1) * SUB:]], 1))
-    return found
+        lo[mine, :place], hi[mine, :place] = product.lo, product.hi
+    return Iv(lo, hi)
 
 
 def key_diagonal(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
-    """`algebra.key_diagonal_pairs` `[C, C]` under a decay a key dimension, the pairs within each row's
-    sub-chunk at or before it (zero elsewhere; a strict system's diagonal the caller masks), each its own
-    decay: `sum_k r_ik k_jk exp2(E_ik - E_jk)`, each term the row times the key rounded, then times its decay
-    (`between`), the multiply an add may fuse, and the terms' sum over every key block within one sum's
-    bound of them (a key block's sum and its adds into the total, at most as many roundings as the width's
-    terms)."""
+    """`algebra.key_diagonal_bands` `[C, C]` under a decay a key dimension, the pairs within each row's
+    sub-chunk at or before it (zero elsewhere; a strict system's diagonal the caller masks): `sum_k r_ik k_jk
+    exp2(E_ik - E_jk)`, each pair's decay the product of its tokens' own (`algebra.token_decays`, `between`
+    of each token against the one before), rounded a factor at a time from the row's own token back
+    (`pair_e = pair_(e - 1) a_(i - e + 1)`), each term the row times the key rounded, then times its decay,
+    the multiply an add may fuse, and the terms' sum over every key block within one sum's bound of them (a
+    key block's sum and its adds into the total, at most as many roundings as the width's terms)."""
     exact, bound = exponents.exact, exponents.bound
     size = np.shape(k)[0]
     tokens = np.arange(size)
     placed = ((tokens[:, None] // SUB) == (tokens[None, :] // SUB)) & (tokens[:, None] >= tokens[None, :])
-    decay = between(exact[:, None, :], bound[:, None, :], exact[None, :, :], bound[None, :, :], lane)
+    # Each token's own decay against the one before, `own[t - 1]` token `t`'s.
+    own = between(exact[1:], bound[1:], exact[:-1], bound[:-1], lane)
+    lo, hi = np.zeros((size, size, *exact.shape[1:])), np.zeros((size, size, *exact.shape[1:]))
+    lo[tokens, tokens] = hi[tokens, tokens] = 1.0
+    # Each row's pair so far, from its own token back.
+    pair_lo, pair_hi = np.ones(exact.shape), np.ones(exact.shape)
+    for e in range(1, SUB):
+        rows_e = tokens[tokens % SUB >= e]
+        found = fp32(mul(Iv(pair_lo[rows_e], pair_hi[rows_e]), Iv(own.lo[rows_e - e], own.hi[rows_e - e])),
+                     lane)
+        pair_lo[rows_e], pair_hi[rows_e] = found.lo, found.hi
+        lo[rows_e, rows_e - e], hi[rows_e, rows_e - e] = found.lo, found.hi
+    decay = Iv(lo, hi)
     keyed = fp32(mul(Iv(rows.lo[:, None, :], rows.hi[:, None, :]), point(np.asarray(k)[None, :, :])), lane)
     terms = fused(mul(keyed, decay), lane)
     terms = where(placed[:, :, None], terms, point(np.zeros(terms.lo.shape)))
@@ -453,11 +460,14 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
               np.broadcast_to(raised.hi[-1][:, None], step.carry.lo.shape))
     leaving = fp32(add(fused(mul(step.carry, held), lane), write), lane)
     factor = point(np.float32(scale))
-    scores = fp32(mul(pairs(point(step.q)), factor), lane)
-    # Each key block's scores scaled before their sum: one rounding a block more, at most the width's.
-    width = np.asarray(step.k).shape[-1]
-    slack = width * 2.0 ** -24 * np.maximum(np.abs(scores.lo), np.abs(scores.hi))
-    scores = staged(where(_lags(size) >= 0, outward(scores.lo - slack, scores.hi + slack), zeros), lane)
+    # The pairs of sub-chunks the gated queries scaled by the scale's magnitude up to one (their sum held
+    # across the key blocks), the rest and its sign the read sums'; each sub-chunk's own scaled once summed
+    # (`algebra.band_masked`).
+    shrinking, growing = min(abs(scale), 1.0), math.copysign(max(abs(scale), 1.0), scale)
+    crossed = fp32(mul(key_pairs(point(step.q), step.k, exponents, lane, shrinking),
+                       point(np.float32(growing))), lane)
+    within = fp32(mul(key_diagonal(point(step.q), step.k, exponents, lane), factor), lane)
+    scores = staged(where(_lags(size) >= 0, where(own, within, crossed), zeros), lane)
     queries = staged(fp32(mul(fp32(mul(point(step.q), raised), lane), factor), lane), lane)
     left = Iv(np.concatenate([queries.lo, scores.lo], 1), np.concatenate([queries.hi, scores.hi], 1))
     right = point(np.concatenate([step.h, step.c], 0))

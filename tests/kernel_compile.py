@@ -321,7 +321,7 @@ def _compiled(case, generation: str, record: dict,
                              if key not in uncertified]
     # Each kernel once, as JAX lowered it (a function's kernels however many calls reach them).
     calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]
-    modules = kernel_modules(calls)
+    modules = report.kernel_modules(calls)
     record["modules"] = modules
     # Each kernel certification compiled alone in this process, by name and launch: its module.
     record["certified"] = {name: module for found in report.certifications()
@@ -348,17 +348,6 @@ def _compiled(case, generation: str, record: dict,
     if expected is not None:
         record["route"] = _route(lowered, executable, _device(generation, expected.axes))
     return report.launched_kernels(executable), triton_kernels(lowered)
-
-
-def kernel_modules(calls: list) -> dict[str, str]:
-    """Each Mosaic GPU call's module (its kernel hash) by its kernel's name and launch (`report.launch_name`):
-    one name and launch of two modules raises, as its evidence would be one's."""
-    modules: dict[str, str] = {}
-    for call in calls:
-        name = report.launch_name(call.name, call.launch)
-        if modules.setdefault(name, call.config) != call.config:
-            raise ValueError(f"{name} names two kernels: its evidence would be one's")
-    return modules
 
 
 def _estimates(calls: list, printed: str) -> dict[str, str]:
@@ -670,6 +659,9 @@ RAISED = re.compile(r"setmaxnreg\.inc\.sync\.aligned\.u32 (\d+);")
 DECREASED = re.compile(r"setmaxnreg\.dec\.sync\.aligned\.u32 (\d+);")
 """A producer's decrease's registers, as a kernel record states them (`decreased`)."""
 
+THREADS = re.compile(r"\.maxntid (\d+),")
+"""A kernel's threads a block (`.maxntid`'s first), as a kernel record states them (`threads`)."""
+
 
 RELOCATABLE = not resources.RAISES_HONORED
 """Whether the GPU compiles a Mosaic GPU kernel's PTX relocatably, as jaxlib's Mosaic GPU does through
@@ -752,6 +744,9 @@ def _compiled_here(cases, generation: str) -> list[dict]:
                 kernel["raised"] = int(raise_.group(1)) if (raise_ := RAISED.search(ptx)) else None
                 # The registers its producer lowers to, as its PTX states (`setmaxnreg.dec`); None likewise.
                 kernel["decreased"] = int(lower.group(1)) if (lower := DECREASED.search(ptx)) else None
+                # Its threads a block, as its PTX states (`.maxntid`); None likewise. A record compiled in a
+                # process of its own (`compiled_apart`) carries it where this process's `PTX` holds none.
+                kernel["threads"] = int(threads.group(1)) if (threads := THREADS.search(ptx)) else None
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
         found.append(record)
     return found

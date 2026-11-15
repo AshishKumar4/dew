@@ -503,7 +503,7 @@ class Chunk(Expr):
     def spread(cls, readers: Chunk, values: Chunk, keys: Chunk, between: Chunk) -> Chunk: ...
     """`sum_{j <= i} (readers_i . values_j) keys_jk between_ijk`: each token's earlier writes, their values
     read by its reader along the state's values, decayed to it along the keys by `between`
-    (`decay("between")`; `scan._spread`)."""
+    (`decay("between")`; `scan.spread`)."""
 
     @classmethod
     def applied(cls, state: Chunk, readers: Chunk) -> Chunk: ...

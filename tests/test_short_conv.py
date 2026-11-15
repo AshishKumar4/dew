@@ -374,3 +374,38 @@ def test_documents_that_continue_another_convolve_after_their_chain_as_their_own
     variables = jax.jit(mixer.init)(jax.random.key(0), jnp.ones((1, 4, 8), jnp.float32))
     assert_forks_as_own_rows(mixer, variables, 8, layout, "short conv")
 
+
+
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100"])
+def test_a_conv_backward_hands_no_more_partial_sums_than_a_wave_of_programs(generation_name):
+    """Qwen3.5-4B's conv (its queries', keys' and values' 8192 channels, four taps) over four rows of 12,288
+    tokens, its taps' and bias's gradients lowered for a compile-only device: the backward launch (the call
+    writing the input's gradient) hands XLA its taps' and bias's partial sums, `[K + 1]` of its channels fp32
+    a program, for the fewest programs filling the device once, short of a wave (each multiprocessor its
+    register file over a warpgroup at a thread's most) by less than one span of every row's channel
+    programs, where a program to every 64 tokens of every row handed XLA 100 MB a layer, which it held to a
+    4B step's end (row 6027's residual, 2.22 GB of a compile-only GH200's step)."""
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels.lowered import custom_calls
+    from dew.nn.kernels.templates import scan
+    from dew.nn.kernels.templates.recurrence import conv
+
+    parts, taps, rows, length = ((2048, 128), (2048, 128), (4096, None)), 4, 4, 12288
+    channels = sum(width for width, _ in parts)
+
+    def loss(kernel, x):
+        return sum(jnp.sum(out.astype(jnp.float32)) for out in causal_conv1d(x, kernel, parts=parts))
+
+    shapes = (jax.ShapeDtypeStruct((channels, taps), jnp.float32),
+              jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16))
+    calls = custom_calls(lowered_for(jax.grad(loss), shapes, generation_name))
+    (backward,) = [call for call in calls if (rows, length, channels) in call.results]
+    handed = sum(int(np.prod(shape)) for shape in backward.results if shape != (rows, length, channels))
+    # Each program's partials its channels' (`conv.lanes`), the taps' and the bias's.
+    width = conv.lanes(parts, jnp.bfloat16)
+    programs = handed // ((taps + 1) * width)
+    target = generation.gpu_target(generation_name)
+    held = target.multiprocessor
+    wave = target.multiprocessors * (held.registers // (scan.THREADS * held.thread_registers))
+    assert programs < wave + rows * (channels // width), (programs, wave)

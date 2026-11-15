@@ -257,6 +257,11 @@ FED = dataclasses.replace(COOPERATIVE, family=mosaic_sm90.FED.name)
 PINGPONG = dataclasses.replace(COOPERATIVE, pingpong=True)
 """`COOPERATIVE`'s two consumers taking alternate tiles whole, their products in turn (ping-pong)."""
 
+PINGPONG_PAIRED = dataclasses.replace(PINGPONG, cluster=2)
+"""`PINGPONG` on a pair of multiprocessors a cluster, the matrix's blocks the pair's row tiles read alike
+loaded once between them (multicast), each program's owning consumer releasing its slots: CUTLASS's sm90
+ping-pong on its 2 x 1 cluster."""
+
 def test_a_family_that_takes_no_pingpong_refuses_it():
     """Ping-pong is a family's whose own producer loads every tile (`mosaic.Family.takes_pingpong`): a
     consumer-fed ring's tile refuses it, its first consumer loading every ring's steps, its partner's tiles'
@@ -275,8 +280,8 @@ matrix's blocks (the interpreter runs the pair's two programs, each loading the 
 
 
 @runs("sm90")
-@pytest.mark.parametrize("forward", [COOPERATIVE, PAIRED, FED, PINGPONG],
-                         ids=["one multiprocessor", "a pair", "fed", "ping-pong"])
+@pytest.mark.parametrize("forward", [COOPERATIVE, PAIRED, FED, PINGPONG, PINGPONG_PAIRED],
+                         ids=["one multiprocessor", "a pair", "fed", "ping-pong", "ping-pong on a pair"])
 @pytest.mark.parametrize("case", ["scaled", "row scaled"])
 def test_a_cooperative_tile_holds_check_1_with_its_hooks(case, forward):
     """The Hopper launches pinned to a cooperative tile, the forward's alone, a pair's (whose second row
@@ -302,18 +307,20 @@ def a_cooperative_tile_holds_check_1_with_its_hooks(case: str, forward: mosaic_g
 
 
 @runs("sm90")
+@pytest.mark.parametrize("forward", [PINGPONG, PINGPONG_PAIRED], ids=["one multiprocessor", "a pair"])
 @pytest.mark.parametrize("case", ["plain", "dense plain"])
-def test_a_pingpong_tile_holds_check_1_with_its_gradients(case):
+def test_a_pingpong_tile_holds_check_1_with_its_gradients(case, forward):
     """The Hopper forward and input gradient pinned to ping-pong's tile (`PINGPONG`: its two consumers take
     alternate tiles whole, their products in turn on the tensor cores, each finishing its tile while the
     other issues the next), interpreted, grouped and dense, a program's tiles more than its consumers: the
     value and every gradient as exact as the plain program's from float64 truth, the kernel gradient on the
-    cooperative tile (which takes no ping-pong, its consumers each preparing half of a step's rows)."""
+    cooperative tile (which takes no ping-pong, its consumers each preparing half of a step's rows); on one
+    multiprocessor and on a multicast pair (`PINGPONG_PAIRED`)."""
     spec = CASES["plain"] if case == "plain" else dataclasses.replace(CASES["plain"], dense=True)
-    pinned = {grouped_matmul.MosaicGmm: PINGPONG, grouped_matmul.MosaicTgmm: COOPERATIVE}
+    pinned = {grouped_matmul.MosaicGmm: forward, grouped_matmul.MosaicTgmm: COOPERATIVE}
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.pinned(pinned):
         assert_as_exact(as_given(_gradients(_dew(spec, interpret_on_cpu=True))), _gradients(_plain(spec)),
-                        _gradient_draw(spec), f"{case} gradients at {PINGPONG}", seeds=SEEDS,
+                        _gradient_draw(spec), f"{case} gradients at {forward}", seeds=SEEDS,
                         truth_fn=_gradients(_plain(spec, truth=True)))
 
 
@@ -2146,25 +2153,47 @@ def test_a_cooperative_tiles_exact_sums_add_as_its_plain_sum_does():
 
 def test_a_tile_states_a_schedule_the_kernels_run():
     """A pair of multiprocessors needs two warpgroups, which stream at least two stages; a warpgroup count
-    or cluster outside one or two is refused where the tile is made; the kernel gradient's schedule is one
-    multiprocessor's, so the tile it derives is no pair and a direct kernel gradient refuses one."""
+    or cluster outside one or two is refused where the tile is made."""
     for fields in ({"warpgroups": 1, "cluster": 2}, {"warpgroups": 3}, {"warpgroups": 2, "cluster": 4},
                    {"warpgroups": 2, "stages": 1}):
         with pytest.raises(ValueError):
             mosaic_gpu.Tiles(**{"block_m": 128, "block_n": 128, "block_k": 64, "stages": 3, "grid_block_n": 1,
                                 "family": "wgmma"} | fields)
-    launch = grouped_matmul.MosaicTgmm()
-    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    with generation.assumed("sm90"):
-        space = launch.space(launch.bind(bf16((ROWS, 512)), bf16((ROWS, WIDTH)),
-                                         jax.ShapeDtypeStruct((3,), jnp.int32), out_dtype="float32",
-                                         interpret=False))
-    assert space and all(tile.cluster == 1 for tile in space)
-    x = jnp.zeros((ROWS, 512), jnp.bfloat16)
-    with pytest.raises(ValueError):
-        mosaic_gpu.tgmm(x, jnp.zeros((ROWS, WIDTH), jnp.bfloat16), jnp.asarray(SIZES),
-                        tiles=mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, cluster=2, family='wgmma'),
-                        out_dtype=jnp.float32, multiprocessors=2)
+
+
+@runs("sm90")
+@pytest.mark.parametrize("sizes", [None, (0, 70, 1, 129, 100, 0), "gathered"],
+                         ids=["dense", "grouped", "gathered"])
+def test_a_kernel_gradient_on_a_multicast_cluster_holds_check_1(sizes):
+    """The kernel gradient on a pair of Hopper multiprocessors a cluster (`PAIRED`), each its own depth tile
+    of the pair's 256 rows, the cotangent's blocks they read alike loaded once between them (multicast, as
+    the forward's matrix and cuBLAS's 2 x 1 cluster on the 4B's up dW), interpreted: on par with the plain
+    kernel gradient from float64 truth (check 1), where the kernel gradient refused a cluster; and with its
+    rows and cotangent read through gather tables (a MoE's routed rows), each program gathering its own
+    half of the pair's rows, where both gathered the pair's first block."""
+    gathered = sizes == "gathered"
+    sizes = (0, 70, 1, 129, 100, 0) if gathered else sizes
+    order = np.random.default_rng(3).permutation(ROWS).astype(np.int32)
+    gather = (jnp.asarray(order), jnp.asarray(order[::-1].copy())) if gathered else None
+
+    def draw(seed):
+        rng = np.random.default_rng(seed + 4)
+        return (jnp.asarray(rng.normal(size=(ROWS, 256)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(ROWS, WIDTH)), jnp.bfloat16))
+
+    def dew(x, dy):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
+                {grouped_matmul.MosaicTgmm: PAIRED}):
+            return gemm.gemm_t(x, dy, None if sizes is None else jnp.asarray(sizes), out_dtype=jnp.float32,
+                               interpret_on_cpu=True, gather=gather)
+
+    def plain(x, dy, wide=jnp.float32):
+        if gathered:
+            x, dy = x[gather[0]], dy[gather[1]]
+        return _kernel_gradient(x.astype(wide), dy.astype(wide), sizes)
+
+    assert_as_exact(dew, jax.jit(plain), draw, "a kernel gradient on a multicast cluster", seeds=SEEDS,
+                    truth_fn=functools.partial(plain, wide=jnp.float64))
 
 
 def test_a_pin_names_only_a_config_the_launchs_kernel_takes():

@@ -17,7 +17,7 @@ from jax.sharding import Mesh
 from kernel_compile import gate_generations
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import across, handoffs, mosaic, rings, swizzling
+from dew.nn.kernels.templates import across, handoffs, mosaic, rings, stores, swizzling
 
 pytestmark = pytest.mark.kernel
 
@@ -303,8 +303,9 @@ def test_a_schedules_roles_share_the_launch_pool_by_weight(weights, programs):
     needs=lambda family, architecture: architecture.multiprocessor.register_raises is not None))
 def test_a_launch_whose_producer_holds_more_lowers_it_to_its_own_floor_and_its_consumers_hold_the_rest(
         generation_name):
-    """A launch stating its producer's registers (a producer whose issue loop holds more than setmaxnreg's
-    least: the sm100 states launch's, 44 to 60 bytes spilled at 24) runs its schedule's producer at them,
+    """A launch whose producer lowers past setmaxnreg's least (its derivation's raise of one that spilled
+    there, `resources.Producers`: the sm100 states launch's, 44 to 60 bytes at 24) runs its schedule's
+    producer at them,
     its consumers sharing what remains of the launch's pool, and its register model states the same split:
     so the consumers' budget a derivation reads is the raise the kernel runs."""
     from dew.nn.kernels.templates import handoffs, resources
@@ -325,10 +326,34 @@ def test_a_launch_whose_producer_holds_more_lowers_it_to_its_own_floor_and_its_c
 
 @pytest.mark.parametrize("generation_name", gate_generations(
     needs=lambda family, architecture: architecture.multiprocessor.register_raises is not None))
+def test_a_spilled_launchs_producer_steps_down_its_ladder_from_its_top(generation_name):
+    """A derivation's rung (`resources.Producers.stepped`): a spilled launch's producer to its top first (its
+    program's entry share), then a setmaxnreg step lower each time; every other launch's left where it was;
+    none at the ladder's foot, a step above the least, so the derivation steps its tiles down instead; a top
+    past setmaxnreg's most bounded at it."""
+    from dew.nn.kernels.templates import resources
+
+    with generation.assumed(generation_name):
+        steps = resources.facts().raises()
+        top = steps.lowest + 13 * steps.step
+        first = resources.Producers().stepped({"states": top})
+        second = first.stepped({"states": top, "scan": top})
+        assert (first.of("states"), first.of("scan")) == (top, None)
+        assert (second.of("states"), second.of("scan")) == (top - steps.step, top)
+        foot = resources.Producers((("states", steps.lowest + steps.step),))
+        assert foot.stepped({"states": top}) is None
+        assert resources.Producers().stepped({"states": steps.lowest}) is None
+        assert resources.Producers().stepped({"states": steps.highest + steps.step}).of("states") == (
+            steps.highest)
+
+
+@pytest.mark.parametrize("generation_name", gate_generations(
+    needs=lambda family, architecture: architecture.multiprocessor.register_raises is not None))
 def test_a_planned_launch_at_its_producers_registers_holds_the_programs_and_budget_its_schedule_runs(
         generation_name):
-    """A launch planned at its producer's stated registers (`resources.Launch.producer`, as the sm100 states
-    launch states 48) takes the programs a multiprocessor holds and the consumer budget its schedule runs at
+    """A launch planned at its producer's raised registers (`resources.Launch.producer`, as certification
+    raises the sm100 states launch's) takes the programs a multiprocessor holds and the consumer budget its
+    schedule runs at
     that split (`Family.roles`), which the planner, the walk's schedule and the gate's register model all
     read, so no decision holds a launch at the split it does not run."""
     from dew.nn.kernels.templates import resources
@@ -1255,7 +1280,7 @@ def _chained(a, b, c, *, m_warps: int, interpret: bool):
             out = issuer.product(first.astype(jnp.bfloat16), c_smem, (rows, RELAYED))
             plgpu.store(out_smem, out, optimized=False)
             mosaic.synced(interpret)
-            mosaic.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
+            stores.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
                               widest=resources.copied_rows(RELAYED, jnp.float32))
 
         swizzle = resources.widest_swizzle(jnp.bfloat16, RELAYED)
@@ -1319,7 +1344,7 @@ def _negated(a, b, *, path: str, interpret: bool):
                 # Written through registers, read by the store's copy.
                 plgpu.commit_smem()
             mosaic.synced(interpret)
-            mosaic.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(LANDED), 0, LANDED,
+            stores.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(LANDED), 0, LANDED,
                               copy=swizzling.coalesced, widest=resources.copied_rows(LANDED, jnp.float32))
 
         swizzle = resources.widest_swizzle(jnp.bfloat16, LANDED)
@@ -1398,7 +1423,7 @@ def _converted(codes, scale, *, generation_name: str, interpret, scaled: bool = 
             family.converted(codes_smem, into, interpret is not False,
                              row_scale=row_scale if scaled else None)
             mosaic.synced(interpret is not False)
-            mosaic.store_rows(into, out_gmem, 0, 0, jnp.int32(CODES[0]), 0, CODES[0],
+            stores.store_rows(into, out_gmem, 0, 0, jnp.int32(CODES[0]), 0, CODES[0],
                               copy=swizzling.coalesced, widest=resources.copied_rows(CODES[1], jnp.bfloat16))
 
         # Scoped as the family scopes a program's allocations (`Family.program_scoped`: across its thread
@@ -1496,6 +1521,164 @@ def _chunks_products(x, w, *, interpret):
                          interpret=interpret, name="chunks_left")(x, w)
 
 
+def _kept_sums(x, w, *, interpret):
+    """`3 + sum_j x_j @ w_j` and `5 + sum_j 2 x_j @ w_j` over a walk of `x`'s and `w`'s depth blocks on
+    tcgen05's chunks, two sums of one width each kept in its own accumulator of the issuer's tensor memory
+    across the walk (`product_scratch`'s `sums`, `accumulated`) from its initial value, each step's register
+    left operand's product added onto it in place."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.CHUNKS
+    rows, columns = family.rows, w.shape[1]
+    steps = x.shape[1] // CHUNK_DEPTH
+
+    def body(x_gmem, w_gmem, out_gmem, twice_gmem):
+        allocated = family.streams({'x': ((rows, CHUNK_DEPTH), jnp.bfloat16),
+                                    'w': ((CHUNK_DEPTH, columns), jnp.bfloat16)}, 2, 1)
+
+        def scope(*, streams):
+            rings = family.opened(streams)
+            views = {'x': (x_gmem, lambda j: (0, j)), 'w': (w_gmem, lambda j: (j, 0))}
+
+            def step(index, slots, carry, accumulators):
+                del index
+                held = family.tile_of(slots['x'])
+                return carry, (family.register_products(accumulators[0], (held,), slots['w']),
+                               family.register_products(accumulators[1], (held * 2,), slots['w']))
+
+            def walked(wg):
+                del wg
+                _, (sums, twice) = family.walk(rings, ((step, 0, steps),), None, ((rows, columns),) * 2,
+                                               interpret, initial=(family.zeros((rows, columns)) + 3.0,
+                                                                   family.zeros((rows, columns)) + 5.0))
+                out_gmem[...] = sums
+                twice_gmem[...] = twice
+
+            family.scheduled(1, walked, lambda: family.stream(rings, views, 0, steps))
+
+        family.scoped(scope, streams=allocated,
+                      products=(1, (), ((CHUNK_DEPTH, jnp.bfloat16),), (), (columns, columns)))
+
+    out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
+    return family.kernel(body, out_type=(out, out), grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="chunks_kept")(x, w)
+
+
+def _summed_together(x, w, *, interpret, awaiting: bool = False):
+    """`x_0 @ w_0`, `x_1 @ w_1` and `x_0 @ w_1` (`x`'s and `w`'s two depth blocks, each a stream of its own)
+    on tcgen05's chunks from shared memory, three groups of one width summed together in one step
+    (`summed_together`): each issued into its own accumulator of the issuer's together scratch, one commit and
+    one wait for all three, each read where it is stored. `awaiting`, the last group adds a value into its
+    accumulator, which awaits its own products (`added_into`)."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.CHUNKS
+    rows, columns = family.rows, w.shape[1]
+
+    def body(x_gmem, w_gmem, *outs):
+        blocks = dict.fromkeys(('x0', 'x1'), ((rows, CHUNK_DEPTH), jnp.bfloat16))
+        blocks |= dict.fromkeys(('w0', 'w1'), ((CHUNK_DEPTH, columns), jnp.bfloat16))
+
+        def scope(*, streams):
+            rings = family.opened(streams)
+            views = {f'x{k}': (x_gmem, lambda j, k=k: (0, k)) for k in range(2)}
+            views |= {f'w{k}': (w_gmem, lambda j, k=k: (k, 0)) for k in range(2)}
+
+            def step(index, slots, carry, accumulators):
+                del index, carry
+                # Every slot awaited first, so the step's only waits after its first product are the groups'.
+                slots.acquire_all()
+                pairs = (('x0', 'w0'), ('x1', 'w1'), ('x0', 'w1'))
+                issues = [lambda acc, x=x, w=w: family.products(acc, slots[x], slots[w]) for x, w in pairs]
+                if awaiting:
+                    issues[-1] = lambda acc: family.added_into(family.products(acc, slots['x0'], slots['w1']),
+                                                               jnp.zeros((rows, columns), jnp.float32),
+                                                               interpret=False)
+                readers = family.summed_together(((rows, columns),) * 3, tuple(issues))
+                return tuple(read() for read in readers), accumulators
+
+            def walked(wg):
+                del wg
+                found, _ = family.walk(rings, ((step, 0, 1),), (family.zeros((rows, columns)),) * 3, (),
+                                       interpret)
+                for out_gmem, value in zip(outs, found, strict=True):
+                    out_gmem[...] = value
+
+            family.scheduled(1, walked, lambda: family.stream(rings, views, 0, 1))
+
+        family.scoped(scope, streams=family.streams(blocks, 2, 1),
+                      products=(1, (), (), (), (), (columns,) * 3))
+
+    out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
+    return family.kernel(body, out_type=(out, out, out), grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="chunks_together")(x, w)
+
+
+@INTERPRETS
+def test_groups_summed_together_in_tcgen05s_tensor_memory_are_each_its_own_sum():
+    """Interpreted: on tcgen05's chunks, three groups of one width summed together (`summed_together`: each
+    its own accumulator, one commit and one wait for all) are exactly each group's product, none another's."""
+    keys = jax.random.split(jax.random.key(5))
+    x = jax.random.randint(keys[0], (64, 2 * CHUNK_DEPTH), -4, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (2 * CHUNK_DEPTH, 128), -4, 4).astype(jnp.bfloat16)
+    first, second, crossed = (np.asarray(out) for out in _summed_together(x, w, interpret=INTERPRETED))
+    x32, w32 = np.asarray(x, np.float32), np.asarray(w, np.float32)
+    np.testing.assert_array_equal(first, x32[:, :CHUNK_DEPTH] @ w32[:CHUNK_DEPTH])
+    np.testing.assert_array_equal(second, x32[:, CHUNK_DEPTH:] @ w32[CHUNK_DEPTH:])
+    np.testing.assert_array_equal(crossed, x32[:, :CHUNK_DEPTH] @ w32[CHUNK_DEPTH:])
+
+
+def test_groups_summed_together_on_tcgen05_issue_every_product_before_one_commit_and_wait():
+    """Traced for a B200 (`summed_together` on tcgen05's chunks): the three groups' products are all issued
+    before the role commits its tensor-core barrier once and waits on it once, no commit or wait between
+    them, so no group's wait stands between another's issue and its own."""
+    from jax.extend.core import ClosedJaxpr, Jaxpr
+
+    keys = jax.random.split(jax.random.key(5))
+    x = jax.random.randint(keys[0], (64, 2 * CHUNK_DEPTH), -4, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (2 * CHUNK_DEPTH, 128), -4, 4).astype(jnp.bfloat16)
+    with generation.assumed("sm100"):
+        traced = jax.make_jaxpr(lambda x, w: _summed_together(x, w, interpret=False))(x, w)
+    order = []
+
+    def walk(jaxpr):
+        for equation in jaxpr.eqns:
+            if equation.primitive.name in ("tcgen05_mma", "tcgen05_commit_arrive", "barrier_wait"):
+                order.append(equation.primitive.name)
+            for param in equation.params.values():
+                for inner in (param if isinstance(param, (tuple, list)) else (param,)):
+                    if isinstance(inner, ClosedJaxpr | Jaxpr):
+                        walk(inner.jaxpr if isinstance(inner, ClosedJaxpr) else inner)
+
+    walk(traced.jaxpr)
+    first = order.index("tcgen05_mma")
+    issued = [index for index, name in enumerate(order) if name == "tcgen05_mma"]
+    assert len(issued) == 3 and issued == list(range(first, first + 3)), order
+    assert order[first + 3:first + 5] == ["tcgen05_commit_arrive", "barrier_wait"], order
+
+
+def test_a_group_summed_together_that_awaits_its_own_products_is_refused():
+    """A group summed together on tcgen05 whose issue awaits its own products (a value added into its
+    accumulator, `added_into`) is refused as it traces: its wait would leave the groups' one commit behind
+    nothing pending (row 5671)."""
+    x = jnp.zeros((64, 2 * CHUNK_DEPTH), jnp.bfloat16)
+    w = jnp.zeros((2 * CHUNK_DEPTH, 128), jnp.bfloat16)
+    with generation.assumed("sm100"), pytest.raises(ValueError):
+        jax.make_jaxpr(lambda x, w: _summed_together(x, w, interpret=False, awaiting=True))(x, w)
+
+
+@INTERPRETS
+def test_a_walks_sums_kept_in_tcgen05s_tensor_memory_are_its_products_onto_its_initial_value():
+    """Interpreted: on tcgen05's chunks, a walk's two sums of one width kept in tensor memory across three
+    steps (`Issuer.accumulated`), each in its own accumulator, each step's register product added onto it in
+    place and none read before the walk's end, are exactly each one's initial value plus its products."""
+    keys = jax.random.split(jax.random.key(4))
+    x = jax.random.randint(keys[0], (64, 3 * CHUNK_DEPTH), -4, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (3 * CHUNK_DEPTH, 128), -4, 4).astype(jnp.bfloat16)
+    sums, twice = (np.asarray(out) for out in _kept_sums(x, w, interpret=INTERPRETED))
+    product_ = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+    np.testing.assert_array_equal(sums, 3 + product_)
+    np.testing.assert_array_equal(twice, 5 + 2 * product_)
+
+
 @INTERPRETS
 def test_a_register_left_product_on_tcgen05s_chunks_is_its_shared_memory_product():
     """Interpreted: on tcgen05's chunks, whose product takes no register left operand
@@ -1524,3 +1707,14 @@ def test_a_row_shift_takes_each_row_from_its_groups_row_shift_up(shift):
     rows = np.arange(64)
     kept = (rows % 16 - shift >= 0) & (rows % 16 - shift < 16)
     np.testing.assert_array_equal(out[kept], tile[rows[kept] - shift])
+
+
+def test_a_product_issued_within_a_staged_block_is_refused():
+    """A warpgroup MMA's or tcgen05's product reads shared memory asynchronously, so one issued while a
+    consumer's staged tiles are still unpublished (`Family.staged_together`) is refused, not left to read them
+    unfenced."""
+    from dew.nn.kernels.templates import mosaic
+    from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
+
+    with pytest.raises(ValueError), WGMMA.staged_together():
+        mosaic.committed()

@@ -17,11 +17,10 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, resources, swizzling
-from dew.nn.kernels.templates.recurrence.intra import intra_rows, systems
+from dew.nn.kernels.templates.recurrence.intra import _named, intra_rows, systems
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Held,
-    Work,
     chunk_liveness,
     f32,
     fp32_operand,
@@ -36,33 +35,46 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
 
 
 def own_staging(call: Call, keys: int) -> tuple:
-    """The plain tile a key block's keys and separated prefix are staged in for its shifted reads
-    (`shifted_keys`): `[3, SUB + C, keys]` fp32, each's block below `SUB` rows a shifted read takes in place
+    """The plain tile a key block's keys and its tokens' own decays are staged in for their shifted reads
+    (`shifted_keys`): `[2, SUB + C, keys]` fp32, each's block below `SUB` rows a shifted read takes in place
     of the tokens before the chunk (masked). Its rows are the block's own width apart: the accumulator's
     layout reads a plain tile only at strides whole tiles of 16 columns divide (a stride of 24 does not lower,
     jsf-own-smem). At a 16-column block a warp's rows alternate two runs of banks, two of its four rows a
     wavefront on one; at 32 or 64 columns every row starts on the same bank, its four rows a wavefront's
     conflict, which `key_block`'s choice (by registers and residency) does not weigh."""
-    return (swizzling.plain((3, algebra.SUB + call.chunk, keys), jnp.float32),)
+    return (swizzling.plain((2, algebra.SUB + call.chunk, keys), jnp.float32),)
+
+
+def own_zeroed(call: Call, staged) -> None:
+    """`staged`'s (`own_staging`'s) rows below the chunk zeroed, which a shifted read takes for the tokens
+    before it and nothing writes: once a program, before its walk, so a row's reads before its sub-chunk are
+    finite (`algebra.key_diagonal_pairs_back` masks its strips, not its terms)."""
+    for index in range(2):
+        below = staged.at[index, pl.ds(0, algebra.SUB)]
+        plgpu.store(below, call.family.zeros(below.shape), optimized=False)
 
 
 def shifted_keys(call: Call, staged, keys: jax.Array, prefix: tuple):
-    """A key block's keys and separated prefix (`algebra.separated` of its halves `prefix`), each offset's
-    reads of them shifted by it (`algebra.Shifted`, a sub-chunk a group: the pairs a sub-chunk's own), any
-    value where a row's source precedes its sub-chunk (masked): stored once in `staged` (`own_staging`) and
-    read at the offset's row. Shifted in registers (`Family.row_shifted`, a lane's two shuffles and a select
-    a register for each of the three at each offset), the B200's own pairs ran 350 M warp instructions
-    against fla's whole intra's 532 M (M-JS-118)."""
+    """A key block's keys and its tokens' own decays (`algebra.token_decays` of its separated prefix, the
+    prefix halves `prefix`, each row against the row before, shifted in registers once a block), each
+    offset's reads of them shifted by it (a sub-chunk a group: the pairs a sub-chunk's own), any value where a
+    row's source precedes its sub-chunk (masked): stored once in `staged` (`own_staging`) and read at the
+    offset's row. Shifted in registers at every offset (`Family.row_shifted`, a lane's two shuffles and a
+    select a register for each), the B200's own pairs ran 350 M warp instructions against fla's whole
+    intra's 532 M (M-JS-118)."""
     chunk, family = call.chunk, call.family
     width = keys.shape[1]
+    whole = algebra.separated(*prefix)
+    earlier = tuple(family.row_shifted(half, 1, period=algebra.SUB, interpret=call.interpret)
+                    for half in whole)
     # The last block's shifted reads done before its rows are written again, and the writes seen before
     # this block's reads (`mosaic.synced`).
     mosaic.synced(call.interpret)
-    for index, value in enumerate((keys, *algebra.separated(*prefix))):
+    for index, value in enumerate((keys, algebra.token_decays(whole, earlier))):
         plgpu.store(staged.at[index, pl.ds(algebra.SUB, chunk), pl.ds(0, width)], value, optimized=False)
     mosaic.synced(call.interpret)
     return lambda e: tuple(family.tile_of(staged.at[index, pl.ds(algebra.SUB - e, chunk), pl.ds(0, width)])
-                           for index in range(3))
+                           for index in range(2))
 
 
 def shifted_up(call: Call, e, value: jax.Array) -> jax.Array:
@@ -111,7 +123,7 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
             prefix = tuple(stream_tile(slots, name, gates).value() for name in ("highs", "lows"))
             found = algebra.key_diagonal_bands(
                 [intra_rows(call, name, operand, beta_ref.at[h, span]) for name in products],
-                shifted_keys(call, shifts, operand("keys"), prefix), algebra.separated(*prefix))
+                shifted_keys(call, shifts, operand("keys"), prefix))
             bands = tuple(band + more for band, more in zip(bands, found, strict=True))
 
             @pl.when(index == steps - 1)
@@ -124,18 +136,19 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
             return bands, accumulators
 
         carry = tuple(family.as_tile(family.zeros((chunk, algebra.SUB))) for _ in products)
-        return mosaic.Walk(views, step, steps=steps, carry=carry)
+        return mosaic.Walk(views, step, steps=steps, carry=carry, prologue=lambda: own_zeroed(call, shifts))
 
     blocks = _own_streamed(call, keys, queries=scored)
     out_type = tuple(_band_form(call, name).shape(call.heads * algebra.SUB) for name in products)
-    # Each output's pairs a key a term, a sub-chunk's offsets; the decay's exponentials once an offset.
-    work = Work(flops=len(products) * 3 * chunk * algebra.SUB * width, span=steps,
-                exponentials=chunk * algebra.SUB * width)
+    # Each output's pairs a key a term, a sub-chunk's offsets: the model's.
+    model = len(products) * 3 * chunk * algebra.SUB * width
     staging, landing = _own_staged(call, keys, products=products)
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=blocks, stages=(1, 2),
-                         live=chunk_liveness(5), work=work, held=_own_held(call, keys, len(products)),
-                         staging=staging, landing=landing, name="recurrence_intra_own", issues=False,
+                         live=chunk_liveness(5), steps=steps, model=model,
+                         held=_own_held(call, keys, len(products)),
+                         staging=staging, landing=landing, name=_named("recurrence_intra_own", products),
+                         issues=False,
                          swizzles={name: resources.widest_swizzle(dtype, keys)
                                    for name, (_, dtype) in blocks.items()})(q, k, hi, lo, beta, taken)
 
@@ -164,33 +177,32 @@ def _own_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
 
 def _own_held(call: Call, block: int, outputs: int = 1) -> Held:
     """`intra_own`'s consumer thread at key block `block` forming `outputs` outputs' bands, carried across
-    the key blocks: an offset's rows, keys and separated prefix as read from their staged tile
-    (`shifted_keys`), the row's prefix, the decay and a term, nothing held across the offsets (ptxas's least
-    spill-free cap at Kimi Linear's training on sm100, sm90 and sm80 104, 96 and 104, jsf-own-smem2; shifted
-    in registers, each offset's sources held across them, 184 on an H100, jsf-ownneed); at the last step one
-    output's bands masked and the lanes' index."""
+    the key blocks: as its staged reads are formed (`shifted_keys`), the separated prefix, its rows shifted,
+    the tokens' own decays and the keys; at an offset the rows, the keys and decays read from their staged
+    tile, the pair's decay and the decay following it carried across the offsets, and a term's two products
+    (ptxas's least spill-free cap at Kimi Linear's training on sm100, sm90 and sm80 104, 96 and 104 where each
+    offset read the separated prefix and held the row's, jsf-own-smem2; shifted in registers, each offset's
+    sources held across them, 184 on an H100, jsf-ownneed); at the last step one output's bands masked and
+    the lanes' index."""
     chunk = call.chunk
     return Held(carried=[f32(chunk, algebra.SUB)] * outputs, phases=(
-        [f32(chunk, block)] * (outputs + 8),
+        [f32(chunk, block)] * 6,
+        [f32(chunk, block)] * (outputs + 6),
         [f32(chunk, algebra.SUB)] * 2))
 
 
-def pairs_back_views(call: Call, row: int, h, q_ref, k_ref, hi_ref, lo_ref, ds_ref, da_ref, *,
-                     columns: int) -> dict:
-    """The streams of a key pairs backward's program at chunk `row` and value head `h` (`key_pairs_own`'s,
-    `key_backward._key_pairs_back`'s): the pairs' gradients once, a chunk's `columns` of each (its square, or
-    its own pairs' bands, `algebra.own_bands`), and the queries, keys and the separated prefix's halves a key
-    block a step."""
+def pairs_back_views(call: Call, row: int, h, q_ref, k_ref, hi_ref, lo_ref) -> dict:
+    """The key-block streams of a key pairs backward's program at chunk `row` and value head `h`
+    (`key_pairs_own`'s, `key_backward._key_pairs_back`'s): the queries, keys and the separated prefix's
+    halves a key block a step."""
     chunk, width = call.chunk, call.width
-    given, gates, square = call.given, call.gates, fp32_operand(call)
+    given, gates = call.given, call.gates
     keyed = h // call.group * width
-    return {**stream_views(lambda i: (0, 0), scores=square.views(ds_ref, row, chunk, h * columns, columns),
-                           system=square.views(da_ref, row, chunk, h * columns, columns)),
-            **stream_views(lambda i: (0, i),
-                           queries=given.views(q_ref, row, chunk, keyed, width),
-                           keys=given.views(k_ref, row, chunk, keyed, width),
-                           gates=gates.views(hi_ref, row, chunk, h * width, width),
-                           lows=gates.views(lo_ref, row, chunk, h * width, width))}
+    return stream_views(lambda i: (0, i),
+                        queries=given.views(q_ref, row, chunk, keyed, width),
+                        keys=given.views(k_ref, row, chunk, keyed, width),
+                        gates=gates.views(hi_ref, row, chunk, h * width, width),
+                        lows=gates.views(lo_ref, row, chunk, h * width, width))
 
 
 def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, operands: tuple, grads: tuple):
@@ -208,10 +220,11 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
     """`(dq, dk, dg [R, HV * Dk], dbeta [HV, R])` fp32: each chunk and value head's gradients through its
     sub-chunks' own pairs, each its own decay (`algebra.key_diagonal_pairs_back`), given the pairs'
     gradients `d_scores` and `d_system` `[R, HV * C]`: a launch of their own, no products on the tensor
-    cores, as the forward's (`intra_own`), each key block's offsets reading the pairs' gradients' own bands
-    (`algebra.own_bands`, taken once from the squares, a column an offset, `algebra.band_strip`) and the keys
-    and separated prefix shifted (`shifted_keys`). In `_key_pairs_back`'s walk, they held an H100's Kimi
-    Linear launch at 248 registers, 2268 us against 672 (M-JS-50d)."""
+    cores, as the forward's (`intra_own`), each key block's offsets reading the pairs' gradients' own
+    bands (`algebra.own_bands`, taken once from the squares, laid an offset a row `[HV * SUB, R]`: each
+    offset's strip a row read as a row's vector) and the keys and the tokens' own decays shifted
+    (`shifted_keys`). In `_key_pairs_back`'s walk, they held an H100's Kimi Linear launch at 248
+    registers, 2268 us against 672 (M-JS-50d)."""
     chunk, width, family = call.chunk, call.width, call.family
     given, gates, square = call.given, call.gates, fp32_operand(call)
     # The block a multiprocessor holds most programs of, at its registers and its shared memory: by its
@@ -227,8 +240,12 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
         shifts, = staging
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
-        views = pairs_back_views(call, row, h, q_ref, k_ref, hi_ref, lo_ref, ds_ref, da_ref,
-                                 columns=algebra.SUB)
+        # The pairs' own bands' gradients once, the same tile every step, an offset a row
+        # (`algebra.own_bands`).
+        views = {**stream_views(lambda i: (0, 0),
+                                scores=square.views(ds_ref, h * algebra.SUB, algebra.SUB, row, chunk),
+                                system=square.views(da_ref, h * algebra.SUB, algebra.SUB, row, chunk)),
+                 **pairs_back_views(call, row, h, q_ref, k_ref, hi_ref, lo_ref)}
 
         def step(index, slots, d_betas, accumulators):
             slots.acquire_all()
@@ -236,9 +253,11 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
             query = stream_tile(slots, "queries", given).value().astype(jnp.float32)
             key = stream_tile(slots, "keys", given).value().astype(jnp.float32)
             prefix = stream_tile(slots, "gates", gates).value(), stream_tile(slots, "lows", gates).value()
-            # Each pairs' gradient's band read at each offset, the scores' scaled as their pairs were.
+            # Each pairs' gradient's band read at each offset, its row (every token's pair `e` back) as a
+            # row's vector, the scores' scaled as their pairs were.
             def strip(name, scaled, e):
-                return algebra.band_strip(stream_tile(slots, name, square).value(), e) * scaled
+                return functools.reduce(jnp.add, (family.rows_of(slots[f"{name}{p}"].at[e])
+                                                  for p in range(square.parts))) * scaled
 
             strips = [functools.partial(strip, name, scaled)
                       for name, scaled in (("scores", scale), ("system", 1.0))]
@@ -247,8 +266,8 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
                 return stream_tile(slots, name, given).value().astype(jnp.float32)
 
             (d_query, d_keyed), d_key = algebra.key_diagonal_pairs_back(
-                strips, [functools.partial(rows, "queries"), lambda: rows("keys") * betas[:, None]],
-                algebra.separated(*prefix),
+                strips,
+                [functools.partial(rows, "queries"), lambda: algebra.write_gated(rows("keys"), betas)],
                 shifted_keys(call, shifts, key, prefix), functools.partial(shifted_up, call),
                 (zero, zero), zero)
             d_betas = d_betas + pairs_back_stored(
@@ -261,27 +280,31 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
 
             return d_betas, accumulators
 
-        return mosaic.Walk(views, step, steps=steps, carry=family.as_row(family.zeros((chunk,))))
+        return mosaic.Walk(views, step, steps=steps, carry=family.as_row(family.zeros((chunk,))),
+                           prologue=lambda: own_zeroed(call, shifts))
 
     tiles = _key_own_streamed(call, keys)
     staging, landing = _key_own_staged(call, keys)
     fp32_rows = square.shape(call.heads * width)
     out_type = (fp32_rows, fp32_rows, fp32_rows, jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
-    # Each offset's two pairs' terms a key, forward and moved up; the decay's exponentials once an offset.
+    # Each offset's two pairs' terms a key, forward and moved up: the model's.
     terms = 2 * 2 * 3 * chunk * algebra.SUB * width
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=(1, 2), live=chunk_liveness(7),
-                         work=Work(flops=terms, span=steps, exponentials=algebra.SUB * chunk * width),
+                         steps=steps, model=terms,
                          held=_key_own_held(call, keys), staging=staging, landing=landing,
-                         name="recurrence_key_pairs_own", issues=False)(
+                         name="recurrence_key_pairs_own", issues=False,
+                         # The bands read a row at a time, at a traced offset: staged plain.
+                         swizzles={f"{name}{p}": swizzling.UNSWIZZLED for name in ("scores", "system")
+                                   for p in range(fp32_operand(call).parts)})(
         q, k, hi, lo, beta, *(algebra.own_bands(d, chunk=chunk) for d in (d_scores, d_system)), taken)
 
 
 def _key_own_streamed(call: Call, keys: int) -> dict:
-    """`key_pairs_own`'s streams at key block `keys`: the pairs' gradients' own bands once, the queries,
-    keys and prefix halves a block at a time."""
+    """`key_pairs_own`'s streams at key block `keys`: the pairs' gradients' own bands once, an offset a row
+    (`algebra.own_bands`), the queries, keys and prefix halves a block at a time."""
     chunk, given, gates, square = call.chunk, call.given, call.gates, fp32_operand(call)
-    bands = ((chunk, algebra.SUB), square)
+    bands = ((algebra.SUB, chunk), square)
     return stream_blocks(scores=bands, system=bands,
                          queries=((chunk, keys), given), keys=((chunk, keys), given),
                          gates=((chunk, keys), gates), lows=((chunk, keys), gates))
@@ -296,15 +319,16 @@ def _key_own_staged(call: Call, keys: int) -> tuple:
 def _key_own_held(call: Call, keys: int) -> Held:
     """`key_pairs_own`'s consumer thread at key block `keys`, as an sm100's lowered peak counts it (row 5298,
     jsf-sm100-backward): the write gates' terms carried, a row's vector; at an offset's shifted loads the
-    three gradients carried, the separated prefix's two tiles, the three shifted reads (`shifted_keys`, from
-    their staged tile) and the block's keys and queries kept for the gradients' stores, the queries and keys
-    as read, the masks and a row's vector; at its strips' reads eight of those tiles, a pairs' gradient's
-    band `[C, SUB]` and its lanes' mask, the queries and keys and three row vectors (ptxas's least
-    spill-free cap at Kimi Linear's training 112 on sm100, sm90 and sm80, jsf-own-smem2)."""
+    three gradients carried, the pair's decay and the decay following it, the two shifted reads
+    (`shifted_keys`, from their staged tile) and the block's keys and queries kept for the gradients'
+    stores, the queries and keys as read, the masks and a row's vector; at its strips' reads seven of those
+    tiles, the queries and keys and three row vectors, each strip read from its band's row in shared memory
+    (a band `[C, SUB]` and its lanes' mask held where it was taken out of a token's band; ptxas's least
+    spill-free cap at Kimi Linear's training 112 on sm100, sm90 and sm80 where each offset read the
+    separated prefix and held it, jsf-own-smem2)."""
     chunk = call.chunk
     tile, given = f32(chunk, keys), held_tile(call.given, chunk, keys)
     row = f32(chunk, 4)
     banded = masks(chunk, keys)
-    band = [f32(chunk, algebra.SUB), *masks(chunk, algebra.SUB)]
-    return Held(carried=[row], phases=([tile] * 9 + given * 2 + banded + [row],
-                                       [tile] * 8 + band + given * 2 + banded + [row] * 3))
+    return Held(carried=[row], phases=([tile] * 8 + given * 2 + banded + [row],
+                                       [tile] * 7 + given * 2 + banded + [row] * 3))

@@ -572,14 +572,13 @@ def test_an_fp16_backward_compiles_spill_free_as_its_model_decides(width):
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("kept", [template.Kept.SPLIT, template.Kept.NONE], ids=["training", "inference"])
 @pytest.mark.parametrize("rows", [2, 1], ids=["step", "decision"])
-def test_each_tcgen05_forward_the_4b_steps_refusals_derive_lowers_for_a_b200(rows, kept):
+def test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200(rows, kept):
     """Qwen3.5-4B's attention (16 query heads over 4, 256 wide, 12,288 causal tokens: its step's two rows and
-    the planner's one-row decision) on a compile-only B200: each config its derivation offers on tcgen05's
-    chunks as a compile refuses the one before (`report.refuse_launch`, a spill's refusal) lowers, so a
-    refusal never steps the step onto a forward it cannot build (the B200 4B step, its spill refused onto 64 x
-    128 keys at 16 value columns, raised at its values' padded operand)."""
-    from dew.nn.kernels.templates import report
-
+    the planner's one-row decision) on a compile-only B200: every config of each tcgen05 family legal for the
+    call (`MosaicForward.offered`: the family's configs its derivation searches, each as it launches), pinned,
+    lowers, so a compile's refusal never steps the call onto a forward it cannot build (the B200 4B step, its
+    spill refused onto 64 x 128 keys at 16 value columns, raised at its values' padded operand; tcgen05's rows
+    at 16 value columns, its rescale's block of 32 past them, et-rows-spill). The call has such configs."""
     tokens, heads, kv_heads, width = 12288, 16, 4, 256
     spans = template.spans(tokens, tokens, rows, causal=True)
     query = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
@@ -588,18 +587,17 @@ def test_each_tcgen05_forward_the_4b_steps_refusals_derive_lowers_for_a_b200(row
     def forward(query, key, value):
         return attention_mosaic.forward(query, key, value, spans, None, residuals=kept)
 
-    with generation.assumed("sm100"), report.refusals():
+    with generation.assumed("sm100"):
         target = generation.gpu_target()
         op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None,
                                                   natural=attention_mosaic.NATURAL)
         ba = op.bind(*args, residuals=kept, interpret=False)
-        offered = 0
-        while (config := op.derived(ba, target)) is not None and config.family == "tcgen05.chunks":
+        legal = [config for family in attention_mosaic_program.layouts("sm100", jnp.bfloat16, tokens)
+                 if family.name.startswith("tcgen05") for config in op.offered(ba, family, target)]
+        assert legal
+        for config in legal:
             with tuning.pinned({attention_mosaic.MosaicForward: config}):
                 jax.jit(forward).trace(query, key, key).lower(lowering_platforms=("cuda",))
-            report.refuse_launch(op, ba, config, {"attention_forward"})
-            offered += 1
-        assert offered
 
 
 @COMPILES_ON_CPU
@@ -607,9 +605,9 @@ def test_each_tcgen05_forward_the_4b_steps_refusals_derive_lowers_for_a_b200(row
 @pytest.mark.parametrize("rows", [2, 1], ids=["step", "decision"])
 def test_the_4b_steps_forward_compiles_spill_free_on_tensor_memory_for_a_b200(rows, kept):
     """Qwen3.5-4B's attention forward (16 query heads over 4, 256 wide, 12,288 causal tokens: the step's two
-    rows and the planner's one-row decision) at the config its derivation gives on a compile-only B200: on a
-    tensor-memory family, every launch compiled by ptxas spilling nothing (`mosaic_failures`). A B200's 4B
-    step stepped through 19 spilling chunks forwards for 42 minutes and landed on the Ampere family's."""
+    rows and the planner's one-row decision) at the config its derivation gives on a compile-only B200: every
+    launch compiled by ptxas spilling nothing (`mosaic_failures`). A B200's 4B step stepped through 19
+    spilling chunks forwards for 42 minutes and landed on the Ampere family's."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -625,33 +623,51 @@ def test_the_4b_steps_forward_compiles_spill_free_on_tensor_memory_for_a_b200(ro
         op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None,
                                                   natural=attention_mosaic.NATURAL)
         config = op.derived(op.bind(*args, residuals=kept, interpret=False), generation.gpu_target())
-        assert config is not None and config.family.startswith("tcgen05"), config
+        assert config is not None
         case = KernelCase("4B forward", lambda: (forward, (query, key, key)))
         found = compile_mosaic_kernels([case], "sm100")
     failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
 
-@pytest.mark.parametrize("kept", [template.Kept.SPLIT, template.Kept.NONE], ids=["training", "inference"])
-def test_the_4b_steps_forward_issues_its_logits_ahead_on_a_b200(kept):
-    """Qwen3.5-4B's attention forward (16 query heads over 4, 256 wide, 12,288 causal tokens) at the config
-    its derivation gives on a compile-only B200: its program issues each key tile's logits a step before its
-    softmax reads them (`attention_mosaic_forward.logits_ahead`, row 5368), its two consumers' value
-    accumulators and two logits' each within the multiprocessor's tensor memory."""
-    from dew.nn.kernels.templates.attention_mosaic_forward import logits_ahead
-    from dew.nn.kernels.templates.attention_mosaic_program import bundle_of
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [128, 256])
+def test_the_walked_backward_of_the_4b_heads_compiles_spill_free_on_a_b200(width):
+    """Qwen3.5-4B's heads (16 query heads over 4, 12,288 causal tokens) at widths 128 and 256 on a
+    compile-only B200: the call has a backward whose launches tcgen05's walked placements take
+    (`MosaicBackward.walked`, row 4839: the derivation's search of them by what fits, the one launch keys
+    first or the two), and pinned there, its training step's every launch compiles by ptxas spilling nothing
+    (`mosaic_failures`). Today's dQ on mma.sync held 340 registers at width 256, past a thread's 248, and the
+    4B backward ran on Triton."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    tokens, heads, kv_heads, width = 12288, 16, 4, 256
-    spans = template.spans(tokens, tokens, 2, causal=True)
-    query = jax.ShapeDtypeStruct((2, tokens, heads, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((2, tokens, kv_heads, width), jnp.bfloat16)
+    from dew.nn.kernels import tuning
+
+    tokens, heads, kv_heads = 12288, 16, 4
+    spans = template.spans(tokens, tokens, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16)
+
+    def trained(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None, residuals=template.Kept.SPLIT)
+
+    def step(query, key, value, dout):
+        _, *residuals = trained(query, key, value)
+        return attention_mosaic.backward(query, key, value, spans, None, dout, residuals=tuple(residuals))
+
     with generation.assumed("sm100"):
-        op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None,
-                                                  natural=attention_mosaic.NATURAL)
-        config = op.derived(op.bind(*args, residuals=kept, interpret=False), generation.gpu_target())
-        assert config is not None and config.family == "tcgen05.chunks", config
-        family = bundle_of(config, jnp.bfloat16)
-        assert logits_ahead(family, config, config.columns or width, jnp.bfloat16, stages=config.stages)
+        _, *residuals = jax.eval_shape(trained, query, key, key)
+        op, args = attention_mosaic._backward_call(query, key, key, spans, None, query, tuple(residuals),
+                                                   scale=None, natural=attention_mosaic.NATURAL,
+                                                   accurate=attention_mosaic.ACCURATE)
+        config = op.walked(op.bind(*args, interpret=False), generation.gpu_target())
+        assert config is not None
+        with tuning.pinned({attention_mosaic.MosaicBackward: config}):
+            found = compile_mosaic_kernels([KernelCase("4B step", lambda: (step, (query, key, key, query)))],
+                                           "sm100")
+    failed = mosaic_failures(found)
+    assert not failed, "\n".join(failed)
 
 
 CERTIFIED_FORWARD = """

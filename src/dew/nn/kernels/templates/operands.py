@@ -224,6 +224,31 @@ class Issuer:
             total = total + summed_group()
         return total
 
+    def summed_together(self, groups: list) -> tuple[Callable[[], jax.Array], ...]:
+        """Readers of `groups`' sums (each a list `summed` takes), none of which reads another's: issued
+        together where every product is unscaled, a pair of tiles in memory (no `product.Blocks`) with no
+        register left operand (`Family.summed_together`: one wait for them all where products are awaited,
+        tcgen05's), each its own accumulator; else each summed where it is read (`summed`), in the reader's
+        order, as `Family.summed_together`'s default is."""
+        entries = [list(self._entries(group)) for group in groups]
+        triples = [[entry for entry in found if not isinstance(entry, product.Blocks)] for found in entries]
+        plain = (all(len(found) == len(entry) for found, entry in zip(triples, entries, strict=True))
+                 and all(not isinstance(lhs, product.Scaled) and self._registered(name, lhs) is None
+                         for found in triples for name, lhs, _ in found))
+        if not plain:
+            return tuple(functools.partial(self.summed, found) for found in entries)
+        family, interpret = self.call.family, self.call.interpret
+
+        def issued(found: list, acc):
+            read: list = []
+            for name, lhs, rhs in found:
+                left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
+                acc = family.issued(acc, left, right, interpret)
+            return acc
+
+        shapes = tuple((found[0][1].shape[0], found[0][2].shape[1]) for found in triples)
+        return family.summed_together(shapes, tuple(functools.partial(issued, found) for found in triples))
+
     def _entries(self, products: Iterable):
         """`products` as `summed` issues them: a `product.Blocks` it loops over as it is, more than one block
         of tiles in memory (`Parts`) on a family whose products read registers; any other as its blocks'

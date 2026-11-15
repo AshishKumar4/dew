@@ -429,3 +429,62 @@ def a_pairs_partial_extents_hold_check_1_on_blackwell(rows, depth, width, transp
     assert_as_exact(jax.jit(_paired(transposed)), jax.jit(plain()), draw,
                     f"a pair's partial extents {rows}x{depth}x{width}{' transposed' if transposed else ''}",
                     seeds=SEEDS, truth_fn=plain(truth=True))
+
+
+def _gated(gate, up):
+    """A gated MLP's SwiGLU of its two accumulators."""
+    return jax.nn.silu(gate) * up
+
+
+def _gated_product(tile):
+    """The 4B's gated MLP as one paired product (gate and up over 12,288 rows of 2560, 9216 wide, SwiGLU in
+    the epilogue, bf16 out), pinned at `tile`."""
+    def product(x, gate, up):
+        with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: tile}):
+            return gemm.gemm(x, gate, None, paired=up, epilogue=_gated, out_dtype=jnp.bfloat16)
+
+    shapes = (jax.ShapeDtypeStruct((12288, 2560), jnp.bfloat16),
+              *(jax.ShapeDtypeStruct((2560, 9216), jnp.bfloat16) for _ in range(2)))
+    return product, shapes
+
+
+@pytest.mark.parametrize("tile", [dataclasses.replace(TILE, block_n=64),
+                                  dataclasses.replace(PAIRED, block_n=64)], ids=["one CTA", "pair"])
+def test_a_gated_mlp_runs_as_one_paired_product_on_tcgen05_within_its_resources(tile):
+    """A B200's gated MLP as one paired product (its gate and up accumulators side by side in tensor memory,
+    their SwiGLU read out a chunk of each at once) on one CTA and on a CTA pair at 64 columns a CTA, compiled
+    by Mosaic for a compile-only B200 through ptxas: within its shared and tensor memory, no register
+    spilled, where tcgen05 took no paired product and a pair no second matrix (the call fell to mma.sync's
+    fed bundle at 128 x 64)."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    case = support.KernelCase(f"tcgen05 gated mlp {tile.family}", lambda: _gated_product(tile))
+    found = compile_mosaic_kernels([case], "sm100")
+    assert found and all(record.get("kernels") for record in found), found
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@INTERPRETS
+@pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "cast prologue", "dense norm and bias"])
+def test_a_prologue_on_tcgen05_holds_check_1(case):
+    """A product's prologue on tcgen05 (an RMS norm as a projection's prologue, its rows' inverse roots
+    loaded once a tile and its weight a step; a SwiGLU down projection's gated input, its up rows streamed
+    beside the gate's; a cast), each step's rows stage rewritten by the launch's own rewriting warpgroup
+    (`mosaic_gpu.prologue_rewritten`), pinned to a CTA's tile and interpreted as an sm100, grouped and
+    dense: as exact as the plain program from float64 truth. tcgen05 refused a prologue, its consumers
+    issuing no products to take the prologue's value in registers, and the pin with it."""
+    from test_gemm_template import (
+        CASES,
+        SEEDS as TEMPLATE_SEEDS,
+        _dew,
+        _draw as _template_draw,
+        _drop,
+        _plain as _template_plain,
+    )
+
+    spec = CASES[case]
+    with (generation.assumed("sm100"), generation.chosen(grouped_matmul="mosaic"),
+          tuning.pinned({grouped_matmul.MosaicGmm: TILE})):
+        dew = jax.jit(_drop(_dew(spec, interpret_on_cpu=True)))
+        assert_as_exact(dew, jax.jit(_drop(_template_plain(spec))), _template_draw, f"{case} on tcgen05",
+                        seeds=TEMPLATE_SEEDS, truth_fn=_drop(_template_plain(spec, truth=True)))

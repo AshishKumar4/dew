@@ -195,7 +195,6 @@ def pytest_runtest_makereport(item, call):
         item.user_properties.append(("later", True))
     # A GPU flow's counts (`gpu_flow.REPORTED`), the JUnit property `cells`: a flow none of whose cells ran is
     # unqualified on the GPU it ran for, never green.
-    flow = sys.modules.get("gpu_flow")
     if call.when == "call" and flow is not None and flow.REPORTED:
         counted = ("cells", json.dumps({key: sum(run[key] for run in flow.REPORTED)
                                         for key in ("passed", "failed", "skipped")}

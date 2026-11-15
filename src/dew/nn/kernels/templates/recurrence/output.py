@@ -11,7 +11,6 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, operands, product, resources, swizzling
-from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
@@ -106,14 +105,11 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     fp32 sum (the memory's and the local product's, each its own accumulator where products overlap,
     `Family.products_overlap`), its values and one product's fragments (`product_fragments`); and the first
     step's scores' phase, their sum, their pairs' decays and their masks (an fp32 call's split into parts) and
-    their product's fragments. The two phases hold at once where the walk steps over value blocks (the scores'
-    branch inside its loop); apart where it takes one value block, the scores staged before its products
-    issue. So an A100's need was 232, 240, None and 216 registers at value blocks 16, 32, 64 and 128 wide of
-    128 values, and None at 128 of 256; an H100's 222 at 64 and within 255 at 128 (Mosaic GPU forming each
-    warpgroup product's descriptors at its use, JAX 0.12.0.1.post33; post32's hoisted descriptors held the
-    128-wide block past 255, where both phases were stated at once). Under a decay a key dimension the value
-    block's phase, and apart from it the first step's: a key block's prefix halves, its decay raised from them
-    and its queries widened, read from global memory and staged for every step (`_gated_queries`)."""
+    their product's fragments. The two phases apart: the scores staged in the first step's branch before the
+    value block's products issue, whether the walk takes one value block or steps over several. Under a decay
+    a key dimension the value block's phase, and apart from it the first step's: a key block's prefix halves,
+    its decay raised from them and its queries widened, read from global memory and staged for every step
+    (`_gated_queries`)."""
     chunk = call.chunk
     held, memories, given, family = call.held, call.memories, call.given, call.family
     products = largest_live_set(
@@ -164,13 +160,12 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     # output 48 registers past a model of 16, 255 and a spill on an A100, where it stated 216; row 2943).
     scored = product_fragments(call, (given, chunk, call.block), (given, call.block, chunk),
                                rhs_transposed=True, rhs_swizzle=swizzle)
-    if call.value_width // bv == 1:
-        return Held(carried=prefixes, phases=(values + products, *(stage + scored for stage in stages)))
-    # One product's fragments at a time where both phases hold at once, the products issuing in turn: each
-    # phase's own beside the other stated an A100's fp32 call at 288 registers a 16-wide output block, where
-    # ptxas needed 248 (tf32-fp32c at 9f82d62c4).
-    return Held(carried=prefixes,
-                phases=tuple(values + stage + largest_live_set(products, scored) for stage in stages))
+    # The phases apart at every output width: the first step's scores staged (its branch) before the value
+    # block's products issue, the step's order whether it walks one value block or many. Joined for a walk
+    # of several, an A100's bf16 output with no delta rule was stated 304 registers at a 32-wide block and
+    # 272 at 16 and taken at neither, where ptxas held them at 255 and 238 spilling none (row 6233); its
+    # compile certifies what this states (`tuning`'s spill refusal).
+    return Held(carried=prefixes, phases=(values + products, *(stage + scored for stage in stages)))
 
 
 @lowered_once
@@ -262,9 +257,9 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
     out_type = jax.ShapeDtypeStruct((call.rows, call.heads * value_width), out_dtype)
     # The prefix twice, as the solve's.
     # The chunk's scores once (the intra launch's under a decay a key dimension), then each value block's
-    # memory and local products.
+    # memory and local products: the model's.
     scored = 0 if call.per_key else 2 * chunk * chunk * width
-    work = Work(flops=scored + 2 * chunk * (width + chunk) * value_width, span=steps)
+    model = scored + 2 * chunk * (width + chunk) * value_width
     landing = {"out": ((chunk, bv), out_dtype)}
     swizzle = None if call.per_key else _output_swizzle(call, bv, staging, landing)
     keys = None if swizzle is None else {f"keys{p}": swizzle for p in range(call.given.parts)}
@@ -272,7 +267,7 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
     # launch for the function its program is defined in, here `output_launch`).
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          name="recurrence_output", grid_names=("chunks", "heads"), blocks=blocks, stages=1,
-                         live=chunk_liveness(8), work=work,
+                         live=chunk_liveness(8), steps=steps, model=model,
                          held=_output_held(call, bv, swizzle), staging=staging, landing=landing,
                          # A 16-bit call's takes no reduction (an A100's asked for its tiles' 49152 bytes
                          # alone).

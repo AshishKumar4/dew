@@ -12,8 +12,6 @@ user's (`lane_environment.USERS_ARITHMETIC`), each flow in the process of its va
 import model_flows
 import pytest
 
-from dew.nn.kernels import generation
-
 pytestmark = [pytest.mark.gpu(reason="each family's own GPU kernels, from programs compiled for this GPU"),
               pytest.mark.prepares]
 
@@ -36,12 +34,13 @@ def test_a_model_trains_and_decodes_on_its_gpu_routes(name, monkeypatch, record_
         pytest.skip(f"{flow.name}: this follow-up job was asked for no site of it")
     if model_flows.preparing():
         if (took := model_flows.prepared_apart(flow)) is None:
-            pytest.skip(f"{flow.name}: the node's GPU runs its routes on the portable math (`Flow.families`)")
+            pytest.skip(f"{flow.name}: no native kernel claims a route it is for on the node's GPU")
         for name, value in took.items():
             record_property(f"prepare_{name}", value)
         return
-    if not flow.runs_on(generation.device_generation()):
-        pytest.skip(f"{flow.name}: this GPU runs its routes on the portable math (`Flow.families`)")
+    if model_flows.portable_here(flow):
+        pytest.skip(f"{flow.name}: no native kernel claims a route it is for on this GPU (its prepare's "
+                    "record)")
     model_flows.held_process(flow)
     # The flags its programs were compiled under, which a load holds them to (`BuildTarget.held`): the
     # process's own but the host backend's, which compute nothing of the GPU's programs.

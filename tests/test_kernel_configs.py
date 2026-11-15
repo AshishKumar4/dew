@@ -198,8 +198,10 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
 
 
 @lowers("sm90")
-@pytest.mark.parametrize(("block_m", "block_n"), [(128, 128), (64, 128)])
-def test_a_pingpong_tile_compiles_within_its_resources_as_its_register_model_prices_it(block_m, block_n):
+@pytest.mark.parametrize(("block_m", "block_n", "cluster"), [(128, 128, 1), (64, 128, 1), (128, 128, 2),
+                                                          (64, 256, 2)])
+def test_a_pingpong_tile_compiles_within_its_resources_as_its_register_model_prices_it(block_m, block_n,
+                                                                                       cluster):
     """A Hopper GEMM pinned to a ping-pong tile (`Tiles.pingpong`: two consumers each holding a whole
     tile's accumulators, their products in turn), legal at a consumer's 64 rows (its granularity whole roles
     of the rows one consumer holds, `Tiles.sharing`), its forward and its input gradient, grouped and dense,
@@ -210,7 +212,8 @@ def test_a_pingpong_tile_compiles_within_its_resources_as_its_register_model_pri
     from dew.nn.kernels.templates.gemm import mosaic_gpu
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    tile = mosaic_gpu.Tiles(block_m, block_n, 64, 3, 1, warpgroups=2, family='wgmma', pingpong=True)
+    tile = mosaic_gpu.Tiles(block_m, block_n, 64, 3, 1, warpgroups=2, cluster=cluster, family='wgmma',
+                            pingpong=True)
     launch = grouped_matmul.MosaicGmm()
     sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
     one = jax.ShapeDtypeStruct((1,), jnp.int32)
@@ -644,8 +647,9 @@ def _emitted_forms(family) -> set[str]:
     paired ones where its launches take a pair whole (`Family.takes_pairs`), the FP8 ones where its products
     take FP8 (`Family.fp8_formats`); where its consumers do not issue their products, none whose step prepares
     them (`Family.issues_in_consumers`: a kernel gradient's consumer zeroes its stage's neighbouring rows
-    first, an exactly summed step takes its product apart); at every projection, its widths padded to whole
-    tiles where they are not (`grouped_matmul._Mosaic._aligned`)."""
+    first, an exactly summed step takes its product apart) but a product's prologue its family's own role
+    rewrites the stage by (`mosaic_gpu.prologue_rewritten`, tcgen05's); at every projection, its widths
+    padded to whole tiles where they are not (`grouped_matmul._Mosaic._aligned`)."""
     if family is None:
         return set()
     tiled = () if family.takes_prologue_tiles else PROLOGUE_TILED_FORMS
@@ -654,9 +658,10 @@ def _emitted_forms(family) -> set[str]:
              *(FP8_FORMS if family.fp8_formats else ())}
     if not family.issues_in_consumers:
         # A dense kernel gradient's step prepares nothing (`mosaic_gpu.rows_unstaged`); a prologue's does.
+        rewritten = mosaic_gpu.prologue_rewritten(family, lambda rows: rows)
         forms = {form for form in forms
                  if (form.startswith("dense") or ("kernel gradient" not in form and form not in EXACT_FORMS))
-                 and form not in PROLOGUE_FORMS}
+                 and (form not in PROLOGUE_FORMS or (rewritten and "kernel gradient" not in form))}
     return forms
 
 
@@ -757,9 +762,9 @@ def test_a_b200s_dense_kernel_gradient_runs_no_rewriting_role():
     """The 4B's up projection's dense kernel gradient (24,576 rows of 2560 by 9216, fp32) on a compile-only
     B200 derives a tile legal for its call (a pair's among its candidates, `mosaic_sm100.PAIR`), and its
     kernel runs the threads its planning prices for a stage read as loaded
-    (`grouped_matmul._Mosaic.unstaged`): its producer's and its consumers' warpgroups (`.maxntid` 256), no
-    third warpgroup rewriting each step (em35d: 384 threads, 6.7x cuBLAS's instructions in that role's
-    predicated LDSM, PRMT and SEL), compiled within its resources."""
+    (`grouped_matmul._Mosaic.unstaged`): its producer's and its derived tile's consumers' warpgroups
+    (`.maxntid`), no further warpgroup rewriting each step (em35d: a third, 384 threads, 6.7x cuBLAS's
+    instructions in that role's predicated LDSM, PRMT and SEL), compiled within its resources."""
     import kernel_compile as kc
 
     from dew.nn.kernels import gemm
@@ -771,29 +776,37 @@ def test_a_b200s_dense_kernel_gradient_runs_no_rewriting_role():
         # At the default precision, a step's: no promoted sums (`templates.product.promoted`).
         return gemm.gemm_t(x, dy, None, out_dtype=jnp.float32, precision=jax.lax.Precision.DEFAULT)
 
-    with generation.chosen(grouped_matmul="mosaic"), tuning.seen() as seen:
-        kc.PTX.clear()
-        found = kc.compile_mosaic_kernels([support.KernelCase("up kernel gradient",
-                                                              lambda: (kernel_gradient, operands))], "sm100")
-    with generation.assumed("sm100"):
+    # The launch's tile as this process traces it (its selection's), its kernel's threads as its compile's
+    # records state them, wherever the compile ran (`kernel_compile.compiled_apart`).
+    with generation.chosen(grouped_matmul="mosaic"), generation.assumed("sm100"), tuning.seen() as seen:
+        jax.jit(kernel_gradient).trace(*operands)
         target = generation.gpu_target()
         assert seen.taken and all(op.legal(ba, config, target) for (op, _), (config, ba)
                                   in zip(seen, seen.taken, strict=True)), seen.taken
-    threads = {int(each) for ptx in kc.PTX.values() for each in re.findall(r"\.maxntid (\d+),", ptx)}
-    assert threads == {256}, threads
+    # A warpgroup's 128 threads for each consumer the derivation chose and the producer's, none rewriting.
+    planned = {128 * (config.warpgroups + 1) for config, _ in seen.taken}
+    with generation.chosen(grouped_matmul="mosaic"):
+        found = kc.compile_mosaic_kernels([support.KernelCase("up kernel gradient",
+                                                              lambda: (kernel_gradient, operands))], "sm100")
+    threads = {kernel["threads"] for record in found for kernel in record.get("kernels", [])}
+    assert threads == planned, (threads, planned)
     failed = kc.mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
 
 @functools.cache
 def _contract_cases(generation_name: str, form: str | None = None) -> list:
-    """Each launch form (or `form` alone) at each consumer count of a family's contract
+    """Each launch form of a family's contract (`_family_forms`; or `form` alone) at each consumer count
     (`_gemm_mainloop_cases(every_consumer_count=True)`), at the first projection whose rows give it a legal
-    tile (two consumers' rows past a few rows a MoE expert takes, mma.sync's)."""
+    tile (two consumers' rows past a few rows a MoE expert takes, mma.sync's): a form only another bundle of
+    the generation emits (a B200's gated forward, tcgen05's rewritten prologue beside mma.sync's contract)
+    is that bundle's, compiled at the gate's picks."""
     found: dict = {}
+    contract = _family_forms(generation_name)
     for shape in GEMM_SHAPES:
         for case in _gemm_mainloop_cases(generation_name, shape, every_consumer_count=True, form=form):
-            found.setdefault((case.form, case.consumers), case)
+            if case.form in contract:
+                found.setdefault((case.form, case.consumers), case)
     return list(found.values())
 
 
@@ -1385,15 +1398,15 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
 
 def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
     """Evidence of one kernel's name and launch from two kernels is one kernel's at most: two modules
-    (`kernel_modules`), two binaries (`reports`) or two PTX modules (`write_modules`) of one raise."""
-    from kernel_compile import PTX_MODULE, kernel_modules, reports, write_modules
+    (`report.kernel_modules`), two binaries (`reports`) or two PTX modules (`write_modules`) of one raise."""
+    from kernel_compile import PTX_MODULE, reports, write_modules
 
     from dew.nn.kernels.lowered import KernelCall
 
     calls = [KernelCall("mosaic_gpu", "k", b"", module, None, "0123456789") for module in ("aa", "bb")]
-    assert kernel_modules(calls[:1]) == {"k__l0123456789": "aa"}
-    with pytest.raises(ValueError):
-        kernel_modules(calls)
+    assert report.kernel_modules(calls[:1]) == {"k__l0123456789": "aa"}
+    with pytest.raises(report.KernelsOfOneName):
+        report.kernel_modules(calls)
     binaries = [report.Binary("k", "0123456789", registers, 0) for registers in (168, 200)]
     assert len(reports({}, binaries[:1])) == 1
     with pytest.raises(ValueError):

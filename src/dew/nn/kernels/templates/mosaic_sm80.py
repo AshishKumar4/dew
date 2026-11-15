@@ -9,7 +9,7 @@ Its layouts are its operands' dtype's (`Layout.MMA_ACC(dtype)`), so a bundle is 
 import abc
 import dataclasses
 import functools
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any, Self
 
 import jax
@@ -22,7 +22,18 @@ from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import launches
-from dew.nn.kernels.templates import bodies, handoffs, mosaic, persistent, report, resources, swizzling
+from dew.nn.kernels.templates import (
+    bodies,
+    emission,
+    handoffs,
+    mosaic,
+    persistent,
+    report,
+    resources,
+    stores,
+    swizzling,
+)
+from dew.nn.kernels.templates.cost import Stated, Work
 
 
 def _staging(block: tuple, swizzle: int | None) -> tuple:
@@ -459,7 +470,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         issued: Callable[..., jax.Array] = plgpu.inline_mgpu(
             arg_types=(self.layout, self.lhs, self.rhs),
             return_type=plgpu.ShapeDtypeStruct(acc.shape, jnp.dtype(jnp.float32), layout=self.layout))(
-            lambda ctx, acc, left, right: mgpu.mma(acc, left, right))
+            _tf32_product)
         # The accumulator laid as the product takes it: a fresh one's splat passed in whole left a cast no
         # pass lowers (tf32-dump-sm80 at ca3dd0f0a, a splat to the accumulator's registers).
         return issued(plgpu.layout_cast(acc, self.layout), left, right)
@@ -497,6 +508,14 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
     def settled(self, pending: int = 0) -> None:
         del pending
+
+
+@emission.stating(lambda acc, left, right: Work(tf32_flops=2 * acc.shape[0] * acc.shape[1] * left.shape[1]))
+def _tf32_product(ctx, acc, left, right):
+    """`acc + left @ right`, fp32's operands as TF32 by one mma.sync (`MmaIssuer._mma`), inlined: `2 m n k`
+    TF32 FLOPs, its accumulator `[m, n]` and its left operand `[m, k]`."""
+    del ctx
+    return mgpu.mma(acc, left, right)
 
 
 class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
@@ -544,7 +563,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
+               cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
+               model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None,
                producer: int | None = None, shared: int | None = None,
@@ -558,14 +578,15 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                                 name=name or self.name,
                                 out_type=out_type, grid=grid, grid_names=grid_names,
                                 compiler_params=plgpu.CompilerParams(approx_math=approx_math,
-                                                                     min_blocks_per_sm=resident),
+                                                                     min_blocks_per_sm=resident,
+                                                                     metadata=report.launch_metadata()),
                                 interpret=bodies.interpreted(interpret),
                                 kernel_name=report.named(
                                     name, model=(None if registers is None
                                                  else resources.register_model(self, consumers, registers,
                                                                                shared=shared))),
-                                cost_estimate=cost)
-        return mosaic.checked(built, name or self.name, resident, model_flops)
+                                cost_estimate=emission.built_with(cost))
+        return mosaic.checked(emission.costed(built, cost), name or self.name, resident, model_flops)
 
     def program_scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
@@ -618,7 +639,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             def copied(smem):
                 # The row-copy ladder needs strided layouts, not optimized-only transfers.
                 plgpu.store(smem, value.astype(smem.dtype), optimized=False)
-                mosaic.store_rows(smem, ref, *place, copy=swizzling.copied,
+                stores.store_rows(smem, ref, *place, copy=swizzling.copied,
                                   widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
             pl.run_scoped(copied, staging[output])
@@ -638,12 +659,14 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, products: Sequence[mosaic.Product] = ()
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
         # each stage back as its step ends, so no step holds one past it, nor reads one ahead.
-        if ahead:
+        if mosaic.ahead_streams(products):
             raise NotImplementedError(f"{self.name}'s pipeline reads no stream ahead")
         del first, in_flight, unrolled
+        segments = mosaic.stepped(segments)
         blocks = streams.pipeline.blocks
         names = tuple(blocks)
         carry = (start, self.started(shapes, initial))
@@ -705,7 +728,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 continue
             plgpu.store(smem, part.astype(smem.dtype), optimized=False)
             rows = smem.shape[0]
-            mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
+            stores.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
                               widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:

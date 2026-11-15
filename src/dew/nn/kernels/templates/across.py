@@ -12,7 +12,8 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith
 
-from dew.nn.kernels.templates import resources
+from dew.nn.kernels.templates import emission, resources
+from dew.nn.kernels.templates.cost import Work
 
 
 def arrived(counter, contributors) -> jax.Array:
@@ -26,6 +27,9 @@ def arrived(counter, contributors) -> jax.Array:
     semaphores alike)."""
     scalar = plgpu.Layout.WG_SPLAT(())
 
+    # An atomic and a barrier's reduction: no product, no operation of the CUDA cores a count prices, and
+    # a word of device memory read and written.
+    @emission.stating(lambda ref, count: Work(device_bytes=8))
     def ticket(ctx, ref, count):
         del ctx
         i32 = ir.IntegerType.get_signless(32)
