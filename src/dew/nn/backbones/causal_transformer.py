@@ -2054,32 +2054,8 @@ class CausalTransformer(LinearProducts):
                            routed=coverage, depth=depth)
 
     def per_layer_inputs(self, tokens, inputs_embeds):
-        """Return every layer's input signal `[B, S, L, P]` (Gemma 3n/4 PLE).
-
-        The token-identity part is the packed table's row for each token,
-        scaled like the main embedding. The context part is the input
-        embeddings projected down, scaled and normed. Each layer's gate
-        multiplies in their sum divided by sqrt(2). A model without
-        `per_layer_input_dim` raises `ValueError`.
-        """
-        # modeling_gemma4.py, get_per_layer_inputs and project_per_layer_inputs.
-        ple = self.per_layer_input_dim
-        if ple is None:
-            raise ValueError(
-                "per_layer_inputs is the signal of a model with per-layer input "
-                "embeddings, and this one has none: per_layer_input_dim is unset")
-        table = self.embed_tokens_per_layer(tokens).reshape(
-            *tokens.shape, self.num_layers, ple)
-        # The reference scales by sqrt(P) cast to the table's weight dtype
-        # (modeling_gemma4.py, Gemma4TextScaledWordEmbedding), not to the
-        # activation dtype.
-        table = table * jnp.asarray(
-            math.sqrt(ple), self.embed_tokens_per_layer.embedding.dtype)
-        context = self.per_layer_model_projection(inputs_embeds)
-        context = context * jnp.asarray(self.emb_features ** -0.5, context.dtype)
-        context = self.per_layer_projection_norm(
-            context.reshape(*inputs_embeds.shape[:-1], self.num_layers, ple))
-        return (context + table) * jnp.asarray(2.0 ** -0.5, context.dtype)
+        """Every layer's input signal `[B, S, L, P]` (Gemma 3n/4 PLE; `embeddings.per_layer_inputs`)."""
+        return embeddings.per_layer_inputs(self, tokens, inputs_embeds)
 
     def output_table(self) -> OutputTable | None:
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables

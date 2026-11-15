@@ -1,7 +1,8 @@
 """How a `CausalTransformer`'s token becomes its stream's first state: the table's lookup with its zeroed
-ids, the stream-width projection, the first layer's scaling and its factor, and a caller's prepared
-embeddings in their place. The decoder builds the table and its projections (`_embeddings`); its methods
-of these names read them here, within its scope."""
+ids, the stream-width projection, the first layer's scaling and its factor, each layer's own input signal
+(Gemma's per-layer inputs), and a caller's prepared embeddings in their place. The decoder builds the
+tables and their projections (`_embeddings`); its methods of these names read them here, within its
+scope."""
 
 from __future__ import annotations
 
@@ -60,6 +61,30 @@ def embedding_factor(decoder: CausalTransformer) -> float:
     to take in its own arithmetic (`dew.nn.diffusion_gemma.soft_embeddings`)."""
     return ((math.sqrt(decoder.emb_features) if decoder.embedding_scale else 1.0)
             * decoder.embedding_multiplier)
+
+
+def per_layer_inputs(decoder: CausalTransformer, tokens, inputs_embeds) -> jax.Array:
+    """Every layer's input signal `[B, S, L, P]` (Gemma 3n/4 PLE).
+
+    The token-identity part is the packed table's row for each token, scaled like the main embedding. The
+    context part is the input embeddings projected down, scaled and normed. Each layer's gate multiplies
+    in their sum divided by sqrt(2). A model without `per_layer_input_dim` raises `ValueError`.
+    """
+    # modeling_gemma4.py, get_per_layer_inputs and project_per_layer_inputs.
+    ple = decoder.per_layer_input_dim
+    if ple is None:
+        raise ValueError(
+            "per_layer_inputs is the signal of a model with per-layer input "
+            "embeddings, and this one has none: per_layer_input_dim is unset")
+    table = decoder.embed_tokens_per_layer(tokens).reshape(*tokens.shape, decoder.num_layers, ple)
+    # The reference scales by sqrt(P) cast to the table's weight dtype (modeling_gemma4.py,
+    # Gemma4TextScaledWordEmbedding), not to the activation dtype.
+    table = table * jnp.asarray(math.sqrt(ple), decoder.embed_tokens_per_layer.embedding.dtype)
+    context = decoder.per_layer_model_projection(inputs_embeds)
+    context = context * jnp.asarray(decoder.emb_features ** -0.5, context.dtype)
+    context = decoder.per_layer_projection_norm(
+        context.reshape(*inputs_embeds.shape[:-1], decoder.num_layers, ple))
+    return (context + table) * jnp.asarray(2.0 ** -0.5, context.dtype)
 
 
 def prepared_embeddings(x: jax.Array, input_embeddings) -> jax.Array:
