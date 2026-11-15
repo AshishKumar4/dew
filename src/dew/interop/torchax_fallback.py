@@ -155,13 +155,14 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     with torch.no_grad(), probe.recording():
         model(input_ids=torch.from_numpy(ids.astype(np.int64)), use_cache=False)
     why = probe.kept_from_dew(int(config.num_hidden_layers))
-    # The model tier 3 runs (`load`): on Dew's attention where every layer asks for what it computes, on
-    # its own otherwise, its parts functional; its experts at static shapes (`functional_parts`), so one
-    # token's route rounds no other's products (ledger 3125).
-    ran = AutoModelForCausalLM.from_config(config, trust_remote_code=False, dtype=torch.float32,
-                                           **({} if why else {"attn_implementation": _ATTENTION})).eval()
+    # The model tier 3 runs, built as `load` builds it (`_built`, its config's own attention), its parts
+    # functional, on Dew's attention where every layer asks for what it computes; its experts at static
+    # shapes (`functional_parts`), so one token's route rounds no other's products (ledger 3125).
+    ran = AutoModelForCausalLM.from_config(config, trust_remote_code=False, dtype=torch.float32).eval()
     verify.scatter_weights(ran)
     functional_parts(ran)
+    if not why:
+        ran.set_attn_implementation(_ATTENTION)
     jittable = JittableModule(ran)
     params = {name: host_view(leaf, name) for name, leaf in jittable.params.items()}
     buffers = {name: host_view(leaf, name) for name, leaf in extract_all_buffers(ran)[1].items()}
