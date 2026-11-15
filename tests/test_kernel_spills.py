@@ -474,10 +474,13 @@ def _cubin(registers: int, frame: int) -> bytes:
     return header + names + info + b"".join(sections)
 
 
-def _kernel_proto(name: str, registers: int, frame: int) -> bytes:
-    """A `MosaicGpuKernelProto`: its version, binary, kernel name and launch's shared memory."""
+def _kernel_proto(name: str, registers: int, frame: int, notes: tuple[tuple[str, str], ...] = ()) -> bytes:
+    """A `MosaicGpuKernelProto`: its version, binary, kernel name, launch's shared memory and what ptxas noted
+    of a loss of performance (each a code and a message)."""
     return (_field(1, 4) + _field(8, _cubin(registers, frame))
-            + _field(9, f"{name}_mosaic_gpu_kernel".encode()) + _field(10, 1024))
+            + _field(9, f"{name}_mosaic_gpu_kernel".encode()) + _field(10, 1024)
+            + b"".join(_field(13, _field(1, code.encode()) + _field(2, message.encode()))
+                       for code, message in notes))
 
 
 def _thunk(calls: int, kernels: list[bytes]) -> bytes:
@@ -497,6 +500,21 @@ def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_n
     assert read == [("dew_gmm", "0123456789", 168, 0, 1024), ("dew_tgmm", None, 255, 344, 1024)]
     with pytest.raises(ValueError):
         report.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm", 168, 0)]))
+
+
+def test_a_kernels_assembler_notes_are_read_from_its_compiled_call():
+    """What ptxas noted of a loss of performance as it assembled a kernel (Dew's JAX build keeps each note's
+    code and message in its compiled call, `report.ASSEMBLER_NOTES`) is read with its binary, in order: an
+    sm90 attention backward's warpgroup products serialized for want of registers, where nothing spills,
+    is data a certification refuses by, not text a process printed. A kernel noted nothing reads none."""
+    serialized = ("C7512", "wgmma.mma_async instructions are serialized due to insufficient register "
+                  "resources for the function 'attention_dkv'")
+    ignored = ("C7507", "'setmaxnreg' ignored to maintain minimum register requirements")
+    kernels = [_kernel_proto("attention_dkv", 168, 0, (serialized, ignored)),
+               _kernel_proto("attention_dq", 128, 0)]
+    noted, plain = report.thunk_kernels(_thunk(2, kernels))
+    assert noted.notes == (report.AssemblerNote(*serialized), report.AssemblerNote(*ignored))
+    assert plain.notes == ()
 
 
 @pytest.mark.mesh(devices=8)
@@ -648,20 +666,43 @@ class TwoKernels(grouped_matmul.MosaicGmm):
 
 
 @lowers("sm90")
-def test_a_launch_of_two_kernels_of_one_name_is_refused_where_its_kernels_evidence_is_read():
-    """A launch of two kernels of one name and launch (a training call's keys-alone re-forming beside its
-    weighted launch, both `recurrence_weighted`, as one name given two forms of a launch makes) is refused
-    wherever its kernels' evidence is read by that name, never read as one kernel's: as a start certifies it
-    on a compile-only H100 (`report.certified`, whose read of one missed the other's 8-byte spill) and as a
-    step-down compiles its kernels alone (`report.compiled_alone`)."""
+def test_two_kernels_of_one_launch_are_two_names_each_certified_on_its_own():
+    """A launch of two kernels its template names alike (the grouped forward and its re-launch over half its
+    rows, both `dew_gmm`, as a training call's keys-alone re-forming beside its weighted launch were both
+    `recurrence_weighted`) is two names, each kernel's form apart (`report.forming`: the half call's shape),
+    so a start certifying it on a compile-only H100 reads each kernel's evidence on its own
+    (`report.certified`, whose read of one, the names alike, missed the other's 8-byte spill) and a step-down
+    compiles each alone (`report.compiled_alone`)."""
     from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.lowered import kernel_calls
 
-    devices, lowered = _paired_step(TwoKernels())
+    op = TwoKernels()
+    devices, lowered = _paired_step(op)
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90")):
-        with report.certifying(compile_only_gpus("sm90")[0]), pytest.raises(report.KernelsOfOneName):
-            lowered()
-        with pytest.raises(report.KernelsOfOneName):
-            report.compiled_alone(lowered(), None, lambda call: True)
+        with report.certifying(compile_only_gpus("sm90")[0]):
+            program = lowered()
+        names = [report.launch_name(call.name, call.launch) for call in kernel_calls(program, unrun=True)
+                 if call.kind == "mosaic_gpu"]
+        alone = report.compiled_alone(program, None, lambda call: True)
+    # Certification lowers the launch in a program of its own, whose launch it names by its own placement.
+    [certified] = [each for each in report.certifications() if each.op == type(op).__name__]
+    assert len(set(names)) == len(names) == len(certified.kernels) == 2, (names, certified.kernels)
+    assert set(alone) == set(names), alone
+
+
+def test_two_kernels_of_one_name_and_launch_are_refused_not_read_as_one():
+    """Two Mosaic GPU calls of one name and launch whose kernels differ (a kernel whose body reads what its
+    name holds not, neither its launch's config nor its form) are refused wherever a kernel's evidence is
+    read by its name (`report.kernel_bodies`), as each record would hold one kernel's evidence for both; one
+    kernel called twice is one."""
+    from dew.nn.kernels.lowered import KernelCall
+
+    def call(kernel_hash: str) -> KernelCall:
+        return KernelCall("mosaic_gpu", "dew_gmm", b"", kernel_hash, None, launch="0123456789")
+
+    assert set(report.kernel_bodies([call("a"), call("a")])) == {"dew_gmm__l0123456789"}
+    with pytest.raises(report.KernelsOfOneName):
+        report.kernel_bodies([call("a"), call("b")])
 
 
 @lowers("sm90")

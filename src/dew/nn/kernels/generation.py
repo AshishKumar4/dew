@@ -858,10 +858,11 @@ def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
     (its `utils._infer_arch`; a device that states none it takes for sm90's, and an sm80 kernel's cp.async
     waits do not lower), as a mesh of compile-only devices of the generation does (`compile_only_gpus`, whose
     `abstract_mesh` a caller holding one takes), so one GPU's programs trace on one abstract mesh (row
-    3915). It states each device as JAX states a GPU's (`mesh._abstract_device` of a device of the `gpu`
-    platform: its kind, its multiprocessors as its cores, its compute capability), so a program traced on it
-    and one traced on compile-only or attached GPUs of the generation's own multiprocessors key one abstract
-    mesh (the Pallas lowering cache's, a step compiled ahead and its run's)."""
+    3915). It is the abstract mesh of the generation's compile-only devices with `mesh`'s axes (platform
+    `gpu`, the generation's multiprocessors as cores, its device kind and capability), so a program traced
+    on it and one traced on those devices key one abstract mesh; an attached GPU's is the same where its kind,
+    cores and capability are. A program traced on it lowers with `lowering_platforms=('cuda',)`: JAX resolves
+    a `gpu` platform it is not given through the backends this process has."""
     from jax.sharding import AbstractDevice, AbstractMesh
     target = gpu_target(generation)
     version = capability(generation)

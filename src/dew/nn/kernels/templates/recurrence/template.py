@@ -482,9 +482,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _refused(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                  ) -> bool:
         """Whether a compile refused `tiles` past what its derivation's raise answers: a kernel spilled
-        (`report.spilled`) whose launch's producer can rise no further, or would leave its tiles unheld
+        (`report.refused_at`) whose launch's producer can rise no further, or would leave its tiles unheld
         (`_raised`)."""
-        spilled = report.spilled(self, ba, tiles)
+        spilled = report.refused_at(self, ba, tiles)
         return bool(spilled) and self._raised(ba, tiles, spilled, target) is None
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mainloop.Tiles | None:
@@ -526,8 +526,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
           0.095 32 wide five deep (batch-window-h100-0b202f7cc).
         None where no block is legal: the launch refuses the call.
 
-        A compile that refused the joined tiles (`report.spilled`: kernels of the launch spilled) refuses the
-        tiles each spilling kernel's product ran at, the training call's or the forward alone's
+        A compile that refused the joined tiles (`report.refused_at`: kernels of the launch spilled) refuses
+        the tiles each spilling kernel's product ran at, the training call's or the forward alone's
         (`Tiles.forward`), and that product's rules take the next they give: its ring a stage shallower, else
         the next narrower value block, as a refusal of a product's own tiles steps it (`legal`)."""
         family = bundle(target, _dtype(ba))
@@ -572,20 +572,21 @@ class Mosaic(base.Template[mainloop.Tiles]):
             forward = trained if alone in (None, trained) else alone
             joined = self._settled(ba, trained if forward is trained
                                    else dataclasses.replace(trained, forward=alone), target)
-            if not _spilled(self, ba, joined):
+            if not _refused_kernels(self, ba, joined):
                 return joined
             # Each product's tiles refused where a kernel it runs spilled past the last raise: the training
             # call's launches at its tiles, a forward alone's at its own (`Tiles.forward`, the training call's
             # where None). A refusal of the joined tiles is no refusal of either's (`legal`'s), so a forked
             # forward's spilling scan once refused its whole value block where a shallower ring held
             # (Nemotron-H 4B's on sm100).
-            spilled = report.spilled(self, ba, joined)
+            spilled = report.refused_at(self, ba, joined)
             products = ((refused[True], trained, self.launches(ba, joined, target, backward=True), spilled),
-                        (refused[False], forward, self.launches(ba, joined.forward or joined, target,
-                                                                backward=False), _spilled(self, ba, joined)))
+                        (refused[False], forward,
+                         self.launches(ba, joined.forward or joined, target, backward=False),
+                         _refused_kernels(self, ba, joined)))
             ran = [(tiles_refused, tiles) for tiles_refused, tiles, launches, kernels in products
                    if _owners(kernels, launches)]
-            assert ran, (f"the spilled kernels {sorted(_spilled(self, ba, joined))} are none of the "
+            assert ran, (f"the spilled kernels {sorted(_refused_kernels(self, ba, joined))} are none of the "
                          "call's launches")
             for tiles_refused, tiles in ran:
                 tiles_refused.add(tiles)
@@ -593,7 +594,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _settled(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                  ) -> mainloop.Tiles:
         """`tiles` with their spilling launches' producers stepped down their ladders for as long as a
-        compile found them spilling (`report.spilled`: a training call's at its tiles, a forward alone's at
+        compile refused them (`report.refused_at`: a training call's at its tiles, a forward alone's at
         its own, `Tiles.forward`) and a rung answers it (`_raised`): first each producer's top, the program's
         entry share, which every role holds with no register moved, then a setmaxnreg step lower at a time,
         each rung giving its consumers a step more: the assembler, not a model, finds a producer's registers.
@@ -601,22 +602,29 @@ class Mosaic(base.Template[mainloop.Tiles]):
         wherever the producer's need and the consumers' meet. Tiles still spilling at the ladder's foot their
         derivation refuses (`_chunked`). From the foot up, the 4B's reverse walk took eight compiles of a
         B200's cold start, 95 s, to the 80 registers its producer holds; its top, 128, holds in one."""
-        while (spilled := _spilled(self, ba, tiles)) and (
+        while (spilled := _refused_kernels(self, ba, tiles)) and (
                 raised := self._raised(ba, tiles, spilled, target)) is not None:
             tiles = _producing(tiles, raised)
         return tiles
 
     def emitted(self, config: Hashable, kernel: str) -> Hashable:
         """What `kernel` reads of `config` as it is emitted: all of it but the other launches' producers
-        (`Tiles.producers`, each launch's own setmaxnreg cap), so a producer's raise leaves every other kernel
-        of the launch the module it was, which a rung's certification then reads from the lowering cache and
-        Mosaic's compile (`rungs`): a rung re-lowered and recompiled every kernel of the 4B's training launch,
-        7 and 5 s of each 12."""
+        (`Tiles.producers`, each launch's own setmaxnreg cap, the call's tiles' and its forward's apart, each
+        a level a launch reads), so a producer's raise leaves every other kernel of the launch the module it
+        was, which a rung's certification then reads from the lowering cache and Mosaic's compile (`rungs`):
+        a rung re-lowered and recompiled every kernel of the 4B's training launch, 7 and 5 s of each 12."""
         if not self._typed(config):
             return config
-        owner = _owner(kernel, dict(config.producers.raised_to))
-        return _producing(config, resources.Producers(tuple(
-            (launch, cap) for launch, cap in config.producers.raised_to if launch == owner)))
+
+        def own(tiles: mainloop.Tiles) -> mainloop.Tiles:
+            # The cap its emission reads: its launch's by its name, which the launch passes to `report.named`
+            # and to `Call.producers` alike.
+            cap = tiles.producers.of(kernel)
+            return dataclasses.replace(tiles, producers=resources.Producers(
+                () if cap is None else ((kernel, cap),)))
+
+        forward = None if config.forward is None else own(config.forward)
+        return dataclasses.replace(own(config), forward=forward)
 
     def rungs(self, ba: tokamax.BoundArguments, config: Hashable) -> Iterator[mainloop.Tiles]:
         """The tiles a refused `config`'s spilling launches' producers step through (`_raised`): each one's
@@ -625,7 +633,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         (`tuning.KernelOp._climbed`)."""
         if not self._typed(config):
             return
-        target, spilled, rung = generation.gpu_target(), _spilled(self, ba, config), config
+        target, spilled, rung = generation.gpu_target(), _refused_kernels(self, ba, config), config
         while spilled and (raised := self._raised(ba, rung, spilled, target)) is not None:
             rung = _producing(rung, raised)
             yield rung
@@ -888,11 +896,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
 
 
-def _spilled(op, ba: tokamax.BoundArguments, tiles: mainloop.Tiles) -> frozenset[str]:
-    """The kernels a compile found spilling at `tiles` (`report.spilled`): its training call's and its
-    forward alone's, at its own tiles where it has them (`Tiles.forward`)."""
-    return report.spilled(op, ba, tiles) | (report.spilled(op, ba, tiles.forward) if tiles.forward
-                                            else frozenset())
+def _refused_kernels(op, ba: tokamax.BoundArguments, tiles: mainloop.Tiles) -> frozenset[str]:
+    """The kernels a compile refused at `tiles` (`report.refused_at`): its training call's and its forward
+    alone's, at its own tiles where it has them (`Tiles.forward`)."""
+    return report.refused_at(op, ba, tiles) | (report.refused_at(op, ba, tiles.forward) if tiles.forward
+                                               else frozenset())
 
 
 def _owner(kernel: str, names: Iterable[str]) -> str | None:

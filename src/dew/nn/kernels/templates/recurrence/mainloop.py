@@ -626,7 +626,8 @@ STATIC = ("call", "tiles", "scale", "keeps", "applies", "out_dtype", "solves")
 and its constants; its every other argument an array or None."""
 
 
-lowered_once = tuning.lowered_once(STATIC, unless=lambda: PLANNED.get() is not None)
+lowered_once = tuning.lowered_once(STATIC, configured=("call", "tiles"),
+                                   unless=lambda: PLANNED.get() is not None)
 """A launch lowered once a configuration (`tuning.lowered_once`): a launch's program closes over its call,
 so each call traced its own and a hybrid model's step lowered its layers' identical kernels one by one.
 Planning (`template.planned`) traces every call, each launch recording itself (`launch_kernel`)."""

@@ -1104,15 +1104,49 @@ def test_a_relowering_that_launches_its_refused_config_again_keeps_the_program()
 
     with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm100")):
         first = jax.jit(forward).trace(shape, shape, shape).lower()
-    calls = [call for call in kernel_calls(first, unrun=True) if call.kind == "mosaic_gpu" and call.launch]
+    calls = [call for call in kernel_calls(first, unrun=True) if call.kind == "mosaic_gpu" and call.launched]
     assert calls
     # Every compile's kernels read as spilling, as a B200's ptxas read the 4B forward's.
-    spilled = [report.Binary(report.kernel_of(call.name)[0], call.launch, 255, 8) for call in calls]
+    spilled = [report.Binary(report.kernel_of(call.name)[0], call.launch, 255, 8, caller=call.caller)
+               for call in calls]
     with generation.assumed("sm100"), report.refusals():
         report.kept(first, relower=lambda: first, read=lambda executable: spilled)
         misses = report.misses()
         assert misses and not any(miss.stepped for miss in misses), misses
         assert report.refused_launches() == ()
+
+
+@COMPILES_ON_CPU
+def test_a_run_refuses_a_kernel_whose_warpgroup_products_ptxas_serialized_as_a_spilling_one():
+    """A run's compile (`report.kept`) whose kernels spill nothing but whose warpgroup MMAs ptxas noted
+    serialized (C7512, as the ranking's sm90 attention backward's were) refuses them as spilling ones: each is
+    recorded as a miss with its codes and no frame, its reason the serialization, as a plan states it."""
+    import kernel_compile
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.lowered import kernel_calls
+    from dew.nn.kernels.templates import report
+
+    mesh = kernel_compile._device("sm90")
+    spans = template.spans(512, 512, 1, causal=True)
+    shape = jax.ShapeDtypeStruct((1, 512, 2, 128), jnp.bfloat16,
+                                 sharding=NamedSharding(mesh, PartitionSpec()))
+
+    def forward(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None)
+
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm90")):
+        first = jax.jit(forward).trace(shape, shape, shape).lower()
+    calls = [call for call in kernel_calls(first, unrun=True) if call.kind == "mosaic_gpu" and call.launched]
+    assert calls
+    serialized = (report.AssemblerNote("C7512", "wgmma.mma_async instructions are serialized"),)
+    noted = [report.Binary(report.kernel_of(call.name)[0], call.launch, 168, 0, caller=call.caller,
+                           notes=serialized) for call in calls]
+    with generation.assumed("sm90"), report.refusals():
+        report.kept(first, relower=lambda: first, read=lambda executable: noted)
+        misses = report.misses()
+    assert misses and all(miss.serialized == ("C7512",) and not miss.frame for miss in misses), misses
+    assert all("serializes its warpgroup MMAs" in miss.reason for miss in misses), misses
 
 
 @pytest.mark.parametrize("residuals", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])
