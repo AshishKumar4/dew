@@ -416,6 +416,42 @@ def test_form(form):
 unmarked."""
 
 
+GENERATED = """import pytest
+CHECK1_SHARDS = {"test_form[heavy-one]": {"seeds": 128, "per_task": 16}}
+
+
+def cells():
+    held = {form: CHECK1_SHARDS.get(f"test_form[{form}]") for form in ("heavy-one", "light")}
+    return [pytest.param(form, id=form, marks=[pytest.mark.check1_shards(**counts)] if counts else [])
+            for form, counts in held.items()]
+
+
+@pytest.mark.parametrize("form", cells())
+def test_form(form):
+    pass
+"""
+"""A test whose parameters are generated, one marked from the module's CHECK1_SHARDS literal (row 6444)."""
+
+
+def test_a_generated_cell_is_a_site_its_files_check1_shards_literal_declares(ci, tmp_path):
+    """A generated parameter marked in code from the file's module-level `CHECK1_SHARDS` literal is a site of
+    its own, its counts the literal's, its line the literal's; an entry of an id the plan cannot name (a
+    space) or of counts but seeds and per_task refuses the file (the per-shard cells, row
+    6444)."""
+    written(tmp_path, {"test_site.py": GENERATED})
+    assert ci.sites("tests/test_site.py") == {
+        "test_form[heavy-one]": ci.Mark(units=staged_units(128), per_task=16, line=2, timed=128)}
+    judges = [entry for entry in ci.plan(30.0, {}) if entry["python"] == "3.12" and "after" in entry]
+    assert [entry["split"] for entry in judges] == ["test_form[heavy-one]"]
+    for entry in ('"test_form[heavy one]": {"seeds": 128, "per_task": 16}',
+                  '"test_form[heavy-one]": {"seeds": 128, "per_task": 16, "units": 4}',
+                  '"test_form[heavy-one]": {"seeds": 0, "per_task": 16}'):
+        written(tmp_path, {"test_site.py": GENERATED.replace(
+            '"test_form[heavy-one]": {"seeds": 128, "per_task": 16}', entry)})
+        with pytest.raises(SystemExit):
+            ci.plan(30.0, {})
+
+
 def test_a_marked_parameter_is_a_site_of_its_own_whose_tasks_run_it_alone(ci, tmp_path, monkeypatch):
     """A parameter marked check1_shards in its test's one literal parametrize list, `pytest.param(...,
     id="<id>", marks=...)`, is a site of its own, `test[id]`: its own map tasks and judge, which run its node
