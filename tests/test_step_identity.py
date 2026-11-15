@@ -231,10 +231,12 @@ def test_a_notebooks_step_compiles_and_reads_its_rows(monkeypatch):
     assert loader.plan is not None and not loader.plan.manifest.exact
 
 
-def test_a_position_saved_before_held_code_resumes_an_unchanged_run_exactly(tmp_path, monkeypatch):
-    """A position saved before steps' held code was saved (no `held` in its plan) resumes an unchanged run
-    exactly, its code list compared as it was saved (train 898's review: the held digests appended to the
-    code list refused every such position of a configured external factory)."""
+@pytest.mark.parametrize("saved", ["without held", "held in its code list"])
+def test_a_position_saved_before_held_code_resumes_exactly_and_refuses_a_change(tmp_path, monkeypatch, saved):
+    """A position saved before steps' held code was saved apart resumes an unchanged run exactly and refuses
+    one whose step's code changed: one saved before held code at all (`without held`, train 898's review:
+    the held digests appended to the code list refused every such position), and one main saved for an
+    hour, each step's held code appended to its code list (`held in its code list`)."""
     import json
 
     module = tmp_path / f"shift_{uuid4().hex}.py"
@@ -244,36 +246,14 @@ def test_a_position_saved_before_held_code_resumes_an_unchanged_run_exactly(tmp_
 
     def reader():
         pipeline = Pipeline(ROWS).map(Calling(shift.Shifting())).shuffle(0).repeat().batch(2)
-        return compile(pipeline, read="indexed", loading=READ).train(DataPartition())
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
 
-    saved = json.loads(saved_after_one(reader))
-    place = saved[_position.ENVELOPE]
-    earlier = {_position.ENVELOPE: {**place, "plan": {name: value for name, value in place["plan"].items()
-                                                      if name != "held"}}}
-    assert resumed_changes(reader(), json.dumps(earlier).encode()) == ()
-
-
-def test_a_position_saved_with_held_code_in_its_code_list_resumes_an_unchanged_run_exactly(tmp_path,
-                                                                                         monkeypatch):
-    """A position main saved for an hour, each step's held code appended to its code list and no `held` of
-    its own, resumes an unchanged run exactly, and one whose step's code changed is refused."""
-    import json
-
-    module = tmp_path / f"shift_{uuid4().hex}.py"
-    module.write_text(SHIFT.format(by=1))
-    monkeypatch.syspath_prepend(str(tmp_path))
-    shift = importlib.import_module(module.stem)
-
-    def reader():
-        pipeline = Pipeline(ROWS).map(Calling(shift.Shifting())).shuffle(0).repeat().batch(2)
-        return compile(pipeline, read="indexed", loading=READ).train(DataPartition())
-
-    saved = json.loads(saved_after_one(reader))
-    place = saved[_position.ENVELOPE]
-    plan = place["plan"]
-    appended = {name: value for name, value in plan.items() if name != "held"}
-    appended["code"] = [[*code, *held] for code, held in zip(plan["code"], plan["held"], strict=True)]
-    position = json.dumps({_position.ENVELOPE: {**place, "plan": appended}}).encode()
+    place = json.loads(saved_after_one(reader))[_position.ENVELOPE]
+    plan = {name: value for name, value in place["plan"].items() if name != "held"}
+    if saved == "held in its code list":
+        plan["code"] = [[*code, *held] for code, held in zip(plan["code"], place["plan"]["held"],
+                                                               strict=True)]
+    position = json.dumps({_position.ENVELOPE: {**place, "plan": plan}}).encode()
     assert resumed_changes(reader(), position) == ()
     module.write_text(SHIFT.format(by=10))
     importlib.reload(shift)

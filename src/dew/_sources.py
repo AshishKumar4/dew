@@ -30,8 +30,9 @@ def recorded(name: str) -> Path | None:
     it holds none of: a module of no file, a frozen one (the interpreter's own, whatever file it names),
     Dew's (its package digest's) and `__main__` (stated where a call names it)."""
     module = sys.modules[name]
-    frozen = getattr(getattr(module, "__spec__", None), "origin", None) == "frozen"
-    if (getattr(module, "__file__", None) is None or frozen or name in ("dew", "__main__")
+    spec = vars(module).get("__spec__")
+    frozen = spec is not None and spec.origin == "frozen"
+    if (vars(module).get("__file__") is None or frozen or name in ("dew", "__main__")
             or name.startswith("dew.")):
         return None
     return file_of(name)
