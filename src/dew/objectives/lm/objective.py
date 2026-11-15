@@ -562,6 +562,11 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     only they read, `pad_id` and `token_accuracy`.
     """
 
+    untraced: ClassVar[Mapping[str, str]] = {
+        "samples": "its preview's budget and sampling (`preview`, `task_settings`), which its loss, draw and "
+                   "optimizer do not read",
+        "_prompt": "its preview's prompt (`preview`), which its loss, draw and optimizer do not read"}
+
     saved_task = TextGeneration
     settings = TextSettings
     shown: Mapping[str, Shown] = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
@@ -1449,6 +1454,10 @@ class LMObjective(TokenScorer):
     which no generation steps yet, so an objective with `adaptation` takes no `samples`, refuses
     `policy` and records no task.
     """
+
+    untraced: ClassVar[Mapping[str, str]] = {
+        "phase": "the parameters its draw freezes (`_phase_filter`), a function of its indexer, its model "
+                 "and the settings the key holds"}
 
     def __init__(
         self,
