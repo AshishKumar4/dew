@@ -626,11 +626,13 @@ STATIC = ("call", "tiles", "scale", "keeps", "applies", "out_dtype", "solves")
 and its constants; its every other argument an array or None."""
 
 
-lowered_once = tuning.lowered_once(STATIC, configured=("call", "tiles"),
+lowered_once = tuning.lowered_once(STATIC, configured=("call", "tiles"), at="tiles",
                                    unless=lambda: PLANNED.get() is not None)
 """A launch lowered once a configuration (`tuning.lowered_once`): a launch's program closes over its call,
 so each call traced its own and a hybrid model's step lowered its layers' identical kernels one by one.
-Planning (`template.planned`) traces every call, each launch recording itself (`launch_kernel`)."""
+Planning (`template.planned`) traces every call, each launch recording itself (`launch_kernel`). Its kernels
+are emitted at its `tiles`, a training config's own or its forward's (`Tiles.forward`, a forward alone's),
+which their names read."""
 
 
 def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *, once: dict | None = None,

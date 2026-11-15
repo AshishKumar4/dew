@@ -796,7 +796,7 @@ class KernelOp(tokamax.Op):
                 else jnp.zeros(spec.shape, spec.dtype) for key, spec in zip(keys, specs, strict=True)]
 
 
-def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (),
+def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), at: str | None = None,
                  unless: Callable[[], bool] = lambda: False) -> Callable[[Callable], Callable]:
     """A kernel launch jitted with the arguments its signature names among `static` static: JAX keys its
     program on them and on its operands' shapes and dtypes, so each configuration is traced and lowered
@@ -811,7 +811,9 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (),
     template says its launch's config carries (which its kernels' names read through `KernelOp.emitted`)
     (`report.forming`): a launch whose statics differ outside its config (a forward keeping its inverses or
     not, a training call's attention forward and a forward alone) traces each kernel of a name apart, and a
-    template that says nothing names every static."""
+    template that says nothing names every static. The static `at` names carries the config its kernels are
+    emitted at, a level of the launch's (a training call's tiles or its forward's), whose part each kernel's
+    name reads (`report.forming`'s `at`)."""
     def decorate(launch: Callable) -> Callable:
         signature = inspect.signature(launch)
         names = tuple(name for name in static if name in signature.parameters)
@@ -829,7 +831,7 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (),
             # Each static argument but those its config carries, keyed as a key kept beyond this process is.
             form = opaque(parameter_key(tuple(
                 (name, bound[name]) for name in names if name in bound and name not in configured)))
-            with report.forming(form):
+            with report.forming(form, at=None if at is None else bound.get(at)):
                 if unless() or not all(holdable(bound[name]) for name in names if name in bound):
                     return launch(*args, **kwargs)
                 return jitted(report.launch_digest())(*args, **kwargs)

@@ -12,7 +12,6 @@ import collections
 import contextlib
 import contextvars
 import dataclasses
-import functools
 import hashlib
 import importlib.util
 import itertools
@@ -127,8 +126,9 @@ class Launch:
     """Each kernel the launch traced that stated its register model as it was named (`named`'s `model`), by
     its name less the launch's suffix (`kernel_of`'s): the launch's stated register allocation, whose
     producer the compile gate checks its emission lowers to."""
-    emitted: Callable[[str], Hashable] | None = dataclasses.field(default=None, compare=False)
-    """What each kernel's emission reads of `config`, by its name (`tuning.KernelOp.emitted`)."""
+    emitted: Callable[[Hashable, str], Hashable] | None = dataclasses.field(default=None, compare=False)
+    """What each kernel's emission reads of a config it is emitted at (`config`, or a level of it the launch
+    runs a call at, `forming`'s `at`), by its name (`tuning.KernelOp.emitted`)."""
     reverse: bool = dataclasses.field(default=False, compare=False)
     """Whether it traced as reverse mode runs it (`pulled`), the form its certification compiles
     (`certified`): a kernel's own entry (`named`) its trace's, the launch's its first trace's."""
@@ -142,24 +142,27 @@ class _Pending:
     op: str
     config: Hashable
     padded: Callable[[], float | None]
-    emitted: Callable[[str], Hashable]
+    emitted: Callable[[Hashable, str], Hashable]
     digest: str | None = None
     reverse: bool = False
 
 
 _TRACING: contextvars.ContextVar[_Pending | None] = contextvars.ContextVar("tracing_launch", default=None)
 """The pending launch whose Mosaic kernels acquire their digest through `named`."""
-_FORM: contextvars.ContextVar[Hashable] = contextvars.ContextVar("kernel_form", default=())
-"""The form of the kernel tracing (`forming`): what its emission reads beside its launch's config."""
+_FORM: contextvars.ContextVar[tuple[Hashable, Hashable]] = contextvars.ContextVar("kernel_form",
+                                                                               default=((), None))
+"""The form of the kernel tracing and the config it is emitted at (`forming`)."""
 
 
 @contextlib.contextmanager
-def forming(form: Hashable) -> Iterator[None]:
+def forming(form: Hashable, at: Hashable = None) -> Iterator[None]:
     """Within the block, the kernels traced are of `form`, what their emission reads beside their launch's
     config (`tuning.lowered_once`: a launch's static arguments the config does not carry, a forward's keeping
-    its inverses for a backward or not), which their names hold (`named`): a launch traces one kernel of a
-    name in two forms (a training call's forward and a forward alone) as two bodies."""
-    token = _FORM.set(form)
+    its inverses for a backward or not), emitted `at` a config, the launch's own where None or a level of it
+    a call runs at (a training config's forward tiles, which a forward alone takes): their names hold what
+    their emission reads of it (`named`), so a launch tracing one kernel at two levels of its config (a
+    training call's forward and a forward alone, an SSD's states at 32 and 16 value columns) names two."""
+    token = _FORM.set((form, at))
     try:
         yield
     finally:
@@ -279,8 +282,7 @@ def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterat
     """Within the block, the kernels a template's launch traces carry its digest in their names (`named`),
     the same in every process, and their binaries name the launch (`Binary.launched`, `traced`)."""
     token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config,
-                                  lambda: op.padded(arguments, config),
-                                  functools.partial(op.emitted, config),
+                                  lambda: op.padded(arguments, config), op.emitted,
                                   reverse=_PULLED.get() and op.CARRIES_DERIVATIVE))
     try:
         yield
@@ -335,7 +337,9 @@ def named(name: str | None, *, model: "RegisterModel | None" = None) -> str | No
         launch = _LAUNCHES[digest]
         if model is not None:
             launch.kernels[kernel] = model
-        own = _digest(f"{launch.identity}|{pending.emitted(kernel)!r}|{_FORM.get()!r}")
+        form, at = _FORM.get()
+        part = pending.emitted(pending.config if at is None else at, kernel)
+        own = _digest(f"{launch.identity}|{part!r}|{form!r}")
         # The kernel's identity names its launch too (`traced`), for a reader holding its name alone, in the
         # mode it traced in.
         _LAUNCHES.setdefault(own, dataclasses.replace(launch, reverse=pending.reverse))
