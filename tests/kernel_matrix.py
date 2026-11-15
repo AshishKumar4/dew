@@ -13,7 +13,7 @@ cells to its supported pairs (`covered`). A TPU tier runs `TPU_FLOWS`. Nothing h
 import functools
 import importlib
 import itertools
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 
 import gpu_flow
 import jax.numpy as jnp
@@ -321,9 +321,9 @@ def check(family: str):
     return getattr(importlib.import_module(module), name)
 
 
-def combinations(family: str) -> list[dict[str, str]]:
-    """Every combination of `family`'s axis values, in `AXES`' order."""
-    axes = AXES[family]
+def combinations(axes: Mapping[str, Sequence]) -> list[dict]:
+    """Every combination of `axes`' values (each axis's values by its name), in their order: a family's are
+    `combinations(AXES[family])`."""
     return [dict(zip(axes, values, strict=True)) for values in itertools.product(*axes.values())]
 
 
@@ -337,7 +337,7 @@ def supported(family: str, combination: tuple[tuple[str, str], ...]) -> bool:
 def supported_pairs(family: str) -> set[tuple[tuple[str, str], tuple[str, str]]]:
     """Every pair of axis values (each an axis and its value) that some combination the route serves holds."""
     pairs = set()
-    for combination in combinations(family):
+    for combination in combinations(AXES[family]):
         if supported(family, tuple(combination.items())):
             pairs |= gpu_flow.held(combination, values=False)
     return pairs
@@ -353,7 +353,7 @@ def covering(family: str) -> list[tuple[str, ...]]:
     `AXES`' order, the family's seeded cases (`SEEDED`) first. A family's cell module takes these as its
     cases, regenerated where its axes or its route's support change (tests/test_kernel_matrix.py fails until
     they are)."""
-    served = [combination for combination in combinations(family)
+    served = [combination for combination in combinations(AXES[family])
               if supported(family, tuple(combination.items()))]
     seeded = [dict(zip(AXES[family], case, strict=True)) for _, case in SEEDED.get(family, ())]
     return [tuple(combination.values()) for combination in pairwise(served, seeded)]

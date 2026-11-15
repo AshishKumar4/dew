@@ -334,7 +334,8 @@ def test_a_decision_run_that_ends_on_its_best_loads_at_its_calibrated_step(tmp_p
 def test_a_run_resumes_under_another_remat_or_dropout_and_is_refused_another_computation_or_dtype(tmp_path):
     """A saved run resumes with its model's remat or dropout changed, which say how it trains and not what
     (`dew._records.RUNS`), as a resume on devices whose memory plan recomputes otherwise does; a field that
-    says what it computes (its head count) or the numbers it computes in (its dtype) is refused its
+    says what it computes (its head count), the numbers it computes in (its dtype) or what it trains toward
+    (a masked-diffusion corruption id, `_records.TRAINS`, row 6476) is refused its
     resume, by name (`RunConfig.check_resume`). Main refused the first as a change of the model."""
     record = tmp_path / "record"
     run = lm(tmp_path, drawn=False)
@@ -346,7 +347,7 @@ def test_a_run_resumes_under_another_remat_or_dropout_and_is_refused_another_com
                                                                                      **fields}))
 
     under(remat="full", dropout_rate=0.1).check_resume(saved)
-    for name, value in (("num_heads", 1), ("dtype", "bfloat16")):
+    for name, value in (("num_heads", 1), ("dtype", "bfloat16"), ("mask_token_id", 3)):
         with pytest.raises(ValueError):
             under(**{name: value}).check_resume(saved)
 

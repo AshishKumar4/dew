@@ -224,6 +224,12 @@ NUMBERS = "numbers"
 `dtype` and `precision`, which a decoder's and every part of a wrapper's (its towers, projections) spell
 alike and no export's config reads back as fields (`dew.interop.hf_decoders.NUMERICS_FIELDS`)."""
 
+TRAINS = "trains"
+"""The metadata key of a field that says what a run trains toward though not what its forward computes
+(`RUNS`, so an export need not carry it): a masked-diffusion decoder's corruption id. A resume and an average
+of runs hold it as they hold what the model computes (`dew.registry.computing_differences`' `kept`): a run
+resumed under another, or two runs trained under two, learned another objective."""
+
 ROUNDS = "rounds"
 """The metadata key of a field that orders a model's rounding (`RUNS`): a norm's scale against its cast to the
 compute dtype, a softmax's width, which no family's config states and which change what it computes below

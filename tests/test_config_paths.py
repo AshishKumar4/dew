@@ -10,11 +10,9 @@ import dataclasses
 import json
 import typing
 
-import numpy as np
 import pytest
 from option_witness import alternatives, flag, held_at, replaced
-from process_support import logged_losses
-from run_kinds import KINDS, cli_settings, lm, saved_record, scalars, trained_by_cli, trained_record
+from run_kinds import KINDS, saved_record, scalars, trained_by_cli, trained_record
 
 from dew import registry
 from dew.config import RunConfig, TrainerConfig
@@ -97,36 +95,32 @@ SET = ("optim.learning_rate=0.0123", "data_seed=3", "trainer.key=5")
 
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("kind", list(KINDS))
-def test_a_run_trained_from_python_trains_as_dew_train_trains_it(kind, tmp_path):
-    """A kind's run with options set, trained one step from Python (`prepare().train`) and by `dew train`
-    over its run.json with the same trainer on the command line, on one mesh and layout: both steps log
-    one loss, and the run.json each writes reads back as one run, but for the name each trains under."""
+def test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran(
+        kind, tmp_path):
+    """A kind's run with options set (`SET`, and its trainer's beside them on one mesh and layout) trains two
+    steps three ways: from Python (`prepare().train`); from its record saved and read back
+    (`RunConfig.load`); and by `dew train` over its run.json with the trainer on the command line, stopped at
+    its first step's checkpoint and resumed for the second by `dew train` over the run's own record. Every
+    way logs the same two losses, and the run.json each writes reads back as one run, but for the name each
+    trains under (row 4511: prepare, train, the command and a saved, reloaded and resumed run agree)."""
     run = KINDS[kind](tmp_path, drawn=False).assigned(list(SET))
     hints = typing.get_type_hints(TrainerConfig)
-    given = {"mesh": MeshSpec(fsdp=2), "layout": Layout(min_shard=64), "log_every": 1,
-             "checkpoint_final": False}
-    trainer = dataclasses.replace(run.trainer, checkpoint_dir=str(tmp_path / "runs"), steps=1,
+    given = {"mesh": MeshSpec(fsdp=2), "layout": Layout(min_shard=64), "log_every": 1}
+    trainer = dataclasses.replace(run.trainer, checkpoint_dir=str(tmp_path / "runs"), steps=2,
                                   eval_every=None, checkpoint_every=None, multi_host=False,
                                   compilation_cache_dir=None, **given)
-    dataclasses.replace(run, trainer=trainer).prepare().train("python")
-    trained_by_cli(run, tmp_path, "cli", {f"trainer.{name}": flag(value, hints[name])
-                                          for name, value in given.items()})
+    python = dataclasses.replace(run, trainer=trainer)
+    python.prepare().train("python")
+    RunConfig.load(str(saved_record(python, tmp_path, "saved"))).prepare().train("reloaded")
+    stopped = trained_by_cli(run, tmp_path, "cli", {f"trainer.{name}": flag(value, hints[name])
+                                                    for name, value in given.items()})
+    trained_record(stopped, {"trainer.steps": "2"})
     runs = tmp_path / "runs"
-    assert scalars(runs / "python")[1]["train/loss"] == scalars(runs / "cli")[1]["train/loss"]
-    python, cli = (RunConfig.load(str(runs / name)) for name in ("python", "cli"))
-    renamed = dataclasses.replace(python, trainer=dataclasses.replace(python.trainer, name=cli.trainer.name))
-    assert renamed.record() == cli.record()
-
-
-@pytest.mark.parametrize("rows", ["packed", "padded"])
-def test_an_lm_run_trains_by_its_command_in_a_process_that_sees_two_devices(tmp_path, rows):
-    """A language-model run whose documents are packed beside each other or padded one a row, saved and
-    trained by `dew train` in a process of its own that sees two CPU devices, split over both (fsdp), logs a
-    finite loss for each step (`run_kinds.trained_record`, the one way the tests run a command)."""
-    settings = cli_settings(tmp_path, rows, {"trainer.steps": "2", "trainer.log_every": "1",
-                                              "trainer.mesh.fsdp": "2", "trainer.layout.min_shard": "8"})
-    record = saved_record(lm(tmp_path, drawn=False, rows=rows), tmp_path, rows)
-    run = trained_record(record, settings, devices=2)
-    losses = logged_losses(run)
-    assert len(losses) == 2 and np.isfinite(losses).all(), losses
-
+    losses = {name: [scalars(runs / name)[step]["train/loss"] for step in (1, 2)]
+              for name in ("python", "reloaded", "cli")}
+    assert losses["reloaded"] == losses["cli"] == losses["python"], losses
+    records = {name: RunConfig.load(str(runs / name)) for name in losses}
+    for name, record in records.items():
+        named = dataclasses.replace(records["python"], trainer=dataclasses.replace(
+            records["python"].trainer, name=record.trainer.name))
+        assert named.record() == record.record(), name

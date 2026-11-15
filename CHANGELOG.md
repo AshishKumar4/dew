@@ -130,6 +130,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   memory. `AheadTarget.capacity_gib` is that memory, and `AheadOfTime.capacity` the limit the plan held to.
 
 
+- Dew requires its JAX build 0.12.0.1.post97 and its CUDA and PJRT plugins 0.12.0.1.post96 (post81's until now). A
+  compiled Mosaic GPU kernel's record keeps what ptxas noted of a loss of performance (`assembler_notes`), so
+  certification refuses a kernel whose warpgroup MMAs ptxas serialized as it refuses a spilling one; XLA builds
+  against cuDNN's frontend 1.32.3, whose plan for the packed attention backward at head width 256 holds 577 MiB of
+  workspace at a 12,288-token call where 1.26.0's held 9.68 GB; and XLA:GPU promotes a 16-bit all-reduce whose
+  reducer's root is a copy, where it aborted. A compile for compile-only GPUs caches as any other: post92's
+  exception for an untuned one is gone, as the cache key keeps the two apart from post94 on.
 - Dew requires its JAX build 0.12.0.1.post95 (Python alone; the CUDA and PJRT plugins stay post81's): a compile for
   compile-only GPUs is told apart as JAX builds their client (a `CompileOnlyPyClient` of the `gpu` platform), so
   one that states no tuning reads and writes no persistent cache entry as post92 meant, and one a host's own GPUs

@@ -19,6 +19,7 @@ from optax.contrib import _muon
 from dew.mesh import STAGE_AXIS
 from dew.nn.kernels.gemm import batched_product
 from dew.nn.precision import configured_precision, iteration_dtype
+from dew.nn.sharding import constrained
 
 Preconditioning = Literal["frobenius", "spectral", "aol", "schatten"]
 """How optax's Newton-Schulz scales a matrix before it iterates (`optax.contrib.muon`'s `preconditioning`)."""
@@ -128,8 +129,7 @@ def _spread_orthogonalized(updates, *, numbers, coeffs, steps: int, eps: float,
     devices = math.prod(mesh.shape[axis] for axis in axes)
 
     def split(stack: jax.Array) -> jax.Array:
-        return stack if not axes else jax.lax.with_sharding_constraint(
-            stack, jax.sharding.PartitionSpec(axes, None, None, None))
+        return stack if not axes else constrained(stack, jax.sharding.PartitionSpec(axes, None, None, None))
 
     def iterated(stack: jax.Array) -> jax.Array:
         if algorithm is not None and jnp.iscomplexobj(stack):

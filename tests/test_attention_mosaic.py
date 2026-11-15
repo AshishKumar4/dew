@@ -2366,6 +2366,7 @@ def test_a_common_walk_states_every_tile_each_holder_walks():
             2 * rows * heads * pairs * 4 * width, 2 * rows * heads * walked * 5 * width)
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("axis", [0, 1])
 def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     """A score hook that forms a unit column (`q_pos[:, :1]`, `axis` 0) or a unit row (`k_pos[:1, :]`, 1,

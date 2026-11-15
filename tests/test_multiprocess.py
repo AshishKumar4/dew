@@ -1203,8 +1203,8 @@ def told(pool: list[tuple[subprocess.Popen, Path]], timeout: float = 600) -> lis
             # The channels come first, so a worker's word is read before its exit in one wake.
             ready = select.select([*waiting, *unheard], [], [], left)[0] if left > 0 else []
             if not ready:
-                pytest.fail(stuck([process for process, _ in pool],
-                                  f"blocking with its checkpoints landed within {timeout}s"))
+                raise stuck([process for process, _ in pool],
+                            f"blocking with its checkpoints landed within {timeout}s")
             for handle in ready:
                 if handle in waiting:
                     heard[waiting.pop(handle)] = int(os.read(handle, 64))
@@ -1388,8 +1388,8 @@ def test_a_local_save_that_fails_in_the_background_ends_the_pool(tmp_path):
     for process in pool:
         try:
             outputs.append(output(process, 120))
-        except subprocess.TimeoutExpired:
-            pytest.fail(stuck(pool, "end after a failed local save"))
+        except subprocess.TimeoutExpired as late:
+            raise stuck(pool, "end after a failed local save") from late
     assert pool[1].returncode != 0 and "NotADirectoryError" in outputs[1], outputs[1][-4000:]
     assert pool[0].returncode != 0, outputs[0][-4000:]
 
