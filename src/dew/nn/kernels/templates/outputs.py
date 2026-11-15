@@ -114,6 +114,12 @@ def structs[Stated](out_type: Stated) -> Stated:
                         is_leaf=_stated_leaf)
 
 
+def declared(out_type, operands: Sequence[jax.Array]) -> dict[str, str]:
+    """The frontend attributes a kernel called with `operands` whose outputs are `out_type` declares its
+    outputs' dimensions by (`OUTPUT_DIMS`, `stated`): none where it states no output as its operands' axes."""
+    return {OUTPUT_DIMS: stated(out_type, operands)} if dimensioned(out_type) else {}
+
+
 def stated(out_type, operands: Sequence[jax.Array]) -> str:
     """`OUTPUT_DIMS` of a kernel called with `operands` whose outputs are `out_type`: each output's dimensions
     as the `[operand, axis]` pairs they are the products of, an operand by its place among `operands`. An
