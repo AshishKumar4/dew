@@ -66,6 +66,8 @@ class InBackward:
 
 _PLAN: contextvars.ContextVar[InBackward | None] = contextvars.ContextVar("dew_in_backward", default=None)
 _GATE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_in_backward_gate", default=None)
+_FINITE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_in_backward_finite",
+                                                                          default=None)
 
 
 @contextlib.contextmanager
@@ -79,14 +81,18 @@ def planned(plan: InBackward) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def gated(due: jax.Array) -> Iterator[None]:
+def gated(due: jax.Array, finite: jax.Array | None = None) -> Iterator[None]:
     """Let the backward a step takes in it write the runs' updates where `due`, and leave each run's state
-    as it was elsewhere: whether the step commits, known once its forward is."""
-    token = _GATE.set(due)
+    as it was elsewhere: whether the step commits, known once its forward is. Given `finite`, whether the
+    step's loss is finite, a layer whose loss or own gradient is not takes the update of a zero gradient:
+    its weights as they were, its optimizer one step on (training.md, a step that is not finite), as every
+    layer of a step with no loss scale that is not finite does; a layer the walk reached before is moved."""
+    tokens = _GATE.set(due), _FINITE.set(finite)
     try:
         yield
     finally:
-        _GATE.reset(token)
+        _GATE.reset(tokens[0])
+        _FINITE.reset(tokens[1])
 
 
 PERIOD_NORMS = "layers_0"
@@ -213,7 +219,7 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
         weights, masters, moments, norms, kept, inputs, per_layer, shared = residuals
         assert traced.structure is not None, "the run's forward traces its layer before its backward"
         (treedef,), slots = traced.structure, traced.slots
-        due = _GATE.get()
+        due, finite = _GATE.get(), _FINITE.get()
         count = jax.tree.leaves(weights)[0].shape[0]
         shared_leaves = jax.tree.leaves(shared)
 
@@ -235,10 +241,16 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
             dshared = jax.tree.map(jnp.add, dshared, dflowed)
             held = _sliced(moving, index)
             held_moments = {name: _sliced(tree, index) for name, tree in moments.items()}
-            moved, moved_moments = current.update(path, index, gradient, held, held_moments)
             leaves = jax.tree.leaves(gradient)
             squares = jnp.sum(jnp.stack([jnp.sum(jnp.square(leaf.astype(jnp.float32))) for leaf in leaves]))
             bad = jnp.sum(jnp.stack([jnp.sum(~jnp.isfinite(leaf)) for leaf in leaves])).astype(jnp.float32)
+            ok = None if finite is None else finite & (bad == 0)
+            if ok is not None:
+                gradient = jax.tree.map(lambda leaf, ok=ok: jnp.where(ok, leaf, jnp.zeros_like(leaf)),
+                                        gradient)
+            moved, moved_moments = current.update(path, index, gradient, held, held_moments)
+            if ok is not None:
+                moved = jax.tree.map(lambda new, old, ok=ok: jnp.where(ok, new, old), moved, held)
             if due is not None:
                 moved = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old), moved, held)
                 moved_moments = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old),

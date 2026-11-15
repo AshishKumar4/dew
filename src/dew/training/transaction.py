@@ -122,6 +122,9 @@ class Committed:
     own: Ratio | jax.Array | float | None = None
     """The microbatch's own loss statistics, which a step read in several pools into its batch's loss
     (`dew.training.planning.whole_step`) and lets go; None past the step."""
+    unfinite_layer: jax.Array | None = None
+    """The first layer the attempt's backward walk met whose gradient was not finite (`Applied`), -1 for
+    none; None in a step that updates no layer in its backward, and past the step."""
     finite: jax.Array | None = None
     """Whether an attempt with no loss scale was finite, its gradient and forward as well as its loss, which
     the step reports (`outcome`) and a run's streak of steps that are not reads (`dew.training.interval`): a
@@ -468,6 +471,10 @@ class Applied:
     moments: tuple[Variables, ...]
     sumsq: jax.Array
     nonfinite: jax.Array
+    unfinite_layer: jax.Array
+    """The first layer the backward's walk met whose gradient was not finite (the runs' layers numbered in
+    the model's order, the walk taking them from the top), -1 for none: the layers above it moved, it and
+    those below took a zero gradient (`dew.nn.in_backward.gated`), which a run's log names."""
 
     def onto(self, state: TrainState) -> TrainState:
         """`state` with the runs' new parameters and moments in place of theirs."""
@@ -476,6 +483,17 @@ class Applied:
                                  lambda index, copy: merge(copy, self.moments[index]))
         return dataclasses.replace(state, variables={**state.variables, "params": merge(params, self.params)},
                                    opt_state=opt_state)
+
+
+def _unfinite_layer(runs: Sequence[jax.Array]) -> jax.Array:
+    """The highest-numbered layer whose gradient held a non-finite value, of `runs`' per-layer counts in
+    the model's order, the layers numbered across them: the first the backward's walk met; -1 for none."""
+    first, offset = jnp.asarray(-1, jnp.int32), 0
+    for counts in runs:
+        places = jnp.arange(counts.shape[0], dtype=jnp.int32) + offset
+        first = jnp.maximum(first, jnp.max(jnp.where(counts > 0, places, -1)))
+        offset += counts.shape[0]
+    return first
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1223,7 +1241,14 @@ class Transaction:
         # back is rejected whole, its optimizer state kept, as a scaled step's is.
         holding = holds_back(state.opt_state)
         accepted = jnp.asarray(a=True) if scale is None and not holding else finite
-        numerical = dataclasses.replace(state, variables=write_back(state.variables, aux.variables),
+        written = aux.variables
+        if scale is None and not holding and written is not None:
+            # A step with no loss scale that is not finite writes back none of its forward's collections
+            # (a batch norm's statistics), as it moves no parameter (training.md, a step that is not finite).
+            written = dicts(written)
+            kept = finite if pending.applied is None else finite & (pending.applied.nonfinite == 0)
+            written = _chosen(kept, written, {name: state.variables[name] for name in written})
+        numerical = dataclasses.replace(state, variables=write_back(state.variables, written),
                                         microstep=state.microstep + 1)
         # Runs that updated in their backward wrote it only where the step commits (`in_backward.gated`).
         numerical = numerical if pending.applied is None else pending.applied.onto(numerical)
@@ -1300,7 +1325,8 @@ class Transaction:
         return advanced, loss, aux, Committed(
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
             jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted),
-            own=pending.own if self.split > 1 else None, finite=finite if scale is None else None)
+            own=pending.own if self.split > 1 else None, finite=finite if scale is None else None,
+            unfinite_layer=None if pending.applied is None else pending.applied.unfinite_layer)
 
     def planned(self, state: TrainState) -> _Planned | None:
         """The plan by which the runs a one-stage scanned state holds stacked update in their backward
@@ -1400,7 +1426,9 @@ class Transaction:
             sumsq=sum((jnp.sum(in_backward.norms_of(_at(norms, path))["sumsq"]) for path in handled),
                       jnp.zeros((), jnp.float32)),
             nonfinite=sum((jnp.sum(in_backward.norms_of(_at(norms, path))["nonfinite"]) for path in handled),
-                          jnp.zeros((), jnp.float32)))
+                          jnp.zeros((), jnp.float32)),
+            unfinite_layer=_unfinite_layer([in_backward.norms_of(_at(norms, path))["nonfinite"]
+                                            for path in handled]))
         zeros = functools.reduce(merge, [_nested(path, jax.tree.map(jnp.zeros_like, _at(gradient, path)))
                                          for path in handled], {})
         return merge(gradient, zeros), applied
@@ -1423,8 +1451,11 @@ class Transaction:
         and what its runs that updated in their backward left (`split_planned`), whose backward reads
         whether the step commits (`dew.nn.in_backward.gated`), known once its forward is."""
         if planned is not None:
-            _, active = self.objective.reduce_loss(realized.stats)
-            with in_backward.gated(active):
+            loss, active = self.objective.reduce_loss(realized.stats)
+            # A run that updates in its backward holds no loss scale (`consumed_where_made`), so a step
+            # that is not finite is gated layer by layer as the walk reaches each: by the loss's
+            # finiteness and each layer's own gradient's (`in_backward.gated`).
+            with in_backward.gated(active, jnp.isfinite(loss)):
                 gradient, applied = self.split_planned(planned, realized.pullback(cotangent), masters)
             return gradient, None, applied
         if realized.probed is None or not whole:
