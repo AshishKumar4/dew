@@ -288,7 +288,11 @@ class Recipe(NamedTuple):
 RECIPES = {"blockwise_fp8": Recipe(blockwise_fp8_projection, SCALE_DEPTH, generation.Choice.BLOCKWISE_FP8),
            "mxfp8": Recipe(mxfp8_projection, MX_BLOCKS.depth, generation.Choice.MXFP8),
            "nvfp4": Recipe(nvfp4_projection, NVFP4_BLOCKS.depth, generation.Choice.NVFP4_BLOCK)}
-"""Each of `dew.nn.precision.LOW_PRECISION_RECIPES`' projection."""
+"""The low-precision recipes a run's projections train in (`dew.nn.precision.LowPrecision.recipe`), by name:
+the one declaration of them, each product's sums fp32 and its gradients the recipe's own products of requantized
+operands. DeepSeek-V3's blockwise FP8, its operands E4M3 by 1 x 128 activation tiles and 128 x 128 weight
+blocks under power-of-two scales; MXFP8 (OCP MX), E4M3 under a power-of-two scale every 32 of each product's
+contraction; NVFP4, E2M1 under an E4M3 scale every 16 of it and a tensor scale."""
 
 
 def _nvfp4_forward(x, w, group_blocks, out_dtype, interpret):

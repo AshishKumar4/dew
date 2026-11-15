@@ -42,8 +42,9 @@ def test_the_fp8_preset_names_the_recipe_and_keeps_the_runs_dtypes():
     assert FP8.low_precision is not None and FP8.low_precision.roles == ("mixer", "mlp", "experts")
     with pytest.raises(ValueError):
         LowPrecision(roles=("mixer", "norm"))
-    with pytest.raises(ValueError):
-        LowPrecision(recipe="fp6")
+    unknown = Numerics(low_precision=LowPrecision(recipe="fp6"))
+    with pytest.raises(ValueError), generation.run_precision(unknown):
+        pass
 
 
 def test_the_routers_gates_and_head_never_reach_the_fp8_projection():
@@ -346,6 +347,32 @@ def test_an_mxfp8_product_of_operands_whose_scales_are_subnormal_is_their_value(
     np.testing.assert_array_equal(np.asarray(out, np.float32), 32.0)
 
 
+def test_a_recipe_projection_on_a_data_parallel_mesh_lowers_for_cuda():
+    """Row 6719: under the 'fp8' numerics, a feed-forward's projection and its gradients on two compile-only
+    H100s whose automatic data axis splits the rows (a data-parallel run's mesh, `MeshSpec().build`), the
+    recipe's kernel named, lower through the template: each device's rows its own launch, where a launch
+    reading its operands whole refused the unmapped rows."""
+    from dew.distributed.placement import MeshSpec
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.precision import projection_role
+
+    numbers = (((2,), (0,)), ((), ()))
+    mesh = MeshSpec().build(compile_only_gpus("sm90", 2))
+
+    def stepped(rows, matrix):
+        def loss(rows, matrix):
+            return jnp.sum(projections.dot_general(jax.lax.dot_general)(rows, matrix, numbers))
+        return jax.grad(loss, argnums=(0, 1))(rows, matrix)
+
+    split = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
+    whole = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    with (jax.set_mesh(mesh), generation.assumed("sm90"), generation.run_precision(FP8),
+          projection_role("mlp"), generation.chosen(blockwise_fp8="mosaic")):
+        jax.jit(stepped).trace(jax.ShapeDtypeStruct((8, 128, 256), jnp.bfloat16, sharding=split),
+                               jax.ShapeDtypeStruct((256, 256), jnp.bfloat16, sharding=whole)
+                               ).lower(lowering_platforms=("cuda",))
+
+
 @pytest.mark.parametrize("explicit", [True, False], ids=["explicit", "automatic"])
 def test_a_recipe_projection_of_rows_a_data_axis_splits_is_each_devices_own(explicit):
     """Rows 4854 and 6719: under the 'fp8' numerics, a dense projection of rows a data axis splits over
@@ -366,9 +393,7 @@ def test_a_recipe_projection_of_rows_a_data_axis_splits_is_each_devices_own(expl
     numbers = (((2,), (0,)), ((), ()))
 
     def pulled(rows, matrix, cotangent):
-        # The recipe's kernel named and interpreted as an H100's: a launch reads its operands whole.
-        with (generation.run_precision(FP8), projection_role("mlp"),
-              generation.assumed("sm90", interpreted=True), generation.chosen(blockwise_fp8="mosaic")):
+        with generation.run_precision(FP8), projection_role("mlp"):
             value, pull = jax.vjp(lambda r, m: projections.dot_general(jax.lax.dot_general)(r, m, numbers),
                                   rows, matrix)
             return (value, *pull(cotangent))

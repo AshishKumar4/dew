@@ -61,7 +61,6 @@ __all__ = [
     "FP8",
     "FP32_SUMS",
     "L2NORM_EPS",
-    "LOW_PRECISION_RECIPES",
     "MATMUL_PRECISIONS",
     "MXFP8",
     "NUMERICS_PRESETS",
@@ -862,29 +861,19 @@ token mixer's (attention's queries, keys, values and output, a linear mixer's), 
 routed experts', a router's scores, a shared expert's gate. A projection that plays none of them, a head's
 or an embedding's, keeps the run's dtypes under every recipe."""
 
-LOW_PRECISION_RECIPES = ("blockwise_fp8", "mxfp8", "nvfp4")
-"""The low-precision recipes a run's projections train in, each product's sums fp32 and its gradients the
-recipe's own products of requantized operands (`dew.nn.kernels.projections.recipe_projection`): DeepSeek-V3's
-blockwise FP8, its operands E4M3 by 1 x 128 activation tiles and 128 x 128 weight blocks under power-of-two
-scales (`blockwise_fp8_projection`); MXFP8 (OCP MX), E4M3 under a power-of-two scale every 32 of each
-product's contraction (`mxfp8_projection`); and NVFP4, E2M1 under an E4M3 scale every 16 of it and a tensor
-scale (`nvfp4_projection`). Blackwell's block-scaled tensor cores multiply the last two; elsewhere their
-block-scaled values, each exact in bfloat16, are summed as XLA sums fp32 products."""
-
-
 @dataclasses.dataclass(frozen=True)
 class LowPrecision:
-    """A low-precision training recipe for a run's projections by role (row 2513): `recipe`
-    (`LOW_PRECISION_RECIPES`) multiplies the projections whose role is among `roles` (`PROJECTION_ROLES`),
-    each where its widths take the recipe's blocks; every other product keeps the run's dtypes, the routers,
-    norms, embeddings and heads among them, as every published low-precision recipe keeps them."""
+    """A low-precision training recipe for a run's projections by role (row 2513): `recipe`, one of
+    `dew.nn.kernels.projections.RECIPES` (the one declaration of the recipes: their projections, blocks and
+    routes), which a run's numerics check where they take effect (`generation.run_precision`), multiplies
+    the projections whose role is among `roles` (`PROJECTION_ROLES`), each where its widths take the
+    recipe's blocks; every other product keeps the run's dtypes, the routers, norms, embeddings and heads
+    among them, as every published low-precision recipe keeps them."""
 
     recipe: str = "blockwise_fp8"
     roles: tuple[str, ...] = ("mixer", "mlp", "experts")
 
     def __post_init__(self):
-        if self.recipe not in LOW_PRECISION_RECIPES:
-            raise ValueError(f"a low-precision recipe is one of {LOW_PRECISION_RECIPES}, not {self.recipe!r}")
         object.__setattr__(self, "roles", tuple(self.roles))
         unknown = sorted(set(self.roles) - set(PROJECTION_ROLES))
         if unknown:
