@@ -1724,7 +1724,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         half = jnp.where(held, jnp.exp(jnp.minimum(starts[0] - peak, 0.0) * 0.5), 0.0)
 
         def weighed_by(*, flushing: bool) -> jax.Array:
-            if not flushing or jnp.dtype(delta.dtype) != jnp.dtype(jnp.float32):
+            if not flushing:
                 return share * factor
             # `delta * half * half / total` with D raised from its bits until its products stay normal,
             # divided and lowered in one rounding (`lowered_divide`).
@@ -1736,7 +1736,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
             divisor = jnp.where(total > 0, total, 1.0)
             return jnp.where(nonzero, lowered_divide(numerator, divisor, raised), 0.0)
 
-        weighed = bodies.subnormals(weighed_by)
+        weighed = bodies.subnormals(weighed_by, delta.dtype)
         initial = Initial(m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
                           total=(-weighed).astype(state.total.dtype),
                           acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
