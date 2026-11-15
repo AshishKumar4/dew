@@ -4,6 +4,7 @@ compile point for the generation's facts, as the build compiles them (ledger 271
 on its device's work alone; 2026-11-02, an H100 ran a CPU host's sm90 build of a dot and the template
 attention's forward so)."""
 
+import json
 import os
 import pickle
 import subprocess
@@ -132,6 +133,57 @@ COMPUTING = "--xla_gpu_enable_fast_min_max=true"
 refused for (`BuildTarget.held`)."""
 
 
+ALIASED = """
+import json
+import sys
+
+import jax
+
+mode, cache, topology = sys.argv[1], sys.argv[2], sys.argv[3]
+jax.config.update("jax_compilation_cache_dir", cache)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+read = []
+jax.monitoring.register_event_listener(
+    lambda event, **metadata: read.append(event) if event == "/jax/compilation_cache/cache_hits" else None)
+import jax.numpy as jnp
+from jax.experimental import topologies
+
+from dew.training.ahead import BuildTarget, host_gpus
+
+
+def program(values, weights):
+    # A product XLA tunes on a GPU and leaves untuned where it has none: a 4096-square bf16 GEMM fusion.
+    return jax.nn.relu(values @ weights) * 2 + 1
+
+
+SHAPE = (4096, 4096)
+
+
+if mode == "topology":
+    # This host's GPU's own topology and generation, written for a process that sees no GPU.
+    with open(topology, "wb") as file:
+        file.write(topologies.get_attached_topology("cuda").serialize())
+    print(json.dumps({"generation": BuildTarget.of(jax.devices()[:1]).generation}))
+elif mode == "compile":
+    # No GPU in this process (none visible, JAX_PLATFORMS=cpu): XLA compiles over the topology with none to
+    # tune on.
+    (compile_only,) = host_gpus(sys.argv[4], topology, 1)
+    there = jax.sharding.SingleDeviceSharding(compile_only)
+    placed = jax.ShapeDtypeStruct(SHAPE, jnp.bfloat16, sharding=there)
+    jax.jit(program).lower(placed, placed).compile()
+    print(json.dumps({"read": len(read)}))
+else:
+    values = jnp.ones(SHAPE, jnp.bfloat16)
+    jax.block_until_ready(jax.jit(program)(values, values))
+    print(json.dumps({"read": len(read)}))
+"""
+"""A fresh process, by its mode (argv[1]), over a persistent cache (argv[2]) and a topology file (argv[3]):
+`topology` writes this host's GPU's topology and prints its generation; `compile` compiles one program over
+that topology for the generation (argv[4]) with no GPU attached, outside Dew's compile point; `run` runs it
+on the GPU. Each prints how many programs it read from the cache."""
+
+
 def environment_of(tmp_path: Path) -> dict[str, str]:
     """This process's environment for a fresh one running a script under `tmp_path`, with this suite's
     modules importable."""
@@ -200,3 +252,32 @@ def test_a_run_compiled_ahead_for_this_gpu_compiles_nothing_on_it_and_is_refused
                    env=environment, check=True)
     subprocess.run([sys.executable, str(tmp_path / "refused.py"), str(tmp_path / "step.dew-aot")],
                    env=computing_otherwise(environment), check=True)
+
+
+def test_a_deviceless_compile_stores_nothing_a_device_run_reads(tmp_path):
+    """The contract between the persistent cache's key and the autotuner: a program compiled in a process that
+    sees no GPU (none visible, `JAX_PLATFORMS=cpu`) over this host's own topology (`host_gpus`), as a user's
+    compile-only process compiles one (a 4096-square bf16 GEMM, outside Dew's compile point, with no
+    process settings handed down), is no program of the GPU's own: XLA had no device to tune it on. So the
+    GPU's run of the same program on the same persistent cache reads nothing the deviceless compile wrote and
+    compiles its own: an untuned program is never read under a tuned key (rows 4792 and 6046). JAX post87
+    read it (UB-4792-AHEAD-TIME-gh200); since post90's key it does not, read 0 on GH200 on post94 and post95
+    (MC-UNTUNEDKEY4-post94-f74e55896, MC-UNTUNEDKEY4-post95-16d207cc1), so a JAX that loses that key turns
+    this red."""
+    (tmp_path / "aliased.py").write_text(ALIASED)
+    # None of this process's JAX or XLA settings handed down (a lane's name its own tuning and cache), as a
+    # user's process runs.
+    environment = {name: value for name, value in environment_of(tmp_path).items()
+                   if not name.startswith(("JAX_", "XLA_"))}
+    cache, topology = str(tmp_path / "cache"), str(tmp_path / "topology.bin")
+
+    def ran(mode: str, *arguments: str, **variables: str) -> dict:
+        done = subprocess.run([sys.executable, str(tmp_path / "aliased.py"), mode, cache, topology,
+                               *arguments], env={**environment, **variables}, capture_output=True, text=True,
+                              check=True)
+        return json.loads(done.stdout.splitlines()[-1])
+
+    generation = ran("topology")["generation"]
+    # The GPU hidden as well: a process that sees one of the topology's own compiles through it, tuned.
+    assert ran("compile", generation, JAX_PLATFORMS="cpu", CUDA_VISIBLE_DEVICES="") == {"read": 0}
+    assert ran("run") == {"read": 0}
