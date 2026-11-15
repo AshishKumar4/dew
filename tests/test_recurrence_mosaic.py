@@ -1795,8 +1795,9 @@ def _reach(target: str, group: tuple) -> set:
     with generation.assumed(facts), report.refusals():
         for _, bound, pulled, (tiles, *_) in _ladders(target, group):
             apart = training and not pulled
-            launches = template.MOSAIC.launches(bound, tiles.forward if apart else tiles, facts, backward=pulled)
-            found |= {('forward launch' if apart else 'launch', launch.name) for launch in launches}
+            walked = tiles.forward if apart else tiles
+            found |= {('forward launch' if apart else 'launch', launch.name)
+                      for launch in template.MOSAIC.launches(bound, walked, facts, backward=pulled)}
     kind = 'two roles' if variant == TWO_ROLES else 'derived' if variant is None else 'a neighbour'
     return found | {('dtype', jnp.dtype(dtype).name), ('packed', packed), ('tiles', kind)} if found else found
 
