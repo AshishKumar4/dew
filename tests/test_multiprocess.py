@@ -1371,6 +1371,21 @@ def test_every_process_writes_its_own_local_checkpoint_every_n_steps(tmp_path):
 
 
 @pytest.mark.distributed
+@pytest.mark.parametrize("mode", ["local_made", "local_made_lost"], ids=["held", "lost"])
+def test_a_pools_local_step_restores_into_a_template_holding_an_array_it_never_wrote(tmp_path, mode):
+    """A local step restores onto the placement it was written with, each process its own shards of it,
+    and a template's array the step lacks, which the template holds made (a scheduled solver's horizons,
+    of a step written before a state held them), is kept as made wherever it lies: the step reads none
+    of it (row 5628: it was refused as placed as None, a current resume of every scheduled run). So too
+    where process 1 lost its copy (the data axis across the processes, so process 0 holds a replica of its
+    shards): its written leaves come from process 0's, its made array is its own."""
+    reports = run_pool(mode, tmp_path / "out", 2, name="made", run_dir=tmp_path / "run", fsdp_size=2,
+                       local_dir=tmp_path / "local")
+    for report in reports:
+        assert report == {"refused": None, "made": [0.0, 1.0, 2.0], "as_written": True}, report
+
+
+@pytest.mark.distributed
 def test_a_local_save_that_fails_in_the_background_ends_the_pool(tmp_path):
     """A process whose local checkpoint fails in orbax's background thread
     (its tmp directory not made, as FileExistsError left one on a CI shard on

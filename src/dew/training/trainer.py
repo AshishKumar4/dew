@@ -707,13 +707,16 @@ class Trainer(Generic[Loss, Effects]):
         compiled ahead builds it with the programs compiled with the step (`_taking`)."""
         with self._taking():
             state, shardings, position = self._placing(start, positioned=positioned)
-        return self._stated(state), shardings, position
+        return self._configured(state), shardings, position
 
-    def _stated(self, state: TrainState) -> TrainState:
-        """`state` with its scheduled solvers' step horizons this run's (`OptimConfig.horizons`), which a
-        configured run's optimizer holds as operands it sets on every state it steps (`stated`,
-        `dew.optim_schedules.with_horizons`): its step and its start are one program at any length of run, a
-        rehearsal's or a restart's served from the persistent cache. A restore's template (`_placing`)
+    def _configured(self, state: TrainState) -> TrainState:
+        """`state` with the operands its optimizer holds of each param group this run configures, set
+        together: its rates (`OptimConfig.rates`, `with_rates`), its bounds (`OptimConfig.bounds`,
+        `with_bounds`) and its scheduled solvers' step horizons (`OptimConfig.horizons`, `with_horizons`),
+        which its step reads as operands: its step and its start are one program at any length of run, a
+        rehearsal's or a restart's served from the persistent cache, and a resumed or supplied state
+        trains at the rate and within the bounds this run states, not the ones it held. Set on the
+        state a run places, fresh, restored or supplied, and on a restore's template (`_placing`), which
         holds them made, so a checkpoint saved without them restores. A trainer given an Optax
         transformation keeps its own."""
         config = self._config
@@ -723,7 +726,9 @@ class Trainer(Generic[Loss, Effects]):
         horizons = config.horizons(steps, clocked=self._shape.examples is not None)
         schedules = {group: rate for group, (rate, _) in config.grouped_rates().items()
                      if isinstance(rate, ScheduleBase)}
-        return rates_set(state, lambda held: with_horizons(held, horizons, schedules, steps))
+        rates, bounds = config.rates(), config.bounds()
+        return rates_set(state, lambda held: with_horizons(with_bounds(with_rates(held, rates), bounds),
+                                                           horizons, schedules, steps))
 
     def _placing(self, start: Start, *, positioned: bool
                  ) -> tuple[TrainState, Placement[TrainState], bytes | None]:
@@ -743,14 +748,10 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, abstract.variables,
                 lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype)))
         share = DataPartition.of(self.device_mesh) if positioned else None
-        state, position = self._staging.restore(checkpoints, self._stated(placed_shapes(abstract, shardings)),
-                                               resume, share)
+        template = self._configured(placed_shapes(abstract, shardings))
+        state, position = self._staging.restore(checkpoints, template, resume, share)
         state = restored(state, resume, self._shape.examples)
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
-        if (config := self._config) is not None:
-            # The rate and bounds this run configures, not the ones its checkpoint holds.
-            state = rates_set(state, lambda held: with_bounds(with_rates(held, config.rates()),
-                                                              config.bounds()))
         self._compiler.resume_rung(checkpoints.rung(resume))
         # At the rung it trained on, the run's computation is the checkpoint's or the resume is refused.
         differs = computation_differs(checkpoints.artifact(resume), self._artifact())
@@ -984,9 +985,15 @@ class Trainer(Generic[Loss, Effects]):
         run.warmed = self._compiler.rung()
 
     def _planned_afresh(self) -> None:
-        """The step planned afresh, as where a phase of other passes begins at an update's end: at the split
-        the run was given, or the planner's for its own passes."""
-        self._shape = dataclasses.replace(self._shape, split=self._given_split)
+        """The step planned afresh, as where a phase of other passes begins at an update's end
+        (`_afresh_shape`)."""
+        self._shape = self._afresh_shape()
+
+    def _afresh_shape(self) -> RunShape:
+        """The run's shape as a step planned afresh plans it, the loop's at a phase of other passes
+        (`_planned_afresh`) and a later phase's off the loop (`dew.training.ahead.LaterPlans`): at the
+        split the run was given, or the planner's for its own passes."""
+        return dataclasses.replace(self._shape, split=self._given_split)
 
     @ruled
     def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None) -> CompiledStep:
@@ -1444,7 +1451,7 @@ class Trainer(Generic[Loss, Effects]):
             initial = owned_dicts(self._staging.received(self.objective, dataclasses.replace(
                 initial, variables=dict(initial.variables))))
             with self._staging.held(boxed(self._boxed_axes())):
-                initial = self._stated(afresh(initial, schedule_states(self.optimizer,
+                initial = self._configured(afresh(initial, schedule_states(self.optimizer,
                                                                        initial.variables["params"]),
                                               self._shape.examples))
             # Placed once the first batch's whole state, its accumulation among it, is checked against the

@@ -9,7 +9,6 @@ facts with the run's own XLA flags.
 from __future__ import annotations
 
 import collections
-import concurrent.futures
 import contextlib
 import contextvars
 import dataclasses
@@ -254,18 +253,27 @@ class Compiling:
 
 def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
     """`program` over these arguments (arrays or shapes) lowered here and its first compile begun in a
-    thread of its own (`report.attempted`: XLA's compile alone, which releases the GIL), so it compiles
-    while this thread runs on: a run's start beside its step's planning, which does not read it."""
+    daemon thread of its own (`report.attempted`: XLA's compile alone, which releases the GIL), so it
+    compiles while this thread runs on: a run's start beside its step's planning, which does not read it.
+    Only `attempting` waits for it: a run refused before its start is taken exits without waiting for a
+    compile no one reads (row 5966), where an executor's worker held the interpreter's exit for it."""
     from dew.nn.kernels.templates import report
 
     lowered = program.lower(*args, **kwargs)
-    pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dew-compile-ahead")
-    try:
-        # In this thread's context: the compile's target reads it (`report.for_devices`).
-        return Compiling(program_digest(lowered),
-                         pool.submit(contextvars.copy_context().run, report.attempted, lowered, None))
-    finally:
-        pool.shutdown(wait=False)
+    attempt: Future = Future()
+    # In this thread's context: the compile's target reads it (`report.for_devices`).
+    context = contextvars.copy_context()
+
+    def attempted() -> None:
+        attempt.set_running_or_notify_cancel()
+        try:
+            attempt.set_result(context.run(report.attempted, lowered, None))
+        except BaseException as error:
+            # Its reader raises it (`attempting`).
+            attempt.set_exception(error)
+
+    threading.Thread(target=attempted, name="dew-compile-ahead", daemon=True).start()
+    return Compiling(program_digest(lowered), attempt)
 
 
 _ATTEMPTING: contextvars.ContextVar[Compiling | None] = _cache.untraced(

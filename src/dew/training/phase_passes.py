@@ -108,7 +108,13 @@ class PhasePasses[L, E]:
 
     def key(self, signature: Hashable) -> Hashable:
         """The compiled step's key for a batch's `signature`: with the count it runs, one program a count."""
-        return signature if self.current is None else (signature, self.current)
+        return self.key_at(signature, self.current)
+
+    @staticmethod
+    def key_at(signature: Hashable, passes: int | None) -> Hashable:
+        """The key of a step at `passes` (None for the objective's own) for a batch's `signature` (`key`), a
+        later phase's as the loop keys it (`dew.training.ahead.later_phases`)."""
+        return signature if passes is None else (signature, passes)
 
     def run(self, objective: Objective[L, E], passes: int) -> None:
         """Run `objective`'s looped modules `passes` times, each keeping its other choices, the rest as is."""
