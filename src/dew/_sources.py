@@ -11,17 +11,18 @@ import inspect
 import site
 import sys
 import sysconfig
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 
-def source_file(held: object) -> Path | None:
+def source_file(held: Callable | type) -> Path | None:
     """The file `held`, a function or a class, is defined in, None where it has none: a class of a notebook,
-    a REPL or `python -c` (`__main__` with no file), a builtin's, or a file since removed."""
-    try:
-        place = inspect.getsourcefile(held)  # type: ignore[arg-type]
-    except (OSError, TypeError):
+    a REPL or `python -c` (`__main__` with no file), a builtin's or an extension's, or a file since removed.
+    Read where its module names a file, where Python reads its source file without raising."""
+    module = sys.modules.get(held.__module__)
+    if module is None or vars(module).get("__file__") is None:
         return None
+    place = inspect.getsourcefile(held)
     return Path(place) if place is not None and Path(place).is_file() else None
 
 
