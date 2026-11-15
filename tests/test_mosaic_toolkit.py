@@ -1761,6 +1761,24 @@ def test_groups_summed_together_stage_no_operand_into_a_tile_a_product_in_flight
         in_flight = (in_flight or event == "tcgen05_mma") and event != "barrier_wait"
 
 
+@INTERPRETS
+@pytest.mark.parametrize("shared", [True, False], ids=["one tile", "a tile each"])
+def test_groups_summed_together_from_staged_operands_are_each_its_own_sum(shared):
+    """Interpreted: two groups summed by one issuer on tcgen05's chunks (`operands.Issuer.summed_together`),
+    each left operand a register value staged into a shared tile, one tile for both or a tile each, its
+    operands distinct small integers: each group's sum is exactly its own, `x @ w` and `2 x @ w`. A group
+    staged while another's product still read the tile gave that product the second group's operand, the
+    first group summing `2 x @ w` too (row 6527: the order-only test held no sum)."""
+    x = jax.random.randint(jax.random.key(11), (64, CHUNK_DEPTH), -4, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(jax.random.key(12), (CHUNK_DEPTH, 128), -4, 4).astype(jnp.bfloat16)
+    with generation.assumed("sm100"):
+        first, twice = (np.asarray(out) for out in _staged_together(x, w, interpret=INTERPRETED,
+                                                                   shared=shared))
+    product = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+    np.testing.assert_array_equal(first, product)
+    np.testing.assert_array_equal(twice, 2 * product)
+
+
 def test_a_group_summed_together_that_awaits_its_own_products_is_refused():
     """A group summed together on tcgen05 whose issue awaits its own products (a value added into its
     accumulator, `added_into`) is refused as it traces: its wait would leave the groups' one commit behind
