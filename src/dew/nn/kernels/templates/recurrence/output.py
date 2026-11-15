@@ -133,11 +133,14 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
              if family.products_overlap and max(given.parts, memories.parts, held.parts) > 2 else 1)
     values = ([f32(chunk, bv)] * (1 + fresh if family.products_overlap else 1)
               + held_tile(held, chunk, bv))
-    # An fp32 call's prologue's high and low prefixes, a row's and a column's, held across the first step's
-    # envelope where products overlap: unstated, Qwen3.5's fp32 forward claimed 2 programs an H100 at 204
-    # registers, whose cap spilled 16 bytes (jsf-owncap).
+    # The prologue's high and low prefixes as a row's vectors, read by the first step's scores and by every
+    # value block's output (`algebra.chunk_output`'s decay), held across the walk: unstated, a 192-wide value
+    # head's output stated 248 registers, its budget, where ptxas took 254 and serialized its warpgroup MMAs
+    # (C7512; the resource gate's training forward, FS-GATEFWD-908471231). An fp32 call's, a column's too,
+    # across the first step's envelope where products overlap: unstated, Qwen3.5's fp32 forward claimed 2
+    # programs an H100 at 204 registers, whose cap spilled 16 bytes (jsf-owncap).
     split = family.products_overlap and held.parts > 1
-    prefixes = [f32(chunk, 4)] * 2 + [f32(32, chunk)] * 2 if split else []
+    prefixes = [f32(chunk, 4)] * 2 + ([f32(32, chunk)] * 2 if split else [])
     # A write gate on the keys' side scales the scores' columns (`chunk_scores`' `column_scale`): its vector
     # across a thread's columns, 16 fragments on a 64-wide tile (the lowered liveness of Nemotron-H 4B's SSD
     # output, ssd-evidence5 at 97a10a66b; row 2943).

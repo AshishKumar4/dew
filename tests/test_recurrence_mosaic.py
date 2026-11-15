@@ -1751,67 +1751,26 @@ def _named_bodies(bound, config, target: str, *, training: bool) -> dict[str, st
         return report.kernel_modules(kernel_calls(lowered, unrun=True))
 
 
-def _ladder(bound, tiles, launch: str, facts) -> list:
-    """`launch`'s producer ladder from `tiles` (`Mosaic._raised`): each rung's tiles, from its top down."""
-    rungs, rung = [], tiles
-    while (up := template.MOSAIC._raised(bound, rung, frozenset({launch}), facts)) is not None:
-        rung = template._producing(rung, up)
-        rungs.append(rung)
-    return rungs
-
-
-def _ladders(target: str, group: tuple) -> list:
-    """The configs the identity test lowers for the gate's `group` on `target`: each case's
-    (`compiled_cases`: its derived tiles, a variant's, two roles') `(label, bound, pulled, configs)` a ladder,
-    its tiles and every rung of each launch's producer ladder, and, a training case's, its forward alone at
-    its tiles with one launch's forward producers alone at each rung (a pinned config's, which may set the
-    forward's caps apart from the call's)."""
+@functools.cache
+def _cases(target: str, group: tuple) -> tuple:
+    """The gate's `group`'s cases on `target` (`compiled_cases`, model alone): each `(label, bound, tiles,
+    training)`."""
     plans, refused, apart, launched = {}, [], {}, {}
     compiled_cases(target, plans, refused, apart, only=group, launched=launched)
-    facts, training = generation.gpu_target(target), group[2]
-    found = []
-    for label, (bound, tiles) in launched.items():
-        found += [(label, bound, training, [tiles, *_ladder(bound, tiles, launch.name, facts)])
-                  for launch in template.MOSAIC.launches(bound, tiles, facts, backward=training)]
-        if training and tiles.forward is not None:
-            def forward_at(rung, tiles=tiles):
-                return dataclasses.replace(tiles, forward=dataclasses.replace(
-                    tiles.forward, producers=rung.producers))
-
-            found += [(label, bound, False,
-                       [tiles, *map(forward_at, _ladder(bound, tiles, launch.name, facts))])
-                      for launch in template.MOSAIC.launches(bound, tiles.forward, facts, backward=False)]
-    return found
-
-
-def _dealt(ladders: list, shards: int, shard: int) -> list:
-    """The `shard`-th of `shards` tasks' share of `ladders` (`_ladders`'), packed by their configs as the CI
-    plan packs files (tools/armada/ci.py's `packed`, heaviest first into the lightest task): dealt in turn, an
-    sm90 Kimi training task took 167 s and another 5. Every ladder holds its case's tiles, so a name present
-    there is compared against one body in every task, whichever task its ladders went to; a name absent at
-    the tiles that two ladders in two tasks hold (a kernel whose emitted part reads another launch's
-    producers) is compared in neither."""
-    from tool_support import load
-
-    _, names = load("ci", "tools/armada").packed({f"{index:04d}": len(ladder[3])
-                                                  for index, ladder in enumerate(ladders)}, shards)[shard]
-    return [ladders[int(name)] for name in names]
+    return tuple((label, bound, tiles, group[2]) for label, (bound, tiles) in launched.items())
 
 
 def _reach(target: str, group: tuple) -> set:
-    """What the identity test reaches through the gate's `group` on `target` (`_ladders`, model alone): each
-    launch it lowers, a training case's forward-apart launches, and the axes that change a kernel's form or
-    its emitted part (the operands' dtype, packed documents, the tiles' kind: derived, a neighbour's, two
-    roles')."""
+    """What the identity test reaches through the gate's `group` on `target` (`_cases`, model alone, their
+    ladders unwalked): each launch it lowers, a training case's forward-apart launches, and the axes that
+    change a kernel's form or its emitted part (the operands' dtype, packed documents, the tiles' kind:
+    derived, a neighbour's, two roles'). Read through the cases' ladders, the cover's derivation took 86 to
+    107 s a task (jsf-coversize)."""
     facts = generation.gpu_target(target)
-    name, dtype, training, packed, variant = group
-    found = set()
+    name, dtype, _, packed, variant = group
     with generation.assumed(facts), report.refusals():
-        for _, bound, pulled, (tiles, *_) in _ladders(target, group):
-            apart = training and not pulled
-            walked = tiles.forward if apart else tiles
-            found |= {('forward launch' if apart else 'launch', launch.name)
-                      for launch in template.MOSAIC.launches(bound, walked, facts, backward=pulled)}
+        found = {(kind, launch) for _, bound, tiles, training in _cases(target, group)
+                 for kind, _, launch in _rungs_of(bound, tiles, training, facts)}
     kind = 'two roles' if variant == TWO_ROLES else 'derived' if variant is None else 'a neighbour'
     # The arithmetic form a launch's emitted part reads (`_form`: the delta rule, the rounding), beside the
     # operands' dtype: without it a cover could drop every write gate's group, whose unrounded walk emits a
@@ -1821,62 +1780,105 @@ def _reach(target: str, group: tuple) -> set:
             if found else found)
 
 
-IDENTITY_GROUPS = (('qwen3.5-27b-gdn', jnp.bfloat16, False, False, None),
-                   ('qwen3.5-27b-gdn', jnp.bfloat16, False, False, 0),
-                   ('qwen3.5-27b-gdn', jnp.bfloat16, True, False, None),
-                   ('qwen3.5-27b-gdn', jnp.bfloat16, True, False, TWO_ROLES),
-                   ('qwen3.5-27b-gdn', jnp.bfloat16, False, True, None),
-                   ('qwen3.5-27b-gdn', jnp.float32, False, False, None),
-                   ('kimi-linear-kda', jnp.bfloat16, False, False, None),
-                   ('kimi-linear-kda', jnp.bfloat16, True, False, None),
-                   ('nemotron-h-4b-ssd', jnp.bfloat16, True, False, None),
-                   ('nemotron-h-4b-ssd', jnp.float32, False, False, None),
-                   ('a write gate', jnp.bfloat16, False, False, None))
-"""The gate's groups the identity test lowers (`GATE_GROUPS`' greedy cover, in its order, of every target's
-reach, `_reach`): what it guards is each launch's emitted part and its form, the same code whatever the
-geometry, so every launch the gate reaches and each axis that changes a kernel's form or emitted part, on
-each target, once. Every gate group lowered took 13,478 s of train 878's CI (run dew-20261115050258-0ab99fc6),
-twelve of its tasks past the train's bound; `test_the_identity_groups_reach_all_the_gate_reaches` says which
-group a launch added later needs."""
-
-IDENTITY_SHARDS = {('kimi-linear-kda', jnp.bfloat16, False, False, None): 6,
-                   ('kimi-linear-kda', jnp.bfloat16, True, False, None): 12,
-                   ('qwen3.5-27b-gdn', jnp.bfloat16, True, False, None): 4,
-                   ('qwen3.5-27b-gdn', jnp.bfloat16, True, False, TWO_ROLES): 4,
-                   ('nemotron-h-4b-ssd', jnp.bfloat16, True, False, None): 4}
-"""Each identity group's tasks, its ladders dealt among them in turn (`_ladders`), each under the 120 s a test
-takes: a Kimi delta attention forward lowered 138 configs, its training 132, and an sm90 Kimi training case's
-lowerings ran past 965 s whole (train 878)."""
+def _rungs_of(bound, tiles, training: bool, facts) -> list:
+    """A case's ladders unwalked: each `(kind, pulled, launch)`, its every launch's at its tiles ('launch',
+    pulled where `training`), and a training case's forward alone's at its forward tiles ('forward launch',
+    not pulled)."""
+    found = [('launch', training, launch.name)
+             for launch in template.MOSAIC.launches(bound, tiles, facts, backward=training)]
+    if training and tiles.forward is not None:
+        found += [('forward launch', False, launch.name)
+                  for launch in template.MOSAIC.launches(bound, tiles.forward, facts, backward=False)]
+    return found
 
 
-@pytest.mark.parametrize('target', gate_generations(scoped=True))
-def test_the_identity_groups_reach_all_the_gate_reaches(target):
-    """Every launch and axis the gate's groups reach on `target` (`_reach`) one of `IDENTITY_GROUPS` reaches,
-    else the group that reaches it is named, to add."""
-    reach = {group: _reach(target, group) for group in GATE_GROUPS}
-    missing = set().union(*reach.values()) - set().union(*(reach[group] for group in IDENTITY_GROUPS))
-    assert not missing, {feature: next(_gated(target, group).id for group, found in reach.items()
-                                       if feature in found) for feature in missing}
+def _walked(bound, tiles, kind: str, launch: str, facts) -> list:
+    """A launch's ladder from a case's `tiles`: its tiles and each rung of its producer ladder
+    (`Mosaic._raised`, from its top down), a forward-apart launch's ('forward launch') its forward alone at
+    the case's tiles with that launch's forward producers alone at each rung (a pinned config's, which may set
+    the forward's caps apart from the call's)."""
+    rungs, rung = [], tiles
+    while (up := template.MOSAIC._raised(bound, rung, frozenset({launch}), facts)) is not None:
+        rung = template._producing(rung, up)
+        rungs.append(rung if kind == 'launch' else dataclasses.replace(
+            tiles, forward=dataclasses.replace(tiles.forward, producers=rung.producers)))
+    return [tiles, *rungs]
 
 
-@pytest.mark.parametrize('target, group, shard', [
-    pytest.param(target, group, shard, id=f'{_gated(target, group).id}-{shard}')
-    for target in gate_generations(scoped=True) for group in IDENTITY_GROUPS
-    for shard in range(IDENTITY_SHARDS.get(group, 1))])
-def test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes(target, group, shard):
-    """The `shard`-th of the gate's `group`'s ladders on `target` (`_ladders`, dealt among `IDENTITY_SHARDS`'
-    tasks, `_dealt`), each config's kernels lowered afresh through their real names (`_named_bodies`, a
-    config once however many ladders hold it): one name is one body across every config, each ladder holding
-    its case's tiles beside its rungs, and along a ladder one body keeps one name, so a rung's unchanged
-    kernels keep their modules and their names (`Mosaic.emitted`)."""
+@functools.cache
+def _identity_units(target: str) -> tuple:
+    """The identity test's units on `target`: each `(label, bound, tiles, kind, pulled, launch, kernels)`, a
+    launch's ladder unwalked (`_rungs_of`) of every case of the gate's groups that cover every launch and axis
+    the gate reaches there (`_reach`: `GATE_GROUPS` taken in order where a group reaches what none before it
+    did), beside the kernels a config of its case lowers. Derived in each task, as collection cannot afford it
+    (6.0 to 8.0 s a target of the model alone, jsf-cover, in every CI task's collection), and held a process;
+    each task walks its own units' ladders alone (`_walked`): every case's walked in every task took 50 s of
+    each sm100 task (jsf-6547d)."""
+    facts = generation.gpu_target(target)
+    held, units = set(), []
+    with generation.assumed(facts), report.refusals():
+        for group in GATE_GROUPS:
+            if not (found := _reach(target, group) - held):
+                continue
+            held |= found
+            for label, bound, tiles, training in _cases(target, group):
+                for kind, pulled, launch in _rungs_of(bound, tiles, training, facts):
+                    walked = tiles.forward if kind == 'forward launch' else tiles
+                    kernels = len(template.MOSAIC.launches(bound, walked, facts, backward=pulled))
+                    units.append((label, bound, tiles, kind, pulled, launch, kernels))
+    return tuple(units)
+
+
+def _dealt(units: list, tasks: int, task: int) -> list:
+    """The `task`-th of `tasks` tasks' share of `units` (`_identity_units`'): each case's units kept together
+    in parts of at most a task's even share of the kernels a ladder lowers a config, as every ladder of a case
+    holds its tiles, lowered once a task, the parts packed by those kernels as the CI plan packs files
+    (tools/armada/ci.py's `packed`, heaviest first into the lightest task). A name present at a case's tiles
+    is compared against one body in every task holding that case; a name absent at the tiles that two parts in
+    two tasks hold (a kernel whose emitted part reads another launch's producers) is compared in neither."""
+    from tool_support import load
+
+    cases: dict[tuple, list] = collections.defaultdict(list)
+    for each in units:
+        cases[each[0], each[4]].append(each)
+    share = -(-sum(each[-1] for each in units) // tasks)
+    parts: list[list] = []
+    for held in cases.values():
+        parts.append([])
+        for each in held:
+            if parts[-1] and sum(kept[-1] for kept in parts[-1]) + each[-1] > share:
+                parts.append([])
+            parts[-1].append(each)
+    _, names = load("ci", "tools/armada").packed({f"{index:04d}": sum(each[-1] for each in part)
+                                                  for index, part in enumerate(parts)}, tasks)[task]
+    return [each for name in names for each in parts[int(name)]]
+
+
+IDENTITY_TASKS = {'sm80': 3, 'sm86': 3, 'sm89': 3, 'sm90': 40, 'sm100': 44, 'sm120': 2}
+"""The tasks a target's identity units are dealt among (`_dealt`), a sharding size like a CI group count:
+dealt by the kernels a config lowers, not yet by their ladders' rungs, which only a walk counts, a task holds
+up to twice a target's mean, so its mean is about 60 s (jsf-6547e: sm90's tasks 16 to 171 s at 28, sm100's
+13 to 157 at 32; sm89's whole 260 s, sm80's 221, sm86's 201, sm120's 175). Every gate group lowered took
+13,478 s of train 878's CI, twelve of its tasks past the train's bound."""
+
+
+@pytest.mark.parametrize('target, task', [pytest.param(target, task, id=f'{target}-{task}')
+                                          for target in gate_generations(scoped=True)
+                                          for task in range(IDENTITY_TASKS[target])])
+def test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes(target, task):
+    """The `task`-th share of `target`'s identity units (`_identity_units`, dealt among its `IDENTITY_TASKS`,
+    `_dealt`), each launch's ladder walked (`_walked`) and each config's kernels lowered afresh through their
+    real names (`_named_bodies`, a config once however many ladders hold it): one name is one body across
+    every config, each ladder holding its case's tiles beside its rungs, and along a ladder one body keeps one
+    name, so a rung's unchanged kernels keep their modules and their names (`Mosaic.emitted`)."""
     facts = generation.gpu_target(target)
     bodies: dict[str, set[str]] = collections.defaultdict(set)
     lowered: dict[tuple, dict[str, str]] = {}
     with generation.assumed(facts), report.refusals():
-        dealt = _dealt(_ladders(target, group), IDENTITY_SHARDS.get(group, 1), shard)
-        for label, bound, pulled, configs in dealt:
+        for label, bound, tiles, kind, pulled, launch, _ in _dealt(list(_identity_units(target)),
+                                                                     IDENTITY_TASKS[target], task):
             named = []
-            for config in configs:
+            for config in _walked(bound, tiles, kind, launch, facts):
                 if (label, pulled, config) not in lowered:
                     lowered[label, pulled, config] = _named_bodies(bound, config, target, training=pulled)
                 named.append(lowered[label, pulled, config])
