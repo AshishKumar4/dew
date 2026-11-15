@@ -43,16 +43,17 @@ def raw(leaf) -> np.ndarray:
     return np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
 
 
-def layouts_agree(run, draw, label: str, layout, reference):
+def layouts_agree(run, draw, label: str, layout, reference, seeds: int = LAYOUT_SEEDS):
     """The state `run(layout, *inputs)` steps to, on par from float64 with `run(reference, *inputs)`'s over
-    the seeds' draws (check 1), the truth the reference layout's run in float64 on the draw widened; their
-    other leaves (counts, steps, keys) exact at the first draw."""
+    `seeds` draws (check 1, the site's declared count where `LAYOUT_SEEDS` does not resolve it), the truth
+    the reference layout's run in float64 on the draw widened; their other leaves (counts, steps, keys)
+    exact at the first draw."""
     from reference_error import as_given, assert_as_exact, widened
 
     def arm(placed):
         return as_given(lambda *inputs: floats(run(placed, *inputs)))
 
-    assert_as_exact(arm(layout), arm(reference), draw, label, seeds=LAYOUT_SEEDS,
+    assert_as_exact(arm(layout), arm(reference), draw, label, seeds=seeds,
                     truth_fn=as_given(lambda *inputs: floats(run(reference, *widened(inputs)))))
     ran, held = (run(placed, *draw(0)) for placed in (layout, reference))
     assert jax.tree.structure(ran) == jax.tree.structure(held)

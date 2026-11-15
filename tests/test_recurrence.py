@@ -312,8 +312,7 @@ def bf16_state_steps_as_its_float64_form(hooks):
 
 def test_a_write_gate_without_the_delta_rule_scales_what_the_token_writes():
     """Without the delta rule a write gate is an input gate: a zero gate writes nothing, so a zero
-    state stays zero and the output is zero, in the launch and in its XLA form; and a one-tap conv's
-    moved history is empty in both, its step the same as an unconvolved one's on the scaled token."""
+    state stays zero and the output is zero, in the launch and in its XLA form."""
     hooks = recurrence.Hooks(decay='none', delta=False, write_gate=True)
     # A warpgroup's keys, as the launch steps them (`templates.recurrence.step.fits`).
     ones = jnp.ones((2, 1, 128))
@@ -323,16 +322,27 @@ def test_a_write_gate_without_the_delta_rule_scales_what_the_token_writes():
         out, _, state = step(hooks, given)
         np.testing.assert_array_equal(np.asarray(out), 0.0)
         np.testing.assert_array_equal(np.asarray(state), 0.0)
-    one_tap = recurrence.Hooks(conv=recurrence.Conv(None), decay='none', delta=False)
+
+
+ONE_TAP = recurrence.Hooks(conv=recurrence.Conv(None), decay='none', delta=False)
+"""A one-tap conv before a write without the delta rule."""
+
+
+@pytest.mark.parametrize('dtype', [
+    pytest.param(jnp.float32, id='float32', marks=pytest.mark.check1_shards(seeds=256, per_task=64)),
+    pytest.param(jnp.bfloat16, id='bfloat16', marks=pytest.mark.check1_shards(seeds=256, per_task=64))])
+def test_a_one_tap_convs_step_is_an_unconvolved_ones_on_the_scaled_token(dtype):
+    """A one-tap conv's moved history is empty in the launch and in its XLA form, its step on par (check 1)
+    with the XLA form's on the scaled token, each operand dtype a site of its own seeds, sharded: both in one
+    test took 168.8 s of a CI task (main 78393f98d), past its 120 s target."""
     channels = 2 * KEY_WIDTH + VALUE_WIDTH
-    for dtype in (jnp.float32, jnp.bfloat16):
-        given = one_tap_operands(dtype, 3)
-        for step in (recurrence.step, recurrence.step_reference):
-            assert step(one_tap, given)[1].shape == (ROWS, 0, channels)
-        assert_as_exact(jax.jit(functools.partial(recurrence.step, one_tap)), summed(one_tap),
-                        functools.partial(one_tap_draw, dtype), f'one-tap {jnp.dtype(dtype).name}',
-                        seeds=ONE_TAP_SEEDS[dtype],
-                        truth_fn=jax.jit(functools.partial(recurrence.step_reference, one_tap)))
+    given = one_tap_operands(dtype, 3)
+    for step in (recurrence.step, recurrence.step_reference):
+        assert step(ONE_TAP, given)[1].shape == (ROWS, 0, channels)
+    assert_as_exact(jax.jit(functools.partial(recurrence.step, ONE_TAP)), summed(ONE_TAP),
+                    functools.partial(one_tap_draw, dtype), f'one-tap {jnp.dtype(dtype).name}',
+                    seeds=ONE_TAP_SEEDS[dtype],
+                    truth_fn=jax.jit(functools.partial(recurrence.step_reference, ONE_TAP)))
 
 
 SKIP_SEEDS = 8

@@ -46,11 +46,11 @@ from jax.interpreters import ad, batching, mlir
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
-from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, logical_spec, mesh_axes
+from dew.mesh import SEQUENCE_AXIS, logical_spec, mesh_axes
 
 from .flops import conv_flops
 from .precision import biased, exact_products
-from .sharding import auto_part, automatic_axes, in_pipeline_stage
+from .sharding import auto_part, constrained, placed_axes
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
 # from either leaves the same convolution chain open to the faulty rewrite.
@@ -74,24 +74,14 @@ def _barrier(x: jax.Array) -> jax.Array:
     return _barrier_p.bind(x)
 
 
-def _automatic_axes(mesh: jax.sharding.AbstractMesh) -> list[str]:
-    """The automatic mesh axes (`sharding.automatic_axes`) a constraint here
-    places: not an Explicit axis, which an array's type places, nor, inside a
-    pipeline's stage (`in_pipeline_stage`), the stage axis, which the stage's
-    vmap holds. Outside one, a convolution runs on every stage, and the stage
-    axis replicating its input and output doubled its kernel gradient as the
-    first bug does (a JEPA's patch embedding over stage 2 and sequence 2,
-    tests/test_stage_blocks.py), so it splits them like any other axis."""
-    return [axis for axis in automatic_axes() if axis not in mesh.explicit_axes
-            and not (axis == STAGE_AXIS and in_pipeline_stage())]
-
-
 def _whole(kernel: jax.Array) -> jax.Array:
     """`kernel` placed whole on every device (the module docstring's second
-    bug). Where no automatic mesh axis is above size one, it is left as it is."""
-    if _automatic_axes(jax.sharding.get_abstract_mesh()):
-        return jax.lax.with_sharding_constraint(kernel, P())
-    return kernel
+    bug), where a constraint places anything (`sharding.constrained`). Outside a
+    pipeline's stage, a convolution runs on every stage, and the stage axis
+    replicating its input and output doubled its kernel gradient as the first
+    bug does (a JEPA's patch embedding over stage 2 and sequence 2,
+    tests/test_stage_blocks.py), so the stage axis counts like any other there."""
+    return constrained(kernel, P())
 
 
 def _promoted_whole(*arrays: jax.Array | None, dtype: DTypeLike | None = None,
@@ -111,7 +101,7 @@ def _unreplicated(x: jax.Array, spatial: int) -> jax.Array:
     divides nothing replicates. Inside a pipeline's stage the stage axis is
     left to its vmap, and with no automatic axis above one `x` is left as it is."""
     mesh = jax.sharding.get_abstract_mesh()
-    automatic = _automatic_axes(mesh)
+    automatic = [] if mesh.empty else placed_axes(mesh)
     if not automatic:
         return x
     batched = x.ndim > spatial + 1
@@ -127,9 +117,8 @@ def _unreplicated(x: jax.Array, spatial: int) -> jax.Array:
                 entries[dimension].append(axis)
                 break
         else:
-            return jax.lax.with_sharding_constraint(x, P())
-    return jax.lax.with_sharding_constraint(
-        x, P(*(tuple(entry) if entry else None for entry in entries)))
+            return constrained(x, P())
+    return constrained(x, P(*(tuple(entry) if entry else None for entry in entries)))
 
 
 def _polyphase_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:

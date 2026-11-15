@@ -40,7 +40,7 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
-from dew.nn.kernels.recurrence import Hooks
+from dew.nn.kernels.recurrence import Hooks, skip_added
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
 from dew.nn.linear import forked_scan
@@ -595,7 +595,10 @@ class Mamba3(nn.Module):
         # The scan's output under both names a remat policy reads it by (`RESIDUALS`), as `held_scan` marks
         # it.
         out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
-        out = out + self.D[:, None] * values.astype(wide)
+        # The skip by the shared product (`recurrence.skip_added`): written here, D's gradient was one
+        # reduction over every token's products, whose order XLA:CPU took by the input's shape, a packed
+        # tiny decoder's 1.65 times the error of its documents laid a row each (row 6479).
+        out = skip_added(out, self.D, values, wide)
         ranks = (batch, length, self.mimo_rank, self.intermediate_size)
         if self.outproj_norm:
             out = self.norm(out.reshape(ranks), z.reshape(ranks)).astype(wide).reshape(out.shape)

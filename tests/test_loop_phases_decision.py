@@ -124,11 +124,14 @@ def test_a_decision_run_whose_passes_grow_by_phase_is_its_phases_runs_and_resume
 
 
 
-def test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_counts_its_flops(tmp_path):
+@pytest.mark.parametrize("phase", range(len(STEPS)), ids=[f"{passes}-passes" for passes in STEPS])
+def test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_counts_its_flops(tmp_path,
+                                                                                               phase):
     """From the same state over the same batch, each phase's step of the phased decision run computes what
     a run whose loop runs that phase's count computes: its loss and its stepped parameters the same bits (the
-    ask's invariant 1); and the FLOPs it counts are that run's, so its FLOP count follows the phase's count,
-    two passes counting more than one (invariant 5); and its offline view of an update is that run's."""
+    ask's invariant 1); and the FLOPs it counts are that run's, so its FLOP count follows the phase's count
+    (invariant 5); and its offline view of an update is that run's. A cell a phase: each compiles its own
+    phase's programs and its fixed-count run's, four, where one cell of both compiled eight (300 s in CI)."""
     from dew.batch import PHASE as READ_IN
     from dew.config import TrainerConfig
     from dew.data.dataset import DataPartition
@@ -158,27 +161,24 @@ def test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_cou
     finally:
         stream.close()
     assert sorted(batches) == [0, 1]
-    counted = []
-    for phase, passes in enumerate(STEPS):
-        # The count the step runs is its batch's phase's, read on the host; the step reads the rest.
-        assert stepping.phase_passes.at(batches[phase]) == passes
-        batch, _ = split_fields(batches[phase])
-        state, _, _ = stepping.place()
-        stepped, loss, *_ = stepping.compile(state, batch)(state, batch)
-        alone, _ = built(passes, asked(tickets(tmp_path, "first", "billing")), f"alone-{passes}")
-        start, _, _ = alone.place()
-        own, own_loss, *_ = alone.compile(start, batch)(start, batch)
-        assert np.isfinite(np.asarray(loss)) and np.array_equal(np.asarray(loss), np.asarray(own_loss)), phase
-        assert jax.tree.all(jax.tree.map(lambda a, b: bool(np.array_equal(a, b)),
-                                         jax.device_get(stepped.variables), jax.device_get(own.variables)))
-        assert stepping.step_flops == alone.step_flops is not None
-        counted.append(stepping.step_flops)
-        # Its offline view of one update over the phase's batch is that run's view (`inspected`, at the
-        # count of the phase the batch was read in, not the run's last).
-        for trainer in (stepping, alone):
-            trainer.inspection = Inspection(paths=("*",), targets=("updates",))
-        assert inspected(stepping, batches[phase]) == inspected(alone, batch), phase
-    assert counted[0] != counted[1]
+    passes = STEPS[phase]
+    # The count the step runs is its batch's phase's, read on the host; the step reads the rest.
+    assert stepping.phase_passes.at(batches[phase]) == passes
+    batch, _ = split_fields(batches[phase])
+    state, _, _ = stepping.place()
+    stepped, loss, *_ = stepping.compile(state, batch)(state, batch)
+    alone, _ = built(passes, asked(tickets(tmp_path, "first", "billing")), f"alone-{passes}")
+    start, _, _ = alone.place()
+    own, own_loss, *_ = alone.compile(start, batch)(start, batch)
+    assert np.isfinite(np.asarray(loss)) and np.array_equal(np.asarray(loss), np.asarray(own_loss))
+    assert jax.tree.all(jax.tree.map(lambda a, b: bool(np.array_equal(a, b)),
+                                     jax.device_get(stepped.variables), jax.device_get(own.variables)))
+    assert stepping.step_flops == alone.step_flops is not None
+    # Its offline view of one update over the phase's batch is that run's view (`inspected`, at the
+    # count of the phase the batch was read in, not the run's last).
+    for trainer in (stepping, alone):
+        trainer.inspection = Inspection(paths=("*",), targets=("updates",))
+    assert inspected(stepping, batches[phase]) == inspected(alone, batch)
 
 
 def test_a_phased_runs_later_phases_are_named_from_the_first_batch_its_loop_read(tmp_path):
