@@ -44,10 +44,10 @@ from dew.nn.kernels.templates.attention import (
     Param,
     Split,
     gradients,
+    head_width,
     kept_dtype,
     key_prologue_taken,
     logit_scale,
-    power_of_two,
     prescale,
     prologued,
     prologues_taken,
@@ -1107,7 +1107,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         hooks = dataclasses.replace(hooks, score_params=())
     fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
     parts = product.EXACT_PARTS if fp32 else 1
-    if hooks.query_mod is not None and (parts > 1 or power_of_two(query.shape[3]) != query.shape[3]):
+    if hooks.query_mod is not None and (parts > 1 or head_width(query.shape[3]) != query.shape[3]):
         # A query prologue its consumers cannot take where they load the query: an fp32 call's query enters as
         # its parts, and a padded width's rows hold zeros past it (a norm over them is another norm); XLA's
         # program before the launch takes it.
@@ -1126,7 +1126,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        output_kinds=tuple(param.kind for param in hooks.output_params),
                        score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
                        output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
-                       score_reduces=hook_reduces(hooks), output_width=power_of_two(value.shape[3]),
+                       score_reduces=hook_reduces(hooks), output_width=head_width(value.shape[3]),
                        form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,

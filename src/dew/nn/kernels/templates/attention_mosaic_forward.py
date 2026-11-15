@@ -49,6 +49,7 @@ from dew.nn.kernels.templates.attention import (
     Param,
     Split,
     by_power,
+    head_width,
     output_hooked,
     output_split,
     padded_call,
@@ -668,7 +669,8 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     fused = hooks.query_mod is not None
     call = padded_call(query if fused else by_power(query, power / taken), key, value, spans, hooks,
                        _block(tiles), table, by_position=True,
-                       query_block=tiles.consumers * tiles.block_q if inference else None)
+                       query_block=tiles.consumers * tiles.block_q if inference else None,
+                       widths=head_width)
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale * taken,
                            score_mod=hooks.score_mod, natural=natural,
                            # A quantized model's codes and values, each at most 127, sum far within fp32.

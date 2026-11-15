@@ -32,6 +32,7 @@ from dew.nn.kernels.templates import (
     swizzling,
 )
 from dew.nn.kernels.templates.attention import (
+    WIDEST_POWER,
     Draw,
     Dropout,
     Hooks,
@@ -42,9 +43,9 @@ from dew.nn.kernels.templates.attention import (
     block_map,
     differentiable,
     floating_params,
+    head_width,
     kept_dtype,
     key_tiles,
-    power_of_two,
     shared_place,
     whole,
 )
@@ -382,9 +383,9 @@ class BackwardTiles:
 
 
 def _width(width: int, family: mosaic.Family, dtype) -> int:
-    """A head width as a launch stages it: a power of two (`padded_call`) in whole swizzled rows
-    (`Family.column_unit`)."""
-    return whole(power_of_two(width), family.column_unit(dtype))
+    """A head width as a launch stages it: as `padded_call` pads it (`head_width`: a power of two to 256,
+    whole groups of 64 columns past it) in whole swizzled rows (`Family.column_unit`)."""
+    return whole(head_width(width), family.column_unit(dtype))
 
 
 def _products(family: mosaic.Family, dtype, *products: resources.Product, narrow: bool = False,
@@ -523,6 +524,8 @@ def _multiples(family: mosaic.Family, unit: int, extent: int) -> tuple[int, ...]
     `extent` in whole multiples (`extents`)."""
     top = -(-max(extent, 1) // unit)
     if family.copy_extent is not None:
+        # Stricter than the tiled box's own limit along its rows (rows / 8 at most `copy_extent`), kept until
+        # longer tiles are measured: lifting it lets a derivation offer tiles past 256 rows.
         top = min(top, family.copy_extent // unit)
     return tuple(range(top * unit, 0, -unit))
 
@@ -580,10 +583,12 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     if backward and not transposable(hooks):
         return Refusal('hook_layout', "the Mosaic backward holds its tiles keys first, and its score hook "
                        "takes an axis of them by an operation no layout rule takes (`layout.RULES`)")
-    widest = max(_width(width, family, dtype), _width(value_width, family, dtype))
-    if family.copy_extent is not None and widest > family.copy_extent:
-        return Refusal('copy_extent', f"the Mosaic mainloop loads a head {widest} wide in one copy, past the "
-                       f"{family.copy_extent} one moves (`Family.copy_extent`)")
+    if any(each > WIDEST_POWER and head_width(each) != each for each in (width, value_width)):
+        return Refusal('width', f"the Mosaic mainloop takes a head past {WIDEST_POWER} wide in whole groups "
+                       f"of 64 columns (`head_width`), not {width} and {value_width}")
+    if backward and max(width, value_width) > WIDEST_POWER:
+        return Refusal('width', f"the Mosaic backward takes heads to {WIDEST_POWER} wide: an absorbed MLA "
+                       "call past it is inference's (DeepSeek trains its 192-wide keys and 128-wide values)")
     return None
 
 

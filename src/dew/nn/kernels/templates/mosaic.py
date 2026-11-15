@@ -1508,9 +1508,11 @@ class Transport[Allocated, Opened](abc.ABC):
 
     copy_extent: int | None = None
     """The most elements one asynchronous copy moves along a dimension of its box after the copy's tiling
-    (TMA's, 256): an operand block tiled in 8 rows by a swizzled row stays far below it at any tile its
-    registers hold, and a one-dimensional side operand's block, untiled, is at most it
-    (`grouped_matmul._Mosaic.fitting`); None where cp.async moves a block (mma.sync's)."""
+    (TMA's, 256; Mosaic GPU's launch_context refuses a tiled slice past it along any dimension): a dimension
+    of the tiled box, never a block's row: a 16-bit block swizzled at 128 bytes tiles as (rows / 8, columns /
+    64, 8, 64), so a row 576 wide is 9 tiles of 64 (an absorbed MLA key's, `attention.head_width`), and a
+    one-dimensional side operand's block, untiled, is at most it (`grouped_matmul._Mosaic.fitting`); None
+    where cp.async moves a block (mma.sync's)."""
 
     copies_in_pieces: bool = True
     """Whether a step's block may arrive in several copies (`streams`' `copies`, `Pieces`), TMA's each into
