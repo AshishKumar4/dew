@@ -164,6 +164,7 @@ class JitArguments(TypedDict, total=False):
 
 
 _PROGRAMS: weakref.WeakSet[OuterProgram] = weakref.WeakSet()
+"""Every program alive (`OuterProgram`), whose executables `release` drops."""
 
 type Taken = Mapping[str, Callable[[], jax.stages.Compiled]]
 """Executables compiled ahead (`dew.training.ahead`), each loaded on demand, by the digest of the program it
@@ -390,7 +391,6 @@ def compiled_together() -> Iterator[None]:
         for call, executable in zip(held, executables, strict=True):
             kept(call.program, call.key, call.args, call.kwargs,
                  call.relowered[-1][1] if call.relowered else call.lowered, executable)
-"""Every program alive (`OuterProgram`), whose executables `release` drops."""
 
 _PASSING: contextvars.ContextVar[bool] = contextvars.ContextVar("outer_program_passing", default=False)
 """Whether an `OuterProgram`'s trace, which the algebra pass reads whole, encloses the current call."""
