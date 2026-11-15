@@ -738,7 +738,7 @@ class MosaicForward(_Mainloop[Tiles]):
         """`config` of a `family` whose program takes no masked rewalk (`Issuer.rewalks`: tcgen05's rows,
         whose consumer gives its issuer a plain walk's weights alone) with its rewalk on the device's register
         family, at the tiles that family's derivation gives the call (`_tiles`), past each a compile refused
-        where the rewalk's kernel spilled (`report.spilled`, `NATURAL_NAME`): the rewalk steps as that
+        where the rewalk's kernel spilled (`report.refused_at`, `NATURAL_NAME`): the rewalk steps as that
         derivation steps under the refusal of its own config, the config's own kernel's refusal its
         derivation's (`legal`). Refused as one config, a B200's 4B rows forward stepped to a 16-column block
         of the rows where its chunks rewalk had spilled 112 bytes at 64 x 64 on two consumers
@@ -753,7 +753,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                            relaunch_q=relaunch.block_q, relaunch_k=relaunch.block_k,
                                            relaunch_consumers=relaunch.consumers,
                                            relaunch_columns=relaunch.columns)
-            if not any(NATURAL_NAME in kernel for kernel in report.spilled(self, ba, launched)):
+            if not any(NATURAL_NAME in kernel for kernel in report.refused_at(self, ba, launched)):
                 return launched
             refused.add(fallback)
         return None

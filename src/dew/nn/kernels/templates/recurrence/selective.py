@@ -841,7 +841,7 @@ class Tiles:
 class Selective(base.Template[Tiles]):
     """Mamba's selective scan on the recurrence template (`selective_scan`), its config derived from the
     device's facts (`derived`), its launches named for the compile's reports (`report.launching`), so a launch
-    whose kernels spilled steps its backward's tokens down (`report.spilled`). Its operands are
+    whose kernels spilled steps its backward's tokens down (`report.refused_at`). Its operands are
     `dew.nn.mixers.mamba.selective_scan`'s: `x`, `dt` `[B, S, D]`, `A` `[D, N]`, `B`, `C` `[B, S, N]`, `D`
     `[D]`, the entering state `[B, D, N]` or None and documents' first tokens `[B, S]` or None."""
 
@@ -863,13 +863,13 @@ class Selective(base.Template[Tiles]):
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
         """The call's config on `target`: the backward's tokens a thread and residency from its register model
-        (`backward_plan`), past the token counts a compile found spilling (`report.spilled`), each a step down
-        to half its tokens (None where a spill no token count clears); and the forward's chunk, from `CHUNK`
-        the longest whose ring a block's shared memory holds (`staged_bytes`), up to a warpgroup's tokens (a
-        chunk dividing every backward block), dividing the call's tokens padded to `CHUNK`'s (a longer chunk
-        walks no more padding): on an H100 Mamba-1's bf16 forward at 8x2048x5120 took 1.21 ms at 16 tokens a
-        chunk, 1.14 at 32 and 1.12 to 1.14 at 64 and 128, its training step 6.51, 6.39 to 6.43 and 6.34 to
-        6.40 (sel-chunk-sxm at 5bf70d36b)."""
+        (`backward_plan`), past the token counts a compile found spilling (`report.refused_at`), each a step
+        down to half its tokens (None where a spill no token count clears); and the forward's chunk, from
+        `CHUNK` the longest whose ring a block's shared memory holds (`staged_bytes`), up to a warpgroup's
+        tokens (a chunk dividing every backward block), dividing the call's tokens padded to `CHUNK`'s (a
+        longer chunk walks no more padding): on an H100 Mamba-1's bf16 forward at 8x2048x5120 took 1.21 ms at
+        16 tokens a chunk, 1.14 at 32 and 1.12 to 1.14 at 64 and 128, its training step 6.51, 6.39 to 6.43 and
+        6.34 to 6.40 (sel-chunk-sxm at 5bf70d36b)."""
         facts = self._facts(ba, target)
         positions, resident = backward_plan(facts)
         chunk, length = CHUNK, ba.arguments["x"].shape[1]
@@ -881,7 +881,7 @@ class Selective(base.Template[Tiles]):
         # A launch whose compile found a kernel spilling steps the tile that sets that kernel's registers: the
         # backward's tokens. The forward's registers no tile sets (its chunk's loop is rolled, `UNROLLED`), so
         # a forward spill, or a backward's at one token, leaves no config.
-        while spilled := report.spilled(self, ba, tiles):
+        while spilled := report.refused_at(self, ba, tiles):
             backward = all(name.startswith("selective_scan_backward") for name in spilled)
             if not backward or tiles.positions == 1:
                 return None

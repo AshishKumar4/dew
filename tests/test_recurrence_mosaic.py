@@ -944,7 +944,7 @@ def test_two_launches_whose_padded_lengths_meet_name_their_own_kernels():
     named: dict[str, set] = {}
     for call in kernel_calls(lowered):
         if call.kind == 'mosaic_gpu':
-            named.setdefault(call.name, set()).add(call.launch)
+            named.setdefault(call.name, set()).add(call.launched)
     assert named and None not in set().union(*named.values())
     assert all(len(found) == 2 for found in named.values()), named
 
@@ -977,10 +977,10 @@ def test_a_plan_at_a_rings_depth_is_the_trace_at_that_depth(target, name):
 @pytest.mark.parametrize('kernel', ['recurrence_scan', 'recurrence_states', 'recurrence_reverse'],
                          ids=['forward', 'training forward', 'backward'])
 def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
-    """A compile that refused the 27B gated delta net's derived tiles on an H100 (`report.spilled`: a kernel
-    spilled), its forward's walk (`mainloop._scan`), its training forward's or its backward's: the derivation
-    steps the refused tiles down, which the call takes (`fits`); a refusal of the joined tiles once matched
-    none of the rules' candidates, and the call found none (`Unfitted`)."""
+    """A compile that refused the 27B gated delta net's derived tiles on an H100 (`report.refused_at`: a
+    kernel spilled), its forward's walk (`mainloop._scan`), its training forward's or its backward's: the
+    derivation steps the refused tiles down, which the call takes (`fits`); a refusal of the joined tiles once
+    matched none of the rules' candidates, and the call found none (`Unfitted`)."""
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 4096)
     bound = template.MOSAIC.bind(*args, None, bound=1.0)
     with report.refusals(), generation.assumed('sm90'):
@@ -1059,8 +1059,8 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
         named()
         training = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
         lowered = training.trace(*operands).lower(lowering_platforms=('cuda',))
-        (identity,) = {report.traced(call.launch).identity for call in kernel_calls(lowered)
-                       if call.kind == 'mosaic_gpu' and call.launch is not None}
+        (identity,) = {report.traced(call.launched).identity for call in kernel_calls(lowered)
+                       if call.kind == 'mosaic_gpu' and call.launched is not None}
         # The run's launch bound as the run binds it, its identity the lowering's.
         bound = template.MOSAIC.bind(*operands, None, None, firsts=None, skip=None, recomputed=True,
                                      **options)
@@ -1626,7 +1626,7 @@ def test_a_training_launchs_backward_kernels_carry_its_launch():
 
     def launches(fn) -> dict:
         lowered = lowered_for(fn, args, 'sm90')
-        return {found.name: found.launch for found in kernel_calls(lowered, unrun=True)
+        return {found.name: found.launched for found in kernel_calls(lowered, unrun=True)
                 if found.kind == 'mosaic_gpu'}
 
     forward, training = launches(call), launches(trained)
@@ -1729,53 +1729,82 @@ def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
     assert 232 in caps and 128 not in caps, caps
 
 
-@lowers('sm100')
-@pytest.mark.parametrize('target', ['sm100', 'sm90'])
-def test_a_kernel_named_alike_beside_a_raised_launch_is_one_module(target):
-    """Each geometry the gate trains in bf16, its training call at its derived tiles and at each launch's
-    first producer rung alone (`Mosaic._raised`, a setmaxnreg step), lowered: a kernel whose
-    identity (`report.named`: the launch's and what its emission reads of the config, `Mosaic.emitted`) is
-    alike at two configs is one module at both, so a rung's certification may read every kernel it leaves
-    alone from the lowering cache and Mosaic's compile; one the rung raises is another module."""
+def _named_bodies(bound, configs, target: str, *, training: bool) -> list[dict[str, str]]:
+    """Each of `configs`' Mosaic GPU kernels lowered as certification lowers them (`Mosaic.lowering`, which
+    names each kernel, `report.named`; a training call's pullback of a unit cotangent where `training`, its
+    forward alone where not), with the Pallas lowering cache off, so each is lowered afresh: a config's
+    kernels' bodies (their kernel hashes) by their names."""
+    from jax._src import config as jax_config
+    from kernel_compile import lowered_for
+
     from dew.nn.kernels.lowered import kernel_calls
 
-    facts = generation.gpu_target(target)
-    unchanged = raised = 0
-    # The geometries the gate trains in bf16 (`GATE_GROUPS`' training groups).
-    for name in sorted({name for name, dtype, training, packed, variant in GATE_GROUPS
-                        if training and dtype == jnp.bfloat16 and not packed and variant is None}):
-        operands = resource_operands(name, jnp.bfloat16, 1, 1024)[:5]
-        form, skipped = _form(name, jnp.bfloat16), _skipped(name, jnp.bfloat16)
-        bound = template.MOSAIC.bind(*operands, None, bound=1.0, **form, **skipped)
-        with generation.assumed(facts), report.refusals():
-            tiles = template.MOSAIC.derived(bound, facts)
-            if tiles is None:
-                continue
-            # Each launch's first rung alone: every other kernel's part is the derived tiles' at it.
-            ladders = [tiles]
-            for launch in template.MOSAIC.launches(bound, tiles, facts, backward=True):
-                up = template.MOSAIC._raised(bound, tiles, frozenset({launch.name}), facts)
-                if up is not None:
-                    ladders.append(template._producing(tiles, up))
-            modules: dict[tuple[str, str], set[bytes]] = collections.defaultdict(set)
-            for config in ladders:
-                # A rated scan's skip an operand beside the call's, traced as its route hands it.
-                def loss(*given, config=config, form=form, named=tuple(skipped)):
-                    out, final = mosaic_rule(*given[:5], tiles=config, bound=1.0, **form,
-                                             **dict(zip(named, given[5:], strict=True)))
-                    return out.astype(jnp.float32).sum() + final.sum()
+    found = []
+    with jax_config.jax_pallas_lowering_cache_dir(None):
+        for config in configs:
+            traced, shapes = template.MOSAIC.lowering(bound, config)
 
-                # A lowering cache's hit is the module its lowering gives: its key is all the lowering reads.
-                program = jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(
-                    *operands, *skipped.values()).lower(lowering_platforms=('cuda',))
-                for call in kernel_calls(program, unrun=True):
-                    if call.kind == 'mosaic_gpu':
-                        modules[call.name, repr(template.MOSAIC.emitted(config, call.name))].add(call.ir)
-        assert all(len(found) == 1 for found in modules.values()), name
-        named = collections.Counter(kernel for kernel, _ in modules)
-        unchanged += sum(1 for kernel, _ in modules if named[kernel] == 1)
-        raised += sum(1 for kernel in named if named[kernel] > 1)
-    assert unchanged and raised, (unchanged, raised)
+            def pulled(*given, traced=traced):
+                out, pullback = jax.vjp(traced, *given)
+                return pullback(jax.tree.map(lambda leaf: jnp.ones(leaf.shape, leaf.dtype), out))
+
+            lowered = lowered_for(pulled if training else traced, tuple(shapes), target)
+            found.append({report.launch_name(call.name, call.launch): call.config
+                          for call in kernel_calls(lowered, unrun=True) if call.kind == 'mosaic_gpu'})
+    return found
+
+
+def _ladder(bound, tiles, launch: str, facts) -> list:
+    """`launch`'s producer ladder from `tiles` (`Mosaic._raised`): each rung's tiles, from its top down."""
+    rungs, rung = [], tiles
+    while (up := template.MOSAIC._raised(bound, rung, frozenset({launch}), facts)) is not None:
+        rung = template._producing(rung, up)
+        rungs.append(rung)
+    return rungs
+
+
+@pytest.mark.parametrize('target, group', [_gated(target, group) for target in gate_generations(scoped=True)
+                                           for group in GATE_GROUPS])
+def test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes(target, group):
+    """Each case of the gate's `group` on `target` (`compiled_cases`: its derived tiles, a variant's, two
+    roles'), at its tiles and at every rung of each launch's producer ladder, and, a training case's, its
+    forward alone at its tiles with one launch's forward producers alone at each rung (a pinned config's,
+    which may set the forward's caps apart from the call's), its kernels lowered afresh through their real
+    names (`_named_bodies`): one name is one body across every config, and along a ladder one body keeps
+    one name, so a rung's unchanged kernels keep their modules and their names (`Mosaic.emitted`)."""
+    plans, refused, apart, launched = {}, [], {}, {}
+    compiled_cases(target, plans, refused, apart, only=group, launched=launched)
+    facts, training = generation.gpu_target(target), group[2]
+    bodies: dict[str, set[str]] = collections.defaultdict(set)
+    with generation.assumed(facts), report.refusals():
+        for bound, tiles in launched.values():
+            ladders = [(training, [tiles, *_ladder(bound, tiles, launch.name, facts)])
+                       for launch in template.MOSAIC.launches(bound, tiles, facts, backward=training)]
+            if training and tiles.forward is not None:
+                # The forward's caps set apart from the call's, as a pinned config may set them.
+                def forward_at(rung, tiles=tiles):
+                    return dataclasses.replace(tiles, forward=dataclasses.replace(
+                        tiles.forward, producers=rung.producers))
+
+                ladders += [(False, [tiles, *map(forward_at, _ladder(bound, tiles, launch.name, facts))])
+                            for launch in template.MOSAIC.launches(bound, tiles.forward, facts,
+                                                                   backward=False)]
+            for pulled, configs in ladders:
+                if len(configs) < 2 and any(bodies.values()):
+                    continue
+                named = _named_bodies(bound, configs, target, training=pulled)
+                for found in named:
+                    for name, body in found.items():
+                        bodies[name].add(body)
+                # Along a ladder, a body keeps its name.
+                names: dict[str, set[str]] = collections.defaultdict(set)
+                for found in named:
+                    for name, body in found.items():
+                        names[body].add(name)
+                assert all(len(held) == 1 for held in names.values()), {
+                    body: held for body, held in names.items() if len(held) > 1}
+    assert all(len(found) == 1 for found in bodies.values()), {
+        name: found for name, found in bodies.items() if len(found) > 1}
 
 
 def test_a_spilling_kernel_raises_only_the_launch_it_belongs_to():

@@ -14,9 +14,8 @@ import typing
 from pathlib import Path
 
 import pytest
-from run_kinds import KINDS, scalars
+from run_kinds import KINDS, cli_arguments, cli_settings, saved_record, scalars, trained_record
 
-from dew._cli.main import main
 from dew.checkpoints import Checkpoints
 from dew.config import RunConfig, TrainerConfig
 from dew.quantization import Quantization
@@ -51,25 +50,25 @@ MESH = {"tensor": 2}
 the rest): two rows each, which a split in two and a ramp's first batch of four still divide."""
 
 
-def train_arguments(kind: str, root: Path, name: str, run: RunConfig | None = None,
-                    **settings: object) -> list[str]:
-    """`dew train`'s arguments over `kind`'s run.json under `root`, or `run`'s where given, its options
-    `settings` (`--set path=value`, a mapping as JSON), at most as many steps as it is given."""
-    record, data = root / f"record-{name}", root / name
+def train_record(kind: str, root: Path, name: str, run: RunConfig | None = None,
+                 **settings: object) -> tuple[Path, dict[str, object]]:
+    """`kind`'s run under `root`, or `run` where given, saved for `dew train` (`saved_record`), and its
+    options `settings` over the matrix's (`cli_settings`: a log every step, its mesh, no metric), at most
+    as many steps as it is given."""
+    data = root / name
     data.mkdir()
-    (run or KINDS[kind](data, drawn=False)).save(str(record))
-    given = {"trainer.name": name, "trainer.checkpoint_dir": str(root / "runs"), "trainer.log_every": "1",
-             "trainer.eval_every": "None", "trainer.checkpoint_every": "None", "trainer.mesh": MESH,
-             "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None", "val_metrics": "[]",
-             **settings}
-    return [str(record / "run.json"), *(flag for path, value in given.items() for flag in (
-        "--set", f"{path}={json.dumps(value) if isinstance(value, dict) else value}"))]
+    record = saved_record(run or KINDS[kind](data, drawn=False), root, name)
+    given = cli_settings(root, name, {"trainer.log_every": "1", "trainer.mesh": MESH, "val_metrics": "[]",
+                                      **settings})
+    if "trainer.steps" not in settings:
+        # The run's own steps, as it states them.
+        del given["trainer.steps"]
+    return record, given
 
 
 def trained(kind: str, root: Path, name: str, run: RunConfig | None = None, **settings: object) -> Path:
-    """`dew train` here over `train_arguments`: the run's directory."""
-    assert main(["train", *train_arguments(kind, root, name, run, **settings)]) == 0
-    return root / "runs" / name
+    """`dew train` here over `train_record`: the run's directory."""
+    return trained_record(*train_record(kind, root, name, run, **settings))
 
 
 def trainer_record(field: str, value: object) -> object:
@@ -169,7 +168,7 @@ def test_a_ramped_run_accumulating_two_microbatches_resumes_at_a_stage_its_updat
     run = trained(kind, tmp_path, "ramped", **{"trainer.steps": 2, **settings})
     first = saved(run)[-1]
     # Resumed from its record, as `dew train <run>/run.json` resumes it.
-    assert main(["train", str(run / "run.json"), "--set", "trainer.steps=4"]) == 0
+    trained_record(run, {"trainer.steps": "4"})
     started = recorded(run, "FitStarted")[-1]
     assert (started["start_step"], started["resumed_from"] is not None) == (first, True)
     assert saved(run)[-1] > first
@@ -345,10 +344,11 @@ def an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
     environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(compiled),
                    "PYTHONPATH": str(REPO_ROOT / "src"), "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
                    "XLA_FLAGS": measuring}
-    dew_train(tmp_path, environment, *train_arguments("lm", tmp_path, "tuned", **{
+    record, settings = train_record("lm", tmp_path, "tuned", **{
         "trainer.steps": 1, "trainer.tune_kernels": "True", "trainer.mesh": {},
         "trainer.compilation_cache_dir": str(compiled), "model.attention_impl": "template",
-        "model.head_dim": 16}))
+        "model.head_dim": 16})
+    dew_train(tmp_path, environment, str(record / "run.json"), *cli_arguments(settings))
     assert json.loads(picks.read_text())["data"]
 
 
@@ -366,9 +366,10 @@ def an_lm_run_whose_launches_are_tokamaxs_refuses_to_tune(tmp_path):
     environment = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"),
                    "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
                    "XLA_FLAGS": without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))}
-    arguments = train_arguments("lm", tmp_path, "untuned", **{
+    record, settings = train_record("lm", tmp_path, "untuned", **{
         "trainer.steps": 1, "trainer.tune_kernels": "True", "trainer.mesh": {},
         "model.attention_impl": "triton", "model.head_dim": 16})
+    arguments = [str(record / "run.json"), *cli_arguments(settings)]
     done = subprocess.run([sys.executable, "-m", "dew._cli.main", "train", *arguments], cwd=tmp_path,
                           env=environment, capture_output=True, text=True, timeout=900)
     assert done.returncode != 0

@@ -538,7 +538,7 @@ def test_a_launchs_backward_kernel_carries_its_launch():
         return pull(out)
 
     lowered = lowered_for(trained, operands, 'sm90')
-    launches = {call.name: call.launch for call in kernel_calls(lowered, unrun=True)
+    launches = {call.name: call.launched for call in kernel_calls(lowered, unrun=True)
                 if call.kind == 'mosaic_gpu'}
     assert set(launches) == {'selective_scan', 'selective_scan_backward'}, launches
     assert launches['selective_scan'] is not None
