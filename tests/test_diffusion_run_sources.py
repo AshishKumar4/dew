@@ -889,12 +889,12 @@ def a_256_pixel_diffusion_run_trains_saves_resumes_and_draws(tmp_path):
     from dew.training import LocalTracker
 
     images = np.random.RandomState(0).randint(0, 256, (16, 256, 256, 3), np.uint8)
-    data = Memory([{"image": image} for image in images]).batch(4)
+    data = Memory([{"image": image} for image in images]).batch(8)
 
     def trained(steps: int):
-        config = diffusion_run(tmp_path / "runs", 4, log_every=1)
+        config = diffusion_run(tmp_path / "runs", 8, log_every=1)
         config = dataclasses.replace(
-            config, data=images_of("tfds://oxford_flowers102", 256, batch=4),
+            config, data=images_of("tfds://oxford_flowers102", 256, batch=8),
             model=dataclasses.replace(config.model, fields={
                 **config.model.fields, "patch_size": 16, "emb_features": 64, "num_layers": 2, "num_heads": 4,
                 "dtype": "bfloat16"}),
