@@ -367,10 +367,11 @@ def with_release_sources(artifact: JSON) -> JSON:
     """`artifact`, a step's inference declaration, with the cache releases it names paths within mapped to
     the saved runs they hold (`release_sources`), where it names any: what a run's checkpoint carries
     (`Trainer`)."""
-    if not isinstance(artifact, dict) or "objective" not in artifact:
-        return artifact
-    sources = release_sources(artifact)
-    return {**artifact, RELEASE_SOURCES: sources} if sources else artifact
+    match artifact:
+        case {"objective": _} if sources := release_sources(artifact):
+            return {**artifact, RELEASE_SOURCES: sources}
+        case _:
+            return artifact
 
 
 def releases_here(record: Mapping[str, object], *, mesh: MeshSpec | Mesh | None = None,
