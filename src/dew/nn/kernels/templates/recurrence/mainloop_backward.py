@@ -911,9 +911,9 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         row, span, last = n * chunk, pl.ds(n * chunk, chunk), n * chunk + chunk - 1
         key_columns = keyed * width + c * call.block
         first = keyed * group
-        views = _query_key_views(call, (q_ref, k_ref), (v_ref, do_ref, dv_ref), (h_ref, dh_ref), row=row,
-                                 key_columns=key_columns, first=first, chunk=n, block=c, split=split, vq=vq,
-                                 scores=(ds_ref, keyed))
+        views, once = _walked_once(call, _query_key_views(
+            call, (q_ref, k_ref), (v_ref, do_ref, dv_ref), (h_ref, dh_ref), row=row, key_columns=key_columns,
+            first=first, chunk=n, block=c, split=split, vq=vq, scores=(ds_ref, keyed)))
 
         def step(index, slots, carry, accumulators, *, scores: bool = True):
             h = first + index
@@ -975,9 +975,10 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
 
         # Without the delta rule the scores' products the first step's alone.
         return mosaic.Walk(views, step, steps=group, segments=() if call.delta else (
-            (step, 0, 1), (functools.partial(step, scores=False), 1, group)))
+            (step, 0, 1), (functools.partial(step, scores=False), 1, group)), once=once)
 
     tiles, out_type = _query_key_launched(call, vq)
+    tiles, once = _walked_once(call, tiles)
     # Persistent under the delta rule, whose tile walks one step function (without it, the first step's
     # scores products are a segment of their own, which a persistent tile walks none of): a program a tile
     # paid each tile's setup, its chunk's table entries' dependent loads and its ring's and done barriers,
@@ -985,7 +986,8 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
     dq, dk, *weights, after, leaving, memory = launch_kernel(
         program, call, out_type=out_type,
         grid=(splits, width // call.block, call.chunks, call.heads // group),
-        grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(10),
+        grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, once=once or None, stages=1,
+        live=chunk_liveness(10),
         steps=call.group, model=_query_key_model(call), held=_query_key_held(call, vq),
         landing=_query_key_landing(call, splits),
         persistent=call.delta, together=(call.block,) * (2 + call.delta + 2 * (splits == 1)))(
@@ -996,6 +998,18 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
     after, leaving, memory = (x.reshape(splits, -1, *x.shape[1:]).sum(0) for x in (after, leaving, memory))
     dw = None if not weights else weights[0] if splits == 1 else held.split(weights[0])
     return dq, dk, dw, after, leaving, memory
+
+
+def _walked_once(call: Call, streams: dict) -> tuple[dict, dict]:
+    """`_query_key`'s `streams` (its views or its blocks, by part name) as those its steps stream and those
+    its walk loads once (`mosaic.Walk.once`): without the delta rule the key head's queries, keys and scores'
+    gradient, which every value head's step reads alike (a plain walk's, on a family whose walks load them,
+    `Family.walks_once`; under the delta rule its tiles persist, whose once streams the recurrence's bundles
+    do not load, each step its value head's scores' gradient): streamed, a step each of a group's value heads
+    loaded them again, the 4B SSD's twelve where one serves."""
+    once = () if call.delta or not call.family.walks_once else ("queries", "keys", "ds")
+    held = {name: value for name, value in streams.items() if name.rstrip("0123456789") in once}
+    return {name: value for name, value in streams.items() if name not in held}, held
 
 
 def _query_key_model(call: Call) -> float:

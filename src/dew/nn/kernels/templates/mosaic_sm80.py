@@ -30,6 +30,7 @@ from dew.nn.kernels.templates import (
     persistent,
     report,
     resources,
+    rings,
     stores,
     swizzling,
 )
@@ -106,7 +107,7 @@ def _gathered_walk(streams, segments, carry, interpret: bool):
                 slot = lax.rem(index - lo, stages)
                 started, accumulators = carried
                 tiles = {name: ring.at[slot] for name, ring in zip(names, slots, strict=True)}
-                return step(index, mosaic.WholeSlots(tiles), started, accumulators)
+                return step(index, rings.WholeSlots(tiles), started, accumulators)
 
             return lax.fori_loop(lo, hi, body, carry)
 
@@ -541,6 +542,9 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
     gathers_rows = True  # its one warpgroup's cp.async copies gather a step's rows (`_gathered_walk`)
+    # `emit_pipeline` would allocate a folded once block a slot per stage in the walk's scope, where its
+    # planned once allocation (`lifetimes`) holds one: no once stream walks here until the plan counts it.
+    walks_once = False
     gathers_alone = False  # its walk gathers every stream's rows or none (`streams`)
     gathers_interpreted = True
 
@@ -623,9 +627,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
-                pingpong: bool = False) -> None:
+                pingpong: bool = False, once=None) -> None:
         del producer  # no producer role of its own
         self.pingponged(pingpong)
+        self.onced(once)
         # Each tile's pipeline fills and drains before its output copy. Synchronize at that lifetime
         # boundary so the output's shared memory can reuse the pipeline's slots.
         del in_flight, unrolled, accumulators  # its walk carries its accumulators
@@ -680,7 +685,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
             def body(indices, *refs, step=step, lo=lo):
                 (index,), (carried, accumulators) = indices, refs[-1]
-                slots = mosaic.WholeSlots(dict(zip(names, refs[:-1], strict=True)))
+                slots = rings.WholeSlots(dict(zip(names, refs[:-1], strict=True)))
                 return step(index + lo, slots, carried, accumulators)
 
             # A tile's blocks staged swizzled for ldmatrix (`_staging`), each read inside its operand: its

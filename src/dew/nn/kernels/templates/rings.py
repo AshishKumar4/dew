@@ -1,8 +1,9 @@
 """The Mosaic GPU toolkit's rings (docs/design/kernel-templates.md): a stream's shared-memory slots a
 producer loads by TMA and its consumers read (`Ring`, allocated by `ring`), a step's turn round them
 (`Turn`), the views a step's block is copied from (`viewed`: `Pieces`, `Rows`, `Paired`, `Split`), a
-producer's loads and drain (`loads`, `streamed`, `drain`) and a consumer's passing of steps it reads none
-of (`passed`). The families and walks that compose them are `mosaic`'s."""
+producer's loads and drain (`loads`, `streamed`, `drain`), a consumer's passing of steps it reads none
+of (`passed`), and a step's slots of them (`Slots`, `WholeSlots`; `Beside` its once streams' beside
+them). The families and walks that compose them are `mosaic`'s."""
 
 import dataclasses
 from collections.abc import Iterable, Sequence
@@ -99,6 +100,14 @@ def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
     def _(step):
         for name, ring in rings.items():
             ring.load(ring.turn(counter + step), ring.viewed(views[name], step))
+
+
+def loaded_once(rings: dict, done, views: dict) -> None:
+    """A producer's loads of a walk's or a persistent tile's once streams (`Walk.once`, `Family.persist`'s
+    `once`): each its block, which every step reads, into its one-deep ring at the turn `done` (a tile's:
+    the active tiles before it)."""
+    for name, ring in rings.items():
+        ring.load(ring.turn(done), ring.viewed(views[name], 0))
 
 
 def streamed(rings: tuple, views, lo, hi) -> None:
@@ -351,3 +360,132 @@ def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, multicast: boo
         consumed = plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)
     return {'smem': swizzling.staged((stages, *block), dtype, swizzle),
             'full': plgpu.Barrier(num_arrivals=copies, num_barriers=stages), 'consumed': consumed}
+
+
+class WholeSlots:
+    """A step's operand slots by stream name (`Slots`' interface) where the walk hands the step its blocks
+    whole and refills a slot only after the step that read it (`emit_pipeline`'s on cp.async, a TPU core's
+    walk awaiting its blocks): releasing one early is nothing."""
+
+    def __init__(self, refs: dict):
+        self._refs = refs
+
+    def __getitem__(self, name: str):
+        return self._refs[name]
+
+    def release(self, name: str) -> None:
+        del name
+
+    def acquire_all(self) -> None:
+        """Every slot acquired: the step's blocks are its whole."""
+
+
+class Beside:
+    """A step's slots (`Slots`) beside its walk's or its persistent tile's once streams' (`Walk.once`,
+    `Family.persist`'s `once`), by stream name: a once stream's the slot every step reads, which the walk or
+    tile gives back, every other the step's own."""
+
+    def __init__(self, slots: "Slots", once: dict):
+        self._slots, self._once = slots, once
+        self.more, self.first = slots.more, slots.first
+
+    def __getitem__(self, name: str):
+        return self._once[name] if name in self._once else self._slots[name]
+
+    def release(self, name: str) -> None:
+        if name not in self._once:
+            self._slots.release(name)
+
+    def opened(self, name: str):
+        return self._slots.opened(name)
+
+    def following(self, name: str):
+        return self._slots.following(name)
+
+    def done(self) -> None:
+        self._slots.done()
+
+    def held(self) -> None:
+        self._slots.held()
+
+    def acquire_all(self) -> None:
+        self._slots.acquire_all()
+
+
+def besides(slots: "Slots", once: dict | None):
+    """A step's `slots` beside its walk's or tile's once streams' (`Beside`), as they are where none."""
+    return Beside(slots, once) if once else slots
+
+
+class Slots:
+    """A walk step's operand slots (`Family.walk`), by stream name: each acquired when the step first reads
+    it (`slots[name]`) and released at the step's end, once its MMAs are done, unless the step `release`s it
+    sooner (a slot its last product has read). A stream the walk reads a step `ahead` the step reads through
+    the next step's slot (`following`, where `more` steps follow in its range): its own slot was acquired by
+    the step before it, or by itself where it is its range's `first` (`opened`), and it gives that slot
+    back as any other."""
+
+    def __init__(self, rings: dict[str, Ring], turn: Turn, ahead: tuple[str, ...] = (), *, more=False,
+                 first=True):
+        self._rings, self._turn = rings, turn
+        self._held: dict[str, Ref] = {}
+        self._released: set[str] = set()
+        self._ahead, self.more, self.first = ahead, more, first
+
+    def __getitem__(self, name: str):
+        if name in self._ahead:
+            raise ValueError(f"{name}'s slot is read a step ahead: the step before read it (`following`), or "
+                             "the range's first step reads its own (`opened`)")
+        if name not in self._held:
+            self._held[name] = self._rings[name].acquire(self._turn)
+        return self._held[name]
+
+    def opened(self, name: str):
+        """Stream `name`'s own slot where the walk reads it ahead and no step before this one did: the range's
+        first step's (`first`), within its branch."""
+        return self._rings[name].acquire(self._turn)
+
+    def following(self, name: str):
+        """Stream `name`'s slot at the next step, which this one reads ahead of it where `more` steps follow:
+        acquired here, given back by the next step."""
+        stages = min(ring.stages for ring in self._rings.values())
+        return self._rings[name].acquire(self._turn.ahead(1, stages))
+
+    def release(self, name: str) -> None:
+        """Stream `name`'s slot given back now, its reads done (acquired first if the step read none, or by
+        the step before where the walk reads it ahead)."""
+        if name not in self._ahead:
+            self[name]
+        self._rings[name].release(self._turn)
+        self._released.add(name)
+
+    def done(self) -> None:
+        """Every slot the step has not given back given back, each acquired: each consumer waits on every load
+        (a wait takes its barrier's next phase), so a slot it never read is still acquired before it is
+        released."""
+        for name in self._rings:
+            if name not in self._released:
+                self.release(name)
+
+    def held(self) -> None:
+        """Every slot the step has not read acquired, none given back: a step whose products stay running
+        past it (`Family.walk`'s `in_flight`) gives its slots back a step later (`released`)."""
+        if self._released or self._ahead:
+            raise ValueError("a step whose products run past it gives back no slot early nor reads one ahead")
+        self.acquire_all()
+
+    def acquire_all(self) -> None:
+        """Every slot the step has not read acquired in the step's own trace: a slot first acquired inside a
+        loop's body (a rolled `lax.fori_loop`) is kept by its first read, which would carry that body's slot
+        index past it, a scalar the kernel then takes as an input (the Mosaic GPU lowering fails on it); a
+        step that reads its slots in a loop acquires them before it. A stream read ahead is not its own to
+        acquire."""
+        for name in self._rings:
+            if name not in self._ahead:
+                self[name]
+
+
+def released(rings: dict[str, Ring], turn: Turn) -> None:
+    """Every ring's slot of `turn` given back: a step's slots its walk held past it (`Slots.held`)."""
+    for ring in rings.values():
+        ring.release(turn)
