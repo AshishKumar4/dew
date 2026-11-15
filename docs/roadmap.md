@@ -65,14 +65,12 @@ This page is generated from the maintainers' findings ledger as each change land
 - Time to first step: the compile path's re-derivations. [5556, 5558]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
-- CI time: every test within 120 seconds. [6351, 6443]
-- Training & Data's tests on check 1. [708]
+- CI time: every test within 120 seconds. [6351]
 - XLA:CPU edges. [1591]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
 
 ## Data
 
-- Metamorphic run flows: a run equals its saved, reloaded and restarted self. [4511]
 - The diffusion kinds' starts keep no record and their refits trace again. [6297]
 - A distillation objective states no trace key, so its refits and warm starts trace their step again. [6303]
 
