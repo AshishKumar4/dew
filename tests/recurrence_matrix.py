@@ -32,16 +32,17 @@ import pytest
 from delta_rule_support import fla_layer_side
 from gpu_flow import cell
 from kernel_matrix import AXES
-from reference_error import (
-    FEWEST_SEEDS,
-    assert_as_exact,
-    indexed_recording,
-    recording,
-    widened,
-    with_gradients,
-)
+from reference_error import FEWEST_SEEDS, assert_as_exact, indexed_recording, recording, with_gradients
 from ssd_support import mamba_side
-from test_recurrence_chunk import FORMED, VALUE_HEADS, chunk_on, draw, hosted, token_by_token
+from test_recurrence_chunk import (
+    FORMED,
+    VALUE_HEADS,
+    against_the_portable_math,
+    chunk_on,
+    draw,
+    hosted,
+    token_by_token,
+)
 from upstream_support import upstream_arm
 
 from dew.nn.kernels import generation, recurrence_chunk
@@ -299,24 +300,6 @@ def _upstream(named: dict[str, str], block: int, *, first: int = 0):
                         keyed=lambda operands, cotangents: operands)
 
 
-def _deficit(named: dict[str, str], seeds: int, truth) -> str:
-    """The cell's kernel's distance from float64 against Dew's own chunk math's (the portable math's), each
-    leaf's pooled RMS ratio over the first `seeds` draws: reported beside the verdict, never judged."""
-    port, portable = (jax.jit(_step(named, kernel)) for kernel in (named["kernel"], "xla"))
-    errors: dict[str, dict[str, list[float]]] = {}
-    for seed in range(seeds):
-        drawn = _drawn(named, seed)
-        with jax.enable_x64(new_val=True):
-            exact = truth(*widened(drawn))
-        for arm, results in (("port", port(*drawn)), ("portable", portable(*drawn))):
-            for (path, leaf), true in zip(jax.tree_util.tree_flatten_with_path(results)[0],
-                                         jax.tree.leaves(exact), strict=True):
-                errors.setdefault(jax.tree_util.keystr(path), {}).setdefault(arm, []).append(
-                    float(np.mean((np.asarray(leaf, np.float64) - np.asarray(true, np.float64)) ** 2)))
-    return ", ".join(f"{name} {np.sqrt(sum(arms['port']) / max(sum(arms['portable']), 1e-300)):.3g}"
-                     for name, arms in errors.items())
-
-
 def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> None:
     """The chunked op's training step of `case` on its GPU, its kernel named, on par with its reference's
     (`_reference`; check 1, the recurrence a token at a time in float64 the truth) over `seeds` draws: the
@@ -340,11 +323,14 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> No
         _on_par_recorded(named, step, with_gradients(truth), upstream, seeds)
         return
     oracle = jax.jit(with_gradients(truth)) if upstream is None else _upstream(named, (1 + REDRAW) * seeds)
+    if named["kernel"] != "xla":
+        distance = against_the_portable_math(_step(named, named["kernel"]), _step(named, "xla"),
+                                             functools.partial(_drawn, named), with_gradients(truth),
+                                             FEWEST_SEEDS)
+        print(f"{'-'.join(case)} under the {generation.numerics().forms} forms, its distance against Dew's "
+              f"own chunk math's: {distance}", flush=True)
     assert_as_exact(step, oracle, functools.partial(_drawn, named), "-".join(case), seeds=seeds,
                     truth_fn=with_gradients(truth))
-    if named["kernel"] != "xla":
-        print(f"{'-'.join(case)} under the {generation.numerics().forms} forms, its distance against Dew's "
-              f"own chunk math's: {_deficit(named, FEWEST_SEEDS, with_gradients(truth))}", flush=True)
 
 
 def _on_par_recorded(named: dict[str, str], step, truth, upstream: str, seeds: int) -> None:

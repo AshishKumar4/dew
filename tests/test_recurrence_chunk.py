@@ -271,6 +271,26 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
     return jnp.moveaxis(out, 0, 1), state
 
 
+def against_the_portable_math(dew_fn, portable_fn, draw, truth_fn, seeds: int) -> str:
+    """`dew_fn`'s distance from float64 against Dew's own chunk math's (`portable_fn`, the portable math),
+    each leaf's pooled RMS ratio over the first `seeds` draws (`draw(seed)`, `truth_fn` the float64 truth on
+    them): reported beside a cell's verdict, never judged (testing.md: Dew's own chunk math is no cell's
+    reference)."""
+    arms = {"dew": jax.jit(dew_fn), "portable": jax.jit(portable_fn)}
+    errors: dict[str, dict[str, list[float]]] = {}
+    for seed in range(seeds):
+        drawn = draw(seed)
+        with jax.enable_x64(new_val=True):
+            exact = truth_fn(*widened(drawn))
+        for arm, fn in arms.items():
+            for (path, leaf), true in zip(jax.tree_util.tree_flatten_with_path(fn(*drawn))[0],
+                                         jax.tree.leaves(exact), strict=True):
+                errors.setdefault(jax.tree_util.keystr(path), {}).setdefault(arm, []).append(
+                    float(np.mean((np.asarray(leaf, np.float64) - np.asarray(true, np.float64)) ** 2)))
+    return ", ".join(f"{name} {np.sqrt(sum(arms['dew']) / max(sum(arms['portable']), 1e-300)):.3g}"
+                     for name, arms in errors.items())
+
+
 @pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
 @pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)
 def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, packed):
