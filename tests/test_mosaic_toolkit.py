@@ -1563,6 +1563,18 @@ def _kept_sums(x, w, *, interpret):
                          interpret=interpret, name="chunks_kept")(x, w)
 
 
+def _stepped_once(family, rings, step, outs, shape, interpret):
+    """A consumer's walk of `rings` for one `step` from a fresh accumulator of `shape` an output of `outs`,
+    each sum stored into its output."""
+    def walked(wg):
+        del wg
+        found, _ = family.walk(rings, ((step, 0, 1),), (family.zeros(shape),) * len(outs), (), interpret)
+        for out_gmem, value in zip(outs, found, strict=True):
+            out_gmem[...] = value
+
+    return walked
+
+
 def _summed_together(x, w, *, interpret, awaiting: bool = False):
     """`x_0 @ w_0`, `x_1 @ w_1` and `x_0 @ w_1` (`x`'s and `w`'s two depth blocks, each a stream of its own)
     on tcgen05's chunks from shared memory, three groups of one width summed together in one step
@@ -1595,14 +1607,8 @@ def _summed_together(x, w, *, interpret, awaiting: bool = False):
                 readers = family.summed_together(((rows, columns),) * 3, tuple(issues))
                 return tuple(read() for read in readers), accumulators
 
-            def walked(wg):
-                del wg
-                found, _ = family.walk(rings, ((step, 0, 1),), (family.zeros((rows, columns)),) * 3, (),
-                                       interpret)
-                for out_gmem, value in zip(outs, found, strict=True):
-                    out_gmem[...] = value
-
-            family.scheduled(1, walked, lambda: family.stream(rings, views, 0, 1))
+            family.scheduled(1, _stepped_once(family, rings, step, outs, (rows, columns), interpret),
+                             lambda: family.stream(rings, views, 0, 1))
 
         family.scoped(scope, streams=family.streams(blocks, 2, 1),
                       products=(1, (), (), (), (), (columns,) * 3))
@@ -1679,14 +1685,8 @@ def _staged_together(x, w, *, interpret):
                 readers = issuer.summed_together([[("left", held, right)], [("left", held * 2, right)]])
                 return tuple(read() for read in readers), accumulators
 
-            def walked(wg):
-                del wg
-                found, _ = family.walk(rings, ((step, 0, 1),), (family.zeros((rows, columns)),) * 2, (),
-                                       interpret)
-                for out_gmem, value in zip(outs, found, strict=True):
-                    out_gmem[...] = value
-
-            family.scheduled(1, walked, lambda: family.stream(rings, views, 0, 1))
+            family.scheduled(1, _stepped_once(family, rings, step, outs, (rows, columns), interpret),
+                             lambda: family.stream(rings, views, 0, 1))
 
         # An accumulator of the width alone (`summed`'s) beside two together (`summed_together`'s).
         products = (1, (columns,), (), (), (), (columns,) * 2)

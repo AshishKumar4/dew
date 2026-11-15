@@ -241,8 +241,9 @@ class Issuer:
         wait follows them all, so a product of another group still reading the tile would read the new
         operand."""
         entries = [list(self._entries(group)) for group in groups]
-        if not all(not isinstance(entry, product.Blocks) and _in_memory(entry[1]) and _in_memory(entry[2])
-                   for found in entries for entry in found):
+        triples = [[entry for entry in found if not isinstance(entry, product.Blocks)] for found in entries]
+        staged = all(_in_memory(lhs) and _in_memory(rhs) for found in triples for _, lhs, rhs in found)
+        if not staged or any(len(found) != len(entry) for found, entry in zip(triples, entries, strict=True)):
             return tuple(functools.partial(self.summed, found) for found in entries)
         family, interpret = self.call.family, self.call.interpret
 
@@ -252,8 +253,8 @@ class Issuer:
                 acc = family.issued(acc, left, right, interpret)
             return acc
 
-        shapes = tuple((found[0][1].shape[0], found[0][2].shape[1]) for found in entries)
-        return family.summed_together(shapes, tuple(functools.partial(issued, found) for found in entries))
+        shapes = tuple((found[0][1].shape[0], found[0][2].shape[1]) for found in triples)
+        return family.summed_together(shapes, tuple(functools.partial(issued, found) for found in triples))
 
     def _entries(self, products: Iterable):
         """`products` as `summed` issues them: a `product.Blocks` it loops over as it is, more than one block
