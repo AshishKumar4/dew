@@ -12,7 +12,7 @@ import numpy as np
 import optax
 import pytest
 from learning_gate import FEWEST_UNITS, assert_learns
-from scenario_contract import held_out_losses
+from scenario_contract import held_out_measures
 from tiny_configs import MATRIX_DECODER
 
 from dew.data.dataset import Loader, replayed
@@ -33,10 +33,15 @@ STEPS = 40
 """Each scenario's runs: the fewest the learning gate judges, forty steps of Adam each."""
 
 
+def counted(starts, width: int = SEQ + 1, high: int = HIGH) -> np.ndarray:
+    """The language's rows from their first ids `starts` (`[rows, 1]`): each `width` ids counting up by
+    one, wrapping from `high` back to LOW."""
+    return (LOW + (np.asarray(starts) - LOW + np.arange(width)) % (high - LOW)).astype(np.int32)
+
+
 def counting(rows: int, seed) -> np.ndarray:
     """`rows` sequences of SEQ + 1 ids, each counting up by one from a drawn first id, from LOW to HIGH."""
-    starts = np.random.default_rng(seed).integers(LOW, HIGH, size=(rows, 1))
-    return (LOW + (starts - LOW + np.arange(SEQ + 1)) % (HIGH - LOW)).astype(np.int32)
+    return counted(np.random.default_rng(seed).integers(LOW, HIGH, size=(rows, 1)))
 
 
 def text(rows: int, seed, width: int = SEQ + 1) -> dict:
@@ -53,7 +58,7 @@ def judged(objective, label: str, width: int = SEQ + 1) -> None:
     """The scenario's claim, testing.md's "loss decreases", over RUNS independent runs, each on its own
     stream and held-out batch: each run's contrast the share of its held-out loss training removed, positive
     where the loss after is below the loss before, at no margin past that."""
-    before, after = held_out_losses(objective, optax.adam(1e-2), lambda run: loader(run, width),
+    before, after = held_out_measures(objective, optax.adam(1e-2), lambda run: loader(run, width),
                                     lambda run: text(64, [run, 10_000], width), runs=RUNS, steps=STEPS)
     lowered = 1 - after / before
     assert_learns(lambda runs: {"training lowers the held-out loss": lowered[runs]}, label, units=RUNS)

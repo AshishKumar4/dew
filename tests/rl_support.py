@@ -93,6 +93,32 @@ def completion_length(text: str, record) -> float:
     return float(len(text))
 
 
+def recorded_grpo_config(tmp_path, *cli: str):
+    """An LM run that names GRPO and records its rollout (`LMRunConfig.rollout`): a one-layer decoder over
+    the tiny chat tokenizer, eight prompts each longer than its width of 8 ids (the preset's `long='truncate'`
+    keeps each prompt's last 8), its completions' length the reward (`completion_length`, by import path),
+    two groups of four new tokens; one step, logged, checkpointed under `tmp_path`, and `cli`'s flags on
+    top (`LMRunConfig.cli`). test_grpo's recorded run and a scenario's online RL cell each build from it."""
+    from pathlib import Path
+
+    from dew.config import ObjectiveConfig
+    from dew.config.lm import LMRunConfig, PromptRollout
+    from dew.data import Memory, presets
+    from dew.registry import ModelConfig
+
+    tokenizer = str(Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat")
+    rows = [{"prompt": "hi there " * 8, "data_source": "rule", "ground_truth": "a"}] * 8
+    rollout = PromptRollout(reward=f"{__name__}:completion_length", groups=2, max_new_tokens=4)
+    model = ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1, "num_heads": 2,
+                                               "dtype": "float32"})
+    default = LMRunConfig(data=Memory(rows).pipe(presets.prompts, tokenizer, max_prompt_len=8, batch=8),
+                          tokenizer=tokenizer, objective=ObjectiveConfig("grpo"), rollout=rollout,
+                          model=model, max_new_tokens=0)
+    return LMRunConfig.cli(["--trainer.steps", "1", "--trainer.checkpoint-dir", str(tmp_path),
+                            "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
+                            "--trainer.log-every", "1", *cli], default=default)
+
+
 class ScriptedSource:
     """An asynchronous scheduler's source (`dew.objectives.rl.scheduler.Asynchronous`) whose sessions
     `drawn(task, sample, version)` draws at once, each submitted call's future done; a cancel cancels
