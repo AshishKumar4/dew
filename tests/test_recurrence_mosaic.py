@@ -1785,14 +1785,17 @@ def _ladders(target: str, group: tuple) -> list:
 
 
 def _dealt(ladders: list, shards: int, shard: int) -> list:
-    """The `shard`-th of `shards` tasks' share of `ladders` (`_ladders`'), dealt by their configs, the longest
-    first to the task holding fewest: dealt in turn, an sm90 Kimi training task took 167 s and another 5."""
-    loads, taken = [0] * shards, [[] for _ in range(shards)]
-    for ladder in sorted(ladders, key=lambda ladder: -len(ladder[3])):
-        lightest = loads.index(min(loads))
-        taken[lightest].append(ladder)
-        loads[lightest] += len(ladder[3])
-    return taken[shard]
+    """The `shard`-th of `shards` tasks' share of `ladders` (`_ladders`'), packed by their configs as the CI
+    plan packs files (tools/armada/ci.py's `packed`, heaviest first into the lightest task): dealt in turn, an
+    sm90 Kimi training task took 167 s and another 5. Every ladder holds its case's tiles, so a name present
+    there is compared against one body in every task, whichever task its ladders went to; a name absent at
+    the tiles that two ladders in two tasks hold (a kernel whose emitted part reads another launch's
+    producers) is compared in neither."""
+    from tool_support import load
+
+    _, names = load("ci", "tools/armada").packed({f"{index:04d}": len(ladder[3])
+                                                  for index, ladder in enumerate(ladders)}, shards)[shard]
+    return [ladders[int(name)] for name in names]
 
 
 def _reach(target: str, group: tuple) -> set:
@@ -1801,7 +1804,7 @@ def _reach(target: str, group: tuple) -> set:
     its emitted part (the operands' dtype, packed documents, the tiles' kind: derived, a neighbour's, two
     roles')."""
     facts = generation.gpu_target(target)
-    _, dtype, training, packed, variant = group
+    name, dtype, training, packed, variant = group
     found = set()
     with generation.assumed(facts), report.refusals():
         for _, bound, pulled, (tiles, *_) in _ladders(target, group):
@@ -1810,7 +1813,12 @@ def _reach(target: str, group: tuple) -> set:
             found |= {('forward launch' if apart else 'launch', launch.name)
                       for launch in template.MOSAIC.launches(bound, walked, facts, backward=pulled)}
     kind = 'two roles' if variant == TWO_ROLES else 'derived' if variant is None else 'a neighbour'
-    return found | {('dtype', jnp.dtype(dtype).name), ('packed', packed), ('tiles', kind)} if found else found
+    # The arithmetic form a launch's emitted part reads (`_form`: the delta rule, the rounding), beside the
+    # operands' dtype: without it a cover could drop every write gate's group, whose unrounded walk emits a
+    # branch of its own (`mainloop._scan`'s).
+    form = tuple(sorted(_form(name, dtype).items()))
+    return (found | {('dtype', jnp.dtype(dtype).name), ('packed', packed), ('tiles', kind), ('form', form)}
+            if found else found)
 
 
 IDENTITY_GROUPS = (('qwen3.5-27b-gdn', jnp.bfloat16, False, False, None),
