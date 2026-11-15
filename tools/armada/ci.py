@@ -141,7 +141,7 @@ import time
 import tomllib
 import xml.etree.ElementTree as ET
 from collections import Counter
-from collections.abc import Container, Mapping, Sequence
+from collections.abc import Callable, Container, Mapping, Sequence
 from pathlib import Path
 
 
@@ -571,26 +571,41 @@ def reached(python: str, rows: list[tuple[str, str]], kept: Container[tuple[str,
     one whose key over its last run's inputs (`last`, what `record` kept of its reads) differs between `base`
     and here (`cache_key`, each side's own reading and common: a unit executed, a file read, a lookup, a
     listing, a judge's map inputs, all as a key covers them); and one whose last run recorded none, unknown.
-    A row the change leaves unread is no reach of it, whatever the cache's state for it (a red run since its
-    green one, a miss of the cache's own). {"files": every reached row's file, "unknown": the files reached
-    only through a row with no recorded inputs, which the receipt names apart}."""
+    The same keys read in two tiers (Main, 2026-11-15): `files`, the rows whose key moved on an input other
+    than a module's top level (a function or class body its last run executed, a file it read, a lookup),
+    and `module`, those it moved through module-level units alone, which every
+    importer of a module executes. A row the change leaves unread is no reach of it, whatever the cache's
+    state for it. {"files", "module": the files of each tier, "unknown": the files reached only through a row
+    with no recorded inputs}."""
     rows = [each for each in rows if each not in kept]
     here = os.getcwd()
 
-    def keyed() -> dict[tuple[str, str], str]:
+    def keyed() -> tuple[dict[tuple[str, str], str], Callable[[str], str]]:
         common, reading = shared(python), Reading()
-        return {(name, group): cache_key(common, name, group, last[(name, group)], reading)
-                for name, group in rows if last.get((name, group))}
+        alone: dict[str, str] = {}
 
-    now = keyed()
+        def single(item: str) -> str:
+            # One input's own key, which says whether that input moved (`moved`).
+            if item not in alone:
+                alone[item] = cache_key("", "", "", [item], reading)
+            return alone[item]
+        return ({(name, group): cache_key(common, name, group, last[(name, group)], reading)
+                 for name, group in rows if last.get((name, group))}, single)
+
+    now, single_now = keyed()
     try:
         os.chdir(base)
-        then = keyed()
+        then, single_then = keyed()
+        moved = {each: [item for item in last[each] if single_then(item) != single_now(item)]
+                 for each, key in now.items() if then.get(each) != key}
     finally:
         os.chdir(here)
-    known = {name for each, key in now.items() for name in [each[0]] if then.get(each) != key}
-    unknown = {name for name, group in rows if not last.get((name, group))} - known
-    return {"files": sorted(known | unknown), "unknown": sorted(unknown)}
+    top = f"{followed.CODE}<module>"
+    deep = {each[0] for each, items in moved.items()
+            if not items or any(not item.endswith(top) for item in items)}
+    module = {each[0] for each in moved} - deep
+    unknown = {name for name, group in rows if not last.get((name, group))} - deep - module
+    return {"files": sorted(deep), "module": sorted(module), "unknown": sorted(unknown)}
 
 
 def eager_sites(python: str, sites: Sequence[tuple[str, str]]) -> set[tuple[str, str]]:
@@ -1230,7 +1245,7 @@ def plan(target: float, timings: dict, census: bool = False,
         # A change every key covers, or none places (the policy cold or off), reaches every row.
         if reach is not None:
             reach[python] = (reached(python, rows_of, found, last, reach["base"]) if cache == "on" else
-                             {"files": sorted({name for name, _ in rows_of}), "unknown": []})
+                             {"files": sorted({name for name, _ in rows_of}), "module": [], "unknown": []})
         print(f"plan: {python}: kept {len(found)} of {len(rows_of)}; not kept: {missed}", file=sys.stderr)
         # A lookup a row, in seconds: a kept task's weight is its container's start and those lookups.
         tasks: list[tuple[list[tuple[str, str]], float]] = [
