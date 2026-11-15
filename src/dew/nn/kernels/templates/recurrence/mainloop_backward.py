@@ -472,6 +472,23 @@ def _reverse_views(call: Call, q_ref, k_ref, w_ref, do_ref, local_ref, v_ref, h,
                            if v_ref is not None else {}))
 
 
+def _entered_views(call: Call, entered_ref, h, walked, walked_width: int) -> dict:
+    """The per-key reverse walk's streams of the memory each chunk entered (`memory`, the forward's, in
+    `call.memories`' form), a key slice `entered{i}` each, value head `h`'s `walked_width` columns from
+    `walked`: step `f` the chunk `chunks - 1 - f`'s slice, as `_reverse_views`' steps, its ring prefetching it
+    for the memory decay's sum. Read from global memory in the step, its load stalled the walk's consumer a
+    quarter of Kimi Linear's reverse walk on an emulated B200 (754k cycles, a load of the accumulator's layout
+    at the walk's every key slice, HS's tip2 ranking, nvgpu-lean run 20261114203056-aebe0292)."""
+    slices = call.width // call.block
+    whole = call.memories.views(entered_ref, 0, call.chunks * call.heads * call.width, walked, walked_width)
+    views: dict = {}
+    for i in range(slices):
+        # The slice's block of rows: chunk-major, then head, then key slice (`memory`'s rows).
+        views |= stream_views(lambda f, i=i: (((call.chunks - 1 - f) * call.heads + h) * slices + i, 0),
+                              **{f"entered{i}": whole})
+    return views
+
+
 def _reverse_keyed(call: Call, h) -> tuple[Operand, object]:
     """The form and columns of the queries and keys `_reverse` takes for value head `h`: the key head's as
     given under a decay a head; under one a key dimension each value head's own, gated (`key_gated`'s
@@ -506,6 +523,10 @@ def _reverse_launched(program, call: Call, tiles: Tiles, batch: int, sequences: 
                            out=((chunk, walked_width), given),
                            local=((chunk, walked_width), _value_grads(call)),
                            **({"values": ((chunk, walked_width), given)} if gates else {}))
+    if call.per_key:
+        # The memory each chunk entered, a key slice a stream (`_entered_views`).
+        blocks |= stream_blocks(**{f"entered{i}": ((call.block, walked_width), call.memories)
+                                   for i in range(width // call.block)})
     finals = stream_blocks(**{f"final{i}": ((call.block, walked_width), final)
                               for i in range(width // call.block)})
     out_type = (*out_type, *(() if table is None else table_returned(call, table, batch)))
@@ -583,6 +604,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
 
         views = _reverse_views(call, q_ref, k_ref, w_ref, do_ref, local_ref, v_ref if gates else None, h,
                                walked, walked_width)
+        if entered_ref is not None:
+            views |= _entered_views(call, entered_ref, h, walked, walked_width)
         final_views = stream_views(**{f"final{i}": final.views(dht_ref, memory(row, i), call.block, walked,
                                                                walked_width) for i in range(slices)})
         walked_streams = family.opened(streams["walked"], views)
@@ -612,9 +635,9 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                 memories.store(dh_ref, part, memory(n, i), call.block, column, bv, family=family,
                                smem=lands[f"memory{i}"], wait=False)
                 if entered_ref is not None:
-                    rows = pl.ds(memory(n, i), call.block)
-                    gated_ref[0].at[column // bv, rows][...] = algebra.key_memory_decay(
-                        family.tile_of(entered_ref.at[rows, pl.ds(column, bv)]), part)
+                    entered = stream_tile(slots, f"entered{i}", call.memories, columns=columns)
+                    gated_ref[0].at[column // bv, pl.ds(memory(n, i), call.block)][...] = (
+                        algebra.key_memory_decay(entered.value(), part))
 
             out = stream_tile(slots, "out", given, columns=columns)
             grad, dv = _reverse_carried(call, slots, grad, out, columns, issue, (hi_ref, lo_ref), h, n,
