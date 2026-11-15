@@ -133,64 +133,44 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_pat
     assert first["missed"][0] not in [refusal["config"] for refusal in again["planned"]["refused"]]
 
 
-class Recurrent(nn.Module):
-    """Qwen3.5-4B's gated delta net over a row of 12,288 tokens (16 key heads and 32 value heads, each 128
-    wide) on the template, its queries and keys the input, its values the input's scaled by a trained scale,
-    its output what the loss reads: a training step's recurrence whose output launch writes only the output
-    (`output_launch`, a call keeping its memories for its backward)."""
-
-    @nn.compact
-    def __call__(self, x):
-        from dew.nn.kernels import recurrence_chunk
-
-        scale = self.param("scale", nn.initializers.ones, (32, 128), jnp.float32)
-        if self.is_initializing():
-            return jnp.zeros((*x.shape[:2], 32, 128), jnp.float32) * scale
-        keys = x.astype(jnp.bfloat16)
-        values = (jnp.concatenate([x, x], axis=2) * scale).astype(jnp.bfloat16)
-        decay = jnp.full((*x.shape[:2], 32), -0.1, jnp.float32)
-        written = jnp.full((*x.shape[:2], 32), 0.5, jnp.bfloat16)
-        out, _ = recurrence_chunk.template_rule(keys, keys, values, decay, written, max_segments=None,
-                                                scale=None, delta=True, wide=False, bound=1.0, rounded=True)
-        return out.astype(jnp.float32)
-
-
-def recurrent(mesh, ahead=None) -> Trainer:
-    return Trainer(Supervised(Recurrent(), squared, inputs=InputSpec(Field("x", (12288, 16, 128)))),
-                   optax.adam(1e-3), key=0, mesh=mesh, ahead=ahead)
-
-
 RECURRENT_AHEAD = """
 import json
 import jax
-import numpy as np
-from test_kernel_spills import recurrent
-from dew.nn.kernels import generation
+import optax
+from token_support import token_rows
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels.generation import compile_only_gpus
-from dew.training import MeshSpec
+from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
+from dew.objectives.lm import LMObjective
+from dew.training import MeshSpec, Trainer
 from dew.training.ahead import compile_ahead
 
 lowered = []
 jax.monitoring.register_event_duration_secs_listener(
     lambda event, seconds, *, fun_name=None, **_: lowered.append(fun_name)
     if event == "/jax/core/compile/jaxpr_to_mlir_module_duration" else None)
-with generation.chosen(gated_delta_rule="mosaic_gpu"):
-    compile_ahead(recurrent(MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30))),
-                  {"x": np.zeros((1, 12288, 16, 128), np.float32)})
+# Qwen3.5-4B's linear attention: 16 key heads and 32 value heads, each 128 wide, over a row of 12,288 tokens.
+model = CausalTransformer(vocab_size=64, emb_features=512, num_layers=1, num_heads=4, head_dim=128,
+                          mlp_features=512, max_seq_len=12288, dtype="bfloat16", mixer=GatedDeltaNetMixer())
+trainer = Trainer(LMObjective(model, 12288), optax.adam(1e-3), key=jax.random.key(0),
+                  mesh=MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30)))
+compile_ahead(trainer, token_rows(64, 1, 12289))
 print(json.dumps({"lowered": lowered}))
 """
-"""A recurrent step compiled ahead for a compile-only H100 (`recurrent`), each program it lowered by name."""
+"""A one-layer decoder of Qwen3.5-4B's gated delta net compiled ahead for a compile-only H100, each program
+it lowered by name."""
 
 
 @lowers("sm90")
 def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path):
-    """The 4B gated delta net's step compiled ahead for a compile-only H100 (`Recurrent`), twice over one
-    cache: at its derived tiles its output launch spills (8 bytes at 128 registers), and each process lowers
-    the step once. Certification compiles a launch with its outputs live, as a step reads them, so it refuses
-    the spilling config and steps the launch's producer down at trace, each rung compiled alone; and a later
-    process reads the verdicts stored, compiling nothing to certify. Certification that dropped the outputs
-    never compiled the output launch, and the program's compile stepped it down a whole-step relowering a
-    rung, again in every process (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm)."""
+    """A one-layer decoder of the 4B's gated delta net, its step compiled ahead for a compile-only H100
+    (`RECURRENT_AHEAD`), twice over one cache: at its derived tiles its output launch spills (8 bytes at 128
+    registers under the cuda12 build's ptxas), and each process lowers the step once. Certification compiles
+    a launch with its outputs live, as a step reads them, so it refuses the spilling config and steps the
+    launch's producer down at trace, each rung compiled alone; and a later process reads the verdicts stored,
+    compiling nothing to certify. Certification that dropped the outputs never compiled the output launch,
+    and the program's compile stepped it down a whole-step relowering a rung, again in every process
+    (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm)."""
     cache = tmp_path / "cache"
     counts = [fresh(RECURRENT_AHEAD, cache_dir=cache)["lowered"].count("jit(step)") for _ in range(2)]
     assert counts == [1, 1], counts
