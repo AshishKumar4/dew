@@ -64,6 +64,7 @@ from dew.state import CHECKPOINTED, TokenCount, TrainState
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, ema_update
 from dew.training.evaluation import WARM_BATCHES
 from dew.training.runtime import Preempted
+from dew.training.trainer import refuse_non_finite
 
 
 def endless():
@@ -2454,3 +2455,34 @@ def test_a_state_built_from_a_held_tree_steps_without_freeing_the_tree():
     stepped, *_ = trainer.compile(state, batch)(state, batch)
     jax.block_until_ready(stepped)
     assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(objective.variables))
+
+
+class PoisonedThird(Counting):
+    """`Counting`'s batches, the third's features not finite: its loss and gradient are."""
+
+    def __next__(self):
+        batch = super().__next__()
+        if batch["index"][0] == 2:
+            batch = {**batch, "x": np.full_like(batch["x"], np.nan)}
+        return batch
+
+
+@pytest.mark.parametrize("tier", ["persistent", "local"])
+def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path, tier):
+    """A save that meets a state holding a non-finite value writes nothing and rotates nothing out, on either
+    tier: the run stops there, and the checkpoint a resume finds is the last finite one, its parameters
+    finite (row 6699). A run with no loss scale whose third batch is not finite, checkpointed every step
+    and keeping two (`persistent`), saved its non-finite parameters at steps 3 and 4 and rotated its good
+    checkpoints out; one that writes a local copy every second step and a persistent one every tenth
+    (`local`) wrote its step-4 local copy unchecked, and a resume restored it (train 901's review, F1)."""
+    def trainer():
+        return make_trainer(tmp_path, keep=2) if tier == "persistent" else local_trainer(tmp_path)
+
+    with pytest.raises(RuntimeError):
+        trainer().fit(dataset(PoisonedThird), steps=5, log_every=100,
+                      checkpoint_every=1 if tier == "persistent" else 10)
+    resumed = trainer()
+    assert resumed.checkpoints.latest == 2
+    restored, *_ = resumed.checkpoints.restore(resumed.initial_state())
+    assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(restored.variables))
+    refuse_non_finite(restored, 3, lambda: 2)
