@@ -1134,7 +1134,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         setting no class names costs a trace where it differs, never another's program. None where a value
         states none (an array, a closure, an object compared by identity, an objective stating none). A
         key reads the objective as it is now, its modules and head as a fit's rung set them."""
-        left = set(type(self).untraced_names())
+        left = set(type(self)._untraced())
         cached = {name for klass in type(self).__mro__ for name, member in vars(klass).items()
                   if isinstance(member, functools.cached_property)} - left
         run = {id(entry.module) for entry in self.program_key()}
@@ -1150,7 +1150,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         return None if own is None else (own, tuple(sorted(held.items())))
 
     @classmethod
-    def untraced_names(cls) -> dict[str, str]:
+    def _untraced(cls) -> dict[str, str]:
         """What its trace key leaves out, by name, each with its reason: its own class's and its bases'
         (`untraced`)."""
         return {name: why for klass in reversed(cls.__mro__)
