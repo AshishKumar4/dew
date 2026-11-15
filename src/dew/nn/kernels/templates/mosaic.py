@@ -1180,13 +1180,17 @@ class Issuer[Accumulator](abc.ABC):
         accumulator is a ref scopes (wgmma's)."""
         return issue(self.zeros(shape))
 
-    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple) -> tuple[Callable, ...]:
+    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False
+                        ) -> tuple[Callable, ...]:
         """Groups of products none of which reads another's sum, each `issues[i](acc) -> acc` into a fresh
         fp32 accumulator of `shapes[i]`: a reader of each group's value, which its caller calls where it uses
         it, so no more sums are held in registers at once than it reads together. Where the issuer awaits its
         products (tensor memory's), every group is issued before any is awaited, one wait for them all, and a
-        reader reads its group's accumulator (`Tcgen05ChunksIssuer`'s); elsewhere a reader sums its group
-        where it is read (`summed`), in the caller's order."""
+        reader reads its group's accumulator (`Tcgen05ChunksIssuer`'s); `apart`, each group's products
+        awaited before the next group issues, as groups that stage their operands into shared tiles need (a
+        group's staging would overwrite a tile another group's product in flight reads). Elsewhere a reader
+        sums its group where it is read (`summed`), in the caller's order, each group done before the next."""
+        del apart
         return tuple(functools.partial(self.summed, shape, issue)
                      for shape, issue in zip(shapes, issues, strict=True))
 
