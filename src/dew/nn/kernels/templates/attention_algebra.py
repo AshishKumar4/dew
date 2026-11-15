@@ -1266,14 +1266,6 @@ def chunk_of(spec: Forward) -> int | None:
     return CHUNK if spec.compensated else None
 
 
-def _softmax(spec: Forward, state: Partial, keys: Keys):
-    """A tile's softmax: the running maximum, the factor the state's sums take, the weights for the
-    product and the tile's values."""
-    m, alpha = peak(spec, state.m, keys.logits, keys.products, axis=keys.coords.key_axis)
-    p = weights(spec, keys.logits, m, keys.coords)
-    return m, alpha, p, keys.values.load()
-
-
 def magnitudes(value: jax.Array) -> jax.Array:
     """Each key's values' largest magnitude, `[bk]` of a tile's `[bk, Dv]`, fp32 (`weighed_reach`)."""
     return jnp.max(jnp.abs(value.astype(jnp.float32)), axis=-1)
@@ -1419,50 +1411,6 @@ def bounded_past(largest: jax.Array, *, keys_axis: int, initial: jax.Array | Non
     return bound >= np.float32(2.0 ** (HEADROOM - 1 - BOUND_UNIT))
 
 
-def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
-    """The state after a tile `keys`: its softmax and the product of its weights with its values, the
-    mainloop's own running sums taking it where it holds them (`Keys.accumulate`, the state's `acc` in its
-    form), at its rows' scale on the scaled walk (`scaled_step`). A tile held keys first
-    (`Coords.keys_first`, a decode program's `K Qᵀ`) takes its sums so: the mainloop's, `[Dv, bq]`, its
-    queries their columns. The derived forms' (`_derived_step`), but for a dropping call's: the derivation
-    narrows a dropped weight unnormalized, past fp16's largest at a rate near 1 (a multiplier of 2^16), where
-    this step's scaled parts (`weights_parts`) keep it, a representation the declaration states none of."""
-    # A compensated or scaled walk's step takes its dropped roundings and its rows' scale through the derived
-    # step's own hook (`_derived_step`).
-    if keys.coords.drop is None:
-        return _derived_step(spec, state, keys)
-    m, factor, p, value = _softmax(spec, state, keys)
-    axis = keys.coords.key_axis
-    scale = rescaled(state, factor, lambda: weighed_reach(keys, value, p, axis=axis), keys.coords.drop)
-    raised = raised_weights(spec, keys.logits, lambda: m, keys.coords)
-    multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
-    bound = keys.coords.drop.bound
-    accumulate = keys.accumulate
-    if accumulate is not None:
-        def accumulated(held: Scaled | None) -> Partial:
-            # The weights the walk accumulates dropped where the call drops (`_times`' parts); the
-            # denominator the undropped weights'.
-            parts = tile_parts(p, held, value.dtype, multiplier, bound, axis=axis)
-            # The denominator before the product, so the tile's fp32 weights die at their narrowing and hold
-            # no registers through it (FS-4324-PEAK1: on an A100 they held 64 a thread past P·V, its peak 299
-            # at 128 x 64, where FlashAttention 2's sums them before; its bits the same either way).
-            total = denominator_after(state.total, factor, p.sum(axis=axis), held)
-            taken = functools.partial(_queries_taken, keys.coords, factor, held)
-            acc = accumulate(state.acc, taken, parts, value)
-            return Partial(acc, m, total, scale)
-
-        return scaled_step(state, scale, accumulated, raised=raised, branched=False)
-    assert not keys.coords.keys_first, "a tile held keys first takes the mainloop's sums"
-
-    def multiplied(held: Scaled | None) -> Partial:
-        products = _times(keys.dot, value, p, multiplier=multiplier, chunk=chunk_of(spec), bound=bound,
-                          held=held)
-        # The weights' sum after their products, as the template's compensated step has taken it.
-        return stepped(state, m, factor, p.sum(axis=axis), products, scale, held)
-
-    return scaled_step(state, scale, multiplied, raised=raised)
-
-
 def _queries_taken(coords: Coords, factor: jax.Array | None, held: Scaled | None, acc):
     """`carry_factor` on a mainloop's own sums `acc` (`Keys.accumulate`'s `scale`), each query's factor
     (none where None) and its change of scale broadcast over its sums as the mainloop holds them."""
@@ -1516,9 +1464,7 @@ def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Gathered) -> tu
     scaled walk every split sum is at its rows' scale (`scaled_step`). Where the mainloop holds the sums
     (`Keys.accumulate`), they take the tile there. Returns the carry and `rows`."""
     state, arg, own, others_total = carry
-    # The derived forms' softmax (`_derived_softmax`), but for a dropping call's, as `plain_step` takes them.
-    softmax = _derived_softmax if keys.coords.drop is None else _softmax
-    m, factor, p, value = softmax(spec, state, keys)
+    m, factor, p, value = _softmax(spec, state, keys)
     weighed = p.sum(axis=-1)
     scale = rescaled(state, factor, lambda: weighed_reach(keys, value, p), keys.coords.drop)
     anchor = argmax(arg, keys.logits, keys.coords.k_pos)
@@ -1583,7 +1529,7 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
     state, arg, own, others_total = carry
     if keys.coords.drop is None:
         # The derived forms' weights at the known maximum, which no tile moves.
-        _, _, p, value = _derived_softmax(spec, state, keys)
+        _, _, p, value = _softmax(spec, state, keys)
     else:
         p, value = weights(spec, keys.logits, state.m), keys.values.load()
     # A quantized model's weights in the value product its codes at the row's maximum, each at most
@@ -2204,10 +2150,10 @@ def _step_forms(spec: Forward, keys: Keys):
                                                       for name, value in tiles.items()})
 
 
-def _derived_softmax(spec: Forward, state: Partial, keys: Keys):
-    """`_softmax` by the derived forms: the running maximum the forms' step reaches, the factor the state's
-    sums take, the tile's weights (the denominator's terms, before their narrowing for the product) and
-    values."""
+def _softmax(spec: Forward, state: Partial, keys: Keys):
+    """A tile's softmax by the derived forms: the running maximum the forms' step reaches, the factor the
+    state's sums take, the tile's weights (the denominator's terms, before their narrowing for the product)
+    and values."""
     forms, tiles, fields = _step_forms(spec, keys)
     taken: list = []
 
@@ -2226,16 +2172,24 @@ def _derived_softmax(spec: Forward, state: Partial, keys: Keys):
     return m, added.factor, added.terms, accumulated.values
 
 
-def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
-    """`plain_step` by the derived forms: the tile's logits (-inf where a query does not see a key, as
-    `modify` writes them) and values, its maximum, rescale and weights the forms'; the weighted values' sums
-    the mainloop's own where it holds them (`Keys.accumulate`), every product the mainloop's (`Keys.dot`). A
-    compensated walk's (the state's `Low`) takes its sums as the template's step takes them (`stepped`): the
-    tile's products a chunk of keys each, each addition's rounding kept; a scaled walk's (`SCALED_WALK`) its
-    rows' scale from the forms' weights and the tile's values (`rescaled`), each tile at it where some row is
-    scaled (`scaled_step`)."""
+def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
+    """The state after a tile `keys` by the derived forms: the tile's logits (-inf where a query does not see
+    a key, as `modify` writes them) and values, its maximum, rescale and weights the forms'; the weighted
+    values' sums the mainloop's own where it holds them (`Keys.accumulate`, the state's `acc` in its form),
+    every product the mainloop's (`Keys.dot`). A tile held keys first (`Coords.keys_first`, a decode
+    program's `K Qᵀ`) takes its sums so: the mainloop's, `[Dv, bq]`, its queries their columns. A compensated
+    walk's (the state's `Low`) takes its sums as the template's step takes them (`stepped`): the tile's
+    products a chunk of keys each, each addition's rounding kept; a scaled walk's (`SCALED_WALK`) its rows'
+    scale from the forms' weights and the tile's values (`rescaled`), each tile at it where some row is
+    scaled (`scaled_step`). A dropping call's draw (`drawn`) multiplies the weights of the tile's product
+    alone, never its denominator's, so the template's product takes them (`tile_parts`): narrowed in place,
+    or past fp16's range (a multiplier of 2^16) at the power-of-two scale `dropped_parts` keeps them at,
+    where the forms' product would narrow them unnormalized."""
     forms, tiles, fields = _step_forms(spec, keys)
     held_by, plain = keys.accumulate, state.low is None
+    drop = keys.coords.drop
+    multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
+    bound = 1.0 if drop is None else drop.bound
     after: list[Partial] = []
 
     def own(states, parts):
@@ -2243,7 +2197,8 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
         accumulated, added = taken["acc"], taken["total"]
         assert isinstance(accumulated, Accumulated) and isinstance(added, Added)
         value, axis = accumulated.values, keys.coords.key_axis
-        scale = rescaled(state, added.factor, lambda: weighed_reach(keys, value, added.terms, axis=axis))
+        scale = rescaled(state, added.factor, lambda: weighed_reach(keys, value, added.terms, axis=axis),
+                         drop)
 
         def step(held: Scaled | None) -> Partial:
             if plain and held_by is not None:
@@ -2253,8 +2208,8 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
                 weighed = added.terms.sum(axis=axis)
                 total = (states[fields.index("total")] * added.factor + weighed if held is None
                          else denominator_after(states[fields.index("total")], added.factor, weighed, held))
-                parts = ((accumulated.weights,) if held is None
-                         else tile_parts(added.terms, held, value.dtype, axis=axis))
+                parts = ((accumulated.weights,) if held is None and multiplier is None
+                         else tile_parts(added.terms, held, value.dtype, multiplier, bound, axis=axis))
                 # The weighted values' sums taken by their factor, a row's (none where the forms state none),
                 # and a scaled tile's change of scale.
                 taken = functools.partial(_queries_taken, keys.coords, accumulated.factor, held)
@@ -2262,8 +2217,8 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
                 return Partial(acc, state.m, total, scale)
             # The template's step over the forms' weights (the denominator's terms, before their narrowing
             # for the product) and rescale.
-            products = _times(keys.dot, value, added.terms, multiplier=None, chunk=chunk_of(spec), bound=1.0,
-                              held=held)
+            products = _times(keys.dot, value, added.terms, multiplier=multiplier, chunk=chunk_of(spec),
+                              bound=bound, held=held)
             return stepped(state, state.m, added.factor, added.terms.sum(axis=axis), products, scale, held)
 
         # The tile's maximum as the forms' step reaches it, read only where a tile is scaled.
@@ -2273,7 +2228,8 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
         return tuple(getattr(after[0], field) if field in ("acc", "total") else None for field in fields)
 
     derived = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
-                         stepped=None if held_by is None and plain and state.scale is None else own)
+                         stepped=None if held_by is None and plain and state.scale is None and drop is None
+                         else own)
     found = Partial(**dict(zip(fields, derived, strict=True)))
     return found if not after else found._replace(scale=after[0].scale, low=after[0].low)
 
