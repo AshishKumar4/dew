@@ -677,9 +677,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         residents = joined.residents.fewer(planned) if planned else None
         if residents is None:
             return None
-        producers = resources.Producers(tuple((name, cap) for name, cap in joined.producers.raised_to
-                                              if name not in planned))
-        return _limited(joined, producers=producers, residents=residents)
+        return _limited(joined, producers=joined.producers.without(planned), residents=residents)
 
     def _raised(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                 target: generation.GpuTarget) -> resources.Producers | None:
