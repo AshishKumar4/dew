@@ -156,7 +156,7 @@ def test_a_trainer_given_a_config_steps_its_objectives_fresh_modules_at_their_gr
     source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference").with_cross_attention(
         CrossAttention((0,), 8), key=0, frozen=False)
     decision = DecisionObjective(source, tokenizer=ByteTokenizer(), specials=SPECIALS)
-    trainer = Trainer(decision, OptimConfig(optimizer="adam", learning_rate=RATE, param_groups=named))
+    trainer = Trainer(decision, OptimConfig(optimizer="adam", learning_rate=RATE, param_groups=named), key=0)
     trainer.scheduled(4)
     params = jax.eval_shape(lambda: decision.init(jax.random.key(0)))["params"]
     labels = labelled(OptimConfig(param_groups=(FRESH, BASE)).with_fresh(
