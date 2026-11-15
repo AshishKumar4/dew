@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
+import functools
 from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import jax
@@ -145,6 +146,23 @@ def _written(tree, layer, index):
                                                                               index, 0), tree, layer)
 
 
+def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments, bad: jax.Array):
+    """One layer's update in a step that may not be finite (`gated`): where `ok` (the loss and the layer's
+    gradient finite) by its gradient, else by a zero gradient, its weights kept as they were. Finite inputs
+    can still form a value that is not finite (a moment past its dtype): a layer whose candidate weights or
+    moments are not takes the zero gradient's update too, formed only then, and counts not finite (`bad`), so
+    the step does. The layer's moved weights, moments and non-finite count."""
+    gradient = jax.tree.map(lambda leaf: jnp.where(ok, leaf, jnp.zeros_like(leaf)), gradient)
+    moved, moved_moments = update(gradient, held, moments)
+    formed = _finite((moved, moved_moments))
+    zero = jax.tree.map(jnp.zeros_like, gradient)
+    moved_moments = jax.lax.cond(ok & ~formed, lambda: update(zero, held, moments)[1],
+                                 lambda: moved_moments)
+    written = ok & formed
+    moved = jax.tree.map(lambda new, old: jnp.where(written, new, old), moved, held)
+    return moved, moved_moments, bad + (ok & ~formed).astype(bad.dtype)
+
+
 def _finite(tree) -> jax.Array:
     """Whether every inexact leaf of `tree` is finite throughout."""
     flags = [jnp.isfinite(leaf).all() for leaf in jax.tree.leaves(tree)
@@ -251,23 +269,12 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
             leaves = jax.tree.leaves(gradient)
             squares = jnp.sum(jnp.stack([jnp.sum(jnp.square(leaf.astype(jnp.float32))) for leaf in leaves]))
             bad = jnp.sum(jnp.stack([jnp.sum(~jnp.isfinite(leaf)) for leaf in leaves])).astype(jnp.float32)
-            ok = None if finite is None else finite & (bad == 0)
-            if ok is not None:
-                gradient = jax.tree.map(lambda leaf, ok=ok: jnp.where(ok, leaf, jnp.zeros_like(leaf)),
-                                        gradient)
-            moved, moved_moments = current.update(path, index, gradient, held, held_moments)
-            if ok is not None:
-                # Finite inputs can still form a value that is not finite (a moment past its dtype): a
-                # layer whose candidate weights or moments are not takes the zero gradient's update too,
-                # formed only then, and is counted not finite, so the step is.
-                formed = _finite((moved, moved_moments))
-                zero = jax.tree.map(jnp.zeros_like, gradient)
-                moved_moments = jax.lax.cond(
-                    ok & ~formed, lambda: current.update(path, index, zero, held, held_moments)[1],
-                    lambda moments=moved_moments: moments)
-                written = ok & formed
-                moved = jax.tree.map(lambda new, old, kept=written: jnp.where(kept, new, old), moved, held)
-                bad = bad + (ok & ~formed).astype(bad.dtype)
+            if finite is None:
+                moved, moved_moments = current.update(path, index, gradient, held, held_moments)
+            else:
+                moved, moved_moments, bad = _gated_layer(
+                    functools.partial(current.update, path, index), finite & (bad == 0), gradient, held,
+                    held_moments, bad)
             if due is not None:
                 moved = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old), moved, held)
                 moved_moments = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old),

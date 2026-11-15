@@ -348,9 +348,9 @@ class ProfileReport:
         # The program the window ran: the one its last step ran, by its batch signature's digest
         # (`ProfileTraced.program`), compiled then or earlier, a signature read again after another's
         # reusing its program (row 6822).
-        window = next((entry["value"] for entry in reversed(entries) if entry["type"] == "ProfileTraced"),
-                      {})
-        program = window.get("program")
+        traced_window = next((entry["value"] for entry in reversed(entries)
+                              if entry["type"] == "ProfileTraced"), {})
+        program = traced_window.get("program")
         ran = [entry["value"] for entry in compiled
                if program is not None and entry["value"].get("program") == program]
         plan = ran[-1].get("plan") if ran else None
