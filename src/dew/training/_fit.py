@@ -1189,21 +1189,31 @@ def stage_reached(plan: FitPlan, run: FitRun) -> tuple[PhasedStream, bytes, int]
 @dataclasses.dataclass(frozen=True)
 class Start:
     """What `Trainer.place` reads before it places the state (`Trainer._started`): the objective's
-    held tree and the key, the state's shapes, the checkpoint step a run resumes from, the state's placement
-    and how a fresh one is built (`placing`: its build replayed from the program its shapes were traced from
-    and which frozen leaves its init passes through, `traced_start`)."""
+    held tree and the key, the state's shapes and which frozen leaves its init passes through
+    (`traced_start`), the checkpoint step a run resumes from, the state's placement and its build."""
 
     initializer: Initializer
     key: jax.Array
     abstract: TrainState
+    through: dict[int, int]
     resume: int | None
     shardings: Placement[TrainState]
+    build: Callable[[Initializer, jax.Array], TrainState]
+    """The fresh state's build replayed from the program its shapes were traced from (`traced_start`),
+    which the start's program traces in place of the objective's init."""
     held: Mapping[int, int]
     """Each device's bytes of the state, by its id, as the layout validates its placement
     (`Validation.device_bytes`): its own memory's alone, none of a field kept in the host's."""
-    placing: StartBuild
-    """How a fresh state is built and placed (`dew.training.distributed.start_build`), its program built
-    once, whether its start is compiled beside the step (`start_compiling`) or as it is placed."""
+
+    @functools.cached_property
+    def placing(self) -> StartBuild:
+        """How a fresh state is built and placed (`dew.training.distributed.start_build`), its program built
+        once, whether its start is compiled beside the step (`start_compiling`) or as it is placed: made
+        where a fresh start is placed or compiled, never for a host-master run's, which places its own
+        (`placed_host`)."""
+        from dew.training.distributed import start_build
+
+        return start_build(self.build, self.initializer, self.shardings, self.through)
 
 
 def _rollout_admitted(rollout: Rollout | None) -> Rollout | None:
