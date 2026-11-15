@@ -194,11 +194,12 @@ def whole_step_program[L, E](objective: Objective[L, E]) -> OuterProgram:
 def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
                   shown: frozenset[str] = frozenset()):
     """A step's outputs from those of the microbatches it was read in: its loss as an unsplit step logs it,
-    whatever the split (docs/design/training.md, the logged loss): where its last microbatch commits, the
-    update's, pooled over the window; elsewhere its own batch's, its microbatches' own statistics pooled
-    (`Committed.own`) and reduced by `reduce` (`Objective.reduce_loss`); its metrics pooled by their own
-    statistics (`_pooled`), a metric the objective shows (`shown`, which a run selects by) refused where it
-    states none; finite and accepted where every microbatch was; and the commits' counts,
+    whatever the split (docs/design/training.md, the logged loss): where a microbatch of it commits, the
+    latest such commit's update's, pooled over its window; elsewhere its own batch's, its microbatches'
+    own statistics pooled (`Committed.own`) and reduced by `reduce` (`Objective.reduce_loss`); its
+    metrics pooled by their own statistics (`_pooled`), a metric the objective shows (`shown`, which a
+    run selects by) refused where it states none; finite and accepted where every microbatch was; and the
+    commits' counts,
     tokens and norms summed, its inspection the latest part's that committed (`interval.latest`), as a
     run's interval keeps the latest sampled commit: a step of two commits (a window a rejection left part
     filled, then the closing part of a run's last batch) reports its second's summaries, never the two
@@ -225,7 +226,11 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
         scalar = all(isinstance(part, jax.Array) and part.ndim == 0 for part in owns)
         own = reduce(jax.tree.map(lambda *values: sum(values), *owns))[0]
         own = own / len(owns) if scalar else own
-        loss = jnp.where(committed[-1].count > 0, loss, own.astype(loss.dtype))
+        # The latest part that commits logs its update's loss, its window pooled, whichever part it is: a
+        # window a rejection left part filled commits at an earlier part, and the later ones open the next.
+        loss = own.astype(loss.dtype)
+        for part, update in zip(committed, losses, strict=True):
+            loss = jnp.where(part.count > 0, update, loss)
     summed = jax.tree.map(lambda *values: sum(values),
                           *(dataclasses.replace(part, inspected=None, own=None) for part in committed))
     sample = None

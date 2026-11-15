@@ -95,29 +95,54 @@ def test_a_saved_runs_component_records_read_without_the_fields_their_classes_lo
         "segments": [{"class": "dew.decision.layout:OptionLines", "fields": {"line": "x"}}]}
 
 
-SHIFT = """def shifted(row):
+SHIFT = """import dataclasses
+
+
+def shifted(row):
     return {{**row, "id": row["id"] + {by}}}
 
 
 def shifting(metadata):
     return shifted
+
+
+@dataclasses.dataclass(frozen=True)
+class Shifting:
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + {by}}}
 """
 
 
+@dataclasses.dataclass(frozen=True)
+class Calling:
+    """A step whose field holds a callable object of another module, which it calls on each record."""
+
+    shift: object
+
+    def __call__(self, row):
+        return self.shift(row)
+
+
+
 @pytest.mark.parametrize("read", ["indexed", "memory"])
-@pytest.mark.parametrize("configured", [False, True], ids=["function", "configured"])
-def test_an_exact_resume_refuses_a_function_step_whose_code_changed(tmp_path, monkeypatch, read, configured):
-    """A function outside Dew that declares no identity, a step or the factory that configured one, is
-    what its code computes, which its module's bytes name: rewritten to make other rows, it refuses an
-    exact resume, where the plan names the step and where a memory read's rows name the steps that made
-    them, and reads on under resume='relaxed'; unchanged, it resumes exactly (row 3938)."""
+@pytest.mark.parametrize("kind", ["function", "configured", "callable", "held"])
+def test_an_exact_resume_refuses_an_external_step_whose_code_changed(tmp_path, monkeypatch, read, kind):
+    """An external step that declares no identity is what its code computes: a function, a step or the
+    factory that configured one, by its module's bytes (row 3938), and an object of an external class with
+    `__call__` (`callable`), alone or held in a step's field (`held`), by its class's source (data.md §10;
+    those resumed with other rows, spec alignment 2026-11-15). Rewritten to make other rows, each refuses
+    an exact resume, where the plan names the step and where a memory read's rows name the steps that made
+    them, and reads on under resume='relaxed'; unchanged, it resumes exactly. A function a field holds, a
+    partial, a bound method, a lambda and a callable object of a class that is no dataclass are refused an
+    exact resume already, their descriptions unstable or inexact."""
     module = tmp_path / f"shift_{uuid4().hex}.py"
     module.write_text(SHIFT.format(by=1))
     monkeypatch.syspath_prepend(str(tmp_path))
     shift = importlib.import_module(module.stem)
 
     def reader(resume="exact"):
-        step = Configured(shift.shifting, needs=()) if configured else shift.shifted
+        step = {"function": shift.shifted, "configured": Configured(shift.shifting, needs=()),
+                "callable": shift.Shifting(), "held": Calling(shift.Shifting())}[kind]
         pipeline = Pipeline(ROWS).map(step).shuffle(0).repeat().batch(2)
         return compile(pipeline, read=read, loading=READ, resume=resume).train(DataPartition())
 

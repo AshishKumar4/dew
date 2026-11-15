@@ -760,6 +760,20 @@ def _volatile(stage: Stage) -> bool:
     return ran is not None and isinstance(ran.step, Volatile) and ran.step.volatile
 
 
+def member_length(pipeline: Pipeline, analyzed: _Lowering) -> int | None:
+    """The records a mix's member `pipeline` reads before it ends, where they are its source's, one for one
+    (`dew.data.mixing.mix_end`): none of its stages drops, makes, bounds or repeats records, it caches none
+    and its source is indexed, a missing record held in memory not counted; None otherwise, a member that
+    reads only as a stream or of no length known ahead, which ends its mix at its first failed pull."""
+    source = pipeline.source
+    if (isinstance(source, Combined) or analyzed.cache is not None or analyzed.unending
+            or not source.supports("indexed")
+            or any(_drops(stage) or isinstance(stage, (Slice, Limit, Repeat, Native))
+                   for stage in pipeline.stages)):
+        return None
+    records = source.records("indexed")
+    return sum(record is not None for record in records) if _in_memory(source) else len(records)
+
 def _drops(stage: Stage) -> bool:
     """Whether a stage can drop or make rows, so the rows after it are not
     the rows before it, one for one."""
