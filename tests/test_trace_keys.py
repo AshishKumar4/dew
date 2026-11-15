@@ -130,7 +130,7 @@ def rolled_out(name: str, batch):
 
 def unvalued(objective) -> list[str]:
     """The attributes of an objective that state no value, the ones of an objective it holds by its name."""
-    left = type(objective).untraced_names()
+    left = type(objective)._untraced()
     found = []
     for held, value in sorted(vars(objective).items()):
         if held in left or held in HELD:
@@ -153,7 +153,7 @@ def test_every_objective_keys_every_attribute_it_holds_or_names_why_not(built_ob
         objective, _ = build()
         key = stated_trace(objective)
         mro = type(objective).__mro__
-        left = type(objective).untraced_names()
+        left = type(objective)._untraced()
         if (key is None) != (name in KEYLESS):
             problems[name] = {"no key": unvalued(objective)} if key is None else "a key, which KEYLESS denies"
             continue
