@@ -874,6 +874,25 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
                                                                              plan["head_fused"])
 
 
+def test_a_fused_tiled_head_compiles_its_offloaded_frontier(tmp_path, monkeypatch):
+    """A fused tiled head compiles its offloaded sibling and restores the admitted plan."""
+    from dew.training.ahead import compile_ahead
+    from dew.training.memory import head_fused_of, head_tile_of, recompute_record
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=650_000)), split=None, remat="full")
+    trainer.objective.tile_head()
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
+    plan = record(ahead.plan, "plan")
+    assert plan["remat"] == "full"
+    assert plan["head_fused"] and plan["head_tile"] is not None
+    assert recompute_record(trainer.objective) == plan["remat"]
+    tile = head_tile_of(trainer.objective)
+    assert tile is not None and list(tile) == plan["head_tile"]
+    assert head_fused_of(trainer.objective) == plan["head_fused"]
+    assert trainer.plan == ahead.plan
+
+
 def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can_time(monkeypatch):
     """Every program compiled for compile-only GPUs takes autotuning off at Dew's compile point
     (`report.targeted`), a step and the programs a run compiles ahead beside it alike, its programs' bytes

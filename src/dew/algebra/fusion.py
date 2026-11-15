@@ -265,7 +265,8 @@ def _product(form: Form, operands: list, precision, out_dtype, fused_gemm) -> ja
     (its consumers after it in XLA), whose dense product is its one group's."""
     from dew.nn.kernels import gemm
 
-    interpret_on_cpu = generation.assumption() is not None
+    assumed = generation.assumption()
+    interpret_on_cpu = assumed is not None and assumed.interpreted
     lhs, rhs, *sizes = operands
     if form.transpose_lhs:
         made = gemm.gemm_t(lhs, rhs, sizes[0] if form.grouped else None, out_dtype=out_dtype,
