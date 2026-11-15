@@ -19,8 +19,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - The kernel challenge's lessons in the templates. [5271]
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353, 5288]
 - Convolution repairs above their owner. [5665]
-- Abstract values keyed by their printed form. [6287]
-- No program holding a Mosaic GPU kernel hits JAX's persistent cache across processes. [6298]
 - The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822, 5391]
@@ -34,6 +32,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
 - Block-selected attention's other selections as mixers. [6301]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm. [6030]
+- A Hopper kernel gradient's cluster along its output's columns. [6318]
 - Exact on every path, every edge and every derivative order. [2656]
 - The suite's wall. [5478]
 
@@ -53,7 +52,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Training and parallelism
 
-- Time to first step: the compile path's re-derivations. [5556, 5558, 6082]
+- Time to first step: the compile path's re-derivations. [5556, 5558]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
 - Training & Data's tests on check 1. [708]
@@ -64,6 +63,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Metamorphic run flows: a run equals its saved, reloaded and restarted self. [4511]
 - The diffusion kinds' starts keep no record and their refits trace again. [6297]
+- A distillation objective states no trace key, so its refits and warm starts trace their step again. [6303]
 
 ## RL and serving
 
@@ -93,3 +93,4 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
 - The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
+- Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]

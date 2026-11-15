@@ -911,7 +911,7 @@ def _response_validity(value: jax.Array, valid: jax.Array, width: int) -> jax.Ar
 
 def _response_positions(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
     """On from the last real token's position, which a document reset may have lowered."""
-    return _last_real(value, valid)[:, None] + jnp.arange(1, width + 1)[None]
+    return _last_real(value, valid)[:, None] + jnp.arange(1, width + 1, dtype=value.dtype)[None]
 
 
 def _response_coordinates(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
@@ -919,7 +919,7 @@ def _response_coordinates(value: jax.Array, valid: jax.Array, width: int) -> jax
     all of them together (Qwen's M-RoPE)."""
     keep = valid.reshape(valid.shape + (1,) * (value.ndim - 2))
     last = jnp.max(jnp.where(keep, value, -1), axis=tuple(range(1, value.ndim)))
-    coordinates = last[:, None] + jnp.arange(1, width + 1)[None]
+    coordinates = last[:, None] + jnp.arange(1, width + 1, dtype=value.dtype)[None]
     return jnp.broadcast_to(coordinates.reshape((value.shape[0], width) + (1,) * (value.ndim - 2)),
                             (value.shape[0], width, *value.shape[2:]))
 

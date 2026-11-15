@@ -45,7 +45,8 @@ from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.kernels import chunked_launch, recurrence_algebra, recurrence_chunk
-from dew.nn.linear import DepthwiseConv1d, held_scan
+from dew.nn.kv_cache import Opened, compute_dtype
+from dew.nn.linear import DepthwiseConv1d, held_scan, scan_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general
@@ -219,6 +220,14 @@ class Mamba(nn.Module):
                               **normal_kernel(self.init_std if self.output_init_std is None
                                               else self.output_init_std))
 
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """The layer's decode cache for `rows` rows (`scan_cache`): the conv's history and the state, both
+        in at least fp32, where the conv and the scan run."""
+        wide = at_least_fp32(compute_dtype(self, self.dtype))
+        return scan_cache(rows, self.conv_kernel, self.intermediate_size, 'ssm_state',
+                          (self.intermediate_size, self.state_size), wide, wide)
+
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
         decode, attention_metadata = call.decode, call.metadata
@@ -238,11 +247,8 @@ class Mamba(nn.Module):
         wide = at_least_fp32(mixed.dtype)
         taps, bias = self.conv1d()
         out = held_scan(self, mixed, taps, bias, self._scan, (self.intermediate_size, self.state_size),
-                        decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide, dtype=wide)
-        if out is None:
-            # Allocation only: init_cache's dummy token must not consume a
-            # position or leave state behind.
-            return self.out_proj(jnp.zeros((batch, length, self.intermediate_size), self.dtype))
+                        decode=decode, coordinates=tokens, spec=self.cache_spec(batch) if decode else None,
+                        state_dtype=wide, conv_dtype=wide, dtype=wide)
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
         gated = out * nn.silu(gate.astype(wide))

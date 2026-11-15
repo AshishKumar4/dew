@@ -5,9 +5,11 @@ control (`waits`, `dependent`), with its L2 prefetches issued before that wait (
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
+import jax
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
@@ -51,8 +53,7 @@ def dependent(entry: Callable, interpret, *, prefetched: Callable | None = None)
         return entry
 
     def body(*refs):
-        token = _INTERPRETING.set(interpreting_)
-        try:
+        with launched(interpreting_):
             if waiting:
                 for view in () if prefetched is None else prefetched(*refs):
                     plgpu.async_prefetch(view)
@@ -60,22 +61,43 @@ def dependent(entry: Callable, interpret, *, prefetched: Callable | None = None)
             entry(*refs)
             if waiting:
                 plgpu.griddepcontrol_launch_dependents()
-        finally:
-            _INTERPRETING.reset(token)
 
     return body
 
 
-_INTERPRETING: contextvars.ContextVar[bool] = contextvars.ContextVar("interpreting", default=False)
-"""Whether the launch whose body is tracing runs in Pallas's interpreter (`dependent`, which every launch's
-body passes through)."""
+_INTERPRETING: contextvars.ContextVar[bool | None] = contextvars.ContextVar("interpreting", default=None)
+"""Whether the launch whose body is tracing runs in Pallas's interpreter (`launched`, which every launch's
+body passes through, `dew.nn.kernels.launches`; `dependent` too); None outside any launch's body."""
 
 
 def interpreting() -> bool:
     """Whether the launch whose program is tracing runs in Pallas's interpreter: a family's products issue
     no instruction the interpreter lacks there (mma.sync's sums, `mosaic_sm80.Mma.products`), whatever a
     caller states (row 5209's A100 backward: products called with no interpret flag issued mma.sync's)."""
-    return _INTERPRETING.get()
+    return bool(_INTERPRETING.get())
+
+
+@contextlib.contextmanager
+def launched(interpreting_: bool) -> Iterator[None]:
+    """Within the block, a launch's body traces (`dew.nn.kernels.launches`), run in Pallas's interpreter or
+    not (`interpreting`, `subnormals`)."""
+    token = _INTERPRETING.set(interpreting_)
+    try:
+        yield
+    finally:
+        _INTERPRETING.reset(token)
+
+
+def subnormals[T](compute: Callable[..., T]) -> T:
+    """`compute(flushing=)`, `flushing` whether the arithmetic it traces flushes a subnormal operand and
+    result (XLA's CPU, per primitive, row 4023), so it keeps them itself: within a launch's body, whether
+    the launch runs in Pallas's interpreter (on XLA's CPU); outside any, XLA's CPU's program
+    (`jax.lax.platform_dependent`): the one owner of the choice (row 6302's finish, train 866's review)."""
+    within = _INTERPRETING.get()
+    if within is not None:
+        return compute(flushing=within)
+    return jax.lax.platform_dependent(cpu=lambda: compute(flushing=True),
+                                      default=lambda: compute(flushing=False))
 
 
 RESIDENT: contextvars.ContextVar[int] = contextvars.ContextVar("resident", default=1)

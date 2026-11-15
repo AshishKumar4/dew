@@ -14,7 +14,7 @@ Arms, each on the same operands:
 - `xla`: the portable math in XLA (`chunk` with `generation.chosen`'s 'xla', `linear.xla_conv1d`);
 - `fla`: fla's own torch/Triton kernels (`chunk_gated_delta_rule` on the queries and keys repeated
   over the value heads, as the layers hand them to it, `chunk_kda`, `causal_conv1d`,
-  `chunk_log_linear_attn`);
+  `chunk_log_linear_attn`, `chunk_lightning_attn`);
 - `mamba_ssm`: mamba_ssm's `mamba_chunk_scan_combined`;
 - `flashqla`: FlashQLA's TileLang kernels (`flash_qla.chunk_gated_delta_rule`, Hopper and Blackwell only),
   the gated delta rule's queries and keys a key head each, as its API takes them.
@@ -62,7 +62,8 @@ class Shape:
     """A model's recurrent layer at one row of `length` tokens: `kind` 'gdn' (a decay a head),
     'kda' (a decay a key dimension), 'ssd' (Mamba2's, `key_heads` its groups, `key_width` its state,
     `value_width` its head width), 'loglinear' (log-linear attention on Mamba2's backbone, its fields the
-    SSD's) or 'conv' (the short conv over the gated delta net's projection)."""
+    SSD's), 'lightning' (MiniMax's lightning attention: a decay a head, no delta rule, no write gate) or
+    'conv' (the short conv over the gated delta net's projection)."""
     kind: str
     key_heads: int
     value_heads: int
@@ -90,13 +91,15 @@ SHAPES = {
     # fla's LogLinearMamba2Config (Mamba2Config's defaults): hidden 2048, expand 2, heads of 64, state 128,
     # one group: 64 heads (row 1446).
     'log-linear-mamba2': Shape('loglinear', 1, 64, 128, 64),
+    # tests/fixtures/hf/minimax-text-01/config.json: its lightning layers' 64 heads of 128 (M1's alike).
+    'minimax-text-01-lightning': Shape('lightning', 64, 64, 128, 128),
 }
 """The real shapes. Dory 1.0 4B has none: its layers are attention and MLP (its config.json)."""
 
 ARMS = {'gdn': ('template', 'mosaic', 'hand', 'xla', 'fla', 'flashqla'),
         'kda': ('template', 'mosaic', 'hand', 'xla', 'fla'),
         'ssd': ('template', 'mosaic', 'hand', 'xla', 'mamba_ssm'), 'conv': ('hand', 'xla', 'fla'),
-        'loglinear': ('template', 'mosaic', 'xla', 'fla')}
+        'loglinear': ('template', 'mosaic', 'xla', 'fla'), 'lightning': ('template', 'mosaic', 'xla', 'fla')}
 
 JAX_ARMS = ('template', 'mosaic', 'hand', 'xla')
 """The arms `jax` mode runs (`jax_arms`), each on the shapes whose `ARMS` list it."""
@@ -104,14 +107,15 @@ JAX_ARMS = ('template', 'mosaic', 'hand', 'xla')
 
 def flops(shape: Shape) -> float:
     """The forward's model FLOPs, the recurrent function's (`dew.nn.flops`): the delta rule's
-    `6 H K V` a token, the SSD's `4 H N P`, the depthwise conv's `2 C K_taps` over its channels."""
+    `6 H K V` a token, the SSD's and lightning attention's `4 H N P` (the memory's write and read), the
+    depthwise conv's `2 C K_taps` over its channels."""
     from dew.nn import flops as model
 
     lengths = np.full(shape.batch, shape.length)
     if shape.kind == 'conv':
         channels = 2 * shape.key_heads * shape.key_width + shape.value_heads * shape.value_width
         return model.conv_flops(lengths, channels, channels, shape.taps, groups=channels)
-    if shape.kind == 'ssd':
+    if shape.kind in ('ssd', 'lightning'):
         return model.ssd_flops(lengths, shape.value_heads, shape.key_width, shape.value_width)
     if shape.kind == 'loglinear':
         return model.log_linear_flops(lengths, shape.value_heads, shape.key_width, shape.value_width,
@@ -173,6 +177,7 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
     from dew.nn import linear
     from dew.nn.kernels import generation, log_linear, mamba_ssd, recurrence
     from dew.nn.kernels.recurrence_chunk import SCAN, Chunk, chunk, fla_rule, scan_case
+    from dew.nn.mixers.lightning import LIGHTNING
     from dew.nn.mixers.mamba2 import SSD
 
     given = {key: (np.asarray if host else jnp.asarray)(value) for key, value in operands(shape).items()}
@@ -205,7 +210,9 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
             refusals['hand'] = '; '.join(refusal.detail for refusal in SCAN.kernel('pallas').refusals(case))
             cotangents = (given['dy'], given['dfinal'])
         elif shape.kind == 'loglinear':
-            inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'], given['scales'])
+            # The level weights in bf16 as fla's arm takes them, the two arms' inputs one draw's.
+            inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'],
+                      given['scales'].astype(bf16))
 
             def template(q, k, v, g, scales):
                 # Scaled by one, as fla's kernel is unscaled.
@@ -214,6 +221,15 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
             # No kernel of its own beside the template's.
             hands = {}
             cotangents = (given['do'],)
+        elif shape.kind == 'lightning':
+            inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'])
+
+            def template(q, k, v, g):
+                return chunk(LIGHTNING, Chunk(q, k, v, log_decay=g), chunk_size=shape.chunk)
+
+            # No kernel of its own beside the template's: fla's port takes no form without the delta rule.
+            hands = {}
+            cotangents = (given['do'], given['dfinal'])
         else:
             # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
             hooks = recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
@@ -339,7 +355,12 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
     elif shape.kind == 'loglinear':
         from fla.ops.log_linear_attn import chunk_log_linear_attn
 
-        leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'], given['scales']]
+        # The level weights in the operands' dtype, as a bf16 model's layer hands them (its `L` parameter's,
+        # log_linear_mamba2.py:105): fla-core 0.5.2's forward scales its scores by them after rounding to the
+        # queries' dtype and dots them with the values (chunk.py:194-199), which an fp32 weight makes an fp32
+        # operand beside bf16 values, refused by Triton.
+        leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'],
+                  given['scales'].to(bf16)]
 
         def run(q, k, v, g, scales):
             # fla-core 0.5.2's kernel takes one key group (its forward refuses any other, chunk.py:1117) and
@@ -347,6 +368,18 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
             return (chunk_log_linear_attn(q, k, v, g, scales)[0],)
 
         cotangents = (given['do'].to(bf16),)
+    elif shape.kind == 'lightning':
+        from fla.ops.lightning_attn import chunk_lightning_attn
+
+        leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16)]
+
+        def run(q, k, v):
+            # fla's MiniMax layer's call: its decay a head's own, from the layer's place (one layer of one,
+            # which times as any other), its scores unscaled as Dew's lightning layer's.
+            return chunk_lightning_attn(q, k, v, layer_idx=0, num_layers=1, scale=1.0,
+                                        output_final_state=True)
+
+        cotangents = (given['do'].to(bf16), given['dfinal'])
     elif shape.kind == 'conv':
         from fla.modules.convolution import causal_conv1d
 

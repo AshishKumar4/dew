@@ -53,24 +53,31 @@ TARGETS: dict[str, Target] = {
     for prefix in ("dew_flash_mha", "dew_flash3_mha")
     for packed in (False, True) for backward in (False, True)}
 """Every FFI target of the two libraries by name (FlashAttention-2's `dew_flash_mha_*`, 3's
-`dew_flash3_mha_*`): `_registered` registers them and `_call` calls them, and a reader of a program's
+`dew_flash3_mha_*`): `registered` registers them and `_call` calls them, and a reader of a program's
 custom calls reads them (Dew's FLOP counter)."""
 
 
 @functools.cache
-def _registered() -> None:
-    """Both libraries' FFI targets (`TARGETS`), registered with jax once, at the first call that needs them:
-    importing the package to read ARCHITECTURES leaves jax's registry as it was."""
+def registered() -> None:
+    """Registers both libraries' FFI targets (`TARGETS`) with jax, once. Its entry point in the
+    `dew.kernel_wheels` group names it; Dew calls it before it loads a program compiled ahead, and the first
+    call that needs a target calls it too. Importing the package to read ARCHITECTURES leaves jax's registry
+    as it was."""
     for name in TARGETS:
         library = _library3 if name.startswith("dew_flash3_") else _library
         jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(library, name)), platform="CUDA")
+
+
+_registered = registered
+"""The name Dew's callers that predate the `dew.kernel_wheels` group call. They accept any 0.3 wheel, so
+the 0.3 series keeps it."""
 
 
 def _call(name: str, results):
     """`jax.ffi.ffi_call` of one of the libraries' targets (`TARGETS`)."""
     if name not in TARGETS:
         raise ValueError(f"{name} is no target of the libraries: {sorted(TARGETS)}")
-    _registered()
+    registered()
     return jax.ffi.ffi_call(name, results)
 
 

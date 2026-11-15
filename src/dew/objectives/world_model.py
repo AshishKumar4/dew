@@ -22,7 +22,7 @@ from __future__ import annotations
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal
+from typing import ClassVar, Literal
 
 import jax
 import jax.numpy as jnp
@@ -225,9 +225,6 @@ class TokenizerObjective(Objective[Ratio]):
     def validation_loss_refusal(self) -> str | None:
         return None
 
-    traced = ("max_mask",)
-    """Its masking."""
-
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         video = unit_frames(batch["video"])
         rows, frames = video.shape[:2]
@@ -380,6 +377,10 @@ class WorldModelObjective(Objective[Ratio]):
     diffusion objective's frozen towers are: they reach the compiled step as arguments, placed and
     checkpointed with the rest, and the optimizer never sees them."""
 
+    untraced: ClassVar[Mapping[str, str]] = {
+        "_tokenizer": "its tokenizer's held tree, which the key states by its shapes as part of the tree it "
+                      "starts from (`held_variables`)"}
+
     shown: Mapping[str, Shown] = {"loss": Shown()}
 
     # The held tree is the starting tree or the tokenizer a draw goes beside.
@@ -416,9 +417,6 @@ class WorldModelObjective(Objective[Ratio]):
     def latents(self, variables: Variables, video: jax.Array) -> jax.Array:
         """`video`'s latents, each frame encoded by the tokenizer `variables` hold (`TOKENIZER`)."""
         return jax.lax.stop_gradient(self.tokenizer.bind(variables[TOKENIZER]).encode(video))
-
-    traced = ("tokenizer", "shortcut")
-    """Its tokenizer and its forcing; both trees pass as arguments."""
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         clean = self.latents(variables, unit_frames(batch["video"]))

@@ -732,7 +732,8 @@ def test_a_borrowed_compile_under_autopgle_profiles_beside_the_state_only_where_
     caller's, which it never steps. With room for the step and its state alone, it is refused before it
     copies anything, where trials that own the state (`fit`'s), which step it and restore it, profile at
     that room; with room for the copy too, it profiles and leaves the devices holding the caller's state
-    alone, the copy freed."""
+    alone, the copy freed. Both profile the step alike: no profile on a backend XLA profiles none of
+    (CPU), one on a GPU (89 bytes on an H100, its timings' encoding varying)."""
     need = needs(monkeypatch, lm())
     state, _, _ = lm().place()
     copy = placed_bytes(apart(state)[0])
@@ -753,13 +754,14 @@ def test_a_borrowed_compile_under_autopgle_profiles_beside_the_state_only_where_
         assert copies(state) == held
         owned = lm()
         stepped(owned, trials=functools.partial(Trials, batch=BATCH))
-        assert owned.plan["pgle"] == {"runs": 2, "bytes": 0}
+        assert owned.plan["pgle"]["runs"] == 2
         free(monkeypatch, need + 2 * copy)
         borrowed = lm()
         state, _, _ = borrowed.place()
         held = copies(state)
         borrowed.compile(state, BATCH)
-        assert borrowed.plan["pgle"] == {"runs": 2, "bytes": 0}
+        profiled = borrowed.plan["pgle"]
+        assert profiled["runs"] == 2 and bool(profiled["bytes"]) == bool(owned.plan["pgle"]["bytes"])
         assert copies(state) == held and not any(leaf.is_deleted() for leaf in jax.tree.leaves(state))
 
 

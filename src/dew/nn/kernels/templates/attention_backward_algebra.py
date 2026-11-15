@@ -95,12 +95,17 @@ def softmax_gradients(logits, q, k, values, dout, peak, total, anchor, delta, sl
     # cotangents' quarter cancels in the product overflow it unscaled.
     scaled = (ds if slope is None else gradient.pulled(ds, (slope,), seen, ())[0]) * scale
     if normalized_values:
-        values_operands = (weights if keep is None else weights * keep), dout
+        # bf16's normalized weights narrowed, as the reference rounds its probabilities and every tensor-core
+        # mainloop's dV takes them (`algebra.value_weights`): held in fp32, a weight within an ulp of 1 kept
+        # its distance from 1 that the reference's rounds away (row 6302: 130 ulps of dV).
+        held = weights if keep is None else weights * keep
+        values_operands = (held.astype(dout.dtype) if dout.dtype == jnp.bfloat16 else held), dout
     else:
         values_operands = (e if keep is None else e * keep), dout * over[:, None]
     return (float32_einsum("qk,kd->qd", scaled, k, precision=REFERENCE_PRECISION),
             float32_einsum("qk,qd->kd", scaled, q, precision=REFERENCE_PRECISION),
-            float32_einsum("qk,qd->kd", *values_operands, precision=REFERENCE_PRECISION), e, ds)
+            float32_einsum("qk,qd->kd", *values_operands, precision=REFERENCE_PRECISION,
+                           preferred_element_type=jnp.float32), e, ds)
 
 
 @functools.cache

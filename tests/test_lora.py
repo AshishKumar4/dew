@@ -664,6 +664,68 @@ def _adapted(model, tree, *, contracted=1, rank=2, alpha=4.0, seed=0):
     return adapter, adapter.model, adapted_tree, adapter.merge(adapted_tree)
 
 
+def test_an_adapter_served_quantized_adds_its_float_update_to_its_quantized_base():
+    """A LoRA fine-tune quantized after training for serving (`quantize_for_serving`, Qwix's PTQ) quantizes
+    its base's product alone: the served output is the quantized base's, the same layer served without its
+    adapter, plus the adapter's update in float, its factors stored as they trained, where the adapter's
+    product fed Qwix's PTQ factors no quantized tree held and the call raised."""
+    from dew.nn.precision import FP32_SUMS
+    from dew.quantization import Quantization, quantize_for_serving
+
+    model = _BranchHost(nn.Dense(6))
+    x = jnp.asarray(np.random.RandomState(0).randn(3, 8), jnp.float32)
+    tree = nn.unbox(model.init(jax.random.key(0), x))
+    adapter, adapted, adapted_tree, _ = _adapted(model, tree)
+    served, served_tree = quantize_for_serving(adapted, adapted_tree, Quantization(), x)
+    base, base_tree = quantize_for_serving(model, tree, Quantization(), x)
+    factors = adapted_tree["params"]["proj"]
+    for factor in ("lora_A", "lora_B"):
+        np.testing.assert_array_equal(served_tree["params"]["proj"][factor], factors[factor])
+    # The update as a quantized model's float products sum, as Qwix's do (`FP32_SUMS`).
+    with jax.default_matmul_precision(FP32_SUMS):
+        update = lora._low_rank(nn.Dense(6), x, factors["lora_A"], factors["lora_B"],
+                                adapter.scale(adapter.targets[("params", "proj")]), (1,), rowwise=False)
+    np.testing.assert_array_equal(served.apply(served_tree, x), base.apply(base_tree, x) + update)
+
+
+def test_a_lora_run_served_quantized_decodes_with_its_trained_factors(decoder, loaded, reference, tmp_path):
+    """A LoRA run's decoder loaded as its task (`TextGeneration.from_run`) and quantized for serving
+    (`TextGeneration.quantized`, Qwix's PTQ over its adapted projections) decodes, its factors held as they
+    trained, in float, beside its quantized base, where the adapter's products fed Qwix's PTQ factors no
+    quantized tree held and the decode raised."""
+    from dew.inference import TextGeneration
+    from dew.quantization import Quantization
+
+    adapter = _rebound(loaded, decoder.model, dropout=0.0)
+    tokens = np.asarray(reference["input_ids"])
+    rows = 2 * jax.device_count()
+    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
+    data = Loader(train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}]), val=None,
+                  records=rows, batch=rows)
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
+                      layout=Layout(min_shard=2**30), checkpoints=checkpoints)
+    trainer.fit(data, steps=1, log_every=1, checkpoint_every=1)
+    checkpoints.wait()
+
+    task = TextGeneration.from_run(str(tmp_path / "run"), ema=False)
+    served = task.quantized(Quantization())
+    drawn = np.asarray(served(tokens[:1, :4], 4, key=0).tokens)
+    # Each row its prompt, then four drawn tokens.
+    assert drawn.shape[-1] == 8
+    np.testing.assert_array_equal(drawn[:, :4], np.broadcast_to(tokens[:1, :4], (drawn.shape[0], 4)))
+    def factors_of(tree) -> dict:
+        # Each factor by its path, among a served tree's quantized leaves (Qwix's, which are no dicts).
+        return {path: leaf for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]
+                if getattr(path[-1], "key", None) in lora.FACTORS}
+
+    factors, kept = factors_of(thaw(task.variables)), factors_of(thaw(served.variables))
+    assert factors
+    for name, leaf in factors.items():
+        assert np.asarray(kept[name]).dtype == np.asarray(leaf).dtype, name
+        np.testing.assert_array_equal(np.asarray(kept[name]), np.asarray(leaf), err_msg=str(name))
+
+
 CLIPPED_SEEDS = 64
 """The clipped adapter site's reference-only sizing, including its input and factor gradients."""
 

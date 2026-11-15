@@ -1400,8 +1400,8 @@ jaraco-functools==4.6.0 \
     # via
     #   -c locks/cpu.txt
     #   cheroot
-jax==0.12.0.1.post93 \
-    --hash=sha256:f2d3cd98ce2418f822add96aa86a660f515768e3768815264506bc2b72dbfe56
+jax==0.12.0.1.post95 \
+    --hash=sha256:aaca7846d221b4618804dd3a55d23bad374d2152b01c602817793ef0c6e8bfb0
     # via
     #   -c constraints.txt
     #   -c locks/cpu.txt

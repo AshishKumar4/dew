@@ -216,10 +216,6 @@ class ControlPPOObjective(ReleasesModel, Objective[Ratio, Variables]):
         """One update's work on `batch`, its loss's gradient's traced program's (`traced_update_flops`)."""
         return traced_update_flops(self, batch)[1]
 
-    traced = ("observation_size", "discount", "lam", "clip", "reward_scaling", "value_cost",
-              "entropy_cost", "reads")
-    """What it reads and its return and loss settings."""
-
     def batch_statistics(self, variables: Variables,
                          part_at: Callable[[jax.Array], tuple[Batch, Step]],
                          split: int) -> tuple[jax.Array, jax.Array]:

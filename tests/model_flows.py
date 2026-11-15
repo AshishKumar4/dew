@@ -8,8 +8,10 @@ into the tier's store (`reference_error.stored_truths`), compiles its programs f
 serialized topology names (`dew.training.ahead.compile_programs`) beside them, and holds its programs'
 routes to the ones the flow is for (`Flow.native`, read as the GPU's target would choose them,
 `generation.routes`). Its run loads those programs and judges them: it traces, lowers and compiles
-nothing of its own and computes no truth. Under the lane's deterministic ops check 1 also holds each arm to
-its own bits on the same draw (`reference_error._of_its_inputs`)."""
+nothing of its own and computes no truth, but where a qualification run sizes its sites
+(`check1_wire.QUALIFY`), each computing its sizing draws' truths (`reference_error._qualified`). Under
+the lane's deterministic ops check 1 also holds each arm to its own bits on the same draw
+(`reference_error._of_its_inputs`)."""
 
 import dataclasses
 import functools
@@ -27,7 +29,9 @@ import jax
 import jax.numpy as jnp
 import kernel_matrix
 import numpy as np
+from check1_wire import ASKED
 from gpu_flow import Cell, run_cells
+from map_judge import site_id
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact, stored_truths
 
@@ -95,7 +99,10 @@ class Flow:
     rows: int = 2
     length: int = 256
     prefill: int = 248
-    seeds: int = 8
+    seeds: Mapping[str, int] = dataclasses.field(default_factory=lambda: {"train": 8, "decode": 8})
+    """Each kind's declared count (`KINDS`), as a qualification run sizes it on the GPUs
+    (`reference_error._qualified`, row 6198): the larger of an A100's and a GH200's (DC-SIZE2-A100 and
+    -SM90, 2026-11-14)."""
     families: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
     """Each choice the flow is for that takes a native kernel on some GPUs alone: the instruction families
     (`generation.family`) of those GPUs, elsewhere the portable math; a choice it names none for takes one on
@@ -283,24 +290,27 @@ FLOWS = (
     Flow("window and softcap, a user's", "gemma2-tiny", GEMMA2, "bfloat16",
          {"train": TEMPLATE, "decode": {**TEMPLATE, "decode": NATIVE}}, lane=False),
     Flow("sinks, the lane's", "gpt-oss-tiny", GPT_OSS, "bfloat16",
-         {"train": TEMPLATE, "decode": {**TEMPLATE, "decode": NATIVE}}),
+         {"train": TEMPLATE, "decode": {**TEMPLATE, "decode": NATIVE}}, seeds={"train": 128, "decode": 8}),
     Flow("sinks, a user's", "gpt-oss-tiny", GPT_OSS, "bfloat16",
-         {"train": TEMPLATE, "decode": {**TEMPLATE, "decode": NATIVE}}, lane=False),
+         {"train": TEMPLATE, "decode": {**TEMPLATE, "decode": NATIVE}}, lane=False,
+         seeds={"train": 128, "decode": 8}),
     Flow("latent attention, the lane's", "deepseek-v2-tiny", MLA, "bfloat16",
          {"train": TEMPLATE, "decode": {}}),
     Flow("latent attention, a user's", "deepseek-v2-tiny", MLA, "bfloat16",
          {"train": {"attention": "flash"}, "decode": {}}, lane=False),
     Flow("delta attention (KDA)", "kimi-linear-tiny", KDA, "bfloat16",
          {"train": {**TEMPLATE, "gated_delta_rule": NATIVE, "short_conv": NATIVE},
-          "decode": {"gated_delta_rule": NATIVE, "short_conv": NATIVE, "delta_decode": "step"}}),
+          "decode": {"gated_delta_rule": NATIVE, "short_conv": NATIVE, "delta_decode": "step"}},
+         seeds={"train": 64, "decode": 8}),
     Flow("gated delta net and its short conv", "qwen3-next-tiny", GDN, "bfloat16",
          {"train": {**TEMPLATE, "gated_delta_rule": NATIVE, "short_conv": NATIVE},
           "decode": {**TEMPLATE, "decode": NATIVE, "gated_delta_rule": NATIVE, "short_conv": NATIVE,
-                     "delta_decode": "step"}}),
+                     "delta_decode": "step"}}, seeds={"train": 64, "decode": 8}),
     Flow("state-space duality (SSD), bf16", "mamba2-tiny", SSD, "bfloat16",
-         {kind: {"ssd": NATIVE, "short_conv": NATIVE} for kind in KINDS}),
+         {kind: {"ssd": NATIVE, "short_conv": NATIVE} for kind in KINDS}, seeds={"train": 16, "decode": 8}),
     Flow("state-space duality (SSD), fp32, a user's", "mamba2-tiny", SSD, "float32",
-         {kind: {"ssd": NATIVE, "short_conv": NATIVE} for kind in KINDS}, lane=False),
+         {kind: {"ssd": NATIVE, "short_conv": NATIVE} for kind in KINDS}, lane=False,
+         seeds={"train": 32, "decode": 8}),
     Flow("selective scan", "mamba-tiny", SELECTIVE, "bfloat16",
          {kind: {"selective_scan": NATIVE, "short_conv": NATIVE} for kind in KINDS}),
     Flow("lightning attention", "minimax-tiny", LIGHTNING, "bfloat16",
@@ -498,7 +508,7 @@ def prepare(flow: Flow) -> bool:
         reference, found = _compiled(named, "reference", target)
     reference.save(directory / "reference.programs")
     held_reference(flow, [route for kind in KINDS for route in found[kind]])
-    for kind in KINDS:
+    for kind in kinds_of(flow):
         judge(flow, {}, kind)
     return True
 
@@ -548,18 +558,35 @@ def judge(flow: Flow, programs: Mapping[str, Callable], kind: str) -> None:
     (prepared there where this process prepares, `programs` none)."""
     truth_model = float64_twin(flow.model)
     truth = flow.train(truth_model) if kind == "train" else flow.decode_truth(truth_model)
-    with stored_truths(store_of(flow) / "truths", prepare=preparing(), stamp=stamp()):
+    with stored_truths(store_of(flow) / "truths", prepare=preparing(), stamp=stamp(), later=asked()):
         assert_as_exact(programs.get(f"{kind} dew"), programs.get(f"{kind} reference"), flow.draw,
-                        f"{flow.name}: {kind}", seeds=flow.seeds, truth_fn=truth)
+                        f"{flow.name}: {kind}", seeds=flow.seeds[kind], truth_fn=truth)
+
+
+def asked() -> frozenset[str]:
+    """The sites (`map_judge.site_id`) a follow-up job draws the second stage of (`check1_wire.ASKED`, its
+    first run's asks merged), none for a job that is no follow-up."""
+    path = os.environ.get(ASKED)
+    return frozenset() if not path else frozenset(
+        json.loads(line)["site"] for line in Path(path).read_text().splitlines() if line.strip())
+
+
+def kinds_of(flow: Flow) -> tuple[str, ...]:
+    """The flow's programs a job judges: every one, in a follow-up (`asked`) every one of a flow it was asked
+    a site of and none of another. A flow's cells fail as one (`gpu_flow.CellsFailed`) and its case is
+    waived for its asks alone, so a follow-up judges the flow's decided cells again beside its asked one: a
+    red of theirs comes back in its receipt."""
+    later = asked()
+    return KINDS if not later or any(site_id(f"{flow.name}: {kind}") in later for kind in KINDS) else ()
 
 
 def run(flow: Flow) -> int:
-    """The flow on this GPU from its prepared programs and truths: check 1 of each program, each a cell
-    (`gpu_flow.run_cells`, which reports the cells that ran); its device's peak bytes after them, which the
-    test reports."""
+    """The flow on this GPU from its prepared programs and truths: check 1 of each program its run judges
+    (`kinds_of`), each a cell (`gpu_flow.run_cells`, which reports the cells that ran); its device's peak
+    bytes after them, which the test reports."""
     programs = loaded(flow)
     run_cells([Cell(f"{flow.name}: {kind}", functools.partial(judge, flow, programs, kind))
-               for kind in KINDS])
+               for kind in kinds_of(flow)])
     return int((jax.devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0))
 
 

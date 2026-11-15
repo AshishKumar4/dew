@@ -14,7 +14,7 @@ its keys. A selection takes no gradient."""
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -22,23 +22,16 @@ import numpy as np
 from flax import linen as nn
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.batch import coordinates
 from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
-from dew.nn.documents import CrossDocuments
-from dew.nn.inputs import numbered_blocks
+from dew.nn.documents import CrossDocuments, DocumentWindows, document_windows
 from dew.nn.inspection import QK
 from dew.nn.kv_cache import cached_validity
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import AttentionMixer, CausalSelfAttention
+from dew.nn.mla import SELECTIONS
 from dew.nn.precision import float32_einsum
 from dew.nn.residuals import Residual
-from dew.nn.sparse_selection import block_maxima, selected_attention, top_k_selection
-
-
-def row_blocks(keys: int, block: int) -> jax.Array:
-    """`[K]`: each of `keys` keys' block of `block` along one sequence, the chunks a selection of blocks
-    names (`dew.nn.sparse_selection.selected_runs`)."""
-    return jnp.arange(keys, dtype=jnp.int32) // block
+from dew.nn.sparse_selection import SELECTING, block_maxima, block_runs, selected_attention, top_k_selection
 
 
 def _earlier_blocks(queries: int, blocks: int, block: int) -> jax.Array:
@@ -48,54 +41,88 @@ def _earlier_blocks(queries: int, blocks: int, block: int) -> jax.Array:
     return jnp.arange(blocks)[None, :] < own
 
 
-def moba_selection(query: jax.Array, key: jax.Array, chunks: jax.Array, *, top_k: int, count: int,
-                   slots: jax.Array | None = None, documents: jax.Array | None = None,
-                   dtype: jnp.dtype | None = None) -> jax.Array:
-    """MoBA's selection (arXiv 2502.13189; moba_naive.py, its varlen form chunking each sequence from its
-    start): each query head's gate, its query against the mean key of each chunk of its document before its
-    own, the `top_k - 1` highest beside its own chunk, which the reference forces into its `top_k`. `query`
-    `[B, Q, H, D]`, `key` `[B, K, G, D]` (a head's gate against its group's keys); `chunks` `[B, K]` or `[K]`
-    each key's chunk numbered along the row (-1 for none, below `count`: `row_blocks`, or each document's
-    blocks of places, `dew.nn.inputs.numbered_blocks`); `slots` `[B, Q]` each query's own key (its index
-    where None, -1 for a query with none); `documents` `[B, K]` each key's document (one where None). The
-    gate's product takes the attention logits' arithmetic: its operands in `dtype` (the queries' where None,
-    fp32 under `wide_logits`), the mean keys formed in fp32, its sums fp32, where moba_naive.py widens both
-    operands to fp32 whatever the inputs. A selection of chunks `[B, H, Q, top_k]`, a head's own, -1 where
-    fewer."""
-    rows, queries, heads, width = query.shape
-    keys, groups = key.shape[1], key.shape[2]
-    chunks = jnp.broadcast_to(chunks, (rows, keys))
-    slots = jnp.broadcast_to(jnp.arange(queries) if slots is None else slots, (rows, queries))
-    documents = jnp.zeros((rows, keys), jnp.int32) if documents is None else documents
-    numbered = jnp.where(chunks >= 0, chunks, count)
-    sums = jax.vmap(lambda each, ids: jax.ops.segment_sum(each, ids, num_segments=count))(
-        key.astype(jnp.float32), numbered)
-    sizes = jax.vmap(lambda ids: jax.ops.segment_sum(jnp.ones_like(ids), ids, num_segments=count))(numbered)
-    means = sums / jnp.maximum(sizes, 1)[..., None, None]
-    held = jax.vmap(lambda each, ids: jax.ops.segment_max(each, ids, num_segments=count))(documents, numbered)
-    taken = query.dtype if dtype is None else dtype
-    grouped = query.reshape(rows, queries, groups, heads // groups, width).astype(taken)
-    gate = float32_einsum("bqghd,bcgd->bghqc", grouped, means.astype(taken),
-                          preferred_element_type=jnp.float32).reshape(rows, heads, queries, count)
-    reached = slots >= 0
+class MobaChunks(NamedTuple):
+    """A call's keys in MoBA's chunks (`moba_chunks`): each document's complete windows of `block` of its
+    real tokens from its first (`dew.nn.documents.document_windows`), the candidates a query's gate ranks,
+    and each query's own chunk, the keys of its document's chunk up to it."""
+
+    windows: DocumentWindows
+    rank: jax.Array
+    """`[B, Q]`: each query's rank among its document's real keys."""
+    document: jax.Array
+    """`[B, Q]`: each query's document."""
+    own: jax.Array
+    """`[B, Q, 2]`: each query's own chunk's run, its first key to the key past the query's own."""
+
+
+def moba_chunks(keys: int, block: int, *, segments: jax.Array | None = None, valid: jax.Array | None = None,
+                slots: jax.Array | None = None, rows: int = 1) -> MobaChunks:
+    """A call's `keys` keys in MoBA's chunks of `block` (`MobaChunks`; moba_naive.py's varlen form, each
+    sequence chunked from its start): its keys' documents `segments` `[B, K]` (one a row where None), their
+    real ones where `valid` `[B, K]` marks them (every one where None), each document a run of the row's
+    slots (`dew.nn.inputs.document_starts`); `slots` `[B, Q]` each query's own key, its index where None (a
+    call whose queries are its keys)."""
+    segments = jnp.zeros((rows, keys), jnp.int32) if segments is None else jnp.asarray(segments)
+    rows = segments.shape[0]
+    windows = document_windows(segments, valid, block)
+    real = jnp.ones((rows, keys), bool) if valid is None else jnp.broadcast_to(jnp.asarray(valid, bool),
+                                                                               (rows, keys))
+    slots = jnp.broadcast_to(jnp.arange(keys), (rows, keys)) if slots is None else slots
     at = jnp.maximum(slots, 0)
-    own = jnp.where(reached, jnp.take_along_axis(chunks, at, axis=-1), -1)
-    mine = jnp.take_along_axis(documents, at, axis=-1)
-    keep = ((jnp.arange(count) < own[..., None]) & (held[:, None, :] == mine[..., None])
-            & (sizes[:, None, :] > 0))
-    forced = jnp.broadcast_to(own[:, None, :, None], (rows, heads, queries, 1))
-    return top_k_selection(jax.lax.stop_gradient(gate), keep[:, None], top_k - 1, forced=forced)
+    rank, document = (jnp.take_along_axis(field, at, axis=-1)
+                      for field in (windows.query_rank, windows.query_document))
+    # Each key's chunk's first real key: the last that opens a chunk at or before it, in its own document,
+    # its documents each a run of the row's slots.
+    opens = real & (windows.query_rank % block == 0)
+    first = jax.lax.cummax(jnp.where(opens, jnp.arange(keys), 0), axis=1)
+    start = jnp.take_along_axis(first, at, axis=-1)
+    own = jnp.stack([jnp.where(slots >= 0, start, 0), jnp.where(slots >= 0, slots + 1, 0)], axis=-1)
+    return MobaChunks(windows, rank, document, own)
+
+
+def window_runs(windows: DocumentWindows) -> jax.Array:
+    """`[B, T, 2]`: each window's run, its first key to the key past its last, empty where it is no
+    document's complete window (`DocumentWindows.live`)."""
+    first, last = windows.sources[..., 0], windows.sources[..., -1]
+    return jnp.stack([jnp.where(windows.live, first, 0), jnp.where(windows.live, last + 1, 0)], axis=-1)
+
+
+def moba_gate(query: jax.Array, key: jax.Array, chunks: MobaChunks,
+              block: int) -> tuple[jax.Array, jax.Array]:
+    """MoBA's gate (arXiv 2502.13189; moba_naive.py, which widens both its operands to fp32): each query
+    head's query `[B, Q, H, D]` against each complete window's mean key of its group (`key`
+    `[B, K, G, D]`), fp32, `[B, H, Q, T]`, and the windows it may rank `[B, Q, T]`: its own document's
+    before its own chunk."""
+    rows, queries, heads, width = query.shape
+    groups = key.shape[2]
+    windows = chunks.windows
+    flat = key.astype(jnp.float32).reshape(rows, key.shape[1], groups * width)
+    means = jnp.mean(windows.gathered(flat), axis=2).reshape(rows, -1, groups, width)
+    grouped = query.astype(jnp.float32).reshape(rows, queries, groups, heads // groups, width)
+    with jax.named_scope(SELECTING):
+        gate = float32_einsum("bqghd,btgd->bghqt", grouped, means).reshape(rows, heads, queries, -1)
+    keep = (windows.live[:, None, :] & (windows.document[:, None, :] == chunks.document[..., None])
+            & (windows.window[:, None, :] < (chunks.rank // block)[..., None]))
+    return jax.lax.stop_gradient(gate), keep
+
+
+def moba_selection(gate: jax.Array, keep: jax.Array, top_k: int) -> jax.Array:
+    """MoBA's selection of `gate` `[B, H, Q, T]` among the windows `keep` `[B, Q, T]` lets each query rank
+    (`moba_gate`): the `top_k - 1` highest, beside its own chunk, which moba_naive.py forces into its
+    `top_k` (`MobaChunks.own`): `[B, H, Q, top_k - 1]`, -1 where fewer."""
+    return top_k_selection(gate, keep[:, None], top_k - 1)
 
 
 def moba_attention(query: jax.Array, key: jax.Array, value: jax.Array, *, block: int, top_k: int,
                    implementation: AttentionImpl = "auto") -> jax.Array:
-    """MoBA's causal attention over one sequence: each query head reads its own block up to it and the
-    earlier blocks its gate selects (`moba_selection`, `top_k` of them with its own), the template's indexed
-    form a head a row (`selected_attention`). `query` `[B, S, H, D]`, `key` and `value` `[B, S, G, D]`;
-    `[B, S, H, Dv]` out."""
-    chunks = row_blocks(key.shape[1], block)
-    selected = moba_selection(query, key, chunks, top_k=top_k, count=-(-key.shape[1] // block))
-    return selected_attention(query, key, value, selected, chunks, own=False, implementation=implementation)
+    """MoBA's causal attention over one sequence a row: each query head reads its own block up to it and
+    the earlier blocks its gate selects (`moba_selection`, `top_k` of them with its own), the template's
+    indexed form a head a row (`selected_attention`). `query` `[B, S, H, D]`, `key` and `value`
+    `[B, S, G, D]`; `[B, S, H, Dv]` out."""
+    chunks = moba_chunks(key.shape[1], block, rows=key.shape[0])
+    selected = moba_selection(*moba_gate(query, key, chunks, block), top_k)
+    return selected_attention(query, key, value, selected, window_runs(chunks.windows), own=chunks.own,
+                              implementation=implementation)
 
 
 def nsa_selection(compressed_weights: jax.Array, *, stride: int, length: int, block: int, top_k: int,
@@ -152,7 +179,7 @@ def nsa_attention(query: jax.Array, key: jax.Array, value: jax.Array, compressed
     compressed_out = jnp.einsum("bghqc,bcgd->bqghd", weights, compressed_value.astype(jnp.float32))
     selected = nsa_selection(weights, stride=stride, length=length, block=block, top_k=top_k, queries=queries,
                              initial=initial, local=local)
-    selected_out = selected_attention(query, key, value, selected, row_blocks(key.shape[1], block), own=False,
+    selected_out = selected_attention(query, key, value, selected, block_runs(key.shape[1], block),
                                       implementation=implementation)
     sliding_out = scaled_dot_product_attention(
         query, key if window_key is None else window_key, value if window_value is None else window_value,
@@ -229,11 +256,11 @@ def masked_selection(mask: jax.Array, block_q: int, *, queries: int, most: int) 
 
 
 class BlockSparseSelfAttention(CausalSelfAttention):
-    """`CausalSelfAttention` whose each query reads its own block and the earlier blocks of its document its
-    selection picks (`selection`: MoBA's, `moba_selection`), `top_k` of them with its own, a block `block`
-    places of its document from its first (`numbered_blocks`, MoBA's varlen chunks), through the template's
-    indexed form (`selected_attention`): a selection a query head's, over its group's keys. A cached call
-    selects over its cache's keys at the places the cache keeps (`Append.places`), a document a row."""
+    """`CausalSelfAttention` whose each query reads its own chunk and the earlier chunks of its document its
+    selection picks (`selection`: MoBA's, `moba_selection`), `top_k` of them with its own, a chunk `block`
+    of its document's real tokens from its first (`moba_chunks`, MoBA's varlen chunks), through the
+    template's indexed form (`selected_attention`): a selection a query head's, over its group's keys. A
+    cached call selects over its cache's keys, a document a row."""
 
     selection: Literal["moba"] = "moba"
     block: int = 512
@@ -241,16 +268,13 @@ class BlockSparseSelfAttention(CausalSelfAttention):
 
     reads: ClassVar[frozenset[str]] = frozenset()
 
-    @property
-    def _reads_places(self) -> bool:
-        # Its blocks count each document's places, which its cache keeps beside its keys.
-        return True
-
     def _attended(self, masking, positions, append, sinks, train: bool, *, bias=None):
-        """The attention over each query's selected blocks (`selected_attention`), its selection MoBA's over
-        the call's keys numbered into each document's blocks (`numbered_blocks`): an uncached call's its own
-        tokens, by their documents and validity; a cached call's its cache's filled slots
-        (`cached_validity`), its queries at the slots they were written to."""
+        """The attention over each query's selected chunks (`selected_attention`), its selection MoBA's over
+        the call's keys in each document's chunks (`moba_chunks`): an uncached call's its own tokens, by
+        their documents and validity; a cached call's its cache's filled slots (`cached_validity`), its
+        queries at the slots they were written to. The kernel reads the call's real keys alone, so a chunk
+        whose run spans a key the call hides reads none of it. The gate's selection is sown (`SELECTIONS`)
+        for a caller that opens the collection: its scores, the windows each query may take, its budget."""
         del positions, sinks, train
         query, key, value = masking.query, masking.key, masking.value
         rows, keys = key.shape[:2]
@@ -270,25 +294,23 @@ class BlockSparseSelfAttention(CausalSelfAttention):
                 raise ValueError(f"{self.name}: block-selected attention's keys are its own tokens, their "
                                  "documents the queries'")
             slots, valid = None, masking.valid
-            most = 1 if documents is None else masking.max_segments
         else:
             # A cache row holds one document (`BlockSparseAttentionMixer.packed_cache`), its filled slots.
             slots = jnp.asarray(append.positions).reshape(query.shape[:2])
-            valid, documents, most = cached_validity(self, keys), None, 1
-        places = jnp.broadcast_to(masking.key_places, (rows, keys))
-        chunks = numbered_blocks(coordinates((rows, keys), segments=documents, valid=valid, positions=places),
-                                 (rows, keys), self.block)
-        # A row's chunks: each document's blocks, a partial one at either end, and its padding's.
-        count = keys if most is None else min(keys, keys // self.block + 4 * (most + 1))
-        # The gate's product widened where the layer's logits are (`moba_selection`'s `dtype`).
-        widened = jnp.dtype(jnp.float32) if self.ctx.wide_logits else None
-        selected = moba_selection(query, key, chunks, top_k=self.top_k, count=count, slots=slots,
-                                  documents=documents, dtype=widened)
+            valid, documents = cached_validity(self, keys), None
+        valid = None if valid is None else jnp.broadcast_to(jnp.asarray(valid, bool), (rows, keys))
+        chunks = moba_chunks(keys, self.block, segments=documents, valid=valid, slots=slots, rows=rows)
+        gate, keep = moba_gate(query, key, chunks, self.block)
+        if not self.is_initializing():
+            visible = jnp.broadcast_to(keep[:, None], gate.shape)
+            self.sow(SELECTIONS, "selection", {"scores": gate, "visible": visible,
+                                               "budget": jnp.asarray(self.top_k - 1)})
+        selected = moba_selection(gate, keep, self.top_k)
         return checkpoint_name(selected_attention(
-            query, key, value, selected, chunks, slots=slots, own=False,
-            implementation=self.ctx.attention_impl, dtype=self.ctx.dtype, precision=self.ctx.precision,
-            force_fp32_for_softmax=self.ctx.force_fp32_for_softmax, wide_logits=self.ctx.wide_logits,
-            softcap=self.ctx.attn_logit_softcap), Residual.CONTEXT)
+            query, key, value, selected, window_runs(chunks.windows), own=chunks.own, slots=slots,
+            key_valid=valid, implementation=self.ctx.attention_impl, dtype=self.ctx.dtype,
+            precision=self.ctx.precision, force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
+            wide_logits=self.ctx.wide_logits, softcap=self.ctx.attn_logit_softcap), Residual.CONTEXT)
 
 
 @dataclasses.dataclass(frozen=True)

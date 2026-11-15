@@ -70,7 +70,7 @@ import os
 import pickle
 import shutil
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -93,7 +93,7 @@ from arm_forms import (
 from check1_judge import SWITCHED, Verdict, _judged_pooled, _logged, _narrow, _verdicts
 from check1_wire import CENSUS, QUALIFY
 from float64_terms import evaluated_on, float64_terms, lowered, scan_groups
-from map_judge import drawing, judging, record_units
+from map_judge import ask_later, drawing, judging, record_units, site_id
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
 
 from dew._accuracy import distance, reduction_bound, within
@@ -401,6 +401,10 @@ class _Paired:
     pairing: _Pairing
     without: Callable
     plain: Callable
+    ahead: dict = dataclasses.field(default_factory=dict, compare=False)
+    """`without` compiled ahead on the site's first draw to decide its pairing (`_ynn_decided`), by its
+    inputs' signature (`_signature`): the program the arm runs on draws of that signature, never compiled
+    twice."""
 
     @property
     def without_ynn(self) -> bool:
@@ -408,13 +412,28 @@ class _Paired:
         return not self.pairing.with_ynn
 
     def __call__(self, *inputs, **options):
-        return (self.plain if self.pairing.with_ynn else self.without)(*inputs, **options)
+        if self.pairing.with_ynn:
+            return self.plain(*inputs, **options)
+        compiled = None if options else self.ahead.get(_signature(inputs))
+        return (compiled or self.without)(*inputs, **options)
 
     @property
     def trace(self):
         """The trace of the arm the site runs (JAX's `jit(...).trace`), where it is a compiled program's:
         an arm of Dew's own programs has none."""
         return (self.plain if self.pairing.with_ynn else self.without).trace
+
+
+def _signature(inputs) -> tuple:
+    """A draw's inputs as a compiled program takes them: their tree, and each leaf's shape, dtype and weak
+    type, a JAX array's sharding too (a host array or a Python number is placed as the call places it)."""
+    leaves, tree = jax.tree.flatten(inputs)
+    def taken(leaf) -> tuple:
+        if isinstance(leaf, jax.Array):
+            return leaf.shape, leaf.dtype, leaf.weak_type, leaf.sharding
+        return np.shape(leaf), np.result_type(leaf), isinstance(leaf, (bool, int, float, complex))
+
+    return tree, tuple(taken(leaf) for leaf in leaves)
 
 
 def _paired_arms(arms) -> list[_Paired]:
@@ -444,9 +463,17 @@ def _ynn_decided(label: str, arms, inputs) -> None:
     its findings (`_with_mode`). One the fusions refuse too raises, and so does a process whose XLA refuses
     the options themselves (`_ynn_option_held`). An arm running Dew's own programs through Dew's
     seam (`dew_programs`) compiles at its call, without them, as does a window loop's arm, whose program
-    takes each window's slices and not the draw (`over_windows`)."""
+    takes each window's slices and not the draw (`over_windows`). An arm compiled ahead runs that program on
+    draws of its signature (`_Paired.ahead`), compiled once. Off XLA:CPU, which alone has the fusions,
+    nothing is compiled ahead: the arms run as they compile."""
     pairings = {arm.pairing for arm in _paired_arms(arms)}
     if not pairings or all(pairing.decided for pairing in pairings):
+        return
+    if jax.default_backend() != "cpu":
+        # YNNPACK's fusions are XLA:CPU's: elsewhere an arm compiles one way (`without_ynn`), and a compile
+        # ahead to decide them would be its second.
+        for pairing in pairings:
+            pairing.decided = True
         return
     _ynn_option_held()
     refused = None
@@ -456,7 +483,7 @@ def _ynn_decided(label: str, arms, inputs) -> None:
         if not isinstance(arm, _Paired) or not hasattr(arm.without, "lower"):
             continue
         try:
-            arm.without.lower(*inputs).compile()
+            arm.ahead[_signature(inputs)] = arm.without.lower(*inputs).compile()
         except jax.errors.JaxRuntimeError as error:
             arm.plain.lower(*inputs).compile()
             refused = refused or str(error).splitlines()[0]
@@ -478,6 +505,8 @@ def _truth_program(fn):
     gate runs as given (`as_given`: NumPy, torch, a recording, a host loop), one compiled already (a jit,
     `dew_programs`), or none, as it is; a window loop's by its own. A truth with host work inside that does
     not state it fails at its trace, loudly, and passes `as_given`."""
+    if isinstance(fn, Truth):
+        return fn
     if fn is None or _given(fn) or getattr(fn, "dew_programs", False) or hasattr(fn, "lower"):
         return unrewritten(fn)
     if isinstance(fn, _Windowed):
@@ -628,23 +657,26 @@ def _platform_branch(equation, platform: str | None):
     return None if chosen is None else programs.branches(equation)[programs.platform_branch(chosen, platform)]
 
 
-def equations(graph, *, platform: str | None = None):
+def equations(graph, *, platform: str | None = None, skip=None):
     """Every equation of a jaxpr, its sub-jaxprs' (scan, cond, custom rules) in turn. With `platform`
     (a lowering platform's name: 'cpu', 'cuda', 'tpu'), a platform-dependent cond
-    (`jax.lax.platform_dependent`) gives only the branch that platform runs, as lowering keeps it."""
+    (`jax.lax.platform_dependent`) gives only the branch that platform runs, as lowering keeps it. With
+    `skip`, an equation it holds and every equation within it are passed over."""
     if hasattr(graph, "eqns"):
         for equation in graph.eqns:
+            if skip is not None and skip(equation):
+                continue
             yield equation
             kept = _platform_branch(equation, platform)
-            yield from equations(equation.params if kept is None else kept, platform=platform)
+            yield from equations(equation.params if kept is None else kept, platform=platform, skip=skip)
     elif hasattr(graph, "jaxpr"):
-        yield from equations(graph.jaxpr, platform=platform)
+        yield from equations(graph.jaxpr, platform=platform, skip=skip)
     elif isinstance(graph, dict):
         for value in graph.values():
-            yield from equations(value, platform=platform)
+            yield from equations(value, platform=platform, skip=skip)
     elif isinstance(graph, (tuple, list)):
         for value in graph:
-            yield from equations(value, platform=platform)
+            yield from equations(value, platform=platform, skip=skip)
 
 
 def dot_precisions(function, *arguments) -> list:
@@ -670,10 +702,11 @@ def logits_operands(function, *arguments, width: int) -> set:
     them: the witness of a policy that widens the query and keys before their product (`wide_logits`), which
     no output shows on a CPU, whose compiler may keep a bf16 result wider than bf16 (rows 5429 and 5439).
     jax.nn's 16-bit logits are fp32 sums of 16-bit operands, which this tells apart. A float64 sum Dew's wide
-    CPU arithmetic takes (`dew.nn.precision.float64_sum`) multiplies float64."""
+    CPU arithmetic takes (`dew.nn.precision.float64_sum`) multiplies float64. A selection's scoring, which
+    ranks keys rather than weighing them (`dew.nn.sparse_selection.SELECTING`), is no logits' product."""
     graph = jax.make_jaxpr(function)(*arguments)
     found = set()
-    for equation in equations(graph):
+    for equation in equations(graph, skip=_selecting):
         if equation.primitive is not jax.lax.dot_general_p:
             continue
         # Its contracted axes' lengths, which its two operands share.
@@ -681,6 +714,13 @@ def logits_operands(function, *arguments, width: int) -> set:
         if [equation.invars[0].aval.shape[axis] for axis in contracted] == [width]:
             found.add(jnp.promote_types(*(variable.aval.dtype for variable in equation.invars)))
     return found
+
+
+def _selecting(equation) -> bool:
+    """Whether `equation` runs within a selection's scoring scope (`dew.nn.sparse_selection.SELECTING`)."""
+    from dew.nn.sparse_selection import SELECTING
+
+    return any(getattr(scope, "name", None) == SELECTING for scope in equation.source_info.name_stack.stack)
 
 
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
@@ -759,7 +799,7 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
 class MissingTruth(AssertionError):
     """A check-1 site under a store of prepared truths (`stored_truths`) whose truth its prepare did not
     write, or wrote for another commit or other inputs: a red with its reason, never a truth computed here
-    in its place (the GPU tier's run computes none, row 5461)."""
+    in its place (the GPU tier's run computes none of a verdict's, row 5461)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -774,6 +814,10 @@ class TruthStore:
     directory: Path
     prepare: bool
     stamp: str
+    later: frozenset[str] = frozenset()
+    """The sites (`map_judge.site_id`) a follow-up job draws the second stage of (`check1_wire.ASKED`): each
+    prepared over every draw its stages may take, where any other is prepared over its first stage's
+    alone."""
     prepared: set[str] = dataclasses.field(default_factory=set, compare=False)
 
     SITE = "site.json"
@@ -798,6 +842,11 @@ class TruthStore:
             shutil.rmtree(site)
         site.mkdir(parents=True)
         return site
+
+    def draws(self, label: str, seeds: int) -> int:
+        """The draws the site's prepare computes: every one its stages may take where a follow-up draws its
+        second stage (`later`), else its first stage's, the stage a site its census decides at (row 6198)."""
+        return staged_units(seeds) if site_id(label) in self.later else seeds
 
     def finished(self, label: str, terms: bool) -> None:
         (self.path(label) / self.SITE).write_text(json.dumps({"stamp": self.stamp, "label": label,
@@ -836,19 +885,23 @@ STORE: contextvars.ContextVar[TruthStore | None] = contextvars.ContextVar("refer
 
 
 @contextlib.contextmanager
-def stored_truths(directory: str | Path, *, prepare: bool, stamp: str):
+def stored_truths(directory: str | Path, *, prepare: bool, stamp: str, later: Collection[str] = ()):
     """Check 1's float64 truths prepared ahead of the run that judges them (the GPU tier, row 5461): within
-    the block, a site prepared (`prepare`) computes and writes the truth and terms of every draw its two
-    stages may take (`staged_units`), held to float64 on its first draw (`_of_float64`), and runs no arm;
-    a site run reads them (`TruthStore.site`) where it would compute them, its terms the ones its prepare
-    sized it by, and fails where they are missing or made at another `stamp` (the commit and JAX that
-    computed them; `MissingTruth`). Truths and terms are computed as the gate computes them
-    (`_truth_and_terms`), so a prepared site judges as one that computes its own. A recorded reference
-    (`indexed_recording`) is the other store and answers another question: a reference that cannot run in
-    the test, committed and pinned, its count sized on it; a prepared truth's reference runs live beside
-    it, on the GPU it judges. A site that reads a truth at inputs its prepare does not draw (a weighed or
-    library site, a sizing's) is refused within the block."""
-    store = TruthStore(Path(directory), prepare, stamp)
+    the block, a site prepared (`prepare`) computes and writes the truth and terms of its first stage's
+    draws, or every draw its stages may take where a later job draws its second (`later`, sites by
+    `map_judge.site_id`; `TruthStore.draws`), held to float64 on its first draw (`_of_float64`), and runs no
+    arm; a site run reads them (`TruthStore.site`) where it would compute them, its terms the ones its
+    prepare sized it by, and fails where they are missing or made at another `stamp` (the commit and JAX
+    that computed them; `MissingTruth`), or, where its first stage leaves it undecided, asks a later job for
+    its second stage (`map_judge.ask_later`, a red until that job judges it): a prepare leaves out the four
+    fifths of a site's draws its second stage would take, which a site its first stage decides never reads
+    (row 6198). Truths and terms are computed as the gate computes them (`_truth_and_terms`), so a prepared
+    site judges as one that computes its own. A recorded reference (`indexed_recording`) is the other store
+    and answers another question: a reference that cannot run in the test, committed and pinned, its count
+    sized on it; a prepared truth's reference runs live beside it, on the GPU it judges. A site that reads a
+    truth at inputs its prepare does not draw (a weighed or library site) is refused within the block; a
+    qualification run's sizing computes its own (`_qualified`)."""
+    store = TruthStore(Path(directory), prepare, stamp, frozenset(later))
     token = STORE.set(store)
     try:
         yield store
@@ -865,14 +918,15 @@ def _inputs_digest(inputs) -> np.uint64:
 def _prepare_site(store: TruthStore, dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn,
                   terms) -> None:
     """`assert_as_exact`'s site prepared into `store` (`stored_truths`): its truth program and terms as
-    `_site_judged` decides them, every draw its stages may take computed and written, no arm run."""
+    `_site_judged` decides them, the draws its store asks (`TruthStore.draws`: its first stage's, or every
+    stage's where a later job draws its second) computed and written, no arm run."""
     terms_fn, _ = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=None,
                         library_row=None, library_leaves=(), also=None, terms=terms)
     truth_program = _truth_program(truth_fn if truth_fn is not None else reference_fn)
     terms_fn = _site_terms(terms_fn, terms, draw, truth_fn if truth_fn is not None else reference_fn,
                            truth_program)
     site = store.begun(label)
-    for seed in range(staged_units(seeds)):
+    for seed in range(store.draws(label, seeds)):
         inputs = draw(seed)
         truth, found = _truth_and_terms(truth_program, terms_fn, inputs)
         if not seed:
@@ -1446,19 +1500,19 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     (tests/certified.py)."""
     terms = terms if followed is None else _followed_site(label, truth_fn, orders, library_fn, terms,
                                                           conditioning, examples)
-    if (store := STORE.get()) is not None:
-        if conditioning is not None or library_fn is not None:
-            raise ValueError(f"{label}: a weighed or library site reads its reference's own rounding and "
-                             "arms at its truth's inputs, which no prepared truth holds")
-        if store.prepare:
-            _prepare_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn,
-                          terms=terms)
-            return
-        truth_fn, terms = store.site(label)
-    elif os.environ.get(QUALIFY) and not (drawing() or judging()):
+    store = STORE.get()
+    if store is not None and (conditioning is not None or library_fn is not None):
+        raise ValueError(f"{label}: a weighed or library site reads its reference's own rounding and arms "
+                         "at its truth's inputs, which no prepared truth holds")
+    if store is not None and store.prepare:
+        _prepare_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, terms=terms)
+        return
+    if os.environ.get(QUALIFY) and not (drawing() or judging()):
         _qualified(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
                    examples=examples, plain=not (library_fn or also or terms or conditioning),
                    followed=followed)
+    if store is not None:
+        truth_fn, terms = store.site(label)
     if conditioning is not None:
         _deferred(dew_fn, reference_fn, draw, label, seeds=seeds, conditioning=conditioning,
                   truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
@@ -1535,8 +1589,10 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
     pilots, whose count is its recording's, or its verdict is not the `plain` pair's (a library arm, further
     references, terms of its own, a weighed check), which this sizing does not judge. A site whose draw
     cannot draw a sizing seed (one that indexes a fixed set of draws) fails with its draw's own error: it has
-    no pilot stream, so its count cannot be sized again (`seeds_for`'s contract). No sizing runs under a
-    prepared store or in a map task or its judge."""
+    no pilot stream, so its count cannot be sized again (`seeds_for`'s contract). A site judged under a
+    prepared store (`stored_truths`: a GPU flow's) sizes in its run, on its run's device, its sizing draws'
+    truths computed here from its own `truth_fn`, as its store holds its verdict's draws alone; none sizes in
+    a prepare, a map task or its judge."""
     import json
 
     record = {"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0], "label": label,
@@ -1545,8 +1601,18 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
     if not plain or recorded:
         record["unsized"] = "its verdict is not the plain pair's" if not plain else "a recording's count"
     else:
-        record["sized"] = seeds_for(reference_fn, draw, label, truth_fn=truth_fn, dew_fn=dew_fn,
-                                    orders=orders, examples=examples, followed=followed)
+        # Its sizing draws' truths its own, never a prepared store's, which holds the verdict's draws alone,
+        # computed on the host under one (a GPU run's), as its prepare computes them: the GPU's memory is the
+        # arms'.
+        prepared = STORE.get() is not None
+        if prepared and truth_fn is not None and not _given(truth_fn) and not isinstance(truth_fn, Truth):
+            truth_fn = Truth(truth_fn, jax.local_devices(backend="cpu")[0])
+        token = STORE.set(None)
+        try:
+            record["sized"] = seeds_for(reference_fn, draw, label, truth_fn=truth_fn, dew_fn=dew_fn,
+                                        orders=orders, examples=examples, followed=followed)
+        finally:
+            STORE.reset(token)
     with open(os.environ[QUALIFY], "a", encoding="utf-8") as log:
         log.write(json.dumps(record) + "\n")
     if (sized := record.get("sized", 0)) > seeds:
@@ -1597,6 +1663,15 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     def drawn_for(index: int):
         def drawn(start, stop):
             assert not judging(), f"{label}: a judge draws nothing of its own, its draws are its pool's"
+            store = STORE.get()
+            if store is not None and start >= seeds and site_id(label) not in store.later:
+                # Its first stage left it undecided, and its prepare stored that stage alone
+                # (`TruthStore.draws`): its second stage is a later job's, which it asks for.
+                ask_later(label, seeds, staged_units(seeds))
+                raise MissingTruth(f"{label}: its first stage leaves it undecided and its prepare stored "
+                                   "that stage alone; a later job draws its second where check1_wire.LATER "
+                                   "is set, or a prepare given its site (stored_truths' `later`) stores "
+                                   "every stage")
             if (start, stop) not in ranges:
                 draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
                                library_fn=library_fn, library_leaves=library_leaves, also=further,

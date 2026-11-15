@@ -23,7 +23,7 @@ from jax.experimental import checkify
 from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, NamedSharding, PartitionSpec, Sharding
 
-from dew.batch import VALIDITY_FIELD, Variables, coordinates, real_slots
+from dew.batch import Variables, coordinates, real_slots
 from dew.inference.tasks import cache_sized
 from dew.lora import adapter_names
 from dew.mesh import logical_spec
@@ -62,7 +62,14 @@ from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import DecoderState, Speculative, block_step, row_step
-from dew.sampling.text import adapter_field, decode_ops, prediction_depths, prefill_state, rounding_keys
+from dew.sampling.text import (
+    adapter_field,
+    decode_ops,
+    empty_cache,
+    prediction_depths,
+    prefill_state,
+    rounding_keys,
+)
 
 
 @struct.dataclass
@@ -159,26 +166,81 @@ def drafting_depths(model: nn.Module, plan: Speculative | None) -> int | None:
     return None if plan is None else prediction_depths(model)
 
 
+_Signature = tuple[jax.tree_util.PyTreeDef, tuple[jax.ShapeDtypeStruct, ...]]
+
+
+@dataclasses.dataclass(frozen=True)
+class StateTypes:
+    """A decoder state's types beside its cache, as an admission's prefill leaves its rows
+    (`admitted_types`): its logits, its prediction states and the rest a row carries, rows first. A
+    server's free slots hold them zeroed beside the cache its model opens (`opened`)."""
+
+    signature: _Signature
+    """The state's tree and each leaf's type: a static argument of the program that opens the slots."""
+
+    @classmethod
+    def of(cls, state: DecoderState) -> StateTypes:
+        leaves, tree = jax.tree.flatten(dataclasses.replace(state, cache={}))
+        return cls((tree, tuple(jax.ShapeDtypeStruct(leaf.shape, leaf.dtype) for leaf in leaves)))
+
+    def zeros(self, rows: int) -> DecoderState:
+        """The state of `rows` rows, every leaf zeros, its cache empty."""
+        tree, leaves = self.signature
+        return jax.tree.unflatten(tree, [jnp.zeros((rows, *leaf.shape[1:]), leaf.dtype) for leaf in leaves])
+
+
+def rows_prefilled(model: nn.Module, params: Variables, pad_id: int, admission: Admission,
+                   plan: Speculative | None, prng: str, progress: Progress = END
+                   ) -> tuple[DecoderState, jax.Array]:
+    """The admitted prompts' own decoder state, their rows prefilled over a fresh cache at their bucket
+    width, and their real slots: a dense admission's prefill (`Dense.rows_prefilled`), each row's keys
+    of `prng`'s implementation, its prediction depths' where `plan` drafts."""
+    narrow = cache_sized(model, admission.prompts.tokens.shape[1])
+    ops = decode_ops(narrow, params, pad_id, drafting_depths(model, plan), progress)
+    rounding = rounding_keys(jax.random.wrap_key_data(admission.keys, impl=prng))
+    return prefill_state(narrow, params, admission.prompts, ops, rounding=rounding, progress=progress,
+                         adapters=_rows_of(model, admission))
+
+
+def admitted_types(model: nn.Module, params: Variables, pad_id: int, admission: Admission,
+                   placement: Placement, progress: Progress = END) -> StateTypes:
+    """The types `admission`'s prefill leaves its rows, as `placement`'s admitting step prefills them: a
+    dense one's over a fresh cache at their bucket width (`rows_prefilled`), a paged one's over a fresh
+    cache of its pool's layout, which its step reads the pool's pages through (`Paged.prefilled`); a mixed
+    step leaves its rows the same logits' and states' types. Traced at the admission's own shape for those
+    types alone: the forward owns its outputs' types, the states' from the dtype its stack settles in, so
+    no spec states them. A server's start takes this trace once, at an admission it runs (`Server`); the
+    admitting step prefills inside its own program, whose inputs are the very slots these types make, so
+    JAX's trace cache, keyed on a function and its arguments' types, holds no trace of it to share."""
+    def prefilled(params: Variables, admission: Admission) -> DecoderState:
+        if isinstance(placement, Dense):
+            return rows_prefilled(model, params, pad_id, admission, placement.plan, placement.prng,
+                                  progress)[0]
+        ops = decode_ops(model, params, pad_id, drafting_depths(model, placement.plan), progress)
+        rounding = rounding_keys(jax.random.wrap_key_data(admission.keys, impl=placement.prng))
+        return prefill_state(model, params, admission.prompts, ops, rounding=rounding, progress=progress,
+                             adapters=_rows_of(model, admission))[0]
+
+    _, state = jax.eval_shape(checkify.checkify(prefilled, errors=checkify.user_checks), params, admission)
+    return StateTypes.of(state)
+
+
 def opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacity: int,
-           plan: Speculative | None = None, impl: str = "threefry2x32") -> Slots:
-    """Every slot free: zeros in the shapes of a prefill over an all-invalid
-    prompt, which leave the cursors at zero and the validity false, its
-    drafting state among them where the rows draw speculative blocks, and
-    its keys the data of `impl`'s (the server's PRNG implementation, a static
-    argument, as no trace context holds the default one)."""
-    ops = decode_ops(model, params, pad_id, drafting_depths(model, plan))
-    blank = ModelInputs(jnp.zeros((slots, 1), jnp.int32),
-                        {VALIDITY_FIELD: jnp.zeros((slots, 1), bool)})
-    adapters = _base_rows(model, slots)
-
-    def blank_prefill():
-        return prefill_state(model, params, blank, ops, adapters=adapters)[0]
-
-    _, decoder = jax.eval_shape(checkify.checkify(blank_prefill, errors=checkify.user_checks))
-    keys = jax.random.key_data(jax.random.key(0, impl=impl))
+           plan: Speculative | None = None, impl: str = "threefry2x32",
+           types: StateTypes | None = None) -> Slots:
+    """Every slot free: the decode cache its model opens for `slots` rows (`empty_cache`, which traces no
+    forward), its drafting state's among it where the rows draw speculative blocks, every other leaf of
+    the decoder state zeros of the `types` an admission's prefill leaves (`admitted_types`), and its keys
+    the data of `impl`'s (the server's PRNG implementation, a static argument, as no trace context holds
+    the default one)."""
+    assert types is not None, "a server's free slots hold the types its admissions' prefill leaves"
+    depths = drafting_depths(model, plan)
+    ops = decode_ops(model, params, pad_id, depths)
     # A free slot's adapter is the base model alone.
-    return Slots(dataclasses.replace(jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype), decoder),
-                                     adapters=adapters),
+    adapters = _base_rows(model, slots)
+    cache = empty_cache(model, params, slots, ops.depths, ops.record is not None, adapters)
+    keys = jax.random.key_data(jax.random.key(0, impl=impl))
+    return Slots(dataclasses.replace(types.zeros(slots), cache=cache, adapters=adapters),
                  jnp.zeros((slots, 2 * capacity), jnp.int32),
                  jnp.zeros((slots, 2 * capacity), bool),
                  jnp.zeros((slots,), jnp.int32), jnp.zeros((slots,), jnp.int32),
@@ -285,14 +347,9 @@ class Dense:
 
     def rows_prefilled(self, model: nn.Module, params: Variables, pad_id: int, admission: Admission,
                        progress: Progress = END) -> tuple[DecoderState, jax.Array]:
-        """The admitted prompts' own decoder state, their rows prefilled over a fresh cache at their bucket
-        width, and their real slots: what `prefilled` seats, which a server that prefills on a mesh of its
-        own runs there and moves (`Admission.prefilled`)."""
-        narrow = cache_sized(model, admission.prompts.tokens.shape[1])
-        ops = decode_ops(narrow, params, pad_id, drafting_depths(model, self.plan), progress)
-        rounding = rounding_keys(jax.random.wrap_key_data(admission.keys, impl=self.prng))
-        return prefill_state(narrow, params, admission.prompts, ops, rounding=rounding, progress=progress,
-                             adapters=_rows_of(model, admission))
+        """What `prefilled` seats, which a server that prefills on a mesh of its own runs there and moves
+        (`Admission.prefilled`): `rows_prefilled`."""
+        return rows_prefilled(model, params, pad_id, admission, self.plan, self.prng, progress)
 
 
 def _prefilled_rows(model: nn.Module, params: Variables, pad_id: int, placement: Dense, admission: Admission,
@@ -349,7 +406,7 @@ class Paged:
         """
         rows = admission.cursors.shape[0]
         adapters = _rows_of(model, admission)
-        # The cache's allocation runs the model too (a forward over a dummy token): under the rows' adapters.
+        # The rows' fresh cache, as the model's holders state it (`init_cache`), under the rows' adapters.
         allocated = with_rounding_keys(
             model.apply(params, rows, method="init_cache", mutable=["cache"],
                         **adapter_field(adapters))[1]["cache"],
@@ -903,7 +960,7 @@ def entry_programs(states: Variables, rows: NamedSharding | None) -> tuple[Outer
 def opened_in(formats: Formats) -> OuterProgram:
     """`opened`, allocating its state in `formats`: an outer program (`dew.nn.kernels.options.program`),
     one for every layout."""
-    return outer_program(opened, static_argnums=(0, 2, 3, 4, 5, 6), out_shardings=formats)
+    return outer_program(opened, static_argnums=(0, 2, 3, 4, 5, 6, 7), out_shardings=formats)
 
 
 def dispatched(program: OuterProgram) -> Step:

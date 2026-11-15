@@ -8,9 +8,10 @@ import numpy as np
 import pytest
 from attention_oracle import qkv
 from reference_error import assert_as_exact, with_gradients
-from test_mixers import tiny
+from test_mixers import VOCAB, tiny
 from test_text_rollout_contract import assert_generation_scores_as_full_forwards
 
+from dew.batch import coordinates
 from dew.nn import block_sparse, sparse_selection
 from dew.nn.attention import scaled_dot_product_attention
 from dew.registry import mixers
@@ -36,6 +37,12 @@ def _selected_mask(selected: np.ndarray, block: int, keys: int, *, own: bool) ->
     return mask
 
 
+def _own_runs(rows: int, queries: int, block: int) -> jax.Array:
+    """`[B, Q, 2]`: each query's own block of `block` along its row, up to it."""
+    index = jnp.arange(queries, dtype=jnp.int32)
+    return jnp.broadcast_to(jnp.stack([index // block * block, index + 1], axis=-1), (rows, queries, 2))
+
+
 def _drawn(rows: int, queries: int, heads: int, groups: int, width: int):
     """A seed's bf16 queries `[B, Q, H, D]`, keys and values of `groups` heads, and output cotangents."""
     def draw(seed):
@@ -56,30 +63,46 @@ def test_a_selections_runs_hold_its_selected_blocks_keys_up_to_each_query(own):
     rng = np.random.default_rng(0)
     selected = rng.integers(-1, queries // block, size=(rows, queries, 4))
     selected[:, :, 3] = selected[:, :, 2]
-    chunks = block_sparse.row_blocks(queries, block)
-    runs = np.asarray(sparse_selection.selected_runs(jnp.asarray(selected), chunks, own=own))
+    bounds = sparse_selection.block_runs(queries, block)
+    runs = np.asarray(sparse_selection.selected_runs(jnp.asarray(selected), bounds,
+                                                     own=_own_runs(rows, queries, block) if own else None))
     index = jnp.arange(queries)[None, None, :, None]
     seen = np.asarray(jnp.any((index >= runs[:, :, None, :, 0]) & (index < runs[:, :, None, :, 1]), axis=-1))
     np.testing.assert_array_equal(seen, _selected_mask(selected, block, queries, own=own))
 
 
 def test_moba_selects_each_heads_top_earlier_blocks_by_its_gate():
-    """MoBA's selection (`moba_selection`): each query head's own block and the `top_k - 1` earlier key blocks
-    by its query's product with the block's mean key, its group's, as moba_naive.py forces the own block into
-    its top k, written out over numpy (the same blocks)."""
+    """MoBA's selection (`moba_gate`, `moba_selection`): each query head's `top_k - 1` earlier key blocks by
+    its query's product with the block's mean key, its group's, beside its own block, which moba_naive.py
+    forces into its top k (`MobaChunks.own`, up to the query), written out over numpy (the same blocks)."""
     rows, queries, heads, groups, width, block, top_k = 1, 64, 4, 2, 8, 8, 3
     drawn = qkv((rows, queries, heads, width), jnp.float32, kv_shape=(rows, queries, groups, width))
     query, key, _ = (np.asarray(each, np.float32) for each in drawn)
-    selected = np.asarray(block_sparse.moba_selection(jnp.asarray(query), jnp.asarray(key),
-                                                      block_sparse.row_blocks(queries, block), top_k=top_k,
-                                                      count=queries // block))
+    chunks = block_sparse.moba_chunks(queries, block)
+    selected = np.asarray(block_sparse.moba_selection(
+        *block_sparse.moba_gate(jnp.asarray(query), jnp.asarray(key), chunks, block), top_k))
+    windows = np.asarray(block_sparse.window_runs(chunks.windows))
+    np.testing.assert_array_equal(np.asarray(chunks.own)[0], np.asarray(_own_runs(1, queries, block))[0])
     means = key.reshape(rows, queries // block, block, groups, width).mean(2)
     for head in range(heads):
         for index in range(queries):
-            own = index // block
-            gate = query[0, index, head] @ means[0, :own, head // (heads // groups)].T
-            expected = {*np.argsort(-gate)[:top_k - 1].tolist(), own}
-            assert {int(b) for b in selected[0, head, index] if b >= 0} == expected
+            gate = query[0, index, head] @ means[0, :index // block, head // (heads // groups)].T
+            expected = {(b * block, (b + 1) * block) for b in np.argsort(-gate)[:top_k - 1].tolist()}
+            assert {tuple(windows[0, b]) for b in selected[0, head, index] if b >= 0} == expected
+
+
+def test_a_holed_rows_queries_read_none_of_its_hidden_keys():
+    """A decoder of block-selected attention over a row whose validity hides a key inside a chunk (a hole
+    at slot 2 of a chunk of four, `coordinates`' `valid`), whose run spans it: its real queries' logits
+    bitwise as they were whatever token the hidden slot holds (train 856's review F1)."""
+    model = tiny(mixer=mixers.build("block_sparse_attention", block=4, top_k=2), dtype="float32")
+    tokens = jax.random.randint(jax.random.key(0), (1, 12), 0, VOCAB)
+    valid = jnp.ones((1, 12), bool).at[0, 2].set(False)
+    variables = model.init(jax.random.key(1), tokens)
+    forward = jax.jit(lambda row: model.apply(variables, row, coordinates=coordinates(valid=valid)))
+    changed = tokens.at[0, 2].set((tokens[0, 2] + 5) % VOCAB)
+    real = np.asarray(valid[0])
+    np.testing.assert_array_equal(np.asarray(forward(tokens))[0, real], np.asarray(forward(changed))[0, real])
 
 
 def test_a_masked_selection_takes_each_query_blocks_selected_key_blocks():
@@ -107,7 +130,8 @@ def test_attention_over_a_groups_selection_holds_check_1_against_its_dense_mask(
 
     def ours(query, key, value):
         return sparse_selection.selected_attention(query, key, value, selected,
-                                                   block_sparse.row_blocks(queries, block))
+                                                   sparse_selection.block_runs(queries, block),
+                                                   own=_own_runs(rows, queries, block))
 
     def reference(query, key, value):
         return scaled_dot_product_attention(query, key, value, mask=dense, implementation="xla")
