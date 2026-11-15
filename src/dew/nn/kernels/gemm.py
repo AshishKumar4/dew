@@ -30,6 +30,8 @@ cotangents through `gemm` and `gemm_t` and the hooks' through their VJPs in XLA,
 accumulator only where the epilogue's VJP reads it.
 """
 
+import contextlib
+import contextvars
 import dataclasses
 import enum
 import functools
@@ -53,6 +55,22 @@ from dew.nn.programs import read_by
 from dew.nn.sharding import seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
+
+_UNBUILT: contextvars.ContextVar[bool] = contextvars.ContextVar('gemm_unbuilt', default=False)
+"""Whether the calls traced here are weighed, not built (`unbuilt`)."""
+
+
+@contextlib.contextmanager
+def unbuilt():
+    """Within the block a call is weighed, not built: it selects and reports its launch as it would run, and
+    its value is XLA's program of the same outputs, so a pass that reads only the routes and the shapes
+    (`fused_gemm.analysis`) traces no launch's kernel, whose body is most of a call's trace (on a
+    compile-only H100, 0.15 s of a 4B projection's; three of them were 0.44 s of a region's 0.69)."""
+    token = _UNBUILT.set(True)
+    try:
+        yield
+    finally:
+        _UNBUILT.reset(token)
 """The launch axes each hook's side operands may follow; `groups` too beside them (`_split`), which a launch
 reads at its tile's group (`axes.GROUPS`) and XLA's program at each row (`axes.at_rows`)."""
 
@@ -420,8 +438,10 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
                                         dense=dense)
         launch = grouped_matmul.launched(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
         # A kernel gradient is one product: no launch takes it apart.
-        if callable(launch):
+        if callable(launch) and not _UNBUILT.get():
             return launch()
+        if callable(launch):
+            return portable(lhs, rhs, group_sizes, prologue_arrays, tables)
         if tabled:
             # No launch reads the rows where they lie (an fp32 call's, which only Mosaic GPU's gathering
             # producer would): the rows gathered first, the grouped launches taking the product, never XLA's
@@ -939,7 +959,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
             # grouped launches taking the rows between, never XLA's ragged dot over every group's matrix.
             return scattered(kernel(lhs if gather is None else lhs[gather], rhs, group_sizes, prologue_arrays,
                                     epilogue_arrays, paired, first, None, None, interpret=interpret), scatter)
-        if not callable(launch):
+        if not callable(launch) or _UNBUILT.get():
             return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather,
                             scatter)
         return launch()
