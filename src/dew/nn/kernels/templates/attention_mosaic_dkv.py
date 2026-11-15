@@ -15,7 +15,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew._devices import deterministic_ops_requested
-from dew.nn.kernels import tuning
+from dew.nn.kernels import launches, tuning
 from dew.nn.kernels.templates import (
     across,
     attention_algebra as algebra,
@@ -798,12 +798,12 @@ def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind], 
     program's own place too, written, the shared rows summed after (`_grad_buffers`). The gradients of one
     shape (`groups`) are one ref, a leading axis of them (`mosaic.stacked_zeros`, row 3180)."""
     batch, queries, heads, _ = operands[0].shape
-    grads = mosaic.stacked_zeros(buffers, groups)
+    grads = mosaic.stacked_zeros(buffers, groups, *operands[:4])
     if not walk.fused:
         dk, dv = launch(*operands, *grads)
         return dk, dv, *_keys_last(mosaic.stacked_read(grads, groups), graded)
     width = operands[0].shape[3]
     copies = walk.consumers if walk.interpret else 1
-    dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))
+    dq = jax.new_ref(launches.filled((copies, batch, queries, heads, width), jnp.float32, *operands[:4]))
     dk, dv = launch(*operands, dq, *grads)
     return mosaic.added_copies(dq), dk, dv

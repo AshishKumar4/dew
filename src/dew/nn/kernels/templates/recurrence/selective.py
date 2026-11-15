@@ -26,7 +26,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew._devices import deterministic_ops_requested
 from dew.nn import derivatives
-from dew.nn.kernels import generation, recurrence_algebra as algebra, tuning
+from dew.nn.kernels import generation, launches, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.chunked_launch import AlignedDocuments, Forked, zero_padded
 from dew.nn.kernels.templates import base, mosaic, report, resources, scan as block_scan, swizzling
 from dew.nn.kernels.templates.recurrence import mainloop
@@ -699,11 +699,12 @@ def _backward_launched(entry, x, dt, b, c, parameters, entered, resets, dy, dfin
         for ref, value in zip(outputs, found, strict=True):
             ref[...] = value
 
-    sums = [jnp.zeros((2, partials, *b.shape), jnp.float32)]
+    # The sums this launch adds into, its own (`launches.filled`): unbound, every layer's were one buffer.
+    sums = [launches.filled((2, partials, *b.shape), jnp.float32, x, b)]
     if scan.forked:
         # The given slots' gradients and the stored slots' sums one buffer (`DocumentsBack`).
         given = table[0]
-        sums.append(jnp.zeros((rows * (scan.count + scan.held), *given.shape[1:]), jnp.float32))
+        sums.append(launches.filled((rows * (scan.count + scan.held), *given.shape[1:]), jnp.float32, x, b))
     dbc, *found = pl.run_state(accumulated)((*sums, *(jnp.zeros(t.shape, t.dtype) for t in out_type)))
     dgiven = found[0][:rows * scan.count] if scan.forked else None
     dx, ddt, da, dd, dstate = found[scan.forked:]

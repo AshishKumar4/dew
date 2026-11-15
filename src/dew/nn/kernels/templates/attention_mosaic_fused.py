@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import generation, tuning
+from dew.nn.kernels import generation, launches, tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, resources
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
@@ -346,11 +346,11 @@ def _fused_called(launch: Callable, operands: tuple, stacked: tuple, *, copies: 
     `copies`), a consumer's keys its own."""
     query = operands[0]
     batch, queries, heads, width = query.shape
-    dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))
+    dq = jax.new_ref(launches.filled((copies, batch, queries, heads, width), jnp.float32, *operands[:4]))
     if not grouped:
         dk, dv = launch(*operands, dq)
         return mosaic.added_copies(dq), dk, dv
-    dkv = mosaic.stacked_zeros(*stacked)
+    dkv = mosaic.stacked_zeros(*stacked, *operands[:4])
     launch(*operands, dq, *dkv)
     dk, dv = mosaic.stacked_read(dkv, stacked[1])
     return mosaic.added_copies(dq), dk, dv

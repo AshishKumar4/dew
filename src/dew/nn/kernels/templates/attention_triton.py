@@ -1178,7 +1178,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             columns = pl.BlockSpec((None, None, queries, block_k), lambda j, b, h: (b, h, 0, j))
             aliases[len(arrays)] = len(out_shape)
             in_specs.append(columns)
-            arrays.append(jnp.zeros(param.shape, jnp.float32))
+            arrays.append(launches.filled(param.shape, jnp.float32, query, dout))
             out_shape.append(jax.ShapeDtypeStruct(param.shape, jnp.float32))
             out_specs.append(columns)
     kernel = functools.partial(_dkv_kernel, ids=ids, score_kinds=score_kinds,
