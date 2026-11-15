@@ -98,4 +98,8 @@ def main(arguments: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # Under the Python every key is hashed by (`ci.HASHED_BY`, as ci.py's `pinned`), else run again under it.
+    if f"{sys.version_info.major}.{sys.version_info.minor}" != ci.HASHED_BY:
+        os.execvp("uv", ["uv", "run", "--no-project", "--python", ci.HASHED_BY, "python",
+                         str(Path(__file__).resolve()), *sys.argv[1:]])
     sys.exit(main())
