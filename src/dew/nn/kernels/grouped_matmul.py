@@ -2342,20 +2342,11 @@ call) to (that route's kernel, the receipt). A product of a matrix a receipt tim
 its own, which that receipt's winner holds: the template's where it won (on Hopper, over its kind's XLA
 cell), XLA's where it lost (on Blackwell, where the template is the kind's default); one timed whose cell is
 undeclared takes the template. A cell leaves the list once the template measures at least as fast on it.
-Its price includes the step memory its route holds (`HELD`), which no per-call time sees.
-Nothing is ranked at runtime. A
+A cell's route holds no more of a step's memory than the template's: each product's reverse mode leaves its
+rows' cotangent only with its kernel gradient formed (`gemm.in_layer`, row 6027), whichever route forms it
+(tests/test_declared_cells_memory.py). Nothing is ranked at runtime. A
 call the template cannot run (its legality) takes the next route in `GROUPED`'s order, which is no cell of
 this list."""
-
-HELD: dict[tuple[str | None, Kind], tuple[int, str]] = {}
-"""The step memory a declared cell's route holds beyond the template's, which its receipt states beside its
-time: (instruction family, kind of call) to (the outputs of its call each layer holds, the receipt's
-statement); none. XLA's dot of a kernel gradient was put off to the step's end, every layer's cotangent held
-to it (row 6027: the 4B's every layer's SwiGLU backward pair beside the template's input gradient, a four-row
-step's temporaries 80.50 GB on a compile-only GH200 against its parent's 20.42), until each product's reverse
-mode left its rows' cotangent only with its kernel gradient formed (`gemm.in_layer`), whichever route takes
-it. A cell absent holds none (tests/test_declared_cells_memory.py)."""
-
 
 GROUPED: selection.Op[GroupedCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
     MOSAIC, TRITON, CUTLASS,
