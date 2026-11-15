@@ -349,7 +349,11 @@ class ProfileReport:
                   else None if figures["device_window_ms"] is not None
                   else "the capture holds no device track (a CPU run, or its trace has none)")
         report = cls(str(directory), steps, warmup, traced, str(capture), logged["train/step_time_ms"],
-                     logged["train/data_wait_ms"], compiles[0] if compiles else None, **figures,
+                     logged["train/data_wait_ms"], compiles[0] if compiles else None,
+                     device_window_ms=figures["device_window_ms"], compute_ms=figures["compute_ms"],
+                     communication_ms=figures["communication_ms"],
+                     exposed_communication_ms=figures["exposed_communication_ms"],
+                     device_idle_ms=figures["device_idle_ms"],
                      flops=logged.get("train/flops"), mfu=logged.get("train/mfu"),
                      hfu=logged.get("train/hfu"), tokens_per_s=logged.get("train/tokens_per_s"),
                      device=device, kernels=kernels)

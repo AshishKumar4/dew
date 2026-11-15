@@ -213,7 +213,7 @@ def test_a_phased_run_resumed_relaxed_with_other_batches_keeps_its_phases_at_the
 
 
 
-def test_a_per_share_reader_starts_no_prefetch_before_its_saved_plan_is_checked(monkeypatch):
+def test_a_per_share_reader_starts_no_prefetch_before_its_saved_plan_is_checked():
     """A per-share read whose saved position another plan wrote is refused before its reader starts
     prefetching (data.md §10): a resume asks its fresh position first (`resumed_on`), which opens the
     reader and starts none of its loading, and the check refuses it. The fresh position started the
@@ -221,27 +221,10 @@ def test_a_per_share_reader_starts_no_prefetch_before_its_saved_plan_is_checked(
     finding)."""
     import json
 
-    from dew.data import readers
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition, Loading
     from dew.data.plan import PlanChanged
-
-    started = []
-    built = readers._PerShare.__init__
-
-    def opening(self, open_reader, *args, **kwargs):
-        def opened():
-            iterator = open_reader()
-            start = iterator.start_prefetch
-
-            def counted():
-                started.append(type(iterator).__name__)
-                return start()
-
-            iterator.start_prefetch = counted
-            return iterator
-
-        built(self, opened, *args, **kwargs)
+    from dew.data.readers import _PerShare
 
     chain = Pipeline(Memory({"x": np.arange(16, dtype=np.float32)[:, None]}, shard_rows=4)).repeat().batch(2)
     loader = compile(chain, read="streamed", loading=Loading(workers=0))
@@ -250,12 +233,23 @@ def test_a_per_share_reader_starts_no_prefetch_before_its_saved_plan_is_checked(
     decoded = json.loads(stream.get_state())
     stream.close()
     decoded["dew_data_plan"]["rules"].update(shuffle="another-key")
-    monkeypatch.setattr(readers._PerShare, "__init__", opening)
-    resumed = loader.train(DataPartition())
-    try:
-        resumed.get_state()
-        with pytest.raises(PlanChanged):
-            resumed.set_state(json.dumps(decoded).encode())
-    finally:
-        resumed.close()
+    started = []
+
+    class Opened:
+        """The reader the double opens: a fresh position, and its prefetch counted as it starts."""
+
+        def get_state(self):
+            return {}
+
+        def start_prefetch(self):
+            started.append(True)
+
+        def close(self):
+            pass
+
+    assert loader.plan is not None
+    resumed = _PerShare(Opened, loader.plan, "exact", stop_seconds=1.0)
+    resumed.get_state()
+    with pytest.raises(PlanChanged):
+        resumed.set_state(json.dumps(decoded).encode())
     assert started == []
