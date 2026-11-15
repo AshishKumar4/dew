@@ -549,11 +549,18 @@ def initial_state(spec: Forward, initial: Partial) -> Partial:
 
 def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array,
                   initial: Initial | None = None) -> jax.Array:
-    """A split walk's slices merged (`merged` of `slice_state`s, then `finish`): their outputs `out`
-    `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima (in natural `spec`'s units, `finished_rows`', a
-    fold's `unfolded`, raw products where it keeps them) and denominators `[B, KV, S, Q]`, and the call's
-    `initial` state `[B, KV, Q]` (its sums unnormalized): the rows' output `[B, Q, KV, Dv]` fp32, a row of
-    no mass zero, as the reference's."""
+    """A split walk's slices merged (`merged_state`, then `finish`): the rows' output `[B, Q, KV, Dv]` fp32, a
+    row of no mass zero, as the reference's."""
+    return finish(spec, merged_state(spec, out, maximum, total, initial), initial=True, normalized=True)[0]
+
+
+def merged_state(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Array,
+                 initial: Initial | None = None) -> Partial:
+    """A split walk's slices and the call's initial state merged into one finished state (`finished_merged`
+    of `slice_state`s): their outputs `out` `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima (in natural
+    `spec`'s units, `finished_rows`', a fold's `unfolded`, raw products where it keeps them) and denominators
+    `[B, KV, S, Q]`, and the call's `initial` state `[B, KV, Q]` (its sums unnormalized): `[B, Q, KV]` rows,
+    their output normalized."""
     if finished_form(spec) is not spec:
         raise ValueError("a split walk's merge takes its finished form's states (`finished_form`)")
     state = slice_state(spec, out, *(jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total)))
@@ -563,7 +570,16 @@ def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.
         acc, m, total = (jnp.concatenate([mine, theirs[:, None]], axis=1)
                          for mine, theirs in zip(state[:3], own[:3], strict=True))
         state = Partial(acc, m, total)
-    return finish(spec, finished_merged(spec, state, axis=1), initial=True, normalized=True)[0]
+    return finished_merged(spec, state, axis=1)
+
+
+def resumable(spec: Forward, state: Partial) -> Partial:
+    """A finished state (`finished_merged`'s: its output normalized, its maximum in `spec`'s units) as a
+    call's initial state takes it (`initial_state`'s inverse): its sums unnormalized at its natural maximum,
+    a state of no mass the walk's start, which adds nothing to a merge."""
+    held = state.total > 0
+    return Partial(state.acc * state.total[..., None], jnp.where(held, spec.naturalized(state.m), LEAST),
+                   state.total)
 
 
 def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:

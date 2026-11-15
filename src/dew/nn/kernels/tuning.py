@@ -53,6 +53,7 @@ import functools
 import hashlib
 import importlib
 import inspect
+import itertools
 import json
 import logging
 import os
@@ -590,17 +591,70 @@ class KernelOp(tokamax.Op):
 
     def _certified(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """The derived `config`, or, where its kernels spill as the GPU assembles them alone
-        (`report.certified`), each refused, its misses recorded (`report.refuse_spilling`, so its legality
-        refuses it), and the next derived in turn: the first whose kernels hold. A derivation that offers a
+        (`report.certified`), each refused (`report.refuse_launch`, so its legality
+        refuses it) and its misses recorded (`report.missed_spilling`: stepped where the next was derived),
+        and the next derived in turn: the first whose kernels hold. A derivation that offers a
         refused config again (its legality reads no refusal) has it kept, its program's compile left to read
         it (`report.settled`). A pinned or a tuned pick is a measured choice, not certified here: its
         program's compile reads it."""
         seen = set()
         while config not in seen and (spilling := report.certified(self, ba, config)):
             seen.add(config)
-            report.refuse_spilling(self, ba, config, spilling)
-            config = self._get_heuristics_config(ba)
+            report.refuse_launch(self, ba, config, {binary.kernel for binary in spilling})
+            # Each refused config stepped to the next refused one; the last, to what the derivation takes.
+            refused, stepped = [(config, spilling), *self._climbed(ba, config, spilling, seen)], None
+            try:
+                stepped = self._get_heuristics_config(ba)
+            finally:  # a derivation left with no config raises: the last refused one stepped nowhere
+                for (refusal, its), later in zip(refused, [*refused[1:], None], strict=True):
+                    report.missed_spilling(self, ba, refusal, its, stepped=later is not None or (
+                        stepped is not None and stepped not in seen))
+            config = stepped
         return config
+
+    def emitted(self, config: Hashable, kernel: str) -> Hashable:
+        """What the kernel named `kernel` reads of `config` as it is emitted, its identity's part beside its
+        launch's (`report.named`): the whole config, unless the op states a part of it each kernel reads
+        alone, so that a change to one kernel's part leaves every other kernel the module it was. A stated
+        part that leaves out what its kernel reads would serve a stale kernel; the gate's property holds it
+        (test_recurrence_mosaic's one module a kernel's identity)."""
+        del kernel
+        return config
+
+    def rungs(self, ba: tokamax.BoundArguments, config: Hashable) -> Iterator[Hashable]:
+        """The configs above a refused `config` its derivation steps through in turn, each the same launch
+        with one more of a resource the assembler alone decides (a recurrence's producer registers, a
+        setmaxnreg step a rung), up to the most the family allows: none unless the launch states them."""
+        del ba, config
+        return iter(())
+
+    def _climbed(self, ba: tokamax.BoundArguments, config: Hashable, spilling: tuple, seen: set
+                 ) -> list[tuple[Hashable, tuple]]:
+        """`config`'s rungs (`rungs`), its kernels `spilling`, certified until one holds, which the derivation
+        then takes: the first alone (a ladder's top, which usually holds), then a round at a time
+        (`report.certified_together`, `report.rung_round` a round); each rung before it refused, returned with
+        its spilling kernels for its misses (`_certified`'s); a rung of the same round after it that spilled
+        recorded as a miss stepped nowhere, neither refused nor taken. A rung certification cannot read
+        (`report.certified`'s None: the assembler rejects it, or XLA compiles it nowhere alone) never holds:
+        it is refused for the kernels that spilled at `config`. The assembler reports whether a config holds,
+        never what it would need (its stack frame stays a word or two at every rung short of one that holds),
+        so rungs are asked, not computed."""
+        rungs, size, refused = self.rungs(ba, config), 1, []
+        named = {binary.kernel for binary in spilling}
+        while batch := list(itertools.islice(rungs, size)):
+            answers = list(zip(batch, report.certified_together(self, ba, batch), strict=True))
+            held = next((index for index, (_, found) in enumerate(answers) if found == ()), None)
+            for rung, found in answers[:held]:
+                seen.add(rung)
+                report.refuse_launch(self, ba, rung, {binary.kernel for binary in found} if found else named)
+                refused.append((rung, found or ()))
+            if held is not None:
+                for rung, found in answers[held + 1:]:
+                    if found:
+                        report.missed_spilling(self, ba, rung, found, stepped=False)
+                return refused
+            size = report.rung_round()
+        return refused
 
     def variants(self, ba: tokamax.BoundArguments) -> tuple[Hashable, ...]:
         """The configs an opt-in tuning run (`tune`) times for `ba`: the launch's heuristic alone, or, where
@@ -839,14 +893,14 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
 
         def atom(value) -> Hashable:
             if isinstance(value, jax_core.Literal):
-                return "literal", read(value.aval), read(value.val)
+                return "literal", str(value.aval), read(value.val)
             return bound(value)
 
-        update("inputs", *((bound(var), read(var.aval)) for var in (*jaxpr.constvars, *jaxpr.invars)))
+        update("inputs", *((bound(var), str(var.aval)) for var in (*jaxpr.constvars, *jaxpr.invars)))
         for equation in jaxpr.eqns:
             context = equation.ctx
             update(equation.primitive.name, tuple(atom(value) for value in equation.invars),
-                   tuple((bound(var), read(var.aval)) for var in equation.outvars),
+                   tuple((bound(var), str(var.aval)) for var in equation.outvars),
                    # The configuration an equation evaluates and lowers under (a key's bits' construction).
                    read((context.compute_type, context.threefry_partitionable, context.xla_metadata)),
                    read(context.cur_abstract_mesh),

@@ -50,6 +50,11 @@ TRUTHS = "DEW_TIER_TRUTHS"
 PARAMS = "params.pickle"
 """The file of a flow's store holding the parameters its prepare drew (`Flow.params`)."""
 
+PORTABLE = "portable.json"
+"""A flow's store's record that no kernel off the reference path claims a choice it is for on the node's
+GPU (`claimed`), at the stamp and GPU of the prepare that found it: its prepare stores nothing else, and its
+run at that stamp on that GPU skips it."""
+
 TOPOLOGY = "DEW_NODE_TOPOLOGY"
 """The node's GPUs' serialized topology (dew-ops' session hands a prepare its node's): the GPU a flow's
 programs are compiled for."""
@@ -85,7 +90,8 @@ def preparing() -> bool:
 class Flow:
     """One model family's flow: the released config of `fixture` with `widths` set (its text config's for a
     wrapper), computing in `dtype`; `native` each program's (`KINDS`: its training step, its decode loop)
-    choices on a GPU and the kernel each must take there (a name, `NATIVE` or `EVERY`); under the lane's
+    choices and the kernel each must take on a GPU a native kernel claims it on (a name, `NATIVE` or `EVERY`,
+    `held_routes`); under the lane's
     deterministic ops and matmul precision where `lane`, as a user's process runs otherwise, without them
     and at the default precision (`precision`); `rows` sequences of `length` tokens, decoded from `prefill`
     of them a token a step."""
@@ -103,30 +109,12 @@ class Flow:
     """Each kind's declared count (`KINDS`), as a qualification run sizes it on the GPUs
     (`reference_error._qualified`, row 6198): the larger of an A100's and a GH200's (DC-SIZE2-A100 and
     -SM90, 2026-11-14)."""
-    families: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
-    """Each choice the flow is for that takes a native kernel on some GPUs alone: the instruction families
-    (`generation.family`) of those GPUs, elsewhere the portable math; a choice it names none for takes one on
-    every GPU."""
-
     @property
     def precision(self) -> str | None:
         """The default matmul precision its programs trace at (`jax_default_matmul_precision`): the lane's,
         whose fp32 products are whole (tests/lane_environment.py), or a user's, JAX's own default (None),
         under which a port takes an fp32 call's products in TF32 (`recurrence_chunk._port_precision`)."""
         return "highest" if self.lane else None
-
-    def native_on(self, target: str) -> dict[str, dict[str, str]]:
-        """Each program's choices that take a native kernel on the GPU generation `target` (`families`), each
-        with the kernel it must take there."""
-        family = generation.family(target)
-        return {kind: {choice: kernel for choice, kernel in choices.items()
-                       if family in self.families.get(choice, (family,))}
-                for kind, choices in self.native.items()}
-
-    def runs_on(self, target: str) -> bool:
-        """Whether the flow runs on the GPU generation `target`: where a choice it is for is native there, or
-        where it is for none (a precision's flow on its declared routes)."""
-        return not any(self.native.values()) or any(self.native_on(target).values())
 
     @cached_property
     def config(self) -> dict:
@@ -315,8 +303,7 @@ FLOWS = (
          {kind: {"selective_scan": NATIVE, "short_conv": NATIVE} for kind in KINDS}),
     Flow("lightning attention", "minimax-tiny", LIGHTNING, "bfloat16",
          {"train": {**TEMPLATE, "gated_delta_rule": NATIVE},
-          "decode": {**TEMPLATE, "decode": NATIVE, "gated_delta_rule": NATIVE}},
-         families={"gated_delta_rule": ("wgmma",)}),
+          "decode": {**TEMPLATE, "decode": NATIVE, "gated_delta_rule": NATIVE}}),
 )
 """Every model flow, by the route it is for (docs/design/testing.md: a kernel's native run is a flow's
 cell): each family that takes a distinct default route on a GPU, its bf16 attention flows twice, under the
@@ -324,8 +311,9 @@ lane's deterministic ops (the template on a GPU's own mainloop) and as a user's 
 library's fused kernel where one takes the call, FlashAttention among them, which refuses the lane's), the
 dense fp32 flow on XLA's declared fp32 route, and the SSD port in fp32 too, as a user's process runs it (its
 products in TF32 at the default precision, which the lane's whole fp32 products refuse).
-Lightning attention's decay without the delta rule takes the recurrence template on a Hopper GPU alone: fla's
-port hands it to the portable math (`recurrence_chunk.PORT_SUPPORTS`). A latent attention flow's decode loop
+Lightning attention's decay without the delta rule takes the recurrence template on a Hopper or an Ampere GPU
+(an A100's once its output launch's phases were stated apart, row 6233): fla's port hands it to the portable
+math (`recurrence_chunk.PORT_SUPPORTS`). A latent attention flow's decode loop
 attends in XLA (the latent decode's own form), and a KDA flow's decode step's softmax layer too: no native
 attention route of theirs there."""
 
@@ -436,35 +424,56 @@ def programs_of(flow: Flow) -> dict[str, tuple[Callable, list]]:
 
 
 class Unreached(AssertionError):
-    """A flow whose Dew arm did not take a route it is for, or took a native kernel where it holds the route
-    portable (`held_routes`)."""
+    """A flow whose Dew arm did not take a route it is for on a GPU a native kernel claims it on
+    (`held_routes`)."""
+
+
+def claimed(flow: Flow, found: Mapping[str, list]) -> dict[str, set[str]]:
+    """Each program's choices the flow is for that a kernel off the reference path claims on the GPU its
+    routes (`found`, each program's by its kind) were traced for: a route such a kernel took, or one whose
+    `preferred` (what it runs where nothing refuses the call, `generation.Route`) is such a kernel turned
+    down for a limit a row tracks lifting, so a kernel refused by a fit or a launch it does not yet make
+    reddens its flow while its row is open. A refusal no implementation lifts (row `INHERENT`), or the GPU
+    measuring the reference path the faster (`measured`), releases the claim. Read from the routes, never
+    a list kept beside the kernels: a kernel that comes to claim a GPU is the flow's to take there."""
+    generic = generic_kernels()
+
+    def claims(route) -> bool:
+        choice = str(route.choice)
+        if route.kernel not in generic[choice]:
+            return True  # a kernel off the reference path took the call
+        refusal = route.refusal
+        return route.preferred not in generic[choice] and (
+            refusal is None or (refusal.row != generation.INHERENT and refusal.kind != "measured"))
+
+    return {kind: {str(route.choice) for route in found[kind]
+                   if str(route.choice) in choices and claims(route)}
+            for kind, choices in flow.native.items()}
 
 
 def held_routes(flow: Flow, found: Mapping[str, list], target: str) -> None:
     """Raise unless each of the flow's programs, traced for the GPU generation `target` (`found`, each
-    program's routes by its kind), took every route it is for there (`Flow.native_on`): a kernel off the
-    reference path among its choice's routes (`NATIVE`), every one of them so (`EVERY`), or the kernel it
-    names; and the portable math alone on a choice native on other GPUs only (`Flow.families`), so a kernel
-    that comes to take it is a flow's to cover."""
+    program's routes by its kind), took every route it is for that a native kernel claims there
+    (`claimed`): a kernel off the reference path among its choice's routes (`NATIVE`), every one of them so
+    (`EVERY`), or the kernel it names. A choice no native kernel claims on `target` runs the portable math,
+    which check 1 holds as it holds any route."""
     generic = generic_kernels()
-    native = flow.native_on(target)
+    native = claimed(flow, found)
     for kind, choices in flow.native.items():
         taken = {}
         for route in found[kind]:
             taken.setdefault(str(route.choice), set()).add(route.kernel)
         for choice, kernel in choices.items():
-            kernels = taken.get(choice, set())
             if choice not in native[kind]:
-                if kernels - generic[choice]:
-                    raise Unreached(f"{flow.name}: its {kind}'s {choice} took {sorted(kernels)} on {target}, "
-                                    "where the flow holds it portable (`Flow.families`): name "
-                                    f"{generation.family(target)} there")
                 continue
+            kernels = taken.get(choice, set())
             held = (kernels - generic[choice] if kernel == NATIVE else
                     kernels if kernel == EVERY and not kernels & generic[choice] else kernels & {kernel})
             if not held or (kernel not in (NATIVE, EVERY) and kernels - {kernel}):
+                refused = sorted({f"{route.preferred}: {route.refusal.code}" for route in found[kind]
+                                  if str(route.choice) == choice and route.refusal is not None})
                 raise Unreached(f"{flow.name}: its {kind}'s {choice} took {sorted(kernels) or 'nothing'} on "
-                                f"{target}, not {kernel}: the flow does not reach the route it is for")
+                                f"{target}, which a native kernel claims, not {kernel}; refused: {refused}")
 
 
 def held_reference(flow: Flow, found: list) -> None:
@@ -491,17 +500,21 @@ def _compiled(named: Mapping[str, tuple[Callable, list]], arm: str, target):
 
 def prepare(flow: Flow) -> bool:
     """The flow's prepare: its programs compiled for the node's GPU into its store, Dew's arm's routes held
-    to the ones it is for, the reference arm's to its reference path; then every draw's truth (`judge`).
-    Whether it prepared: none where the node's GPU does not run the flow (`Flow.runs_on`)."""
+    to the ones it is for (`held_routes`), the reference arm's to its reference path; then every draw's truth
+    (`judge`). Whether it prepared: none where no kernel off the reference path claims a choice the flow is
+    for on the node's GPU (`claimed`), which its store records (`PORTABLE`) for its run to skip."""
     held_process(flow)
     target = _target()
-    if not flow.runs_on(target.generation):
-        return False
     directory = store_of(flow)
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / PARAMS).write_bytes(pickle.dumps(flow.params))
+    (directory / PORTABLE).unlink(missing_ok=True)
     named = programs_of(flow)
     dew, found = _compiled(named, "dew", target)
+    if any(flow.native.values()) and not any(claimed(flow, found).values()):
+        # No kernel off the reference path claims a choice the flow is for on this GPU: its run's to skip.
+        (directory / PORTABLE).write_text(json.dumps({"stamp": stamp(), "target": target.generation}))
+        return False
+    (directory / PARAMS).write_bytes(pickle.dumps(flow.params))
     dew.save(directory / "dew.programs")
     held_routes(flow, found, target.generation)
     with generation.chosen(**reference_kernels()):
@@ -599,3 +612,16 @@ def measured(flow: Flow, began: float) -> dict:
     written = sum(path.stat().st_size for path in store_of(flow).rglob("*") if path.is_file())
     return {"seconds": time.perf_counter() - began, "written_bytes": written,
             "peak_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024}
+
+
+def portable_here(flow: Flow) -> bool:
+    """Whether the flow's prepare found nothing it is for claimed on this GPU (`PORTABLE`), at this stamp:
+    a record another stamp or GPU wrote is refused, never read as this run's."""
+    record = store_of(flow) / PORTABLE
+    if not record.is_file():
+        return False
+    found = json.loads(record.read_text())
+    here = {"stamp": stamp(), "target": generation.device_generation()}
+    if found != here:
+        raise ValueError(f"{flow.name}: its store's portable record is {found}'s, not this run's {here}")
+    return True

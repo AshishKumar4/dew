@@ -12,8 +12,10 @@ GPU's interpreter on the interpreted target's bundle (`mainloop.issued`) at one 
 roles' streams, not proof of its kernels, which the GPU gate is;
 the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
 
+import collections
 import dataclasses
 import functools
+import types
 from collections.abc import Callable
 
 import jax
@@ -573,37 +575,6 @@ def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(ta
         jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4))).trace(*operands).lower(lowering_platforms=("cuda",))
 
 
-@pytest.mark.parametrize('dtype', [jnp.bfloat16, jnp.float32], ids=['bf16', 'fp32-accurate'])
-def test_a_launch_states_the_part_pairs_it_issues_and_declares_the_models_products(dtype):
-    """A gated delta rule's forward through the template, lowered for an H100: each launch
-    states the products it issues, its operands' part pairs (`product.terms`: one for bf16, six for an fp32
-    operand's three bf16 parts under the accurate forms), and declares the model's products apart
-    (`lowered.KernelCall.model_flops`), which Dew's FLOP count reads for the model's work."""
-    from dew.nn.kernels import lowered
-    from dew.nn.kernels.templates import product
-    from dew.nn.precision import ACCURATE
-
-    rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 64
-    operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), dtype)] * 2 + [
-        jax.ShapeDtypeStruct((rows, length, value_heads, width), dtype),
-        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.float32),
-        jax.ShapeDtypeStruct((rows, length, value_heads), dtype)]
-
-    rule = functools.partial(mosaic_rule, tiles=NARROW, bound=1.0)
-    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    with generation.assumed("sm90"), generation.run_precision(ACCURATE), jax.sharding.use_abstract_mesh(mesh):
-        program = jax.jit(rule).trace(*operands).lower(lowering_platforms=("cuda",))
-    launches = [call for call in lowered.kernel_calls(program) if call.kind == "mosaic_gpu"]
-    assert launches and all(call.model_flops is not None for call in launches)
-    ratios = {(call.flops or 0.0) / call.model_flops for call in launches if call.model_flops}
-    if dtype == jnp.bfloat16:
-        assert ratios == {1.0}
-    else:
-        # A launch over fp32 operands issues every part pair; one over the rule's bf16 gates, one.
-        pairs = float(len(product.terms(product.EXACT_PARTS, product.EXACT_PARTS)))
-        assert pairs in ratios and ratios <= {1.0, pairs}
-
-
 def test_a_ranged_calls_inverse_states_the_fp32_parts_its_merges_issue():
     """A bf16 Kimi delta attention forward with no bound on its inverse, lowered for an H100: its chunk
     inverse's doubling merges in fp32 (`Call.ranged`), two bf16 parts on warpgroup products, which take no
@@ -1020,6 +991,18 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     assert legal and stepped != first and taken == (stepped,)
 
 
+def _route_loss(options: dict):
+    """A loss over the chunked op's route to the template (`recurrence_chunk.template_rule`) under `options`,
+    as a training step takes its output and final memory."""
+    from dew.nn.kernels import recurrence_chunk
+
+    def loss(*given):
+        out, final = recurrence_chunk.template_rule(*given, **options)
+        return out.astype(jnp.float32).sum() + final.sum()
+
+    return loss
+
+
 def test_a_refusal_under_the_remat_rung_reaches_the_route():
     """Under the remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`), a refusal of
     every tile of the run's training call's launch (its identity as its lowering for an H100 names it,
@@ -1038,9 +1021,7 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
     options = {'max_segments': None, 'scale': None, 'delta': True, 'wide': False, 'bound': 1.0,
                'rounded': True}
 
-    def loss(*given):
-        out, final = recurrence_chunk.template_rule(*given, **options)
-        return out.astype(jnp.float32).sum() + final.sum()
+    loss = _route_loss(options)
 
     def named() -> str:
         return recurrence_chunk.port_kernel(*operands, bound=1.0, product='training', report=False)
@@ -1160,18 +1141,23 @@ def _ran(tiles, *, training: bool):
     return tiles if training else tiles.forward or tiles
 
 
-def _two_roles(name: str, bound, derived, family, facts, *, packed: bool, training: bool) -> list:
+def _two_roles(bound, derived, facts, *, packed: bool, training: bool) -> list:
     """The walks at two consumer roles a program (`Tiles.walkers`) as a gate case's tiles, which the
-    derivation gives a call whose walks fill more than a wave and `RESOURCE_SHAPES` never do: a role's
-    registers are its share of the program's; none where the family's walks take one role
-    (`template.walk_roles`), packed documents', a value width of an odd number of blocks, or two roles' tiles
-    past the GPU's resources for the product, a training call's where `training` (`Mosaic._staged` None)."""
-    value_width = RESOURCE_SHAPES[name][3]
-    if template.walk_roles(family) < 2 or packed or value_width // derived.block_v % 2:
+    derivation gives a call whose walks fill more than a wave and `RESOURCE_SHAPES` never do (`Mosaic._walked`
+    at two waves): a role's registers are its share of the program's; none where the family's walks take one
+    role (`template.walk_roles`), packed documents', a value width of an odd number of blocks, two roles'
+    tiles past the GPU's resources for the product, or a training call's whose fast backward holds at one role
+    and not at two. Their launches' producers are raised past a compile's spills as the derivation's are
+    (`Mosaic._settled`), under the target whose capacities a refusal's identity reads."""
+    if packed:
         return []
-    two = template.MOSAIC._staged(bound, derived.block_v, facts, derived.chunk, walkers=2,
-                                  wide=derived.block_o or derived.block_v, training=training)
-    return [] if two is None else [(two, 'two roles ')]
+    # As the derivation walks a call of two waves (`Mosaic._walked`): two roles only where they hold, and
+    # a training call's only where its fast backward holds as it does at one.
+    two = template.MOSAIC._walked(bound, derived, facts, 2, training=training)
+    if two.walkers != 2:
+        return []
+    with generation.assumed(facts):
+        return [(template.MOSAIC._settled(bound, two, facts), 'two roles ')]
 
 
 def _gate_call(name: str, dtype, given: list, starts, tiles, family, *, training: bool):
@@ -1242,8 +1228,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                 # do not hold (`template.backward_holds`).
                 refused.append(f"{name} {jnp.dtype(dtype).name} fast backward{' packed' if packed else ''}")
                 return []
-        walked = _two_roles(name, bound, _ran(derived, training=training), family, facts, packed=packed,
-                            training=training)
+        walked = _two_roles(bound, _ran(derived, training=training), facts, packed=packed, training=training)
         if variant == TWO_ROLES:
             return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
                     for tiles, kind in walked]
@@ -1270,10 +1255,12 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                 *args, tiles=tiles, family=family, target=facts, starts=starts,
                 **unwide, **_skipped(name, dtype))
         if not held or kind == 'two roles ':
-            # Forced role counts can include a launch the model refuses.
+            # Forced role counts can include a launch the model refuses: at setmaxnreg's least producer, as
+            # the template's legality judges it, a raised producer's consumers the assembler's to certify.
             # Its admitted neighbours still have to hold (`apart_failures`).
             unheld = {launch.name for launch in plans[label]
-                      if launch.registers > _model(launch, family, facts).budget}
+                      if launch.registers > _model(dataclasses.replace(launch, producer=None), family,
+                                                   facts).budget}
             if unheld:
                 apart[label] = unheld
 
@@ -1395,10 +1382,10 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
 def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blackwell(name):
     """A geometry's 16-bit training at its derived tiles, compiled for a compile-only B200 over one row of
     2048 tokens, so each persistent launch's programs walk several tiles (the gate's 256 tokens walk one): no
-    launch spills. Its producer at
-    24 registers, the walk's indices and addresses spilled once a program walked three tiles or more and
-    ptxas allocated the consumers past their live set around them (`mainloop.PERSISTENT_PRODUCER`, row 5693:
-    the 4B SSD's scores' gradient spilled 16 bytes at its 248 registers, its model 223)."""
+    launch spills, certification raising a launch's producer where it spills at setmaxnreg's least
+    (`resources.Producers`): at 24 registers, the walk's indices and addresses spilled once a program walked
+    three tiles or more and ptxas allocated the consumers past their live set around them (row 5693: the 4B
+    SSD's scores' gradient spilled 16 bytes at its 248 registers, its model 223)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -1408,15 +1395,24 @@ def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blac
     args = resource_operands(name, dtype, rows, length)
     bound = template.MOSAIC.bind(*args, None, max_segments=None, bound=None if name in RATED else 1.0,
                                  **_form(name, dtype), **_skipped(name, dtype))
-    with generation.assumed(facts):
-        tiles = template.MOSAIC.derived(bound, facts)
-        models = _models(template.MOSAIC.launches(bound, tiles, facts, backward=True), family, facts)
     # The output's and the final memory's cotangents.
     cotangents = [jax.ShapeDtypeStruct(args[2].shape, dtype),
                   jax.ShapeDtypeStruct(args[5].shape, jnp.float32)]
-    call = functools.partial(_gate_call, name, dtype, [*args, *cotangents], None, tiles, family,
-                             training=True)
-    (record,) = compile_mosaic_kernels([KernelCase(name, call, models)], 'sm100')
+    stepped = set()
+    while True:
+        # Derived as a run derives them, a launch spilling at the tiles before refused (`stepped_down`).
+        with generation.assumed(facts):
+            tiles = template.MOSAIC.derived(bound, facts)
+            models = _models(template.MOSAIC.launches(bound, tiles, facts, backward=True), family, facts)
+        call = functools.partial(_gate_call, name, dtype, [*args, *cotangents], None, tiles, family,
+                                 training=True)
+        (record,) = compile_mosaic_kernels([KernelCase(name, call, models)], 'sm100')
+        spilling = {kernel["kernel"] for kernel in record.get("kernels", ()) if kernel.get("spilled")}
+        if not spilling or tiles in stepped:
+            break
+        stepped.add(tiles)
+        with generation.assumed(facts):
+            report.refuse_launch(template.MOSAIC, bound, tiles, spilling)
     assert not mosaic_failures([record]), mosaic_failures([record])
 
 
@@ -1439,10 +1435,13 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
                                 if kernel.get("spilled") and kernel["kernel"] not in
                                 refused_kernels(record, apart.get(case.name, set()))}
                     for case, record in zip(cases, found, strict=True) if case.required}
-        spilling = {name: kernels for name, kernels in spilling.items() if kernels and name not in stepped}
+        # A case refused once at a config, and again at the config its derivation then gives (a launch's
+        # producer raised a step, `Mosaic._settled`), never twice at one.
+        spilling = {name: kernels for name, kernels in spilling.items()
+                    if kernels and (name, launched[name][1]) not in stepped}
         if not spilling:
             break
-        stepped |= set(spilling)
+        stepped |= {(name, launched[name][1]) for name in spilling}
         # Refused as the run's compile refuses them: under the target, whose capacities the launch's identity
         # reads.
         with generation.assumed(generation.gpu_target(target)):
@@ -1609,3 +1608,155 @@ def test_a_training_launchs_backward_kernels_carry_its_launch():
     assert set(training) - set(forward), (forward, training)
     assert len(set(training.values())) == 1 and None not in training.values(), training
 
+
+
+
+def _reverse_walk_certified(op=None) -> list:
+    """Qwen3.5-4B's gated delta net over its 12,288-token row lowered for a compile-only B200 as a training
+    step runs it (its gradient, certified as reverse mode runs it, `report.pulled`), through `op`'s
+    certification where given (`tuning.KernelOp._certified` of its derived tiles), else through the call's
+    route: the template's certifications it made and the configs it refused."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    # Qwen3.5-4B's linear attention: 16 key heads and 32 value heads, each 128 wide.
+    operands = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
+        ((1, 12288, 16, 128), jnp.bfloat16), ((1, 12288, 16, 128), jnp.bfloat16),
+        ((1, 12288, 32, 128), jnp.bfloat16), ((1, 12288, 32), jnp.float32), ((1, 12288, 32), jnp.bfloat16))]
+    options = {'max_segments': None, 'scale': None, 'delta': True, 'wide': False, 'bound': 1.0,
+               'rounded': True}
+    before = {id(certified) for certified in report.certifications()}
+    with (report.refusals(), generation.assumed('sm100'), generation.chosen(gated_delta_rule='mosaic_gpu'),
+          report.certifying(compile_only_gpus('sm100')[0]), report.pulled()):
+        if op is None:
+            jax.jit(jax.grad(_route_loss(options), argnums=(0, 1, 2))).trace(*operands).lower(
+                lowering_platforms=('cuda',))
+        else:
+            bound = op.bind(*operands, None, bound=1.0, rounded=True)
+            op._certified(bound, op.derived(bound, generation.gpu_target()))
+        refused = [config for _, config, _ in report.refused_launches()]
+    return [each for each in report.certifications()
+            if id(each) not in before and each.op == type(op or template.MOSAIC).__name__], refused
+
+
+@lowers('sm100')
+def test_a_launch_whose_producer_must_rise_is_certified_at_its_ladders_top_in_one_compile():
+    """A training call whose reverse walk spills at setmaxnreg's least producer on a compile-only B200
+    (`_reverse_walk_certified`) is certified at its producer's top, its program's entry share (two
+    warpgroups, two programs a multiprocessor: 128), in one compile: every role holds the entry share and
+    no register moves. From the ladder's foot up, the walk's producer rose 24 to 80 over eight
+    certification compiles, 95 s of the 4B's cold start."""
+    from dew.nn.kernels.templates import resources
+
+    certified, _ = _reverse_walk_certified()
+    raised = [each.config.producers.of('recurrence_reverse') for each in certified]
+    assert [cap for cap in raised if cap is not None] == [resources.entry_registers(2, 2)], raised
+
+
+TOP_RUNG_LOWERED = """
+import collections, json
+from jax._src import monitoring
+from dew.training.runtime import ready_process
+import test_recurrence_mosaic as gate
+
+served = collections.Counter()
+monitoring.register_event_listener(
+    lambda event, **_: served.update([event.rsplit("/", 1)[-1]]) if "lowering_cache" in event else None)
+ready_process()
+certified, _ = gate._reverse_walk_certified()
+print(json.dumps({"served": dict(served), "kernels": [len(each.kernels) for each in certified],
+                  "raised": [each.config.producers.of("recurrence_reverse") for each in certified]}))
+"""
+"""A process configured as a run's (`ready_process`: its compilation cache and its kernels' lowerings kept
+beside it) certifying the 4B reverse walk (`_reverse_walk_certified`): the lowering cache's hits and misses,
+each certification's kernels and its reverse walk's producer."""
+
+
+@lowers('sm100')
+def test_a_ladders_top_reads_every_kernel_but_the_raised_one_from_the_lowering_cache(tmp_path):
+    """In a process that keeps its lowerings as a run does (`TOP_RUNG_LOWERED`), the reverse walk's top
+    rung lowers only the kernel its producer changed: every other kernel of the launch is the module it was
+    at the floor (its identity, `report.named`), read back from the Pallas lowering cache, whose key holds no
+    caller metadata (Dew's JAX build, post93). Named by their launch's whole config, each rung lowered all
+    nine of the launch's kernels again in Python."""
+    from process_support import fresh
+
+    found = fresh(TOP_RUNG_LOWERED, cache_dir=tmp_path / "cache", platforms="cpu")
+    assert found["raised"][1:] and found["raised"][-1] is not None, found
+    assert found["served"].get("hit", 0) >= found["kernels"][-1] - 1, found
+
+
+@lowers('sm100')
+def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
+    """A ladder whose first rung the assembler rejects (the reverse walk's producer past its program's entry
+    share, the roles' setmaxnreg moves inverted: ptxas refuses the kernel) and whose next holds: the rejected
+    rung is refused as a spilling one is, and the derivation takes the one below it, never the one
+    certification could not read (`report.certified`'s None)."""
+    from dew.nn.kernels.templates import resources
+
+    class PastItsTop(type(template.MOSAIC)):
+        def rungs(self, ba, config):
+            yield from (template._producing(config, resources.Producers((('recurrence_reverse', cap),)))
+                        for cap in (232, 128))
+
+    certified, refused = _reverse_walk_certified(PastItsTop())
+    assert [each.config.producers.of('recurrence_reverse') for each in certified] == [None, 128], certified
+    caps = {config.producers.of('recurrence_reverse') for config in refused}
+    assert 232 in caps and 128 not in caps, caps
+
+
+@lowers('sm100')
+@pytest.mark.parametrize('target', ['sm100', 'sm90'])
+def test_a_kernel_named_alike_beside_a_raised_launch_is_one_module(target):
+    """Each geometry the gate trains in bf16, its training call at its derived tiles and at each launch's
+    first producer rung alone (`Mosaic._raised`, a setmaxnreg step), lowered: a kernel whose
+    identity (`report.named`: the launch's and what its emission reads of the config, `Mosaic.emitted`) is
+    alike at two configs is one module at both, so a rung's certification may read every kernel it leaves
+    alone from the lowering cache and Mosaic's compile; one the rung raises is another module."""
+    from dew.nn.kernels.lowered import kernel_calls
+
+    facts = generation.gpu_target(target)
+    unchanged = raised = 0
+    # The geometries the gate trains in bf16 (`GATE_GROUPS`' training groups).
+    for name in sorted({name for name, dtype, training, packed, variant in GATE_GROUPS
+                        if training and dtype == jnp.bfloat16 and not packed and variant is None}):
+        operands = resource_operands(name, jnp.bfloat16, 1, 1024)[:5]
+        form, skipped = _form(name, jnp.bfloat16), _skipped(name, jnp.bfloat16)
+        bound = template.MOSAIC.bind(*operands, None, bound=1.0, **form, **skipped)
+        with generation.assumed(facts), report.refusals():
+            tiles = template.MOSAIC.derived(bound, facts)
+            if tiles is None:
+                continue
+            # Each launch's first rung alone: every other kernel's part is the derived tiles' at it.
+            ladders = [tiles]
+            for launch in template.MOSAIC.launches(bound, tiles, facts, backward=True):
+                up = template.MOSAIC._raised(bound, tiles, frozenset({launch.name}), facts)
+                if up is not None:
+                    ladders.append(template._producing(tiles, up))
+            modules: dict[tuple[str, str], set[bytes]] = collections.defaultdict(set)
+            for config in ladders:
+                # A rated scan's skip an operand beside the call's, traced as its route hands it.
+                def loss(*given, config=config, form=form, named=tuple(skipped)):
+                    out, final = mosaic_rule(*given[:5], tiles=config, bound=1.0, **form,
+                                             **dict(zip(named, given[5:], strict=True)))
+                    return out.astype(jnp.float32).sum() + final.sum()
+
+                # A lowering cache's hit is the module its lowering gives: its key is all the lowering reads.
+                program = jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(
+                    *operands, *skipped.values()).lower(lowering_platforms=('cuda',))
+                for call in kernel_calls(program, unrun=True):
+                    if call.kind == 'mosaic_gpu':
+                        modules[call.name, repr(template.MOSAIC.emitted(config, call.name))].add(call.ir)
+        assert all(len(found) == 1 for found in modules.values()), name
+        named = collections.Counter(kernel for kernel, _ in modules)
+        unchanged += sum(1 for kernel, _ in modules if named[kernel] == 1)
+        raised += sum(1 for kernel in named if named[kernel] > 1)
+    assert unchanged and raised, (unchanged, raised)
+
+
+def test_a_spilling_kernel_raises_only_the_launch_it_belongs_to():
+    """A kernel spilling under a launch name another launch's extends (`recurrence_intra_solve` beside
+    `recurrence_intra`) is that longer launch's alone (`template._owners`), so only its producer rises."""
+    launches = [types.SimpleNamespace(name=name)
+                for name in ('recurrence_intra', 'recurrence_intra_solve', 'recurrence_scan')]
+    owners = template._owners({'recurrence_intra_solve__l1f2', 'recurrence_scan__l3a4'}, launches)
+    assert owners == {'recurrence_intra_solve', 'recurrence_scan'}

@@ -11,7 +11,7 @@ programs, one a core. A program is one role: no producer runs beside it, and not
 
 import contextvars
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +21,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import handoffs, mosaic, persistent
+from dew.nn.kernels.templates import emission, handoffs, mosaic, persistent
+from dew.nn.kernels.templates.cost import Stated
 
 STAGES = 2
 """The slots a stream's ring holds: a step's blocks arrive while the step before it multiplies (Pallas
@@ -227,7 +228,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
+               cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
+               model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None,
                producer: int | None = None, shared: int | None = None,
@@ -273,12 +275,13 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                 out_specs=[pl.BlockSpec(memory_space=pl.ANY)] * (len(outputs) + len(aliased)),
                 input_output_aliases={at: len(outputs) + k for k, at in enumerate(places)},
                 compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",) * len(grid)),
-                interpret=pltpu.InterpretParams() if interpret else False, cost_estimate=cost)(*values)
+                interpret=pltpu.InterpretParams() if interpret else False,
+                cost_estimate=emission.built_with(cost))(*values)
             for at, added in zip(places, written[len(outputs):], strict=True):
                 operands[at][...] = added
             return jax.tree.unflatten(structure, written[:len(outputs)])
 
-        return launched
+        return emission.costed(launched, cost)
 
     def program_index(self, name: str, *, fresh: bool = False) -> jax.Array:
         # Pallas TPU numbers a grid's axes: `name`'s place among the launch's (`kernel`'s `grid_names`), a
@@ -382,12 +385,14 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False, ahead: tuple[str, ...] = ()) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False, products: Sequence[mosaic.Product] = ()
+                ) -> tuple[C, tuple[jax.Array, ...]]:
         # Each step's blocks awaited before it and the next step's copied while it multiplies; a segment
         # of no steps copies nothing. Its products are synchronous: no stage outlives its step.
-        if ahead:
+        if mosaic.ahead_streams(products):
             raise NotImplementedError(f"{self.name}'s walk reads no stream ahead")
         del first, in_flight, unrolled, interpret
+        segments = mosaic.stepped(segments)
         names = tuple(streams.views)
         carry = (start, self.started(shapes, initial))
         for step, lo, hi in segments:

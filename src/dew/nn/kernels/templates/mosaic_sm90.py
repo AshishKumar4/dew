@@ -6,7 +6,6 @@ accumulates in a warpgroup's registers in the WGMMA layout, and runs asynchronou
 
 import jax
 import jax.numpy as jnp
-from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
@@ -182,14 +181,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
             for acc, value in zip(accumulators, initial, strict=True):
                 if value is not None:
                     acc[...] = value
-            carry = start
-            for loop in segments:
-                def stepped(index, carry, step=loop.step):
-                    return step(index, carry, accumulators)[0]
-
-                carry = lax.fori_loop(loop.lo, loop.hi, stepped, carry)
-                if loop.then is not None:
-                    loop.then()
+            carry = mosaic.looped(segments, start, accumulators)
             plgpu.wgmma_wait(0)
             return carry, tuple(acc[...] for acc in accumulators)
 

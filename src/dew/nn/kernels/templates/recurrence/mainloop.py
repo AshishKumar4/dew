@@ -60,7 +60,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tables, tuning
 from dew.nn.kernels.templates import bundles, mosaic, operands, product, resources, swizzling
-from dew.nn.kernels.templates.cost import Work, estimate
+from dew.nn.kernels.templates.cost import Stated, stored
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.table import (
     Table,
@@ -156,6 +156,9 @@ class Tiles:
     forward: "Tiles | None" = None
     chunk: int = dataclasses.field(kw_only=True)
     """The tokens a chunk (`Call.chunk`), derived as the other tiles are (`template.Mosaic.derived`)."""
+    producers: resources.Producers = dataclasses.field(default_factory=resources.Producers, kw_only=True)
+    """The registers its launches lower their producers to where a compile found them spilling at fewer
+    (`template.Mosaic._raised`), every other launch's at the least."""
 
     @property
     def output_block(self) -> int:
@@ -280,6 +283,13 @@ class Call:
     """Whether its solve holds the chunk inverse at fp32's range: a 16-bit delta rule whose form proves no
     bound on the inverse's entries (`recurrence.Hooks.inverse_bound`), its merges in bf16 parts
     (`_merging`)."""
+    producers: resources.Producers = dataclasses.field(default_factory=resources.Producers)
+    """Its tiles' (`Tiles.producers`)."""
+
+    def producer(self, launching: Callable) -> int | None:
+        """The registers the producer of the launch `launching` makes (`launch_kernel`'s, named for it)
+        lowers to (`Tiles.producers`), None at the least."""
+        return self.producers.of(f"recurrence{launching.__name__}")
 
     @property
     def gated_keys(self) -> bool:
@@ -568,8 +578,7 @@ class Launch:
     and each one's threads (its bundle's warpgroups, `Family.warpgroups`), the shared memory a program
     allocates (its streams' slots and barriers and its staging tiles, as its bundle declares them), the
     registers a consumer thread holds at its program's peak (`resources.live_registers` of the tiles it
-    states), its steps, the chunks in flight, the bytes a step streams in, a program's tensor FLOPs and
-    exponentials, the bytes it reads and writes in global memory, the programs a multiprocessor holds of it at
+    states), the chunks in flight, the bytes a step streams in, the programs a multiprocessor holds of it at
     once (`resources.plan`; zero where it holds none, a config past the device), its consumer roles, and the
     bundle it issues by (`family`: the call's, or the layout a launch takes for itself, `_solving`), which
     every check of it reads."""
@@ -579,12 +588,8 @@ class Launch:
     threads: int
     shared: int
     registers: int
-    steps: float
     stages: int
     step_bytes: int
-    flops: float
-    exponentials: float
-    device_bytes: int
     resident: int = 1
     consumers: int = 1
     family: mosaic.Family | None = None
@@ -629,7 +634,8 @@ Planning (`template.planned`) traces every call, each launch recording itself (`
 
 def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *, once: dict | None = None,
                       consumers: int = 1, swizzles: dict[str, int] | None = None, reduces: bool = True,
-                      after: tuple = (), issues: bool = True
+                      after: tuple = (), issues: bool = True, together: tuple[int, ...] = (),
+                      sums: tuple[int, ...] = ()
                       ) -> tuple[Callable[[int], dict], Callable[[int], resources.Scope], tuple, dict]:
     """A launch's shared memory at a ring depth, as `launch_kernel` lays it: its walked streams' and its
     streams loaded once' allocations (each its own; a pipelined family's stages are its allocation's), which
@@ -642,7 +648,7 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
     staged = (*staged, _landed(landed, family))
     # The products' shared memory and barriers where the family keeps them (`Issuer.product_held`, of the
     # scratch `launch_kernel` scopes beside the staging).
-    scoped = _products_scoped(call, blocks, staging, consumers, issues)
+    scoped = _products_scoped(call, blocks, staging, consumers, issues, together, sums)
     products, addresses = family.product_held(scoped), family.product_addresses(scoped)
 
     def allocations(depth: int) -> dict:
@@ -658,12 +664,17 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
     return allocations, scope, staged, landed
 
 
-def _products_scoped(call: Call, blocks: dict, staging: tuple, consumers: int, issues: bool) -> tuple | None:
+def _products_scoped(call: Call, blocks: dict, staging: tuple, consumers: int, issues: bool,
+                     together: tuple[int, ...] = (), sums: tuple[int, ...] = ()) -> tuple | None:
     """The products a launch's family scopes memory for (`Family.scoped`'s `products`): its roles' and each
-    width one of its tiles' (its streams', its staging's) or the chunk's; None where it issues none (a
-    launch of elementwise work alone, `own_pairs`': an sm100's tensor memory scoped for none cost one 16 bytes
-    of spills, jsf-sm100-redgreen)."""
-    return (consumers, _product_widths(blocks, staging, call.chunk), ()) if issues else None
+    width one of its tiles' (its streams', its staging's) or the chunk's, the widths of the sums its walk
+    holds across its steps (`sums`, `mosaic.Walk.sums`) and of the groups it sums together (`together`,
+    `Issuer.summed_together`'s, each its own accumulator); None where it issues none (a launch of elementwise
+    work alone, `own_pairs`': an sm100's tensor memory scoped for none cost one 16 bytes of spills,
+    jsf-sm100-redgreen)."""
+    if not issues:
+        return None
+    return consumers, _product_widths(blocks, staging, call.chunk), (), (), sums, together
 
 
 def allocation_scope(family: mosaic.Family, streams: dict, staged: tuple, *, reduces: bool = True,
@@ -688,15 +699,6 @@ def _inverse_flops(chunk: int) -> float:
     """The tensor FLOPs of a `chunk`'s inverse (`algebra.doubled`): two whole-tile products a doubling level,
     from two-wide blocks to the chunk's (`log2(C) - 1` levels), each `2 C^3`, masked after they issue."""
     return 4 * chunk ** 3 * (int(math.log2(chunk)) - 1)
-
-
-def issued_flops(call: Call, flops: float, left: Operand | None = None,
-                 right: Operand | None = None) -> float:
-    """`flops` of products of `left` by `right` (the model's `2 m k n` each) as their issuer takes them: once
-    for each pair of the operands' parts it issues (`product.terms`), each operand the call's held one
-    where None."""
-    left, right = left or call.held, right or call.held
-    return flops * len(product.terms(left.parts, right.parts))
 
 
 def walk_stores(family: mosaic.Family, stores: int):
@@ -741,7 +743,7 @@ def _planned_launch(call: Call, launch: resources.Launch) -> resources.LaunchPla
 
 
 def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, tiles: int, *,
-          stages: int | tuple[int, int] | None, consumers: int = 1, producer: int | None = None,
+          stages: int | tuple[int, int] | None, consumers: int = 1,
           entry: int = 0) -> tuple[resources.LaunchPlan | None, int, resources.Launch]:
     """A launch's plan, its programs and what its plan read (`resources.Launch`, its streams `scope`d at each
     depth and its stated `registers`): a persistent launch's (`stages` None) as many as a multiprocessor
@@ -753,28 +755,17 @@ def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, t
     A100's launches held one program each, a quarter of the warps fla's held, SE-family-a100-8c5b5b16a);
     any other a program a tile at its `stages`, or at the depth `resources.plan` takes between a `(floor,
     most)` pair's; None where no multiprocessor holds it (`_planned_launch`), a persistent launch then a
-    program a multiprocessor; its producer lowered to `producer` (`resources.Launch.producer`), its programs
-    launching with `entry` registers a thread at least (`resources.Launch.entry`)."""
+    program a multiprocessor; planned at setmaxnreg's least producer, its programs launching with `entry`
+    registers a thread at least (`resources.Launch.entry`)."""
     if stages is None:
         most = 1 if call.family.walks_scoped else 2
-        launch = resources.Launch(scope, 1, registers, floor=1, most=most, producer=producer, entry=entry)
+        launch = resources.Launch(scope, 1, registers, floor=1, most=most, entry=entry)
         found = _planned_launch(call, launch)
         held = (call.target.multiprocessors or 1) * (found.programs if found else 1)
         return found, min(tiles, held), launch
     floor, most = stages if isinstance(stages, tuple) else (stages, stages)
-    launch = resources.Launch(scope, consumers, registers, floor=floor, most=most, producer=producer,
-                              entry=entry)
+    launch = resources.Launch(scope, consumers, registers, floor=floor, most=most, entry=entry)
     return _planned_launch(call, launch), tiles, launch
-
-
-def _stated(work: Work, tiles: int, hardware: float, arrays, out_type) -> pl.CostEstimate:
-    """A launch's work over its `tiles` as it states it to XLA and to Dew's FLOP count
-    (`templates.cost.estimate`), the hardware's: its products as issued (`hardware` a tile, `issued_flops`:
-    an fp32 operand's bf16 parts each a product), its exponentials, and its operands' and outputs' bytes
-    once (row 1895's kernel report: unstated, the recurrence made MFU a lower bound). The model's share,
-    `work.flops` a tile, the launch declares apart (`Family.kernel`'s `model_flops`)."""
-    return estimate(hardware * tiles, *arrays, *jax.tree.leaves(out_type),
-                    transcendentals=work.exponentials * tiles)
 
 
 def _tile_at(index, grid: tuple, grid_names: tuple) -> dict:
@@ -796,11 +787,11 @@ def _product_widths(blocks: dict, staging: tuple, chunk: int) -> tuple[int, ...]
 
 
 def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: dict, stages: int | tuple, live,
-                  work: Work, held: Held, staging: tuple = (), once: dict | None = None,
+                  steps: float, model: float, held: Held, staging: tuple = (), once: dict | None = None,
                   landing: dict | None = None, persistent: bool = False, reduces: bool = True,
                   after: tuple = (), consumers: int = 1, swizzles: dict[str, int] | None = None,
-                  name: str | None = None, hardware: float | None = None, issues: bool = True,
-                  producer: int | None = None, ringed: bool = False):
+                  name: str | None = None, issues: bool = True, ringed: bool = False,
+                  together: tuple[int, ...] = (), sums: tuple[int, ...] = ()):
     """`program(at, *refs, streams, staging, landing)` as a kernel over `grid`, `at` a tile's indices by the
     grid's axis names, run where `live(at, refs)` holds (a laid call's chunks and sequences are as many as its
     worst case, most of them empty): its streams' allocations (of `blocks`, `stages` deep, and of `once`'s
@@ -809,16 +800,17 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     given; a launch of elementwise work alone, not `issues`, scopes no products' memory, `_products_scoped`).
     The program returns its walk (`mosaic.Walk`), which the kernel runs (`Transport.run`), or None
     where it runs its own roles (`sequence_walk`'s). `held` is what a consumer thread holds in registers
-    (`Held`). Where `template.planned` collects launches, the launch's record (`Launch`, its
-    `work`) and zeros. `work` states the model's products a tile, `hardware` their FLOPs as issued
-    (`issued_flops`, the held operand's pairs where None), which its cost and Dew's FLOP count state. Its
-    producer is lowered to `producer` (`resources.Launch.producer`), and its programs launch with the
-    registers its products assemble at least (`Held.entry`, `resources.Launch.entry`).
+    (`Held`). Where `template.planned` collects launches, the launch's record (`Launch`) and zeros. Its cost
+    is its kernel's emission (`emission.costed`) over the `steps` its walk takes a tile, each of its consumer
+    roles taking each on its share (`cost.Stated`: a sequence's chunks, a laid call's mean over its
+    sequences); `model` is the model's FLOPs a tile, which it declares to Dew's FLOP count apart
+    (`Family.kernel`'s `model_flops`). Its producer lowers to the registers its call's tiles certified for
+    it (`Call.producers`, by its name; `resources.producer_floor` where none), and its programs launch with
+    the registers its products assemble at least (`Held.entry`, `resources.Launch.entry`).
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
     once, its streams' rings running on across them (`_planned_launch`): the family's `persist` takes each
-    tile's walk from its program at the tile's indices (`_tile_at`), its producer at `PERSISTENT_PRODUCER`
-    where no floor is given. A program that `reduces` none takes no
+    tile's walk from its program at the tile's indices (`_tile_at`). A program that `reduces` none takes no
     reduction scratch (`_scope`; the compile gate holds its plan's shared memory to at least the compiled
     kernel's).
     `after` are the `(shape, dtype)` tiles its program scopes after its walks (`final_memory_landing`), which
@@ -826,40 +818,39 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     (`Tiles.stages`), its record its plan's input (`Launch.ring`), which a plan at other tiles' depth reads.
     A program of `consumers` consumer roles (a walk's, `Tiles.walkers`) holds each staging and landing tile
     once a role, along a leading axis a role indexes (`role_tiles`): one role's products' tiles are no other's
-    to write while its products read them."""
+    to write while its products read them. `together` are the widths of the groups a step sums together
+    (`Issuer.summed_together`), each its own accumulator in the products' scratch; `sums` the widths of the
+    sums its walk holds across its steps (`mosaic.Walk.sums`), which a family keeping them in memory of its
+    own scopes there (`Issuer.keeps_sums`)."""
     family = call.family
-    if persistent and producer is None:
-        producer = stated_producer(call, PERSISTENT_PRODUCER)
+    name = name or f"recurrence{program.__qualname__.split('.')[0]}"
+    producer = call.producers.of(name)
     staging = halves_tiled(family, staging)
     registers = held.registers(family, addressed(staging, landing or {}))
     allocations, scope, staging, landing = shared_allocation(call, blocks, staging, landing or {}, once=once,
                                                              consumers=consumers, swizzles=swizzles,
-                                                             reduces=reduces, after=after, issues=issues)
+                                                             reduces=reduces, after=after, issues=issues,
+                                                             together=together, sums=sums)
     tiles = math.prod(grid)
-    hardware = issued_flops(call, work.flops) if hardware is None else hardware
     threads = 128 * family.warpgroups(consumers)
 
+    # Planned at setmaxnreg's least: a raised producer moves registers within a program's pool, which its
+    # entry sets and so how many programs a multiprocessor holds, and its consumers' share beside it is the
+    # assembler's to certify (`template.Mosaic._raised`), not the model's.
     found, programs, planning = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
-                                      consumers=consumers, producer=producer, entry=held.entry(family))
+                                      consumers=consumers, entry=held.entry(family))
     # Where no multiprocessor holds the launch, its record says so (`Launch.resident` zero), which the
     # template's legality refuses, and it builds at its shallowest depth, as a probe of the config compiles
     # it.
     shallowest = 1 if persistent else stages[0] if isinstance(stages, tuple) else stages
     stages = found.stages if found else shallowest
     streams = allocations(stages)
-    name = name or f"recurrence{program.__qualname__.split('.')[0]}"
     collected = PLANNED.get()
     if collected is not None:
         def recorded(*arrays):
-            outs = jax.tree.leaves(out_type)
-            moved = sum(math.prod(x.shape) * jnp.dtype(x.dtype).itemsize for x in (*arrays, *outs))
             stepped = sum(math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in blocks.values())
-            # A persistent program's work is its tiles' (`work` is a tile's), the most any program takes.
-            each = -(-tiles // programs)
-            flops = hardware * each
             collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
-                                    registers, work.span * each, stages, stepped, flops,
-                                    work.exponentials * each, moved, found.programs if found else 0,
+                                    registers, stages, stepped, found.programs if found else 0,
                                     consumers, family, producer, planning if ringed else None))
             return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
 
@@ -886,7 +877,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
 
         # The products' own memory where the family's issuer keeps each (`Family.scoped`'s `products`): a
         # product's width is one of its tiles' (its streams', its staging's) or the chunk's.
-        products = _products_scoped(call, blocks, staging, consumers, issues)
+        products = _products_scoped(call, blocks, staging, consumers, issues, together, sums)
         if persistent:
             family.scoped(run, staging, streams=streams, products=products)
         else:
@@ -904,8 +895,10 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
         # producer's stated: its schedule moves registers where its model does (`RegisterModel.moves`), the
         # residency its plan took one fact with the registers its program holds.
         return family.kernel(entry, out_type=out_type, **laid, consumers=consumers, interpret=call.interpret,
-                             name=name, cost=_stated(work, tiles, hardware, arrays, out_type),
-                             model_flops=int(work.flops * tiles),
+                             name=name,
+                             cost=Stated(steps * consumers * tiles,
+                                         stored(*arrays, *jax.tree.leaves(out_type))),
+                             model_flops=int(model * tiles),
                              resident=found.programs if found else 1, registers=registers,
                              producer=producer)(*arrays)
 
@@ -956,21 +949,15 @@ def _solving(call: Call) -> mosaic.Family:
 
 
 def _solved_resources(call: Call, *, keeps: bool, applies: bool, narrow: bool) -> tuple:
-    """`_solved`'s work, held tiles, staging tiles and landings: those of its keys' products and the
-    inverse's doubling, and where it `applies` the inverse, of its application to each key and value block
-    (`narrow` where a value tile is narrower than a block, `Call.value_block`)."""
+    """`_solved`'s model FLOPs a tile, held tiles, staging tiles and landings: those of its keys' products
+    and the inverse's doubling, and where it `applies` the inverse, of its application to each key and value
+    block (`narrow` where a value tile is narrower than a block, `Call.value_block`)."""
     chunk = call.chunk
     width, value_width = call.width, call.value_width
     held = dataclasses.replace(call.held, rows=call.rows)
     # The keys' products and the inverse's doubling, then the inverse against each key and value block.
-    work = Work(flops=2 * chunk * chunk * width + _inverse_flops(chunk)
-                + 2 * chunk * chunk * (width + value_width), span=1)
-    # As issued: the keys' products of the operands as given, the doubling's merges in their own form
-    # (`_merged`: a ranged 16-bit call's fp32 parts), the inverse's application to the given keys and values.
-    merged = _merged(call)
-    hardware = (issued_flops(call, 2 * chunk * chunk * width, call.given, call.given)
-                + issued_flops(call, _inverse_flops(chunk), merged, merged)
-                + issued_flops(call, 2 * chunk * chunk * (width + value_width), held, call.given))
+    model = (2 * chunk * chunk * width + _inverse_flops(chunk)
+             + 2 * chunk * chunk * (width + value_width))
     # The keys' products' sum and the system's pairs; then the doubling's inverse, power and product, beside
     # the masks (an fp32 call's merges split the inverse and the power into their parts); then the inverse
     # held beside a block's product, its decay and its keys or values.
@@ -1000,7 +987,7 @@ def _solved_resources(call: Call, *, keeps: bool, applies: bool, narrow: bool) -
         landing["block"] = held.landing(chunk, call.block)
     if narrow:
         landing["values"] = held.landing(chunk, call.value_block)
-    return work, hardware, held_tiles, staging, landing
+    return model, held_tiles, staging, landing
 
 
 @lowered_once
@@ -1093,16 +1080,15 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
     out_type = (held.shape(call.heads * width), held.shape(call.heads * value_width)) if applies else ()
     if keeps:
         out_type = (held.shape(call.heads * chunk), *out_type)
-    work, hardware, held_tiles, staging, landing = _solved_resources(call, keeps=keeps, applies=applies,
-                                                                     narrow=narrow)
+    model, held_tiles, staging, landing = _solved_resources(call, keeps=keeps, applies=applies, narrow=narrow)
     solved = launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                            grid_names=("chunks", "heads"),
                            blocks=stream_blocks(keys=((chunk, width), call.given),
                                                 **({"values": ((chunk, value_width),
                                                                call.given)} if applies else {}))
                            | vector_blocks(call, "gate", "low", "write", "column_gate", "column_low"),
-                           stages=1, live=chunk_liveness(7), work=work, held=held_tiles, staging=staging,
-                           landing=landing, hardware=hardware,
+                           stages=1, live=chunk_liveness(7), steps=1, model=model, held=held_tiles,
+                           staging=staging, landing=landing,
                            persistent=True, reduces=False)(k, v, hi, lo, beta, hi, lo, taken)
     return solved if keeps else (None, *solved)
 
@@ -1246,13 +1232,14 @@ def fp32_operand(call: Call) -> Operand:
 
 
 def _weighted_held(call: Call, block: int) -> Held:
-    """`_weighted`'s consumer thread at key block `block`: the inverse beside a value block's product, its
-    decay and its keys or values; under a decay a key dimension the key block's prefix halves, its range
-    decay's two terms (`algebra.range_decay`, as `between`'s) and its decayed write too."""
+    """`_weighted`'s consumer thread at key block `block`: under the delta rule the inverse beside a value
+    block's product; its decay and its keys or values; under a decay a key dimension the key block's prefix
+    halves, its range decay's two terms (`algebra.range_decay`, as `between`'s) and its decayed write too.
+    The decayed keys alone (`recurrence_decayed_keys`, no delta rule) hold no inverse, which no step reads."""
     chunk = call.chunk
     held = dataclasses.replace(call.held, rows=call.rows)
     return Held(phases=(
-        held_tile(held, chunk, chunk) + [f32(chunk, call.block)] * 2
+        held_tile(held, chunk, chunk) * call.delta + [f32(chunk, call.block)] * 2
         + held_tile(call.given, chunk, call.block) + [f32(chunk, block)] * 5 * call.per_key
         # The inverse against the scaled values and keys in turn, the delta rule's alone (`algebra.weighted`).
         + (largest_live_set(
@@ -1363,17 +1350,19 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: Call):
     out_type = ((held.shape(call.heads * width),) * call.delta
                 + (held.shape(call.heads * value_width),) * (call.delta and not call.per_key)
                 + (held.shape(call.heads * width),) * call.per_key)
-    # Without the delta rule the inverse's place takes the keys, an operand no step reads.
-    work = Work(flops=2 * chunk * chunk * (width + values) if call.delta else 0, span=1,
-                exponentials=chunk * width if call.per_key else 0)
+    # Without the delta rule the inverse's place takes the keys, an operand no step reads: the model's
+    # products, the inverse applied to the keys and values, none.
+    model = 2 * chunk * chunk * (width + values) if call.delta else 0
     staging, landing = _weighted_staged(call, keyed)
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=_weighted_streamed(call, keyed),
                          stages=(1, 2) if call.per_key else 1, live=chunk_liveness(6),
-                         work=dataclasses.replace(work, span=steps), held=_weighted_held(call, keyed),
-                         # The inverse applied to the given keys and values.
-                         hardware=issued_flops(call, work.flops, held, call.given),
+                         steps=steps, model=model, held=_weighted_held(call, keyed),
                          staging=staging, landing=landing,
+                         # The decayed keys alone a kernel of their own, apart from the delta rule's in a
+                         # training call that forms both: one name, its two modules were read as one, the
+                         # one that spilled (8 bytes at every stage depth on a B200) unseen by the gate.
+                         name=None if call.delta else "recurrence_decayed_keys",
                          # A key block's walk a program a tile; a decay a head's one step a tile, persistent.
                          persistent=not call.per_key,
                          # A key block's streams staged at its row: a tile slices only whole swizzle rows.
@@ -1468,13 +1457,11 @@ def _weighted_values(v, a, beta, taken, call: Call):
 
     blocks = stream_blocks(inverse=((chunk, chunk), held), values=((chunk, vb), call.given)) | vector_blocks(
         call, "write")
-    work = Work(flops=2 * chunk * chunk * vb, span=1)
     return launch_kernel(program, call, out_type=held.shape(call.heads * call.value_width),
                          grid=(call.chunks, call.heads, call.value_width // vb),
                          grid_names=("chunks", "heads", "values"), blocks=blocks, stages=1,
-                         live=chunk_liveness(3), work=work,
+                         live=chunk_liveness(3), steps=1, model=2 * chunk * chunk * vb,
                          held=_weighted_values_held(call),
-                         hardware=issued_flops(call, work.flops, held, call.given),
                          staging=staging_tiles(held, (chunk, vb)),
                          landing={"values": held.landing(chunk, vb)})(v, a, beta, taken)
 
@@ -1720,10 +1707,16 @@ def _states_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
         product_fragments(call, (held, chunk, call.block), (held, call.block, bv)),
         written)
                 if call.delta else written)
+    # The products' sums: a key block's, every block's where a family's products overlap, and where accurate
+    # three-part products issue apart each term's fresh sum (`Issuer.apart`), as the output launch states
+    # its: the lowered peak of an H100's fp32 write gate holds six (96 registers a 32-wide value block,
+    # where two key blocks' were stated; ptxas took 180 against 158 stated, and at two walk roles 168
+    # spilling 28 bytes, row 6233).
+    apart = call.family.products_overlap and max(keys.parts, held.parts) > 2
+    sums = (len(product.terms(keys.parts, held.parts)) if apart
+            else 1 if call.per_key or not call.family.products_overlap else call.width // call.block)
     phase = ([f32(chunk, bv)] * 2 + held_tile(values, chunk, bv) + held_tile(held, call.block, bv)
-             + products
-             + [f32(call.block, bv)] * (1 if call.per_key or not call.family.products_overlap
-                                        else call.width // call.block))
+             + products + [f32(call.block, bv)] * sums)
     if held.parts > 1:
         phase += [f32(chunk, bv), f32(call.block, 4), f32(32, bv)]
     if call.per_key:
@@ -1763,10 +1756,9 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
 
     # Where the keys take the write gate, the corrected values are the values as given: none stored.
     stores_corrected = not call.gated_keys
-    # Its producer's floor, the one value its plan and its walk's schedule read (`stated_producer`): 48, its
-    # loads spilling at 24 (60 bytes on Nemotron-H 4B's fp32 states, 52 on GDN's and 44 on KDA's bf16; none
-    # at 40 or 48, jsf-states-held, jsf-pfloor-ab).
-    producer = stated_producer(call, 48)
+    # Its producer's registers, the one value its plan and its walk's schedule read, as its tiles certified
+    # them (`Call.producer`).
+    producer = call.producer(_states)
 
     def program(at, k_ref, w_ref, u_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, taken_ref, *refs,
                 streams, staging, landing):
@@ -1843,9 +1835,9 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
                                      bv, row, lambda role: roled(role)[1].get("table")))
 
     launched, stored = stored_split(table, _states_launched(
-        program, call, tiles, delta, keys, values, batch, sequences.shape[0], stores_corrected, table,
-        producer)(k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken,
-                  *(() if table is None else table.operands)))
+        program, call, tiles, delta, keys, values, batch, sequences.shape[0], stores_corrected, table)(
+        k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken,
+        *(() if table is None else table.operands)))
     if stores_corrected:
         return (*launched, stored)
     assert jnp.dtype(u.dtype) == held.dtype, "the values as given are held so (`Call.gated_keys`)"
@@ -1854,12 +1846,11 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
 
 
 def _states_launched(program, call: Call, tiles: Tiles, delta: bool, keys: Operand, values: Operand,
-                     batch: int, sequences: int, stores_corrected: bool, table: Table | None,
-                     producer: int | None):
+                     batch: int, sequences: int, stores_corrected: bool, table: Table | None):
     """`_states`' `program` launched (`launch_kernel`): its outputs (the memories, the corrected values where
     it stores them, the final memories, and a forked call's stored slots where its `table` holds any), its
     streamed blocks and its initial memories' at `tiles`, its staging and landing tiles (a stored slot's,
-    `table_landing`) and what its final memories' landing waits after (`final_memory_landing`), its `Work`
+    `table_landing`) and what its final memories' landing waits after (`final_memory_landing`), its walk
     over `sequences` and its register model (`_states_held`, `table_held`)."""
     chunk = call.chunk
     width, value_width, walked_width = call.width, call.value_width, tiles.block_v * tiles.walkers
@@ -1886,33 +1877,12 @@ def _states_launched(program, call: Call, tiles: Tiles, delta: bool, keys: Opera
                          grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
                          ringed=True,
                          live=sequence_live(7),
-                         work=Work(flops=4 * chunk * width * walked_width * steps, span=steps),
+                         steps=steps, model=4 * chunk * width * walked_width * steps,
                          consumers=tiles.walkers, staging=staging,
                          held=table_held(_states_held(call, values, keys, bv), call, table, bv),
                          once=initials, landing=landing, after=after,
                          # Its last write's column sums an fp32 call's alone (`column_sums`).
-                         reduces=held.parts > 1, producer=producer)
-
-
-PERSISTENT_PRODUCER = 32
-"""The floor a persistent launch's producer lowers to on a family whose producers load past the floor
-(`stated_producer`): its walk over the program's tiles carries their indices and addresses, which at the 24
-registers of `resources.producer_floor` ptxas spilled (32 bytes, an `STL.64` of an address pair after the
-producer's `setmaxnreg` decrease) once a program walked three tiles or more, and allocated the consumers
-past their live set around it: on a compile-only sm100 the gated delta net's scores' gradient held at 240
-registers a consumer from 512 tokens against 168 with its producer at 32, Nemotron-H 4B's SSD scores'
-gradient spilled 16 bytes at its 248 from 2048 tokens against holding at 200, and its local products'
-gradient held at 240 against 104, their consumers' live peaks the same at either floor (161 for the delta
-net's); 40, 48 and 64 gave 32's (row 5693, armada at 816a3c6d3f1). The gated delta net's 16-bit solve, one
-tile a program, spilled 164 bytes at 24 and none from 32. A consumer's raise at one program a multiprocessor
-stays 248; at two it is 224, 232 at 24."""
-
-
-def stated_producer(call: Call, registers: int) -> int | None:
-    """`registers`, the floor a launch's producer lowers to on a family whose producers load past the floor
-    (`Issuer.loads_past_floor`, tcgen05's: its issue loop's live set, as ptxas assembled it), else None
-    (`resources.producer_floor`'s 24, which a warpgroup MMA's and mma.sync's launches hold)."""
-    return registers if call.family.loads_past_floor else None
+                         reduces=held.parts > 1)
 
 
 def _scan_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
@@ -1977,7 +1947,7 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
     assert delta == call.delta, "the delta rule's walk corrects its values from the chunks' inverses"
     values = keys = call.given
     skipped = int(skip is not None)
-    producer = _scan_producer(call)
+    producer = call.producer(_scan)
 
     def program(at, q_ref, k_ref, a_ref, v_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, taken_ref, *refs,
                 streams, staging, landing):
@@ -2057,7 +2027,7 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
                                      bv, row, lambda role: roled(role)[1].get("table")))
 
     launched = _scan_launched(program, call, tiles, out_dtype, sequences=sequences.shape[0], batch=batch,
-                              table=table, producer=producer)(
+                              table=table)(
         q, k, k if a is None else a, v, hi, lo, beta, h0, sequences, taken,
         *(() if skip is None else (skip.astype(jnp.float32),)), *(() if table is None else table.operands))
     # The output and final memories; a forked call's stored slots no caller reads.
@@ -2083,21 +2053,14 @@ def _scan_corrected(call: Call, slots, tile, bv: int, state, prefix: tuple, beta
     return algebra.corrected(written, None, state, held.dtype, issue)
 
 
-def _scan_producer(call: Call) -> int | None:
-    """`_scan`'s producer's floor (`stated_producer`): 80, its loads spilling at 24 to 64 (52 bytes on a
-    B200's 27B GDN and Nemotron-H 4B SSD forwards), 16 at 72, none at 80 (rows 5357 and 5355, armada
-    20261110172539-d12d4eb1 and 20261110172902-73ad9c43)."""
-    return stated_producer(call, 80)
-
-
 def scan_holds(call: Call, tiles: Tiles, out_dtype, table: Table | None) -> bool:
     """Whether `_scan`'s consumer threads at `tiles` hold their registers (its model, `_scan_planned`'s,
-    within `Family.registers` at its roles beside its producer's floor, `_scan_producer`), its output landing
+    within `Family.registers` at its roles beside its producer's, `Call.producer`), its output landing
     in `out_dtype`: a forked call's forward walks its states and output in one launch only where it does
     (`chunk_forward.prepared`), else in two."""
     staging, landing, _, held = _scan_planned(call, tiles, out_dtype, table)
     return held.registers(call.family, addressed(staging, landing)) <= call.family.registers(
-        tiles.walkers, producer=_scan_producer(call))
+        tiles.walkers, producer=call.producer(_scan))
 
 
 def _scan_planned(call: Call, tiles: Tiles, out_dtype, table: Table | None) -> tuple:
@@ -2117,8 +2080,8 @@ def _scan_planned(call: Call, tiles: Tiles, out_dtype, table: Table | None) -> t
 
 
 def _scan_launched(program, call: Call, tiles: Tiles, out_dtype, *, sequences: int, batch: int,
-                   table: Table | None, producer: int | None):
-    """`_scan`'s `program` launched (`launch_kernel`): its plan (`_scan_planned`), its work over the laid
+                   table: Table | None):
+    """`_scan`'s `program` launched (`launch_kernel`): its plan (`_scan_planned`), its walk over the laid
     sequences' mean of chunks, and its outputs (the output, the final memories, and a forked call's stored
     slots where its `table` holds any)."""
     chunk = call.chunk
@@ -2136,8 +2099,8 @@ def _scan_launched(program, call: Call, tiles: Tiles, out_dtype, *, sequences: i
     # A chunk's products: the memory's write and, under the delta rule, its prediction and the inverse's
     # correction; the scores once a role; the memory's and the local product's.
     corrections = (2 * chunk * width + 2 * chunk * chunk) * walked_width if delta else 0
-    work = Work(flops=(2 * chunk * width * walked_width + corrections + 2 * chunk * chunk * width * walkers
-                       + 2 * chunk * (width + chunk) * walked_width) * steps, span=steps)
+    model = (2 * chunk * width * walked_width + corrections + 2 * chunk * chunk * width * walkers
+             + 2 * chunk * (width + chunk) * walked_width) * steps
     out_type = (jax.ShapeDtypeStruct((call.rows, call.heads * call.value_width), out_dtype),
                 jax.ShapeDtypeStruct((rows, call.value_width), jnp.float32),
                 *table_stored(call, table, batch))
@@ -2146,9 +2109,8 @@ def _scan_launched(program, call: Call, tiles: Tiles, out_dtype, *, sequences: i
                          grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
                          ringed=True,
                          live=sequence_live(8),
-                         work=work,
+                         steps=steps, model=model,
                          consumers=walkers, staging=staging, held=modelled,
-                         once=initials, landing=landing, after=after, reduces=held.parts > 1,
-                         producer=producer)
+                         once=initials, landing=landing, after=after, reduces=held.parts > 1)
 
 

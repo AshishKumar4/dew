@@ -20,7 +20,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir as mgpu_ir
 from jax.extend.mlir.dialects import arith as mgpu_arith, memref as mgpu_memref, vector as mgpu_vector
 
-from dew.nn.kernels.templates import mosaic, rings, swizzling
+from dew.nn.kernels.templates import rings, stores, swizzling
 
 
 @dataclasses.dataclass(frozen=True)
@@ -240,9 +240,9 @@ def _registered(registers: list, layout, rows: int):
     return held
 
 
-def scattered_rows(smem, out: mosaic.Scattered, row_start, first, stored, column) -> None:
+def scattered_rows(smem, out: stores.Scattered, row_start, first, stored, column) -> None:
     """Rows `first` to `first + stored` of `smem` (`[rows, width]`, unswizzled: a consumer's staged share of
-    a tile, `mosaic.staged_rows`) each written to its row of `out` (`out.table[row_start + r]`, a negative
+    a tile, `stores.staged_rows`) each written to its row of `out` (`out.table[row_start + r]`, a negative
     entry nowhere) at `column`: by the warpgroup's threads, each a 16-byte piece of a row at a time
     (`_scattered_pieces`), or interpreted, a row at a time."""
     rows, width = smem.shape

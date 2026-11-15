@@ -231,10 +231,18 @@ def test_the_forward_is_on_par_under_every_hook(hooks, dtype, natural):
     check(CASES["causal-documents-window"], hooks, dtype, PINNED[1], residuals=True, natural=natural)
 
 
-@pytest.mark.parametrize("width, value_width", [(64, 64), (80, 48), (128, 128)])
-def test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two(width, value_width):
-    """Widths of a power of two and narrower ones that ride in zero-padded, values narrower than keys."""
-    check(CASES["causal"], HOOKS["none"], jnp.bfloat16, PINNED[0], width=width, value_width=value_width)
+HEAD_WIDTHS = [(32, 32), (64, 64), (80, 48), (128, 128), (192, 160)]
+"""The (query, value) head widths both mainloops' forwards are checked at (kernel-templates.md §A row 23's 32
+to 256): powers of two from the narrowest, and widths that ride in zero-padded to the next (80 and 48 to 128
+and 64, 192 and 160 to 256), values narrower than keys."""
+
+
+@pytest.mark.parametrize("mainloop", ["triton", "portable"])
+@pytest.mark.parametrize("width, value_width", HEAD_WIDTHS)
+def test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two(width, value_width, mainloop):
+    """The forward at each of `HEAD_WIDTHS`, on the Pallas-Triton mainloop and the plain-JAX one."""
+    check(CASES["causal"], HOOKS["none"], jnp.bfloat16, PINNED[0], width=width, value_width=value_width,
+          mainloop=mainloop)
 
 
 def every_config_on_a_gpu(case):
@@ -312,11 +320,12 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
                 heads: int = 4):
     """The score hooks `names` asks for, as a score_mod and a draw of its parameters and the softmax's
     initial state for a seed (each a `[B, H, ...]` array or `Initial`, fp32, `rows` by `heads` query heads):
-    a softcap, ALiBi, a query's temperature, a per-key bias, a dense bias as one score_mod; sinks, or a
-    resumed partial (its maximum, a positive denominator and a numerator of any sign), as the initial
-    state."""
+    a softcap, ALiBi, a query's temperature, a per-query bias, a per-key bias, a dense bias as one score_mod;
+    sinks, or a resumed partial (its maximum, a positive denominator and a numerator of any sign), as the
+    initial state."""
     kinds = [kind for name, kind in (("alibi", template.Kind.HEAD), ("temperature", template.Kind.QUERY),
-                                     ("key", template.Kind.KEY), ("tile", template.Kind.TILE))
+                                     ("query", template.Kind.QUERY), ("key", template.Kind.KEY),
+                                     ("tile", template.Kind.TILE))
              if name in names]
 
     def score_mod(s, q_pos, k_pos, *values):
@@ -331,7 +340,7 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
             s = s + values.pop(0).astype(s.dtype) * k_pos.astype(s.dtype)
         if "temperature" in names:
             s = s / values.pop(0).astype(s.dtype)
-        for _ in range(("key" in names) + ("tile" in names)):
+        for _ in range(("query" in names) + ("key" in names) + ("tile" in names)):
             s = s + values.pop(0).astype(s.dtype)
         return s
 
@@ -342,6 +351,8 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
             params.append(jnp.asarray(alibi_slopes(heads)))
         if "temperature" in names:
             params.append(jax.random.uniform(streams[0], (rows, heads, queries), jnp.float32, 0.5, 1.5))
+        if "query" in names:
+            params.append(jax.random.normal(jax.random.fold_in(streams[0], 1), (rows, heads, queries)))
         if "key" in names:
             params.append(jax.random.normal(streams[1], (rows, heads, keys)))
         if "tile" in names:
@@ -355,7 +366,8 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
             initial = template.Initial(jax.random.normal(streams[5], (rows, heads, queries)), total, acc)
         return tuple(params), initial
 
-    scoring = bool({"softcap", "custom", "indexed", "alibi", "temperature", "key", "tile"} & set(names))
+    scored = {"softcap", "custom", "indexed", "alibi", "temperature", "query", "key", "tile"}
+    scoring = bool(scored & set(names))
     return (score_mod if scoring else None), tuple(kinds), draw
 
 
@@ -675,10 +687,13 @@ def test_the_backward_resumes_queries_that_read_no_key():
     check_backward({"causal": True, "starts": True}, SCORE_HOOKS["resumed"], jnp.float32, PINNED[0])
 
 
-@pytest.mark.parametrize("width, value_width", [(48, 24), (80, 48)])
-def test_the_backward_is_on_par_at_head_widths_padded_to_powers_of_two(width, value_width):
-    """Head widths that ride in zero-padded, values narrower than keys, bf16."""
-    check_backward(CASES["causal-window"], (), jnp.bfloat16, PINNED[0], width=width, value_width=value_width)
+@pytest.mark.parametrize("mainloop", ["triton", "portable"])
+@pytest.mark.parametrize("width, value_width", [(32, 32), (48, 24), (80, 48), (192, 160)])
+def test_the_backward_is_on_par_at_head_widths_padded_to_powers_of_two(width, value_width, mainloop):
+    """The backward from the narrowest heads to ones past 128 that ride in zero-padded, values narrower than
+    keys, bf16, on the Pallas-Triton mainloop and the plain-JAX one (kernel-templates.md §A row 23)."""
+    check_backward(CASES["causal-window"], (), jnp.bfloat16, PINNED[0], width=width, value_width=value_width,
+                   mainloop=mainloop)
 
 
 @pytest.mark.parametrize("case", IRREGULAR)

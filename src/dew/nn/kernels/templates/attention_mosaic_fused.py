@@ -24,7 +24,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _views_of,
     launch_scope,
     modelled,
-    part_count,
     reducing,
     stated,
 )
@@ -325,11 +324,9 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_fused", reducing_warpgroups=reduced,
         registers=walk.registers(dq=False),
-        # The products this launch issues (`stated`): its `S` recomputed, dP's, dV's, and each part of dK's
-        # and of dQ's (`part_count`); the model's of them it owns (`modelled`): dQ's, dK's, dV's and dP's.
-        cost=stated(walk.spec, batch, heads,
-                    width + 2 * value.shape[-1] + 2 * part_count(query.dtype, walk.accurate) * width,
-                    query, key, value, dout,
+        # Its walk's statement, its work its emission's (`stated`); the model's products it owns
+        # (`modelled`): dQ's, dK's, dV's and dP's.
+        cost=stated(walk.spec, batch, heads, query, key, value, dout,
                     tile_walk=TileWalk((queries, keys_padded), (block_q, block_k), consumers, keyed=True,
                                        common=family.feeds_itself)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,

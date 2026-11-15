@@ -39,7 +39,7 @@ def test_a_grouped_call_no_cooperative_tile_holds_derives_one_consumer_alone():
     assert tile is not None and (tile.warpgroups, tile.cluster) == (1, 1)
 
 
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "sm100"))
 @pytest.mark.parametrize("grouped", [False, True], ids=["dense", "grouped"])
 def test_the_templates_paired_product_holds_check_1(generation_name, grouped):
     """A gate and an up projection as the template's paired product (`gemm`'s `paired`): its value on

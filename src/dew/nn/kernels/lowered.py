@@ -330,9 +330,13 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
                   if "cost_estimate_json" in config else {})
         hashed = ir.StringAttr(config["kernel_hash"]).value_bytes.hex()[:16]
         named = _kernel_name(operation.location)
+        # Its launch is its call's metadata (`report.launch_metadata`), its name's suffix its kernel's own
+        # identity (`report.named`), which is its launch's where the launch states no kernel's part.
+        launch = (ir.StringAttr(config["metadata"]).value if "metadata" in config
+                  else named[1] if named else None)
         # A call whose location names no kernel is named by its kernel's hash, apart from every other.
         return KernelCall(kind, named[0] if named else hashed, ir.StringAttr(config["module"]).value_bytes,
-                          hashed, stated.get("flops"), named[1] if named else None, _model_flops(attributes))
+                          hashed, stated.get("flops"), launch, _model_flops(attributes))
     if kind == "mosaic_tpu":
         config = json.loads(ir.StringAttr(attributes["backend_config"]).value)["custom_call_config"]
         return KernelCall(kind, ir.StringAttr(attributes["kernel_name"]).value, config["body"].encode(), "",

@@ -14,7 +14,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, swizzling
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, stores, swizzling
 from dew.nn.kernels.templates.attention_mosaic_fused import staged_parts, walked_sums
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
@@ -25,7 +25,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _streamed,
     _views_of,
     modelled,
-    part_count,
     reducing,
     stated,
 )
@@ -44,12 +43,12 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
     the keys whole rows of their swizzle, the widest whose row divides it and the products' contractions
     over the tile's queries and keys (`swizzling.swizzle_for`: 64 bytes at a share of 32), fp16's two parts
     each (`staged_parts`); each consumer's fp32 stage of its adds a chunk of its columns at a time
-    (`mosaic.staged_columns`: width 256's two stages of its 64 x 256 slots fit beside it); the two loads'
+    (`stores.staged_columns`: width 256's two stages of its 64 x 256 slots fit beside it); the two loads'
     barriers and the exchange's (`Family.exchange`); fp16's shares' exponents, a row each of the weights'
     and of the cotangents' (`_sixteen_step`); and its query and output-cotangent streams in `stages` slots
     (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
-    chunk = mosaic.staged_columns(width // consumers, (jnp.float32,))
+    chunk = stores.staged_columns(width // consumers, (jnp.float32,))
     swizzle = swizzling.swizzle_for(dtype, block_k // consumers, block_q, block_k)
     parts = staged_parts(dtype)
     scoped = [family.staged_memory((block_k, width), dtype), family.staged_memory((block_k, width), dtype),
@@ -239,12 +238,11 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         registers=walk.registers(dq=False),
         # A score hook's warpgroups reserve their reduction scratch, and fp16's running scale's (`reducing`).
         reducing_warpgroups=reducing(family, consumers, walk.reduces, scaled=staged_parts(query.dtype) > 1),
-        # The products this launch issues (`stated`): its `S` recomputed, dP's, dV's, and each part of dK's
-        # and of dQ's (`part_count`); the model's of them it owns (`modelled`): dQ's, dK's, dV's and dP's.
-        cost=stated(walk.spec, batch, heads,
-                    width + 2 * value.shape[-1] + 2 * part_count(query.dtype, walk.accurate) * width,
-                    query, key, value, dout,
-                    tile_walk=TileWalk((queries, keys_padded), (block_q, block_k), keyed=True)),
+        # Its walk's statement, its work its emission's (`stated`); the model's products it owns
+        # (`modelled`): dQ's, dK's, dV's and dP's.
+        cost=stated(walk.spec, batch, heads, query, key, value, dout,
+                    tile_walk=TileWalk((queries, keys_padded), (block_q, block_k), keyed=True,
+                                       sharing=consumers)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
     dq = jax.new_ref(jnp.zeros((batch, queries, heads, width), jnp.float32))

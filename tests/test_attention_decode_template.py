@@ -102,6 +102,30 @@ def test_a_decode_step_through_the_template_is_on_par_interpreted(call, hook, dt
 
 
 @INTERPRETS
+@pytest.mark.parametrize("width", [32, 192])
+@pytest.mark.parametrize("device", ["sm90", "sm80"])
+def test_a_decode_step_is_on_par_at_head_widths_interpreted(device, width):
+    """A one-query decode step through the template at heads 32 wide and 192, which ride in zero-padded to
+    256 (kernel-templates.md §A row 23; 64 the step's own, 256 the split launch's below), under the
+    interpreter as an H100 or an A100 runs it: on par with the reference path over the same keys (check 1)."""
+    positions, heads, kv_heads = CALLS["one-query"]
+    spans = _spans(positions)
+
+    def ours(query, key, value, sinks):
+        del sinks
+        with generation.assumed(device):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    def reference(query, key, value, sinks):
+        del sinks
+        return template.reference(query, key, value, spans)
+
+    draw = _drawn(positions, heads, kv_heads, jnp.bfloat16, width)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"template decode {device} {width} wide",
+                    seeds=SEEDS)
+
+
+@INTERPRETS
 def test_a_256_wide_decode_step_whose_split_launch_does_not_fit_is_on_par_interpreted():
     """A 256-wide bf16 decode step (Qwen3.5-0.8B's heads: 8 query heads over 2 key heads) on an H100, whose
     split launch's fp32 slices and the query's stage pass its shared memory, runs a slice a row through the
@@ -235,25 +259,71 @@ def test_a_split_decode_step_at_aligned_keys_beside_an_empty_row_is_on_par_inter
 
 
 @INTERPRETS
-def test_a_work_lists_rows_read_their_cache_rows_in_place_interpreted():
-    """A serving step's work list over a cache of two rows: three batch rows, a decode row's one query and
-    two pieces of four prompt queries each, reading cache rows 1, 0 and 1 where they lie (`attend`'s
-    `sources`), each query over its own span (a piece's causal over its row's earlier keys, past its prefix):
+@pytest.mark.parametrize("hook", ["plain", "sinks"])
+@pytest.mark.parametrize("keys", [KEYS, 4096])
+def test_a_decode_steps_state_resumed_over_the_rest_of_its_keys_is_its_whole_softmax_interpreted(keys, hook):
+    """A decode step's keys cut in two (kernel-templates.md §A rows 19 and 63): the first part's state
+    (`attend`'s `finished=False`, its softmax left unnormalized, an `Initial`), under its sinks where it has
+    them, taken by the call over the rest as its initial state gives the step over every key: on par with
+    the reference path over them all (check 1), at 256 keys and at 4096."""
+    positions, heads, _ = CALLS["one-query"]
+    lengths = jnp.asarray([keys - 56, keys // 3], jnp.int32)
+    cut = lengths // 2
+    whole, first = (template.spans(positions, keys, 2, lengths=ends) for ends in (lengths, cut))
+    rest = template.spans(positions, keys, 2, lengths=lengths, starts=cut)
+    operands = _operands((2, positions, heads, 64), keys)
+
+    def draw(seed: int):
+        return *operands(seed), jax.random.normal(jax.random.key(seed + 7), (heads,), jnp.float32)
+
+    def ours(query, key, value, sinks):
+        with generation.assumed("sm90"):
+            state = attention_decode.attend(query, key, value, first, _hooks(hook, heads, positions, sinks),
+                                            interpret=True, finished=False)
+            return attention_decode.attend(query, key, value, rest, template.Hooks(initial=state),
+                                           interpret=True)
+
+    def reference(query, key, value, sinks):
+        return template.reference(query, key, value, whole, _hooks(hook, heads, positions, sinks))
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                    f"template decode resumed over {keys} keys {hook}", seeds=SEEDS)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("page", [None, 16], ids=["rows", "pages"])
+def test_a_work_lists_rows_read_their_cache_rows_in_place_interpreted(page):
+    """A serving step's work list over a cache of two rows (kernel-templates.md §A row 33): three items, a
+    decode row's one query and two pieces of four prompt queries each, reading cache rows 1, 0 and 1 where
+    they lie: a dense cache's through `attend`'s `sources`, a paged pool's through each item's own page table
+    (its row's, `table`, as the cache's work list gathers them: pages of 16 keys, each row's in an order of
+    its own), each query over its own span (a piece's causal over its row's earlier keys, past its prefix):
     on par with the reference path over the rows gathered (check 1)."""
     sources = jnp.asarray([1, 0, 1], jnp.int32)
     starts = jnp.zeros((3, 4), jnp.int32)
     ends = jnp.asarray([[200, 0, 0, 0], [97, 98, 99, 100], [181, 182, 183, 184]], jnp.int32)
     spans = template.KeySpans(starts, ends, None, None, keys=KEYS)
+    pages = None if page is None else KEYS // page
+    tables = None if page is None else jnp.asarray(
+        np.random.default_rng(page).permutation(2 * pages).reshape(2, pages), jnp.int32)
+
+    def paged(rows: jax.Array) -> jax.Array:
+        # The cache's rows `[2, K, KV, D]` laid in a pool `[KV, P, page, D]` at each row's pages.
+        laid = rows.reshape(2 * pages, page, *rows.shape[2:]).transpose(2, 0, 1, 3)
+        return jnp.zeros_like(laid).at[:, tables.reshape(-1)].set(laid)
 
     def ours(query, key, value):
         with generation.assumed("sm90"):
-            return attention_decode.attend(query, key, value, spans, interpret=True, sources=sources)
+            if page is None:
+                return attention_decode.attend(query, key, value, spans, interpret=True, sources=sources)
+            return attention_decode.attend(query, paged(key), paged(value), spans, interpret=True,
+                                           table=tables[sources])
 
     def reference(query, key, value):
         return template.reference(query, key[sources], value[sources], spans)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), _operands((3, 4, 8, 64), KEYS),
-                    "template decode over a work list's rows", seeds=SEEDS)
+                    f"template decode over a work list's {'pages' if page else 'rows'}", seeds=SEEDS)
 
 
 @INTERPRETS

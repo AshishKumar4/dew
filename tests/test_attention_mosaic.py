@@ -142,9 +142,11 @@ def _form_tiles(generation_name: str | None = None) -> attention_mosaic.Tiles:
     H100's pair two consumers' blocks, an A100's one consumer's each (mma.sync's one warpgroup)."""
     family = INTERPRETED_ON[generation_name or _INTERPRETED.get()]
     return attention_mosaic.Tiles(64, 64, 2, 2 if family == WGMMA else 1, family=family)
-HEAD_WIDTHS = ((64, 128), (128, 64), (80, 48))
-"""The (query, value) head widths the forward and the backward are checked at: a value wider than its
-query, a narrower one, and both off a power of two (80 and 48 pad to 128 and 64, `attention.padded_call`)."""
+HEAD_WIDTHS = ((64, 128), (128, 64), (80, 48), (32, 32), (192, 160))
+"""The (query, value) head widths the forward and the backward are checked at (kernel-templates.md §A row
+23's 32 to 256): a value wider than its query, a narrower one, both off a power of two (80 and 48 pad to 128
+and 64, `attention.padded_call`), the narrowest, and both past 128 off a power of two (192 and 160 pad to
+256); 256 itself the wide backward's site below."""
 
 
 def _drawn(shape: tuple[int, int, int, int], dtype, width: int = 128, keys: int | None = None,
@@ -272,14 +274,17 @@ def _dropping(shape) -> template.Hooks:
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
                  form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
                  natural: bool = False, seeds: int | None = None, width: int = 64,
-                 param_rows: int | None = None):
+                 param_rows: int | None = None, pins: tuple | None = None,
+                 target: generation.GpuTarget | None = None, routed: bool = True):
     """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `_form_tiles`
     (64 wide) under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
     (rows, queries, query and key heads, four and two under a hook) over the spans' keys in `dtype`, heads
     `width` wide, the forward's logits `natural` or folded. The backward differentiates the queries, keys,
     values, the hook's parameters and the initial state, over `seeds` draws where given (the site's own,
-    else the template site's)."""
+    else the template site's); its launches at the forward's and backward's configs `pins` where given
+    (`_pinned`), interpreted for `target` where given (`_device`), the backward the one the route takes
+    where `routed`, else this mainloop's (a TPU core's, which the route's CUDA facts do not read)."""
     rows, queries, heads, _ = shape
     # A hook's parameters drawn for `param_rows` batch rows where given (one every row shares).
     score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, width,
@@ -301,8 +306,8 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
         hooks = hooked(params, initial)
         # The forward at the call forms' tiles 64 wide, else at its derivation's (two consumers' hooked sums
         # 128 wide pass their registers, and a hooked training forward's natural walk theirs 64 wide).
-        with _device(interpret), _pinned(_form_tiles() if width == 64 and not (backward and score) else None,
-                                         config):
+        pinned = pins or (_form_tiles() if width == 64 and not (backward and score) else None, config)
+        with _device(interpret, target), _pinned(*pinned):
             if not backward:
                 return attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
                                                 interpret=interpret)
@@ -311,8 +316,9 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
                                                  residuals=template.Kept.SPLIT, interpret=interpret)[1:]
             # On the mainloop the route takes it to (`attention_route.backward`): this one's, else the
             # Pallas-Triton one's where this one's registers hold no tile of it.
-            grads = attention_route.backward(query, key, value, spans, hooks, dout, residuals=residuals,
-                                             accurate=accurate, interpret=interpret)
+            pulled = attention_route.backward if routed else attention_mosaic.backward
+            grads = pulled(query, key, value, spans, hooks, dout, residuals=residuals, accurate=accurate,
+                           interpret=interpret)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
     def reference(query, key, value, dout, params, initial):
@@ -349,6 +355,41 @@ def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
     spans = template.spans(queries, keys, rows, **called)
     _check_spans("causal-documents-window", spans, (rows, queries, 4, 2), interpret=interpret, score=score,
                  gate=gate, dtype=dtype, natural=natural)
+
+
+STREAMED_HOOKS = {"key-bias": ("key",), "tile-bias": ("tile",), "query-bias": ("query",)}
+"""Score hooks whose parameters ride a producer's streams (`attention_mosaic_program.riding`): a key's and a
+tile's the keys' in the forward and dQ, a tile's (keys first) and a query's the queries' in dK/dV; an additive
+query bias, whose dK/dV holds one varying tile where a temperature's holds two, the query's that fits one
+consumer's registers."""
+
+
+@INTERPRETS
+@pytest.mark.parametrize("hooks", STREAMED_HOOKS)
+def test_a_hooks_streamed_parameters_hold_check_1_through_the_rings_rotations_interpreted(hooks):
+    """The forward and the backward under a score hook whose parameters ride the producer's streams
+    (`STREAMED_HOOKS`; a walk's held ones, a query's in the forward and dQ and a key's in dK/dV, beside them),
+    over 256 causal tokens (four 64-token tiles a walk at most, its two-stage rings each slot read twice), at
+    wgmma's tiles, the forward on two consumers and the backward on one (on two a tile bias's held 244
+    registers, past a thread's 240, at 64 x 64), dK/dV on the producer's rings too
+    (`BackwardTiles.dkv_family`): on par with the reference (check 1)."""
+    spans = template.spans(256, 256, 1, causal=True)
+    pins = (attention_mosaic.Tiles(64, 64, 2, 2, family=WGMMA),
+            attention_mosaic.BackwardTiles(64, 64, 2, 1, family=WGMMA, dkv_family=WGMMA))
+    _check_spans("causal", spans, (1, 256, 2, 1), interpret=True, backward=True, score=STREAMED_HOOKS[hooks],
+                 pins=pins)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
+def test_a_hooks_streamed_parameters_hold_check_1_on_tcgen05s_chunks_interpreted(hooks):
+    """The forward under a score hook whose parameters ride the keys' stream on a B200's tcgen05 chunks, over
+    256 causal tokens on two consumers (its two-stage rings each slot read twice): on par with the reference
+    (check 1)."""
+    spans = template.spans(256, 256, 1, causal=True)
+    _check_spans("causal", spans, (1, 256, 2, 1), interpret=True, score=SCORE_HOOKS[hooks],
+                 pins=(attention_mosaic.Tiles(64, 64, 2, 2, family="tcgen05.chunks"), None),
+                 target=generation.gpu_target("sm100"))
 
 
 INTERPRETED_HOOK_SITES = {"none": ((1, 2, 1), 8), "alibi": ((1, 2, 1), 128), "key-bias": ((1, 2, 1), 16),
@@ -595,6 +636,21 @@ def test_a_tpu_cores_forward_is_on_par_interpreted(call, forward):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+@pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
+def test_a_tpu_cores_forward_and_backward_are_on_par_under_a_score_hooks_parameters_interpreted(hooks,
+                                                                                               backward):
+    """The forward, and the backward's every gradient, on a v5e's MXU under a score hook of a key's or a
+    tile's parameter, each step reading its block where the core's one role walks (no producer: `riding`
+    takes none), over 160 causal tokens at its derived configs, under Pallas TPU's interpreter: on par with
+    the reference (check 1)."""
+    spans = template.spans(160, 160, 1, causal=True)
+    _check_spans("causal", spans, (1, 160, 2, 1), interpret=True, backward=backward,
+                 score=SCORE_HOOKS[hooks], pins=(None, None), target=generation.gpu_target("v5e"),
+                 routed=False)
+
+
+@INTERPRETS
 @pytest.mark.parametrize("call", CALLS)
 def test_a_tpu_cores_backward_is_on_par_interpreted(call):
     """The backward on a v5e's MXU, its fused launch's dQ adds each program's in turn on the core's one
@@ -668,9 +724,21 @@ def test_the_forward_is_on_par_over_every_call_form_interpreted(form):
 @pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
 def test_the_forward_is_on_par_at_head_widths_interpreted(width, value_width):
     """The forward of query heads `width` wide and value heads `value_width` over a causal call at
-    `_form_tiles`, under the interpreter."""
+    `_form_tiles`, heads past 128 at their derived tiles (an A100 refuses that pin at heads padded to 256,
+    `tuning.Unpinnable`), under the interpreter."""
+    tiles = _form_tiles() if max(width, value_width) <= 128 else None
     _check_forward("causal", jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=width,
-                   value_width=value_width, tiles=_form_tiles())
+                   value_width=value_width, tiles=tiles)
+
+
+@INTERPRETS
+def test_an_absorbed_mla_forward_of_576_wide_keys_and_512_wide_values_is_on_par_interpreted():
+    """An absorbed MLA call's widths (DeepSeek's latent 512 and rotary 64 a key, its latent 512 a value;
+    kernel-templates.md §A row 25) through the Mosaic forward an H100 runs, interpreted: its heads padded
+    to whole groups of 64 columns past 256 (`attention.head_width`), not to 1024, each loaded by one copy,
+    at its derived tiles: on par with the reference (check 1)."""
+    _check_forward("causal", jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=576,
+                   value_width=512, target=generation.gpu_target("sm90"))
 
 
 @ON_EACH_FAMILY
@@ -1304,6 +1372,34 @@ def test_the_backward_is_on_par_over_every_call_form_interpreted(case, form):
     _check_call_form(case, interpret=True, backward=True, form=form)
 
 
+def block_selected(tokens: int, block: int) -> np.ndarray:
+    """Runs `[1, tokens, 3, 2]` of a block-selected causal call (MoBA's, NSA's selected branch): each query
+    reads the keys of its own block up to its own, and two earlier blocks, its block's first and its
+    half-way one, whole; a block its query block does not select between them, so its walk's tiles are
+    the selected ones apart (`attention_mosaic_program.indexed_walk`)."""
+    runs = np.zeros((1, tokens, 3, 2), np.int32)
+    for query in range(tokens):
+        own = query // block
+        earlier = sorted({0, own // 2} - {own})
+        for index, chosen in enumerate(earlier):
+            runs[0, query, index] = (chosen * block, (chosen + 1) * block)
+        runs[0, query, len(earlier)] = (own * block, query + 1)
+    return runs
+
+
+@INTERPRETS
+@on_each_family_for(("width", "form"), [(64, "default"), (128, "default"), (64, "fused")], ids=str)
+def test_a_block_selected_call_holds_check_1_walking_its_selected_tiles_interpreted(width, form):
+    """A block-selected causal call over 512 tokens (`block_selected`: each query its own block and two
+    earlier blocks of 64, others between them unread), forward and backward under the interpreter at the
+    derived tiles, the backward in the form `form` names, on each GPU's family: on par with the reference
+    (check 1), its query blocks' walks stepping the selected tiles alone, each step's tile read through its
+    ranges (`_Program.tile_of`), which a wrong tile would miss."""
+    spans = template.spans(512, 512, 1, causal=True, runs=jnp.asarray(block_selected(512, 64)))
+    _check_spans("block-selected", spans, (1, 512, 2, 1), interpret=True, backward=True, width=width,
+                 form=form)
+
+
 @INTERPRETS
 @on_each_family_for(("case", "form"), _walked(RUN_CASES, ["forward", *BACKWARD_FORMS]), ids=str)
 def test_a_call_over_runs_is_on_par_interpreted(case, form):
@@ -1455,18 +1551,22 @@ def test_the_forward_on_three_consumers_holds_check_1_interpreted(call, training
 
 
 @INTERPRETS
-@pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
+@pytest.mark.parametrize(("width", "training"), [(64, template.Kept.NONE), (64, template.Kept.SPLIT),
+                                                 (256, template.Kept.SPLIT)],
+                         ids=["plain", "training", "training-256"])
 @pytest.mark.parametrize("call", ["full", "causal"])
-def test_the_forward_on_tcgen05s_chunks_holds_check_1_interpreted(call, training):
+def test_the_forward_on_tcgen05s_chunks_holds_check_1_interpreted(call, training, width):
     """The forward and the training forward on a B200's tcgen05 chunks (`mosaic_sm100.CHUNKS`: consumers of
     64 rows, three a program for the forward and two for the training forward, whose registers three do
-    not hold, each product into its scoped tensor memory and read back into registers, the weights staged
-    into the issuer's tile for the values' product), under the interpreter, which models tensor memory: on
-    par with the reference (check 1)."""
+    not hold; each product into its scoped tensor memory, the logits read back into registers, the weights
+    staged into the issuer's tile for the values' product; the forward's sums carried in registers, the
+    training forward's split sums kept in tensor memory across its walk), under the interpreter, which models
+    tensor memory, at width 256 too the 4B call's one training launch over every value column: on par with
+    the reference (check 1)."""
     consumers = 3 if training == template.Kept.NONE else 2
     tiles = attention_mosaic.Tiles(64, 64, 2, consumers, family="tcgen05.chunks")
-    _check_forward(call, jnp.bfloat16, (1, 192, 2, 1), natural=False, interpret=True, width=64,
-                   value_width=64, tiles=tiles, training=training, target=generation.gpu_target("sm100"))
+    _check_forward(call, jnp.bfloat16, (1, 192, 2, 1), natural=False, interpret=True, width=width,
+                   value_width=width, tiles=tiles, training=training, target=generation.gpu_target("sm100"))
 
 
 @pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
@@ -1779,9 +1879,9 @@ mainloop's own list."""
 
 @pytest.mark.parametrize("operation", APPROXIMATED_BY_MOSAIC)
 def test_every_approximated_operation_in_a_hook_takes_exact_math(operation):
-    """A score hook and an output hook each computing one operation Mosaic GPU approximates under
-    `approx_math` (`APPROXIMATED_BY_MOSAIC`) take exact math, in the forward and differentiated: no such
-    operation of a hook passes unseen."""
+    """A score hook, an output hook and a query prologue each computing one operation Mosaic GPU approximates
+    under `approx_math` (`APPROXIMATED_BY_MOSAIC`) take exact math, in the forward and (the score hook)
+    differentiated: no such operation of a hook passes unseen."""
     def applied(x):
         return getattr(jax.lax, operation)(jnp.abs(x) + 1.0)
 
@@ -1792,10 +1892,18 @@ def test_every_approximated_operation_in_a_hook_takes_exact_math(operation):
     def output_mod(out):
         return applied(out)
 
+    def query_mod(q, q_pos):
+        del q_pos
+        return applied(q.astype(jnp.float32)).astype(q.dtype)
+
     for hooks in (template.Hooks(score_mod), template.Hooks(output_mod=output_mod)):
         for differentiated in (False, True):
             assert not attention_mosaic_program.approximate(hooks, (64, 64), 64,
                                                             differentiated=differentiated)
+    # A query prologue a launch takes on its query tile (`attention_mosaic_forward._prologued`).
+    assert not attention_mosaic_program.approximate(
+        template.Hooks(query_mod=query_mod), (64, 64), 64, differentiated=False,
+        query=(64, 64, jnp.bfloat16))
 
 
 def _fullest(op, ba, target):
@@ -2031,17 +2139,17 @@ def the_backward_256_wide_under_a_softcap_is_on_par_on_an_h100():
     _check_hooked_backward("softcap", form="derived", interpret=False, width=256)
 
 
-def _counted(fn, *arrays) -> tuple[float, float]:
-    """The model's share of the Mosaic launches' work `fn` lowers for an H100 each declares
-    (`instrumentation.MODEL_FLOPS`) and the hardware's work each states (its cost estimate), as the lowered
-    program's structured reader reads them (`lowered.kernel_launches`, each launch times the calls a call
-    of the program makes)."""
+def _counted(fn, *arrays, generation_name: str = "sm90") -> tuple[float, float]:
+    """The model's share of the Mosaic launches' work `fn` lowers for a GPU of `generation_name` (an H100's)
+    each declares (`instrumentation.MODEL_FLOPS`) and the hardware's work each states (its cost estimate), as
+    the lowered program's structured reader reads them (`lowered.kernel_launches`, each launch times the calls
+    a call of the program makes)."""
     from dew.nn.kernels.lowered import kernel_launches
 
-    # Lowered deviceless for an H100 whatever the host, so a GPU host of another generation lowers no TMA
-    # of its own.
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+    # Lowered deviceless for the GPU whatever the host, so a GPU host of another generation lowers no TMA of
+    # its own.
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
+    with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",))
     launches = [(call, times) for call, times in kernel_launches(lowered) if call.kind == "mosaic_gpu"]
     assert launches and all(call.flops is not None and call.model_flops is not None for call, _ in launches)
@@ -2056,9 +2164,10 @@ def _counted(fn, *arrays) -> tuple[float, float]:
     ids=["causal", "causal-fewer-queries", "causal-more-queries", "causal-padded", "full", "full-padded"])
 def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, keys, pairs):
     """A bf16 call's plain forward, training forward and backward through the Mosaic mainloop, each lowered
-    for an H100: every launch states its hardware work (`attention_mosaic_program.stated`), which Dew's FLOP
-    count reads to size it (`instrumentation._stated_flops`: no launch unsized), and declares the model's
-    share of it; together the model's are the library's fused attention's own count, a multiply-add a
+    for an H100: every launch states its hardware work, counted from its kernel's emission
+    (`emission.costed`), which Dew's FLOP count reads to size it (`instrumentation._stated_flops`: no launch
+    unsized), and declares the model's share of it; together the model's are the library's fused
+    attention's own count, a multiply-add a
     reached pair, head and product column (a causal call's `pairs` each query's keys up to its own place,
     written out: the first key aligned to the first query, as the mainloop masks them): the forward's two
     products, the training forward's two and the backward's four (`instrumentation._fused_attention_flops`).
@@ -2126,7 +2235,7 @@ def test_a_common_walk_states_every_tile_each_holder_walks():
     """The fast backward's one launch fed by its consumers (`wgmma.fed`, a program two key blocks, each
     consumer walking every query tile either block is read by, `Family.walk_own`) over a causal call of 128
     queries and 192 keys, its keys padded to 256, lowered for an H100: the launch states the tiles each
-    consumer walks (`attention_mosaic_program.issued`), one its own keys are not seen by too. The first
+    consumer walks (`attention_mosaic_program.walked_steps`), one its own keys are not seen by too. The first
     program's consumers walk both 64-row query tiles each, the second keys' tile read by the second alone;
     the second program's none, its first keys past every query's and its second past the keys."""
     rows, heads, width, block = 1, 2, 64, 64

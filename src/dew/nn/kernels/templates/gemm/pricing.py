@@ -31,9 +31,10 @@ def tile_columns(tiles: "Tiles", family: mosaic.Family) -> int:
 
 
 def tile_rows(tiles: "Tiles", family: mosaic.Family) -> int:
-    """The output rows a tile spans: its `block_m`, or both CTAs' of a pair whose family's products span it
-    (`tile_columns`: each CTA's accumulators its own `block_m` rows)."""
-    return tiles.block_m * (tiles.cluster if family.pairs_product else 1)
+    """The output rows a cluster's tile spans: each CTA's `block_m` its own, side by side, whether a pair's
+    products span them (`tile_columns`) or its CTAs multicast the blocks they read alike."""
+    del family
+    return tiles.block_m * tiles.cluster
 
 
 def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
@@ -129,8 +130,8 @@ def split_count(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: in
     in MMA steps (`step_seconds`). Over a wave of P programs (`multiprocessors` x
     `tiles.programs`) and `rows` in steps a group (on average), the busiest program walks ceil(O s / P) of
     the O output tiles at ceil(steps / s) steps each at s slices, and streams as many shares of the operands
-    (`rows` of `depth` and of `width` at `itemsizes` bytes, each read once) at its share of `bandwidth`
-    (that of the multiprocessors the programs keep busy, over the programs in flight): the walk is the
+    (`rows` of `depth` and of `width` at `itemsizes` bytes, each read once) at its multiprocessor's share
+    of `bandwidth`, beside that multiprocessor's other programs' shares (`SplitWalk.walk`): the walk is the
     longer of the two, W unsplit. A split adds its fp32 partials' 2s + 1 passes over the output
     (`partial_rows` of it where they hold fewer than its `groups` x `depth`: a decode step's experts' few
     rows), p steps each at `bandwidth`, and the launch their sum adds (`launch_seconds`, the part's measured
@@ -176,18 +177,23 @@ class SplitWalk:
     def walk(self, splits: int) -> float:
         """The busiest program's walk at `splits` slices a tile, in steps: its waves' share of every tile's
         slices, each step at its share of its multiprocessor's tensor rate (the programs a wave runs on each
-        at once), or its share of the operands' stream where that is longer. Priced at the whole rate, two
-        programs a multiprocessor read as twice the part's peak: an RTX PRO 6000's dense 64 x 64 walks at
-        two programs priced 0.21-0.23 of their measured time (M-FS-9), where an underfilled wave, one
-        program a multiprocessor, runs at the whole rate."""
+        at once), or its multiprocessor's share of the operands' stream where that is longer: each
+        multiprocessor streams at its share of the memory's rate, its programs' shares in turn, so a wave of
+        more programs than multiprocessors but not twice them streams two shares on some. Priced at a rate
+        shared by programs instead, an A100's 2048 x 2048 decode product at 16 rows took a seven-way split
+        of its 16 tiles (112 programs on 108 multiprocessors) over the six-way swapped walk (96 programs),
+        which ran 0.88x its kernel time at the same DRAM bytes, 0.79x its call's (M-EM-45b-a100; the split
+        count's own share of that, M-EM-45c). Priced at the whole rate, two programs a multiprocessor read as
+        twice the part's peak: an RTX PRO 6000's dense 64 x 64 walks at two programs priced 0.21-0.23 of
+        their measured time (M-FS-9), where an underfilled wave, one program a multiprocessor, runs at the
+        whole rate."""
         programs = self.output * splits
         waves = -(-programs // self.wave)
         sharing = -(-min(programs, self.wave) // self.multiprocessors)
         busiest = waves * -(-self.steps // splits) * sharing
-        # A program's share of the operands, at its share of the memory's rate.
-        rate = (self.bandwidth * min(programs, self.multiprocessors) / self.multiprocessors
-                / min(programs, self.wave))
-        stream = waves * self.operand_bytes / programs / rate / self.step_seconds
+        # The busiest multiprocessor's programs' shares of the operands, at its share of the memory's rate.
+        rate = self.bandwidth / self.multiprocessors
+        stream = waves * sharing * self.operand_bytes / programs / rate / self.step_seconds
         return max(busiest, stream)
 
     def seconds(self, splits: int) -> float:
