@@ -597,40 +597,35 @@ def test_the_scenario_suites_coverage_items_are_its_tasks_alone(ci, tmp_path):
     assert ran == sorted(ci.SCENARIO_SUITE)
 
 
-def test_a_changes_reach_is_the_rows_whose_recorded_inputs_it_changed_at_the_keys_grain(ci, tmp_path,
-                                                                                          monkeypatch):
-    """A change's reach (`reached`) reads it as a key does (`changed_inputs`): a row whose own file it
-    changed; one whose last run executed a unit whose digest it changed (one function of a module, not its
-    untouched neighbour), read a file wholly changed (data), or found by an import lookup a file it added;
-    and one whose last run recorded no inputs (unknown, named apart); never a row the cache keeps, nor one
-    whose inputs it left alone (Main, 2026-11-15: a reach read off the plan's misses named 547 files for a
-    one-space change)."""
+def test_a_changes_reach_is_the_rows_whose_keys_it_changes(ci, tmp_path, monkeypatch):
+    """A change's reach (`reached`) is the rows whose key over their last run's inputs differs between its
+    base and its checkout, as the cache reads it: one that executed a function it changed, not one that
+    executed its untouched neighbour; one that read a data file it changed; one whose last run recorded no
+    inputs, unknown and named apart; never a row the cache keeps (Main, 2026-11-15: a reach read off the
+    plan's misses named 547 files for a one-space change)."""
     followed = ci.followed
-    monkeypatch.chdir(tmp_path)
-    subprocess.run(["git", "init", "-q"], check=True)
-    Path("src/dew").mkdir(parents=True)
-    Path("src/dew/x.py").write_text("def f():\n    return 1\n\n\ndef g():\n    return 2\n")
-    Path("data.txt").write_text("a\n")
-    subprocess.run(["git", "add", "-A"], check=True)
-    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"], check=True)
-    base = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
-                          check=True).stdout.strip()
-    Path("src/dew/x.py").write_text("def f():\n    return 10\n\n\ndef g():\n    return 2\n")
-    Path("data.txt").write_text("b\n")
-    Path("src/dew/y.py").write_text("Y = 1\n")
-    change = ci.changed_inputs(base, {"src/dew/x.py", "data.txt", "src/dew/y.py", "tests/test_a.py"})
-    rows = [("tests/test_a.py", ""), ("tests/test_b.py", "1/2"), ("tests/test_b.py", "2/2"),
-            ("tests/test_c.py", ""), ("tests/test_d.py", ""), ("tests/test_e.py", ""),
-            ("tests/test_f.py", ""), ("tests/test_g.py", "")]
+
+    def tree(root: Path, body: str, data: str) -> None:
+        (root / "src/dew").mkdir(parents=True)
+        (root / "src/dew/x.py").write_text(f"def f():\n    return {body}\n\n\ndef g():\n    return 2\n")
+        (root / "data.txt").write_text(data)
+
+    base, head = tmp_path / "base", tmp_path / "head"
+    tree(base, "1", "a\n")
+    tree(head, "10", "b\n")
+    monkeypatch.chdir(head)
+    monkeypatch.setattr(ci, "shared", lambda python: "common")
+    rows = [("tests/test_b.py", "1/2"), ("tests/test_b.py", "2/2"), ("tests/test_d.py", ""),
+            ("tests/test_e.py", ""), ("tests/test_f.py", ""), ("tests/test_g.py", "")]
     last = {("tests/test_b.py", "1/2"): [f"src/dew/x.py{followed.CODE}f"],
             ("tests/test_b.py", "2/2"): [f"src/dew/x.py{followed.CODE}g"],
-            ("tests/test_c.py", ""): [f"{followed.LOOKUP}src/dew/y"],
             ("tests/test_d.py", ""): ["data.txt"],
             ("tests/test_f.py", ""): [f"src/dew/x.py{followed.CODE}f"],
             ("tests/test_g.py", ""): [f"src/dew/x.py{followed.CODE}g"]}
-    reach = ci.reached(rows, {("tests/test_f.py", "")}, last, change)
-    assert reach == {"files": ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py", "tests/test_d.py",
-                               "tests/test_e.py"], "unknown": ["tests/test_e.py"]}
+    reach = ci.reached("3.12", rows, {("tests/test_f.py", "")}, last, base)
+    assert reach == {"files": ["tests/test_b.py", "tests/test_d.py", "tests/test_e.py"],
+                     "unknown": ["tests/test_e.py"]}
+    assert Path.cwd() == head
 
 
 def test_a_coverage_task_has_a_deadline_for_tracing(ci, tmp_path):
