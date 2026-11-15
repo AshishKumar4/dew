@@ -111,15 +111,17 @@ def averaged_pinned(runs: Sequence[SavedRun], *, ema: bool | None = None, mesh=N
 
 def _refuse_another(model: ModelConfig, base: ModelConfig, directory: str, first: str) -> None:
     """Refuse the run in `directory`, whose model record is `base`, where it is another model than the
-    first run's (`model`): another class or wrappers, or a field that says what it computes
-    (`registry.computing_differences`) otherwise, each named."""
+    first run's (`model`): another class or wrappers, or a field that says what it computes or what it
+    trains toward (`registry.computing_differences`, `TRAINS` kept) otherwise, each named."""
+    from dew import _records
     from dew.registry import computing_differences
 
     if (base.name, base.wrappers) != (model.name, model.wrappers):
         differing = [f"its class {base.name}" if base.name != model.name else "its wrappers"]
     else:
         differing = [f"{name} {theirs!r} where it has {ours!r}" for name, (ours, theirs) in
-                     computing_differences(model.member, model.arguments, base.arguments).items()]
+                     computing_differences(model.member, model.arguments, base.arguments,
+                                           kept=(_records.TRAINS,)).items()]
     if differing:
         raise ValueError(f"the run in {directory} trains another model than {first}'s, so their weights "
                          f"are not one model's to average: {'; '.join(differing)}")

@@ -481,9 +481,10 @@ def takes_dtype(model: ModelConfig) -> bool:
 def _model_changes(saved: ModelConfig, before: JSON, now: JSON) -> list[str]:
     """What a resume of a run whose model record was `before` (`saved` read back) changes of what it trains
     under `now`, by name: its class or wrappers (`model`), or a field that says what the model computes or
-    the numbers it computes in (`registry.computing_differences`, `NUMBERS` and `ROUNDS` kept), as
-    `model.<field>`. A field that says how it runs or trains alone (`dew._records.RUNS`: remat, dropout,
-    kernels), which the memory plan or the devices a resume lands on choose, changes freely."""
+    the numbers it computes in, or what it trains toward (`registry.computing_differences`, `NUMBERS`,
+    `ROUNDS` and `TRAINS` kept), as `model.<field>`. A field that says how it runs or trains alone
+    (`dew._records.RUNS`: remat, dropout, kernels), which the memory plan or the devices a resume lands on
+    choose, changes freely."""
     records = [_records.record(record, "model") for record in (before, now)]
     named = [{key: value for key, value in record.items() if key not in ("fields", "defaults")}
              for record in records]
@@ -492,7 +493,7 @@ def _model_changes(saved: ModelConfig, before: JSON, now: JSON) -> list[str]:
     stated = [{**_records.record(record.get("defaults") or {}, "model.defaults"),
                **_records.record(record.get("fields") or {}, "model.fields")} for record in records]
     return [f"model.{name}" for name in registry.computing_differences(
-        saved.member, *stated, kept=(_records.NUMBERS, _records.ROUNDS))]
+        saved.member, *stated, kept=(_records.NUMBERS, _records.ROUNDS, _records.TRAINS))]
 
 
 def _learns_alike(before: ObjectiveConfig | None, now: ObjectiveConfig | None) -> bool:

@@ -2687,8 +2687,8 @@ jaraco-functools==4.6.0 \
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post95 \
-    --hash=sha256:aaca7846d221b4618804dd3a55d23bad374d2152b01c602817793ef0c6e8bfb0
+jax==0.12.0.1.post97 \
+    --hash=sha256:257d13c0c8fec88c631829c7d1e66fd8db5de4c96b2e952b1192b763ac5fd958
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -2699,19 +2699,19 @@ jax==0.12.0.1.post95 \
     #   orbax-checkpoint
     #   qwix
     #   tokamax
-jax-cuda13-pjrt==0.12.0.1.post81 \
-    --hash=sha256:b8eb00c3c9fee6e2d685e4c6644aed3c51ef574aad04af1f47ed5eb605648618 \
-    --hash=sha256:f7d71fbea21c0264ad9e60adcd83fa27a8191e4882d8fc6bee9862e03fb24e73
+jax-cuda13-pjrt==0.12.0.1.post96 \
+    --hash=sha256:01b3a8766ad9b26f9b09780570d404c679498fe2e7c93cf8c6cbd8b10cb35a58 \
+    --hash=sha256:b01e0213d7da59778402cd216f42e59cf68df615284b9c3b5f0ddb2699e84a68
     # via
     #   dewml (pyproject.toml)
     #   jax-cuda13-plugin
-jax-cuda13-plugin==0.12.0.1.post81 \
-    --hash=sha256:03c9317494126ef66bfc107dce9e14d5c33eed4e338ed741f63f029aa02fb1b4 \
-    --hash=sha256:9c3d0aea181cf3cd605a14a5841d41c0e92024eee071e50d3c746e277e84bd54 \
-    --hash=sha256:b96b9d8ee1bb5bfc03efd4092747f6d3c5d4a4e6154aa57471fd5e4a76027ee9 \
-    --hash=sha256:e1bdd0665bf7ca05e7654871b63edba132761ef02de645379d87b8874e4cfe7e \
-    --hash=sha256:e2a63b48a7c49ba19aea6bad866146a0337edec5656031e58c785e2f03185d4e \
-    --hash=sha256:ef2ddbb372bc46c9a1fc9336a6b32f3a8e1e3e6e5b658c8007b9fe2a7dd9d14d
+jax-cuda13-plugin==0.12.0.1.post96 \
+    --hash=sha256:7b953defeb46c21789189f6db2a7f15ae23828196e869553e9c5338c6a0bfe26 \
+    --hash=sha256:98f2f7939c7af8a6dc9f7666fd02f8009f0b3b29cb9de0bd6ca2d45beac82bac \
+    --hash=sha256:de59271c6d6fa3a7bf7493cc5d8fb9b2c1fbaacfea32f3f2383e11304182ab51 \
+    --hash=sha256:df0a2777a01f1743b930e4cad9cc7fbfc254eefc0aa75e60650206e16115c901 \
+    --hash=sha256:f378c6b51247201cfcd5947d9ddf3ff58b1169897093c80588c901a07877fee6 \
+    --hash=sha256:f953a74cdf7c20bb4c21d823946a024bc1ed89c11fa10a1a4b36889bf14f73e0
     # via dewml (pyproject.toml)
 jaxlib==0.12.0.1 \
     --hash=sha256:00acba6d262f20110289e5d3384cd92298ae362226b66f77f92c518fab55c2c6 \

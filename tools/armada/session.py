@@ -155,9 +155,11 @@ def declared_marks(name: str, text: str) -> dict[str, tuple[str, dict[str, int],
     its mark's kind of `SHARDS`, its literal counts and the line that holds it: a test's own decorator, or a
     parameter's of the test's one literal parametrize list, `pytest.param(..., id="<id>", marks=...)`, its
     site `test[id]` (Main's ruling, 2026-11-09: test_recurrence's ~60 hook combinations, each a check-1 site
-    of its own seeds). A mark written otherwise would set its site aside from its file's tasks and plan none
-    of its own, so nothing would run it: its file is refused, by the lines that hold it. None for a source
-    that does not parse, whose collection fails its row, saying why."""
+    of its own seeds); or an entry of the file's module-level literal `CHECK1_SHARDS` (`declared`),
+    whose generated cells its code marks from it (row 6444). A mark written otherwise would set its site
+    aside from its file's tasks and plan none of its own, so nothing would run it: its file is refused, by
+    the lines that hold it. None for a source that does not parse, whose collection fails its row, saying
+    why."""
     try:
         tree = ast.parse(text)
     except SyntaxError:
@@ -182,6 +184,7 @@ def declared_marks(name: str, text: str) -> dict[str, tuple[str, dict[str, int],
     decorated = list(decorated_tests(tree.body))
     for test, mark in decorated:
         marked(test, mark)
+    declared(tree, found, read)
     lists = {test: [mark for each, mark in decorated if each == test
                     and ast.unparse(mark.func) == "pytest.mark.parametrize"] for test, _ in decorated}
     for test, parametrized in lists.items():
@@ -213,6 +216,40 @@ def declared_marks(name: str, text: str) -> dict[str, tuple[str, dict[str, int],
                          f"digits, _ and -, which the plan reads from the source "
                          f"(tools/armada/ci.py `sites`)")
     return found
+
+
+CHECK1_SHARDS = "CHECK1_SHARDS"
+"""A test file's module-level literal of its generated check-1 sites (`declared_marks`)."""
+
+
+def declared(tree: ast.Module, found: dict[str, tuple[str, dict[str, int], int]], read: set[int]) -> None:
+    """The sites of a test file's module-level `CHECK1_SHARDS` literal, {"test[id]": {"seeds": S,
+    "per_task": P}} (its parsed `tree`), into `found`: each of a literal id, its counts above zero, the
+    dict's line its line; and the marks its code builds from it, `pytest.mark.check1_shards(**...)`,
+    counted `read`, as the dict states their counts. An entry otherwise refuses the file, naming it."""
+    literal = next((node for node in tree.body if isinstance(node, ast.Assign) and [
+        target.id for target in node.targets if isinstance(target, ast.Name)] == [CHECK1_SHARDS]), None)
+    if literal is None:
+        return
+    try:
+        entries = ast.literal_eval(literal.value)
+    except ValueError:
+        entries = None
+    if not isinstance(entries, dict):
+        raise SystemExit(f"{CHECK1_SHARDS}, line {literal.lineno}: a literal dict the plan reads from the "
+                         "source, {\"test[id]\": {\"seeds\": S, \"per_task\": P}}")
+    for site, counts in entries.items():
+        test, _, rest = site.partition("[")
+        if not (isinstance(counts, dict) and set(counts) == {"seeds", "per_task"} and test.startswith("test")
+                and rest.endswith("]") and PARAM_ID.fullmatch(rest[:-1]) and site not in found
+                and all(type(count) is int and count > 0 for count in counts.values())):
+            raise SystemExit(f"{CHECK1_SHARDS}, line {literal.lineno}: {site!r} is no `test[id]` of an id of "
+                             "letters, digits, _ and - with seeds and per_task alone, each above zero")
+        found[site] = ("check1_shards", counts, literal.lineno)
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and ast.unparse(node.func).endswith("mark.check1_shards")
+                and not node.args and [keyword.arg for keyword in node.keywords] == [None]):
+            read.add(id(node.func))
 
 
 def site_name(node: str, sites: Container[str]) -> str:

@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 import pytest
-from process_support import ProcessGroup, drained, output, run_pool, running, start_process, terminate
+from process_support import ProcessGroup, Stuck, drained, output, run_pool, running, start_process, terminate
 
 
 def test_pool_reports_follow_rank_order_and_workers_own_sessions(tmp_path):
@@ -101,9 +101,9 @@ def test_timed_out_pool_reports_every_rank_and_reaps_them(tmp_path):
         running.append(process)
         return process
 
-    with pytest.raises(pytest.fail.Exception) as caught:
+    with pytest.raises(Stuck) as caught:
         run_pool("timeout", tmp_path, 2, start=start, timeout=.05)
-    assert all(f"--- process {rank}, exit " in str(caught.value) for rank in range(2))
+    assert len(caught.value.exits) == 2 and None not in caught.value.exits
     assert all(process.poll() is not None for process in running)
 
 

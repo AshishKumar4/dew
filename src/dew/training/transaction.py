@@ -49,7 +49,7 @@ from dew.nn.kernels.options import owned_program
 from dew.nn.moe import fixed_routers
 from dew.nn.precision import at_least_fp32
 from dew.nn.programs import called, computed
-from dew.nn.sharding import auto_part, rows_spec
+from dew.nn.sharding import constrained, rows_spec
 from dew.objectives.base import (
     EXAMPLE_STREAM,
     Aux,
@@ -490,14 +490,8 @@ def _unscale(gradient: jax.Array, factor: jax.typing.ArrayLike) -> jax.Array:
 
 
 def placed_as(tree, placement):
-    """`tree` constrained to where `placement` places each of its leaves, over the Auto axes of the mesh in
-    context (`auto_part`): an Explicit axis stays where a leaf's type places it, a Manual one is a
-    `shard_map`'s own, and no mesh, or one of no Auto axis, leaves `tree` as it is."""
-    mesh = jax.sharding.get_abstract_mesh()
-    if mesh.empty or not mesh.auto_axes:
-        return tree
-    return jax.tree.map(lambda leaf, sharding: jax.lax.with_sharding_constraint(
-        leaf, auto_part(sharding.spec, mesh)), tree, placement)
+    """`tree` constrained to where `placement` places each of its leaves (`constrained`)."""
+    return jax.tree.map(lambda leaf, sharding: constrained(leaf, sharding.spec), tree, placement)
 
 
 def _descending(gradient: jax.Array, parameter: jax.Array) -> jax.Array:

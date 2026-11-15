@@ -187,19 +187,21 @@ def examples() -> list[Example]:
             for state in STATES]
 
 
-def scored(objective, windows, variables) -> dict[str, np.ndarray]:
-    """Each question's real options' logits, keyed by its request's shared part's tokens and its own
-    part's: a row of its own is both, a row over one state its shared document and the question's."""
+def scorer(objective, windows):
+    """Each question's real options' logits as a function of the variables, keyed by its request's shared
+    part's tokens and its own part's: a row of its own is both, a row over one state its shared document
+    and the question's. Its forward is compiled once and its windows laid out once, so each seed of a
+    check runs the program alone: one compiled a call traced the model again for every seed's every arm."""
     forward = without_ynn(lambda variables, inputs: objective.model.logits(variables, inputs))
-    logits = {}
+    laid = []
     for batch in windows:
         inputs = laid_out(batch, objective.bounds.segments, attention=objective.layout.attention)
-        held = np.asarray(forward(variables, inputs))
         options, owners = np.asarray(batch["options"]), np.asarray(batch["question_rows"])
         tokens, segments = np.asarray(batch["tokens"]), np.asarray(batch["segments"])
         # Each token's part of its row: its document, or its stream where its rows stand in streams.
         marked = next((name for name in ("documents", "streams") if name in batch), None)
         parts = np.zeros_like(tokens) if marked is None else np.asarray(batch[marked])
+        places = []
         for window, owner in enumerate(owners):
             for row in range(1, int(segments[window].max()) + 1):
                 own = segments[window] == row
@@ -208,8 +210,17 @@ def scored(objective, windows, variables) -> dict[str, np.ndarray]:
                     part = own & (np.isin(parts[window], held_parts[[0, number]])
                                   if marked is not None else True)
                     key = bytes(tokens[window][part].astype(np.uint8)).decode(errors="replace")
-                    logits[key] = held[window][slot][options[window][slot]]
-    return dict(sorted(logits.items()))
+                    places.append((key, window, slot, options[window][slot]))
+        laid.append((inputs, places))
+
+    def scored(variables) -> dict[str, np.ndarray]:
+        logits = {}
+        for inputs, places in laid:
+            held = np.asarray(forward(variables, inputs))
+            for key, window, slot, options in places:
+                logits[key] = held[window][slot][options]
+        return dict(sorted(logits.items()))
+    return scored
 
 
 def test_a_row_over_one_state_decides_each_question_as_its_own_row_does():
@@ -229,13 +240,14 @@ def test_a_row_over_one_state_decides_each_question_as_its_own_row_does():
     wide.model = DecisionModel(alone.model.backbone.clone(dtype=jnp.float64),
                                alone.model.head.clone(dtype=jnp.float64), alone.model.context_encoder)
 
+    wide_scored = scorer(wide, windows["alone"])
+
     @as_given
     def truth(variables):
         with jax.enable_x64(new_val=True):
-            return scored(wide, windows["alone"], widened(variables))
+            return wide_scored(widened(variables))
 
-    assert_as_exact(as_given(lambda variables: scored(shared, windows["shared"], variables)),
-                    as_given(lambda variables: scored(alone, windows["alone"], variables)),
+    assert_as_exact(as_given(scorer(shared, windows["shared"])), as_given(scorer(alone, windows["alone"])),
                     lambda seed: (initialized(jax.random.key(seed)),), "rows over one state",
                     seeds=STATE_ONCE_SEEDS, truth_fn=truth)
 
