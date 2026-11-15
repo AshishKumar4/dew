@@ -379,7 +379,6 @@ def test_padded_packed_rows_reset_at_each_document(seeded_reference):
     assert_recorded_as_exact(seeded_reference, "model_scored", scored, "the scored padded row")
 
 
-@pytest.mark.scenario("Hybrid and state-space models")
 def test_the_model_decodes_as_it_scores_in_parallel(seeded_reference):
     """A prefill of four tokens and eight single-token steps, every layer's state riding the flax cache
     collection, against transformers' model on the same twelve tokens at each step's width

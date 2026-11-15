@@ -597,7 +597,6 @@ def test_a_metric_reads_the_host_fields_of_every_process_share(tmp_path):
 # The same step, on more processes
 # --------------------------------------------------------------------------
 
-@pytest.mark.scenario("Distributed training")
 @pytest.mark.distributed
 def test_two_processes_train_the_step_one_process_trains(tmp_path):
     """Splitting the batch across processes must not change the arithmetic.
@@ -1703,7 +1702,6 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
     assert relative_difference(unmasked, reference) > 1e-2
 
 
-@pytest.mark.scenario("Hybrid and state-space models")
 @pytest.mark.distributed
 def test_a_pool_trains_a_hybrid_split_over_the_sequence(tmp_path):
     """Two processes of one device each train a hybrid decoder's Mamba-2 and attention layers split

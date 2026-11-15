@@ -62,7 +62,6 @@ def assert_same_bits(found, expected) -> None:
     np.testing.assert_array_equal(found.reshape(-1).view(np.uint8), expected.reshape(-1).view(np.uint8))
 
 
-@pytest.mark.scenario("Published diffusion pipelines")
 @pytest.mark.parametrize("family", ["flux", "z_image", "wan"])
 def test_a_streamed_pipeline_keeps_its_towers_placed_as_it_samples(extracted, family):
     """A pipeline loaded onto a mesh samples a prompt end to end on its placed leaves: the conditioner's,

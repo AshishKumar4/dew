@@ -56,6 +56,12 @@ type ReleaseFormat = Literal["laya", "joint", "slots"]
 (`dew.decision.joint_checkpoint`) and the slot readout's (`dew.decision.slot_source`)."""
 
 
+RUNS = {_records.RUNS: True}
+"""A head field that says how it runs or trains, not what it computes (`dew._records.RUNS`): runs whose
+heads differ in it alone are of one task (`Decide.averaged`)."""
+NUMBERS = {_records.RUNS: True, _records.NUMBERS: True}
+"""A head field that says in what numbers it computes (`dew._records.NUMBERS`), which a task's runs share."""
+
 class Head(nn.Module):
     """What every decision head offers: its call, whether it reads the output
     table, and the record a run keeps of it.
@@ -163,10 +169,10 @@ class DecisionHead(Head):
 
     features: int
     layers: int = 2
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
+    dropout_rate: float = dataclasses.field(default=0.0, metadata=RUNS)
+    dtype: Dtype | None = dataclasses.field(default=None, metadata=NUMBERS)
+    precision: PrecisionLike = dataclasses.field(default=None, metadata=NUMBERS)
+    attention_impl: AttentionImpl = dataclasses.field(default="auto", metadata=RUNS)
 
     @nn.nowrap
     def decision_flops(self, lengths, questions, options) -> float:
@@ -363,9 +369,9 @@ class JointSchemaHead(Head):
     layers: int = 4
     heads: int = 16
     feedforward: int = 4096
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
+    dtype: Dtype | None = dataclasses.field(default=None, metadata=NUMBERS)
+    precision: PrecisionLike = dataclasses.field(default=None, metadata=NUMBERS)
+    attention_impl: AttentionImpl = dataclasses.field(default="auto", metadata=RUNS)
     reads_table: ClassVar[bool] = True
     reads_apart: ClassVar[bool] = False
     release_format: ClassVar[ReleaseFormat | None] = "joint"
@@ -546,7 +552,7 @@ class LabelReadout(Head):
     features: int
     label_ids: tuple[tuple[int, ...], ...]
     untied: bool = False
-    dtype: Dtype | None = None
+    dtype: Dtype | None = dataclasses.field(default=None, metadata=NUMBERS)
     count: int = 0
     reads_labels: ClassVar[bool] = True
     release_format: ClassVar[ReleaseFormat | None] = "slots"
@@ -626,7 +632,7 @@ class SlotReadout(Head):
     label_ids: tuple[int, ...]
     head_dim: int = 64
     slot_rows: int | None = None
-    dtype: Dtype | None = None
+    dtype: Dtype | None = dataclasses.field(default=None, metadata=NUMBERS)
     reads_labels: ClassVar[bool] = True
     release_format: ClassVar[ReleaseFormat | None] = "slots"
     draws_from_rows: ClassVar[bool] = True

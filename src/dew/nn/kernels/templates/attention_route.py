@@ -201,11 +201,18 @@ def _mainloop(declined: selection.Refusal | None, spans: KeySpans, hooks: Hooks,
               interpret: bool = False) -> str:
     """The mainloop a pass runs, reported (`MAINLOOP`), from Mosaic's reason it `declined` the pass and the
     Triton mainloop's refusal of its spans and hooks (`attention_triton.refused`: a dropping call's) or of
-    the call, no config of whose launch fits the GPU (`unfitted()`, its own fitting); the GPU in effect's
-    mainloops where `interpret` runs them on the CPU."""
+    the call, no config of whose launch fits the GPU (`unfitted()`, its own fitting), and where the Triton
+    mainloop is the one selected, none its GPU's assembler holds (`unfitted(certified=True)`: each config
+    it derives compiled alone, a spilling one refused and the next derived, to its least tile): a call that
+    exhausts it is declined for its registers, reported so, and the plain-JAX mainloop takes it, a call
+    another mainloop takes compiling none of the Triton kernels. The GPU in effect's mainloops where
+    `interpret` runs them on the CPU."""
     on_gpu = _on_gpu() or interpret
     triton = (attention_triton.refused(spans, hooks) or unfitted()) if on_gpu else None
-    return selection.select(MAINLOOP, _Pass(on_gpu, _on_mosaic() or interpret, declined, triton)).kernel
+    case = _Pass(on_gpu, _on_mosaic() or interpret, declined, triton)
+    if on_gpu and not interpret and triton is None and selection.selected(MAINLOOP, case).name == 'triton':
+        case = dataclasses.replace(case, triton=unfitted(certified=True))
+    return selection.select(MAINLOOP, case).kernel
 
 
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,

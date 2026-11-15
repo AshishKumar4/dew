@@ -338,34 +338,57 @@ def entering_documents(operands):
     return dataclasses.replace(operands, starts=starts, loads=loads, stores=stores, held=HELD)
 
 
+def _neutral(hooks: recurrence.Hooks, name: str) -> float:
+    """A padded token's value of field `name` under `hooks`, one that leaves the memory as it is: no key,
+    value or query, no decay and no write; where the hooks form the decay and the write gate from
+    pre-activations (`recurrence.gated`), one far below zero, whose softplus and sigmoid are 0."""
+    formed = name == 'gate' or (name == 'beta' and hooks.gates is not None)
+    return -1e30 if formed else 0.0
+
+
 def document_by_document(hooks, operands, run=None):
     """Each document of `operands` a sequence of its own through `run(hooks, piece)` (`token_by_token`
     where None), in the row's order from its `FORKED` table slot's memory (a given one, or the final an
     earlier document stored, with its entry write added where `operands` give one), its outputs back in
-    place, and each row's last memory."""
+    place, and each row's last memory. The rows' k-th documents run as one call, a row each over the longest
+    document's tokens, each padded after its own with tokens that leave its memory as it is (`_neutral`):
+    a call a document, the template's reference arm certified each document's launches at its own length,
+    the six documents' 18 sets of the GPU tier's three forms, and with the float64 truth's six traces took
+    240 s of an H100 job's harness (MAINGPU-be0a83791-PART2of10, tests/arm_arithmetic.py:147)."""
     run = token_by_token if run is None else run
-    tokens = ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'z')
-    outs, lasts = [], []
-    for row, (begins, (loads, stores)) in enumerate(zip(DOCUMENTS, FORKED, strict=True)):
-        ends = (*begins[1:], operands.value.shape[1])
-        table = list(operands.state[row]) + [None] * HELD
-        pieces, final = [], None
-        for document, (begin, end, load, store) in enumerate(zip(begins, ends, loads, stores, strict=True)):
-            state = table[load - 1] if load else jnp.zeros_like(operands.state[row, 0])
+    named = [name for name in ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'z')
+             if getattr(operands, name) is not None]
+    bounds = [tuple(zip(begins, (*begins[1:], operands.value.shape[1]), strict=True)) for begins in DOCUMENTS]
+    longest = max(end - begin for row in bounds for begin, end in row)
+    tables = [list(operands.state[row]) + [None] * HELD for row in range(len(DOCUMENTS))]
+    pieces = [[] for _ in DOCUMENTS]
+    finals = []
+
+    def padded(name, row, begin, end):
+        tokens = getattr(operands, name)[row, begin:end]
+        return jnp.pad(tokens, [(0, longest - (end - begin))] + [(0, 0)] * (tokens.ndim - 1),
+                       constant_values=_neutral(hooks, name))
+
+    for document in range(len(DOCUMENTS[0])):
+        states = []
+        for row, (loads, _) in enumerate(FORKED):
+            load = loads[document]
+            state = tables[row][load - 1] if load else jnp.zeros_like(operands.state[row, 0])
             if operands.entry_key is not None:
                 state = state + entry_write(operands, row, document)
-            fields = {name: getattr(operands, name)[row:row + 1, begin:end] for name in tokens
-                      if getattr(operands, name) is not None}
-            piece = dataclasses.replace(operands, **fields, state=state[None], starts=None, loads=None,
-                                        stores=None, held=0, entry_key=None, entry_value=None,
-                                        entry_weight=None)
-            out, final = run(hooks, piece)
-            pieces.append(out[0])
-            if store:
-                table[GIVEN + store - 1] = final[0]
-        outs.append(jnp.concatenate(pieces))
-        lasts.append(final[0])
-    return jnp.stack(outs), jnp.stack(lasts)
+            states.append(state)
+        piece = dataclasses.replace(
+            operands, **{name: jnp.stack([padded(name, row, *bounds[row][document])
+                                          for row in range(len(DOCUMENTS))]) for name in named},
+            state=jnp.stack(states), starts=None, loads=None, stores=None, held=0, entry_key=None,
+            entry_value=None, entry_weight=None)
+        out, finals = run(hooks, piece)
+        for row, (_, stores) in enumerate(FORKED):
+            begin, end = bounds[row][document]
+            pieces[row].append(out[row, :end - begin])
+            if stores[document]:
+                tables[row][GIVEN + stores[document] - 1] = finals[row]
+    return jnp.stack([jnp.concatenate(row) for row in pieces]), finals
 
 
 @pytest.mark.check1_shards(seeds=80, per_task=8)

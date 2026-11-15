@@ -8,8 +8,8 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392, 5437]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Performance measurements. [569, 285, 295, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
 - One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427, 1701, 5739]
@@ -20,6 +20,11 @@ This page is generated from the maintainers' findings ledger as each change land
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353, 5288]
 - Convolution repairs above their owner. [5665]
 - The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
+- Every reverse mode that forms a parameter gradient calls with_gradients_formed. [6471]
+- Gemm.in_layer deleted; gemm's reverse mode and the plain projection call derivatives.with_gradients_formed, the one statement. [6472]
+- Kernel-templates.md section 10. [6473]
+- The contract's guard, tests/test_declared_cells_memory.py, runs over every instruction family a GPU target claims. [6474]
+- The recurrence suite's wall: every case within CI's group target. [6480, 6481, 6482, 6483, 6484, 6485, 6486, 6487, 6488, 6489, 6490, 6491, 6529, 6530, 6531, 6532, 6533, 6534]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822, 5391]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -31,10 +36,14 @@ This page is generated from the maintainers' findings ledger as each change land
 - Derived resources: tiles, registers, residency and issued work. [5567]
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
 - Block-selected attention's other selections as mixers. [6301]
+- Mosaic has no float32 forward at width 256 on Hopper. [6508]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm. [6030]
 - A Hopper kernel gradient's cluster along its output's columns. [6318]
 - Exact on every path, every edge and every derivative order. [2656]
 - The suite's wall. [5478]
+- Resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
+- Sm90 lightning attention (MiniMax-Text-01, 64 heads of 128, bf16) packed forward, the gate's two-roles variant. [6495]
+- The interpreter (Pallas Mosaic GPU interpret mode, the CPU suite's) takes about 8 times as long a draw for a tcgen05. [6521]
 
 ## Models and interop
 
@@ -49,6 +58,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Every nn and interop primitive, seam, contract and derivative has one owner. [5450, 5625]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
 - Prepared_embeddings sits in call_metadata.py, the per-call data beside the residual, to keep causal_transformer.py under 2500 lines. [6189]
+- Src/dew/interop/config_records.py:48-57 hand-copies PretrainedConfig().to_dict()'s field names. [6496]
 
 ## Training and parallelism
 
@@ -59,6 +69,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Training & Data's tests on check 1. [708]
 - XLA:CPU edges. [1591]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
+- The frontier's offloaded sibling. [6526]
 
 ## Data
 

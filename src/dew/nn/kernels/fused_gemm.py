@@ -34,6 +34,7 @@ kernels take, the reference a fused route is checked against, and 'fused' raises
 take it rather than run XLA (`selection.KernelRefused`).
 """
 
+import contextlib
 import contextvars
 import dataclasses
 import functools
@@ -81,20 +82,25 @@ def product(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None
     consumers, fused into the template's epilogue under `fuser.fuse`, read the product exactly as the
     program they came from does: the accumulator tile rounded to `out_dtype`, their first operation."""
     declared = (precision, jnp.dtype(lhs.dtype if out_dtype is None else out_dtype))
-    if not all(jnp.issubdtype(operand.dtype, jnp.inexact) for operand in (lhs, rhs)):
+    floating = all(jnp.issubdtype(operand.dtype, jnp.inexact) for operand in (lhs, rhs))
+    made = _FUSIBLES.get()
+    if floating and made is not None:
+        made.append(declared)
+    if not floating or made is not None:
         # An integer product (a quantized dot's) is XLA's own, nothing fused: the template sums floating
-        # products alone, so a region of one has no stage to analyse or price (`analysis`).
+        # products alone, so a region of one has no stage to analyse or price (`analysis`). While `fused`
+        # looks for a region's fusible products (`_FUSIBLES`), a product is its dot as written: the look
+        # reads their declarations and shapes alone, and builds no launch to drop.
         if group_sizes is None:
             return jax.lax.dot_general(lhs, rhs, (((1,), (1 if transpose_rhs else 0,)), ((), ())),
                                        precision=precision, preferred_element_type=declared[1])
         matrices = jnp.swapaxes(rhs, 1, 2) if transpose_rhs else rhs
         return jax.lax.ragged_dot(lhs, matrices, group_sizes, precision=precision,
                                   preferred_element_type=declared[1])
-    if (made := _FUSIBLES.get()) is not None:
-        made.append(declared)
     fusible = fuser.fusible(output_fusion_prefix=True)(
         functools.partial(_product, transpose_rhs, interpret_on_cpu, group_sizes is None, declared))
-    return fusible(lhs, rhs) if group_sizes is None else fusible(lhs, rhs, group_sizes)
+    with gemm.unbuilt() if _FUSING.get() else contextlib.nullcontext():
+        return fusible(lhs, rhs) if group_sizes is None else fusible(lhs, rhs, group_sizes)
 
 
 def fused(region, *inputs):
@@ -109,11 +115,23 @@ def fused(region, *inputs):
         jax.eval_shape(region, *inputs)
     finally:
         _FUSIBLES.reset(token)
-    return fuser.fuse(region)(*inputs) if made else region(*inputs)
+    if not made:
+        return region(*inputs)
+    fusing = _FUSING.set(True)
+    try:
+        return fuser.fuse(region)(*inputs)
+    finally:
+        _FUSING.reset(fusing)
 
 
 _FUSIBLES: contextvars.ContextVar[list | None] = contextvars.ContextVar('fused_gemm_fusibles', default=None)
 """The fusible products a region makes while `fused` traces it."""
+
+_FUSING: contextvars.ContextVar[bool] = contextvars.ContextVar('fused_gemm_fusing', default=False)
+"""Whether `fused` fuses the region traced here (`fuser.fuse`): its trace of the region reads the fusible's
+output types alone, and the fuser calls the fusible's function afresh with the fusions it finds
+(`fuse_jaxpr`), so the product traced within the region is unbuilt (`gemm.unbuilt`), its launch built by
+that call alone."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -141,7 +159,9 @@ def analysis(region, *inputs) -> Analysis:
     token = _PRICED.set(priced_calls)
     try:
         # Its routes are its own, no caller's report's: what a pass only weighs is no decision a call took.
-        with _cache.KERNEL_ROUTES(()), generation.routes() as found:
+        # Weighed, not built (`gemm.unbuilt`): what the analysis reads is the routes and the shapes, never a
+        # launch's kernel, which the region's splice traces once it is taken.
+        with _cache.KERNEL_ROUTES(()), generation.routes() as found, gemm.unbuilt():
             jax.eval_shape(functools.partial(fused, region), *inputs)
     except KernelRefused as refusal:
         return Analysis(None, None, None, refused=str(refusal))

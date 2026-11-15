@@ -215,7 +215,6 @@ def run(directory, steps, records, accumulation=1):
     return trainer.fit(data, steps=steps, log_every=1)
 
 
-@pytest.mark.scenario("Online post-training")
 @pytest.mark.parametrize("accumulation", [1, 2])
 def test_trainer_update_and_checkpoint_continue_without_replaying_committed_episodes(tmp_path, accumulation):
     complete, resumed = [], []
