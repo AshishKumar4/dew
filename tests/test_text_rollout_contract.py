@@ -264,12 +264,12 @@ def test_padding_and_cached_likelihoods_match_unpadded_full_forwards(kind):
     np.testing.assert_array_equal(result.lengths, [3, 3])
     np.testing.assert_array_equal(result.terminated, [False, False])
     objective = GRPOObjective(model, seq_len=6)
+    scores = jax.jit(lambda rows, padding: objective.per_token_log_probs(params, rows, left_padding=padding))
 
     @as_given
     def rescored(prompt, lengths, key, tokens):
         rows = np.concatenate([prompt, tokens], axis=1)
-        padding = prompt.shape[1] - lengths
-        return {"raw": objective.per_token_log_probs(params, rows, left_padding=padding)[:, 3:]}
+        return {"raw": scores(jnp.asarray(rows), jnp.asarray(prompt.shape[1] - lengths))[:, 3:]}
 
     label = f"{kind} rescored generation"
     assert_as_exact(rescored, only("raw", scored(model, params, sampling)),
