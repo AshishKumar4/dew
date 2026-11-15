@@ -46,16 +46,36 @@ def visible(length: int, ahead: int = 0, first_sees: bool = True):
     return seen if first_sees else seen & (jnp.arange(length) > 0)[:, None]
 
 
-def biased_attention(tokens, bias: float, *, dropout: bool = False):
-    """Transformers' eager attention: scaled scores plus a mask of `bias` past each query's own key, a
-    float32 softmax, its weights dropped out where `dropout`, over the values."""
+def biased_attention(tokens, bias: float, *, dropout: bool = False, scale: float = D ** -0.5):
+    """Transformers' eager attention: scores scaled by `scale` plus a mask of `bias` past each query's
+    own key, a float32 softmax, its weights dropped out where `dropout`, over the values. A finite mask
+    zeroes a later key's weight only where the scores are small beside it: none the walk can show."""
     q = k = v = embedded(tokens)
     length = tokens.shape[1]
-    scores = jnp.einsum("bqd,bkd->bqk", q, k) * D ** -0.5
+    scores = jnp.einsum("bqd,bkd->bqk", q, k) * scale
     weights = jax.nn.softmax(scores + jnp.where(visible(length), 0.0, bias), axis=-1)
     if dropout:
         weights = weights * jax.random.bernoulli(jax.random.key(0), 0.9, weights.shape) / 0.9
     return jnp.einsum("bqk,bkd->bqd", weights, v)
+
+
+def cast_attention(tokens):
+    """Attention whose scores, masked by their dtype's lowest, pass through unsigned bytes and back, which
+    takes masked and unmasked scores alike to one value: each query attends to every key."""
+    q = k = v = embedded(tokens)
+    scores = jnp.einsum("bqd,bkd->bqk", q, k)
+    masked = jnp.where(visible(tokens.shape[1]), scores, jnp.finfo(jnp.float32).min)
+    weights = jax.nn.softmax(masked.astype(jnp.uint8).astype(jnp.float32), axis=-1)
+    return jnp.einsum("bqk,bkd->bqd", weights, v)
+
+
+def shuffled_maximum(tokens):
+    """Attention masked by minus infinity whose scores are taken less another row's maximum."""
+    q = k = v = embedded(tokens)
+    scores = jnp.where(visible(tokens.shape[1]), jnp.einsum("bqd,bkd->bqk", q, k), -jnp.inf)
+    peak = scores.max(axis=-1, keepdims=True)
+    weights = jnp.exp(scores - jnp.roll(peak, 1, axis=1))
+    return jnp.einsum("bqk,bkd->bqd", weights / weights.sum(axis=-1, keepdims=True), v)
 
 
 def routed(tokens, shift: int = 0):
@@ -141,10 +161,10 @@ ADMITTED = {
         jax.random.fold_in(jax.random.key(0), token), ())))(tokens)[..., None],
     "attention written out, masked to minus infinity": lambda tokens: attention(
         *(embedded(tokens),) * 3, causal=True),
-    "attention written out, masked by its dtype's lowest added": lambda tokens: biased_attention(
-        tokens, float(jnp.finfo(jnp.float32).min)),
-    "attention masked by its dtype's lowest, its weights dropped out": lambda tokens: biased_attention(
-        tokens, float(jnp.finfo(jnp.float32).min), dropout=True),
+    "attention written out, masked by minus infinity added": lambda tokens: biased_attention(
+        tokens, -jnp.inf),
+    "attention masked by minus infinity, its weights dropped out": lambda tokens: biased_attention(
+        tokens, -jnp.inf, dropout=True),
     "a token's top routing weights taken by its row": routed,
     "keys assembled by slice assignment": assembled,
     "halves rotated through an unstack and a stack": rotated,
@@ -168,6 +188,10 @@ REFUSED = {
                                                                        causal=True, first_sees=False),
     "attention masked by a bias too small to vanish": lambda tokens: biased_attention(tokens, -1.0),
     "a token's top routing weights taken from the next token's": lambda tokens: routed(tokens, shift=1),
+    "attention masked by its dtype's lowest, cast through bytes": lambda tokens: cast_attention(tokens),
+    "attention masked by its dtype's lowest, its scores unbounded": lambda tokens: biased_attention(
+        tokens, float(jnp.finfo(jnp.float32).min), scale=1e37),
+    "attention less a maximum of other rows": shuffled_maximum,
     "keys assembled by slice assignment from the next position": lambda tokens: assembled(tokens, shift=1),
     "a left shift named as Dew's attention": lambda tokens: named(lambda q, k, v: shifted_left(v),
                                                                   CAUSAL_ATTENTION)(*(embedded(tokens),) * 3),

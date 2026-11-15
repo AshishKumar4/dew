@@ -13,8 +13,9 @@ scans (step by step, their carries and initial state included) each move those p
 entries; a contraction, reduction, sort or selection across the positions' axis gives every entry the latest
 of all, as does any operation the walk holds no rule for (`_RULES`, `dew.nn.programs.positionwise`). A
 contraction of two values along their positions on two axes of its own (attention's scores written out)
-reads along both (`Pair`), so a mask that lowers each later key's score to minus infinity or its dtype's
-lowest zeroes its softmax there, and the weighted values read no later key. Dew's
+reads along both (`Pair`), each value the tokens reach taken as finite, so a mask that takes each later
+key's score to minus infinity zeroes its softmax there, and the weighted values read no later key; a mask
+by a finite value zeroes nothing it can show. Dew's
 causal attention (`CAUSAL_ATTENTION`) gives each query its own position's latest and its keys' up to its own;
 attention under a visibility its caller states (`STATED_ATTENTION`) gives each position its own query's, key's
 and value's, the caller's visibility being the call's and not the source's; a computation Dew states is token
@@ -134,20 +135,19 @@ def _read_at(latest: np.ndarray, rows: np.ndarray) -> np.ndarray:
 @dataclasses.dataclass(frozen=True)
 class Pair:
     """A value whose entries read along two of its axes (`axes`, a query's and a key's): its entry at
-    (i, j) along them reads none past `latest[i, j]`, its value lies within `low[i, j]` and `high[i, j]`,
-    and where `zero[i, j]` holds it is exactly zero, reading nothing (a product or a sum of it reads nothing
-    of what made it). A contraction of two values the tokens reach along their positions makes one
-    (attention's scores), its entries within a fraction of their dtype's largest (`_BOUND`); a mask's
-    lowest values added to a score, or chosen in its place, bound it far below every unmasked score of its
-    row, so that its softmax is exactly zero there, whatever the later key it scores read (masked
-    attention written out, transformers' own). Every value but a mask's is finite, so a zero times any
-    other value is zero; an operation the walk holds no such rule for reads it as `collapsed`."""
+    (i, j) along them reads none past `latest[i, j]`, and where `held[i, j]` its value is `value[i, j]`
+    whatever the tokens, reading nothing. A contraction of two values the tokens reach along their
+    positions on two axes makes one (attention's scores), none of its entries held. The walk takes every
+    value a program computes from the tokens as finite: so a score plus minus infinity is minus infinity,
+    its exponential zero, and zero times a value the later key reads zero, whatever that value is (masked
+    attention written out, transformers' own, with an infinite mask); a mask by a finite value, its dtype's
+    lowest, holds no score and reads it. An operation the walk holds no such rule for reads it as
+    `collapsed`."""
 
     axes: tuple[int, int]
     latest: np.ndarray
-    low: np.ndarray
-    high: np.ndarray
-    zero: np.ndarray
+    held: np.ndarray
+    value: np.ndarray
 
     @property
     def last(self) -> int:
@@ -157,10 +157,10 @@ class Pair:
         """Its reads along its first axis alone, each index the latest of its row."""
         return Reads(self.axes[0], self.latest.max(axis=1, initial=NONE))
 
-
-_BOUND = 2.0 ** -10
-"""The fraction of its dtype's largest value that bounds a contraction's entries along two positions'
-axes (a score), which a mask's lowest value lies far below: a score past it overflows its softmax."""
+    @classmethod
+    def unheld(cls, axes: tuple[int, int], latest: np.ndarray) -> Pair:
+        """A pair reading `latest`, no entry held."""
+        return cls(axes, latest, np.zeros(latest.shape, bool), np.zeros(latest.shape))
 
 
 type Held = Reads | Pair | None
@@ -244,6 +244,7 @@ def _stop_gradient() -> core.Primitive:
     (eqn,) = jax.make_jaxpr(jax.lax.stop_gradient)(jnp.zeros(1)).eqns
     return eqn.primitive
 
+
 class _Walk:
     def __init__(self, length: int):
         self.length = length
@@ -254,33 +255,20 @@ class _Walk:
         """The entries the walk holds of an integer value the tokens reach in part, by the value's
         variable's identity: a concatenation of indices it holds beside ones the tokens decide (a
         gather's row coordinates beside its routed ones)."""
-        self.row_max: dict[int, Pair] = {}
-        """Each value that is a `Pair`'s maximum along its second axis, by the value's variable's identity,
-        kept through the broadcasts and reshapes that lay it beside the pair (a softmax's)."""
-
     def followed(self, eqn: core.JaxprEqn, given: list[Held], operands: list[np.ndarray | None]) -> None:
-        """Keeps what the walk knows of `eqn`'s output past its reads: the entries it holds of a
-        concatenation the tokens reach in part, and a pair's row maximum carried through a broadcast, a
-        reshape or a conversion."""
-        primitive = eqn.primitive
-        if (primitive is jax.lax.concatenate_p and any(isinstance(value, Reads) for value in given)
+        """Keeps the entries the walk holds of a concatenation of indices the tokens reach in part, each
+        unheld one masked, in the concatenation's own dtype."""
+        if (eqn.primitive is jax.lax.concatenate_p and any(isinstance(value, Reads) for value in given)
                 and any(operand is not None for operand in operands)
                 and all(isinstance(var.aval, ShapedArray) and _indexing(var.aval.dtype) for var in eqn.invars)
                 and math.prod(_shape(eqn.outvars[0])) <= CONCRETE):
-            parts = [np.ma.masked_array(np.zeros(_shape(var), np.int64), mask=True) if operand is None
-                     else np.ma.masked_array(np.broadcast_to(operand, _shape(var)), mask=False)
+            aval = eqn.outvars[0].aval
+            assert isinstance(aval, ShapedArray)
+            dtype = aval.dtype
+            parts = [np.ma.masked_array(np.zeros(_shape(var), dtype), mask=True) if operand is None
+                     else np.ma.masked_array(np.broadcast_to(operand, _shape(var)).astype(dtype), mask=False)
                      for var, operand in zip(eqn.invars, operands, strict=True)]
             self.partial[id(eqn.outvars[0])] = np.ma.concatenate(parts, axis=eqn.params["dimension"])
-        elif (primitive in (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.convert_element_type_p,
-                            jax.lax.squeeze_p, _stop_gradient()) and id(eqn.invars[0]) in self.row_max):
-            self.row_max[id(eqn.outvars[0])] = self.row_max[id(eqn.invars[0])]
-        elif primitive is jax.lax.max_p:
-            # A maximum with a floor of minus infinity (a reduction's `initial`) is the maximum.
-            for index, var in enumerate(eqn.invars[:2]):
-                other = operands[1 - index]
-                if (id(var) in self.row_max and other is not None
-                        and bool(np.all(np.isneginf(np.asarray(other, np.float64))))):
-                    self.row_max[id(eqn.outvars[0])] = self.row_max[id(var)]
 
     def run_reads(self, jaxpr: core.Jaxpr, inputs: Sequence[Held],
                   values: Sequence[np.ndarray | None]) -> list[Reads | None]:
@@ -317,6 +305,9 @@ class _Walk:
             return _call(self, eqn, given, operands)
         if not any(isinstance(value, Reads | Pair) for value in given):
             return [None] * len(eqn.outvars), self.evaluated(eqn, operands)
+        if primitive is _stop_gradient():
+            # Its operand, unchanged.
+            return list(given), [None]
         if any(isinstance(value, Pair) for value in given):
             paired = _paired(self, eqn, given, operands)
             if paired is not None:
@@ -441,13 +432,6 @@ def _attended(eqn: core.JaxprEqn, given: list[Held], *, causal: bool) -> list[He
             for var in eqn.outvars]
 
 
-def _largest(var) -> float:
-    """The largest finite value of `var`'s dtype, infinite for a dtype of no such bound (an integer's)."""
-    aval = var.aval
-    assert isinstance(aval, ShapedArray)
-    return float(jnp.finfo(aval.dtype).max) if jnp.issubdtype(aval.dtype, jnp.floating) else math.inf
-
-
 def _paired(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
             operands: list[np.ndarray | None]) -> list[Held] | None:
     """The outputs' reads of an operation over a `Pair`, where the walk keeps its two axes through it: a
@@ -457,7 +441,7 @@ def _paired(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
     if primitive is jax.lax.dot_general_p:
         return _pair_dot(eqn, given)
     if primitive in (jax.lax.reduce_max_p, jax.lax.reduce_sum_p):
-        return _pair_reduced(walk, eqn, given)
+        return _pair_reduced(eqn, given)
     if primitive in (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.transpose_p, jax.lax.squeeze_p):
         moved = _pair_moved(eqn, given[0])
         if moved is None:
@@ -468,7 +452,7 @@ def _paired(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
     if positionwise(primitive) and all(_shape(var) == shape for var in eqn.outvars) and all(
             _fits(_shape(var), shape) for var, value in zip(eqn.invars, given, strict=True)
             if isinstance(value, Reads | Pair)):
-        entrywise = _pair_entrywise(walk, eqn, given, operands, shape)
+        entrywise = _pair_entrywise(eqn, given, operands, shape)
         if entrywise is None:
             return None
         combined: list[Held] = [entrywise] * len(eqn.outvars)
@@ -513,19 +497,12 @@ def _kept_axis(axis: int, before: tuple[int, ...], after: tuple[int, ...]) -> in
     return None
 
 
-def _per_entry(value: np.ndarray, shape: tuple[int, ...], axes: tuple[int, int]) -> tuple[np.ndarray, ...]:
-    """A value the walk holds, broadcast to `shape`, as each entry along `axes`' lowest and highest over
-    the others."""
-    full = np.moveaxis(np.broadcast_to(np.asarray(value, np.float64), shape), axes, (0, 1))
-    flat = full.reshape(shape[axes[0]], shape[axes[1]], -1)
-    return flat.min(axis=2), flat.max(axis=2)
-
-
-def _pair_entrywise(walk: _Walk, eqn: core.JaxprEqn, given: list[Held], operands: list[np.ndarray | None],
+def _pair_entrywise(eqn: core.JaxprEqn, given: list[Held], operands: list[np.ndarray | None],
                     shape: tuple[int, ...]) -> Pair | None:
     """An operation entry by entry over pairs alike and values the walk holds or reads along either axis:
-    each entry reads what its operands' entries read, past a zero product's or quotient's, and its value
-    bounds and zeros follow what the operation does (`_bounded`)."""
+    an entry every operand of which is held is held at the operation's value of theirs, computed as the
+    program computes it; one whose held operands decide it whatever the others' finite values are
+    (`_absorbed`) is held and reads nothing; any other reads what its operands' entries read."""
     pairs = [value for value in given if isinstance(value, Pair)]
     axes = pairs[0].axes
     size = (shape[axes[0]], shape[axes[1]])
@@ -534,28 +511,37 @@ def _pair_entrywise(walk: _Walk, eqn: core.JaxprEqn, given: list[Held], operands
     entries = [_entries(value, operand, shape, axes) for value, operand in zip(given, operands, strict=True)]
     if any(entry is None for entry in entries):
         return None
-    reads, lows, highs, zeros = (list(group) for group in zip(*entries, strict=True))
+    reads, helds, values = (list(group) for group in zip(*entries, strict=True))
+    every = np.logical_and.reduce(helds)
+    computed = eqn.primitive.bind(*(np.asarray(value).astype(_dtype(var))
+                                    for value, var in zip(values, eqn.invars, strict=True)), **eqn.params)
+    value = np.asarray(computed[0] if eqn.primitive.multiple_results else computed, np.float64)
     latest = np.maximum.reduce(reads)
-    low, high, zero = _bounded(walk, eqn, given, operands, shape, axes, lows, highs, zeros)
+    held = every.copy()
     if eqn.primitive is jax.lax.select_n_p:
-        chosen = _chosen(operands[0], shape, axes, len(given) - 1)
-        if chosen is not None:
-            latest = np.maximum(reads[0], np.maximum.reduce(
-                [np.where(taken, reads[case], NONE) for case, taken in enumerate(chosen, 1)]))
-    if eqn.primitive in (jax.lax.mul_p, jax.lax.div_p, jax.lax.exp_p, jax.lax.convert_element_type_p,
-                         jax.lax.select_n_p):
-        # Zero whatever its operands' other entries read.
-        latest = np.where(zero, NONE, latest)
-    return Pair(axes, latest, low, high, zero)
+        latest, held, value = _selected(reads, helds, values, latest, held, value)
+    else:
+        absorbed, taken = _absorbed(eqn.primitive, helds, values)
+        held |= absorbed
+        value = np.where(absorbed & ~every, taken, value)
+    return Pair(axes, np.where(held, NONE, latest), held, np.where(held, value, 0.0))
+
+
+def _dtype(var) -> np.dtype:
+    aval = var.aval
+    assert isinstance(aval, ShapedArray)
+    return aval.dtype
 
 
 def _entries(value: Held, operand: np.ndarray | None, shape: tuple[int, ...],
-             axes: tuple[int, int]) -> tuple[np.ndarray, ...] | None:
-    """An operand's entries along `axes` of an operation entry by entry over a pair: what each reads, its
-    value's bounds and whether it is zero; None where it reads along another axis."""
+             axes: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """An operand's entries along `axes` of an operation entry by entry over a pair: what each reads,
+    whether the walk holds its value, and that value; a value the tokens do not reach is held along `axes`
+    where it is one across its other axes; None where it reads along another axis."""
     size = (shape[axes[0]], shape[axes[1]])
+    unheld = np.zeros(size, bool), np.zeros(size)
     if isinstance(value, Pair):
-        return value.latest, value.low, value.high, value.zero
+        return value.latest, value.held, value.value
     if isinstance(value, Reads):
         if value.axis is None:
             reads = np.full(size, value.last, np.int64)
@@ -565,106 +551,79 @@ def _entries(value: Held, operand: np.ndarray | None, shape: tuple[int, ...],
             reads = np.broadcast_to(value.latest[None, :], size)
         else:
             return None
-        return reads, np.full(size, -math.inf), np.full(size, math.inf), np.zeros(size, bool)
+        return reads, *unheld
     reads = np.full(size, NONE, np.int64)
     if operand is None:
-        return reads, np.full(size, -math.inf), np.full(size, math.inf), np.zeros(size, bool)
-    low, high = _per_entry(operand, shape, axes)
-    return reads, low, high, (low == 0) & (high == 0)
+        return reads, *unheld
+    full = np.moveaxis(np.broadcast_to(np.asarray(operand, np.float64), shape), axes, (0, 1))
+    flat = full.reshape(*size, -1)
+    low, high = flat.min(axis=2), flat.max(axis=2)
+    # One value across its other axes (NaN never equal to itself, so never held).
+    held = low == high
+    return reads, held, np.where(held, low, 0.0)
 
 
-def _bounded(walk: _Walk, eqn: core.JaxprEqn, given: list[Held], operands: list[np.ndarray | None],
-             shape: tuple[int, ...], axes: tuple[int, int], lows: list[np.ndarray], highs: list[np.ndarray],
-             zeros: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """An entrywise operation's value bounds and zeros from its operands': a sum's and a difference's
-    (a score less its row's maximum below the row's largest lower bound), a product's, a quotient's by a
-    positive divisor, a negation's, a maximum's, an exponential's (zero where it underflows its dtype),
-    a conversion's and a choice's; any other's unknown."""
-    primitive = eqn.primitive
-    size = lows[0].shape
-    low, high, zero = np.full(size, -math.inf), np.full(size, math.inf), np.zeros(size, bool)
-    with np.errstate(invalid="ignore", over="ignore"):
+def _absorbed(primitive: core.Primitive, helds: list[np.ndarray],
+              values: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Where an operation's held operands decide its value whatever the other's finite value is, and that
+    value: a sum with an infinite term, a difference from or of one, a product with a zero factor, a
+    quotient of a zero or by an infinity; nowhere for any other operation."""
+    size = helds[0].shape
+    nowhere = np.zeros(size, bool), np.zeros(size)
+    if len(helds) != 2:
+        return nowhere
+    (left, right), (first, second) = helds, values
+    only_left, only_right = left & ~right, right & ~left
+    with np.errstate(invalid="ignore"):
         if primitive is jax.lax.add_p:
-            low, high, zero = lows[0] + lows[1], highs[0] + highs[1], zeros[0] & zeros[1]
-        elif primitive is jax.lax.sub_p:
-            low, high, zero = lows[0] - highs[1], highs[0] - lows[1], zeros[0] & zeros[1]
-            row = walk.row_max.get(id(eqn.invars[1]))
-            subtracted = given[1]
-            if (row is not None and given[0] is row and isinstance(subtracted, Reads)
-                    and subtracted.axis == axes[0]):
-                # A score less its row's maximum, which is at least the row's largest lower bound.
-                high = np.minimum(high, row.high - row.low.max(axis=1, keepdims=True))
-                low = np.maximum(low, row.low - row.high.max(axis=1, keepdims=True))
-        elif primitive in (jax.lax.mul_p, jax.lax.div_p):
-            divided = primitive is jax.lax.div_p
-            zero = zeros[0] if divided else zeros[0] | zeros[1]
-            if not divided or bool(np.all(lows[1] > 0)):
-                pairs = [(lows[0], lows[1]), (lows[0], highs[1]), (highs[0], lows[1]), (highs[0], highs[1])]
-                corners = [first / second if divided else first * second for first, second in pairs]
-                low, high = np.nanmin(corners, axis=0), np.nanmax(corners, axis=0)
-        elif primitive is jax.lax.neg_p:
-            low, high, zero = -highs[0], -lows[0], zeros[0]
-        elif primitive is jax.lax.max_p:
-            low, high, zero = np.maximum.reduce(lows), np.maximum.reduce(highs), np.logical_and.reduce(zeros)
-        elif primitive is jax.lax.exp_p:
-            aval = eqn.outvars[0].aval
-            assert isinstance(aval, ShapedArray)
-            # Below this an exponential rounds to zero in its dtype.
-            floor = math.log(float(jnp.finfo(aval.dtype).smallest_subnormal) / 2)
-            low, high, zero = np.exp(lows[0]), np.exp(highs[0]), highs[0] < floor
-        elif primitive is jax.lax.convert_element_type_p:
-            low, high, zero = lows[0], highs[0], zeros[0]
-            if jnp.issubdtype(eqn.params["new_dtype"], jnp.floating):
-                largest = float(jnp.finfo(eqn.params["new_dtype"]).max)
-                high, low = np.where(high > largest, math.inf, high), np.where(low < -largest, -math.inf, low)
-        elif primitive is jax.lax.select_n_p:
-            chosen = _chosen(operands[0], shape, axes, len(given) - 1)
-            if chosen is not None:
-                low = np.minimum.reduce([np.where(taken, lows[case], math.inf)
-                                         for case, taken in enumerate(chosen, 1)])
-                high = np.maximum.reduce([np.where(taken, highs[case], -math.inf)
-                                          for case, taken in enumerate(chosen, 1)])
-                zero = np.logical_and.reduce([~taken | zeros[case] for case, taken in enumerate(chosen, 1)])
-    return np.nan_to_num(low, nan=-math.inf), np.nan_to_num(high, nan=math.inf), zero
+            return ((only_left & np.isinf(first)) | (only_right & np.isinf(second)),
+                    np.where(only_left, first, second))
+        if primitive is jax.lax.sub_p:
+            return ((only_left & np.isinf(first)) | (only_right & np.isinf(second)),
+                    np.where(only_left, first, -second))
+        if primitive is jax.lax.mul_p:
+            return (only_left & (first == 0)) | (only_right & (second == 0)), np.zeros(size)
+        if primitive is jax.lax.div_p:
+            # A finite quotient of a zero, or by an infinity, is zero.
+            return (only_left & (first == 0)) | (only_right & np.isinf(second)), np.zeros(size)
+    return nowhere
 
 
-def _chosen(predicate: np.ndarray | None, shape: tuple[int, ...], axes: tuple[int, int],
-            cases: int) -> list[np.ndarray] | None:
-    """Along `axes`, where a choice of `cases` by a `predicate` the walk holds may take each case."""
-    if predicate is None:
-        return None
-    full = np.moveaxis(np.broadcast_to(np.asarray(predicate).astype(np.int64), shape), axes, (0, 1))
-    flat = full.reshape(shape[axes[0]], shape[axes[1]], -1)
-    return [np.any(flat == case, axis=2) for case in range(cases)]
+def _selected(reads: list[np.ndarray], helds: list[np.ndarray], values: list[np.ndarray], latest: np.ndarray,
+              held: np.ndarray, value: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A choice among cases by a predicate: where the walk holds the predicate, each entry its chosen
+    case's reads, holding and value; elsewhere every case's reads and the predicate's."""
+    chooser = helds[0]
+    cases = len(reads) - 1
+    case = np.where(chooser, values[0], 0).astype(np.int64).clip(0, cases - 1) + 1
+    chosen = np.take_along_axis(np.stack(reads[1:]), case[None] - 1, axis=0)[0]
+    kept = np.take_along_axis(np.stack(helds[1:]), case[None] - 1, axis=0)[0]
+    taken = np.take_along_axis(np.stack(values[1:]), case[None] - 1, axis=0)[0]
+    return (np.where(chooser, chosen, latest), np.where(chooser, kept, held),
+            np.where(chooser & kept, taken, value))
 
 
-def _pair_reduced(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held] | None:
-    """A maximum or a sum over a pair's axes: along its second axis, each row reads its entries that may
-    take part (each but a zero of a sum; each a maximum may be, its upper bound past the row's largest
-    lower one), kept along its first; along neither, a pair of its remaining axes."""
+def _pair_reduced(eqn: core.JaxprEqn, given: list[Held]) -> list[Held] | None:
+    """A maximum or a sum over a pair's axes: along its second axis, each row reads its entries' reads
+    (a held one's none), kept along its first; along its first, each column alike; along both, the
+    latest of all; along neither, a pair of its remaining axes, an entry held where it was and a maximum,
+    or a sum of a zero or an infinity."""
     value, axes = given[0], tuple(eqn.params["axes"])
     assert isinstance(value, Pair)
     first, second = value.axes
-    maximum = eqn.primitive is jax.lax.reduce_max_p
-    part = value.high >= value.low.max(axis=1, keepdims=True) if maximum else ~value.zero
     if second in axes and first not in axes:
-        rows = np.where(part, value.latest, NONE).max(axis=1, initial=NONE)
-        held = Reads(first - sum(1 for dim in axes if dim < first), rows)
-        if maximum:
-            walk.row_max[id(eqn.outvars[0])] = value
-        return [held]
+        return [Reads(first - sum(1 for dim in axes if dim < first), value.latest.max(axis=1, initial=NONE))]
     if first in axes and second not in axes:
-        if maximum:
-            part = value.high >= value.low.max(axis=0, keepdims=True)
-        cols = np.where(part, value.latest, NONE).max(axis=0, initial=NONE)
-        return [Reads(second - sum(1 for dim in axes if dim < second), cols)]
+        columns = value.latest.max(axis=0, initial=NONE)
+        return [Reads(second - sum(1 for dim in axes if dim < second), columns)]
     if first in axes:
-        return [_everywhere(int(np.where(part, value.latest, NONE).max(initial=NONE)))]
+        return [_everywhere(value.last)]
     moved = (first - sum(1 for dim in axes if dim < first), second - sum(1 for dim in axes if dim < second))
-    if maximum:
-        return [dataclasses.replace(value, axes=moved)]
-    return [Pair(moved, value.latest, np.full(value.latest.shape, -math.inf),
-                 np.full(value.latest.shape, math.inf), value.zero)]
+    held = value.held
+    if eqn.primitive is jax.lax.reduce_sum_p:
+        # A sum of one value over the other axes is that value only where it is a zero or an infinity.
+        held = held & ((value.value == 0) | np.isinf(value.value))
+    return [Pair(moved, np.where(held, NONE, value.latest), held, np.where(held, value.value, 0.0))]
 
 
 def _pair_dot(eqn: core.JaxprEqn, given: list[Held]) -> list[Held] | None:
@@ -681,7 +640,8 @@ def _pair_dot(eqn: core.JaxprEqn, given: list[Held]) -> list[Held] | None:
     contract, other_contract = ((lhs_contract, rhs_contract) if side == 0 else (rhs_contract, lhs_contract))
     batch = (lhs_batch, rhs_batch)[side]
     first, second = pair.axes
-    latest, zero = pair.latest, pair.zero
+    # A held zero times any finite value the other side reads is zero.
+    latest, zero = pair.latest, pair.held & (pair.value == 0)
     if first in contract and second not in contract:
         first, second, latest, zero = second, first, latest.T, zero.T
     if second not in contract or first in contract or first in batch:
@@ -851,9 +811,7 @@ def _dot_general(walk: _Walk, eqn, given, operands) -> list[Held]:
         # Each side's positions on an axis of its own (a query's and a key's): a score.
         rows, cols = placed
         latest = np.maximum(np.maximum(rows.latest[:, None], cols.latest[None, :]), extra)
-        bound = _largest(eqn.outvars[0]) * _BOUND
-        return [Pair((rows.axis, cols.axis), latest, np.full(latest.shape, -bound),
-                     np.full(latest.shape, bound), np.zeros(latest.shape, bool))]
+        return [Pair.unheld((rows.axis, cols.axis), latest)]
     base = placed[0]
     for other in placed[1:]:
         if other.axis == base.axis:

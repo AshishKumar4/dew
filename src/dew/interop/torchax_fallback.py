@@ -130,8 +130,9 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     operation, on any backend, from the program alone), the training one drawing nothing on the host. A
     decoder configured bidirectionally (BERT's with is_decoder False) is not. An operation whose output's
     shape or value the traced values decide (a `nonzero`, an `item()`) fails that trace with JAX's own
-    error, naming it. Each program the model then runs is proven before it runs (`TorchGraph.certify`):
-    a trace at one length says nothing of another's. Each refusal names its cause."""
+    error, naming it. On Dew's attention, each program the model then runs is proven before it runs
+    (`TorchGraph.certify`): a trace at one length says nothing of another's. Each refusal names its
+    cause."""
     import torch
     from torchax.interop import JittableModule, extract_all_buffers
     from transformers import AutoConfig, AutoModelForCausalLM
@@ -963,9 +964,11 @@ class TorchGraph:
     """Its parameters' logical axes by their torch names, its tensor-parallel plan's (`planned_axes`),
     which its placement reads (`TorchCausalLM.placement`)."""
     certified: dict[tuple, str | None] | None = None
-    """For a source tier 3 admitted (`admitted`, `qualified`): each program specialization it has run, by
-    the refusal its walk gave (None where causal); None for one loaded by `fallback="torchax"`, whose
-    causality its caller vouches for (`certify`)."""
+    """For a source tier 3 runs on Dew's attention (`TorchAdmission.attends`): each program
+    specialization it has run, by the refusal its walk gave (None where causal); None for one on
+    transformers' own attention, whose causality its admission's walk decided at the probe's length
+    (`admitted`), or one loaded by `fallback="torchax"`, whose causality its caller vouches for
+    (`certify`)."""
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None,
@@ -1021,10 +1024,10 @@ class TorchGraph:
         return outputs
 
     def certify(self, traced, arguments: tuple, *, train: bool, max_segments: int) -> None:
-        """For a source tier 3 admitted (`certified`), prove the program about to run, `traced` over
-        `arguments`, causal before it runs: its logits and states (its first two outputs) read at a
-        position no later token (`sequence_causality.causality_refusal`), once a specialization (its
-        arguments' structure, shapes and dtypes, train or not, its documents' bound). Refused where an
+        """For a source tier 3 runs on Dew's attention (`certified`), prove the program about to run,
+        `traced` over `arguments`, causal before it runs: its logits and states (its first two outputs)
+        read at a position no later token (`sequence_causality.causality_refusal`), once a specialization
+        (its arguments' structure, shapes and dtypes, train or not, its documents' bound). Refused where an
         output position reads a later one."""
         if self.certified is None:
             return
@@ -1670,7 +1673,7 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     torch.nn.Module.to(model, "meta")
     graph = TorchGraph(jittable, persistent, attention_impl=attention_impl if attends else None,
                        shapes={"params": _shapes(params), "buffers": _shapes(buffers)}, axes=axes,
-                       certified=None if admission is None else {})
+                       certified={} if admission is not None and admission.attends else None)
     # The decode cache's slots: the load's, else the source's own context as its config class reads it
     # (an alias, CTRL's `n_positions`, included).
     named = type(model.config).attribute_map.get("max_position_embeddings", "max_position_embeddings")
