@@ -53,6 +53,7 @@ from dew.data.analysis import (
     _volatile,
     _written,
     ends,
+    member_length,
 )
 from dew.data.cache import _Mapped
 from dew.data.completion import Completed, Numbered, cuts, reach, released
@@ -1448,28 +1449,11 @@ class _Build:
                 labels=[_label(child) for child in source.pipelines],
                 stamped=self.stamped,
             )
-        return KeyedMix(streams, source.weights, keys, source.seed, stamped=self.stamped,
-                        end=self.mix_end(pipeline, partition))
-
-    def mix_end(self, pipeline: Pipeline, partition: DataPartition) -> int | None:
-        """Where a streamed read of `pipeline`'s mix ends (`dew.data.mixing.mix_end`), the end its indexed
-        read has, where every member's length is known: each member read one record for each of its
-        source's, by index, its length its indexed rows' (`records`, read "indexed"); None where a member
-        drops or makes records, never ends or reads only as a stream, which has no indexed read to agree
-        with and ends the mix at its first failed pull (data.md §3)."""
-        mixture = pipeline.source
-        assert isinstance(mixture, Mixture)
-        lengths = []
-        for index, child in enumerate(children(pipeline)):
-            analyzed = self.lowering.children[index]
-            if (isinstance(child.source, Combined) or analyzed.unending or _dropping(child, analyzed)
-                    or not child.source.supports("indexed")):
-                return None
-            rows = dataclasses.replace(self.child(index), read="indexed").records(child, partition)
-            if not isinstance(rows, pygrain.MapDataset):
-                return None
-            lengths.append(len(rows))
-        return mix_end(lengths, mixture)
+        # Its end is its indexed read's where every member's length is known, in one order (`mix_end`).
+        lengths = [member_length(child, analyzed)
+                   for child, analyzed in zip(children(pipeline), self.lowering.children, strict=True)]
+        end = None if partition.count > 1 or None in lengths else mix_end(lengths, source)
+        return KeyedMix(streams, source.weights, keys, source.seed, stamped=self.stamped, end=end)
 
     def counted_members(self, pipeline: Pipeline) -> tuple[tuple[str, str, str], ...]:
         """The members of `pipeline`'s mixture, each's key (`_member_keys`), name and label, where a read
