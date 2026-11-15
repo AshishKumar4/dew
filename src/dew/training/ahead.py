@@ -257,10 +257,9 @@ class Executable:
 
 
 def _wheel_targets_registered() -> None:
-    """Each installed Dew kernel wheel's FFI targets registered with jax, by the callable each names in the
-    `dew.kernel_wheels` entry-point group (dew-cutlass's grouped GEMM, dew-flash-attn's attention): a wheel
-    registers its own at the first call that traces one, and a process that only loads a program compiled
-    ahead traces none, so its first run of a call to one found no handler."""
+    """Registers every installed Dew kernel wheel's FFI targets with jax, through the callable each names in
+    the `dew.kernel_wheels` entry-point group (dew-cutlass's grouped GEMM, dew-flash-attn's attention). A
+    process that loads a program compiled ahead traces no call that would register them."""
     for wheel in importlib.metadata.entry_points(group="dew.kernel_wheels"):
         wheel.load()()
 

@@ -73,9 +73,9 @@ def targets() -> dict[str, object]:
 
 @functools.cache
 def registered() -> None:
-    """The library's FFI targets (`TARGETS`), registered with jax once: the callable its entry point names
-    (the `dew.kernel_wheels` group), which Dew runs at the first launch that calls one or before a program
-    compiled ahead is loaded, which traces none."""
+    """Registers the library's FFI targets (`TARGETS`) with jax, once. Its entry point in the
+    `dew.kernel_wheels` group names it; Dew calls it at the first launch that calls a target, and before it
+    loads a program compiled ahead."""
     import jax
 
     for name, handler in targets().items():

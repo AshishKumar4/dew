@@ -17,8 +17,8 @@ dependencies = ["jax>=0.11.2"]
 Source = "https://github.com/AshishKumar4/dew/tree/main/kernels/cutlass"
 
 [project.entry-points."dew.kernel_wheels"]
-# Dew loads every wheel of this group, and each one's exact build is part of what a program compiled ahead
-# was built with (dew.training.ahead.BuildTarget.builds): its FFI targets, registered with jax.
+# A process loading a program compiled ahead traces no call that would register this wheel's FFI targets, so
+# Dew calls every callable of this group first (dew.training.ahead).
 dew_cutlass = "dew_cutlass:registered"
 
 [tool.setuptools]

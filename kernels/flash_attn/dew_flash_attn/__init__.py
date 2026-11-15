@@ -59,19 +59,18 @@ custom calls reads them (Dew's FLOP counter)."""
 
 @functools.cache
 def registered() -> None:
-    """Both libraries' FFI targets (`TARGETS`), registered with jax once: the callable its entry point names
-    (the `dew.kernel_wheels` group), which Dew runs before a program compiled ahead is loaded, and the first
-    call that needs them runs too. Importing the package to read ARCHITECTURES leaves jax's registry as it
-    was."""
+    """Registers both libraries' FFI targets (`TARGETS`) with jax, once. Its entry point in the
+    `dew.kernel_wheels` group names it; Dew calls it before it loads a program compiled ahead, and the first
+    call that needs a target calls it too. Importing the package to read ARCHITECTURES leaves jax's registry
+    as it was."""
     for name in TARGETS:
         library = _library3 if name.startswith("dew_flash3_") else _library
         jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(library, name)), platform="CUDA")
 
 
 _registered = registered
-"""The name Dew's releases through dewml 0.1.1, and its main until it loads this wheel through the
-`dew.kernel_wheels` group, call. Those releases take any 0.3 wheel (`~=0.3.9`), so every 0.3 release keeps it;
-0.4.0, which they exclude, drops it."""
+"""The name Dew's callers that predate the `dew.kernel_wheels` group call. They accept any 0.3 wheel, so
+the 0.3 series keeps it."""
 
 
 def _call(name: str, results):
