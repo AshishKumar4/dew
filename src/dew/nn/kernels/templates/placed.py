@@ -277,21 +277,19 @@ class Tcgen05Placed(Tcgen05Rings):
         mosaic.looped(issued(score, weigh, lo, hi), None, ())
 
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
-        # Sums kept past the walk (`mosaic.Kept`), each in turn, taken by their rows' factor in place in
-        # tensor memory's own layout (a row a thread; zero where the factor is, a row that saw no key, whose
-        # sums its walk never wrote), then read out a swizzle tile of columns at a time in the epilogue's
-        # layout (`STORED`) into `smem`, and stored a stage of columns at a time (the whole where `smem`
-        # holds them, CUTLASS's sub-tiled epilogue where it is narrower); every other part as a register
-        # family's.
+        # Sums kept past the walk (`mosaic.Kept`), each in turn, taken by their scale in place in tensor
+        # memory's own layout (a row a thread), then read out a swizzle tile of columns at a time in the
+        # epilogue's layout (`STORED`) into `smem`, and stored a stage of columns at a time (the whole where
+        # `smem` holds them, CUTLASS's sub-tiled epilogue where it is narrower); every other part as a
+        # register family's.
         if not any(isinstance(part, mosaic.Kept) for part in parts):
             return super().stored(parts, views, smem=smem, wait=wait)
         dtype, stage = smem.dtype, smem.shape[1]
         read = min(stage, swizzling.swizzle_columns(dtype, swizzling.swizzle_for(dtype, stage)))
         for index, (kept, view) in enumerate(zip(parts, views, strict=True)):
-            acc, factor = kept.acc, kept.factor
-            if factor is not None:
-                _rescaled(self, acc, lambda block, factor=factor: jnp.where(factor[:, None] != 0,
-                                                                            block * factor[:, None], 0.0))
+            acc = kept.acc
+            if kept.scale is not None:
+                _rescaled(self, acc, kept.scale)
                 plgpu.commit_tmem()
             for column in range(0, acc.shape[1], stage):
                 if wait or index or column:

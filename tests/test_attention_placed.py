@@ -78,6 +78,21 @@ def test_the_forward_on_tcgen05s_rows_streams_values_its_keys_columns_as_handed_
 
 
 @INTERPRETS
+def test_the_forward_on_tcgen05s_rows_keeps_a_subnormal_output_interpreted():
+    """The forward on a B200's tcgen05 rows, its sums kept in tensor memory and taken by their rows' ratio
+    as stored (`mosaic.Kept.scale`), under the interpreter on XLA's CPU, which flushes a subnormal product:
+    a full bf16 call of 128 keys, every logit 0, one key's values 2^-120 and the rest 0, returns 2^-127
+    (below fp32's and bf16's least normal) at every entry, exactly, as every other forward finish does
+    (`algebra.quotient`, row 6302), where the product by the inverse total returned 0."""
+    query = jnp.zeros((1, 128, 1, 64), jnp.bfloat16)
+    value = jnp.zeros_like(query).at[:, 0].set(2.0 ** -120)
+    spans = template.spans(128, 128, 1)
+    with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
+        out = attention_mosaic.forward(query, query, value, spans, None, interpret=True)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.full(out.shape, 2.0 ** -127, np.float32))
+
+
+@INTERPRETS
 def test_the_forward_on_tcgen05s_rows_over_narrow_value_blocks_holds_check_1_interpreted():
     """The forward on a B200's tcgen05 rows with its values walked 16 columns a launch (`Tiles.columns`),
     a block narrower than its sums' rescale takes at once (`placed.RESCALED_COLUMNS`), causal and

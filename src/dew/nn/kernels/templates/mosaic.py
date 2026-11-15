@@ -569,19 +569,19 @@ def ahead_stages(products: Sequence[Product]) -> int:
 class Kept:
     """A walk's sums kept in its issuer's own memory past the walk (`Issuer.accumulated`: tcgen05's rows,
     whose sums stay in tensor memory, their 256 fp32 columns a row past a thread's registers): the
-    accumulator `acc` (its issuer's) and, `scaled`, each row's factor its output takes (`algebra.inverse`
-    of its total), which the family applies where it stores them a block of columns at a time
-    (`Family.stored`)."""
+    accumulator `acc` (its issuer's) and, `scaled`, each block of columns as stored, `scale(block)`, a
+    function of the block whose rows are the accumulator's, which the family applies where it stores them
+    a block of columns at a time (`Family.stored`)."""
     acc: Any
-    factor: jax.Array | None = None
+    scale: Callable[[jax.Array], jax.Array] | None = None
 
     @property
     def shape(self) -> tuple[int, ...]:
         return tuple(self.acc.shape)
 
-    def scaled(self, factor: jax.Array) -> "Kept":
-        """The sums each row taken by `factor`, as stored."""
-        return dataclasses.replace(self, factor=factor)
+    def scaled(self, scale: Callable[[jax.Array], jax.Array]) -> "Kept":
+        """The sums each block of columns taken by `scale` (a function of the block), as stored."""
+        return dataclasses.replace(self, scale=scale)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1940,6 +1940,12 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
 
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
+
+    @property
+    def derived_consumers(self) -> int:
+        """The compute roles a forward's derivation tries first (`attention_mosaic._derived`), at most
+        `consumers`: the count its programs run fastest at where measured (`Wgmma`'s), else `consumers`."""
+        return self.consumers
 
     @property
     def register_step(self) -> int:
