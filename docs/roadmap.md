@@ -61,7 +61,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Saved runs carried across. [1622, 1641, 2791, 2792]
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
-- Every nn and interop primitive, seam, contract and derivative has one owner. [5450, 5625]
+- Every nn and interop primitive, seam, contract and derivative has one owner. [5625]
 - CROSS-05 (audit 2026-11-15 pm, validated). [6779]
 
 ## Training and parallelism
@@ -98,7 +98,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Bit-level synthesis in dew.algebra. [3733]
 - Py `_holds_regions`: 'any other holder of a program. [6578]
 - Spec alignment 2026-11-15 §4 (algebra.md §6.9:953-961). [6674]
-- Spec alignment 2026-11-15 pm: testing.md:142 says a probability declaration summing off one is refused, never repaired. [6769]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
@@ -117,6 +116,5 @@ This page is generated from the maintainers' findings ledger as each change land
 ## CI and tooling
 
 - Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
-- On the A10 build node's kept tree. [6757]
 - The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]
