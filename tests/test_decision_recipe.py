@@ -106,7 +106,6 @@ def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_thei
     assert (recorded.val_metrics, recorded.val_summaries) == (config.val_metrics, config.val_summaries)
 
 
-@pytest.mark.scenario("Structured prediction")
 def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_path):
     """A decision release takes the backbone's transformations as a fresh backbone does: a LoRA
     run over a slot release starts from the release's own readout and its question layout, trains
@@ -793,7 +792,6 @@ def test_a_decision_release_compiles_its_step_under_the_layer_recomputation_its_
     answered(run)
 
 
-@pytest.mark.scenario("Structured prediction")
 def test_a_decision_run_trains_and_serves_the_part_of_its_source_its_source_options_say(tmp_path):
     """Qwen3.5's tiny wrapper loads with a vision tower and a prediction depth; a decision run's
     `--source.text-only` and `--source.prediction-depths 0` train the language model alone: its saved task

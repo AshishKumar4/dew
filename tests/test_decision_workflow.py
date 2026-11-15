@@ -180,7 +180,6 @@ def trained(cell: Cell, backbone: Path, root: Path) -> Path:
     return trained_record(saved_record(run_of(cell, backbone, root), root, cell.name), settings)
 
 
-@pytest.mark.scenario("Decision ablation workflow")
 @pytest.mark.parametrize("cell", CELLS, ids=lambda cell: cell.name)
 def test_a_cell_of_the_workflow_holds_the_conservation_contract(cell, backbone, tmp_path):
     run = trained(cell, backbone, tmp_path)
