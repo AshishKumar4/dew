@@ -61,7 +61,7 @@ from dew.objectives.base import Aux, EMASpec, Objective
 from dew.objectives.lm import LMObjective
 from dew.optim import Cosine, OptimConfig, Power
 from dew.state import CHECKPOINTED, TokenCount, TrainState
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer, ema_update
+from dew.training import Checkpoints, DiLoCo, Layout, MeshSpec, Trainer, ema_update
 from dew.training.evaluation import WARM_BATCHES
 from dew.training.runtime import Preempted
 from dew.training.trainer import refuse_non_finite
@@ -2467,20 +2467,27 @@ class PoisonedThird(Counting):
         return batch
 
 
-@pytest.mark.parametrize("tier", ["persistent", "local"])
+@pytest.mark.parametrize("tier", ["persistent", "local",
+                                  pytest.param("diloco", marks=pytest.mark.mesh(devices=2))])
 def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path, tier):
     """A save that meets a state holding a non-finite value writes nothing and rotates nothing out, on either
     tier: the run stops there, and the checkpoint a resume finds is the last finite one, its parameters
     finite (row 6699). A run with no loss scale whose third batch is not finite, checkpointed every step
     and keeping two (`persistent`), saved its non-finite parameters at steps 3 and 4 and rotated its good
     checkpoints out; one that writes a local copy every second step and a persistent one every tenth
-    (`local`) wrote its step-4 local copy unchecked, and a resume restored it (train 901's review, F1)."""
+    (`local`) wrote its step-4 local copy unchecked, and a resume restored it (train 901's review, F1); a
+    DiLoCo run's replicas' inner copies, which its next meeting averages into the outer model, saved
+    unchecked between meetings (`diloco`, train 904's review, F3)."""
     def trainer():
+        if tier == "diloco":
+            # Two replicas meeting every fourth step: the third batch poisons their inner copies mid-period.
+            return make_trainer(tmp_path, keep=2, mesh=MeshSpec(diloco=2).build(jax.devices()[:2]),
+                                diloco=DiLoCo(every=4, rate=0.7, momentum=0.9))
         return make_trainer(tmp_path, keep=2) if tier == "persistent" else local_trainer(tmp_path)
 
     with pytest.raises(RuntimeError):
         trainer().fit(dataset(PoisonedThird), steps=5, log_every=100,
-                      checkpoint_every=1 if tier == "persistent" else 10)
+                      checkpoint_every=10 if tier == "local" else 1)
     resumed = trainer()
     assert resumed.checkpoints.latest == 2
     restored, *_ = resumed.checkpoints.restore(resumed.initial_state())
