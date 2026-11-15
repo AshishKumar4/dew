@@ -20,7 +20,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353, 5288]
 - Convolution repairs above their owner. [5665]
 - The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
-- The recurrence suite's wall: every case within CI's group target. [6325]
+- The recurrence suite's wall: every case within CI's group target. [6334, 6336, 6337, 6338, 6340, 6343, 6347, 6353, 6356, 6363, 6383]
+- Attention tests to the bible's §6 and §7 test rules. [6339, 6342, 6344, 6357, 6364, 6365, 6366, 6367, 6369, 6373, 6374, 6376, 6378, 6379, 6380, 6381, 6384, 6385, 6386, 6387, 6388, 6389, 6391, 6395, 6396]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822, 5391]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -35,12 +36,12 @@ This page is generated from the maintainers' findings ledger as each change land
 - A Hopper kernel gradient's cluster along its output's columns. [6318]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm. [6030]
 - Exact on every path, every edge and every derivative order. [2656]
-- The suite's wall. [5478]
 
 ## Models and interop
 
 - Every recurrence transition and state family. [1300, 1448, 1449, 1450, 1451, 1452, 1453, 1454, 1455, 1456, 1457, 1458, 1459, 1460, 1646, 1446]
 - Saved runs carried across. [1622, 1641, 2791, 2792]
+- The suite's wall. [5478, 6346, 6349, 6362, 6375]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548, 2534, 2535]
 - Looped residuals: InfiLoop on Dory. [1314]
@@ -53,9 +54,10 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Training and parallelism
 
-- Time to first step: the compile path's re-derivations. [5556, 5558, 5669]
+- Time to first step: the compile path's re-derivations. [5556, 5558]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
+- CI time: every test within 120 seconds. [6332, 6333, 6335, 6341, 6345, 6348, 6350, 6351, 6352, 6354, 6355, 6358, 6359, 6360, 6361, 6368, 6370, 6371, 6372, 6377, 6390, 6392, 6393, 6394]
 - Training & Data's tests on check 1. [708]
 - XLA:CPU edges. [1591]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
@@ -82,6 +84,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Released checkpoints judged on GPUs. [1703, 1549]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - Every MAINPERF measurement since 2026-11-09. [6045]
+- algebra.md and the engine agree. [6382]
 - Reference comparisons held by derived bounds. [1719, 2094]
 - Bit-level synthesis in dew.algebra. [3733]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]

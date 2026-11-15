@@ -663,8 +663,10 @@ class FitSearch[LossT, EffectsT]:
     run's tile `base` at each remat rung (`recompute_more`). It holds what it lowered, compiled and
     measured, and where on the ladder it stands.
 
-    The first rung climbed drops the narrow copies, and a plan above it keeps them dropped: taking them
-    back would compile another plan once one fits. A split missing at a rung with a half rung
+    The first rung climbed drops the narrow copies, and the next judges the drop: where the step without
+    them fell less short, a plan above keeps them dropped; where it fell no less short (a GPU's step casts
+    its weights whole either way), they come back and the ladder climbs on with them (`copies_freed`).
+    Once a plan fits, no other compiles. A split missing at a rung with a half rung
     (`remat_half`) is compiled there, the plan staying where it fits; climbing passes
     every half rung asked (`onward`). Each compile that misses names the split asked next (`after`);
     `resumed`, a checkpoint's rung, is warned of where it misses; where nothing fits it raises with the
@@ -695,6 +697,12 @@ class FitSearch[LossT, EffectsT]:
     misses: dict[tuple[str, int], MemoryMiss] = dataclasses.field(default_factory=dict)
     """What each compile that did not fit read, by its rung and split (`MemoryMiss`), which names the split
     the search asks next (`after`)."""
+    dropped_from: str | None = None
+    """The rung (`rung`) the search dropped the narrow copies from, whose miss at a split the step without
+    them must fall less short than for the drop to stand (`copies_freed`)."""
+    copies_kept: bool = False
+    """Whether the copies came back after their drop left the step no less short, so no later rung drops
+    them again."""
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled, jax.stages.CompilerOptions | None] | None = None
     """The plan the search last found to fit: its candidate, executable and the options it compiled under."""
@@ -983,10 +991,20 @@ class FitSearch[LossT, EffectsT]:
 
     def climb(self) -> bool:
         # The first rung drops the narrow copies, two bytes a parameter held all run for 1-2% of a step.
-        if self.narrow and any(candidate.copies for candidate in self.lowered.values()):
-            self.narrow = False
+        copied = any(candidate.copies for candidate in self.lowered.values())
+        if self.narrow and not self.copies_kept and copied:
+            self.dropped_from, self.narrow = self.rung(), False
             self.lowered.clear()
             return True
+        if self.dropped_from is not None and self.copies_freed():
+            self.dropped_from = None
+        elif self.dropped_from is not None:
+            # Dropped, the step fell no less short at the split both missed at: on a GPU the step casts its
+            # weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with them), so the
+            # copies come back, their 1-2% of a step kept, and the ladder climbs on with them.
+            _log.warning("the step's narrow copies free nothing it needs: it keeps them and climbs on")
+            self.dropped_from, self.narrow, self.copies_kept = None, True, True
+            self.lowered.clear()
         # XLA's default options, but `required`, are the half rung above the step's own where those
         # are another program: the Triton GEMM fusions they keep can take fewer temporaries (sm89).
         if not self.xla_defaults and self.chosen != self.required:
@@ -995,6 +1013,19 @@ class FitSearch[LossT, EffectsT]:
         self.xla_defaults = False
         self.lowered.clear()
         return self.onward(self.compiled_again)
+
+    def copies_freed(self) -> bool:
+        """Whether dropping the narrow copies brought the step nearer to fitting: without them, at the split
+        it last missed at, it fell less short than with them at that split, the copies' own bytes and the
+        temporaries their absence changes counted together; True where either compile read no memory, the
+        drop standing as before. Every process gathers its verdict, as at every miss (`after`), so all keep
+        the copies or none."""
+        here = self.rung()
+        latest = next((miss for (rung, _), miss in reversed(self.misses.items()) if rung == here), None)
+        before = None if latest is None or self.dropped_from is None else self.misses.get(
+            (self.dropped_from, latest.split))
+        kept = before is not None and latest is not None and latest.shortfall >= before.shortfall
+        return not any(self.gather(kept))
 
     def compiled_again(self) -> bool:
         """Climb the objective one rung, as `recompute_more` does, saying it compiles the step again
