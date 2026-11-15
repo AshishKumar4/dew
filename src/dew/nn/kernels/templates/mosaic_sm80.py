@@ -607,12 +607,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         return Pipeline(blocks, stages, dict(swizzles or {}), tuple(gathered))
 
 
-    def folded(self, allocated: Pipeline, once: Pipeline | None) -> Pipeline:
-        # `emit_pipeline` copies a block whose index holds from step to step once.
-        if once is None:
-            raise ValueError("a walk's once streams take their allocations (`Transport.run`'s `once`)")
-        return dataclasses.replace(allocated, blocks={**allocated.blocks, **once.blocks},
-                                   swizzles={**allocated.swizzles, **once.swizzles})
+    def folded(self, allocated: Pipeline, once: Pipeline) -> Pipeline:
+        # `emit_pipeline` would allocate a folded block a slot per stage in the walk's scope, where its
+        # planned once allocation (`lifetimes`) holds one: no once stream walks here until the plan counts it.
+        del allocated, once
+        raise NotImplementedError("a cp.async walk folds no once stream: its pipeline allocates one a stage")
 
     def lifetimes(self, streams: Pipeline, steps: int | None = None) -> tuple[tuple, tuple]:
         # `emit_pipeline` allocates a walk's slots in its own scope, no more of them than the walk's steps.

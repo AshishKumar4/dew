@@ -310,9 +310,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                        'sems': pltpu.SemaphoreType.DMA((STAGES,))}
                 for name, (shape, dtype) in blocks.items()}
 
-    def folded(self, allocated: dict, once: dict | None) -> dict:
-        if once is None:
-            raise ValueError("a walk's once streams take their allocations (`Transport.run`'s `once`)")
+    def folded(self, allocated: dict, once: dict) -> dict:
         return {**allocated, **once}
 
     def lifetimes(self, streams: dict, steps: int | None = None) -> tuple[tuple, tuple]:

@@ -1794,20 +1794,32 @@ def _walked_once(x, w, *, family, interpret):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("bundle", ["wgmma", "fed", "mma"])
+@pytest.mark.parametrize("bundle", ["wgmma", "fed"])
 def test_a_walks_once_stream_loads_once_and_every_step_reads_it(bundle):
     """Interpreted: a plain walk whose left operand is a once stream (`Walk.once`), on each way a family
-    holds one: warpgroup MMA's producer loading it beside the ring, its consumer-fed bundle's loading
-    consumer before the walk (`fed.ConsumerFed.taken_once`), and mma.sync's pipeline walking it as a block
-    whose index holds (`folded`); every step reads it with its own ringed block, so the walk sums that
-    block times every step's: exactly, small integers in fp32. (tcgen05's plain walks' accumulators are
-    their persist's or their launch's tensor memory, which this one scopes none of.)"""
-    from dew.nn.kernels.templates import mosaic_sm80, mosaic_sm90
-    family, target = {"wgmma": (mosaic_sm90.WGMMA, "sm90"), "fed": (mosaic_sm90.FED, "sm90"),
-                      "mma": (mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)), "sm80")}[bundle]
+    holds one: warpgroup MMA's producer loading it beside the ring, and its consumer-fed bundle's loading
+    consumer before the walk (`fed.ConsumerFed.taken_once`); every step reads it with its own ringed
+    block, so the walk sums that block times every step's: exactly, small integers in fp32. (tcgen05's plain
+    walks' accumulators are their persist's or their launch's tensor memory, which this one scopes none of;
+    mma.sync's pipeline refuses a once stream, `test_a_cp_async_walk_refuses_a_once_stream`.)"""
+    from dew.nn.kernels.templates import mosaic_sm90
+    family, target = {"wgmma": (mosaic_sm90.WGMMA, "sm90"), "fed": (mosaic_sm90.FED, "sm90")}[bundle]
     x, w = _persisted_operands(family.rows)
     x = x[:family.rows]
     with generation.assumed(target):
         got = np.asarray(_walked_once(x, w, family=family, interpret=INTERPRETED))
     blocks = np.asarray(w, np.float32).reshape(PERSISTED_STEPS, PERSISTED_DEPTH, -1).sum(axis=0)
     np.testing.assert_array_equal(got, np.asarray(x, np.float32)[:, :PERSISTED_DEPTH] @ blocks)
+
+
+@INTERPRETS
+def test_a_cp_async_walk_refuses_a_once_stream():
+    """mma.sync's walk refuses a once stream (`CpAsync.folded`): its pipeline would allocate the block a
+    slot per stage in the walk's scope, where the plan (`lifetimes`) counts one, so a ring depth the plan
+    accepts could overflow an A100's shared memory."""
+    from dew.nn.kernels.templates import mosaic_sm80
+
+    family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
+    x, w = _persisted_operands(family.rows)
+    with generation.assumed("sm80"), pytest.raises(NotImplementedError, match="folds no once stream"):
+        _walked_once(x[:family.rows], w, family=family, interpret=INTERPRETED)

@@ -412,6 +412,11 @@ class Beside:
         self._slots.acquire_all()
 
 
+def besides(slots: "Slots", once: dict | None):
+    """A step's `slots` beside its walk's or tile's once streams' (`Beside`), as they are where none."""
+    return Beside(slots, once) if once else slots
+
+
 class Slots:
     """A walk step's operand slots (`Family.walk`), by stream name: each acquired when the step first reads
     it (`slots[name]`) and released at the step's end, once its MMAs are done, unless the step `release`s it

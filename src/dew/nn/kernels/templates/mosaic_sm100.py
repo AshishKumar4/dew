@@ -853,8 +853,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
                 def walked(lo, hi, start, shapes, accumulators: tuple, step):
                     def stepped(at, slots, carry, accs):
-                        return step(at - counter, rings.Beside(slots, once_slots) if once_slots else slots,
-                                    carry, accs)
+                        return step(at - counter, rings.besides(slots, once_slots), carry, accs)
 
                     return self.walk(opened, ((stepped, lo, hi),), start, shapes, interpret,
                                      initial=accumulators, unrolled=unrolled)

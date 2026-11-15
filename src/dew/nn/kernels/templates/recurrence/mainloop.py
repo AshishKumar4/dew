@@ -873,8 +873,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                 return
             walked = given({axis: lax.axis_index(axis) for axis in grid_names})
             if walked is not None:
-                family.run(streams["walked"], walked, call.interpret, floor=producer,
-                           once=streams.get("once"))
+                family.run(streams["walked"], walked, call.interpret, floor=producer)
 
         # The products' own memory where the family's issuer keeps each (`Family.scoped`'s `products`): a
         # product's width is one of its tiles' (its streams', its staging's) or the chunk's.

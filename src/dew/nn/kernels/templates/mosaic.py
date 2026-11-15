@@ -54,11 +54,11 @@ from dew.nn.kernels.templates import (
 from dew.nn.kernels.templates.cost import Stated, Work
 from dew.nn.kernels.templates.rings import (
     CLUSTER,
-    Beside,
     Ref,
     Ring,
     Slots,
     Turn,
+    besides,
     drain,
     loaded_once,
     loads,
@@ -627,10 +627,10 @@ class Walk:
 
 
 def _besides(step: Callable, once: dict | None) -> Callable:
-    """`step` reading its slots beside the `once` streams' (`rings.Beside`), as it is where none."""
+    """`step` reading its slots beside the `once` streams' (`besides`), as it is where none."""
     if not once:
         return step
-    return lambda index, slots, *rest, **given: step(index, Beside(slots, once), *rest, **given)
+    return lambda index, slots, *rest, **given: step(index, besides(slots, once), *rest, **given)
 
 
 class Issuer[Accumulator](abc.ABC):
@@ -1683,10 +1683,18 @@ class Transport[Allocated, Opened](abc.ABC):
         others."""
         if not once_views:
             return self.opened(allocated, views), views, {}
+        if once is None:
+            raise ValueError("a walk's once streams take their allocations (`Transport.run`'s `once`)")
+        return self.held_once(allocated, views, once, once_views)
+
+    def held_once(self, allocated: Allocated, views: dict, once: Allocated, once_views: dict
+                  ) -> tuple[Opened, dict, dict]:
+        """`walked_once`'s streams where the walk has once streams: by default folded into its walked ones
+        (`folded`), each step's block the one block."""
         merged = {**views, **once_views}
         return self.opened(self.folded(allocated, once), merged), merged, {}
 
-    def folded(self, allocated: Allocated, once: Allocated | None) -> Allocated:
+    def folded(self, allocated: Allocated, once: Allocated) -> Allocated:
         """`allocated` beside a walk's `once` streams, walked as they are (`walked_once`)."""
         raise NotImplementedError(f"{self.name} walks no once streams")
 
@@ -2181,13 +2189,9 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             ring_.initialized()
         return rings
 
-    def walked_once(self, allocated: dict, views: dict, once: dict | None, once_views: dict
-                    ) -> tuple[dict[str, Ring], dict, dict[str, Ring]]:
+    def held_once(self, allocated: dict, views: dict, once: dict, once_views: dict
+                  ) -> tuple[dict[str, Ring], dict, dict[str, Ring]]:
         # Its once streams held apart, one deep, beside its rings.
-        if not once_views:
-            return self.opened(allocated, views), views, {}
-        if once is None:
-            raise ValueError("a walk's once streams take their allocations (`Transport.run`'s `once`)")
         return self.opened(allocated, views), views, self.opened(once, once_views)
 
     def stream(self, streams, views: dict, lo, hi) -> None:
