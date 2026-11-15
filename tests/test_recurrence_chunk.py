@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import tiny_models
+from delta_rule_support import stacked_documents
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec as P
 from port_support import row_names_port
@@ -339,9 +340,8 @@ def entering_documents(operands):
 
 
 def _neutral(hooks: recurrence.Hooks, name: str) -> float:
-    """A padded token's value of field `name` under `hooks`, one that leaves the memory as it is: no key,
-    value or query, no decay and no write; where the hooks form the decay and the write gate from
-    pre-activations (`recurrence.gated`), one far below zero, whose softplus and sigmoid are 0."""
+    """A padded token's value of field `name` under `hooks` (`stacked_documents`'): zero, or where the hooks
+    form the decay and the write gate from pre-activations (`recurrence.gated`), one far below zero."""
     formed = name == 'gate' or (name == 'beta' and hooks.gates is not None)
     return -1e30 if formed else 0.0
 
@@ -351,7 +351,8 @@ def document_by_document(hooks, operands, run=None):
     where None), in the row's order from its `FORKED` table slot's memory (a given one, or the final an
     earlier document stored, with its entry write added where `operands` give one), its outputs back in
     place, and each row's last memory. The rows' k-th documents run as one call, a row each over the longest
-    document's tokens, each padded after its own with tokens that leave its memory as it is (`_neutral`):
+    document's tokens, each padded after its own with tokens that leave its memory as it is
+    (`stacked_documents`, `_neutral`):
     a call a document, the template's reference arm certified each document's launches at its own length,
     the six documents' 18 sets of the GPU tier's three forms, and with the float64 truth's six traces took
     240 s of an H100 job's harness (MAINGPU-be0a83791-PART2of10, tests/arm_arithmetic.py:147)."""
@@ -364,11 +365,6 @@ def document_by_document(hooks, operands, run=None):
     pieces = [[] for _ in DOCUMENTS]
     finals = []
 
-    def padded(name, row, begin, end):
-        tokens = getattr(operands, name)[row, begin:end]
-        return jnp.pad(tokens, [(0, longest - (end - begin))] + [(0, 0)] * (tokens.ndim - 1),
-                       constant_values=_neutral(hooks, name))
-
     for document in range(len(DOCUMENTS[0])):
         states = []
         for row, (loads, _) in enumerate(FORKED):
@@ -377,9 +373,10 @@ def document_by_document(hooks, operands, run=None):
             if operands.entry_key is not None:
                 state = state + entry_write(operands, row, document)
             states.append(state)
+        spans = [(row, *bounds[row][document]) for row in range(len(DOCUMENTS))]
         piece = dataclasses.replace(
-            operands, **{name: jnp.stack([padded(name, row, *bounds[row][document])
-                                          for row in range(len(DOCUMENTS))]) for name in named},
+            operands, **{name: stacked_documents(getattr(operands, name), spans, longest,
+                                                 _neutral(hooks, name)) for name in named},
             state=jnp.stack(states), starts=None, loads=None, stores=None, held=0, entry_key=None,
             entry_value=None, entry_weight=None)
         out, finals = run(hooks, piece)
