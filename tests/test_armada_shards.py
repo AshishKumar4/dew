@@ -453,6 +453,17 @@ def test_a_generated_cell_is_a_site_its_files_check1_shards_literal_declares(ci,
             ci.plan(30.0, {})
 
 
+def test_a_mark_built_from_counts_of_its_own_beside_the_literal_refuses_its_file(ci, tmp_path):
+    """A `check1_shards(**...)` mark whose counts are not drawn from the file's `CHECK1_SHARDS` refuses the
+    file: CI's selection sets every marked test aside, and no site would plan it (row 6595: an empty dict
+    beside `**{"seeds": 128, "per_task": 16}` left test_unplanned unrun, its body never judged)."""
+    written(tmp_path, {"test_site.py": "import pytest\nCHECK1_SHARDS = {}\n\n\n"
+                                       "@pytest.mark.check1_shards(**{'seeds': 128, 'per_task': 16})\n"
+                                       "def test_unplanned():\n    assert False\n"})
+    with pytest.raises(SystemExit):
+        ci.plan(30.0, {})
+
+
 def test_a_marked_parameter_is_a_site_of_its_own_whose_tasks_run_it_alone(ci, tmp_path, monkeypatch):
     """A parameter marked check1_shards in its test's one literal parametrize list, `pytest.param(...,
     id="<id>", marks=...)`, is a site of its own, `test[id]`: its own map tasks and judge, which run its node
