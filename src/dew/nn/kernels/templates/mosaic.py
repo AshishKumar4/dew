@@ -614,11 +614,13 @@ class Walk:
     loaded once, one deep and outside the rings' rotation, awaited before the first step, each step reading
     it among its slots (`rings.Beside`), given back after the last (`Transport.run`'s `once`)."""
 
-    def stepped(self, once: dict | None = None) -> tuple:
+    def stepped(self, once: Callable[[], dict] | None = None) -> tuple:
         """Its segments, each step given its prologue's value, the prologue run here (in the consumer), and
-        its slots beside the `once` streams' acquired slots where given (`rings.Beside`)."""
+        its slots beside the once streams' slots `once()` acquires where given (`rings.Beside`), after the
+        prologue's loads start: they wait on none of the streams'."""
         loaded = None if self.prologue is None else self.prologue()
-        return tuple((_besides(step if loaded is None else functools.partial(step, loaded=loaded), once),
+        held = None if once is None else once()
+        return tuple((_besides(step if loaded is None else functools.partial(step, loaded=loaded), held),
                       lo, hi) for step, lo, hi in (self.segments or ((self.step, 0, self.steps),)))
 
     def persisted(self, walk: Callable) -> None:
@@ -1674,9 +1676,10 @@ class Transport[Allocated, Opened](abc.ABC):
         streams, views, held = self.walked_once(allocated, walk.views, once, walk.once)
 
         def consumer(wg):
-            taken = self.taken_once(held, walk.once, wg)
-            carry, sums = self.walk(self.fed(streams, views, 0, walk.steps, wg), walk.stepped(taken),
-                                    walk.carry, walk.sums, interpret)
+            # Its streams' first loads, then its prologue's, in flight before it waits on its once streams.
+            fed = self.fed(streams, views, 0, walk.steps, wg)
+            stepped = walk.stepped(functools.partial(self.taken_once, held, walk.once, wg))
+            carry, sums = self.walk(fed, stepped, walk.carry, walk.sums, interpret)
             for ring in held.values():
                 ring.release(ring.turn(0))
             if walk.read is not None:
