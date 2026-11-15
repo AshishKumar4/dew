@@ -143,12 +143,13 @@ def _finished(prepared: Dataset, *, batch: int | None, records: int | None, host
 def lm(dataset: Dataset, tokenizer: str | SavedTokenizer | None, *, seq_len: int, batch: int | None,
        field: str = "text", eos: bool | None = None,
        pack: Literal["first-fit", "best-fit", "concat"] | None = PACK_POLICY, bins: int = PACK_BINS,
-       stride: int | None = None, cache: str | Cached | None = None,
+       segments: int | None = None, stride: int | None = None, cache: str | Cached | None = None,
        records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Documents in `field` tokenized, ended by the tokenizer's EOS where it has one (`eos=True`
     always, `False` never), cut into pieces that keep every next-token target, and packed into
     rows of `seq_len + 1` tokens (the last a target) by `pack`, first-fit with `bins` open rows,
-    best-fit, or concatenated, in batches of `batch` rows (`records` and `host` as `images` takes
+    best-fit, or concatenated, `segments` documents at most a row (`segments=1`: one a row, the rest
+    padding, a padded run's rows), in batches of `batch` rows (`records` and `host` as `images` takes
     them). `pack=None` joins the documents into one stream of tokens instead and cuts it into
     windows `stride` apart (`windows`), which carry no document coordinates. With
     `tokenizer=None` the documents are token ids already, under "text", such as a token store's,
@@ -163,12 +164,16 @@ def lm(dataset: Dataset, tokenizer: str | SavedTokenizer | None, *, seq_len: int
 
     if pack is not None and stride is not None:
         raise ValueError("stride places fixed windows, pack=None; a pack lays documents out whole")
+    if segments is not None and pack in (None, "concat"):
+        raise ValueError(f"segments caps the documents a fitting pack lays in a row; pack={pack!r} lays no "
+                         "document whole")
     documents = dataset if tokenizer is None else dataset.map(text_steps.tokenize(tokenizer, field=field,
                                                                                   eos=eos))
     if pack is None:
         windows = _cached(documents, cache).windows(seq_len, stride=stride)
     else:
-        windows = _next_token_windows(documents, Pack(seq_len + 1, bins=bins, policy=pack), cache=cache)
+        windows = _next_token_windows(documents, Pack(seq_len + 1, bins=bins, policy=pack, segments=segments),
+                                      cache=cache)
     return _finished(windows, batch=batch, records=records, host=host)
 
 
