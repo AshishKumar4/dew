@@ -2311,22 +2311,13 @@ def test_cli_exports_a_recorded_chain_whose_step_its_trust_names_in_a_fresh_proc
     assert source(str(tmp_path / "out2")).records("indexed")[0] == {"text": "QUIET"}
 
 
-
-def test_an_endless_read_of_files_whose_whole_pass_yields_no_row_is_refused(tmp_path):
-    """A repeated stream whose complete pass yields nothing is refused (data.md §10), whether or not its
-    store counts its rows: a header-only CSV, whose shards state no count, read streamed and repeated
-    endlessly. Its first batch never came: the read reopened the empty file forever (spec alignment
-    2026-11-15, data.md's fourth finding)."""
-    from dew.data.compile import compile
-
-    path = tmp_path / "rows.csv"
-    path.write_text("id,text\n")
-    data = compile(Files(str(path)).repeat().batch(1), read="streamed",
-                   loading=Loading(workers=0, threads=1, read_buffer=1))
+def _first_read(data, partition=None) -> list[BaseException | object]:
+    """The outcome of `data`'s first training batch, read on a thread of its own for at most 120 s: the
+    batch, or what refused it; empty where the read never returned."""
     outcome: list[BaseException | object] = []
 
     def first() -> None:
-        stream = data.train(DataPartition())
+        stream = data.train(partition or DataPartition())
         try:
             outcome.append(next(iter(stream)))
         except BaseException as refusal:
@@ -2337,5 +2328,49 @@ def test_an_endless_read_of_files_whose_whole_pass_yields_no_row_is_refused(tmp_
     reader = threading.Thread(target=first, daemon=True)
     reader.start()
     reader.join(120)
-    assert not reader.is_alive(), "the read of an empty repeated stream never returned"
-    assert isinstance(outcome[0], ValueError), outcome
+    return outcome
+
+
+def test_an_endless_read_of_files_whose_whole_pass_yields_no_row_is_refused(tmp_path):
+    """A repeated stream whose complete pass yields nothing is refused (data.md §10), whether or not its
+    store counts its rows: a header-only CSV, whose shards state no count, read streamed and repeated
+    endlessly. Its first batch never came: the read reopened the empty file forever (spec alignment
+    2026-11-15, data.md's fourth finding)."""
+    from dew.data.compile import compile
+
+    path = tmp_path / "rows.csv"
+    path.write_text("id,text\n")
+    (outcome,) = _first_read(compile(Files(str(path)).repeat().batch(1), read="streamed",
+                                     loading=Loading(workers=0, threads=1, read_buffer=1)))
+    assert isinstance(outcome, ValueError), outcome
+
+
+@pytest.mark.parametrize("read", ["interleaved", "shuffled in workers"])
+def test_an_endless_read_of_files_some_empty_reads_the_rows_the_others_hold(tmp_path, read):
+    """Shards no store counts, some empty, are read on, not refused, while any holds rows: under an
+    interleave of a file of rows and two empty ones an open shard that is still yielding rows ends no run
+    of empty ones, and a loading worker's slice of shards dealt in a drawn order may meet several empty
+    ones in a row while the store holds rows (train 897's review: a run of twice the shards ending empty
+    was refused by its fourth row)."""
+    from dew.data.compile import compile
+
+    paths = []
+    empty = 2 if read == "interleaved" else 6
+    for name, rows in (("full", 64), *((f"empty{index}", 0) for index in range(empty))):
+        path = tmp_path / f"{name}.csv"
+        path.write_text("id\n" + "".join(f"{index}\n" for index in range(rows)))
+        paths.append(str(path))
+    files = Files(tuple(paths))
+    # A streamed read deals its shards in an order the run's seed draws, each pass its own, a worker its
+    # slice of them (`dew.data.shards.streamed`).
+    chain = (files.interleave().repeat().batch(1) if read == "interleaved"
+             else files.repeat().batch(1).workers(2))
+    data = compile(chain, read="streamed", loading=Loading(workers=0 if read == "interleaved" else 2,
+                                                           threads=1, read_buffer=1))
+    stream = data.train(DataPartition())
+    try:
+        read_ids = [int(batch["id"][0]) for batch in itertools.islice(stream, 40)]
+    finally:
+        stream.close()
+    assert len(read_ids) == 40 and set(read_ids) <= set(range(64))
+
