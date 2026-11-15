@@ -2342,9 +2342,9 @@ call) to (that route's kernel, the receipt). A product of a matrix a receipt tim
 its own, which that receipt's winner holds: the template's where it won (on Hopper, over its kind's XLA
 cell), XLA's where it lost (on Blackwell, where the template is the kind's default); one timed whose cell is
 undeclared takes the template. A cell leaves the list once the template measures at least as fast on it.
-A cell's route holds no more of a step's memory than the template's: each product's reverse mode leaves its
-rows' cotangent only with its kernel gradient formed (`gemm.in_layer`, row 6027), whichever route forms it
-(tests/test_declared_cells_memory.py). Nothing is ranked at runtime. A
+A cell's route holds no more of a step's memory than the template's: each product's reverse mode returns
+its rows' cotangent only with its kernel gradient formed (`derivatives.with_gradients_formed`, row 6027),
+whichever route forms it (tests/test_declared_cells_memory.py). Nothing is ranked at runtime. A
 call the template cannot run (its legality) takes the next route in `GROUPED`'s order, which is no cell of
 this list."""
 

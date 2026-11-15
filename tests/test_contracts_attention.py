@@ -134,3 +134,18 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
 
     assert_contract(paged, primals, direction, cotangent, f"the paged decode kernel {edge} {kernel}",
                     truth_fn=plain, plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_sink_softmax_holds_every_order(edge):
+    """The sink softmax (`attention_sinks.sink_softmax`: its reverse mode returning the logits' cotangent
+    only with the sinks' gradient formed): every order, forward and reverse, under a nested jit and a scan,
+    in the logits and the sinks, finite wherever float64 is a normal float32 and wherever its plain softmax
+    (`_weights`, its float64 run the truth) is, at logits near float32's ends."""
+    from dew.nn.attention_sinks import _weights, sink_softmax
+
+    primals = normal_draw(6175, (2, 4, 8, 16), (4,), scale=EDGES[edge])
+    direction = normal_draw(6176, (2, 4, 8, 16), (4,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(6177, (2, 4, 8, 16))
+    assert_contract(sink_softmax, primals, direction, cotangent, f"a sink softmax {edge}",
+                    plain_fn=lambda logits, sinks: _weights(logits, sinks, None))

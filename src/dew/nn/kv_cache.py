@@ -47,7 +47,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.batch import prefix_sum
 from dew.mesh import LayoutRefused, logical_spec, mesh_axes
-from dew.nn.derivatives import KernelGlue, contracted
+from dew.nn.derivatives import KernelGlue, contracted, with_gradients_formed
 from dew.nn.fake_quant import E4M3_MAX
 from dew.nn.host_memory import fetched, fetched_at, on_host, placed_like, stored_at
 from dew.nn.kernels import decode_attention, generation
@@ -1432,7 +1432,10 @@ def _paged_forward(query, key, value, table, lengths, starts=None, sinks=None, *
 
 
 def _paged_backward(saved, operands, cotangent, *, softcap=None):
-    return jax.vjp(functools.partial(_gathered_attention, softcap=softcap), *operands)[1](cotangent)
+    # The query's and pools' cotangents leave only with the sinks' gradient formed (`with_gradients_formed`).
+    first, *rest = jax.vjp(functools.partial(_gathered_attention, softcap=softcap), *operands)[1](cotangent)
+    first, rest = with_gradients_formed(first, tuple(rest))
+    return (first, *rest)
 
 
 @functools.cache

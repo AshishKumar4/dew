@@ -264,3 +264,29 @@ def test_a_default_precision_call_holds_every_order_it_takes(edge):
     assert_contract(precision.at_precision('default')(product), primals, direction, cotangent,
                     f"a default-precision call {edge}", truth_fn=product, plain_fn=product,
                     without=OWN_FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_norms_xla_path_holds_every_order(edge):
+    """An RMS norm's XLA path (`norms.stream_rms_normalized` at 'xla': its reverse mode returning the rows'
+    cotangent only with the weight's gradient formed, `norms._formed`): every order, forward and reverse,
+    under a nested jit and a scan, in the rows and the weight, finite wherever float64 is a normal float32
+    and wherever its plain norm (`norms._xla_rms_normalized`, its float64 run the truth) is, at rows near
+    float32's ends."""
+    from dew.nn import norms
+
+    primals = normal_draw(6178, (4, 8, 32), (32,), scale=EDGES[edge])
+    direction = normal_draw(6179, (4, 8, 32), (32,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(6180, (4, 8, 32))
+
+    offset, after_cast, fp32_statistics, weight_first = False, False, True, False
+
+    def normed(rows, scale):
+        return norms.stream_rms_normalized(rows, None, scale, 1e-6, None, offset, after_cast, fp32_statistics,
+                                           implementation="xla")[1]
+
+    def plain(rows, scale):
+        return norms._xla_rms_normalized(rows, scale, 1e-6, None, offset, after_cast, fp32_statistics, None,
+                                         weight_first)
+
+    assert_contract(normed, primals, direction, cotangent, f"a norm's xla path {edge}", plain_fn=plain)

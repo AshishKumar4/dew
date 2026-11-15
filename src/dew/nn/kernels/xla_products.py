@@ -201,6 +201,8 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike, out_
     # The tangents keep their dtypes to this point whatever produced them, so an activation's bf16 cotangent
     # is not fused into a wider expression: XLA's excess-precision simplification (`SimplifyFPConversions`,
     # on under `xla_allow_excess_precision`, its default) drops a round trip through bf16 a fusion forms.
+    # Both live, the same barrier is the rule's dual (`with_tangents_formed`): its transpose returns `x`'s
+    # cotangent only with the kernel's gradient formed.
     held = dict(zip((name for name, _ in live),
                     jax.lax.optimization_barrier(tuple(tangent for _, tangent in live)),
                     strict=True))

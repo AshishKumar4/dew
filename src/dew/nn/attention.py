@@ -22,7 +22,7 @@ import tokamax
 from flax.linen.dtypes import promote_dtype
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
+from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed
 from dew.nn.residuals import Residual
 
 from .attention_kernels import (
@@ -1124,9 +1124,11 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
                 arrays[index] = array
             return tangent(*arrays)
 
+        # The live tangents through the rule's dual (`with_tangents_formed`): reverse mode returns the
+        # query's, key's and value's cotangents only with a bias's and the sinks' gradients formed.
+        first, rest = with_tangents_formed(tangents[live[0]], tuple(tangents[index] for index in live[1:]))
         with contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision):
-            taken, differentiated = jax.jvp(moved, tuple(primals[index] for index in live),
-                                            tuple(tangents[index] for index in live))
+            taken, differentiated = jax.jvp(moved, tuple(primals[index] for index in live), (first, *rest))
         return (taken if primal_alone else attend(*primals)), differentiated
 
     attend = contracted("test_a_fused_attention_call_in_forward_mode_holds_every_order")(

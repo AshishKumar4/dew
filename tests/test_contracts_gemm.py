@@ -168,6 +168,21 @@ def test_a_once_rounded_biased_layer_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_a_biased_sum_holds_every_order(edge):
+    """A product plus its bias as a biased layer adds them (`precision.biased`: the bias spread at fp32, its
+    reverse mode through the rule's dual): every order, in the product and the bias, finite wherever float64
+    is a normal float32 and wherever the plain sum is, at values near float32's ends."""
+    primals = normal_draw(6471, (8, 16), (16,), scale=EDGES[edge])
+    direction = normal_draw(6472, (8, 16), (16,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(6473, (8, 16))
+
+    def plain(product, bias):
+        return product + bias
+
+    assert_contract(precision.biased, primals, direction, cotangent, f"a biased sum {edge}", plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_an_mxfp8_projection_holds_every_reverse_order(edge):
     """`projections.mxfp8_projection` (the MXFP8 recipe, its custom VJP the recipe's own MX products, declared
     as a surrogate): every reverse order, under a nested jit and a scan, in the rows and the matrices, finite
@@ -644,15 +659,43 @@ def test_a_broadcast_sums_its_gradient_wide_at_every_order(dtype):
 
 
 @pytest.mark.parametrize("edge", EDGES)
-def test_an_xla_projection_in_its_layer_holds_every_order(edge):
+def test_a_portable_formed_rule_holds_every_order(edge):
+    """An XLA program whose last operand is a parameter through the rule (`derivatives.portable_formed`:
+    its value and every derivative XLA's of it, its reverse mode's cotangents leaving together): every order,
+    forward and reverse, under a nested jit and a scan, in the rows and the parameter, finite wherever
+    float64 is a normal float32 and wherever the program itself (its float64 run the truth) is, at values
+    near float32's ends."""
+    from dew.nn.derivatives import portable_formed
+
+    primals = normal_draw(6471, (4, 32, 64), (64,), scale=EDGES[edge])
+    direction = normal_draw(6472, (4, 32, 64), (64,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(6473, (4, 32, 64))
+
+    def plain(rows, weight):
+        return jnp.tanh(rows) * weight + rows * rows
+
+    assert_contract(portable_formed(plain), primals, direction, cotangent, f"a portable formed rule {edge}",
+                    plain_fn=plain)
+
+
+# A projection's forms: a dense one's rows against a matrix, a batched one's (DeepSeek V4's grouped
+# `o_a_proj`) each batch member's rows against its own matrix.
+XLA_FORMS = {"dense": ((4, 32, 64), (64, 48), (4, 32, 48), (((2,), (0,)), ((), ()))),
+             "batched": ((4, 32, 64), (4, 64, 48), (4, 32, 48), (((2,), (1,)), ((0,), (0,))))}
+
+
+@pytest.mark.parametrize("form", XLA_FORMS)
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_xla_projection_in_its_layer_holds_every_order(edge, form):
     """A projection's product no launch takes (`projections._in_layer_product`: XLA's own dot, its reverse
-    mode's cotangents leaving together, `gemm.in_layer`): every order, forward and reverse, under a nested
-    jit and a scan, in the rows and the matrix, finite wherever float64 is a normal float32 and wherever the
-    plain dot (its float64 run the truth) is, at values whose products near float32's ends."""
-    primals = normal_draw(6027, (4, 32, 64), (64, 48), scale=EDGES[edge])
-    direction = normal_draw(6028, (4, 32, 64), (64, 48), scale=EDGES[edge])
-    (cotangent,) = normal_draw(6029, (4, 32, 48))
-    dimensions = (((2,), (0,)), ((), ()))
+    mode's cotangents leaving together, `derivatives.with_gradients_formed`), dense or batched: every order,
+    forward and reverse, under a nested jit and a scan, in the rows and the matrix, finite wherever float64
+    is a normal float32 and wherever the plain dot (its float64 run the truth) is, at values whose products
+    near float32's ends."""
+    rows, matrix, out, dimensions = XLA_FORMS[form]
+    primals = normal_draw(6027, rows, matrix, scale=EDGES[edge])
+    direction = normal_draw(6028, rows, matrix, scale=EDGES[edge])
+    (cotangent,) = normal_draw(6029, out)
     product = projections._in_layer_product(jax.lax.dot_general, dimensions, None, None)
 
     def plain(rows, matrix):

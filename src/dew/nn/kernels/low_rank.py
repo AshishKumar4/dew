@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from flax.typing import PrecisionLike
 
-from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
+from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
 from dew.nn.kernels import generation, selection
 from dew.nn.kernels.gemm import gemm, gemm_t
 from dew.nn.kernels.templates import swizzling
@@ -123,6 +123,7 @@ def _low_rank_backward(out_dtype, precision, interpret_on_cpu, residuals, cotang
     if wants_scale:
         unscaled = jnp.dot(lhs, a.astype(lhs.dtype), precision=precision, preferred_element_type=wide)
         d_scale = jnp.sum(through * unscaled).astype(scale.dtype)
+    d_lhs, (d_kernel, d_a, d_b, d_scale) = with_gradients_formed(d_lhs, (d_kernel, d_a, d_b, d_scale))
     return d_lhs, d_kernel, d_a, d_b, d_scale
 
 # The launches' derivative glue (`derivatives.KernelGlue`): an operand no reverse pass reaches is a symbolic

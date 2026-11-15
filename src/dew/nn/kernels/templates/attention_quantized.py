@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 
 from dew._cache import unintercepted
-from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
+from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import traced_fact
 from dew.nn.kernels.templates import attention_route
@@ -183,7 +183,8 @@ def _attend_backward(saved: tuple, dout: jax.Array) -> tuple:
         query, key, value, spans, hooks = saved
         _, pullback = jax.vjp(lambda q, k, v, h: _straight_through(q, k, v, spans, h), query, key, value,
                               hooks)
-        d_query, d_key, d_value, d_hooks = pullback(dout)
+        *inputs, d_hooks = pullback(dout)
+        (d_query, d_key, d_value), d_hooks = with_gradients_formed(tuple(inputs), d_hooks)
         return d_query, d_key, d_value, None, d_hooks
 
     return unintercepted(pulled)(saved, dout)

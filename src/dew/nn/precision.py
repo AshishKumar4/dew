@@ -50,6 +50,8 @@ from dew.nn.derivatives import (
     declared_derivative,
     declared_tangent,
     surrogate,
+    with_gradients_formed,
+    with_tangents_formed,
 )
 from dew.nn.nested import nested
 from dew.nn.programs import UNROUNDED, equations
@@ -242,14 +244,50 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
     at fp32, the gradient sums at fp32 and rounds once into the bias. A CPU running Dew's wide
     arithmetic (`WIDE_CPU_ARITHMETIC`) sums it in float64, as it sums a float32 product (`spread`).
-    """
+
+    Its reverse mode returns the product's cotangent only with the bias's gradient formed (the rule's
+    dual, `with_tangents_formed`): XLA's sum of a bias's gradient, a reduction over every row of the
+    cotangent, was put off to a step's end, each layer's cotangent held to it (a biased attention decoder's
+    temporaries grew 27 MB a layer, tests/test_declared_cells_memory.py)."""
+    return _biased(product, bias)
+
+
+def _biased_value(product: jax.Array, bias: jax.Array) -> jax.Array:
+    """`biased`'s value: `product` plus `bias` spread at fp32 (`broadcast_summed`) over the product's
+    trailing axes, as flax's layers reshape it, so no rank is promoted implicitly; rounded back, it adds as
+    flax adds it (XLA folds the round trip, so the product and bias fuse as before)."""
     dtype = jnp.result_type(product, bias)
-    # The bias over the product's trailing axes, as flax's layers reshape it, so no rank is promoted
-    # implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds the round trip,
-    # so the product and bias fuse as before) and its gradient sums at fp32 (`broadcast_summed`).
     leading = product.ndim - bias.ndim
     spread_bias = broadcast_summed(bias, product.shape, tuple(range(leading, product.ndim)), dtype=dtype)
     return product.astype(dtype) + spread_bias
+
+
+def _biased_tangent(primals, tangents):
+    """`biased`'s tangent: the product's and the bias's directions added as the value adds them, both
+    through the rule's dual where both move, so reverse mode, its transpose, sums the bias's gradient at fp32
+    (`broadcast_summed`) and returns the product's cotangent only with it."""
+    from jax.custom_derivatives import SymbolicZero
+
+    from dew._cache import unintercepted
+
+    product, bias = primals
+    d_product, d_bias = tangents
+    if not any(isinstance(direction, SymbolicZero) for direction in tangents):
+        d_product, d_bias = with_tangents_formed(d_product, d_bias)
+    value = _biased_value(product, bias)
+    dtype = value.dtype
+    leading = product.ndim - bias.ndim
+    terms = ([] if isinstance(d_product, SymbolicZero) else [d_product.astype(dtype)]) + (
+        [] if isinstance(d_bias, SymbolicZero)
+        # The spread is Dew's own arithmetic, no model's product for a quantization rule to take: its
+        # transpose, reverse mode's, has no custom VJP to meet (`unintercepted`).
+        else [unintercepted(broadcast_summed)(d_bias, product.shape, tuple(range(leading, product.ndim)),
+                                              dtype=dtype)])
+    return value, sum(terms[1:], terms[0]) if terms else jnp.zeros_like(value)
+
+
+_biased = contracted("test_a_biased_sum_holds_every_order")(
+    declared_tangent(Protected(), _biased_value, _biased_tangent, symbolic_zeros=True))
 
 
 def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...], *,
@@ -710,7 +748,11 @@ def _summed_wide(product: Callable, preferred_element_type, *operands, counts: i
                 (gradient,) = jax.linear_transpose(alone, wide[index])(wide_cotangent)
                 return gradient.astype(operands[index].dtype)
 
-            return tuple(transposed(index) for index in live)
+            # Each operand's cotangent leaves only with the others' formed (`with_gradients_formed`): a
+            # product's matrix is any of them.
+            first, *rest = (transposed(index) for index in live)
+            first, rest = with_gradients_formed(first, tuple(rest))
+            return (first, *rest)
 
     # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
     wide = contracted("test_a_wide_cpu_sum_of_products_holds_every_order")(
@@ -1711,8 +1753,9 @@ def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.A
         """Each operand's cotangent: the product's transpose to it over the cotangent rounded to bf16."""
         del saved
         rounded = cotangent.astype(jnp.bfloat16)
-        return tuple(_transposed(rounded, operands, numbers, side, typed).astype(operands[side].dtype)
-                     for side in (0, 1))
+        left, right = (_transposed(rounded, operands, numbers, side, typed).astype(operands[side].dtype)
+                       for side in (0, 1))
+        return with_gradients_formed(left, right)
 
     def forward(lhs, rhs):
         return typed(lhs, rhs, numbers)
@@ -1786,8 +1829,12 @@ def at_precision[Output](precision: jax.lax.PrecisionLike
                 return jax.vjp(fn, *args)
 
         def backward(pullback, cotangent):
+            # The arguments' cotangents leave together (`with_gradients_formed`): a call's parameters (an
+            # attention's bias and sinks) beside its inputs.
             with jax.default_matmul_precision(name):
-                return pullback(cotangent)
+                first, *rest = pullback(cotangent)
+            first, rest = with_gradients_formed(first, tuple(rest))
+            return (first, *rest)
 
         # A protected span: the precision it holds is the kernels' own, which no rewrite may change.
         @contracted("test_a_default_precision_call_holds_every_order_it_takes")
