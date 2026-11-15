@@ -1458,9 +1458,12 @@ class _Build:
             return None
         from dew.data.epochs import held_records
 
-        loading = dataclasses.replace(self.loading, workers=0)
-        return held_records(member, dataclasses.replace(self.child(index), read="indexed", training=False,
-                                                         loading=loading))
+        child = self.child(index)
+        # Counted by index in one order, as an epoch is, whatever order the member is read in.
+        counting = dataclasses.replace(child, read="indexed", training=False,
+                                       lowering=dataclasses.replace(child.lowering, per_share=False),
+                                       loading=dataclasses.replace(self.loading, workers=0))
+        return held_records(member, counting)
 
     def counted_members(self, pipeline: Pipeline) -> tuple[tuple[str, str, str], ...]:
         """The members of `pipeline`'s mixture, each's key (`_member_keys`), name and label, where a read
