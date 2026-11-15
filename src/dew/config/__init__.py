@@ -484,12 +484,13 @@ def _model_changes(saved: ModelConfig, before: JSON, now: JSON) -> list[str]:
     the numbers it computes in (`registry.computing_differences`, `NUMBERS` and `ROUNDS` kept), as
     `model.<field>`. A field that says how it runs or trains alone (`dew._records.RUNS`: remat, dropout,
     kernels), which the memory plan or the devices a resume lands on choose, changes freely."""
-    if not (isinstance(before, Mapping) and isinstance(now, Mapping)):
-        return [] if before == now else ["model"]
-    if {key: value for key, value in before.items() if key not in ("fields", "defaults")} != {
-            key: value for key, value in now.items() if key not in ("fields", "defaults")}:
+    records = [_records.record(record, "model") for record in (before, now)]
+    named = [{key: value for key, value in record.items() if key not in ("fields", "defaults")}
+             for record in records]
+    if named[0] != named[1]:
         return ["model"]
-    stated = [{**(record.get("defaults") or {}), **(record.get("fields") or {})} for record in (before, now)]
+    stated = [{**_records.record(record.get("defaults") or {}, "model.defaults"),
+               **_records.record(record.get("fields") or {}, "model.fields")} for record in records]
     return [f"model.{name}" for name in registry.computing_differences(
         saved.member, *stated, kept=(_records.NUMBERS, _records.ROUNDS))]
 

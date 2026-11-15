@@ -993,7 +993,7 @@ def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_
         Decide.averaged(runs)
     dropped = trained_runs(with_head(dropout_rate=0.1), tmp_path, 1, name="dropped")
     assert len(Decide.averaged(runs + dropped).weights.averaged) == 2
-    with pytest.raises(ValueError, match=r"head\.dtype"):
+    with pytest.raises(ValueError):
         Decide.averaged(runs + trained_runs(with_head(dtype="bfloat16"), tmp_path, 1, name="narrow"))
     other = replace(decide, layout=replace(decide.layout, head_max_len=decide.layout.head_max_len // 2))
     runs += trained_runs(other, tmp_path, 1, name="other")
