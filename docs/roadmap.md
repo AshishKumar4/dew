@@ -70,7 +70,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Time to first step: the compile path's re-derivations. [5556, 5558]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
-- CI time: every test within 120 seconds. [6731]
+- CI time: every test within 120 seconds. [6731, 6846]
 - XLA:CPU edges. [1591]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
 - A fact and a question for the step's owner. [6646]
