@@ -133,6 +133,49 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_pat
     assert first["missed"][0] not in [refusal["config"] for refusal in again["planned"]["refused"]]
 
 
+RECURRENT_AHEAD = """
+import json
+import jax
+import optax
+from token_support import token_rows
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
+from dew.objectives.lm import LMObjective
+from dew.training import MeshSpec, Trainer
+from dew.training.ahead import compile_ahead
+
+lowered = []
+jax.monitoring.register_event_duration_secs_listener(
+    lambda event, seconds, *, fun_name=None, **_: lowered.append(fun_name)
+    if event == "/jax/core/compile/jaxpr_to_mlir_module_duration" else None)
+# Qwen3.5-4B's linear attention: 16 key heads and 32 value heads, each 128 wide, over a row of 12,288 tokens.
+model = CausalTransformer(vocab_size=64, emb_features=512, num_layers=1, num_heads=4, head_dim=128,
+                          mlp_features=512, max_seq_len=12288, dtype="bfloat16", mixer=GatedDeltaNetMixer())
+trainer = Trainer(LMObjective(model, 12288), optax.adam(1e-3), key=jax.random.key(0),
+                  mesh=MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30)))
+compile_ahead(trainer, token_rows(64, 1, 12289))
+print(json.dumps({"lowered": lowered}))
+"""
+"""A one-layer decoder of Qwen3.5-4B's gated delta net compiled ahead for a compile-only H100, each program
+it lowered by name."""
+
+
+@lowers("sm90")
+def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path):
+    """A one-layer decoder of the 4B's gated delta net, its step compiled ahead for a compile-only H100
+    (`RECURRENT_AHEAD`), twice over one cache: at its derived tiles its output launch spills (8 bytes at 128
+    registers under the cuda12 build's ptxas), and each process lowers the step once. Certification compiles
+    a launch with its outputs live, as a step reads them, so it refuses the spilling config and steps the
+    launch's producer down at trace, each rung compiled alone; and a later process reads the verdicts stored,
+    compiling nothing to certify. Certification that dropped the outputs never compiled the output launch,
+    and the program's compile stepped it down a whole-step relowering a rung, again in every process
+    (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm)."""
+    cache = tmp_path / "cache"
+    counts = [fresh(RECURRENT_AHEAD, cache_dir=cache)["lowered"].count("jit(step)") for _ in range(2)]
+    assert counts == [1, 1], counts
+
+
 HANDED = """
 import json, sys
 import jax
