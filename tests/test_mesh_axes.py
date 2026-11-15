@@ -929,14 +929,17 @@ def test_a_stage_and_sequence_mesh_runs_whole_under_whole():
         assert (pipeline_stages(), sequence_shards()) == (2, 2)
 
 
-def test_a_mesh_of_one_device_lowers_a_decoders_gradient_with_no_placement_constraint():
+def test_a_mesh_of_one_device_traces_a_decoders_gradient_with_no_placement_constraint():
     """A mesh whose every axis holds one device places nothing, and its program carries no sharding
     constraint (`nn.sharding.constrained`): one device's step carried 1,525 (row 5855), each an op the
     compiler is handed for nothing."""
+    from reference_error import equations
+
     model = tiny()
     tokens = jnp.zeros((2, SEQ_LEN), jnp.int32)
     with jax.set_mesh(MeshSpec(fsdp=1, tensor=1).build(jax.devices()[:1])):
         variables = jax.jit(model.init)(jax.random.key(0), tokens)
-        text = jax.jit(jax.grad(lambda v: model.apply(v, tokens).astype(jnp.float32).mean())).lower(
-            variables).as_text()
-    assert text.count("sharding_constraint") + text.count("@Sharding") == 0, text.count("sharding_constraint")
+        traced = jax.make_jaxpr(jax.grad(lambda v: model.apply(v, tokens).astype(jnp.float32).mean()))(
+            variables)
+    assert [equation for equation in equations(traced)
+            if equation.primitive.name == "sharding_constraint"] == []
