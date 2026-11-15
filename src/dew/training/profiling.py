@@ -290,6 +290,10 @@ class ProfileReport:
     missing), whose surviving kernels no full-window figure may be read from (`device` says why). The
     window holds no checkpoint, validation or log read but its own, so their time is outside every
     figure here.
+    `kernels` is the step's chosen kernels as its plan recorded them (`StepCompiled`'s plan, its
+    `KernelReport.record`: each dispatch's route and each kernel's launches), None where its record holds
+    none; `losses` the three largest shares of a step its analytic work did not take (`step_losses`),
+    largest first.
     `directory` is the profile's, its `report.json` beside the run."""
 
     directory: str
@@ -310,6 +314,8 @@ class ProfileReport:
     hfu: float | None
     tokens_per_s: float | None
     device: str | None
+    kernels: dict | None = None
+    losses: tuple[tuple[str, float], ...] = ()
 
     @classmethod
     def read(cls, directory: Path, name: str, window: Path, *, warmup: int, steps: int) -> "ProfileReport":
@@ -330,8 +336,10 @@ class ProfileReport:
         logged = {key: value for step, scalars in LocalTracker(run / "tracking").scalars()
                   if step == warmup + steps for key, value in scalars.items()}
         records = (run / "tracking" / "records.jsonl").read_text().splitlines()
-        compiles = [entry["value"]["seconds"] for entry in map(json.loads, records)
-                    if entry["type"] == "StepCompiled"]
+        compiled = [entry["value"] for entry in map(json.loads, records) if entry["type"] == "StepCompiled"]
+        compiles = [value["seconds"] for value in compiled]
+        plan = compiled[0].get("plan") if compiled else None
+        kernels = plan.get("kernels") if isinstance(plan, dict) else None
         manifest = json.loads((capture / "manifest.json").read_text())
         reasons = manifest.get("capture_reasons") or []
         planes, _ = device_events(capture)
@@ -340,10 +348,29 @@ class ProfileReport:
         device = (f"the capture holds less than the window ran: {'; '.join(reasons)}" if reasons
                   else None if figures["device_window_ms"] is not None
                   else "the capture holds no device track (a CPU run, or its trace has none)")
-        return cls(str(directory), steps, warmup, traced, str(capture), logged["train/step_time_ms"],
-                   logged["train/data_wait_ms"], compiles[0] if compiles else None, **figures,
-                   flops=logged.get("train/flops"), mfu=logged.get("train/mfu"), hfu=logged.get("train/hfu"),
-                   tokens_per_s=logged.get("train/tokens_per_s"), device=device)
+        report = cls(str(directory), steps, warmup, traced, str(capture), logged["train/step_time_ms"],
+                     logged["train/data_wait_ms"], compiles[0] if compiles else None,
+                     device_window_ms=figures["device_window_ms"], compute_ms=figures["compute_ms"],
+                     communication_ms=figures["communication_ms"],
+                     exposed_communication_ms=figures["exposed_communication_ms"],
+                     device_idle_ms=figures["device_idle_ms"],
+                     flops=logged.get("train/flops"), mfu=logged.get("train/mfu"),
+                     hfu=logged.get("train/hfu"), tokens_per_s=logged.get("train/tokens_per_s"),
+                     device=device, kernels=kernels)
+        return dataclasses.replace(report, losses=report.step_losses())
+
+    def step_losses(self) -> tuple[tuple[str, float], ...]:
+        """The three largest shares of a step, in ms, its analytic work did not take, largest first: the
+        loop's input wait, the collectives no compute ran beside, the device's idle gaps, and the compute
+        past the work's time at the device's peak (the compute less `mfu` of the step, the time the work
+        takes at peak); each where the report holds it, and only those that took time."""
+        held = {"input wait": self.input_wait_ms, "exposed communication": self.exposed_communication_ms,
+                "device idle": self.device_idle_ms}
+        if self.compute_ms is not None and self.mfu is not None:
+            held["compute past the work at peak"] = self.compute_ms - self.mfu * self.step_ms
+        ranked = sorted(((name, value) for name, value in held.items() if value is not None and value > 0),
+                        key=lambda named: -named[1])
+        return tuple(ranked[:3])
 
     def text(self) -> str:
         """The report as lines a person reads, the largest share of a step named last."""
@@ -376,6 +403,13 @@ class ProfileReport:
         if self.tokens_per_s is not None:
             lines.append(f"  tokens        {self.tokens_per_s:10.1f} real tokens a second")
         lines.append("  checkpoints, validation and logging: none inside the window")
+        if self.kernels is not None:
+            launches = ", ".join(f"{entry['name']} x{'?' if entry['calls'] is None else entry['calls']}"
+                                 for entry in self.kernels.get("launches", ()))
+            lines.append(f"  kernels       {launches or 'none'}")
+        if self.losses:
+            lost = "; ".join(f"{name} {value:.2f} ms" for name, value in self.losses)
+            lines.append(f"  losses        {lost}")
         largest = max(shares, key=shares.__getitem__)
         lines.append(f"The largest share of a step: {largest}, {100 * shares[largest] / self.step_ms:.0f}%.")
         return "\n".join(lines)
