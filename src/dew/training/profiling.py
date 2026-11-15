@@ -377,8 +377,9 @@ class ProfileReport:
         takes at peak); with no device track, the loop's input wait in their place, which the device's queue
         can hide; each where the report holds it, and only those that took time."""
         device = self.device_window_ms is not None
-        held = ({"device waiting on input": self.input_idle_ms, "device idle on the host": self.host_idle_ms}
-                if device else {"input wait": self.input_wait_ms})
+        held: dict[str, float | None] = (
+            {"device waiting on input": self.input_idle_ms, "device idle on the host": self.host_idle_ms}
+            if device else {"input wait": self.input_wait_ms})
         held["exposed communication"] = self.exposed_communication_ms
         if self.compute_ms is not None and self.mfu is not None:
             held["compute past the work at peak"] = self.compute_ms - self.mfu * self.step_ms
