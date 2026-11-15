@@ -628,8 +628,11 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
         specs = [jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=placed) for shape in shapes]
 
         def pulled_back(*operands):
+            # Its outputs too, as a step reads them: dropped, the kernels writing only them were dead code
+            # to XLA and went uncertified (the 4B decision step's recurrence_output, LF-PROMO3, whose
+            # program then stepped its producer down a whole-step relowering a rung).
             out, pullback = jax.vjp(launch, *operands)
-            return pullback(jax.tree.map(_unit_cotangent, out))
+            return out, pullback(jax.tree.map(_unit_cotangent, out))
 
         lowered = owned_program(pulled_back if reverse else launch).trace(*specs).lower()
     # A Mosaic GPU kernel compiled alone is the one its program loads (Mosaic compiles a module once a
