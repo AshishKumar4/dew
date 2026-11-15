@@ -236,6 +236,33 @@ def test_a_rewritten_program_is_finite_wherever_the_program_is(name):
     assert np.all(np.isfinite(jax.core.eval_jaxpr(closed.jaxpr, closed.consts, *operands_)[0]))
 
 
+TOP = float(np.uint32(0x7F7FFFFC).view(np.float32))
+"""Float32's `(2**24 - 4) 2**104`, four units under its largest: `a + 3 a 2**-24` rounds to the largest,
+where `a (1 + 3 2**-24)` rounds `1 + 3 2**-24` to `1 + 2**-22` first and passes it."""
+
+ROUNDED_FIRST = {
+    "distributivity": lambda a: a * 1.0 + a * (3 * 2.0 ** -24),
+    "a row scalar out of a sum": lambda a: jnp.sum(a[:, None] * jnp.asarray([1.0, 3 * 2.0 ** -24]), axis=-1),
+    "a row scale out of a product": lambda a: jnp.dot(
+        jnp.asarray([[1.0, 3 * 2.0 ** -24]] * 2) * a[:, None], jnp.ones((2, 1))),
+}
+"""Programs of an unbounded operand `a` a reordering factors out of terms whose sum it rounds first: each
+finite at `a = TOP`, where the factored product (`a` times the rounded sum) passes float32's largest."""
+
+
+@pytest.mark.parametrize("name", list(ROUNDED_FIRST))
+def test_a_factored_product_is_finite_wherever_the_program_is(name):
+    """A product a rule factors out of a sum, `a (x + y)` for `a x + a y` (and a scale out of a sum or a
+    product), rounds the sum before the product: at `TOP` the program is finite and its factored form is
+    not. The rules bound the product they make (`rules.dominated` of it, under the reach), so over an
+    unbounded `a` none fires, and the rewritten program is finite wherever the program is (§6.3)."""
+    program = ROUNDED_FIRST[name]
+    operand = jnp.full((2,), TOP, jnp.float32)
+    assert np.all(np.isfinite(program(operand)))
+    closed = jax.make_jaxpr(algebra.rewritten(program))(operand)
+    assert np.all(np.isfinite(jax.core.eval_jaxpr(closed.jaxpr, closed.consts, operand)[0]))
+
+
 def cos_at(values) -> jax.Array:
     """Float32 arguments whose `cos` is each of `values` exactly, as XLA computes it: the first of a fine
     grid of each, so a witness's precondition is a fact of the function itself."""

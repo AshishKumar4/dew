@@ -406,8 +406,8 @@ def _linear() -> tuple[RuleFamily, ...]:
     shape (the broadcast's extent along the axis the product's or 1, as an elementwise product broadcasts a
     unit axis), and a matrix product of an operand scaled along its kept axis (a dequant's row or column
     scale) as the product scaled: each reorders rounding, and each fires only where every intermediate it
-    makes is under a magnitude the program as written reaches (`dominated`, §6.3), each stating its own
-    (`made`)."""
+    makes, and the value it gives in the written one's place, is under a magnitude the program as written
+    reaches (`dominated`, §6.3), each stating its own (`made`)."""
     x, y, a, t = vars_("x y a t", Term)
     axes, extent = vars_("axes extent", Vec[i64])
     params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
@@ -431,12 +431,18 @@ def _linear() -> tuple[RuleFamily, ...]:
             (lambda x, y, a: jnp.dot(x, y.T) * 0.5, moved, _ROWS)))
     facts, power = summed_magnitude(magnitude(x, "x"), magnitude(y, "y"))
     new = x.binary("add", y, added)
+    # The factored product too: `a (x + y)` rounds `x + y` before the product, so it may pass the float's
+    # largest where `a x + a y` does not (float32's `a = (2**24 - 4) 2**104`, `x = 1`, `y = 3 2**-24`:
+    # `x + y` rounds to `1 + 2**-22`, and `a (1 + 2**-22)` overflows where the written sum rounds to the
+    # largest). Under the reach it is finite for every `a` its bound holds: `|a| 2**(max(x, y) + 1)`.
+    more, factored = product_magnitude(magnitude(a, "a"), ([], power), 0)
     families += [
         RuleFamily("distributivity", (rule(
             eq(t).to(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)),
             eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
-            *dominated(power, "new")).then(
-            union(t).with_(a.binary("mul", new, multiplied)), *made(new, power)),),
+            *dominated(power, "new"), *more, *dominated(factored, "factored")).then(
+            union(t).with_(a.binary("mul", new, multiplied)), *made(new, power),
+            *made(a.binary("mul", new, multiplied), factored)),),
             (lambda x, y, a: a * x + a * y, lambda x, y, a: a * (x + y), _ROWS)),
     ]
     # A shared operand factored out of two contractions (`shared_factored`), each product in its operands'
@@ -455,12 +461,16 @@ def _linear() -> tuple[RuleFamily, ...]:
     facts, power = magnitude(x, "x")
     length = var("length", i64)
     sum_of = x.reduce("sum", axes, summed)
+    # The scaled sum too, which rounds the sum before its product (distributivity's).
+    more, scaled = product_magnitude(magnitude(a, "a"), ([], power + length), 0)
     families.append(RuleFamily("a row scalar out of a sum", (rule(
         eq(t).to(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied).reduce("sum", axes, summed)),
         along(laid, axis), plain(multiplied), eq(axes).to(Vec[i64](axis)), eq(shape(x)).to(extent),
         eq(shape(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied))).to(extent),
-        eq(length).to(log2_of(extent[axis])), *facts, *dominated(power + length, "new")).then(
-        union(t).with_(a.binary("mul", sum_of, multiplied)), *made(sum_of, power + length)),),
+        eq(length).to(log2_of(extent[axis])), *facts, *dominated(power + length, "new"), *more,
+        *dominated(scaled, "scaled")).then(
+        union(t).with_(a.binary("mul", sum_of, multiplied)), *made(sum_of, power + length),
+        *made(a.binary("mul", sum_of, multiplied), scaled)),),
         (lambda x, s: jnp.sum(s[:, None] * x, -1), lambda x, s: s * jnp.sum(x, -1), _SCALED)))
     return (*families, *_extrema(), *_scale_lifts())
 
@@ -507,6 +517,8 @@ def _scale_lifts() -> tuple[RuleFamily, ...]:
     contracted = (eq(left).to(shape(x)), eq(length2).to(log2_of(left[i64(1)]) + mode_power(params)))
     facts, power = product_magnitude(magnitude(x, "x"), magnitude(y, "y"), length2)
     product = x.dot(y, params)
+    # The scaled product too, which rounds the product before its scale (distributivity's).
+    more, scaled_power = product_magnitude(magnitude(s, "s"), ([], power), 0)
     lifted_by: dict[str, list] = {"row": [], "column": []}
     for scaled, laid_axis, lift_axis, lift in (
             (lambda: x.binary("mul", s.shaped("broadcast_in_dim", laid), multiplied).dot(y, params), 1, 0,
@@ -521,7 +533,7 @@ def _scale_lifts() -> tuple[RuleFamily, ...]:
             eq(t).to(scaled()), matrix_product(params), plain(multiplied), matrix(x), matrix(y),
             along(laid, i64(laid_axis)), eq(product_extent).to(shape(t)),
             eq(lift).to(lifted(product_extent, i64(lift_axis))),
-            *contracted, *facts, *dominated(power, "new")).then(
+            *contracted, *facts, *dominated(power, "new"), *more, *dominated(scaled_power, "scaled")).then(
             union(t).with_(s.shaped("broadcast_in_dim", lift).binary("mul", product, multiplied)),
             # The lifted broadcast lays the scale over the product's extent: its shape, so it is priced.
             set_(shape(s.shaped("broadcast_in_dim", lift))).to(product_extent),

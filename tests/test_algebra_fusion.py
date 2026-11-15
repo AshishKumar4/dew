@@ -730,6 +730,28 @@ def test_a_plain_programs_norms_run_the_kernel_dews_own_call_takes(form):
                         lambda *x: program(*(a.astype(jnp.float64) for a in x))))
 
 
+def checkpointed_swiglu(a, b):
+    """A SwiGLU whose sigmoid of the fp32-widened gate alone is checkpointed (`jax.checkpoint`): what the
+    derivative saves is the user's choice at that boundary."""
+    widened = a.astype(_wide(a))
+    return (widened * jax.checkpoint(jax.nn.sigmoid)(widened)).astype(a.dtype) * b
+
+
+def test_a_norm_or_swiglu_region_never_crosses_a_checkpoint():
+    """A SwiGLU written around a checkpointed sigmoid (`checkpointed_swiglu`) is no SwiGLU region on an
+    H100 (`recognize.recognized`): a call written across the checkpoint would remove the boundary the
+    program states, changing what its derivative saves (§6.2), so the checkpoint stays where it was."""
+    from jax.extend.core import primitives
+
+    from dew.algebra import fusion, recognize
+
+    shapes = [jax.ShapeDtypeStruct(ROWS, jnp.bfloat16)] * 2
+    closed = jax.make_jaxpr(checkpointed_swiglu)(*shapes)
+    assert any(equation.primitive is primitives.remat_p for equation in closed.jaxpr.eqns)
+    with generation.assumed("sm90"):
+        assert not recognize.recognized(closed, fusion.Index(closed), recognize.NORMS)
+
+
 def _rows_inverse(x):
     """Each row's inverse root mean square, fp32 `[rows]`, the feature axis reduced."""
     widened = x.astype(_wide(x))
