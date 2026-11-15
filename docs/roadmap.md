@@ -9,6 +9,7 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Kernels and performance
 
 - A launch's call and its gradient's product shared one digest. [6780]
+- Dew's jaxlib 0.12.0.1.post99 crashed CPU processes by SIGFPE. [6829]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -97,7 +98,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Spec alignment 2026-11-15 §3 (algebra.md §6.1:425 context is every derivation's key. [6673]
 - Bit-level synthesis in dew.algebra. [3733]
 - Py `_holds_regions`: 'any other holder of a program. [6578]
-- Spec alignment 2026-11-15 §4 (algebra.md §6.9:953-961). [6674]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
