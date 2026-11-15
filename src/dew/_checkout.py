@@ -1,6 +1,9 @@
 """The Dew checkout a process runs from, as its records name it: its git revision, and whether it is
-clean. An installed Dew is no checkout."""
+clean, each read once a process (two git commands a read were 13% of a small fit, every record reading
+them again): the checkout as the process found it, whose code it imported. An installed Dew is no
+checkout."""
 
+import functools
 import subprocess
 from pathlib import Path
 
@@ -13,11 +16,13 @@ def checked_out() -> bool:
     return (ROOT / ".git").exists()
 
 
+@functools.cache
 def revision() -> str | None:
     """The checkout's commit, or None for an installed Dew. Raises where git cannot read it."""
     return _git("rev-parse", "HEAD") if checked_out() else None
 
 
+@functools.cache
 def clean() -> bool:
     """Whether the checkout changes no tracked file and adds no file to Dew's own source (`src/dew`);
     an installed Dew is clean. Raises where git cannot read it."""
