@@ -922,6 +922,24 @@ def test_two_launches_whose_padded_shapes_meet_name_their_own_kernels():
     assert len(launches) == 2 and None not in launches and len(set(launches)) == 2
 
 
+def test_a_gemms_output_states_its_rows_and_width_as_its_operands_axes():
+    """A dense GEMM lowered for an H100 on any host states its output's dimensions on its call
+    (`outputs.OUTPUT_DIMS`): its rows its rows operand's first axis, its width its matrix's last, which a
+    compile's live buffers read back to the step's tokens and the layer's width."""
+    import json
+
+    from dew.nn.kernels.lowered import kernel_calls
+
+    x = jax.ShapeDtypeStruct((4096, 256), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((256, 512), jnp.bfloat16)
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        lowered = jax.jit(lambda a, b: gemm.gemm(a, b, None, out_dtype=jnp.bfloat16)).trace(x, w).lower(
+            lowering_platforms=("cuda",))
+    (call,) = [call for call in kernel_calls(lowered) if call.name.startswith("dew_gmm")]
+    ((rows, width),) = json.loads(call.output_dims)
+    assert rows == [[0, 0]] and [operand for operand, _ in width] == [1], call.output_dims
+
+
 @pytest.mark.parametrize("policy", ["fp32_result_dot_general", "head_dot_general"])
 def test_a_head_keeps_its_own_products_fp32_result(policy):
     """A bf16 projection whose product states a policy of its own, a DiT's prediction head
