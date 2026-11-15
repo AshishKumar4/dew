@@ -271,24 +271,48 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
     return jnp.moveaxis(out, 0, 1), state
 
 
-def against_the_portable_math(dew_fn, portable_fn, draw, truth_fn, seeds: int) -> str:
+def release(hooks: recurrence.Hooks) -> str | None:
+    """The upstream library a form's family has a release of, whose own code is its oracle (testing.md): fla's
+    for the delta rule, mamba_ssm's for the rated scan; None for a write gate without the delta rule, whose
+    oracle is the recurrence a token at a time (`token_by_token`)."""
+    return "fla" if hooks.delta else "mamba_ssm" if hooks.rated else None
+
+
+def oracle(hooks: recurrence.Hooks, dtype) -> str | None:
+    """A cell's independent oracle at `dtype` (testing.md): its form's release (`release`) where the run's
+    declaration admits that release's products for the dtype (`recurrence_chunk.upstream_precision`: fp32's
+    TF32 at no more than the default), else None, the recurrence a token at a time: no run of the release
+    computes the call's numbers there."""
+    found = release(hooks)
+    return found if found is not None and recurrence_chunk.upstream_precision(dtype) else None
+
+
+def against_the_portable_math(label: str, dew_fn, portable_fn, draw, truth_fn, seeds: int) -> str | None:
     """`dew_fn`'s distance from float64 against Dew's own chunk math's (`portable_fn`, the portable math),
     each leaf's pooled RMS ratio over the first `seeds` draws (`draw(seed)`, `truth_fn` the float64 truth on
     them): reported beside a cell's verdict, never judged (testing.md: Dew's own chunk math is no cell's
-    reference)."""
-    arms = {"dew": jax.jit(dew_fn), "portable": jax.jit(portable_fn)}
-    errors: dict[str, dict[str, list[float]]] = {}
-    for seed in range(seeds):
-        drawn = draw(seed)
-        with jax.enable_x64(new_val=True):
-            exact = truth_fn(*widened(drawn))
-        for arm, fn in arms.items():
-            for (path, leaf), true in zip(jax.tree_util.tree_flatten_with_path(fn(*drawn))[0],
-                                         jax.tree.leaves(exact), strict=True):
-                errors.setdefault(jax.tree_util.keystr(path), {}).setdefault(arm, []).append(
-                    float(np.mean((np.asarray(leaf, np.float64) - np.asarray(true, np.float64)) ** 2)))
-    return ", ".join(f"{name} {np.sqrt(sum(arms['dew']) / max(sum(arms['portable']), 1e-300)):.3g}"
-                     for name, arms in errors.items())
+    reference). Computed once a site (`map_judge.sharded`'s one unit): by the map task that holds it, the
+    judge reading it back, which draws nothing; None in every other map task."""
+    from map_judge import sharded
+
+    def distance(start: int, stop: int) -> str:
+        del start, stop
+        arms = {"dew": jax.jit(dew_fn), "portable": jax.jit(portable_fn)}
+        errors: dict[str, dict[str, list[float]]] = {}
+        for seed in range(seeds):
+            drawn = draw(seed)
+            with jax.enable_x64(new_val=True):
+                exact = truth_fn(*widened(drawn))
+            for arm, fn in arms.items():
+                for (path, leaf), true in zip(jax.tree_util.tree_flatten_with_path(fn(*drawn))[0],
+                                             jax.tree.leaves(exact), strict=True):
+                    errors.setdefault(jax.tree_util.keystr(path), {}).setdefault(arm, []).append(
+                        float(np.mean((np.asarray(leaf, np.float64) - np.asarray(true, np.float64)) ** 2)))
+        return ", ".join(f"{name} {np.sqrt(sum(arms['dew']) / max(sum(arms['portable']), 1e-300)):.3g}"
+                         for name, arms in errors.items())
+
+    found = sharded(f"{label}, against the portable math", distance, 1, upto=1)
+    return None if found is None else found[0]
 
 
 @pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
