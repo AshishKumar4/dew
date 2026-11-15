@@ -178,7 +178,7 @@ def test_narrow_rows_take_their_narrow_factor_and_wider_rows_row_factor():
         factor = NARROW_FACTORS.get(width, ROW_FACTOR)
         for worst, fails in ((0.99 * factor, False), (1.01 * factor, True)):
             # The draws hold each worst row by its log (`log_over`).
-            draws = _Draws(["leaf"], np.ones((8, 1)), np.ones((8, 1)),
+            draws = _Draws(["leaf"], np.zeros((8, 1)), np.zeros((8, 1)),
                            np.tile([[[np.log(worst), 0.0]]], (8, 1, 1)), [[NO_ZERO_ROWS]] * 8,
                            np.ones((8, 1), bool), (width,))
             over, _ = _judgement(draws, "leaf")
@@ -203,24 +203,25 @@ def test_a_worst_row_one_element_rules_takes_one_values_factor():
                  ((ruled, np.nan), True))
         for (mine, theirs), fails in cases:
             shares = np.tile([[[mine, theirs]]], (8, 1, 1))
-            draws = _Draws(["leaf"], np.ones((8, 1)), np.ones((8, 1)),
+            draws = _Draws(["leaf"], np.zeros((8, 1)), np.zeros((8, 1)),
                            np.tile([[[np.log(worst), 0.0]]], (8, 1, 1)), [[NO_ZERO_ROWS]] * 8,
                            np.ones((8, 1), bool), (width,), shares=shares)
             over, _ = _judgement(draws, "leaf")
             assert bool(over) == fails, (width, shares)
         # Joined from a chunk whose shares are all unknown (a map task's draws, a stage's), the factor is the
         # whole run's: the known chunk holds both maxima.
-        ruled_chunk = _Draws(["leaf"], np.ones((4, 1)), np.ones((4, 1)),
+        ruled_chunk = _Draws(["leaf"], np.zeros((4, 1)), np.zeros((4, 1)),
                              np.tile([[[np.log(worst), 0.0]]], (4, 1, 1)), [[NO_ZERO_ROWS]] * 4,
                              np.ones((4, 1), bool), (width,), shares=np.tile([[[ruled, ruled]]], (4, 1, 1)))
-        unknown = _Draws(["leaf"], np.ones((4, 1)), np.ones((4, 1)), np.full((4, 1, 2), -1.0),
+        unknown = _Draws(["leaf"], np.zeros((4, 1)), np.zeros((4, 1)), np.full((4, 1, 2), -1.0),
                          [[NO_ZERO_ROWS]] * 4, np.ones((4, 1), bool), (width,))
         for joined in (unknown.joined(ruled_chunk), ruled_chunk.joined(unknown)):
             assert joined.factor(0) == ruled_chunk.factor(0) == NARROW_FACTORS[1]
         # A site of stacked examples judges their paired worst rows at its width's factor whatever the shares:
         # Dew's rows ten times the reference's on every example fail, however one value rules each.
         tenfold = [[np.full(32, np.log(10.0))] for _ in range(8)]
-        draws = _Draws(["leaf"], np.ones((8, 1)), np.ones((8, 1)), np.zeros((8, 1, 2)), [[NO_ZERO_ROWS]] * 8,
+        draws = _Draws(["leaf"], np.zeros((8, 1)), np.zeros((8, 1)),
+                       np.zeros((8, 1, 2)), [[NO_ZERO_ROWS]] * 8,
                        np.ones((8, 1), bool), (width,), example_rows=tenfold,
                        shares=np.tile([[[ruled, ruled]]], (8, 1, 1)))
         assert _judgement(draws, "leaf")[0], width

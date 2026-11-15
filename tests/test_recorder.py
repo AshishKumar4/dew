@@ -90,3 +90,28 @@ def test_a_recording_resumed_from_what_an_interrupted_run_kept_makes_only_the_re
         before = len(evaluated)
         recorder.record_case("another site", draw, counted, summary=True, resumed_from=whole_kept)
     assert len(evaluated) - before == len(records)
+
+
+def test_a_recording_refuses_an_error_whose_square_float64_holds_as_zero():
+    """A summarized recording of a float64 reference 1e-200 off a truth of zero on every seed: each seed's
+    squared error is nonzero and below float64's least, which a recording keeping its value would read back
+    as exact, so the recorder refuses it (testing.md: a recording's limit); the same reference 1e-100 off
+    records its errors, none read as exact."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    def draw(seed):
+        # Values far under either offset, so each seed's error is its offset to ten digits.
+        return {"x": np.full((4, 8), (1 + seed) * 1e-211)}
+
+    def off_by(offset):
+        def evaluate(inputs):
+            return {"y": inputs["x"] + offset}, {"y": inputs["x"]}
+        return evaluate
+
+    with jax.enable_x64(new_val=True):
+        with pytest.raises(ValueError):
+            recorder.record_case("far below", draw, off_by(1e-200), summary=True)
+        recorded = recorder.record_case("in range", draw, off_by(1e-100), summary=True)
+    assert np.all(recorded["in range.mse.y"] > 0)

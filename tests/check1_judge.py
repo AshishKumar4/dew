@@ -78,7 +78,8 @@ def _verdicts(drawn_for, verdict: Verdict, narrow_leaves: list[str], mode: Calla
     overs, unresolveds, seeds = [], [], verdict.seeds
     for index, named in enumerate(verdict.labels):
         over, unresolved, stage = _staged(drawn_for(index), seeds, named)
-        exact = None if verdict.library and not index else not np.any(drawn_for(index)(0, seeds).theirs)
+        exact = (None if verdict.library and not index
+                 else not np.any(drawn_for(index)(0, seeds).theirs > -np.inf))
         _logged(named, stage, _verdict(over, unresolved), narrow_leaves, mode(), exact)
         overs += over
         unresolveds += unresolved
