@@ -1229,3 +1229,20 @@ def test_a_call_whose_visibility_spans_express_holds_no_dense_mask(differentiate
         return analysis.temp_size_in_bytes
 
     assert temporaries(4096) <= 3 * temporaries(2048)
+
+
+@pytest.mark.parametrize("implementation", ["template", "reference"])
+def test_a_call_whose_queries_hold_no_key_runs_attends_to_no_key(implementation):
+    """`key_runs` of no run a query (`[B, Q, 0, 2]`, a selection of nothing) is one empty run, no key, on
+    every path (`template.spans`): its output and its query's, key's and value's gradients exactly zero."""
+    streams = jax.random.split(jax.random.key(0), 4)
+    query, key, value, dout = (jax.random.normal(stream, (2, 8, 2, 16), jnp.float32) for stream in streams)
+    runs = jnp.zeros((2, 8, 0, 2), jnp.int32)
+
+    def attended(query, key, value):
+        return attention.scaled_dot_product_attention(query, key, value, causal=True, key_runs=runs,
+                                                      implementation=implementation)
+
+    out, pullback = jax.vjp(attended, query, key, value)
+    for found in (out, *pullback(dout)):
+        np.testing.assert_array_equal(np.asarray(found), np.zeros(found.shape, np.float32))
