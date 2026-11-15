@@ -908,6 +908,6 @@ def a_256_pixel_diffusion_run_trains_saves_resumes_and_draws(tmp_path):
     losses = [values["train/loss"] for _, values in LocalTracker(run / "tracking").scalars()
               if "train/loss" in values]
     assert len(losses) >= 4 and np.all(np.isfinite(losses)), losses
-    drawn = np.asarray(TextToImage.from_run(str(run))(None, key=0).host().images)
+    drawn = np.asarray(TextToImage.from_run(str(run))([""], key=0).host().images)
     assert drawn.shape[-3:] == (256, 256, 3) and np.all(np.isfinite(drawn))
 
