@@ -64,12 +64,11 @@ class Scaled:
         return {**row, "id": row["id"] * self.factor}
 
 
-def taken(count: int = 20, factor: int = 2, read: str = "streamed", resume: str = "relaxed"):
-    """40 ids shuffled through a configured step (`Scaled`), taken to `count` records, in batches of two,
-    resumed as `resume` says."""
+def taken(count: int = 20, factor: int = 2, read: str = "streamed"):
+    """40 ids shuffled through a configured step (`Scaled`), taken to `count` records, in batches of two."""
     rows = Memory({"id": np.arange(1, 41, dtype=np.int32)}, shard_rows=4)
     chain = Pipeline(rows).shuffle(seed=3, window=8).map(Scaled(factor)).repeat().take(count).batch(2)
-    return compile(chain, read=read, loading=READ, resume=resume)
+    return compile(chain, read=read, loading=READ)
 
 
 def named(name: str, tag: int) -> Pipeline:

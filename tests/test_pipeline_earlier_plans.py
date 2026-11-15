@@ -238,7 +238,12 @@ def test_a_position_saved_before_reached_code_is_refused_exact_and_read_on_relax
 
     loader, steps = saved_positions_support.SAVED["taken"]
     saved = (SAVED_BEFORE_REACHED / "taken.position").read_bytes()
-    exact = saved_positions_support.taken(resume="exact").train(DataPartition())
+    # The same chain, compiled to resume exactly (`compile` resumes relaxed by default); the support module,
+    # whose file a step's identity holds, unchanged.
+    rows = Memory({"id": np.arange(1, 41, dtype=np.int32)}, shard_rows=4)
+    chain = Pipeline(rows).shuffle(seed=3, window=8).map(saved_positions_support.Scaled(2)).repeat()
+    exact = compile(chain.take(20).batch(2), read="streamed", loading=saved_positions_support.READ,
+                    resume="exact").train(DataPartition())
     try:
         with pytest.raises(PlanChanged) as refused:
             exact.set_state(saved)
