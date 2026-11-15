@@ -542,6 +542,116 @@ def the_gpu_divides_fp32_to_the_nearest_float():
     np.testing.assert_array_equal(quotient, nearest)
 
 
+def division_edges() -> tuple[np.ndarray, np.ndarray]:
+    """Float32 numerators and denominators at division's edges: normal operands of every exponent, whose
+    quotients overflow, fall to the subnormal grid or below it; powers of two; the largest and least normal
+    floats; quotients on a midpoint of the normal grid and of the subnormal grid and their neighbours; and
+    zero, subnormal, infinite and NaN operands."""
+    rng = np.random.default_rng(6312)
+    width = 1 << 16
+
+    def normal(count, low=-126, high=127):
+        signs = np.where(rng.random(count) < 0.5, -1, 1)
+        scaled = np.ldexp(rng.uniform(1, 2, count), rng.integers(low, high + 1, count))
+        return (signs * scaled).astype(np.float32)
+
+    pairs = [(normal(width), normal(width))]
+    # Quotients near the bottom of the range: a small numerator over a large denominator.
+    pairs.append((normal(width, -126, -100), normal(width, 0, 30)))
+    powers = np.ldexp(np.float32(1), rng.integers(-126, 128, (2, width))).astype(np.float32)
+    pairs.append((powers[0], powers[1]))
+    pairs.append((powers[0], normal(width)))
+    extreme = np.array([np.finfo(np.float32).max, np.finfo(np.float32).tiny], np.float32)
+    pairs.append((np.repeat(extreme, width // 2), normal(width)))
+    pairs.append((normal(width), np.repeat(extreme, width // 2)))
+    # Normal quotients on a midpoint and beside it.
+    denominator = rng.uniform(1, 2, width // 4).astype(np.float32)
+    quotient = rng.uniform(-16, 16, denominator.shape).astype(np.float32)
+    midpoint = (quotient.astype(np.float64)
+                + np.nextafter(quotient, np.float32(np.inf)).astype(np.float64)) * 0.5
+    numerator = (midpoint * denominator.astype(np.float64)).astype(np.float32)
+    pairs.extend((numerator if step is None else np.nextafter(numerator, np.float32(step)), denominator)
+                 for step in (-np.inf, None, np.inf))
+    # Subnormal quotients on a midpoint of the subnormal grid, exactly: an odd multiple of 2^-150 times a
+    # denominator of three times a power of two, a normal numerator, and beside it.
+    odd = 2 * rng.integers(1 << 18, 1 << 19, width // 4) + 1
+    exponent = rng.integers(155, 175, width // 4)
+    small = np.ldexp(3.0, exponent - 150).astype(np.float32)
+    exact = np.ldexp(odd * 3.0, exponent - 300).astype(np.float32)
+    pairs.extend((exact if step is None else np.nextafter(exact, np.float32(step)), small)
+                 for step in (-np.inf, None, np.inf))
+    specials = np.array([0.0, -0.0, np.float32(1e-40), -np.float32(1e-40), np.inf, -np.inf, np.nan, 1.5,
+                         -3.0], np.float32)
+    grid = np.meshgrid(specials, specials)
+    pairs.append((grid[0].ravel(), grid[1].ravel()))
+    return (np.concatenate([numerator for numerator, _ in pairs]),
+            np.concatenate([denominator for _, denominator in pairs]))
+
+
+def divides_as_ieee_division_at_its_edges():
+    """`correctly_rounded_divide` over `division_edges`, compiled for this backend: each quotient of normal
+    operands IEEE division's, bit for bit (NumPy's float64 quotient rounded once to float32, which rounds as
+    once: 53 >= 2 x 24 + 2), its overflows infinite and its subnormal quotients on their grid, ties to even,
+    over divisors given as arrays and as constants (which the backend's division approximates); and each
+    quotient of a zero, subnormal, infinite or NaN operand the backend's own division."""
+    from dew.nn.precision import correctly_rounded_divide
+
+    numerator, denominator = division_edges()
+    normal = (np.abs(numerator) >= np.finfo(np.float32).tiny) & np.isfinite(numerator) & (
+        np.abs(denominator) >= np.finfo(np.float32).tiny) & np.isfinite(denominator)
+    actual = np.asarray(jax.jit(correctly_rounded_divide)(numerator, denominator))
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore", under="ignore"):
+        expected = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
+    np.testing.assert_array_equal(actual[normal].view(np.uint32), expected[normal].view(np.uint32))
+    plain = np.asarray(jax.jit(jnp.divide)(numerator[~normal], denominator[~normal]))
+    np.testing.assert_array_equal(actual[~normal], plain)
+    # A constant divisor, which XLA takes as a product by its rounded reciprocal (on a CPU and a GPU alike),
+    # so the first quotient is off and the correction and the last move decide: the edges' normal numerators
+    # over divisors just below a power of two, odd ones and the ones the callers divide by.
+    held = numerator[(np.abs(numerator) >= np.finfo(np.float32).tiny) & np.isfinite(numerator)]
+    for bits in (0x3FFFFFFF, 0x3F7FFFFF, 0x40400000, 0x42FE0000, 0x43E00000, 0x3F400000, 0x7F000000,
+                 0x00800000):
+        divisor = np.array(bits, np.uint32).view(np.float32)
+        divide = jax.jit(lambda values, divisor=divisor: correctly_rounded_divide(values, divisor))
+        quotient = np.asarray(divide(held))
+        with np.errstate(over="ignore", under="ignore"):
+            wanted = (held.astype(np.float64) / np.float64(divisor)).astype(np.float32)
+        np.testing.assert_array_equal(quotient.view(np.uint32), wanted.view(np.uint32), err_msg=hex(bits))
+
+
+APPROXIMATE = "--xla_backend_extra_options=-nvptx-prec-divf32=1"
+"""XLA:GPU's own fp32 division, approximate (`div.full`), which a run naming its backend options keeps
+(`dew._devices.divide_exactly`)."""
+
+
+def divides_as_ieee_division_on_an_approximate_divider():
+    """`divides_as_ieee_division_at_its_edges` in a process whose GPU divides fp32 approximately
+    (`APPROXIMATE`), so each first quotient is off and the correction and its last move decide every
+    result: there its plain division is off IEEE's somewhere, which the check would otherwise not show."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    flags = " ".join(filter(None, (os.environ.get("XLA_FLAGS"), APPROXIMATE)))
+    program = (
+        "import sys; sys.path.insert(0, sys.argv[1]); import jax, jax.numpy as jnp, numpy as np\n"
+        "import test_precision_policy as checks\n"
+        "rng = np.random.default_rng(0)\n"
+        "n, d = (rng.uniform(1e-4, 10, 1 << 20).astype(np.float32) for _ in range(2))\n"
+        "plain = np.asarray(jax.jit(jnp.divide)(n, d))\n"
+        "nearest = (n.astype(np.float64) / d.astype(np.float64)).astype(np.float32)\n"
+        "assert (plain != nearest).any(), 'this process divides as IEEE does'\n"
+        "checks.divides_as_ieee_division_at_its_edges()\n")
+    subprocess.run([sys.executable, "-c", program, str(Path(__file__).parent)],
+                   env={**os.environ, "XLA_FLAGS": flags}, check=True)
+
+
+def test_a_correctly_rounded_division_is_ieee_divisions_at_its_edges():
+    """On this CPU (`divides_as_ieee_division_at_its_edges`); the GPU tiers hold it there."""
+    divides_as_ieee_division_at_its_edges()
+
+
 def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
     from dew.nn.precision import correctly_rounded_divide
 

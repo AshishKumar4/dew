@@ -2162,12 +2162,20 @@ def test_a_tile_states_a_schedule_the_kernels_run():
 
 
 @runs("sm90")
-@pytest.mark.parametrize("sizes", [None, (0, 70, 1, 129, 100, 0)], ids=["dense", "grouped"])
+@pytest.mark.parametrize("sizes", [None, (0, 70, 1, 129, 100, 0), "gathered"],
+                         ids=["dense", "grouped", "gathered"])
 def test_a_kernel_gradient_on_a_multicast_cluster_holds_check_1(sizes):
     """The kernel gradient on a pair of Hopper multiprocessors a cluster (`PAIRED`), each its own depth tile
     of the pair's 256 rows, the cotangent's blocks they read alike loaded once between them (multicast, as
     the forward's matrix and cuBLAS's 2 x 1 cluster on the 4B's up dW), interpreted: on par with the plain
-    kernel gradient from float64 truth (check 1), where the kernel gradient refused a cluster."""
+    kernel gradient from float64 truth (check 1), where the kernel gradient refused a cluster; and with its
+    rows and cotangent read through gather tables (a MoE's routed rows), each program gathering its own
+    half of the pair's rows, where both gathered the pair's first block."""
+    gathered = sizes == "gathered"
+    sizes = (0, 70, 1, 129, 100, 0) if gathered else sizes
+    order = np.random.default_rng(3).permutation(ROWS).astype(np.int32)
+    gather = (jnp.asarray(order), jnp.asarray(order[::-1].copy())) if gathered else None
+
     def draw(seed):
         rng = np.random.default_rng(seed + 4)
         return (jnp.asarray(rng.normal(size=(ROWS, 256)), jnp.bfloat16),
@@ -2177,9 +2185,11 @@ def test_a_kernel_gradient_on_a_multicast_cluster_holds_check_1(sizes):
         with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
                 {grouped_matmul.MosaicTgmm: PAIRED}):
             return gemm.gemm_t(x, dy, None if sizes is None else jnp.asarray(sizes), out_dtype=jnp.float32,
-                               interpret_on_cpu=True)
+                               interpret_on_cpu=True, gather=gather)
 
     def plain(x, dy, wide=jnp.float32):
+        if gathered:
+            x, dy = x[gather[0]], dy[gather[1]]
         return _kernel_gradient(x.astype(wide), dy.astype(wide), sizes)
 
     assert_as_exact(dew, jax.jit(plain), draw, "a kernel gradient on a multicast cluster", seeds=SEEDS,

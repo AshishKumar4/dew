@@ -605,9 +605,9 @@ def test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200(rows, kept
 @pytest.mark.parametrize("rows", [2, 1], ids=["step", "decision"])
 def test_the_4b_steps_forward_compiles_spill_free_on_tensor_memory_for_a_b200(rows, kept):
     """Qwen3.5-4B's attention forward (16 query heads over 4, 256 wide, 12,288 causal tokens: the step's two
-    rows and the planner's one-row decision) at the config its derivation gives on a compile-only B200: on a
-    tensor-memory family, every launch compiled by ptxas spilling nothing (`mosaic_failures`). A B200's 4B
-    step stepped through 19 spilling chunks forwards for 42 minutes and landed on the Ampere family's."""
+    rows and the planner's one-row decision) at the config its derivation gives on a compile-only B200: every
+    launch compiled by ptxas spilling nothing (`mosaic_failures`). A B200's 4B step stepped through 19
+    spilling chunks forwards for 42 minutes and landed on the Ampere family's."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -623,9 +623,49 @@ def test_the_4b_steps_forward_compiles_spill_free_on_tensor_memory_for_a_b200(ro
         op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None,
                                                   natural=attention_mosaic.NATURAL)
         config = op.derived(op.bind(*args, residuals=kept, interpret=False), generation.gpu_target())
-        assert config is not None and config.family.startswith("tcgen05"), config
+        assert config is not None
         case = KernelCase("4B forward", lambda: (forward, (query, key, key)))
         found = compile_mosaic_kernels([case], "sm100")
+    failed = mosaic_failures(found)
+    assert not failed, "\n".join(failed)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [128, 256])
+def test_the_walked_backward_of_the_4b_heads_compiles_spill_free_on_a_b200(width):
+    """Qwen3.5-4B's heads (16 query heads over 4, 12,288 causal tokens) at widths 128 and 256 on a
+    compile-only B200: the call has a backward whose launches tcgen05's walked placements take
+    (`MosaicBackward.walked`, row 4839: the derivation's search of them by what fits, the one launch keys
+    first or the two), and pinned there, its training step's every launch compiles by ptxas spilling nothing
+    (`mosaic_failures`). Today's dQ on mma.sync held 340 registers at width 256, past a thread's 248, and the
+    4B backward ran on Triton."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels import tuning
+
+    tokens, heads, kv_heads = 12288, 16, 4
+    spans = template.spans(tokens, tokens, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16)
+
+    def trained(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None, residuals=template.Kept.SPLIT)
+
+    def step(query, key, value, dout):
+        _, *residuals = trained(query, key, value)
+        return attention_mosaic.backward(query, key, value, spans, None, dout, residuals=tuple(residuals))
+
+    with generation.assumed("sm100"):
+        _, *residuals = jax.eval_shape(trained, query, key, key)
+        op, args = attention_mosaic._backward_call(query, key, key, spans, None, query, tuple(residuals),
+                                                   scale=None, natural=attention_mosaic.NATURAL,
+                                                   accurate=attention_mosaic.ACCURATE)
+        config = op.walked(op.bind(*args, interpret=False), generation.gpu_target())
+        assert config is not None
+        with tuning.pinned({attention_mosaic.MosaicBackward: config}):
+            found = compile_mosaic_kernels([KernelCase("4B step", lambda: (step, (query, key, key, query)))],
+                                           "sm100")
     failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 

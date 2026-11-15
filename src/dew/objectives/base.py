@@ -926,10 +926,16 @@ class Objective(ABC, Generic[Loss, Effects]):
     any the data would give, or declares none."""
 
     ema: EMASpec | None = None
-    traced: ClassVar[tuple[str, ...] | None] = None
-    """The attributes beside its modules, held tree and EMA that its loss, draw and optimizer read, by
-    name, which its trace is kept by (`trace_key`); None where no value states them. A class states its
-    own: a subclass, whose loss may read more, inherits none (`stated_trace`)."""
+    untraced: ClassVar[Mapping[str, str]] = {
+        "parameter_axes": "a function of the modules its programs run (`program_key`), which the key holds",
+        "_drawn_axes": "its draw's boxes, a memo `init` writes: a function of the modules the key holds",
+        "_drawn_shapes": "its draw's shapes, a memo `init` writes: a function of the modules and the held "
+                         "tree the key holds",
+        "_program_cache": "the programs `program` made by name, a memo its first call writes: each traces "
+                          "the modules and settings the key holds"}
+    """The attributes its trace key leaves out (`trace_key`), by name, each with why: what in the key
+    carries it, or why no program its loss, draw or optimizer traces reads it. A class's own, beside its
+    bases'; an attribute no class names here enters the key."""
     saved_task: ClassVar[type[SavedTask] | None] = None
     settings: ClassVar[type[DataclassInstance] | None] = None
     """The dataclass of what a saved run records beside its objective and model
@@ -1116,14 +1122,41 @@ class Objective(ABC, Generic[Loss, Effects]):
         return 3 * self.model_flops(model, batch)
 
     def trace_key(self) -> Hashable | None:
-        """A value of everything this objective's loss and its draw read beside their arguments, equal for
-        two objectives whose losses trace alike, so a trace of one serves the other's equal fit, a refit or
-        a resume in the same process building it anew (`traced_update_flops`; row 3873): its `traced`
-        settings' values beside its modules, held tree and EMA (`traced_by`). None where its class states
-        none, or a value none of them (a closure, a constant a trace bakes in). A key reads the objective
-        as it is now, its modules and head as a fit's rung set them."""
-        names = vars(type(self)).get("traced")
-        return None if names is None else self.traced_by(*(getattr(self, name) for name in names))
+        """A value of everything this objective's loss, its draw and its optimizer read beside their
+        arguments, equal for two objectives whose losses trace alike, so a trace of one serves the other's
+        equal fit, a refit or a resume in the same process building it anew (`traced_update_flops`; row
+        3873). Complete by default: every attribute it holds, by its value (`frozen_value`), its cached
+        properties read into it and an objective it holds by that one's key (`stated_trace`), beside its
+        modules as its programs run them (`program_key`), its held tree's shapes and its EMA
+        (`traced_by`); all but what its classes leave out by name, each with its reason (`untraced`). A
+        setting no class names costs a trace where it differs, never another's program. None where a value
+        states none (an array, a closure, an object compared by identity, an objective stating none). A
+        key reads the objective as it is now, its modules and head as a fit's rung set them."""
+        left = {name for klass in type(self).__mro__ for name in vars(klass).get("untraced", {})}
+        cached = {name for klass in type(self).__mro__ for name, member in vars(klass).items()
+                  if isinstance(member, functools.cached_property)} - left
+        run = {id(entry.module) for entry in self.program_key()}
+        state = {name: getattr(self, name) for name in sorted(cached)}
+        state.update((name, value) for name, value in vars(self).items()
+                     if name not in left and name not in HELD and id(value) not in run
+                     and not self._classes(name, value))
+        # An objective it holds by that one's key, which is frozen already, beside its own state's.
+        held = {name: stated_trace(value) for name, value in state.items() if isinstance(value, Objective)}
+        if any(key is None for key in held.values()):
+            return None
+        own = self.traced_by({name: value for name, value in state.items() if name not in held})
+        return None if own is None else (own, tuple(sorted(held.items())))
+
+    def _classes(self, name: str, value: TracedSetting) -> bool:
+        """Whether `value`, held as `name`, is the value its class states of it (a fit's ladder setting the
+        class's default on the objective), which the key holds by its class (`traced_by`'s modules and the
+        caller's key, `stated_trace` by its class): so it keys alike held or not, and two classes of
+        another default each key by their own."""
+        stated = getattr(type(self), name, _ABSENT)
+        if stated is _ABSENT:
+            return False
+        held = frozen_value(value)
+        return held is not UNKEYED and held == frozen_value(stated)
 
     def traced_by(self, *settings: TracedSetting) -> Hashable | None:
         """A trace key (`trace_key`) of the objective's `settings` (`frozen_value`) beside what every
@@ -2067,11 +2100,18 @@ def held_shapes(tree) -> Hashable:
 
 
 def stated_trace[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> Hashable | None:
-    """`objective.trace_key()` where its own class states its settings (`Objective.traced`) or its key,
-    else None: a subclass reads what its own loss adds (a counter, a term), which a key it inherited does
-    not state."""
-    own = vars(type(objective))
-    return objective.trace_key() if "trace_key" in own or "traced" in own else None
+    """`objective.trace_key()` where Dew defines its class, else None: a class of a user's or another
+    library's may read in its loss what none of its attributes holds (a module's global, a closure's
+    cell), which no key states."""
+    return objective.trace_key() if type(objective).__module__.partition(".")[0] == "dew" else None
+
+
+_ABSENT = object()
+"""What a class states of a name it does not hold (`Objective._classes`)."""
+
+HELD = frozenset({"variables", "ema"})
+"""The attributes every objective's key states its own way (`Objective.traced_by`): the tree it starts
+from by its shapes (`held_variables`, whose arrays pass as arguments) and its EMA by its spec."""
 
 
 class _Unkeyed:

@@ -1255,7 +1255,7 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
                           scan_layers: bool = False,
                           packed_experts: bool = False,
                           step: int | str | None = None,
-                          ema: bool | None = None) -> PretrainedPipeline | RunPipeline:
+                          ema: bool | None = None, weights: bool = True) -> PretrainedPipeline | RunPipeline:
     """A published diffusion pipeline, to train from its own weights, or a saved Dew diffusion run
     (`RunPipeline`), its checkpoint at `step` with `ema` (`pinned_run`).
 
@@ -1282,6 +1282,9 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     pipeline has no wrapper's language model for `text_only` to take, its
     components hold no prediction depths, so any count keeps them all, and
     overrides, DEX, layer scanning and packed expert banks are refused.
+    `weights=False` reads a published pipeline's weights' shapes alone, from its files' headers, as
+    `Pretrained.load`'s does: a resumed run's start, which its checkpoint's restore fills. A saved run's
+    tree is restored either way, its task built over it (`pipeline_of_run`).
     A saved run is no published pipeline: Dew writes no diffusers layout of one, so it loads as the parts
     and policy of the task its run built (`pipeline_of_run`), which a `DiffusionObjective` trains as it
     trains a pipeline. A step or EMA choice beside a pipeline is refused, as it selects nothing.
@@ -1310,12 +1313,14 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
         sources.SourceReference(checkpoint, None if os.path.isdir(checkpoint) else directory.name),
         directory, None, None,
         lambda values: place(values, mesh, layout) if streaming else values, dtype=dtype,
-        attention_impl=attention_impl, param_dtype=param_dtype, streaming=streaming, size=size,
-        variables=variables, text=text)
+        attention_impl=attention_impl, param_dtype=param_dtype, streaming=streaming or not weights, size=size,
+        variables=variables, text=text, weights=weights)
     if loaded is None:
         raise ValueError(f"{checkpoint} is not a diffusion pipeline: it has no model_index.json, or its "
                          "config.json names the model it is")
-    return _published(loaded, checkpoint, selected=False)
+    # Without its weights, their shapes alone, as `Pretrained.load`'s (`_resident`).
+    return _published(loaded if weights else _resident(loaded, weights=False, streaming=False, on_host=False),
+                      checkpoint, selected=False)
 
 
 def _published[K: Pretrained](loaded: K, name_or_dir: str | Path, *, selected: bool) -> K:

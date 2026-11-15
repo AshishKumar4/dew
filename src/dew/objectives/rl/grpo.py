@@ -329,13 +329,6 @@ class GRPOObjective(TokenScorer):
         return _Terms(policy, old, behavior, advantages, mask, segments, kept_weights, proximal, qk, sown,
                       inspected)
 
-    traced = ("seq_len", "balance", "head_chunks", "head_tile", "head_fused", "aggregation_tokens",
-              "kl_term", "reward_kl", "beta", "epsilon_low", "epsilon_high", "dual_clip",
-              "behavior_importance", "sequence_mask", "geometric_mask", "policy_loss", "aggregation",
-              "sampling_temperature")
-    """Its window, balance, head policy and every setting its policy loss reads; its reference is the
-    step's EMA, an argument."""
-
     def loss(self, variables, batch, step):
         """Compute the policy surrogate over the trainable tokens, plus the KL to the reference.
 

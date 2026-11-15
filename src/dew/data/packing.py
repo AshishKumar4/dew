@@ -77,20 +77,26 @@ _FIELDS = ("documents", "offsets", "sizes", "order", "starts", "targets", "accep
 position's order fingerprints."""
 
 
-def plan_windows(lengths: np.ndarray, pack: Pack, overlap: int = 0) -> Mapping[str, np.ndarray]:
+def plan_windows(lengths: np.ndarray, pack: Pack, overlap: int | None = 0) -> Mapping[str, np.ndarray]:
     """The first-fit plan of documents of `lengths` into `pack.seq_len`-token
     windows, a document longer than a window cut into window-long pieces
     `overlap` tokens apart: each chunk's document, offset and size, the chunks
     in packing order and where each window starts in it, each window's
     targets, and the windows that hold one (`accepted`), with their total and
-    the count left out."""
+    the count left out. With `overlap` None no chunk step cuts them: each document is one entry, an
+    empty one too, as a stream of them places it (`FirstFitPacked`), counted against the windows'
+    segments (row 6277)."""
     if pack.policy != "first-fit":
         raise ValueError("indexed packing currently needs policy='first-fit'")
     if pack.along:
         raise ValueError("a plan of document lengths packs tokens alone; fields along other axes "
                          "pack as their rows arrive")
-    chunk_sizes = chunk_lengths(lengths, pack.seq_len, overlap)
-    documents, offsets = chunk_table(lengths, pack.seq_len, overlap)
+    if overlap is None:
+        chunk_sizes = np.asarray(lengths, np.int64)
+        documents, offsets = np.arange(len(chunk_sizes), dtype=np.int64), np.zeros(len(chunk_sizes), np.int64)
+    else:
+        chunk_sizes = chunk_lengths(lengths, pack.seq_len, overlap)
+        documents, offsets = chunk_table(lengths, pack.seq_len, overlap)
     order, starts = first_fit(chunk_sizes, pack.seq_len, pack.bins, pack.segments)
     targets = np.asarray(
         [
@@ -313,7 +319,7 @@ class PackingPlan:
         if lengths is None:
             raise ValueError("published packing needs certified per-document lengths")
         refuse_overlong(lengths, self.pack, generation.url)
-        planned = plan_windows(lengths, self.pack)
+        planned = plan_windows(lengths, self.pack, None)
         return {plan_name(self.pack, field): value for field, value in planned.items()}
 
 
@@ -362,8 +368,9 @@ class _Held:
 
     source: Source
     pack: Pack
-    overlap: int = 0
-    """How many tokens the pieces of a cut document share (`Chunks.overlap`)."""
+    overlap: int | None = None
+    """How many tokens the pieces of a cut document share (`Chunks.overlap`); None where no chunk step cuts
+    them, each document placed whole, an empty one too (`plan_windows`)."""
     kind: ClassVar[str] = "planned"
 
     @functools.cached_property
@@ -458,7 +465,7 @@ class PackedSource(View[Source]):
         """`source` read by a plan of the lengths it states, cutting documents
         only where a chunk step before the pack says to, its pieces `overlap`
         tokens apart; with None no step does."""
-        plan = _Held(source, pack, 0 if overlap is None else overlap)
+        plan = _Held(source, pack, overlap)
         if overlap is None:
             plan.refuse_cuts()
         return cls(source, plan)

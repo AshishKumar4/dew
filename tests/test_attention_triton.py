@@ -203,17 +203,15 @@ def test_the_plain_forward_is_on_par_over_runs(form, config):
     check(RUN_CASES[form], HOOKS["none"], jnp.float32, config, mainloop="portable")
 
 
-def test_the_frozen_mainloop_refuses_runs():
-    """The Pallas-Triton mainloop walks one key interval a query: called on a call's runs, its forward and
-    backward refuse them before any launch rather than compute them as one interval (ledger 956)."""
-    queries, keys = core_geometry(RUN_CASES["runs"])
-    spans = template.spans(queries, keys, ROWS, **arguments(RUN_CASES["runs"]))
-    query = jnp.zeros((ROWS, queries, 2, 32), jnp.float32)
-    key = jnp.zeros((ROWS, keys, 1, 32), jnp.float32)
-    with pytest.raises(NotImplementedError):
-        attention_triton.forward(query, key, key, spans, interpret=True)
-    with pytest.raises(NotImplementedError):
-        attention_triton.backward(query, key, key, spans, None, query, interpret=True)
+@pytest.mark.parametrize("config", PINNED[:2], ids=str)
+@pytest.mark.parametrize("form", RUN_CASES)
+def test_the_frozen_mainloop_is_on_par_over_runs(form, config):
+    """Each query's runs (`test_attention_template.RUN_CASES`), a decision row's: the Pallas-Triton
+    mainloop walks each query block's runs' envelope (`attention.block_map`), each entry masked by its
+    runs (`within`), its forward and backward on par (check 1; row 4862, where an fp32 decision fine-tune's
+    runs fell to the plain-JAX mainloop)."""
+    check(RUN_CASES[form], HOOKS["none"], jnp.float32, config)
+    check_backward(RUN_CASES[form], (), jnp.float32, config)
 
 
 @pytest.mark.parametrize("config", PINNED[:2], ids=str)
@@ -233,10 +231,18 @@ def test_the_forward_is_on_par_under_every_hook(hooks, dtype, natural):
     check(CASES["causal-documents-window"], hooks, dtype, PINNED[1], residuals=True, natural=natural)
 
 
-@pytest.mark.parametrize("width, value_width", [(64, 64), (80, 48), (128, 128)])
-def test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two(width, value_width):
-    """Widths of a power of two and narrower ones that ride in zero-padded, values narrower than keys."""
-    check(CASES["causal"], HOOKS["none"], jnp.bfloat16, PINNED[0], width=width, value_width=value_width)
+HEAD_WIDTHS = [(32, 32), (64, 64), (80, 48), (128, 128), (192, 160)]
+"""The (query, value) head widths both mainloops' forwards are checked at (kernel-templates.md §A row 23's 32
+to 256): powers of two from the narrowest, and widths that ride in zero-padded to the next (80 and 48 to 128
+and 64, 192 and 160 to 256), values narrower than keys."""
+
+
+@pytest.mark.parametrize("mainloop", ["triton", "portable"])
+@pytest.mark.parametrize("width, value_width", HEAD_WIDTHS)
+def test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two(width, value_width, mainloop):
+    """The forward at each of `HEAD_WIDTHS`, on the Pallas-Triton mainloop and the plain-JAX one."""
+    check(CASES["causal"], HOOKS["none"], jnp.bfloat16, PINNED[0], width=width, value_width=value_width,
+          mainloop=mainloop)
 
 
 def every_config_on_a_gpu(case):
@@ -681,10 +687,13 @@ def test_the_backward_resumes_queries_that_read_no_key():
     check_backward({"causal": True, "starts": True}, SCORE_HOOKS["resumed"], jnp.float32, PINNED[0])
 
 
-@pytest.mark.parametrize("width, value_width", [(48, 24), (80, 48)])
-def test_the_backward_is_on_par_at_head_widths_padded_to_powers_of_two(width, value_width):
-    """Head widths that ride in zero-padded, values narrower than keys, bf16."""
-    check_backward(CASES["causal-window"], (), jnp.bfloat16, PINNED[0], width=width, value_width=value_width)
+@pytest.mark.parametrize("mainloop", ["triton", "portable"])
+@pytest.mark.parametrize("width, value_width", [(32, 32), (48, 24), (80, 48), (192, 160)])
+def test_the_backward_is_on_par_at_head_widths_padded_to_powers_of_two(width, value_width, mainloop):
+    """The backward from the narrowest heads to ones past 128 that ride in zero-padded, values narrower than
+    keys, bf16, on the Pallas-Triton mainloop and the plain-JAX one (kernel-templates.md §A row 23)."""
+    check_backward(CASES["causal-window"], (), jnp.bfloat16, PINNED[0], width=width, value_width=value_width,
+                   mainloop=mainloop)
 
 
 @pytest.mark.parametrize("case", IRREGULAR)
@@ -981,6 +990,37 @@ def test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler(tar
     assert len(found) == 2
     assert not failures(found), "\n".join(failures(found))
     assert all(record["shared"] > 0 for record in found), found
+
+
+@pytest.mark.parametrize("target", ["sm80", "sm90"])
+def test_a_calls_runs_lower_and_compile_on_tritons_compiler(target):
+    """A call's runs (`test_attention_template.RUN_CASES`' decision row's), fp32, its forward with residuals
+    and its backward, lowered as on the GPU and compiled by XLA's CUDA backend for a compile-only device on
+    this CPU (tests/kernel_compile.py): the interpreted suite lowers none, and each run's starts and ends
+    load from their own column (`_intervals`), as no Pallas Triton lowering slices a loaded value (row
+    4862)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_kernels, failures
+
+    queries, keys = core_geometry(RUN_CASES["runs"])
+    spans = template.spans(queries, keys, ROWS, **arguments(RUN_CASES["runs"]))
+    query = jax.ShapeDtypeStruct((ROWS, queries, 2, 32), jnp.float32)
+    key = jax.ShapeDtypeStruct((ROWS, keys, 1, 32), jnp.float32)
+    pins = {attention_triton.TritonForward: PINNED[0], attention_triton.TritonBackward: joint(PINNED[0])}
+
+    def forward(query, key, value):
+        with tuning.pinned(pins):
+            return attention_triton.forward(query, key, value, spans, residuals=True)
+
+    def backward(query, key, value, dout):
+        with tuning.pinned(pins):
+            grads = attention_triton.backward(query, key, value, spans, None, dout)
+        return grads.query, grads.key, grads.value
+
+    found = compile_kernels([KernelCase("forward", lambda: (forward, (query, key, key))),
+                             KernelCase("backward", lambda: (backward, (query, key, key, query)))], target)
+    assert len(found) == 2
+    assert not failures(found), "\n".join(failures(found))
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])

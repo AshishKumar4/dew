@@ -53,6 +53,7 @@ from ..inputs import (
     routing_blocks,
 )
 from ..kernels.recurrence_chunk import recomputing
+from ..kv_cache import CacheSpec, cache_of
 from ..mlp import GatedMLP
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP, resolved_dispatch
 from ..ngpt import NGPT, stepped
@@ -956,6 +957,17 @@ class DecoderBlock(nn.Module):
         """The packed groups its mixer and its feed-forward declare (`ProjectionSites`)."""
         return declared_groups(self.self_attn, *([self.mlp] if self.feedforward is not None else []))
 
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> CacheSpec:
+        """The layer's decode cache for `rows` rows, each holder's under its name (`cache_of`): its
+        mixer's, its engram's convolution's and its cross-attention's, a holder that keeps none left
+        out."""
+        holders = {'self_attn': self.self_attn,
+                   **({'engram': self.engram_layer} if self.engram is not None else {}),
+                   **({CROSS_ATTENTION: self.cross_attention} if self.cross is not None else {})}
+        held = {name: cache_of(holder, rows) for name, holder in holders.items()}
+        return {name: spec for name, spec in held.items() if spec}
+
     @overload
     def __call__(self, x: jax.Array, train: bool = False, decode: bool = False, kv_store=None,
                  per_layer_input=None, attention_metadata=None,
@@ -1466,6 +1478,12 @@ class MTPBlock(nn.Module):
                                      norm_eps=self.norm_eps, name='hc_head')
         self.block = self._decoder(name='block')
         self.final_norm = norm(name='final_norm')
+
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> CacheSpec:
+        """The depth's decode cache for `rows` rows: its block's, under the block's name."""
+        held = self.block.cache_spec(rows)
+        return {'block': held} if held else {}
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """The packed groups its block declares (`ProjectionSites`)."""

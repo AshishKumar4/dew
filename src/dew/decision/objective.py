@@ -4,7 +4,7 @@ import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -332,6 +332,10 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         if held is None or FROZEN not in held or "backbone" not in held[FROZEN]:
             return False
         return crosses_alone(held.get("params", {}).get("backbone", {}))
+
+    untraced: ClassVar[Mapping[str, str]] = {
+        "tokenizer": "it reaches a trace only as the windows its rows pack (`bounds`, of the cached "
+                     "`_shared_bounds`, which the key reads)"}
 
     def __init__(self, backbone: nn.Module | Source | Adapter | Decide, *,
                  loss: ScoringRule | None = None, tokenizer: Tokenizer | None = None,

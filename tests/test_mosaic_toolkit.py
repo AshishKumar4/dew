@@ -303,8 +303,9 @@ def test_a_schedules_roles_share_the_launch_pool_by_weight(weights, programs):
     needs=lambda family, architecture: architecture.multiprocessor.register_raises is not None))
 def test_a_launch_whose_producer_holds_more_lowers_it_to_its_own_floor_and_its_consumers_hold_the_rest(
         generation_name):
-    """A launch stating its producer's registers (a producer whose issue loop holds more than setmaxnreg's
-    least: the sm100 states launch's, 44 to 60 bytes spilled at 24) runs its schedule's producer at them,
+    """A launch whose producer lowers past setmaxnreg's least (its derivation's raise of one that spilled
+    there, `resources.Producers`: the sm100 states launch's, 44 to 60 bytes at 24) runs its schedule's
+    producer at them,
     its consumers sharing what remains of the launch's pool, and its register model states the same split:
     so the consumers' budget a derivation reads is the raise the kernel runs."""
     from dew.nn.kernels.templates import handoffs, resources
@@ -325,10 +326,34 @@ def test_a_launch_whose_producer_holds_more_lowers_it_to_its_own_floor_and_its_c
 
 @pytest.mark.parametrize("generation_name", gate_generations(
     needs=lambda family, architecture: architecture.multiprocessor.register_raises is not None))
+def test_a_spilled_launchs_producer_steps_down_its_ladder_from_its_top(generation_name):
+    """A derivation's rung (`resources.Producers.stepped`): a spilled launch's producer to its top first (its
+    program's entry share), then a setmaxnreg step lower each time; every other launch's left where it was;
+    none at the ladder's foot, a step above the least, so the derivation steps its tiles down instead; a top
+    past setmaxnreg's most bounded at it."""
+    from dew.nn.kernels.templates import resources
+
+    with generation.assumed(generation_name):
+        steps = resources.facts().raises()
+        top = steps.lowest + 13 * steps.step
+        first = resources.Producers().stepped({"states": top})
+        second = first.stepped({"states": top, "scan": top})
+        assert (first.of("states"), first.of("scan")) == (top, None)
+        assert (second.of("states"), second.of("scan")) == (top - steps.step, top)
+        foot = resources.Producers((("states", steps.lowest + steps.step),))
+        assert foot.stepped({"states": top}) is None
+        assert resources.Producers().stepped({"states": steps.lowest}) is None
+        assert resources.Producers().stepped({"states": steps.highest + steps.step}).of("states") == (
+            steps.highest)
+
+
+@pytest.mark.parametrize("generation_name", gate_generations(
+    needs=lambda family, architecture: architecture.multiprocessor.register_raises is not None))
 def test_a_planned_launch_at_its_producers_registers_holds_the_programs_and_budget_its_schedule_runs(
         generation_name):
-    """A launch planned at its producer's stated registers (`resources.Launch.producer`, as the sm100 states
-    launch states 48) takes the programs a multiprocessor holds and the consumer budget its schedule runs at
+    """A launch planned at its producer's raised registers (`resources.Launch.producer`, as certification
+    raises the sm100 states launch's) takes the programs a multiprocessor holds and the consumer budget its
+    schedule runs at
     that split (`Family.roles`), which the planner, the walk's schedule and the gate's register model all
     read, so no decision holds a launch at the split it does not run."""
     from dew.nn.kernels.templates import resources

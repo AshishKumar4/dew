@@ -86,9 +86,11 @@ def compiler_params(*, approx_math: bool = False, reduction_scratch: int = 0,
     bytes, which Mosaic GPU splits between the block's warpgroups; with none, such a reduction fails to
     lower rather than share one. `resident`, the programs a multiprocessor holds at once, caps each thread's
     registers so that many fit its register file (CUDA's `__launch_bounds__` minimum blocks, Mosaic GPU's
-    `min_blocks_per_sm`, nvvm.minctasm); at one, ptxas takes up to 255."""
+    `min_blocks_per_sm`, nvvm.minctasm); at one, ptxas takes up to 255. The launch tracing it travels as the
+    call's metadata (`report.launch_metadata`), beside the kernel's name."""
     return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math,
-                                reduction_scratch_bytes=reduction_scratch, min_blocks_per_sm=resident)
+                                reduction_scratch_bytes=reduction_scratch, min_blocks_per_sm=resident,
+                                metadata=report.launch_metadata())
 
 
 def cluster_index(cluster: int) -> jax.Array | int:
@@ -184,6 +186,15 @@ def stacked_views(refs, groups: tuple[tuple[int, ...], ...]) -> list:
         for place, index in enumerate(group):
             views[index] = ref.at[place]
     return views
+
+
+def added_copies(ref) -> jax.Array:
+    """A ref every role adds into (`Family.added`) after the launch, from its leading axis of copies: one on a
+    device, every role's adds atomic into it, read as it is; each role's own interpreted, summed. A sum over
+    one copy is a second buffer of the ref's size, which XLA writes beside it (a Qwen3.5-4B training step's
+    fp32 dQ on an H100, 805 MB more at its peak)."""
+    added = jax.freeze(ref)
+    return added[0] if added.shape[0] == 1 else added.sum(axis=0)
 
 
 def stacked_read(refs, groups: tuple[tuple[int, ...], ...]) -> list[jax.Array]:
@@ -645,7 +656,7 @@ class Issuer[Accumulator](abc.ABC):
         """The rows a walked tile (a forward's keys) comes in whole multiples of: the products' rows, which a
         consumer's weights' product takes as its depth (wgmma's and the chunks' 64, mma.sync's 16); a family
         whose products a role issues takes its weights from tensor memory, a swizzle tile's 64 rows of a
-        16-bit stream (`Tcgen05Placed`)."""
+        16-bit stream (`placed.Tcgen05Placed`)."""
         return self.rows
 
     @property
@@ -697,13 +708,6 @@ class Issuer[Accumulator](abc.ABC):
         returned = plgpu.ShapeDtypeStruct(tile.shape, tile.dtype, layout=self.layout)
         return plgpu.inline_mgpu(arg_types=(self.layout, plgpu.Layout.WG_SPLAT(())), return_type=returned)(
             shifted)(tile, jnp.asarray(shift, jnp.int32))
-
-    loads_past_floor: bool = False
-    """Whether this is an issuer on which some launches' producers hold more than `resources.producer_floor`'s
-    registers in their issue loop: each such launch states its floor where a receipt shows the need
-    (`Launch.producer`), and the compile gate holds the rest to the default (`producer_failures`, spills).
-    tcgen05's: the recurrence's states, solve and reverse walk spilled 52, 164 and 40 bytes at 24 on sm100
-    (row 5357), its other launches spill-free at 24; none of warpgroup MMA's or mma.sync's."""
 
     def entry_floor(self, tiles) -> int:
         """The least registers a thread a program issuing products into a consumer's fp32 `tiles` (each
@@ -1422,9 +1426,11 @@ class Transport[Allocated, Opened](abc.ABC):
 
     copy_extent: int | None = None
     """The most elements one asynchronous copy moves along a dimension of its box after the copy's tiling
-    (TMA's, 256): an operand block tiled in 8 rows by a swizzled row stays far below it at any tile its
-    registers hold, and a one-dimensional side operand's block, untiled, is at most it
-    (`grouped_matmul._Mosaic.fitting`); None where cp.async moves a block (mma.sync's)."""
+    (TMA's, 256; Mosaic GPU's launch_context refuses a tiled slice past it along any dimension): a dimension
+    of the tiled box, never a block's row: a 16-bit block swizzled at 128 bytes tiles as (rows / 8, columns /
+    64, 8, 64), so a row 576 wide is 9 tiles of 64 (an absorbed MLA key's, `attention.head_width`), and a
+    one-dimensional side operand's block, untiled, is at most it (`grouped_matmul._Mosaic.fitting`); None
+    where cp.async moves a block (mma.sync's)."""
 
     copies_in_pieces: bool = True
     """Whether a step's block may arrive in several copies (`streams`' `copies`, `Pieces`), TMA's each into

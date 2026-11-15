@@ -641,3 +641,22 @@ def test_a_broadcast_sums_its_gradient_wide_at_every_order(dtype):
         np.testing.assert_array_equal(np.asarray(derivative), expected, strict=True)
     narrow = np.asarray(2 * weights).sum(0, dtype=dtype)
     assert not np.array_equal(narrow, expected), "a narrow sum rounds these terms apart"
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_xla_projection_in_its_layer_holds_every_order(edge):
+    """A projection's product no launch takes (`projections._in_layer_product`: XLA's own dot, its reverse
+    mode's cotangents leaving together, `gemm.in_layer`): every order, forward and reverse, under a nested
+    jit and a scan, in the rows and the matrix, finite wherever float64 is a normal float32 and wherever the
+    plain dot (its float64 run the truth) is, at values whose products near float32's ends."""
+    primals = normal_draw(6027, (4, 32, 64), (64, 48), scale=EDGES[edge])
+    direction = normal_draw(6028, (4, 32, 64), (64, 48), scale=EDGES[edge])
+    (cotangent,) = normal_draw(6029, (4, 32, 48))
+    dimensions = (((2,), (0,)), ((), ()))
+    product = projections._in_layer_product(jax.lax.dot_general, dimensions, None, None)
+
+    def plain(rows, matrix):
+        return jax.lax.dot_general(rows, matrix, dimensions)
+
+    assert_contract(product, primals, direction, cotangent, f"an xla projection in its layer {edge}",
+                    plain_fn=plain)

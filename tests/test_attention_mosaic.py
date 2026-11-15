@@ -39,9 +39,7 @@ from dew.nn.kernels.templates import (
     attention_route,
     attention_triton,
     bundles,
-    mosaic,
     mosaic_sm90,
-    mosaic_sm100,
 )
 
 pytestmark = pytest.mark.kernel
@@ -144,9 +142,11 @@ def _form_tiles(generation_name: str | None = None) -> attention_mosaic.Tiles:
     H100's pair two consumers' blocks, an A100's one consumer's each (mma.sync's one warpgroup)."""
     family = INTERPRETED_ON[generation_name or _INTERPRETED.get()]
     return attention_mosaic.Tiles(64, 64, 2, 2 if family == WGMMA else 1, family=family)
-HEAD_WIDTHS = ((64, 128), (128, 64), (80, 48))
-"""The (query, value) head widths the forward and the backward are checked at: a value wider than its
-query, a narrower one, and both off a power of two (80 and 48 pad to 128 and 64, `attention.padded_call`)."""
+HEAD_WIDTHS = ((64, 128), (128, 64), (80, 48), (32, 32), (192, 160))
+"""The (query, value) head widths the forward and the backward are checked at (kernel-templates.md §A row
+23's 32 to 256): a value wider than its query, a narrower one, both off a power of two (80 and 48 pad to 128
+and 64, `attention.padded_call`), the narrowest, and both past 128 off a power of two (192 and 160 pad to
+256); 256 itself the wide backward's site below."""
 
 
 def _drawn(shape: tuple[int, int, int, int], dtype, width: int = 128, keys: int | None = None,
@@ -724,9 +724,21 @@ def test_the_forward_is_on_par_over_every_call_form_interpreted(form):
 @pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
 def test_the_forward_is_on_par_at_head_widths_interpreted(width, value_width):
     """The forward of query heads `width` wide and value heads `value_width` over a causal call at
-    `_form_tiles`, under the interpreter."""
+    `_form_tiles`, heads past 128 at their derived tiles (an A100 refuses that pin at heads padded to 256,
+    `tuning.Unpinnable`), under the interpreter."""
+    tiles = _form_tiles() if max(width, value_width) <= 128 else None
     _check_forward("causal", jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=width,
-                   value_width=value_width, tiles=_form_tiles())
+                   value_width=value_width, tiles=tiles)
+
+
+@INTERPRETS
+def test_an_absorbed_mla_forward_of_576_wide_keys_and_512_wide_values_is_on_par_interpreted():
+    """An absorbed MLA call's widths (DeepSeek's latent 512 and rotary 64 a key, its latent 512 a value;
+    kernel-templates.md §A row 25) through the Mosaic forward an H100 runs, interpreted: its heads padded
+    to whole groups of 64 columns past 256 (`attention.head_width`), not to 1024, each loaded by one copy,
+    at its derived tiles: on par with the reference (check 1)."""
+    _check_forward("causal", jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=576,
+                   value_width=512, target=generation.gpu_target("sm90"))
 
 
 @ON_EACH_FAMILY
@@ -1360,6 +1372,34 @@ def test_the_backward_is_on_par_over_every_call_form_interpreted(case, form):
     _check_call_form(case, interpret=True, backward=True, form=form)
 
 
+def block_selected(tokens: int, block: int) -> np.ndarray:
+    """Runs `[1, tokens, 3, 2]` of a block-selected causal call (MoBA's, NSA's selected branch): each query
+    reads the keys of its own block up to its own, and two earlier blocks, its block's first and its
+    half-way one, whole; a block its query block does not select between them, so its walk's tiles are
+    the selected ones apart (`attention_mosaic_program.indexed_walk`)."""
+    runs = np.zeros((1, tokens, 3, 2), np.int32)
+    for query in range(tokens):
+        own = query // block
+        earlier = sorted({0, own // 2} - {own})
+        for index, chosen in enumerate(earlier):
+            runs[0, query, index] = (chosen * block, (chosen + 1) * block)
+        runs[0, query, len(earlier)] = (own * block, query + 1)
+    return runs
+
+
+@INTERPRETS
+@on_each_family_for(("width", "form"), [(64, "default"), (128, "default"), (64, "fused")], ids=str)
+def test_a_block_selected_call_holds_check_1_walking_its_selected_tiles_interpreted(width, form):
+    """A block-selected causal call over 512 tokens (`block_selected`: each query its own block and two
+    earlier blocks of 64, others between them unread), forward and backward under the interpreter at the
+    derived tiles, the backward in the form `form` names, on each GPU's family: on par with the reference
+    (check 1), its query blocks' walks stepping the selected tiles alone, each step's tile read through its
+    ranges (`_Program.tile_of`), which a wrong tile would miss."""
+    spans = template.spans(512, 512, 1, causal=True, runs=jnp.asarray(block_selected(512, 64)))
+    _check_spans("block-selected", spans, (1, 512, 2, 1), interpret=True, backward=True, width=width,
+                 form=form)
+
+
 @INTERPRETS
 @on_each_family_for(("case", "form"), _walked(RUN_CASES, ["forward", *BACKWARD_FORMS]), ids=str)
 def test_a_call_over_runs_is_on_par_interpreted(case, form):
@@ -1527,183 +1567,6 @@ def test_the_forward_on_tcgen05s_chunks_holds_check_1_interpreted(call, training
     tiles = attention_mosaic.Tiles(64, 64, 2, consumers, family="tcgen05.chunks")
     _check_forward(call, jnp.bfloat16, (1, 192, 2, 1), natural=False, interpret=True, width=width,
                    value_width=width, tiles=tiles, training=training, target=generation.gpu_target("sm100"))
-
-
-ROWS_TILES = attention_mosaic.Tiles(128, 64, 2, 1, family="tcgen05.rows")
-"""tcgen05's rows' one tile (`mosaic_sm100.ROWS`): a product's 128 rows, a row a consumer thread, 64 keys
-a step."""
-
-
-@INTERPRETS
-@pytest.mark.parametrize("width", [64, 128])
-@pytest.mark.parametrize("natural", [True, False], ids=["natural", "folded"])
-@pytest.mark.parametrize("call", ["full", "causal"])
-def test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted(call, natural, width):
-    """The forward on a B200's tcgen05 rows (`mosaic_sm100.ROWS`, FlashAttention 4's structure: its walk's
-    declared products issued by a warp of their own a step ahead of the softmax warpgroup, a row a thread in
-    tensor memory's own layout, the weights written there as the weighted values' left operand, the sums
-    kept there across the walk, rescaled in place and finished a block of columns at a time), its logits
-    natural or folded (its fold's guard rewalking on the chunks, `Tiles.relaunch_family`), over 192 tokens
-    (its query and key tiles padded), under the interpreter, which models tensor memory: on par with the
-    reference (check 1)."""
-    _check_forward(call, jnp.bfloat16, (1, 192, 2, 1), natural=natural, interpret=True, width=width,
-                   value_width=width, tiles=ROWS_TILES, target=generation.gpu_target("sm100"))
-
-
-@INTERPRETS
-def test_the_forward_on_tcgen05s_rows_over_narrow_value_blocks_holds_check_1_interpreted():
-    """The forward on a B200's tcgen05 rows with its values walked 16 columns a launch (`Tiles.columns`),
-    a block narrower than its sums' rescale takes at once (`mosaic_sm100.RESCALED_COLUMNS`), causal and
-    folded over 192 tokens, under the interpreter: on par with the reference (check 1)."""
-    _check_forward("causal", jnp.bfloat16, (1, 192, 2, 1), natural=False, interpret=True, width=64,
-                   value_width=64, tiles=dataclasses.replace(ROWS_TILES, columns=16),
-                   target=generation.gpu_target("sm100"))
-
-
-@INTERPRETS
-def test_the_forward_on_tcgen05s_rows_holds_check_1_beside_a_parameter_no_score_hook_reads_interpreted():
-    """The forward on a B200's tcgen05 rows (`ROWS_TILES`), causal over 192 tokens, given a key bias and no
-    score hook to read it: the launch takes no stream of it, which no role of the rows would release (its
-    issuer streams the keys and values alone), and it computes the plain call, on par with the reference
-    (check 1)."""
-    shape = (1, 192, 2, 1)
-    spans = template.spans(shape[1], shape[1], shape[0], **CALLS["causal"])
-    draw_operands = _drawn(shape, jnp.bfloat16, width=64)
-    target = generation.gpu_target("sm100")
-
-    def draw(seed):
-        drawn = jax.random.fold_in(jax.random.PRNGKey(5), seed)
-        return *draw_operands(seed), jax.random.normal(drawn, (1, 2, shape[1]), jnp.float32)
-
-    def unread(bias):
-        return template.Hooks(score_params=(template.Param(bias, template.Kind.KEY),))
-
-    def ours(query, key, value, dout, bias):
-        del dout
-        with _device(interpret=True, target=target), _pinned(ROWS_TILES):
-            return attention_mosaic.forward(query, key, value, spans, unread(bias), interpret=True)
-
-    def reference(query, key, value, dout, bias):
-        del dout
-        return template.reference(query, key, value, spans, unread(bias))
-
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "mosaic forward rows unread key bias",
-                    seeds=SEEDS)
-
-
-@INTERPRETS
-def test_a_refusal_of_the_rows_forwards_rewalk_alone_steps_its_rewalk_alone_interpreted():
-    """The forward pinned on a B200's tcgen05 rows (`ROWS_TILES`), causal and folded over 192 tokens, its
-    fold's rewalk on another family at the tiles that family's derivation gives it (`MosaicForward.completed`,
-    `Tiles.relaunch_family`): a compile's refusal of the rewalk's kernel alone (its spill,
-    `report.refuse_launch`) keeps the rows' own tiles and steps the rewalk to others
-    (`MosaicForward._rewalked_apart`), at which the launch lowers for a B200 and holds check 1 under the
-    interpreter. Refused as one config, the 4B forward's rows stepped down to a block of 16 value columns
-    where its rewalk had spilled (et-rows-spill)."""
-    from kernel_compile import lowered_for
-
-    from dew.nn.kernels.templates import report
-    from dew.nn.kernels.templates.attention_mosaic_forward import NATURAL_NAME
-
-    shape, width = (1, 192, 2, 1), 64
-    spans = template.spans(shape[1], shape[1], shape[0], **CALLS["causal"])
-    query, key, value, _ = _drawn(shape, jnp.bfloat16, width=width, value_width=width)(0)
-    target = generation.gpu_target("sm100")
-    fields = ("relaunch_family", "relaunch_q", "relaunch_k", "relaunch_consumers", "relaunch_columns")
-
-    def refused(interpret: bool) -> None:
-        # The pinned config as the launch of `forward` completes it, then its rewalk's launch refused: the
-        # rows' own tiles kept, the rewalk's stepped.
-        op, args = attention_mosaic._forward_call(query, key, value, spans, template.Hooks(), scale=None,
-                                                  natural=False, residuals=template.Kept.NONE)
-        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=interpret)
-        completed = op.completed(ba, ROWS_TILES)
-        assert completed.relaunch_family is not None, completed
-        columns = "" if completed.relaunch_columns is None else f"_columns{completed.relaunch_columns}"
-        report.refuse_launch(op, ba, completed, {f"attention_forward{NATURAL_NAME}{columns}"})
-        stepped = op.completed(ba, ROWS_TILES)
-        assert stepped.relaunch_family is not None, stepped
-        assert dataclasses.replace(stepped, **dict.fromkeys(fields)) == ROWS_TILES, stepped
-        assert [getattr(stepped, name) for name in fields] != [getattr(completed, name) for name in fields]
-
-    with report.refusals():
-        with _device(interpret=True, target=target):
-            refused(interpret=True)
-        with generation.assumed("sm100"):
-            refused(interpret=False)
-        abstract = tuple(jax.ShapeDtypeStruct(array.shape, array.dtype) for array in (query, key, value))
-        with _pinned(ROWS_TILES):
-            lowered_for(lambda q, k, v: attention_mosaic.forward(q, k, v, spans, None, natural=False),
-                        abstract, "sm100")
-        _check_forward("causal", jnp.bfloat16, shape, natural=False, interpret=True, width=width,
-                       value_width=width, tiles=ROWS_TILES, target=target)
-
-
-@pytest.mark.parametrize("count", [0, 1, 2, 3, 4, 5])
-def test_the_rows_issuer_issues_each_tiles_logits_before_the_tile_befores_weighted_values(count):
-    """tcgen05's rows' issuer warp over a walk of `count` key tiles (`mosaic_sm100.issued`, its loops run
-    eagerly): each tile's logits and its weighted values issued once, at its turn (its place among the two
-    tiles of each, its parity), the next tile's logits before a tile's weighted values (FlashAttention 4's
-    S in flight: the tensor core takes them while the softmax weighs the tile), short walks odd and even."""
-    issued = []
-
-    def score(index, turn: int) -> None:
-        issued.append(("S", int(index), turn))
-
-    def weigh(index, turn: int) -> None:
-        issued.append(("PV", int(index), turn))
-
-    with jax.disable_jit():
-        mosaic.looped(mosaic_sm100.issued(score, weigh, 0, count), None, ())
-    walked = [("S", 0, 0)] if count else []
-    for index in range(count):
-        walked += [("S", index + 1, (index + 1) % 2)] if index + 1 < count else []
-        walked.append(("PV", index, index % 2))
-    assert issued == walked
-
-
-@pytest.mark.parametrize("tiles", [2, 3, 4, 5])
-def test_the_rows_forward_states_each_product_its_issuer_walks(tiles):
-    """A bf16 inference forward on tcgen05's rows (`ROWS_TILES`) over 128 queries and `tiles` key tiles of
-    64, lowered for a B200: its launch states the products its issuer warp issues (`mosaic_sm100.issued`,
-    counted from its kernel's emission, `emission.costed`), each tile's logits and weighted values once, a
-    multiply-add a reached pair, head and product column, the model's share the whole; an odd walk's and an
-    even's alike, its first step's two logits and its last's none its steady step's two
-    (`emission.Role.step`)."""
-    rows, heads, kv_heads, width, queries = 1, 4, 2, 64, 128
-    keys = 64 * tiles
-    query = jax.ShapeDtypeStruct((rows, queries, heads, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), jnp.bfloat16)
-    spans = template.spans(queries, keys, rows)
-    issued = 2 * rows * heads * queries * keys * (width + width)
-    with _pinned(ROWS_TILES):
-        assert _counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key,
-                        generation_name="sm100") == (issued, issued)
-
-
-@INTERPRETS
-def test_the_forward_on_tcgen05s_rows_holds_check_1_over_documents_interpreted():
-    """The forward on a B200's tcgen05 rows over the template core's causal packed documents under a window
-    (`CASES["causal-documents-window"]`: its rows' key intervals, block maps at its 128 x 64 tiles, rows
-    whose keys a tile hides and padding), under the interpreter: on par with the reference (check 1)."""
-    case = CASES["causal-documents-window"]
-    queries, keys = core_geometry(case)
-    called = {name: value[:1] if hasattr(value, "shape") else value
-              for name, value in arguments(case).items()}
-    spans = template.spans(queries, keys, 1, **called)
-    draw = _drawn((1, queries, 2, 1), jnp.bfloat16, width=64, keys=spans.keys)
-    target = generation.gpu_target("sm100")
-
-    def ours(query, key, value, dout):
-        del dout
-        with _device(interpret=True, target=target), _pinned(ROWS_TILES):
-            return attention_mosaic.forward(query, key, value, spans, None, interpret=True)
-
-    def reference(query, key, value, dout):
-        del dout
-        return template.reference(query, key, value, spans)
-
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "mosaic forward rows documents", seeds=SEEDS)
 
 
 @pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])

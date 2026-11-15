@@ -205,7 +205,9 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
             refusals['hand'] = '; '.join(refusal.detail for refusal in SCAN.kernel('pallas').refusals(case))
             cotangents = (given['dy'], given['dfinal'])
         elif shape.kind == 'loglinear':
-            inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'], given['scales'])
+            # The level weights in bf16 as fla's arm takes them, the two arms' inputs one draw's.
+            inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'],
+                      given['scales'].astype(bf16))
 
             def template(q, k, v, g, scales):
                 # Scaled by one, as fla's kernel is unscaled.
@@ -339,14 +341,16 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
     elif shape.kind == 'loglinear':
         from fla.ops.log_linear_attn import chunk_log_linear_attn
 
-        leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'], given['scales']]
-
-        group = shape.value_heads // shape.key_heads
+        # The level weights in the operands' dtype, as a bf16 model's layer hands them (its `L` parameter's,
+        # log_linear_mamba2.py:105): fla-core 0.5.2's forward scales its scores by them after rounding to the
+        # queries' dtype and dots them with the values (chunk.py:194-199), which an fp32 weight makes an fp32
+        # operand beside bf16 values, refused by Triton.
+        leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'],
+                  given['scales'].to(bf16)]
 
         def run(q, k, v, g, scales):
-            # fla-core 0.5.2's kernel takes a key head a value head and no scale (unscaled): the layers'
-            # repeat inside the timed call, as the gated delta rule's arm takes it.
-            q, k = (x.repeat_interleave(group, dim=2) for x in (q, k))
+            # fla-core 0.5.2's kernel takes one key group (its forward refuses any other, chunk.py:1117) and
+            # no scale (unscaled), the queries and keys as its layer hands them (log_linear_mamba2.py:107).
             return (chunk_log_linear_attn(q, k, v, g, scales)[0],)
 
         cotangents = (given['do'].to(bf16),)

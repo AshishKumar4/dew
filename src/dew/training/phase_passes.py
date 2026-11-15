@@ -140,6 +140,17 @@ class PhasePasses[L, E]:
         objective = self.base.substituted(_counted(self.base, passes))
         return PhasePasses(objective, self.counts, passes, dict.fromkeys(self.counts, objective))
 
+    def begun(self, first: int, phases: Sequence[int]) -> list[int]:
+        """Those of `phases` whose step is planned at its boundary, after the run's `first` phase: each the
+        first of a pass count no phase before it ran (`begins`), one plan a count."""
+        seen = {self.counts[first]}
+        begun = []
+        for phase in phases:
+            if self.counts[phase] not in seen:
+                seen.add(self.counts[phase])
+                begun.append(phase)
+        return begun
+
     def objective_for(self, passes: int | None) -> Objective[L, E]:
         """The run's objective (`base`, at the last phase's count) at `passes` (a phase's `count`, the
         step's `current`): a copy of it whose looped modules run that many passes, kept for every step of

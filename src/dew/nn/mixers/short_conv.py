@@ -16,6 +16,7 @@ from jax.ad_checkpoint import checkpoint_name
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
+from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
 from dew.nn.linear import DepthwiseConv1d, forked_conv, held_conv1d
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, float32_dot_general
@@ -69,6 +70,17 @@ class GatedShortConv(nn.Module):
         self.conv = DepthwiseConv1d(features=self.emb_features, kernel=self.kernel, use_bias=self.use_bias,
                                     name='conv')
 
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """The layer's decode cache for `rows` rows: the conv's history of its gated inputs, in its
+        projection's dtype, and where padding holds the bias, whether each row has consumed a real
+        token: only a row's first call can open with a prompt's padding."""
+        spec = {"conv_state": Opened((rows, self.kernel - 1, self.emb_features),
+                                     compute_dtype(self, self.dtype))}
+        if self.use_bias and self.padding_holds_bias:
+            spec["conv_started"] = Opened((rows,), bool)
+        return spec
+
     @nn.compact
     def __call__(self, x: jax.Array, call: MixerCall = PLAIN_CALL) -> jax.Array:
         batch, length, width = x.shape
@@ -76,10 +88,10 @@ class GatedShortConv(nn.Module):
         valid = tokens.valid
         started = None
         biased_padding = self.use_bias and self.padding_holds_bias
+        spec = self.cache_spec(batch) if call.decode else {}
+        holding = cache_variables(self, spec)
         if call.decode and biased_padding:
-            # Whether each row has consumed a real token: only a row's first call can open with a
-            # prompt's padding.
-            started = self.variable('cache', 'conv_started', jnp.zeros, (batch,), bool)
+            started = holding["conv_started"]
         if biased_padding and valid is not None and tokens.segments is None:
             # A prompt's leading padding, the slots before the first real token of a row that has
             # consumed none (not a paused slot, a row's trailing slots or a continuation's): the source
@@ -97,12 +109,8 @@ class GatedShortConv(nn.Module):
         taps, bias = self.conv()
         held = None
         if call.decode:
-            allocated = self.has_variable('cache', 'conv_state')
-            held = self.variable('cache', 'conv_state', jnp.zeros, (batch, self.kernel - 1, width),
-                                 mixed.dtype)
-            if not allocated:
-                # The allocation-only call (`open_kv_cache`'s dummy token) consumes nothing.
-                return self.out_proj(jnp.zeros_like(mixed))
+            stated(spec, "conv_state", (batch, self.kernel - 1, width), mixed.dtype)
+            held = holding["conv_state"]
         if tokens.forks is not None:
             # Each document after its chain's last tokens, a root after the held history; a cached call's
             # cache left as it was.
@@ -110,14 +118,15 @@ class GatedShortConv(nn.Module):
                                     bias=bias, dtype=mixed.dtype, activation=False)
             return self.out_proj(gate_out * checkpoint_name(convolved, Residual.CONV))
         if started is not None:
-            started.value = started.value | (jnp.ones((batch,), bool) if valid is None
-                                             else jnp.asarray(valid, bool).any(axis=1))
+            kept(started, started.value | (jnp.ones((batch,), bool) if valid is None
+                                           else jnp.asarray(valid, bool).any(axis=1)), "conv_started")
         convolved, history = held_conv1d(mixed, taps, valid, None if held is None else held.value,
                                          bias=bias, segments=tokens.segments,
                                          right_padded=tokens.right_padded, dtype=mixed.dtype,
                                          activation=False)
         if held is not None:
-            held.value = history.astype(held.value.dtype)
+            # The history kept in the cache's dtype, as it always was.
+            kept(held, history.astype(held.value.dtype), "conv_state")
         return self.out_proj(gate_out * checkpoint_name(convolved, Residual.CONV))
 
 

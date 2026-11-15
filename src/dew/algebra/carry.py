@@ -17,6 +17,7 @@ outputs read the state and those alone (`Split.carry`, `Split.emit`). The associ
 from __future__ import annotations
 
 import dataclasses
+import time
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import NamedTuple
 
@@ -45,6 +46,7 @@ from dew.algebra.cost import Work
 from dew.algebra.extract import Level
 from dew.algebra.forms import Refused
 from dew.algebra.terms import Term
+from dew.nn.kernels.templates import report as kernel_report
 
 
 @function(merge=lambda old, new: old)
@@ -138,9 +140,10 @@ def _carried():
 
 
 CARRYING = _carrying()
-CARRIED = rules.Rules("carried", "reorders", _carried(), receipt="docs/design/algebra.md §6.9; "
-                      "tests/test_algebra_scan.py")
-"""The split's rules, never among the engine's sets (`rules.admitted`)."""
+CARRIED = rules.armed(rules.Rules("carried", "reorders", _carried(), receipt="docs/design/algebra.md §6.9; "
+                                  "tests/test_algebra_scan.py"))
+"""The split's rules, never among the engine's sets (`rules.admitted`), which a receipt's arm may leave out
+(`rules.ARMS`): the split then extracts its traced forms."""
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -164,17 +167,20 @@ class Priced:
 
 def _carry_priced(region: terms.Region, schedule) -> DagCostModel[Priced]:
     """`Priced` per node: its work (`cost.work`) sequential where an operand reads the state (the e-classes
-    the extractor hands the callback, which alone it may look up), parallel otherwise."""
+    the extractor hands the callback, which alone it may look up), its span the carry's loop's one iteration
+    (spans on one path compose to their peak), parallel otherwise."""
     none = cost.Seconds(Work(), schedule)
 
     def marginal(graph: EGraph, node) -> Priced:
-        done = cost.Seconds(cost.work(graph, node, region), schedule)
+        work = cost.work(graph, node, region)
         operands = next((args for constructor in terms.LANGUAGE
                          if (args := get_callable_args(node, constructor)) is not None), ())
         if any(isinstance(operand, Term) and graph.lookup_function_value(reads(operand)) is not None
                for operand in operands):
-            return Priced(done, none)
-        return Priced(none, done)
+            # The carry is a loop XLA lowers, a chunk an iteration: its work that reads the state is a step
+            # of it, its span at least the loop's one iteration, priced at that loop's step (`Priced`).
+            return Priced(cost.Seconds(dataclasses.replace(work, span=max(work.span, 1.0)), schedule), none)
+        return Priced(none, cost.Seconds(work, schedule))
 
     return DagCostModel(marginal_cost=marginal, identity=Priced(none, none))
 
@@ -221,7 +227,11 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     others = Term.bundle(Vec[Term](*(roots[index] for index in emitted)) if emitted else Vec[Term].empty())
     graph.register(sequential, others)
     facts = seq(rules.FACTS.saturate(), CARRYING.saturate())
-    program.saturate(graph, region, (CARRIED,), saturation, facts)
+    # Its saturation recorded as a region's rewrite is (`program.reported`): the sets it admitted and fired.
+    began, sized = time.perf_counter(), program.node_count(graph)
+    admitted = (CARRIED,) if rules.admits(CARRIED) else ()
+    saturated = program.saturate(graph, region, admitted, saturation, facts)
+    kernel_report.record_rewrite(program.reported(graph, sized, saturated, began))
     schedule = cost.fused(cost.target())
     # The extractor oracle where it is on (`Passes.checked`), as every derivation's (`derive._derived`).
     checked = ALGEBRA.value.checked

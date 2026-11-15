@@ -4,6 +4,7 @@ saved as a run labelling and demonstrating the steps its own policy would, stage
 them, a resume ending where the run that never stopped ends, and each setup the kind refuses."""
 
 import dataclasses
+import shutil
 from pathlib import Path
 
 import jax
@@ -182,12 +183,13 @@ def test_a_runs_episodes_score_its_flights_from_the_evaluations_key(tmp_path, ag
     assert logged == {f"episodes/{name}": value for name, value in expected.items()}
 
 
-def test_a_student_resumed_by_its_command_keeps_the_teacher_step_it_pinned(tmp_path):
+def test_a_student_resumed_by_its_command_keeps_the_teacher_step_it_pinned(tmp_path, saved_teacher):
     """A student whose teacher's step it leaves to its pinning (`TeacherConfig.step` None) pins the
     teacher's latest as it starts; once the teacher has trained on, the same command resumed reads the
     step it pinned (`EnvRunConfig.BUILT`, `RunConfig.resumed`) and trains on, where it pinned the
-    teacher's new latest and its resume was refused (row 3931). A run of no teacher stays one."""
-    teacher_run(tmp_path).prepare().train("teacher")
+    teacher's new latest and its resume was refused (row 3931). A run of no teacher stays one. The
+    teacher is the module's, copied here so this test trains its copy on (row 4284)."""
+    shutil.copytree(saved_teacher, tmp_path / "teacher")
     taught = TeacherConfig(str(tmp_path / "teacher"), demonstrates=True)
     pretrains = {"batch": 8, "length": 4, "train_ratio": float("inf"), "prefill": 8, "capacity": 32}
     # Named in its trainer, as `dew train` names a run by its file.

@@ -59,17 +59,25 @@ from dew.nn.inspection import QK
 from dew.nn.kernels.selection import select
 from dew.nn.kernels.templates import attention as template
 from dew.nn.kv_cache import (
+    CURSOR,
     DOCUMENTS,
     TABLE,
     Append,
     KVCache,
+    KVSpec,
     KVStore,
+    Opened,
+    cache_variables,
     cached_validity,
+    compute_dtype,
+    cursor,
     filled_slots,
+    kept,
     mixed_counts,
     mixed_positions,
     open_kv_cache,
     rotated,
+    written_as,
 )
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerBase, MixerContext
@@ -353,6 +361,9 @@ GATE_ACTIVATIONS = {
     'softplus': lambda gate: jax.nn.softplus(gate.astype(at_least_fp32(gate.dtype))),
 }
 """The output gate's activations (`MixerContext.output_gate_activation`)."""
+
+INDEX_KEYS, INDEX_PLACES = "index_keys", "index_places"
+"""QSA's cache leaves beside a layer's keys: each slot's raw indexer key and its rotary place."""
 
 ATTENTION_AXES: dict[str, LogicalAxes] = {
     "q_proj": ("embed", "heads"),
@@ -860,6 +871,37 @@ class CausalSelfAttention(nn.Module):
             partial_rotary_type=self.ctx.partial_rotary_type, rope_scaling=self.ctx.rope_scaling,
             dtype=dtype, reach=reach, section=section)
 
+    @nn.nowrap
+    def _kv_spec(self, rows: int) -> KVSpec:
+        """The layer's key and value storage for `rows` rows (`KVSpec`), its keys and values in the dtype
+        its projections give them (`compute_dtype`)."""
+        ctx = self.ctx
+        return KVSpec(ctx.kv_cache, rows, ctx.max_seq_len, ctx.num_kv_heads, ctx.head_dim,
+                      compute_dtype(self, ctx.dtype), value_dim=self.value_dim, places=self._reads_places,
+                      groups=self._group_fields())
+
+    @nn.nowrap
+    def _indexed(self, rows: int) -> dict[str, Opened]:
+        """QSA's leaves beside the keys for `rows` rows: each slot's raw indexer key, in its projection's
+        dtype, and its rotary place, on each of the layer's rotary axes where it turns by several
+        (M-RoPE's three, `rotary_axes`)."""
+        assert self.qsa is not None
+        capacity, width = self.ctx.max_seq_len, self.qsa.indexer_head_dim
+        axes = ((3,) if self.mrope_section is not None else
+                (len(self.rotary_axes),) if self.rotary_axes is not None else ())
+        return {INDEX_KEYS: Opened((rows, capacity, width), compute_dtype(self, self.ctx.dtype)),
+                INDEX_PLACES: Opened((rows, capacity, *axes), jnp.int32)}
+
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """The layer's decode cache for `rows` rows: a causal layer's own keys and values with their
+        cursor (`open_kv_cache`), and QSA's indexer keys beside them; none for a layer sharing another's
+        keys or a bidirectional one, which reads its causal model's."""
+        if not self.ctx.causal or self.ctx.kv_shared:
+            return {}
+        indexed = {} if self.qsa is None else self._indexed(rows)
+        return {**self._kv_spec(rows).leaves(), **cursor(rows), **indexed}
+
     def _group_fields(self) -> tuple[str, ...]:
         """The `AttentionMetadata` fields of groups the layer reads (`group_fields`)."""
         return group_fields(self.ctx.causal, images=self.bidirectional_images,
@@ -1168,9 +1210,8 @@ class CausalSelfAttention(nn.Module):
             if self.ctx.causal:
                 if not self.ctx.kv_shared:
                     positions, append = open_kv_cache(
-                        self, key, self.ctx.max_seq_len, value_dim=self.value_dim,
-                        valid=None if attention_metadata is None else attention_metadata.valid,
-                        layout=self.ctx.kv_cache, places=self._reads_places, groups=self._group_fields())
+                        self, self._kv_spec(key.shape[0]), key,
+                        valid=None if attention_metadata is None else attention_metadata.valid)
             elif self.ctx.kv_shared:
                 raise ValueError(
                     "a bidirectional canvas over a cache shares no keys across "
@@ -1182,7 +1223,7 @@ class CausalSelfAttention(nn.Module):
             else:
                 # The encoder's frozen prefix: positions continue past it, and
                 # the decoder never writes it back.
-                prefix = self.get_variable("cache", "cache_index")
+                prefix = self.get_variable("cache", CURSOR)
                 positions = prefix[:, None] + jnp.arange(S)
         elif positions is None and not self.ctx.kv_shared:
             positions = jnp.arange(S)
@@ -1217,8 +1258,7 @@ class CausalSelfAttention(nn.Module):
         (`KVStore.read`: paged, quantized, its keys in the layout's rotation, which the canvas's queries
         and keys take too, as a sharing layer's do)."""
         B, S = query.shape[:2]
-        store = KVStore.open(self, self.ctx.kv_cache, B, self.ctx.max_seq_len, key.shape[-2], key.shape[-1],
-                             key.dtype, value_dim=self.value_dim, places=self._reads_places)
+        store = KVStore.open(self, self._kv_spec(B))
         cached_key, cached_value = store.read()
         rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
         if rotation is not None:
@@ -1431,16 +1471,19 @@ class CausalSelfAttention(nn.Module):
         rotary = jnp.broadcast_to(rotary, (B, S, *rotary.shape[2:]) if rotary.ndim == 3 else (B, S))
         keys, key_places = raw, rotary
         if append is not None:
-            total = masking.key.shape[-3]
-            held = self.variable("cache", "index_keys", jnp.zeros, (B, total, raw.shape[-1]), raw.dtype)
-            held_places = self.variable("cache", "index_places", jnp.zeros, (B, total, *rotary.shape[2:]),
-                                        jnp.int32)
-            if append.allocated:
-                rows = jnp.arange(B)[:, None]
-                slots = jnp.where(append.positions >= 0, append.positions, total)
-                held.value = held.value.at[rows, slots].set(raw, mode='drop')
-                held_places.value = held_places.value.at[rows, slots].set(rotary, mode='drop')
-            keys, key_places = held.value, held_places.value
+            held = cache_variables(self, self._indexed(B))
+            total = held[INDEX_KEYS].value.shape[1]
+            rows = jnp.arange(B)[:, None]
+            slots = jnp.where(append.positions >= 0, append.positions, total)
+            written_as(INDEX_KEYS, held[INDEX_KEYS].value.dtype, raw.dtype)
+            # A text token's M-RoPE place is the same on each axis the cache keeps.
+            axes = held[INDEX_PLACES].value.shape[2:]
+            placed = jnp.broadcast_to(rotary[..., None] if rotary.ndim == 2 and axes else rotary,
+                                      (B, S, *axes))
+            kept(held[INDEX_KEYS], held[INDEX_KEYS].value.at[rows, slots].set(raw, mode='drop'), INDEX_KEYS)
+            kept(held[INDEX_PLACES], held[INDEX_PLACES].value.at[rows, slots].set(placed, mode='drop'),
+                 INDEX_PLACES)
+            keys, key_places = held[INDEX_KEYS].value, held[INDEX_PLACES].value
         groups = masking.groups
         visible = dense_visibility(masking.mask, masking.documents, masking.causal, masking.window,
                                    masking.valid, masking.runs, places, masking.key_places, S, keys.shape[1],
@@ -1561,7 +1604,7 @@ class CausalSelfAttention(nn.Module):
         refusal = mixed_attention_refusal(self.ctx, alibi=self.alibi)
         if refusal is not None:
             raise ValueError(f"a mixed serving step needs plain attention; {self.name}: {refusal}")
-        return mixed_positions(self.get_variable("cache", "cache_index"), admitted, valid)
+        return mixed_positions(self.get_variable("cache", CURSOR), admitted, valid)
 
     def _mixed_attended(self, query, key, value, positions, metadata: AttentionMetadata):
         """A mixed call's attention: every valid token's keys and values go
@@ -1576,9 +1619,9 @@ class CausalSelfAttention(nn.Module):
                              f"step does, and takes no {', '.join(carried)}")
         admitted = metadata.admitted
         assert admitted is not None
-        index = self.variable("cache", "cache_index", jnp.zeros, (0,), jnp.int32)
-        store = KVStore.open(self, self.ctx.kv_cache, index.value.shape[0], self.ctx.max_seq_len,
-                             self.ctx.num_kv_heads, self.ctx.head_dim, key.dtype, value_dim=self.value_dim)
+        # A mixed call continues the rows its server opened, the cursor among them.
+        index = self.variable("cache", CURSOR)
+        store = KVStore.open(self, self._kv_spec(index.value.shape[0]))
         rows, pieces = index.value.shape[0], admitted.slots.shape[0]
         width = (query.shape[1] - rows) // pieces
         positions = positions[0]
@@ -1592,7 +1635,7 @@ class CausalSelfAttention(nn.Module):
                   if getattr(metadata, name) is not None}
         store.write_tokens(key[0], value[0], token_rows, positions, groups)
         prompt = positions[rows:].reshape(pieces, width)
-        index.value = mixed_counts(index.value, admitted, positions[None])
+        kept(index, mixed_counts(index.value, admitted, positions[None]), CURSOR)
         # A cache keeping its keys rotated (an int8 one's) is read by queries in the same rotation.
         rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
         if rotation is not None:
@@ -1801,7 +1844,7 @@ class CausalSelfAttention(nn.Module):
         reads the pool through the page table from each row's `starts` under a window; the gathered keys
         go unread and XLA drops the gather. A row whose query is padding (`positions` -1) reads one key
         (`held_reads`)."""
-        reads = held_reads(self.get_variable("cache", "cache_index"), positions)
+        reads = held_reads(self.get_variable("cache", CURSOR), positions)
         out = append.store.decode(query[:, 0], reads, kernel, self.ctx.attn_logit_softcap, starts, sinks)
         return checkpoint_name(out[:, None], Residual.CONTEXT)
 

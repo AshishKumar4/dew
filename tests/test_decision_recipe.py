@@ -830,14 +830,16 @@ def context_run() -> DecisionRunConfig:
                   context_layers=(0,), context_length=64)
 
 
-def test_a_decision_run_holds_its_backbone_frozen_beside_its_context_layers_by_default(tmp_path):
-    """By default a run with context layers holds its backbone frozen and trains the layers' blocks alone: a
-    step moves the blocks and leaves the backbone, and the saved run loads back as a task answering with
-    its trained probabilities. Without context layers `--no-context-frozen` is refused."""
+@pytest.mark.parametrize("encoder", ["table", "backbone"])
+def test_a_decision_run_holds_its_backbone_frozen_beside_its_context_layers_by_default(tmp_path, encoder):
+    """By default a run with context layers holds its backbone frozen and trains the layers' blocks alone,
+    its context read through the backbone's token table or its own frozen pass (`context_encoder`, row
+    6119): a step moves the blocks and leaves the backbone, and the saved run loads back as a task answering
+    with its trained probabilities. Without context layers `--no-context-frozen` is refused."""
     from dew.batch import FROZEN
     from dew.nn.cross_attention import crossing
 
-    run = context_run()
+    run = dataclasses.replace(context_run(), context_encoder=encoder)
     frozen = stepped_once(tmp_path / "frozen", run, reloaded=True)
     assert any(path.startswith(FROZEN) for path in frozen)
     assert not any(moved for path, moved in frozen.items() if path.startswith(FROZEN))

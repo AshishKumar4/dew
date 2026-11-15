@@ -7,6 +7,37 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A run handed a step file compiled without its GPU kind's tuned choices (`AheadOfTime.tuned` false: one
+  compiled on compile-only GPUs outside a prepare) no longer runs it: it compiles its step on its own
+  devices as a run without a file does, keeps their tuned choices beside its compilation cache, and says
+  once why (`dew.training.ahead.UNTUNED`). On a GH200 such a file's 4096x4096 bf16 product ran at 8.32 ms
+  a call against 0.174 ms compiled on the device (UB-4792-AHEAD-TIME). A run whose own compile tunes
+  nothing either (its XLA_FLAGS setting the autotuner's level 0) takes it, and a file of another target is
+  refused, tuned or not, as before. Such a file still writes, for its plan and its kernels; a file compiled
+  over the GPU host's own topology (`--trainer.compile-ahead.topology`) is compiled with every tuned choice
+  that host's runs left beside its compilation cache, or refused, and a run takes it.
+
+- A compile-ahead target with no path (`--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY`, its generation
+  and devices) compiles the run's first step and every later data phase's step into the run's persistent
+  compilation cache and exits 0, as a job's prepare compiles its node's run, where it refused for want of a
+  path; one with neither a path nor a host's topology is refused, as its compiles key entries no run reads.
+  Those steps take every tuned choice a run on such a GPU left in the autotune cache beside it, or are said
+  not preparable until one has; a step compiled on compile-only GPUs anywhere else is XLA's untuned
+  program, which its record (`AheadOfTime.tuned`), its save and its load say. A step file saved before
+  steps recorded this is refused at load; compile it ahead again.
+
+- `SourceOptions` and its keyword types live in `dew.interop.source_options`, and the release contract
+  (`Release`, `RELEASE_FILE`) in `dew.interop.release_record`, so a source's load imports no trainer;
+  `dew.config`, `dew.config.trainer` and `dew.config.release` keep exporting them, and a saved run's record
+  that names `dew.config.trainer:SourceOptions` reads as before.
+- A run's plan search, past a candidate whose compile misses, asks for the split computed from the
+  compile that missed (`dew.training.memory.MemoryMiss`): the first at which its temporaries, taken as scaled
+  by a microbatch's rows, leave room for its shortfall. This replaces the forecast (`Forecast`) and the
+  halving. A split that fits past one not asked is followed by the split before it until one misses, so
+  the plan is still the fewest microbatches that fit; where none is computed to fit, the finest is asked
+  before the search climbs a rung. A tight start compiles twice cold and once warm where the split
+  computed is the next.
+
 - The condition encoders that bind a released checkpoint are dew.interop's: `CLIPText`, `T5Text` and
   `HFAudio` in `dew.interop.encoders`, and `DiffusionConditioner`, `QwenImageConditioner`,
   `HiddenStatesConditioner` and `WanConditioner` in `dew.interop.conditioners`, each with its
@@ -99,6 +130,25 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   memory. `AheadTarget.capacity_gib` is that memory, and `AheadOfTime.capacity` the limit the plan held to.
 
 
+- Dew requires its JAX build 0.12.0.1.post95 (Python alone; the CUDA and PJRT plugins stay post81's): a compile for
+  compile-only GPUs is told apart as JAX builds their client (a `CompileOnlyPyClient` of the `gpu` platform), so
+  one that states no tuning reads and writes no persistent cache entry as post92 meant, and one a host's own GPUs
+  compile (and autotune) caches as any.
+- Dew requires its JAX build 0.12.0.1.post94 (Python alone; the CUDA and PJRT plugins stay post81's): the persistent
+  compilation cache keys a Mosaic GPU kernel without its source locations, its module read with its dialect, so a
+  program holding one is read by another process that compiles it (it keyed apart wherever the kernel's locations
+  were interned in another order).
+- Dew requires its JAX build 0.12.0.1.post93 (Python alone; the CUDA and PJRT plugins stay post81's): the Pallas
+  lowering cache keys no caller's metadata of a kernel (`CompilerParams.metadata`), which no lowering reads, so
+  kernels that differ in it alone share one lowering, each call carrying its own.
+- Dew requires its JAX build 0.12.0.1.post92 (Python alone; the CUDA and PJRT plugins stay post81's): a compile for
+  compile-only GPUs that states no tuning (its options or XLA_FLAGS name neither autotune level 0 nor complete
+  stored autotune results) neither reads nor writes JAX's persistent cache, so a program XLA compiled untuned is
+  never stored under the key a device's tuned compile reads.
+- Dew requires its JAX build 0.12.0.1.post90 (Python alone; the CUDA and PJRT plugins stay post81's): Mosaic GPU
+  issues tcgen05's products of fp32 shared-memory operands as TF32 (`.kind::tf32`), which Dew's Blackwell kernels
+  do not select yet, and a compile ahead that requires its autotune results keys its programs as its device's
+  compile does.
 - Dew requires its JAX build 0.12.0.1.post87 (Python alone; the CUDA and PJRT plugins stay post81's): a run under
   a profiler or dumping XLA's programs reads the Mosaic GPU lowerings and kernel certifications an unprofiled run
   stored, where it lowered and certified them afresh.

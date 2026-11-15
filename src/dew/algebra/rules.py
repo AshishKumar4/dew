@@ -37,6 +37,7 @@ from egglog import (
     vars_,
 )
 
+from dew._cache import ALGEBRA
 from dew.algebra import terms
 from dew.algebra.terms import Term
 
@@ -680,7 +681,10 @@ register(Rules.declared("stable", "bounded", _stable(),
                         "docs/design/algebra.md §1.5; the log-sum-exp fold, feat/attention-derived 12f9398ba",
                         dev=True))
 register(Rules.declared("linear", "reorders", _linear(), "docs/design/algebra.md §1; ledger 1308"))
-register(Rules.declared("joined", "reorders", _joined(), "docs/design/algebra.md §1; ledger 1308"))
+register(Rules.declared("joined", "reorders", _joined(),
+                        "docs/design/algebra.md §1; ledger 1308; the rule-set survey of 2026-11-14: it "
+                        "changes no shipped program, and the pass runs 12% slower without it (13,604 "
+                        "passes)"))
 
 
 def heads(primitive: str, operands: Sequence[str | None]) -> bool:
@@ -727,9 +731,35 @@ def reorderable(region: terms.Region) -> bool:
 def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]:
     """The rule sets a program's numerics admit: every set under default numerics, the `exact` ones alone
     under the accurate numerics (`precision="accurate"`); the dev-time sets (`Rules.dev`) only where `dev`,
-    whose choice measures each candidate's error instead."""
+    whose choice measures each candidate's error instead; none the pass leaves out (`dew._cache.Passes`'
+    `without`, a receipt's arm)."""
     return tuple(rules for rules in RULES.values()
-                 if (dev or not rules.dev) and (dev or not accurate or rules.rounding == "exact"))
+                 if (dev or not rules.dev) and (dev or not accurate or rules.rounding == "exact")
+                 and admits(rules))
+
+
+ARMS: dict[str, Rules] = {}
+"""Each derivation's own set a receipt's arm may leave out (`program.passes`' `without`) beside the registered
+sets, by name: one whose derivation still makes a program without it (`carry.CARRIED`: the split's traced
+forms). A derivation's defining set (`derive.DECOUPLED`, a scan's own identities, `linear_scan`'s, which no
+`Rules` holds) makes its program, which no arm has without it, and a dev-time set runs at dev time alone:
+neither is an arm's."""
+
+
+def armed(sets: Rules) -> Rules:
+    """`sets`, a derivation's own, nameable by a receipt's arm (`ARMS`)."""
+    ARMS[sets.name] = sets
+    return sets
+
+
+def nameable() -> frozenset[str]:
+    """The sets a receipt's arm may leave out: every registered set but a dev-time one, and each `ARMS`."""
+    return frozenset(name for name, sets in RULES.items() if not sets.dev) | frozenset(ARMS)
+
+
+def admits(sets: Rules) -> bool:
+    """Whether the pass runs `sets` (none an arm leaves out, `dew._cache.Passes`' `without`)."""
+    return sets.name not in ALGEBRA.value.without
 
 
 def admitted_names(accurate: bool) -> tuple[str, ...]:

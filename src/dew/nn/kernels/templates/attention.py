@@ -745,16 +745,19 @@ class Capped(tuning.FieldHook):
 
 @dataclasses.dataclass(frozen=True)
 class Biased(tuning.FieldHook):
-    """`score_mod`'s logits (the scaled logits where None) plus a bias as a score hook, its parameter the
-    tile's keys' `[1, k]` (a `Kind.KEY` one: ALiBi's slope times each key's place) or its entries' `[q, k]` (a
-    `Kind.TILE` one: a dense bias), added after a softcap as `reference_attention` adds its bias: equal for
-    equal inner hooks (`Capped`); its call reads its inner hook alone (`tuning.FieldHook`)."""
+    """`score_mod`'s logits (the scaled logits where None) plus a bias as a score hook, its parameters the
+    bias's terms: the tile's keys' `[1, k]` (a `Kind.KEY` one: ALiBi's slope times each key's place), its
+    entries' `[q, k]` (a `Kind.TILE` one: a dense bias), or its queries' `[q, 1]` and keys' `[1, k]` (a
+    `Kind.QUERY` and a `Kind.KEY` one: `dew.nn.attention.SeparableBias`, FoX's prefix at the query less the
+    key's). The terms are summed before the logits take them, so a logit adds their difference and not each
+    one's magnitude, after a softcap as `reference_attention` adds its bias: equal for equal inner hooks
+    (`Capped`); its call reads its inner hook alone (`tuning.FieldHook`)."""
 
     score_mod: Callable | None = None
 
-    def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array, bias: jax.Array) -> jax.Array:
+    def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array, *terms: jax.Array) -> jax.Array:
         capped = logits if self.score_mod is None else self.score_mod(logits, q_pos, k_pos)
-        return capped + bias
+        return capped + functools.reduce(operator.add, terms)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1375,6 +1378,20 @@ def whole(count: int, block: int) -> int:
     return -(-count // block) * block
 
 
+WIDEST_POWER = 256
+"""The widest head a TMA family's launch pads to a power of two (`head_width`): past it, a power of two
+pads an absorbed MLA key's 576 columns to 1024."""
+
+
+def head_width(width: int) -> int:
+    """The head width a TMA family's launch tiles (`padded_call`'s `widths`): a power of two to
+    `WIDEST_POWER` (`power_of_two`), whole groups of 64 columns past it, an absorbed MLA key's 576 (its
+    latent's 512 and its rotary 64) and its value's 512 as they are, which a copy loads whole (a tiled
+    box's dimensions, `mosaic.Family.copy_extent`). 64 is a 128-byte swizzle's columns of a 16-bit dtype,
+    the Mosaic mainloop's only operands (`attention_mosaic_program.refused`'s 'dtype')."""
+    return power_of_two(width) if width <= WIDEST_POWER else whole(width, 64)
+
+
 def _padded(param: Param, queries: int, keys: int, value_width: int, *, widened: bool = True) -> jax.Array:
     """A hook parameter at the padded call's shape, in fp32 as the kernels compute a score or output hook
     (its gradient returns in its own dtype), in its own where not `widened` (a prologue's, which takes it as
@@ -1444,18 +1461,19 @@ class PaddedCall:
 
 def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
                 block: int, table: jax.Array | None = None, *, query_block: int | None = None,
-                by_position: bool = False) -> PaddedCall:
+                by_position: bool = False, widths: Callable[[int], int] = power_of_two) -> PaddedCall:
     """A call's one padding for every mainloop of the template (`PaddedCall`): its queries and keys at
     whole `block`s (a backend's largest tile), its queries at whole `query_block`s instead where a launch
-    walks no key block of its own over them (an inference forward's), its head widths at powers of two, its
-    spans an interval a query unless the caller's programs read them `by_position` (`KeySpans.per_span`). A
-    paged call's (`table`, its page table) `key` and `value` are its pools `[KV, P, page, D]`, flattened,
-    padded in their widths alone: its keys are its table's slots, whole blocks where its page is."""
+    walks no key block of its own over them (an inference forward's), its head widths at powers of two
+    (`widths`; a TMA family's `head_width`), its spans an interval a query unless the caller's programs
+    read them `by_position` (`KeySpans.per_span`). A paged call's (`table`, its page table) `key` and
+    `value` are its pools `[KV, P, page, D]`, flattened, padded in their widths alone: its keys are its
+    table's slots, whole blocks where its page is."""
     queries, width = query.shape[1], query.shape[3]
     page = None if table is None else key.shape[2]
     keys, value_width = (key.shape[1] if table is None else table.shape[1] * key.shape[2]), value.shape[-1]
     padded_q, padded_k = whole(max(queries, 1), query_block or block), whole(max(keys, 1), block)
-    padded_d, padded_dv = power_of_two(width), power_of_two(value_width)
+    padded_d, padded_dv = widths(width), widths(value_width)
     if table is not None and keys % block:
         # A row's pages padded to whole blocks with page 0, whose slots no span of the call reaches.
         if block % key.shape[2]:

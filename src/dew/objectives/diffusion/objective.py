@@ -617,8 +617,13 @@ class DiffusionObjective(Objective[Ratio]):
 
     def _drawn_denoiser(self, key: jax.Array, encoders) -> Variables:
         """The denoiser drawn over the conditions `encoders` encode, mask and masked image beside them
-        where the inputs hold a mask."""
-        conditions = self.encode(encoders)
+        where the inputs hold a mask. Encoders held as their shapes alone (a resumed run's start, which its
+        restore fills) encode as the shapes they make, zeros of them: a draw reads its inputs' shapes."""
+        if any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(encoders)):
+            conditions = jax.tree.map(lambda shape: jnp.zeros(shape.shape, shape.dtype),
+                                      jax.eval_shape(self.encode, encoders))
+        else:
+            conditions = self.encode(encoders)
         if self.inputs.mask is not None:
             conditions = {**conditions, "mask": jnp.zeros((1, *self.latent_shape[:-1], 1)),
                           "masked_image": jnp.zeros((1, *self.latent_shape))}

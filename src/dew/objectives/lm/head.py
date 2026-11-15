@@ -13,6 +13,7 @@ more (`dew.training.memory.recompute_more`), reading the head the objective repo
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import ClassVar, Literal
 
 from flax import linen as nn
@@ -40,6 +41,10 @@ class HeadedObjective(Objective[Loss, Effects]):
 
     head_chunks: int
     head_tile: tuple[int, int] | None
+
+    untraced: ClassVar[Mapping[str, str]] = {
+        "_head_matrices": "what its head's last trace found of each model's output table (`fused_head`), "
+                          "whose fusing the key holds as its programs run it (`program_key`'s `head_fused`)"}
 
     head_fused: bool = True
     """Whether a tiled head scored for its weighted sums takes their gradient in its forward

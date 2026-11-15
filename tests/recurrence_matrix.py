@@ -10,7 +10,7 @@ them, with the kernel the cell names (`generation.chosen`):
 Its output, final memory and every operand's gradient are held to its family's independent oracle at the
 cell's dtype (check 1; docs/design/testing.md, kernel-templates.md 9), the recurrence a token at a time in
 float64 the truth: the upstream's own code where the family has a release (fla's for the delta rule's forms,
-mamba_ssm's for the rated scan: the release a port of it reproduces, `selection.Kernel.upstream`), live in
+mamba_ssm's for the rated scan, `FORM_RELEASES`), live in
 the GPU tier's reference interpreters (`DEW_FLA_PYTHON`'s, `DEW_MAMBA_PYTHON`'s), else the recurrence a token
 at a time. Dew's own chunk math is no cell's reference: a cell's distance from it is reported beside the
 verdict, with the forms the call took. What a kernel serves is the route's own: the step traced under the
@@ -56,8 +56,7 @@ norm), Kimi Linear's decay a key dimension with its output norm, a step write ga
 and Mamba-2's rated scan with its skip."""
 
 OPS = {op.choice: op for op in (recurrence_chunk.GATED_DELTA, recurrence_chunk.SCAN)}
-"""The chunked op's selectors by their choice's name, each declaring its kernels and the upstream its port
-reproduces (`selection.Kernel.upstream`)."""
+"""The chunked op's selectors by their choice's name, each declaring its kernels."""
 
 CHOICES = frozenset(OPS)
 """The generation.CHOICES entries the family's cells run (row 184): the chunked op's selectors'."""
@@ -69,6 +68,11 @@ route (the cell asserts it): a kernel added to an op is the matrix's without a s
 FLA_LAYERS = {"gated delta net": "gdn", "kimi delta attention": "kda"}
 """fla's own layer each delta rule form is (`delta_rule_support.FLA_LAYER_SIDE`): Qwen3.5's gated delta net
 and Kimi Linear's."""
+
+FORM_RELEASES = {**dict.fromkeys(FLA_LAYERS, "fla"), "rated scan": "mamba_ssm"}
+"""The upstream library each form's family has a release of (testing.md: a cell's oracle is that release's
+own code): fla's layers for the delta rule's forms, mamba_ssm's scan for Mamba-2's rated scan; the step
+write gate's form has none."""
 
 
 def _fla(named: dict[str, str], leaves: dict, cotangents: tuple, starts) -> dict:
@@ -85,8 +89,8 @@ def _mamba(named: dict[str, str], leaves: dict, cotangents: tuple, starts) -> di
 
 
 UPSTREAMS = {"fla": _fla, "mamba_ssm": _mamba}
-"""Each upstream library a port reproduces (`selection.Kernel.upstream`), run on a cell's stacked draws in its
-GPU tier reference interpreter."""
+"""Each upstream library a form's family has a release of (`FORM_RELEASES`), run on a cell's stacked draws in
+its GPU tier reference interpreter."""
 
 RECORDED = {"fla": Path(__file__).resolve().parent / "fixtures" / "fla" / "matrix_seeded.npz"}
 """Each upstream's recording of the cells a host without its GPU tier reference judges (a CPU lane's
@@ -177,11 +181,6 @@ def _step(case: dict[str, str], kernel: str):
     return with_gradients(ours)
 
 
-def _port(case: dict[str, str]):
-    """`case`'s form's port: its op's kernel reproducing an upstream (`selection.Kernel.upstream`)."""
-    return next(kernel for kernel in OPS[_op(FORMS[case["form"]])].kernels if kernel.upstream)
-
-
 def _wide(results):
     """A call's output and final memory in at least fp32, as its cotangents are drawn (float64 in the truth,
     which widens them): the cast's pullback rounds them to the call's own dtypes."""
@@ -205,11 +204,15 @@ def _routed(case: tuple[tuple[str, str], ...], kernel: str) -> frozenset | None:
 
 def _reference(case: dict[str, str]) -> str:
     """`case`'s family's independent oracle at its dtype: the upstream's own code (`upstream <library>`,
-    `UPSTREAMS`) where the family has a release, as its port reproducing it takes the call, else the
-    recurrence a token at a time ('token': a step write gate's form, which no release runs)."""
-    port = _port(case)
-    taken = _routed(tuple(case.items()), port.name) or frozenset()
-    return f"upstream {port.upstream}" if any(kernel == port.name for _, kernel in taken) else "token"
+    `UPSTREAMS`) where its form's family has a release (`FORM_RELEASES`) and the run's declaration admits
+    that release's products for the dtype (`recurrence_chunk.upstream_precision`: fp32's TF32 at no more than
+    the default), whatever kernel the cell names; else the recurrence a token at a time ('token': a step
+    write gate's form, which no release runs, and a call declared above what the release computes,
+    testing.md). Taken from whether Dew's port routed the call, a released family's cell would have dropped
+    its upstream wherever the port refused for any other reason (row 6150)."""
+    release = FORM_RELEASES.get(case["form"])
+    taken = release is not None and recurrence_chunk.upstream_precision(case["dtype"])
+    return f"upstream {release}" if taken else "token"
 
 
 def supported(case: dict[str, str]) -> bool:
@@ -271,10 +274,10 @@ TPU_CASES = (
 
 
 def _upstream(named: dict[str, str], block: int, *, first: int = 0):
-    """The upstream's own computation of `named`'s cell at its dtype (`upstream_support.upstream_arm`): the
-    port's upstream's (`UPSTREAMS`) on the cell's stacked draws, read back a draw at a time, the same tree as
-    the cell's own step, up to `UPSTREAM_SEEDS` past `first`."""
-    run, starts = UPSTREAMS[_port(named).upstream], _starts(named)
+    """The upstream's own computation of `named`'s cell at its dtype (`upstream_support.upstream_arm`): its
+    form's release's (`FORM_RELEASES`, `UPSTREAMS`) on the cell's stacked draws, read back a draw at a time,
+    the same tree as the cell's own step, up to `UPSTREAM_SEEDS` past `first`."""
+    run, starts = UPSTREAMS[FORM_RELEASES[named["form"]]], _starts(named)
 
     def run_block(drawn):
         # The draw's arrays alone: a static field (`Chunk.held`) is no operand of the upstream's.

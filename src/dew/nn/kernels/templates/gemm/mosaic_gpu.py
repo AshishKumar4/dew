@@ -217,12 +217,12 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       ahead, `Family.loads_ahead`, beside the one consumed and those whose products the family keeps in
       flight, `Family.in_flight`); a tile that cannot stage that deep gives way to the next
       narrower or shorter one, or a shallower step.
-    - Cluster: where grouped and a group's rows span at least as many row tiles as the family's cluster
-      takes (`Family.cluster`: a pair on warpgroup MMA), that many multiprocessors a cluster, running row
-      tiles of one group that load its matrix block once between them (multicast), CUTLASS's and
-      cuBLASLt's pair on an H100; each multiprocessor's tile, stages and staged bytes as alone, its
-      legality unchanged. On layouts whose products span a pair (tcgen05's 2-SM MMA, which the caller
-      tries first where the rows hold its two row tiles, `paired_first`), every tile the pair's.
+    - Cluster: where the call's rows (a group's on average, a kernel gradient's output rows) hold a tile's
+      on a family whose cluster takes a pair (`Family.cluster`), a pair of multiprocessors whose row tiles
+      load the block they share once (a matrix, a kernel gradient's cotangent: cuBLASLt's cluster on the
+      4B's up dW read 35% less from device memory, its tensor pipe 98.7% busy against 82.4%, M-EM-48),
+      each multiprocessor's tile as alone. On layouts whose products span a pair (tcgen05's 2-SM MMA,
+      tried first where the rows hold its two row tiles, `paired_first`), every tile the pair's.
     - Band: the planar snake's column tiles a band (`resources.band`), the rows' and the columns' blocks
       balanced over a wave or, grouped, wider while a wave spans each group's row tiles whole, a
       cluster's tiles one program's.
@@ -371,11 +371,12 @@ def _balanced_side(layouts: tuple, consumers: int, role: int, most_rows: int) ->
 def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, programs: int, rows: int,
             width: int, multiprocessors: int, grouped: bool) -> Tiles:
     """`derived`'s tile of a shape and step on `layout`: a pair of multiprocessors a cluster runs two row
-    tiles of one group where its layout's loads multicast and a group averages a tile's rows, which then
-    read its matrix's blocks once; a pair is two consumers' (`Tiles`), so a one-consumer tile, the
+    tiles of one group where its layout's loads multicast and the call's rows (a group's on average, a
+    kernel gradient's output rows) hold a tile's, which then read the block they share once (a product's
+    matrix, a kernel gradient's cotangent); a pair is two consumers' (`Tiles`), so a one-consumer tile, the
     fallback, runs alone; a layout whose products span a pair (`mosaic.Transport.pairs_product`, tcgen05's
     2-SM MMA) runs every tile on its pair."""
-    multicast = grouped and consumers > 1 and rows >= block_m
+    multicast = consumers > 1 and rows >= block_m
     cluster = layout.cluster if layout.pairs_product or multicast else 1
     band = resources.band(multiprocessors * programs, block_m, block_n, width // block_n,
                           -(-rows // (block_m * cluster)) if grouped else None, cluster=cluster)
@@ -2250,10 +2251,13 @@ def _tgmm_scheduled(index, *, groups: tuple, operands: tuple, tail: tail_of.Tail
              if family.pairs_product else
              {'ring_0': (lhs_gmem.at[depth], rows_block), 'ring_1': (rhs_gmem.at[columns], rows_block)}
              if k_major else
-             {name: (gmem.at[:, extent], row_block) if table is None else (gmem, gathered_rows(table, block))
-              for name, gmem, table, extent, block in zip(('ring_0', 'ring_1'), (lhs_gmem, rhs_gmem),
-                                                          table_gmems, (depth, columns), (m_i, n_i),
-                                                          strict=True)})
+             # A gathered operand's block this program's own, as its view's extent (`depth`, `columns`: a
+             # pair's program's half of the pair's rows).
+             {name: (gmem.at[:, extent], row_block) if table is None
+              else (gmem, gathered_rows(table, extent.start // width_of))
+              for name, gmem, table, extent, width_of in zip(('ring_0', 'ring_1'), (lhs_gmem, rhs_gmem),
+                                                             table_gmems, (depth, columns),
+                                                             (tiles.block_m, width), strict=True)})
     if scale_gmems is not None:
         # Its depth rows' scales and its columns', a step's row of each at the tile's (`step_scales`).
         views['row_scales'] = (scale_gmems[0].at[:, depth], row_block)

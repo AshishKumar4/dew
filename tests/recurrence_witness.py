@@ -392,17 +392,30 @@ def key_pairs(rows: Iv, k, exponents: Exponents, lane: Lane, scale: float = 1.0)
 
 
 def key_diagonal(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
-    """`algebra.key_diagonal_pairs` `[C, C]` under a decay a key dimension, the pairs within each row's
-    sub-chunk at or before it (zero elsewhere; a strict system's diagonal the caller masks), each its own
-    decay: `sum_k r_ik k_jk exp2(E_ik - E_jk)`, each term the row times the key rounded, then times its decay
-    (`between`), the multiply an add may fuse, and the terms' sum over every key block within one sum's
-    bound of them (a key block's sum and its adds into the total, at most as many roundings as the width's
-    terms)."""
+    """`algebra.key_diagonal_bands` `[C, C]` under a decay a key dimension, the pairs within each row's
+    sub-chunk at or before it (zero elsewhere; a strict system's diagonal the caller masks): `sum_k r_ik k_jk
+    exp2(E_ik - E_jk)`, each pair's decay the product of its tokens' own (`algebra.token_decays`, `between`
+    of each token against the one before), rounded a factor at a time from the row's own token back
+    (`pair_e = pair_(e - 1) a_(i - e + 1)`), each term the row times the key rounded, then times its decay,
+    the multiply an add may fuse, and the terms' sum over every key block within one sum's bound of them (a
+    key block's sum and its adds into the total, at most as many roundings as the width's terms)."""
     exact, bound = exponents.exact, exponents.bound
     size = np.shape(k)[0]
     tokens = np.arange(size)
     placed = ((tokens[:, None] // SUB) == (tokens[None, :] // SUB)) & (tokens[:, None] >= tokens[None, :])
-    decay = between(exact[:, None, :], bound[:, None, :], exact[None, :, :], bound[None, :, :], lane)
+    # Each token's own decay against the one before, `own[t - 1]` token `t`'s.
+    own = between(exact[1:], bound[1:], exact[:-1], bound[:-1], lane)
+    lo, hi = np.zeros((size, size, *exact.shape[1:])), np.zeros((size, size, *exact.shape[1:]))
+    lo[tokens, tokens] = hi[tokens, tokens] = 1.0
+    # Each row's pair so far, from its own token back.
+    pair_lo, pair_hi = np.ones(exact.shape), np.ones(exact.shape)
+    for e in range(1, SUB):
+        rows_e = tokens[tokens % SUB >= e]
+        found = fp32(mul(Iv(pair_lo[rows_e], pair_hi[rows_e]), Iv(own.lo[rows_e - e], own.hi[rows_e - e])),
+                     lane)
+        pair_lo[rows_e], pair_hi[rows_e] = found.lo, found.hi
+        lo[rows_e, rows_e - e], hi[rows_e, rows_e - e] = found.lo, found.hi
+    decay = Iv(lo, hi)
     keyed = fp32(mul(Iv(rows.lo[:, None, :], rows.hi[:, None, :]), point(np.asarray(k)[None, :, :])), lane)
     terms = fused(mul(keyed, decay), lane)
     terms = where(placed[:, :, None], terms, point(np.zeros(terms.lo.shape)))

@@ -240,9 +240,11 @@ def config() -> list[str]:
     from dew.registry import runs
 
     kinds = {runs.paths[name].partition(":")[0] for name in runs.paths}
+    # The release contract a run's config re-exports (`dew.config.release`) lives below it, in interop.
     modules = {dew.config, *(importlib.import_module(f"dew.config.{info.name}")
                              for info in pkgutil.iter_modules(dew.config.__path__)),
-               *(importlib.import_module(module) for module in kinds)}
+               *(importlib.import_module(module) for module in kinds),
+               importlib.import_module("dew.interop.release_record")}
     listed = {cls for module in modules for cls in vars(module).values()
               if inspect.isclass(cls) and dataclasses.is_dataclass(cls) and cls.__module__ == module.__name__}
     pending = [runs[name] for name in runs]

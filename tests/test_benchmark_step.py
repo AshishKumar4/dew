@@ -150,6 +150,10 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     assert row["finite"] and np.isfinite(row["loss"])
     assert row["measured_steps"] == 2 and row["fixed_batch"] is fixed_batch
     assert row["ms_per_step"] > 0 and row["p50_ms"] > 0
+    # The timed window's parts, each read with its host dispatch, and every synced step's own time.
+    window, synced = row["window_ms_series"], row["synced_ms_series"]
+    assert len(window) == len(row["window_dispatch_ms_series"]) == len(synced) == 2
+    assert all(ms > 0 for ms in (*window, *synced))
     try:
         counted = models.build_objective(case).training_flops(None, models.global_batch(case))
     except MissingFlopsCount:
@@ -261,3 +265,108 @@ def a_cases_measured_peak_holds_at_least_the_bytes_xla_planned(tmp_path):
     row = peak_row(tmp_path, "cuda", "--profile-dir", str(tmp_path / "traces"), "--profile-steps", "1")
     assert row["peak_device_bytes"] == row["peak_bytes_by_device"][0] >= row["planned_device_bytes"] > 0
     assert any((tmp_path / "traces/peak-run").rglob("*.xplane.pb"))
+
+
+@pytest.mark.parametrize(("steps", "parts"), [(30, [5] * 6), (2, [1, 1]), (7, [2, 1, 1, 1, 1, 1]), (1, [1])])
+def test_a_timed_window_is_cut_into_parts_that_hold_every_step(steps, parts):
+    """A timed window of `steps` is cut into at most six parts, none empty, holding every step once."""
+    assert load("benchmark_step").window_parts(steps) == parts
+
+
+def test_the_tuning_a_process_compiles_with_is_named_by_its_results_digest(tmp_path, monkeypatch):
+    """The per-fusion autotuning results XLA_FLAGS names are counted and digested by their names and contents:
+    a result added or changed changes the digest; no directory named, no digest."""
+    tool = load("benchmark_step")
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_enable_command_buffer=")
+    assert tool.tuning_digest() is None
+    monkeypatch.setenv("XLA_FLAGS", f"--xla_gpu_per_fusion_autotune_cache_dir={tmp_path}")
+    (tmp_path / "a.textproto").write_text("pick a")
+    first = tool.tuning_digest()
+    assert first["results"] == 1 and first["directory"] == str(tmp_path)
+    (tmp_path / "a.textproto").write_text("pick b")
+    changed = tool.tuning_digest()
+    (tmp_path / "b.textproto").write_text("pick c")
+    assert len({first["sha256"], changed["sha256"], tool.tuning_digest()["sha256"]}) == 3
+
+
+def test_a_device_samplers_summary_holds_each_gpus_span_and_every_clock_event_reason_any_sample_held():
+    """The GPUs sampled under a window's load summarized per GPU: the samples' count, each reading's least
+    and greatest, and the clock event reasons any sample held, or'd, GpuIdle (between steps) not among
+    them."""
+    sampler = load("benchmark_step").DeviceSampler()
+    import datetime
+
+    sampler.lines = ("2026/11/14 16:00:00.000, 0, 1410, 144.0, 45, 0x0000000000000001\n"
+                     "2026/11/14 16:00:01.000, 0, 1980, 410.5, 51, 0x0000000000000001\n"
+                     "2026/11/14 16:00:01.250, 0, 1755, 690.25, 58, 0x0000000000000004\n"
+                     "2026/11/14 16:00:01.500, 0, 1830, 650.0, 57, 0x0000000000000000\n")
+    window = (datetime.datetime(2026, 11, 14, 16, 0, 0, 500000), datetime.datetime(2026, 11, 14, 16, 0, 2))
+    # The idle sample before the window is not among its samples.
+    assert sampler.summary(window) == {"0": {"samples": 3, "sm_mhz": [1755.0, 1980.0],
+                                             "power_w": [410.5, 690.25], "temperature_c": [51.0, 58.0],
+                                             "event_reasons": "0x4"}}
+    assert sampler.summary()["0"]["samples"] == 4
+    sampler.lines = ""
+    assert sampler.summary(window) is None
+
+
+def test_a_windows_parts_are_stamped_as_each_becomes_ready_whether_dispatch_or_device_is_slower():
+    """Each part's stamp is its last step's readiness, read by a thread as the part is dispatched: a step
+    whose dispatch is the slower (its work done before the next is dispatched) reads each part's own time,
+    none 0, where awaiting the parts after the whole dispatch reads the first part as all of it."""
+    import time
+
+    tool = load("benchmark_step")
+
+    def step(state):
+        time.sleep(0.02)  # the host's dispatch, slower than the device's work
+        return state + 1, np.float32(state), True
+
+    *_, parts, started = tool.timed_parts(step, 0, [2, 2, 2])
+    assert [size for size, _, _ in parts] == [2, 2, 2]
+    assert all(seconds >= 0.03 for _, seconds, _ in parts), parts
+    # The host's dispatch was the slow part: each part's dispatch takes its two steps' sleeps.
+    assert all(sent >= 0.03 for _, _, sent in parts), parts
+    assert started <= time.perf_counter()
+
+
+def test_a_stalled_part_keeps_what_each_thread_was_doing_while_it_ran_and_a_steady_window_keeps_none():
+    """While a window runs, every thread's stack is sampled; of a part that took 1.5 times its parts' median
+    a step or more, the samples within it are kept, each stack once by thread with its count, the most sampled
+    first, so the stall says what the host was doing (Main, 2026-11-14: a round's first arm stalled on the
+    host, its cause unnamed); a window whose parts all ran alike keeps none."""
+    import time
+
+    tool = load("benchmark_step")
+
+    def stalling(state):
+        if state == 2:
+            time.sleep(0.15)  # the host held up mid-window, inside a function of its own name
+        time.sleep(0.02)
+        return state + 1, np.float32(state), True
+
+    with tool.StackSampler() as sampler:
+        *_, parts, started = tool.timed_parts(stalling, 0, [2, 2, 2])
+    [stall] = tool.stalled_stacks(parts, started, sampler.samples)
+    assert stall["part"] == 1 and stall["samples"] > 0 and stall["ms"] >= 80
+    counts = [stack["count"] for stack in stall["stacks"]]
+    assert counts == sorted(counts, reverse=True)
+    assert any(frame.endswith(":stalling") and stack["thread"] == "MainThread"
+               for stack in stall["stacks"] for frame in stack["frames"])
+    steady = [(2, 0.04, 0.04)] * 3
+    assert tool.stalled_stacks(steady, started, sampler.samples) == []
+
+
+def test_a_window_reads_invalid_where_any_of_its_steps_went_non_finite_not_only_its_last():
+    """A compiled step's windows keep every step's loss and finiteness on the device and read them once the
+    window is over: one step that went non-finite (its own flag, or its loss) makes the window's count
+    nonzero, though the steps after it recovered; the count is of the steps since the last read (audit,
+    2026-11-14: only the last step's finiteness was kept, so a NaN mid-window was timed)."""
+    import jax.numpy as jnp
+
+    compiled = load("benchmark_models").CompiledStep(None, None, 0.0)
+    for loss, finite in ((1.0, True), (float("nan"), True), (2.0, False), (0.5, True)):
+        compiled.taken.append((jnp.float32(loss), jnp.asarray(finite)))
+    assert compiled.nonfinite() == 2
+    compiled.taken.append((jnp.float32(0.4), jnp.asarray(1, dtype=bool)))
+    assert compiled.nonfinite() == 0

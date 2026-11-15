@@ -10,7 +10,7 @@ the release contract's (`dew.config.Release`):
 - the head's files are its decision format's (`dew.decision.formats`: Laya's, the joint head's, the slot
   readout's);
 - the assets are the task's tokenizer and generation config;
-- the record states what none of these files state (`dew.config.release`).
+- the record states what none of these files state (`dew.interop.release_record`).
 
 Every saver writes a plan, and every plan is written by `ReleasePlan.write`: `dew export`
 (`dew.interop.saved_sources.export_run`), `Pretrained.save`, `Decide.save_pretrained`,
@@ -30,7 +30,7 @@ import numpy as np
 from etils import epath
 
 from dew._files import write_atomically
-from dew.config.release import Release
+from dew.interop.release_record import Release
 from dew.interop.safetensors_io import (
     CONFIG_FILE,
     MAX_SHARD_SIZE,

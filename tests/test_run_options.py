@@ -19,6 +19,7 @@ walk, an option with no public path)."""
 
 import dataclasses
 import json
+from pathlib import Path
 
 import jax
 import numpy as np
@@ -173,14 +174,16 @@ WITNESSED_ON = {"DecideSettings": {
     "blocked": ("layout.blocks", "layout.segments", "layout.split", "specials"),
     "lettered": ("layout.labels",),
     "merged": ("layout.unit",),
-    "shared": ("layout.shared_state", "layout.siblings")}}
+    "shared": ("layout.shared_state", "layout.siblings")},
+    "ImageSettings": {"diffusion": ("process", "solver", "guidance")}}
 """The settings whose options are witnessed one an armada map task (`shards`), each on the run of `TASK_RUNS`
 that witnesses it, by its builder's name: a run's unset save and one option's alternatives a task, where the
 four DecideSettings runs witnessing in turn took 700 s on one core (row 2788). A decision run's head over a
 backbone that reads no blocks witnesses its layout's reads, order and framing; one over a backbone that reads
 blocks its segments, splits and the blocks it reads; a letter readout its labels; a tokenizer that merges its
 unit; rows over one state their sharing and siblings, which only such a row takes (the runs' turns: each
-option on the first run that witnessed it)."""
+option on the first run that witnessed it). ImageSettings' three, witnessed in turn, took 130 s (row 5773: the
+solver's 74, the process's 28, the guidance's 27, each beside the run's own unset save)."""
 
 ALTERNATIVE_UNITS = {"layout.split": 3}
 """The options whose alternatives are witnessed apart, by how many units: each its own unit's but the last's,
@@ -221,34 +224,31 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
     assert_every_option_witnessed(settings, witnessed)
 
 
-@pytest.mark.mesh(devices=8)
-@pytest.mark.shards(units=20, per_task=1)
-def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_line(tmp_path):
+def witnessed_in_shards(settings: type, root: Path, units_declared: int) -> None:
     """`test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line`'s witness of
-    DecideSettings, each option on the run that witnesses it (`WITNESSED_ON`), one option a unit of armada's
+    `settings`, each option on the run that witnesses it (`WITNESSED_ON`), one option a unit of armada's
     map tasks, or one of its alternatives (`ALTERNATIVE_UNITS`), that records what its run witnessed,
     and a judge that pools them (`map_judge.sharded`) and holds every option the runs hold assigned and
-    witnessed; run whole, the units in turn."""
-    from dew.decision.task import DecideSettings
-
-    runs = {builder.__name__: (builder, objective) for builder, objective in TASK_RUNS["DecideSettings"]}
-    assert set(WITNESSED_ON["DecideSettings"]) == set(runs), "each run of TASK_RUNS witnesses its options"
+    witnessed; run whole, the units in turn. `units_declared` is the test's `shards` mark's count."""
+    name = settings.__name__
+    runs = {builder.__name__: (builder, objective) for builder, objective in TASK_RUNS[name]}
+    assert set(WITNESSED_ON[name]) == set(runs), "each run of TASK_RUNS witnesses its options"
 
     def parts(option: str) -> list[slice]:
         count = ALTERNATIVE_UNITS.get(option, 1)
         return [slice(index, index + 1 if index + 1 < count else None) for index in range(count)]
 
-    units = [(name, option, part) for name, options in WITNESSED_ON["DecideSettings"].items()
+    units = [(run, option, part) for run, options in WITNESSED_ON[name].items()
              for option in options for part in parts(option)]
-    assert len(units) == 20, "the shards mark counts each option's units"
-    label = "the options DecideSettings' runs witness"
+    assert len(units) == units_declared, "the shards mark counts each option's units"
+    label = f"the options {name}' runs witness"
 
     def witness(start: int, stop: int) -> list[tuple[list[str], dict[str, str], bool, list[str], str]]:
         found = []
-        for name, option, part in units[start:stop]:
-            builder, objective = runs[name]
+        for run, option, part in units[start:stop]:
+            builder, objective = runs[run]
             options, failures, exports, holding = witnessed_on(
-                builder, objective, DecideSettings, tmp_path / f"{name}-{option}-{part.start}",
+                builder, objective, settings, root / f"{run}-{option}-{part.start}",
                 chosen=frozenset({option}), part=part)
             found.append((sorted(options), failures, exports, sorted(holding), option))
         return found
@@ -259,12 +259,30 @@ def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_l
     witnessed = [unit for payload in pooled for unit in payload]
     held = {option for *_, holding, _ in witnessed for option in holding}
     assigned = {option for _, option, _ in units}
-    assert held <= assigned, f"DecideSettings' options no run here is assigned: {sorted(held - assigned)}"
+    assert held <= assigned, f"{name}'s options no run here is assigned: {sorted(held - assigned)}"
     # Each unit's option is one its run holds, so it is set and judged there, never dropped unwitnessed.
     unheld = sorted({option for names, *_, option in witnessed if option not in names})
-    assert not unheld, f"DecideSettings' options assigned to a run that does not hold them: {unheld}"
-    assert_every_option_witnessed(DecideSettings, [(names, failures, exports)
-                                                   for names, failures, exports, *_ in witnessed])
+    assert not unheld, f"{name}'s options assigned to a run that does not hold them: {unheld}"
+    assert_every_option_witnessed(settings, [(names, failures, exports)
+                                             for names, failures, exports, *_ in witnessed])
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.shards(units=20, per_task=1)
+def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_line(tmp_path):
+    """DecideSettings' options witnessed one a map task (`witnessed_in_shards`)."""
+    from dew.decision.task import DecideSettings
+
+    witnessed_in_shards(DecideSettings, tmp_path, 20)
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.shards(units=3, per_task=1)
+def test_each_option_an_image_task_is_built_with_reaches_it_from_the_command_line(tmp_path):
+    """ImageSettings' options witnessed one a map task (`witnessed_in_shards`; row 5773)."""
+    from dew.inference.images import ImageSettings
+
+    witnessed_in_shards(ImageSettings, tmp_path, 3)
 
 
 def assert_every_option_witnessed(settings: type, witnessed: list[tuple[list[str], dict[str, str], bool]]):

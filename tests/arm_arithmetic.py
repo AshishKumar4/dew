@@ -154,13 +154,16 @@ class Truth:
     never run eagerly, so a seed's truth is the same whichever seed a process draws first (a map task's,
     DRAWS) and a large truth pays no eager run. A truth that does host work on its values (NumPy, torch, a
     fetch to the host) states it, `as_given`, and the gate runs it so; unstated, its trace fails at its
-    first seed, naming it (ledger 3198)."""
+    first seed, naming it (ledger 3198). On `device` where one is named (a GPU run's sizing, whose truths its
+    host computes as a prepare's do, the GPU's memory left to the arms)."""
 
-    def __init__(self, fn):
-        self.fn, self.run = fn, unrewritten(jax.jit(fn))
+    def __init__(self, fn, device=None):
+        self.fn, self.run, self.device = fn, unrewritten(jax.jit(fn)), device
 
     def __call__(self, *inputs):
-        return self.run(*inputs)
+        # On `device` where one is named: a GPU run's sizing computes its truths on the host, as a prepare
+        # does.
+        return self.run(*(inputs if self.device is None else jax.device_put(inputs, self.device)))
 
     @property
     def trace(self):

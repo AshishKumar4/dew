@@ -181,9 +181,20 @@ def pytest_runtest_makereport(item, call):
         # report reads a test's properties from where only one phase fails.
         outcome.get_result().user_properties.append(found)
         item.user_properties.append(found)
+    # A test whose judgement waits on units a later job draws (`map_judge.LaterUnits`, its asks written to
+    # `check1_wire.LATER`), or a GPU flow every failed cell of which does (`gpu_flow.CellsFailed`), the JUnit
+    # property `later`: red until that job judges it.
+    judge, flow = sys.modules.get("map_judge"), sys.modules.get("gpu_flow")
+    raised = None if call.excinfo is None else call.excinfo.value
+    if flow is not None and isinstance(raised, flow.CellsFailed):
+        asked = all(raised.asked)
+    else:
+        asked = judge is not None and isinstance(raised, judge.LaterUnits)
+    if asked:
+        outcome.get_result().user_properties.append(("later", True))
+        item.user_properties.append(("later", True))
     # A GPU flow's counts (`gpu_flow.REPORTED`), the JUnit property `cells`: a flow none of whose cells ran is
     # unqualified on the GPU it ran for, never green.
-    flow = sys.modules.get("gpu_flow")
     if call.when == "call" and flow is not None and flow.REPORTED:
         counted = ("cells", json.dumps({key: sum(run[key] for run in flow.REPORTED)
                                         for key in ("passed", "failed", "skipped")}

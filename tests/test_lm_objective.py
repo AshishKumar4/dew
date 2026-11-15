@@ -957,6 +957,20 @@ def test_evaluation_weights_follow_loss_role():
     np.testing.assert_array_equal(np.asarray(scores.weights), expected)
 
 
+def test_a_loss_role_run_stepped_on_a_batch_without_roles_is_refused():
+    """A run whose objective counts the assistant's targets alone (`loss_role`), trained on a batch the chat
+    data path did not lay out (no roles column), is refused by its trainer's step, a ValueError, where it
+    would count every target as the assistant's (row 6120)."""
+    trainer = Trainer(make_objective(loss_role=Role.ASSISTANT), optax.sgd(0.1), key=jax.random.key(0))
+    state = trainer.initial_state()
+    # The same rows with their roles compile its step: only the column's absence is refused, as it traces.
+    laid = assistant_batch(batch=BATCH)
+    trainer.compile(state, laid)
+    batch = {name: value for name, value in laid.items() if name != ROLES_KEY}
+    with pytest.raises(ValueError):
+        trainer.compile(state, batch)
+
+
 # --- z-loss: PaLM's log-partition penalty ---------------------------------
 
 

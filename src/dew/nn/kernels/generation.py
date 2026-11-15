@@ -178,20 +178,6 @@ def chosen(**kernels: str) -> Iterator[None]:
         yield
 
 
-@contextlib.contextmanager
-def unforced() -> Iterator[None]:
-    """Within the block, no kernel choice and no kernel config is forced (`chosen`'s choices and
-    `dew.nn.kernels.tuning.pinned`'s pins cleared): a trace that exists only for its shapes, whose
-    selections never run, takes each selector's own pick and each launch its own config, since nothing it
-    selects ever runs, so a choice or pin a caller forces for the programs that run is not met by a product
-    no launch takes or a launch its pin does not fit (Main, 11-14). Its one user is such a trace, a decode
-    cache's allocating forward (`dew.sampling.text._empty_cache`), which row 6082 deletes."""
-    from dew import _cache
-
-    with _cache.KERNEL_CHOICES(()), _cache.KERNEL_PINS(()):
-        yield
-
-
 def numerics() -> Numerics:
     """The run's numerics in effect (`run_precision`), the defaults outside any: JAX keys its trace and
     compile caches on them (`dew._cache.NUMERICS`), so a function jitted under one run's traces again
@@ -872,13 +858,16 @@ def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
     (its `utils._infer_arch`; a device that states none it takes for sm90's, and an sm80 kernel's cp.async
     waits do not lower), as a mesh of compile-only devices of the generation does (`compile_only_gpus`, whose
     `abstract_mesh` a caller holding one takes), so one GPU's programs trace on one abstract mesh (row
-    3915). JAX 0.12's abstract device states it (`AbstractDevice.compute_capability`)."""
+    3915). It states each device as JAX states a GPU's (`mesh._abstract_device` of a device of the `gpu`
+    platform: its kind, its multiprocessors as its cores, its compute capability), so a program traced on it
+    and one traced on compile-only or attached GPUs of the generation's own multiprocessors key one abstract
+    mesh (the Pallas lowering cache's, a step compiled ahead and its run's)."""
     from jax.sharding import AbstractDevice, AbstractMesh
     target = gpu_target(generation)
     version = capability(generation)
     if not target.generation.startswith('sm') or target.shared_limit is None or version is None:
         raise ValueError(f"no CUDA target for {generation!r}")
-    device = AbstractDevice(device_kind=target.device_kind, num_cores=None, platform='cuda',
+    device = AbstractDevice(device_kind=target.device_kind, num_cores=target.multiprocessors, platform='gpu',
                             compute_capability='.'.join(map(str, version)))
     return AbstractMesh(mesh.axis_sizes, mesh.axis_names, axis_types=mesh.axis_types, abstract_device=device)
 

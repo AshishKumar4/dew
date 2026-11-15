@@ -251,24 +251,45 @@ class NoKernels(ValueError):
 
 
 class Ungraphed(ValueError):
-    """A call whose program holds a conditional XLA:GPU may run as a command buffer's conditional node,
-    whose taken branch's kernels CUPTI does not record (`DeviceTime.kernels`): a B32 decode's attention on an
-    RTX PRO 6000 read 1.47 ms with command buffers, its reduces alone, and 4.27 ms without, the kernel's 2.81
-    ms among them (G4-LF-2). Its process keeps conditionals out of command buffers (`UNGRAPHED`)."""
+    """A jitted call timed in a process whose XLA:GPU runs programs as command buffers (`DeviceTime.kernels`):
+    CUPTI does not record a command buffer's conditional node's taken branch (a B32 decode's attention on an
+    RTX PRO 6000 read 1.47 ms with command buffers, its reduces alone, and 4.27 ms without, G4-LF-2), and on
+    an A100 a measured call after a run of recurrence calls failed outright with them ("Failed to check
+    stream capturing status", none without, the same calls memcheck-clean: row 4880). A timed call runs as a
+    program compiled without them (`options_of(UNGRAPHED_FLAG)`), or in a process that runs none
+    (`UNGRAPHED_FLAG`): a call compiled already (a `jax.stages.Compiled`) is refused in one that runs
+    them."""
 
 
-UNGRAPHED = "FUSION,CUBLAS,CUBLASLT,CUSTOM_CALL,CUDNN"
-"""The command buffer kinds a timing process's XLA_FLAGS name (`--xla_gpu_enable_command_buffer`), every
-default's but the conditional and the loop, whose kernels CUPTI reads only as plain launches (`Ungraphed`)."""
+UNGRAPHED_FLAG = "--xla_gpu_enable_command_buffer="
+"""The XLA_FLAGS entry of a process that runs no command buffers (`Ungraphed`), stated here, as this module
+loads into a timing worker beside any tree's Dew (tools/timing.py's `instrument`), the one statement of it a
+program's options read too (`options_of`)."""
 
 
-def graphs_conditionals() -> bool:
-    """Whether this process's XLA:GPU may run a conditional as a command buffer's node: its XLA_FLAGS name
-    no command buffer kinds, or name CONDITIONAL among them."""
-    from dew._devices import xla_flag
+def options_of(flags: str) -> dict[str, str]:
+    """The XLA options `flags`, in XLA_FLAGS' form, name: a program compiled with them runs as a process
+    given them does (`UNGRAPHED_FLAG`'s, `dew.nn.kernels.options.UNGRAPHED_OPTIONS`)."""
+    return dict(token.removeprefix("--").split("=", 1) for token in flags.split())
 
-    kinds = xla_flag("xla_gpu_enable_command_buffer")
-    return kinds is None or "CONDITIONAL" in kinds.upper().split(",")
+
+def graphs() -> bool:
+    """Whether this process's XLA:GPU may run programs as command buffers: unless its XLA_FLAGS leave it
+    none, each occurrence of the flag taken in turn as XLA's parser takes it (a list of kinds replacing the
+    one before it, a list of `+KIND`s and `-KIND`s amending it), XLA's defaults where no list is given."""
+    name = UNGRAPHED_FLAG.removesuffix("=")
+    kinds: set[str] | None = None
+    for token in os.environ.get("XLA_FLAGS", "").split():
+        named, _, value = token.partition("=")
+        if named != name:
+            continue
+        listed = [kind.strip().upper() for kind in value.split(",") if kind.strip()]
+        if not (listed and all(kind[0] in "+-" for kind in listed)):
+            kinds = set(listed)
+        elif kinds is not None:  # amending XLA's defaults leaves some kind running
+            for kind in listed:
+                (kinds.add if kind[0] == "+" else kinds.discard)(kind[1:])
+    return kinds is None or bool(kinds)
 
 
 class DeviceTime:
@@ -282,29 +303,38 @@ class DeviceTime:
     def __init__(self, cupti):
         self._cupti = cupti
         self._subscribed = False
-        self._joined: dict[Callable, Callable] = {}
+        self._joined: dict[tuple[Callable, bool], Callable] = {}
         self._evicting: jax.Array | None = None
-        self._branched: dict[int, tuple[object, bool]] = {}
 
     def kernels(self, fn: Callable, *args, evicted: bool = False) -> tuple[KernelTime, ...]:
         """Each kernel one call of `fn(*args)` launched, in launch order, with its device milliseconds,
         once its output is ready. A call that launched none is refused (`NoKernels`): its time would read
-        as zero; so is a jitted call holding a conditional in a process that graphs them (`Ungraphed`),
-        whose branch CUPTI may not read. `evicted` runs the call behind the session's eviction in one
-        program (`behind`), its kernels left out, so its operands are read from memory, not the cache."""
-        if graphs_conditionals() and isinstance(fn, jax.stages.Wrapped) and self._conditional(fn, args):
-            raise Ungraphed(f"{fn} holds a conditional, which this process's XLA may graph as a command "
-                            f"buffer's node whose branch CUPTI does not record: set XLA_FLAGS="
-                            f"--xla_gpu_enable_command_buffer={UNGRAPHED} before JAX starts")
-        if not evicted:
+        as zero. In a process that runs command buffers (`graphs`), which CUPTI does not read whole, the
+        call runs as one program compiled without them (`program`), and a call compiled already (a
+        `jax.stages.Compiled`) is refused (`Ungraphed`). `evicted` runs the call behind the session's
+        eviction in one such program (`behind`), its kernels left out, so its operands are read from memory,
+        not the cache."""
+        if evicted:
+            if self._evicting is None:
+                self._evicting = eviction()
+            return self.behind(self.program(fn, evicted=True), self._evicting, *args)
+        if not graphs():
             return self._read(fn, *args)
-        if fn not in self._joined:
+        if isinstance(fn, jax.stages.Compiled):
+            raise Ungraphed(f"{fn} was compiled to run as this process's command buffers, which CUPTI does "
+                            f"not read whole: set XLA_FLAGS={UNGRAPHED_FLAG} "
+                            "before JAX starts, or time the function it compiles")
+        return self._read(self.program(fn, evicted=False), *args)
+
+    def program(self, fn: Callable, evicted: bool) -> Callable:
+        """`fn`'s timed program (`kernels`): its call, behind an eviction where `evicted` (`behind`), compiled
+        without command buffers (`options_of(UNGRAPHED_FLAG)`), once a session."""
+        if (fn, evicted) not in self._joined:
             from dew.nn.kernels.options import owned_program
 
-            self._joined[fn] = owned_program(behind(fn))
-        if self._evicting is None:
-            self._evicting = eviction()
-        return self.behind(self._joined[fn], self._evicting, *args)
+            self._joined[fn, evicted] = owned_program(behind(fn) if evicted else fn,
+                                                      step=options_of(UNGRAPHED_FLAG))
+        return self._joined[fn, evicted]
 
     def behind(self, program: Callable, evicting: jax.Array, *args) -> tuple[KernelTime, ...]:
         """The kernels of one call of `program`, a call run behind a read of `evicting` (`behind`,
@@ -315,17 +345,6 @@ class DeviceTime:
         if not timed:
             raise NoKernels(f"{program} launched no kernel CUPTI timed apart from its eviction's")
         return timed
-
-    def _conditional(self, fn: jax.stages.Wrapped, args: tuple) -> bool:
-        """Whether `fn` compiled for `args` holds a conditional (`Ungraphed`), read once for each of its
-        specializations a session times: the program JAX traces for them (its static arguments' values among
-        what it is traced for), which JAX's cache gives again for the same ones."""
-        traced = fn.trace(*args)
-        found = self._branched.get(id(traced.jaxpr))
-        if found is None or found[0] is not traced.jaxpr:
-            found = traced.jaxpr, " conditional(" in (traced.lower().compile().as_text() or "")
-            self._branched[id(traced.jaxpr)] = found
-        return found[1]
 
     def seconds(self, fn: Callable, *args, evicted: bool = False) -> float:
         """One call's device seconds, its kernels' summed (`kernels`)."""

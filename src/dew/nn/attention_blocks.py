@@ -6,7 +6,7 @@ attention_flax.py, and a UNet stage's attention (`Stage`, `stage_attention`).
 import dataclasses
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Literal
 
 import jax
@@ -20,6 +20,7 @@ from dew.nn.dropout import Dropout
 
 from .attention import scaled_dot_product_attention
 from .flops import cross_attention_flops, projection_flops, self_attention_flops
+from .kv_cache import Opened, cache_variables, kept
 from .norms import LayerNorm, RMSNorm
 from .precision import at_least_fp32, float32_dot_general
 from .rope import rotate
@@ -94,28 +95,33 @@ CROSS_VALUE = "cross_value"
 """The cache variable of a cached call's context values, shaped as its keys."""
 
 
-def kept_context(module: nn.Module, rows: int, length: int, shapes: tuple[tuple[int, ...], tuple[int, ...]],
-                 dtype, context: jax.Array | None,
+def context_cache(rows: int, length: int, shapes: tuple[tuple[int, ...], tuple[int, ...]],
+                  dtype: jax.typing.DTypeLike) -> dict[str, Opened]:
+    """The leaves a cached call over a context keeps (`kept_context`): `rows` rows of its keys and values,
+    `length` tokens of each, `shapes` a key's and a value's trailing axes, in `dtype`."""
+    return {CROSS_KEY: Opened((rows, length, *shapes[0]), dtype),
+            CROSS_VALUE: Opened((rows, length, *shapes[1]), dtype)}
+
+
+def kept_context(module: nn.Module, spec: Mapping[str, Opened], context: jax.Array | None,
                  project: Callable[[jax.Array], tuple[jax.Array, jax.Array]]) -> tuple[jax.Array, jax.Array]:
     """The keys and values a cached call of `module` over a context reads, `[rows, tokens, *shape]`
-    each, `shapes` a key's and a value's trailing axes. A call that carries a context `[rows, tokens,
-    features]` projects them from it (`project`) and, once the cache is allocated, keeps them in
-    `CROSS_KEY` and `CROSS_VALUE`, padded to the `length` tokens the cache holds; a call without one
-    reads what the cache keeps. As with a decoder's own cache, the first cached call allocates the
-    cache and writes nothing. The call reads them as the cache keeps them, in `dtype`."""
-    allocated = module.has_variable("cache", CROSS_KEY)
-    keys = module.variable("cache", CROSS_KEY, jnp.zeros, (rows, length, *shapes[0]), dtype)
-    values = module.variable("cache", CROSS_VALUE, jnp.zeros, (rows, length, *shapes[1]), dtype)
+    each, kept as `spec` states them (`context_cache`). A call that carries a context `[rows, tokens,
+    features]` projects them from it (`project`) and keeps them in `CROSS_KEY` and `CROSS_VALUE`, padded
+    to the tokens the cache holds; a call without one reads what the cache keeps. The projections keep
+    their own dtype, which `spec` states: one of another is refused by the leaf's name (`kept`), not cast
+    to it."""
+    held = cache_variables(module, spec)
+    keys, values = held[CROSS_KEY], held[CROSS_VALUE]
     if context is None:
         return keys.value, values.value
-    width = context.shape[1]
+    length, width = keys.value.shape[1], context.shape[1]
     if width > length:
         raise ValueError(f"a cached call keeps at most {length} context tokens a row "
                          f"(CrossAttention.context_length), got {width}")
-    key, value = (projected.astype(dtype) for projected in project(context))
-    if allocated:
-        keys.value = jnp.pad(key, ((0, 0), (0, length - width)) + ((0, 0),) * len(shapes[0]))
-        values.value = jnp.pad(value, ((0, 0), (0, length - width)) + ((0, 0),) * len(shapes[1]))
+    key, value = project(context)
+    for name, leaf, written in ((CROSS_KEY, keys, key), (CROSS_VALUE, values, value)):
+        kept(leaf, jnp.pad(written, ((0, 0), (0, length - width)) + ((0, 0),) * (written.ndim - 2)), name)
     return key, value
 
 
@@ -213,16 +219,21 @@ class NormalAttention(nn.Module):
                                lambda tokens: (self._heads(k_name, tokens, k_norm, keyed=True),
                                                self._heads(v_name, tokens, keyed=True)))
 
-    def _cached(self, rows: int, dtype, context):
-        """The keys and values a cached call reads. A call that carries a context computes them
-        from it and, once the cache is allocated, keeps them; a call without one reads what the
-        cache keeps. As with a decoder's own cache, the first cached call allocates the cache and
-        writes nothing. The call reads the keys and values as the cache keeps them, in `dtype`."""
+    @nn.nowrap
+    def context_spec(self, rows: int, dtype: jax.typing.DTypeLike) -> dict[str, Opened]:
+        """The context's keys and values a cached call keeps for `rows` rows, in `dtype`
+        (`context_cache`)."""
         if self.cache_length is None:
             raise ValueError("a cached call keeps a context's keys and values, which this attention has "
                              "no cache_length for")
         shape = (self.key_heads, self.dim_head)
-        return kept_context(self, rows, self.cache_length, (shape, shape), dtype, context, self._keys_values)
+        return context_cache(rows, self.cache_length, (shape, shape), dtype)
+
+    def _cached(self, rows: int, dtype, context):
+        """The keys and values a cached call reads (`kept_context`): a call that carries a context
+        computes them from it and keeps them; a call without one reads what the cache keeps, in
+        `dtype`."""
+        return kept_context(self, self.context_spec(rows, dtype), context, self._keys_values)
 
     @nn.compact
     def __call__(self, x, context=None, freqs_cis=None, mask=None, key_value_seq_lengths=None,
