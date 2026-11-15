@@ -130,6 +130,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   memory. `AheadTarget.capacity_gib` is that memory, and `AheadOfTime.capacity` the limit the plan held to.
 
 
+- Dew requires its JAX build 0.12.0.1.post95 (Python alone; the CUDA and PJRT plugins stay post81's): a compile for
+  compile-only GPUs is told apart as JAX builds their client (a `CompileOnlyPyClient` of the `gpu` platform), so
+  one that states no tuning reads and writes no persistent cache entry as post92 meant, and one a host's own GPUs
+  compile (and autotune) caches as any.
 - Dew requires its JAX build 0.12.0.1.post94 (Python alone; the CUDA and PJRT plugins stay post81's): the persistent
   compilation cache keys a Mosaic GPU kernel without its source locations, its module read with its dialect, so a
   program holding one is read by another process that compiles it (it keyed apart wherever the kernel's locations
