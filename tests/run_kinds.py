@@ -83,18 +83,21 @@ ROWS = {"windows": {"pack": None}, "packed": {"pack": "first-fit", "bins": 2},
 (their segment ids apart), or one document a row, padded (`presets.lm`'s `segments=1`)."""
 
 
-def lm(root: Path, drawn: bool, *, rows: str = "windows", reading: str = "memory") -> RunConfig:
+def lm(root: Path, drawn: bool, *, rows: str = "windows", reading: str = "memory",
+       dtype: str | None = "float32") -> RunConfig:
     """A tiny decoder's language-model run over a token store, its rows laid as `rows` names (`ROWS`, its
     store of documents, an end of text every seventh token, where they are packed or padded), read as
-    `reading` names, its training rows passed through a random filter where `drawn`."""
+    `reading` names, its training rows passed through a random filter where `drawn`; its model's `dtype`
+    stated, or none (None), so the run's precision derives it (`RunConfig.numerics_fields`)."""
     corpus = write_token_files(root / "tokens", 40 * SEQ, 8 * SEQ, eos_id=None if rows == "windows" else 0)
 
     def windows(path, *, drawn: bool):
         chain = TokenFiles(path).pipe(presets.lm, None, seq_len=SEQ, batch=None, **ROWS[rows])
         chain = chain.random_filter_map(MostlyKept()) if drawn else chain
         return chain.batch(8).read(reading).loading(Loading(workers=0))
-    return LMRunConfig(model=ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1,
-                                                                "num_heads": 2, "dtype": "float32"}),
+    fields = {"emb_features": 16, "num_layers": 1, "num_heads": 2,
+              **({} if dtype is None else {"dtype": dtype})}
+    return LMRunConfig(model=ModelConfig("causal_transformer", fields),
                        data=windows(corpus.train, drawn=drawn), validation=windows(corpus.val, drawn=False))
 
 
