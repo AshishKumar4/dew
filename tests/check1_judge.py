@@ -104,6 +104,9 @@ def _pooled_draws(label: str, references: int):
                           held)
     if refused is not None:
         SWITCHED.append({"label": label, "refused": refused})
+    for start, stop, payload in pieces:
+        if short := sorted({len(draws.mine) for draws in payload["draws"]} - {stop - start}):
+            raise PoolRefused(f"{label}: the record of seeds {start} to {stop} holds {short} of them", start)
     pooled = [functools.reduce(_Draws.joined, (payload["draws"][index] for _, _, payload in pieces))
               for index in range(references)]
 
