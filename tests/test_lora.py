@@ -664,6 +664,30 @@ def _adapted(model, tree, *, contracted=1, rank=2, alpha=4.0, seed=0):
     return adapter, adapter.model, adapted_tree, adapter.merge(adapted_tree)
 
 
+def test_an_adapter_served_quantized_adds_its_float_update_to_its_quantized_base():
+    """A LoRA fine-tune quantized after training for serving (`quantize_for_serving`, Qwix's PTQ) quantizes
+    its base's product alone: the served output is the quantized base's, the same layer served without its
+    adapter, plus the adapter's update in float, its factors stored as they trained, where the adapter's
+    product fed Qwix's PTQ factors no quantized tree held and the call raised."""
+    from dew.nn.precision import FP32_SUMS
+    from dew.quantization import Quantization, quantize_for_serving
+
+    model = _BranchHost(nn.Dense(6))
+    x = jnp.asarray(np.random.RandomState(0).randn(3, 8), jnp.float32)
+    tree = nn.unbox(model.init(jax.random.key(0), x))
+    adapter, adapted, adapted_tree, _ = _adapted(model, tree)
+    served, served_tree = quantize_for_serving(adapted, adapted_tree, Quantization(), x)
+    base, base_tree = quantize_for_serving(model, tree, Quantization(), x)
+    factors = adapted_tree["params"]["proj"]
+    for factor in ("lora_A", "lora_B"):
+        np.testing.assert_array_equal(served_tree["params"]["proj"][factor], factors[factor])
+    # The update as a quantized model's float products sum, as Qwix's do (`FP32_SUMS`).
+    with jax.default_matmul_precision(FP32_SUMS):
+        update = lora._low_rank(nn.Dense(6), x, factors["lora_A"], factors["lora_B"],
+                                adapter.scale(adapter.targets[("params", "proj")]), (1,), rowwise=False)
+    np.testing.assert_array_equal(served.apply(served_tree, x), base.apply(base_tree, x) + update)
+
+
 CLIPPED_SEEDS = 64
 """The clipped adapter site's reference-only sizing, including its input and factor gradients."""
 
