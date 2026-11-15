@@ -15,8 +15,11 @@ the stability suite holds the mainloop under its regimes there (tests/test_recur
 import collections
 import dataclasses
 import functools
+import json
+import math
 import types
 from collections.abc import Callable
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -1976,19 +1979,34 @@ def _dealt(units: list, tasks: int, task: int) -> list:
     return [each for name in names for each in parts[int(name)]]
 
 
-IDENTITY_TASKS = {'sm80': 3, 'sm86': 3, 'sm89': 3, 'sm90': 40, 'sm100': 44, 'sm120': 2}
-"""The tasks a target's identity units are dealt among (`_dealt`), a sharding size like a CI group count:
-dealt by the kernels a config lowers, not yet by their ladders' rungs, which only a walk counts, a task holds
-up to twice a target's mean, so its mean is about 60 s (jsf-6547e: sm90's tasks 16 to 171 s at 28, sm100's
-13 to 157 at 32; sm89's whole 260 s, sm80's 221, sm86's 201, sm120's 175). Every gate group lowered took
-13,478 s of train 878's CI, twelve of its tasks past the train's bound."""
+IDENTITY_TEST = "test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes"
+"""The identity test's name, by which the durations record keys its tasks (`identity_tasks`)."""
+
+
+@functools.cache
+def identity_tasks(target: str) -> int:
+    """The tasks `target`'s identity units are dealt among (`_dealt`), a sharding size like a CI group count,
+    from the record of the gate's own tasks (`ci.durations_record`, folded from main's CI): their seconds over
+    half the group target (.armada.json's), as a task dealt by the kernels a config lowers, not yet by its
+    ladders' rungs, which only a walk counts, holds up to twice its target's mean (jsf-6547e: sm90's tasks
+    16 to 171 s at 28, sm100's 13 to 157 at 32); one for a target the record holds none of, which the next
+    fold sizes. Every gate group lowered took 13,478 s of train 878's CI, twelve of its tasks past the train's
+    bound; a table of the counts by target raised KeyError at a new target's collection (row 6645)."""
+    from tool_support import load
+
+    ci, root = load("ci", "tools/armada"), Path(__file__).resolve().parents[1]
+    task = f"tests/{Path(__file__).name}::{IDENTITY_TEST}[{target}-"
+    seconds = sum(value for node, value in ci.durations_record(root / ci.session.DURATIONS).items()
+                  if node.startswith(task))
+    bound = json.loads((root / ".armada.json").read_text())["target"]
+    return max(1, math.ceil(2 * seconds / bound))
 
 
 @pytest.mark.parametrize('target, task', [pytest.param(target, task, id=f'{target}-{task}')
                                           for target in gate_generations(scoped=True)
-                                          for task in range(IDENTITY_TASKS[target])])
+                                          for task in range(identity_tasks(target))])
 def test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes(target, task):
-    """The `task`-th share of `target`'s identity units (`_identity_units`, dealt among its `IDENTITY_TASKS`,
+    """The `task`-th share of `target`'s identity units (`_identity_units`, dealt among its `identity_tasks`,
     `_dealt`), each launch's ladder walked (`_walked`) and each config's kernels lowered afresh through their
     real names (`_named_bodies`, a config once however many ladders hold it): one name is one body across
     every config, each ladder holding its case's tiles beside its rungs, and along a ladder one body keeps one
@@ -1998,7 +2016,7 @@ def test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes(target,
     lowered: dict[tuple, dict[str, str]] = {}
     with generation.assumed(facts), report.refusals():
         for label, bound, tiles, kind, pulled, launch, _ in _dealt(list(_identity_units(target)),
-                                                                     IDENTITY_TASKS[target], task):
+                                                                     identity_tasks(target), task):
             named = []
             for config in _walked(bound, tiles, kind, launch, facts):
                 if (label, pulled, config) not in lowered:
