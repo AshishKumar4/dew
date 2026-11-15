@@ -44,7 +44,8 @@ def file_of(name: str) -> Path:
     nothing then states its code."""
     names = name.split(".")
     for parts in range(len(names), 0, -1):
-        file = getattr(sys.modules.get(".".join(names[:parts])), "__file__", None)
+        module = sys.modules.get(".".join(names[:parts]))
+        file = None if module is None else vars(module).get("__file__")
         if file is not None and Path(file).is_file():
             return Path(file).resolve()
     raise ValueError(f"the loaded module {name} names no file of its code, so no record of this process "
@@ -57,7 +58,7 @@ def own_source(name: str | None) -> bool:
     Dew's digest does not hold (`dew.training.identity.Process.sources`), or the script the process runs.
     Read once a loaded module (`_OWN`): a module loaded again is read again."""
     if name == "__main__":
-        return getattr(sys.modules[name], "__file__", None) is not None
+        return vars(sys.modules[name]).get("__file__") is not None
     if name is None or name not in sys.modules:
         return False
     module = sys.modules[name]

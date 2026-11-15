@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 from reader_support import resumed_changes, saved_after_one
 
+from dew import _position
 from dew._records import ADDED, earlier_fields
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
@@ -246,8 +247,9 @@ def test_a_position_saved_before_held_code_resumes_an_unchanged_run_exactly(tmp_
         return compile(pipeline, read="indexed", loading=READ).train(DataPartition())
 
     saved = json.loads(saved_after_one(reader))
-    earlier = {**saved, "dew_data_plan": {name: value for name, value in saved["dew_data_plan"].items()
-                                          if name != "held"}}
+    place = saved[_position.ENVELOPE]
+    earlier = {_position.ENVELOPE: {**place, "plan": {name: value for name, value in place["plan"].items()
+                                                      if name != "held"}}}
     assert resumed_changes(reader(), json.dumps(earlier).encode()) == ()
 
 
@@ -267,10 +269,11 @@ def test_a_position_saved_with_held_code_in_its_code_list_resumes_an_unchanged_r
         return compile(pipeline, read="indexed", loading=READ).train(DataPartition())
 
     saved = json.loads(saved_after_one(reader))
-    plan = saved["dew_data_plan"]
+    place = saved[_position.ENVELOPE]
+    plan = place["plan"]
     appended = {name: value for name, value in plan.items() if name != "held"}
     appended["code"] = [[*code, *held] for code, held in zip(plan["code"], plan["held"], strict=True)]
-    position = json.dumps({**saved, "dew_data_plan": appended}).encode()
+    position = json.dumps({_position.ENVELOPE: {**place, "plan": appended}}).encode()
     assert resumed_changes(reader(), position) == ()
     module.write_text(SHIFT.format(by=10))
     importlib.reload(shift)
