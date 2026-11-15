@@ -446,9 +446,10 @@ def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
 
 
 def refused_state() -> frozenset:
-    """Every launch config this context's compiles refused (`refused`), with the kernels that spilled at it:
-    what a template's legality reads as it traces, so a trace held by its state (`dew._cache.traced_state`)
-    is traced again once a compile refuses another config."""
+    """Every launch config this context's compiles refused (`refused`), with the kernels refused at it
+    (`Binary.refused`: spilling, or their warpgroup MMAs serialized): what a template's legality reads as it
+    traces, so a trace held by its state (`dew._cache.traced_state`) is traced again once a compile refuses
+    another config."""
     with _GUARD:
         return frozenset(_registry().refused.items())
 
