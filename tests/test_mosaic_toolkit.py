@@ -697,6 +697,74 @@ def test_a_sum_of_products_of_two_forms_is_one_sum_in_either_order():
     np.testing.assert_array_equal(np.asarray(deferred), wide[2] @ wide[3])
 
 
+def _streamed_sums(a, b, c, *, interpret, case: str):
+    """Sums through one prepared-operand issuer (`operands.Issuer.summed`) on warpgroup MMA whose products of
+    three parts its input forms as the issuer takes them (base review 9f87ff66a's): `restaged`, a stream
+    staging `a` and then `2a` into the same three tiles, each times `b` (three parts), a product retired
+    before the next is formed: `3 a @ b`; `deferred`, a listed product whose left operand a callable forms
+    (`c`, a tile of one part) though its product's buffers are three, times `b`: `c @ b`; `scoped`, a stream
+    yielding `c @ c` and then `a @ b` whose right operand it reads from global memory as it yields it: `c @ c
+    + a @ b`."""
+    from dew.nn.kernels.templates import mosaic_sm90, operands, product
+
+    family = mosaic_sm90.FED  # one warpgroup, no producer
+    part = plgpu.SMEM((ISSUED, ISSUED), jnp.bfloat16)
+
+    def body(a_gmem, b_gmem, c_gmem, out_gmem):
+        def scoped(*refs):
+            held, rights, (c_smem,), buffers = refs[:3], refs[3:6], refs[6:7], refs[7:]
+            for ref, value in zip(rights, product.formed(b_gmem[...], 3), strict=True):
+                ref[...] = value
+            c_smem[...] = c_gmem[...]
+            right, one = operands.Parts(rights, jnp.float32), operands.Parts((c_smem,), jnp.bfloat16)
+            issuer = operands.Issuer(_Call(family, interpret), {"memory": buffers})
+
+            def staged(value):
+                for ref, each in zip(held, product.formed(value, 3), strict=True):
+                    ref[...] = each
+                return operands.Parts(held, jnp.float32)
+
+            if case == "restaged":
+                out_gmem[...] = issuer.summed(
+                    (("memory", staged(scale * a_gmem[...]), right) for scale in (1, 2)), (ISSUED, ISSUED),
+                    retired=True)
+            elif case == "deferred":
+                out_gmem[...] = issuer.summed([("memory", lambda: one, right)], (ISSUED, ISSUED))
+            else:
+                def stream():
+                    yield ("narrow", one, one)
+                    yield ("memory", staged(a_gmem[...]), b_gmem[...])
+
+                out_gmem[...] = issuer.summed(stream(), (ISSUED, ISSUED))
+
+        pl.run_scoped(scoped, *(part for _ in range(10)), collective_axes="wg")
+
+    out = jax.ShapeDtypeStruct((ISSUED, ISSUED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="streamed")(a, b, c)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("case", ["restaged", "deferred", "scoped"])
+def test_a_streams_three_part_products_are_each_issued_before_the_next_is_formed(case):
+    """Interpreted: products of three parts an input forms as the issuer takes them (`_streamed_sums`): a
+    stream's are each issued as it comes, before the next is formed or restaged into its tiles, and a
+    deferred operand is issued as its forming gives it; only a listed sum's, every operand formed before the
+    call, are summed a term at a time. Set aside past their stream's next, the first restaged product read
+    the second's operand (`4 a @ b`), a deferred one-part operand was counted as its buffers' three, and a
+    right operand formed in one product's scope was read in another's (base review 9f87ff66a: F1, F2, F3)."""
+    from reference_error import assert_fp32_reduction_bound
+
+    a, b = (x[0] for x in _termwise_operands())
+    c = jax.random.randint(jax.random.key(6), (ISSUED, ISSUED), -4, 4).astype(jnp.bfloat16)
+    wide = {name: np.asarray(x, np.float64) for name, x in (("a", a), ("b", b), ("c", c))}
+    sums = {"restaged": [("a", "b")] * 3, "deferred": [("c", "b")], "scoped": [("c", "c"), ("a", "b")]}[case]
+    expected = sum(wide[lhs] @ wide[rhs] for lhs, rhs in sums)
+    magnitudes = sum(np.abs(wide[lhs]) @ np.abs(wide[rhs]) for lhs, rhs in sums)
+    found = _streamed_sums(a, b, c, interpret=INTERPRETED, case=case)
+    assert_fp32_reduction_bound(found, expected, magnitudes, terms=ISSUED * 7)
+
+
 def test_groups_summed_together_take_a_three_part_products_terms_apart():
     """Traced for an H100: a group of a product of three parts summed by `summed_together`'s reader takes
     each of its six terms into an accumulator of its own, one at a time, as `summed` does (`_termwise`), not

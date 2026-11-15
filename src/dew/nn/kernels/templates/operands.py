@@ -163,19 +163,23 @@ class Issuer:
         ptxas held every block's fragments at once, an A100's scores backward at keys and values 256 wide
         spilling 280 bytes a thread (wide-kv at e1f928585); elsewhere a product a block, as listed."""
         termwise: dict[tuple[int, int], list] = {}
-
-        def issued_here():
-            # The products summed as they come; each of three parts set aside, by its form, for its terms'
-            # sums, its operands as they resolved (`_counted`).
+        if isinstance(products, Sequence):
+            # A listed sum's products of three parts set aside, by their form, for their terms' sums: each
+            # operand its caller formed before the call, which every term reads where it stands. A stream's
+            # are each issued before the next is formed, as they come: a stream may stage its next operand
+            # into the last one's buffers (`retired`), or form it within the scope the last one issues in.
+            entries = []
             for entry in self._entries(products):
-                counts, entry = self._counted(entry)
+                counts = self._counted(entry)
                 if counts is not None and max(counts) == 3:
                     termwise.setdefault(counts, []).append(entry)
                 else:
-                    yield entry
+                    entries.append(entry)
+            rest = iter(entries)
+        else:
+            rest = iter(self._entries(products))
 
         family, interpret = self.call.family, self.call.interpret
-        rest = issued_here()
         first = next(rest, None)
         if first is None:
             # Every product of three parts: their terms' sums alone.
@@ -260,19 +264,18 @@ class Issuer:
             total = total + value
         return total
 
-    def _counted(self, entry: Entry) -> tuple[tuple[int, int] | None, Entry]:
-        """`entry` (`_entries`') as it is issued, with how many parts each of its operands takes (`_count`),
-        staging nothing: None for a block of tiles, a scaled operand's product or one taking its left operand
-        in registers, which `summed` issues as they are. An operand formed later (a callable) is formed here
-        where its product has no buffers to stage it in, a tile in memory whose own parts are its count."""
+    def _counted(self, entry: Entry) -> tuple[int, int] | None:
+        """How many parts each of `entry`'s operands (`_entries`') takes as it is issued (`_count`), staging
+        nothing: None for a block of tiles, a scaled operand's product, one taking its left operand in
+        registers, and one of an operand formed later (a callable), whose parts only its forming states, all
+        of which `summed` issues as they come."""
         if isinstance(entry, product.Blocks):
-            return None, entry
+            return None
         name, lhs, rhs = entry
-        if isinstance(lhs, product.Scaled) or self._registered(name, lhs) is not None:
-            return None, entry
-        if name not in self.buffers:
-            lhs, rhs = (x() if callable(x) else x for x in (lhs, rhs))
-        return (self._count(name, lhs), self._count(name, rhs)), (name, lhs, rhs)
+        if (isinstance(lhs, product.Scaled) or self._registered(name, lhs) is not None
+                or callable(lhs) or callable(rhs)):
+            return None
+        return self._count(name, lhs), self._count(name, rhs)
 
     def _count(self, name: str, x) -> int:
         """How many parts `_operand` issues operand `x` of product `name` in: a tile in memory's own, an exact
@@ -324,7 +327,7 @@ class Issuer:
         apart, each awaited before the next (`apart`): a staging waits for the products in flight that may
         read its tile (`_settle`) within its group alone, so another group's product still reading the tile
         would read the new operand."""
-        counted = [[self._counted(entry) for entry in self._entries(group)] for group in groups]
+        counted = [[(self._counted(entry), entry) for entry in self._entries(group)] for group in groups]
         entries = [[entry for _, entry in found] for found in counted]
         triples = [[entry for entry in found if not isinstance(entry, product.Blocks)] for found in entries]
         # A group of a product of three parts summed as `summed` sums it (`_termwise`), its terms apart.
