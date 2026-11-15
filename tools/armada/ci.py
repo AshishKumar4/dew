@@ -2279,21 +2279,26 @@ COVERAGE_DEADLINE = 5400.0
 its files' coverage partial, which `coverage_report.report` refuses."""
 
 
-SCENARIO_SUITE = "tests/test_scenario_runs.py"
-"""The scenario suite (docs/design/testing.md): a short run a cell of each scenario its `SCENARIOS` registry
-holds, whose per-module coverage `coverage items --scenarios` measures (row 6118)."""
+SCENARIO_SUITE = ("tests/test_scenario_runs.py", "tests/test_decision_workflow.py")
+"""The scenario suite's files, as docs/design/testing.md names them: a short run a cell of each scenario its
+`SCENARIOS` registry holds, and the decision workflow's cells; `coverage items --scenarios` measures their
+per-module coverage (row 6118; train 878's review F2)."""
 
 
 def coverage_items(target: float, timings: dict, scenarios: bool = False) -> list[str]:
     """The plan's tasks for the oldest Python, as armada map items: each runs its files under coverage.py
     with the test cache off, its rows and data among its artifacts, by `COVERAGE_DEADLINE`. A check-1 site's
     map tasks run its code over every seed; its judge, which pools their draws, has none to pool here. With
-    `scenarios`, the scenario suite's tasks alone (`SCENARIO_SUITE`), each its part of that file."""
+    `scenarios`, the scenario suite's tasks alone (`SCENARIO_SUITE`), each running the suite's files it
+    held."""
     entries = [entry for entry in plan(target, timings)
                if entry["python"] == PYTHONS[0] and entry["split"] != COLLECT and "after" not in entry]
     if scenarios:
-        entries = [{**entry, "tests": SCENARIO_SUITE} for entry in entries
-                   if any(token.startswith(SCENARIO_SUITE) for token in entry["tests"].split())]
+        def held(entry: dict) -> list[str]:
+            tokens = entry["tests"].split()
+            return [name for name in SCENARIO_SUITE if any(token.startswith(name) for token in tokens)]
+
+        entries = [{**entry, "tests": " ".join(held(entry))} for entry in entries if held(entry)]
     return [f"mkdir -p {ARTIFACTS} && python3 tools/armada/ci.py task --python={entry['python']} "
             f"--tests='{entry['tests']}' --split='{entry['split']}' --out={ARTIFACTS}/rows.json --cache=off "
             f"--deadline={COVERAGE_DEADLINE:.0f} --coverage={ARTIFACTS}" for entry in entries]
