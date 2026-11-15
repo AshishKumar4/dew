@@ -581,6 +581,8 @@ def reached(python: str, rows: list[tuple[str, str]], kept: Container[tuple[str,
     here = os.getcwd()
 
     def keyed() -> tuple[dict[tuple[str, str], str], Callable[[str], str]]:
+        # A side's own reading: its digests, and whether a path is a build's output, its checkout's (review).
+        digests.built_input.cache_clear()
         common, reading = shared(python), Reading()
         alone: dict[str, str] = {}
 
@@ -596,7 +598,9 @@ def reached(python: str, rows: list[tuple[str, str]], kept: Container[tuple[str,
     try:
         os.chdir(base)
         then, single_then = keyed()
-        moved = {each: [item for item in last[each] if single_then(item) != single_now(item)]
+        # Each input as the key covers it (`inputs`: the test's own code whole, the lookups that found each
+        # module), so a changed lookup or the test's own change is a tier-one move (review).
+        moved = {each: [item for item in inputs(each[0], last[each]) if single_then(item) != single_now(item)]
                  for each, key in now.items() if then.get(each) != key}
     finally:
         os.chdir(here)
