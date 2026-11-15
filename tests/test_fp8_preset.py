@@ -366,7 +366,9 @@ def test_a_recipe_projection_of_rows_a_data_axis_splits_is_each_devices_own(expl
     numbers = (((2,), (0,)), ((), ()))
 
     def pulled(rows, matrix, cotangent):
-        with generation.run_precision(FP8), projection_role("mlp"):
+        # The recipe's kernel named and interpreted as an H100's: a launch reads its operands whole.
+        with (generation.run_precision(FP8), projection_role("mlp"),
+              generation.assumed("sm90", interpreted=True), generation.chosen(blockwise_fp8="mosaic")):
             value, pull = jax.vjp(lambda r, m: projections.dot_general(jax.lax.dot_general)(r, m, numbers),
                                   rows, matrix)
             return (value, *pull(cotangent))
