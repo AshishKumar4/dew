@@ -23,7 +23,7 @@ from reference_error import assert_as_exact
 from dew.nn import attention_kernels
 from dew.nn.attention import attention_case, scaled_dot_product_attention
 from dew.nn.kernels import generation, selection
-from dew.nn.kv_cache import PAGED, KVCache, KVStore, PagedCase
+from dew.nn.kv_cache import PAGED, KVCache, KVSpec, KVStore, PagedCase
 
 ROWS, CAPACITY, PAGE = 4, 512, 16
 LENGTHS = (1, 63, 300, 512)
@@ -96,7 +96,8 @@ class _Paged(nn.Module):
     @nn.compact
     def __call__(self, key, value, query, lengths, sinks):
         rows, _, kv_heads, width = key.shape
-        store = KVStore.open(self, KVCache(page_size=PAGE), rows, CAPACITY, kv_heads, width, key.dtype)
+        store = KVStore.open(self, KVSpec(KVCache(page_size=PAGE), rows, CAPACITY, kv_heads, width,
+                                          key.dtype))
         if not self.has_variable("cache", "written"):
             self.variable("cache", "written", lambda: True)
             return None

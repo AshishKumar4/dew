@@ -277,7 +277,7 @@ def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     roundings where XLA:CPU's reduction of the broadcast's transpose sums the N positions in order, and
     a program summing whole and one summing by shard each a product's sum, not a reduction XLA's CPU
     fusions sum one way in one program and another in the other (row 4520); a user's process sums it
-    so, as check 1 measures it (ledger 4882, Main 11-14: the blocked sum every CPU process's, where it
+    so, as check 1 measures it (ledger 4882: the blocked sum every CPU process's, where it
     was the suite's alone). A CPU running Dew's wide arithmetic (`WIDE_CPU_ARITHMETIC`, its tests) in no
     scope that states fp32 sums (`FP32_SUMS`) takes the one outer product summed in float64 and rounded
     once (`accumulated`). An accelerator, and a quantized model's trace, take the broadcast, whose

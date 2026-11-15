@@ -15,6 +15,7 @@ from flax import linen as nn
 from dew.nn.backbones.decoder_block import ReadsMixing
 from dew.nn.flops import counted_flops, parameter_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, PredictionPhase
+from dew.nn.kv_cache import CacheSpec, cache_of
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import scaled
 from dew.nn.protocols import (
@@ -109,6 +110,14 @@ class ParallelMixers(nn.Module):
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """The packed groups its branches declare (`dew.nn.protocols.ProjectionSites`)."""
         return declared_groups(*self.mixers)
+
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> CacheSpec:
+        """Each branch's decode cache for `rows` rows under the branch's name (`cache_of`), a branch that
+        keeps none left out."""
+        held = {name: cache_of(mixer, rows)
+                for mixer, (name, *_) in zip(self.mixers, self.branches, strict=True)}
+        return {name: spec for name, spec in held.items() if spec}
 
     def __call__(self, x, call: MixerCall = PLAIN_CALL, *, train: bool = False,
                  prediction_phase: PredictionPhase = 'ordinary',

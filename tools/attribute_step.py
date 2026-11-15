@@ -4,7 +4,7 @@
                                                   [--steps N] [--entry entry.json] [--module jit_step]
 
 `--trace` is a dew.Profiler directory (or a capture inside one); the newest capture holding
-`reports/hlo_stats.json` is read. Profile it with XLA_FLAGS=--xla_gpu_enable_command_buffer= :
+`reports/hlo_stats.json` is read. Profile it with `dew.telemetry.benchmark.UNGRAPHED_FLAG` in XLA_FLAGS:
 inside CUDA command buffers XProf attributes every kernel to its module and hlo_stats is empty.
 `--steps` is how many steps the capture traced; totals are divided by it.
 
@@ -62,7 +62,7 @@ from dew.telemetry.instrumentation import (
     hlo_instructions,
     reported_instruction,
 )
-from dew.telemetry.profile import report_table
+from dew.telemetry.profile import COMMAND_BUFFERS, report_table
 from dew.telemetry.trace import collective, device_events, overlap, program_of, union, window_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -339,8 +339,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
     reports = capture / "reports"
     rows = report_table(reports / "hlo_stats.json")[1]
     if not rows:
-        return {"capture": str(capture), "error": "hlo_stats.json has no ops: profile with "
-                "XLA_FLAGS=--xla_gpu_enable_command_buffer= so XProf can attribute kernels"}
+        return {"capture": str(capture), "error": COMMAND_BUFFERS}
     roofline = json.loads((reports / "roofline_model.json").read_text())
     roofline = roofline[0] if isinstance(roofline, list) else roofline
     # Dew's dense bf16 peak, the MFU denominator every run reports. XProf's roofline peak is a

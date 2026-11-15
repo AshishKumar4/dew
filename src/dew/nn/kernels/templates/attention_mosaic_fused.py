@@ -352,8 +352,8 @@ def _fused_called(launch: Callable, operands: tuple, stacked: tuple, *, copies: 
     dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))
     if not grouped:
         dk, dv = launch(*operands, dq)
-        return jax.freeze(dq).sum(axis=0), dk, dv
+        return mosaic.added_copies(dq), dk, dv
     dkv = mosaic.stacked_zeros(*stacked)
     launch(*operands, dq, *dkv)
     dk, dv = mosaic.stacked_read(dkv, stacked[1])
-    return jax.freeze(dq).sum(axis=0), dk, dv
+    return mosaic.added_copies(dq), dk, dv

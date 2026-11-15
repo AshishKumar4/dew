@@ -49,7 +49,6 @@ from dew.batch import (
 from dew.inputs.spec import Field
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
-from dew.nn.kernels import generation
 from dew.nn.kernels.options import program
 from dew.nn.kv_cache import (
     gather_cache_rows,
@@ -414,8 +413,8 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     """
     adapters = None if adapters is None else jnp.asarray(adapters, jnp.int32)
     batch, width = inputs.tokens.shape
-    held = (_empty_cache(model, params, batch, ops.depths, ops.record is not None, adapters) if cache is None
-            else cache)
+    held = (offloaded_like(model, empty_cache(model, params, batch, ops.depths, ops.record is not None,
+                                              adapters)) if cache is None else cache)
     if rounding is not None:
         held = with_rounding_keys(held, rounding)
     exposed = isinstance(model, Exposing)
@@ -466,25 +465,26 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     return state, last >= 0
 
 
-def _empty_cache(model: nn.Module, params: Variables, batch: int, depths: int, drafter: bool,
-                 adapters: jax.Array | None = None) -> Variables:
-    """A zeroed decode cache for `batch` rows, with the prediction depths' (`depths`) and the block
-    drafter's own (`drafter`) beside it, allocated under the rows' `adapters` (`DecoderState.adapters`),
-    as a forward allocates it. A decoder whose every mixer is tokenwise (`MLPMixer`) keeps no cache, and
-    its collection is empty."""
+def empty_cache(model: nn.Module, params: Variables, batch: int, depths: int, drafter: bool,
+                adapters: jax.Array | None = None) -> Variables:
+    """An empty decode cache for `batch` rows, with the prediction depths' (`depths`) and the block
+    drafter's own (`drafter`) beside it, opened as the model's holders state it (`Decoding.init_cache`,
+    which traces no forward) under the rows' `adapters` (`DecoderState.adapters`). A decoder whose every
+    mixer is tokenwise (`MLPMixer`) keeps no cache, and its collection is empty."""
     def initialized(method: str) -> dict:
-        # A forward traced for its cache's shapes alone, whose products never run (`generation.unforced`).
-        with generation.unforced():
-            _, mutated = model.apply(params, batch, method=method, mutable=["cache"],
-                                     **adapter_field(adapters))
+        _, mutated = model.apply(params, batch, method=method, mutable=["cache"], **adapter_field(adapters))
         return flatten_dict(dict(mutated["cache"])) if "cache" in mutated else {}
 
     cache = initialized("init_cache")
     for method in ("init_mtp_cache",) * bool(depths) + ("init_draft_cache",) * drafter:
         cache.update(initialized(method))
-    held = unflatten_dict(cache)
-    # An offloaded cache's keys and values in host memory, each layer's brought to the device as it runs.
-    return offloaded(held, model.kv_cache) if isinstance(model, Layered) else held
+    return unflatten_dict(cache)
+
+
+def offloaded_like(model: nn.Module, cache: Variables) -> Variables:
+    """`cache` with its keys and values in host memory where the model's layout offloads them, each
+    layer's brought to the device as it runs (`dew.nn.kv_cache.offloaded`)."""
+    return offloaded(cache, model.kv_cache) if isinstance(model, Layered) else cache
 
 
 def _context(model: nn.Module, params: Variables, updated: Mapping,
@@ -703,8 +703,8 @@ def _rebuilt(model: nn.Module, params: Variables, ops: DecodeOps, state: Decoder
     exposed, drafter = isinstance(model, Exposing), ops.record is not None
     (batch, width), rows = history.shape, jnp.arange(history.shape[0])[:, None]
     real = jnp.arange(width)[None, :] < following[:, None]
-    empty = with_rounding_keys_of(_empty_cache(model, params, batch, ops.depths, drafter, state.adapters),
-                                  state.cache)
+    fresh = empty_cache(model, params, batch, ops.depths, drafter, state.adapters)
+    empty = with_rounding_keys_of(offloaded_like(model, fresh), state.cache)
     answer, updated = model.apply(
         {**params, 'cache': empty}, history, coordinates=laid_out(history.shape, valid=real), decode=True,
         mutable=['cache', *(['embeddings'] if ops.depths else []),

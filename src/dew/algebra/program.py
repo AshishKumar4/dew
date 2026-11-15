@@ -15,7 +15,7 @@ import math
 import threading
 import time
 import weakref
-from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -94,12 +94,17 @@ class Rewrite:
 
 
 @contextlib.contextmanager
-def passes(on: bool = True, target: str | None = None) -> Iterator[None]:
+def passes(on: bool = True, target: str | None = None, without: Collection[str] = ()) -> Iterator[None]:
     """Within the block, the programs Dew compiles are rewritten (`on`) or not, priced for the GPU `target`
-    names (None: the process's own): a context of JAX's trace, so a program held across the switch traces
-    afresh (`dew._cache.ALGEBRA`). The accuracy gate holds it off for a reference arm and the float64
-    truth."""
-    with ALGEBRA(dataclasses.replace(ALGEBRA.value, on=on, target=target)):
+    names (None: the process's own), by every rule set but those `without` names (a receipt's arm, §1.6,
+    `rules.nameable`: a name no arm may leave out is refused, as an arm without it would measure nothing): a
+    context of JAX's trace, so a program held across the switch traces afresh (`dew._cache.ALGEBRA`). The
+    accuracy gate holds it off for a reference arm and the float64 truth."""
+    if unknown := sorted(set(without) - rules.nameable()):
+        raise ValueError(f"no arm leaves out {unknown}: an arm may leave out {sorted(rules.nameable())}; a "
+                         "dev-time set runs at dev time alone, and a derivation's defining set (decoupled, a "
+                         "scan's own identities) makes its program, which no arm has without it")
+    with ALGEBRA(dataclasses.replace(ALGEBRA.value, on=on, target=target, without=frozenset(without))):
         yield
 
 
@@ -263,7 +268,8 @@ _HOLDING = threading.Lock()
 
 def structure(window: jcore.Jaxpr) -> Hashable:
     """What a window's derivation (`_region`) reads of it: each input's type (its aval: shape, dtype, weak
-    type and placement, the sharding and memory its forms' values take); each equation's primitive, its
+    type and placement, the sharding and memory its forms' values take, as `terms.parameter_key` encodes an
+    abstract value); each equation's primitive, its
     parameters as a region holds them (`terms.parameters_key`), its operands (an input's or an earlier
     output's position, or a literal's value and type) and its outputs' types; and which values it yields.
     Two windows of one structure, their values named apart, derive one rewrite: every layer of a stack's,
@@ -273,16 +279,18 @@ def structure(window: jcore.Jaxpr) -> Hashable:
     def operand(atom) -> Hashable:
         if isinstance(atom, jcore.Literal):
             dtype, value = terms.held_bits(atom.val)
-            return dtype, value.shape, value.tobytes(), atom.aval
+            return dtype, value.shape, value.tobytes(), terms.parameter_key(atom.aval)
         return position[atom]
 
     equations = []
     for equation in window.eqns:
         equations.append((terms.parameters_key(equation.primitive, equation.params),
-                          tuple(map(operand, equation.invars)), tuple(var.aval for var in equation.outvars)))
+                          tuple(map(operand, equation.invars)),
+                          tuple(terms.parameter_key(var.aval) for var in equation.outvars)))
         for var in equation.outvars:
             position[var] = len(position)
-    return tuple(var.aval for var in window.invars), tuple(equations), tuple(map(operand, window.outvars))
+    return (tuple(terms.parameter_key(var.aval) for var in window.invars), tuple(equations),
+            tuple(map(operand, window.outvars)))
 
 
 def _deriving(accurate: bool, saturation: Saturation) -> Hashable:

@@ -80,7 +80,7 @@ from ..gemma3n import AltUp, clamped_predictions, rescale_to
 from ..host_memory import on_host
 from ..hyper_connections import Carried, HyperConnections, enter_streams, leave_streams, stream_head
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates_of
-from ..kv_cache import DecodeCursor, KVCache
+from ..kv_cache import CacheSpec, DecodeCursor, KVCache, put_opened
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
@@ -113,7 +113,7 @@ from ..rope import LongRopeScaling, Scaling
 from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, pipeline_stages
 from ..value_experts import ValueExperts
 from . import decoder_counts, decoder_refusals
-from .call_metadata import call_metadata
+from .call_metadata import call_metadata, prepared_embeddings
 from .decoder_block import (
     DECODER_REMAT,
     REMAT_POLICIES,
@@ -128,6 +128,7 @@ from .decoder_block import (
     remat_record,
     residual_normed,
 )
+from .decoder_cache import named_caches, trunk_cache
 from .decoder_fields import refuse_unbuildable, settle_fields, softmax_attention_layers
 from .decoder_stack import (
     DecoderBank,
@@ -1349,7 +1350,7 @@ class CausalTransformer(LinearProducts):
             raise ValueError("prediction depths need a sequence longer than their depth count")
         documents, given, given_valid = ((None, None, None) if coordinates is None else
                                          (coordinates.segments, coordinates.positions, coordinates.valid))
-        embeds = self._prepared(self.stream_embeddings(tokens), input_embeddings)
+        embeds = prepared_embeddings(self.stream_embeddings(tokens), input_embeddings)
         # A depth restricts its keys only where the caller's validity or a document boundary does. With
         # neither, every shifted pair is real, and no validity says that: an all-true array would make the
         # depth build a mask and drop off the fused kernel.
@@ -1521,20 +1522,15 @@ class CausalTransformer(LinearProducts):
                                 for layer in self.dspark.target_layers], axis=-1)
 
     def init_draft_cache(self, batch_size: int):
-        """Allocate the drafter's window caches, separately from the trunk's cache."""
+        """Open the drafter's window caches for `batch_size` rows, apart from the trunk's, as its stages
+        state them (`decoder_cache.named_caches`), tracing no forward."""
         assert self.dspark is not None
-        width = len(self.dspark.target_layers) * self.emb_features
-        self.draft(jnp.zeros((batch_size, 1, width), self.dtype or jnp.float32),
-                   jnp.zeros((batch_size,), jnp.int32), decode=True)
+        put_opened(self, named_caches(self.dspark_stages, batch_size))
 
     def init_mtp_cache(self, batch_size: int):
-        """Allocate the prediction depths' caches, separately from the trunk's cache."""
-        shape = ((batch_size, 1, self.emb_features) if self.mtp_hyper_connections is None else
-                 (batch_size, 1, self.mtp_hyper_connections.hc_mult, self.emb_features))
-        for block in self.mtp:
-            block(jnp.zeros(shape, self.dtype),
-                  jnp.zeros((batch_size, 1, self.emb_features), self.dtype), decode=True,
-                  prediction_phase="extend" if self.index_share_for_mtp_iteration else "ordinary")
+        """Open the prediction depths' caches for `batch_size` rows, apart from the trunk's, as the depths
+        state them (`decoder_cache.named_caches`), tracing no forward."""
+        put_opened(self, named_caches(self.mtp, batch_size))
 
     def hidden_states(self, tokens, **kwargs):
         """Return the final normalized states, without the vocabulary projection."""
@@ -1669,7 +1665,7 @@ class CausalTransformer(LinearProducts):
         """The stack's input: the tokens' scaled embeddings (or the caller's `input_embeddings`), their
         learned positions, the embeddings' norm and dropout; the unscaled embeddings a prediction depth
         reads sown where a caller opens their collection."""
-        x = constrain(self._prepared(self.scaled_embeddings(self.token_embeddings(tokens)),
+        x = constrain(prepared_embeddings(self.scaled_embeddings(self.token_embeddings(tokens)),
                                      input_embeddings), RESIDUAL)
         if self.position_embedding == 'learned':
             # The tokens' places as every layer reads them (`Coordinates`), whichever fields the
@@ -1693,7 +1689,7 @@ class CausalTransformer(LinearProducts):
         # computed only where a caller opens the collection, as a forward that
         # does not would trace a second input projection; init leaves it out.
         if not self.is_initializing() and self.is_mutable_collection("embeddings"):
-            prepared = self._prepared(self.stream_embeddings(tokens), input_embeddings)
+            prepared = prepared_embeddings(self.stream_embeddings(tokens), input_embeddings)
             self.sow("embeddings", "prepared", prepared,
                      reduce_fn=lambda _, value: value, init_fn=lambda: prepared)
         return x
@@ -1811,14 +1807,11 @@ class CausalTransformer(LinearProducts):
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         staged = stored_by_stage(self.variables)
         banked = () if staged else self.banked_collections()
-        allocating = not any(group_layers(name) for name in self.variables.get('cache', {}))
-        if decode and 'params' in banked and allocating:
-            # A decode over a store banked by run keeps the cache its layers allocate banked as the store
-            # keeps the weights, each run's layers one array under the run's name, as the run's scan carries
-            # it: every later call reads and writes it there, where a cache kept a layer at a time is
-            # stacked into the run's bank and cut apart again each call (at Qwen3-30B-A3B's layer shape, 8
-            # layers of 64 rows of 512 slots on an H100, 371 and 317 us a step, OM-1342-cache-base-2474a6e4c).
-            # A cache handed in a layer at a time goes back so.
+        held = self.variables.get('cache', {})
+        if decode and 'params' in banked and not any(group_layers(name) for name in held):
+            # A decode over a store banked by run that opens its cache opens it banked as `init_cache` does
+            # (`decoder_cache._banked_runs`), each run's layers' under the run's name, as the run's scan
+            # carries it; a cache handed in a layer at a time goes back so.
             banked = (*banked, 'cache')
         if stages == 1 and staged:
             if span is not None:
@@ -1976,20 +1969,26 @@ class CausalTransformer(LinearProducts):
         return jnp.result_type(streams.dtype, output.dtype)
 
     def first_layer_shapes(self) -> dict:
-        """Return the stack's first layer's variables as shape/dtype structs.
+        """Return the stack's first layer's variables as shape/dtype structs (`layer_shapes`)."""
+        return self.layer_shapes(0)
 
-        These are layer 0's variables, a bank's first row with the layer axis
-        dropped, or layer 0's variables completed by the bank's
+    def layer_shapes(self, run: int) -> dict:
+        """Return the first layer of the stack's run `run` (`groups`) as shape/dtype structs.
+
+        These are the layer's variables, a bank's first row with the layer axis
+        dropped, or the layer's variables completed by the bank's
         (`banked_collections`), or a stage-local store's first stage's first
-        row of the run that holds layer 0 (`StackView.stage_form`), on one
+        row of the run that holds the layer (`StackView.stage_form`), on one
         stage too. Nothing is read, fetched or sliced.
         """
         banked = self.banked_collections()
-        first = StackView(self.groups).bank_names()[0]
+        start, count = self.groups[run]
+        first = StackView(self.groups).bank_names()[run]
+        layer = f'layers_{start}'
         reader = self.variables.get('streaming', {}).get(first, {}).get('bank')
         if reader is not None:
             return reader.shapes()
-        stacked = self.groups[0][1] > 1
+        stacked = count > 1
 
         def shapes(leaf, drop: bool):
             return jax.ShapeDtypeStruct(leaf.shape[1:] if drop else leaf.shape, leaf.dtype)
@@ -1997,7 +1996,7 @@ class CausalTransformer(LinearProducts):
         variables = {}
         for collection, tree in self.variables.items():
             if collection in banked:
-                # A banked cache holds no entry for a first layer that caches nothing.
+                # A banked cache holds no entry for a layer that caches nothing.
                 if first in tree:
                     variables[collection] = jax.tree.map(
                         functools.partial(shapes, drop=stacked), tree[first])
@@ -2005,20 +2004,21 @@ class CausalTransformer(LinearProducts):
             held = {}
             if stacked and first in tree:
                 held = jax.tree.map(functools.partial(shapes, drop=True), tree[first])
-            if 'layers_0' in tree:
-                held = merge(held, jax.tree.map(functools.partial(shapes, drop=False), tree['layers_0']))
-            for name, run in tree.get('stages', {}).items():
+            if layer in tree:
+                held = merge(held, jax.tree.map(functools.partial(shapes, drop=False), tree[layer]))
+            for name, stage in tree.get('stages', {}).items():
                 layers = group_layers(name)
-                # A run that holds layer 0: a one-stage run its first group stacks, beside the leaves its
-                # stage-local state keeps on layer 0 itself (a frozen base joined in), or a pipeline's run
-                # where no layer 0 runs before it.
-                if layers is not None and layers.start == 0 and (stacked or 'layers_0' not in tree):
-                    # The stage axis, a run's own layer axis; a periodic run's layer 0 at its first position.
+                # A run that holds the layer: a one-stage run its group stacks, beside the leaves its
+                # stage-local state keeps on the layer itself (a frozen base joined in), or a pipeline's run
+                # where no such layer runs before it.
+                if layers is not None and layers.start == start and (stacked or layer not in tree):
+                    # The stage axis, a run's own layer axis; a periodic run's first layer at its first
+                    # position.
                     rows = 1 + (len(layers) > 1)
-                    if run_period(self.scan_keys, 0, len(layers)) > 1:
-                        run, rows = run['layers_0'], 2
+                    if run_period(self.scan_keys, start, len(layers)) > 1:
+                        stage, rows = stage['layers_0'], 2
                     held = merge(held, jax.tree.map(
-                        lambda leaf, rows=rows: jax.ShapeDtypeStruct(leaf.shape[rows:], leaf.dtype), run))
+                        lambda leaf, rows=rows: jax.ShapeDtypeStruct(leaf.shape[rows:], leaf.dtype), stage))
             if held:
                 variables[collection] = held
         return variables
@@ -2114,17 +2114,6 @@ class CausalTransformer(LinearProducts):
             context.reshape(*inputs_embeds.shape[:-1], self.num_layers, ple))
         return (context + table) * jnp.asarray(2.0 ** -0.5, context.dtype)
 
-    @staticmethod
-    def _prepared(x, input_embeddings):
-        """`x`, or in its place a caller's prepared `[B, S, D]` embeddings
-        (another encoder's outputs fused in), cast to the stream dtype."""
-        if input_embeddings is None:
-            return x
-        prepared = jnp.asarray(input_embeddings)
-        if prepared.shape != x.shape:
-            raise ValueError(f"input_embeddings are the whole {x.shape} sequence, got {prepared.shape}")
-        return prepared.astype(x.dtype)
-
     def output_table(self) -> OutputTable | None:
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables
         (`_head_table`). None where no matrix alone is the head: past a `head_transform` or a continuum
@@ -2163,16 +2152,25 @@ class CausalTransformer(LinearProducts):
                            scale=self._token_gains(), projection=projection)
 
     def init_cache(self, batch_size: int):
-        """Allocate a zeroed decode cache for `batch_size` sequences.
+        """Open the decode cache for `batch_size` sequences, every row empty.
 
             cache = model.apply(params, batch_size, method=CausalTransformer.init_cache,
                                 mutable=['cache'])[1]['cache']
 
-        It runs the forward pass in decode mode on a single dummy token, and
-        that token's keys are never written: the first decode-mode call
-        allocates the cache, and the calls after it write to it.
+        Each holder states its leaves (`cache_spec`), which its decode opens
+        and writes too, so no forward is traced; a decode over no cache opens
+        it so and writes nothing to it (`dew.nn.kv_cache.Opening`).
         """
-        self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
+        put_opened(self, self.cache_spec(batch_size))
+
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> CacheSpec:
+        """The trunk's decode cache for `rows` rows as its holders state it (`decoder_cache.trunk_cache`);
+        a bidirectional decoder, whose every token reads the whole sequence, keeps none."""
+        if not self.causal:
+            raise ValueError("a bidirectional decoder keeps no decode cache: its every token reads the whole "
+                             "sequence; prefill a canvas's prompt with its causal model")
+        return trunk_cache(self, rows)
 
     # The serving and training hooks (`dew.nn.protocols`).
 

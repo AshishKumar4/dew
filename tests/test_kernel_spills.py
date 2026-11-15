@@ -254,7 +254,8 @@ def test_a_handed_step_derives_for_its_target_on_a_gpu_that_runs_it_alone():
     from dew.training.ahead import AheadOfTime, Executable, handed
 
     canonical = gpu_target("sm90")
-    step = AheadOfTime("sm90", 1, {}, "", Executable(b"", ()), None, 0, 0, 0, 0, 0, {}, canonical)
+    step = AheadOfTime("sm90", 1, {}, "", Executable(b"", ()), None, 0, 0, 0, 0, 0, {},
+                       target=canonical)
     h200 = dataclasses.replace(canonical, device_kind="NVIDIA H200")
     with assumed(h200):
         with handed(step):

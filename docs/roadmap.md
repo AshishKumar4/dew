@@ -19,6 +19,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The kernel challenge's lessons in the templates. [5271]
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353, 5288]
 - Convolution repairs above their owner. [5665]
+- The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822, 5391]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -28,6 +29,9 @@ This page is generated from the maintainers' findings ledger as each change land
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product. [4860]
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5278, 5327]
 - Derived resources: tiles, registers, residency and issued work. [5567]
+- The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
+- Block-selected attention's other selections as mixers. [6301]
+- A Hopper kernel gradient's cluster along its output's columns. [6318]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm. [6030]
 - Exact on every path, every edge and every derivative order. [2656]
 - The suite's wall. [5478]
@@ -44,25 +48,32 @@ This page is generated from the maintainers' findings ledger as each change land
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [5450, 5625]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
+- Prepared_embeddings sits in call_metadata.py, the per-call data beside the residual, to keep causal_transformer.py under 2500 lines. [6189]
 
 ## Training and parallelism
 
-- Time to first step: the compile path's re-derivations. [5556, 5558, 6082]
+- Time to first step: the compile path's re-derivations. [5556, 5558, 5669]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
 - Training & Data's tests on check 1. [708]
 - XLA:CPU edges. [1591]
+- A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
 
 ## Data
 
 - Metamorphic run flows: a run equals its saved, reloaded and restarted self. [4511]
+- The diffusion kinds' starts keep no record and their refits trace again. [6297]
+- A distillation objective states no trace key, so its refits and warm starts trace their step again. [6303]
 
 ## RL and serving
 
+- Serving a LoRA fine-tune quantized after training. [6326]
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - Dory: the release qualified and its tests' oracles. [596]
 - Training and serving efficiency. [3330, 1880, 5292]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
+- A decoder computing in no dtype of its own. [6215]
+- Dew.nn.precision.correctly_rounded_divide lowers to ~210 ops a quotient. [6312]
 
 ## Algebra
 

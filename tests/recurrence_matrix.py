@@ -10,7 +10,7 @@ them, with the kernel the cell names (`generation.chosen`):
 Its output, final memory and every operand's gradient are held to its family's independent oracle at the
 cell's dtype (check 1; docs/design/testing.md, kernel-templates.md 9), the recurrence a token at a time in
 float64 the truth: the upstream's own code where the family has a release (fla's for the delta rule's forms,
-mamba_ssm's for the rated scan, `RELEASES`), live in
+mamba_ssm's for the rated scan, `FORM_RELEASES`), live in
 the GPU tier's reference interpreters (`DEW_FLA_PYTHON`'s, `DEW_MAMBA_PYTHON`'s), else the recurrence a token
 at a time. Dew's own chunk math is no cell's reference: a cell's distance from it is reported beside the
 verdict, with the forms the call took. What a kernel serves is the route's own: the step traced under the
@@ -69,7 +69,7 @@ FLA_LAYERS = {"gated delta net": "gdn", "kimi delta attention": "kda"}
 """fla's own layer each delta rule form is (`delta_rule_support.FLA_LAYER_SIDE`): Qwen3.5's gated delta net
 and Kimi Linear's."""
 
-RELEASES = {**dict.fromkeys(FLA_LAYERS, "fla"), "rated scan": "mamba_ssm"}
+FORM_RELEASES = {**dict.fromkeys(FLA_LAYERS, "fla"), "rated scan": "mamba_ssm"}
 """The upstream library each form's family has a release of (testing.md: a cell's oracle is that release's
 own code): fla's layers for the delta rule's forms, mamba_ssm's scan for Mamba-2's rated scan; the step
 write gate's form has none."""
@@ -89,8 +89,8 @@ def _mamba(named: dict[str, str], leaves: dict, cotangents: tuple, starts) -> di
 
 
 UPSTREAMS = {"fla": _fla, "mamba_ssm": _mamba}
-"""Each upstream library a form's family has a release of (`RELEASES`), run on a cell's stacked draws in its
-GPU tier reference interpreter."""
+"""Each upstream library a form's family has a release of (`FORM_RELEASES`), run on a cell's stacked draws in
+its GPU tier reference interpreter."""
 
 RECORDED = {"fla": Path(__file__).resolve().parent / "fixtures" / "fla" / "matrix_seeded.npz"}
 """Each upstream's recording of the cells a host without its GPU tier reference judges (a CPU lane's
@@ -204,12 +204,15 @@ def _routed(case: tuple[tuple[str, str], ...], kernel: str) -> frozenset | None:
 
 def _reference(case: dict[str, str]) -> str:
     """`case`'s family's independent oracle at its dtype: the upstream's own code (`upstream <library>`,
-    `UPSTREAMS`) where its form's family has a release (`RELEASES`), whatever kernel the cell names and
-    whether Dew's port of it takes the call, else the recurrence a token at a time ('token': a step write
-    gate's form, which no release runs). Held instead to the token oracle wherever Dew's port refused a call,
-    a cell of a released family would have dropped its upstream with no rule saying so (row 6150)."""
-    release = RELEASES.get(case["form"])
-    return "token" if release is None else f"upstream {release}"
+    `UPSTREAMS`) where its form's family has a release (`FORM_RELEASES`) and the run's declaration admits
+    that release's products for the dtype (`recurrence_chunk.upstream_precision`: fp32's TF32 at no more than
+    the default), whatever kernel the cell names; else the recurrence a token at a time ('token': a step
+    write gate's form, which no release runs, and a call declared above what the release computes,
+    testing.md). Taken from whether Dew's port routed the call, a released family's cell would have dropped
+    its upstream wherever the port refused for any other reason (row 6150)."""
+    release = FORM_RELEASES.get(case["form"])
+    taken = release is not None and recurrence_chunk.upstream_precision(case["dtype"])
+    return f"upstream {release}" if taken else "token"
 
 
 def supported(case: dict[str, str]) -> bool:
@@ -272,9 +275,9 @@ TPU_CASES = (
 
 def _upstream(named: dict[str, str], block: int, *, first: int = 0):
     """The upstream's own computation of `named`'s cell at its dtype (`upstream_support.upstream_arm`): its
-    form's release's (`RELEASES`, `UPSTREAMS`) on the cell's stacked draws, read back a draw at a time, the
-    same tree as the cell's own step, up to `UPSTREAM_SEEDS` past `first`."""
-    run, starts = UPSTREAMS[RELEASES[named["form"]]], _starts(named)
+    form's release's (`FORM_RELEASES`, `UPSTREAMS`) on the cell's stacked draws, read back a draw at a time,
+    the same tree as the cell's own step, up to `UPSTREAM_SEEDS` past `first`."""
+    run, starts = UPSTREAMS[FORM_RELEASES[named["form"]]], _starts(named)
 
     def run_block(drawn):
         # The draw's arrays alone: a static field (`Chunk.held`) is no operand of the upstream's.

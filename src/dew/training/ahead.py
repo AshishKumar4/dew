@@ -66,7 +66,7 @@ from jaxlib import xla_client
 from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
 from dew._devices import COMPILE_ONLY_MEMORY, device_memory
-from dew._records import JSON, record
+from dew._records import JSON, boolean, record
 from dew.batch import Batch
 from dew.nn.kernels import options
 from dew.nn.kernels.generation import (
@@ -110,9 +110,14 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-_UNTUNED = ("this step was compiled ahead into a file for %s GPUs without their tuned choices, XLA's "
-            "untuned program; a run's compile on such a GPU tunes it, and a job's prepare into the "
-            "persistent cache takes the choices such runs wrote")
+UNTUNED = ("this step was compiled ahead into a file for %s GPUs without their tuned choices, XLA's "
+           "untuned program, whose products ran up to 48 times slower on a GH200 (UB-4792-AHEAD-TIME): a run "
+           "handed it compiles its step on its GPUs as a run without a file does, and keeps their tuned "
+           "choices beside its compilation cache. To train from a file, compile it ahead over the GPU host's "
+           "own topology (--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY) with that host's compilation "
+           "cache, once a run there has tuned the step")
+"""What a step file compiled without its GPU kind's tuned choices (`AheadOfTime.tuned`) is said as, where it
+is saved and where a run is handed it (`dew.training.trainer.Trainer`)."""
 
 @functools.cache
 def compile_only_tpus(topology: str) -> tuple:
@@ -260,6 +265,12 @@ def _wheel_targets_registered() -> None:
         wheel.load()()
 
 
+class NotTheStepCompiledAhead(ValueError):
+    """A run handed a step compiled ahead (`AheadOfTime`) lowers its step, or its sampled step, to another
+    program than the one compiled: another config, data shape, rung or Dew, which the executable would not
+    run as the run's step (`AheadOfTime.taken`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class AheadProgram:
     """A program compiled ahead beside a step (`AheadOfTime.sampled`): its executable (`Executable`) and the
@@ -279,8 +290,9 @@ class AheadProgram:
         where that is another program than this one, and admitted as a compiled one is
         (`dew.communicators.admit`)."""
         if program_digest(lowered) != self.program:
-            raise ValueError("the sampled step compiled ahead is another program than the one this run "
-                             "compiles: compile it ahead from this run's config, with its inspection")
+            raise NotTheStepCompiledAhead(
+                "the sampled step compiled ahead is another program than the one this run compiles: compile "
+                "it ahead from this run's config, with its inspection")
         return self.executable.loaded(devices)
 
 
@@ -326,6 +338,11 @@ class AheadOfTime:
     planned_seconds: float | None = None
     """The seconds that search took, its derivations and every compile: the time a run spends planning
     before its first step on those GPUs."""
+    planned_parts: Mapping[str, float] = dataclasses.field(default_factory=dict)
+    """The seconds of that search's work by part, summed over its threads (a compile at once runs several):
+    JAX's traces (`traced`), the algebra's passes over the traced programs (`algebra`, `report.passes`),
+    JAX's lowerings (`lowered`) and XLA's compiles (`compiled`; the planner's reading,
+    `planning.spending`)."""
     capacity: int | None = None
     """The allocator's limit each target GPU holds the plan to, derived from the memory stated for it
     (`dew._devices.allocator_limit`); None for a TPU's, whose topology states its own."""
@@ -336,10 +353,6 @@ class AheadOfTime:
     built: BuildTarget | None = None
     """The target its executable was built for (`BuildTarget`), which a process loading it must be
     (`loaded`); None for a step compiled ahead before steps recorded it, which no process loads."""
-    tuned: bool = True
-    """Whether its compile took the GPU kind's tuned choices, as the device's own compile makes them: a step
-    compiled ahead into a file is XLA's untuned program there (`AheadTarget`), which its save and its load
-    say."""
     refusals: tuple = ()
     """The kernel launch configs its compiles found spilling and refused
     (`dew.nn.kernels.templates.report.refused_launches`), which a run handed the step refuses before it
@@ -359,8 +372,7 @@ class AheadOfTime:
         def load(executable: Executable) -> Callable[[], jax.stages.Compiled]:
             def loaded() -> jax.stages.Compiled:
                 found = jax.devices()
-                if self.built is not None:
-                    self.built.held(found)
+                self.held(found)
                 return executable.loaded(found)
             return loaded
 
@@ -386,24 +398,43 @@ class AheadOfTime:
                          "traces with the step's", differ, {axis: self.links[axis] for axis in differ})
         return self.links
 
+    @property
+    def tuned(self) -> bool:
+        """Whether its compile took the GPU kind's tuned choices, as the device's own compile makes them, as
+        its plan records it (`autotuned`, `report.autotuned`): a step compiled on compile-only GPUs outside
+        a prepare is XLA's untuned program there, which its save says, and a run handed it compiles its
+        step on its devices in its place (`runnable`); a TPU's is the device's own."""
+        return boolean(record(self.plan, "plan")["autotuned"], "autotuned")
+
+    def runnable(self, devices: Sequence) -> AheadOfTime | None:
+        """The step a run on `devices` handed it runs: this one where it is tuned, or where the run's own
+        compile would take no tuned choice either (`report.autotuned`: XLA_FLAGS setting the autotuner's
+        level 0, as a repeatable lane's do), its products then the run's own; None where its XLA products
+        are untuned (`tuned`) and the run's would be tuned, which the run then compiles on its devices as
+        without a file, said once (`UNTUNED`). A step of another target is refused first, tuned or not
+        (`held`): no run takes it."""
+        self.held(devices)
+        if self.tuned or not report.autotuned(devices):
+            return self
+        _log.warning(UNTUNED, self.generation)
+        return None
+
     def save(self, path: str | Path) -> None:
         """Write the step to `path`, for `load` on a host of its topology."""
         if not self.tuned:
-            _log.warning(_UNTUNED, self.generation)
+            _log.warning(UNTUNED, self.generation)
         Path(path).write_bytes(filed(self))
 
     @staticmethod
     def load(path: str | Path) -> AheadOfTime:
         """The step `save` wrote to `path`."""
         step = _saved(path, AheadOfTime, "step")
-        if "starts" not in vars(step):
+        if "starts" not in vars(step) or "autotuned" not in record(step.plan, "plan"):
             raise ValueError(f"{path} holds a step compiled ahead before steps carried their start's "
-                             "programs (`starts`), whose run would compile them on its devices; compile it "
+                             "programs (`starts`) and said whether XLA tuned them (`autotuned`); compile it "
                              "ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
         _current(path, "step", [step.executable, *sampled])
-        if not vars(step).get("tuned", True):
-            _log.warning(_UNTUNED, step.generation)
         return step
 
     def loaded(self) -> jax.stages.Compiled:
@@ -411,11 +442,16 @@ class AheadOfTime:
         `generation`: called with the state and batch the step was compiled for, it runs the step. It is
         admitted as a compiled one is (`dew.communicators.admit`)."""
         found = jax.devices()
+        self.held(found)
+        return self.executable.loaded(found)
+
+    def held(self, devices: Sequence) -> None:
+        """Refused, naming what differs, where `devices` are not the target the step was built for
+        (`BuildTarget.held`), or the step recorded none."""
         if self.built is None:
             raise ValueError("this step was compiled ahead before steps recorded the target they were built "
                              "for, which a process loading it must be; compile it ahead again")
-        self.built.held(found)
-        return self.executable.loaded(found)
+        self.built.held(devices)
 
 
     def derived_for(self, device: GpuTarget) -> GpuTarget:
@@ -444,10 +480,10 @@ class AheadOfTime:
         that is another program than the one compiled ahead, a config, a data shape, a rung or a Dew
         that differs, which the executable would not run as the run's step."""
         if program_digest(lowered) != self.program:
-            raise ValueError("the step compiled ahead is another program than the one this run compiles "
-                             "first: compile it ahead from this run's config and data "
-                             "(--trainer.compile-ahead), with this Dew, and no plan recorded for another "
-                             "rung")
+            raise NotTheStepCompiledAhead(
+                "the step compiled ahead is another program than the one this run compiles first: compile it "
+                "ahead from this run's config and data (--trainer.compile-ahead), with this Dew, and no plan "
+                "recorded for another rung")
         return self.loaded()
 
 
@@ -973,17 +1009,30 @@ class AheadTarget:
         if trainer.rollout is not None:
             raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
                              "its rollout's, which it makes only as it trains")
+        if (self.path is None or self.phases) and self.topology is None and ":" not in self.generation:
+            # A canonical target keys another entry than a host's run (`host_gpus`): no run reads it.
+            raise ValueError(f"steps compiled ahead for {self.generation} GPUs into the persistent cache are "
+                             "keyed as a host's run reads them only over that host's own topology: name it "
+                             "(--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY), or save the step to a "
+                             "file (--trainer.compile-ahead.path)")
         # Refused before its first batch is read and its state traced, where its GPUs state no memory.
         stated_limit(list(trainer.device_mesh.devices.flat))
         batch = first_step_batch(trainer, loader, steps, examples, resume)
         topology = None if self.topology is None else Path(self.topology).read_bytes()
         if self.path is not None and not self.phases:
-            # As XLA compiles it without a GPU's tuned choices, which the step's record, its save and its
-            # load say: a host's autotune cache holds some of a kind's choices or none, and a step a device
-            # runs takes all of them or none (`report.for_devices`, which the persistent cache's steps take).
-            ahead = dataclasses.replace(
-                _compiled_ahead(trainer, batch, frontier=self.frontier, plan=plan, topology=topology),
-                tuned=False)
+            # Over a host's own GPUs (`topology`), as its run compiles it: every tuned choice the GPU kind's
+            # runs left beside the compilation cache, all or none (`report.for_devices`), so its run takes
+            # it. Over a generation's canonical GPUs, XLA's untuned program, read for its plan and its
+            # kernels, which its record and its save say and a run compiles in its place (`runnable`).
+            with report.for_devices() if self.topology is not None else contextlib.nullcontext():
+                try:
+                    ahead = _compiled_ahead(trainer, batch, frontier=self.frontier, plan=plan,
+                                            topology=topology)
+                except report.Untuned as untuned:
+                    raise ValueError(
+                        "this step is not preparable on this host until a run on such a GPU has tuned it, "
+                        "leaving its choices beside the compilation cache: run it there once, then compile "
+                        f"it ahead again ({untuned})") from untuned
             ahead.save(self.path)
             return CompiledAhead(self.path, ahead)
         # Into the persistent cache the run reads alone: the steps of the phases named, or the first step
@@ -992,7 +1041,7 @@ class AheadTarget:
         # boundary; the evaluations' programs compile with the first step's.
         batches = ([phase_batch(trainer, batch, phase) for phase in self.phases] if self.phases else
                    [batch, *(phase_batch(trainer, batch, phase) for phase in later_phases(trainer, batch))])
-        ahead = None
+        ahead, untuned = None, []
         for index, stepped in enumerate(batches):
             first = not index and not self.phases
             if not first:
@@ -1002,12 +1051,13 @@ class AheadTarget:
                 with report.for_devices():
                     ahead = _compiled_ahead(trainer, stepped, frontier=False, plan=plan if first else None,
                                             topology=topology)
-            except report.Untuned as untuned:
+            except report.Untuned as refused:
                 # Its run compiles it on the device, which tunes it, and the next prepare finds it.
-                _log.warning("a step is not preparable until a device run has tuned it: %s", untuned)
+                _log.warning("a step is not preparable until a device run has tuned it: %s", refused)
+                untuned.append(program_digest(refused.lowered))
                 continue
             _log.info("a step compiled ahead into the cache in %.1f s", ahead.planned_seconds)
-        return CompiledAhead(None, ahead)
+        return CompiledAhead(None, ahead, tuple(untuned))
 
 
 def stated_limit(devices: Sequence) -> int | None:
@@ -1067,11 +1117,13 @@ class CompiledAhead(SystemExit):
     """Raised by a configured run under `compile_ahead` once its first step is compiled and saved
     (`AheadTarget.compiled`), or its later phases' steps compiled into its cache (`AheadTarget.phases`).
     Compiling was the whole run, so uncaught it ends the program with status 0 and no traceback, the
-    step's cost logged; `ahead` is the step (the last phase's) and `path` where it was saved, if it was."""
+    step's cost logged; `ahead` is the step (the last phase's) and `path` where it was saved, if it was;
+    `untuned` the digests (`program_digest`) of the programs no device run has tuned yet, each of a step not
+    preparable (`report.Untuned`)."""
 
-    def __init__(self, path: str | None, ahead: AheadOfTime | None):
+    def __init__(self, path: str | None, ahead: AheadOfTime | None, untuned: tuple[str, ...] = ()):
         super().__init__(0)
-        self.path, self.ahead = path, ahead
+        self.path, self.ahead, self.untuned = path, ahead, untuned
         if ahead is None:
             _log.info("no step compiled ahead: none was preparable until a device run has tuned it")
             return
@@ -1279,7 +1331,20 @@ def fit_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], dataset: Datase
 def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool,
                                      plan: FitPlan | None, topology: bytes | None = None) -> AheadOfTime:
     """`compile_ahead`'s step and programs, the evaluations' with `plan`, what the run's `fit` is asked for
-    (`Trainer._fit_plan`), over its own data or a configured run's loader (`AheadTarget.compiled`)."""
+    (`Trainer._fit_plan`), over its own data or a configured run's loader (`AheadTarget.compiled`), with its
+    planning's seconds by their parts (`AheadOfTime.planned_parts`)."""
+    from dew.training.planning import spending
+
+    with report.recording() as recorded, spending() as spent:
+        ahead = _planned_ahead(trainer, batch, frontier=frontier, plan=plan, topology=topology)
+    # The planning's seconds by its parts, which perf_gate reports beside its whole (row 5339): JAX's traces,
+    # lowerings and compiles (the planner's own reading of them, `spending`) and the algebra's passes.
+    return dataclasses.replace(ahead, planned_parts={**spent, "algebra": sum(recorded.passes)})
+
+
+def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool,
+                                    plan: FitPlan | None, topology: bytes | None) -> AheadOfTime:
+    """`_compiled_ahead`'s planning and compile: the step's plan, its programs and their record."""
     if trainer.host_master or trainer.rollout is not None or trainer.lower_for is not None:
         raise ValueError("compile-ahead needs a device-resident step over its loader, with no lower_for")
     if trainer.tune_kernels or pgle_runs():
@@ -1322,11 +1387,12 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
         # (`report.certified`), as a run on that GPU certifies it: the cache it prepares holds that run's.
         certifying = (contextlib.nullcontext() if on_tpus
                       else report.certifying(trainer.device_mesh.devices.flat[0]))
-        # Traced with the target's first device as the default too, so a library that reads the GPU it is
-        # traced for (JAX's cuDNN attention gates, row 5894) reads the target's, not this process's backend.
+        # A library that reads the GPU it is traced for (JAX's cuDNN attention gates, row 5894) reads the
+        # target's from the concrete mesh the step traces on (`Trainer._traced_on`); made the process's
+        # default device besides, the compile-only GPU changed the program a run on that GPU compiles first,
+        # which then refused the step (row 6163).
         with (assumed(on, portable=portable), certifying,
-              trainer.phase_passes.scoped(trainer, trainer._compiler),
-              jax.default_device(trainer.device_mesh.devices.flat[0])):
+              trainer.phase_passes.scoped(trainer, trainer._compiler)):
             target = gpu_target()
             # A fresh run's start compiles beside its step's planning, which reads none of it.
             from dew.training.distributed import start_compiling

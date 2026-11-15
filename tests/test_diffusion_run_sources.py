@@ -674,6 +674,25 @@ def test_flow_grpo_trains_from_the_run_config_on_a_registered_reward():
         jax.tree.leaves(state.variables["params"]), started, strict=True))
 
 
+def test_diffusion_nft_trains_from_the_run_config_on_a_registered_reward():
+    """`rl` builds DiffusionNFT's objective and its rollout from the run's record as it builds Flow-GRPO's
+    (above), the one rollout record building either: groups of the old policy's clean samples per prompt,
+    scored by PSNR against the prompt's own image, and one policy step on them (row 6126)."""
+    from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
+
+    config = dataclasses.replace(
+        grpo_run(), objective=ObjectiveConfig("diffusion_nft", {"kl": 0.0, "solver": Euler(), "steps": 2}),
+        rollout=FlowRolloutConfig(reward="psnr", groups=2, steps=3, train_steps=2))
+    objective = config.build()
+    assert isinstance(objective, DiffusionNFTObjective) and config.rollout is not None
+    rollout = config.rollout.build(objective)
+    assert isinstance(rollout, NFTRollout)
+    prepared, started, state = grpo_step(objective, rollout)
+    assert np.all(np.isfinite(prepared["rewards"]))
+    assert any(not np.array_equal(after, before) for after, before in zip(
+        jax.tree.leaves(state.variables["params"]), started, strict=True))
+
+
 def test_a_flow_grpo_runs_rollout_is_its_own_record_beside_the_objective():
     """A Flow-GRPO run's rollout is the run's `rollout` record, which the objective's record does
     not hold: a run naming none states the default, a rollout setting on the objective is no

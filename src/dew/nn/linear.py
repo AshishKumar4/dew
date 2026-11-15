@@ -29,7 +29,7 @@ value head.
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import ClassVar, overload
 
 import jax
@@ -44,6 +44,7 @@ from dew.batch import Coordinates, Forks, document_ranks, prefix_sum, real_bound
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
+from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
 from dew.nn.residuals import Residual
 
 from .attention_masks import repeat_kv_heads
@@ -392,18 +393,28 @@ def _behind(x, *, kernel, held, bias, valid=None, segments=None, parts=None, dty
     return jax.tree.map(lambda piece: piece[:, width:], out)
 
 
+def scan_cache(rows: int, taps: int, width: int, state: str, state_shape: tuple[int, ...], state_dtype,
+               conv_dtype) -> dict[str, Opened]:
+    """A held scan's leaves for `rows` rows (`held_scan`): the conv's history, the last `taps - 1` of its
+    `width`-wide inputs in `conv_dtype`, and the state `state` `[rows, *state_shape]` in `state_dtype`."""
+    return {"conv_state": Opened((rows, taps - 1, width), conv_dtype),
+            state: Opened((rows, *state_shape), state_dtype)}
+
+
 def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, ...], *, decode: bool,
-              coordinates: Coordinates, state: str = 'ssm_state', state_dtype=None, conv_dtype=None,
-              parts=None, dtype=None, token=None):
+              coordinates: Coordinates, spec: Mapping[str, Opened] | None = None, state: str = 'ssm_state',
+              state_dtype=None, conv_dtype=None, parts=None, dtype=None, token=None):
     """The conv and scan of a mixer that holds per-row state: a decode step or
     prefill advancing `module`'s flax cache, `conv_state` `[B, K-1, D]` held
     in `conv_dtype` and `state` `[B, *state_shape]` held in `state_dtype`
-    (both `mixed`'s dtype where None), or rows with padding slots. `mixed`
+    (both `mixed`'s dtype where None), as the module's `spec` states them
+    (`scan_cache`, which a forward computing either otherwise refuses by its
+    name), or rows with padding slots. `mixed`
     `[B, S, D]` is the conv's input in its own dtype and layout, and
     `scan(convolved, *, starts, valid, held)` the rest, given the convolved
     `[B, S, D]` in `dtype` (`mixed`'s where None), or its `parts` where given
     (`causal_conv1d`), and the held state as it is stored and returning
-    `(output, final state)`. None for the allocation-only decode call. The
+    `(output, final state)`, which the cache keeps cast to the state's dtype. The
     tokens' `coordinates` say which are real and which start a packed
     document, where the conv and the state reset; the held state counts as
     the call's first document, which it continues. `token(mixed, history,
@@ -417,23 +428,25 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     `recurrence_chunk.Chunk.loads`) in a state at least fp32 (`state_dtype` widened); a cached one starts
     from the cache and leaves it as it was."""
     batch = mixed.shape[0]
-    if coordinates.forks is not None:
-        return _forked(module, mixed, taps, bias, scan, state_shape, decode=decode, coordinates=coordinates,
-                       state=state, wide=jnp.promote_types(at_least_fp32(mixed.dtype),
-                                                           state_dtype or mixed.dtype),
-                       parts=parts, dtype=dtype)
     held = conv_state = None
     if decode:
-        allocated = module.has_variable('cache', state)
-        conv_state = module.variable('cache', 'conv_state', jnp.zeros,
-                                     (batch, taps.shape[1] - 1, mixed.shape[2]), conv_dtype or mixed.dtype)
-        held = module.variable('cache', state, jnp.zeros, (batch, *state_shape), state_dtype or mixed.dtype)
-        if not allocated:
-            return None
+        assert spec is not None, "a decode call holds its cache as its module states it"
+        stated(spec, 'conv_state', (batch, taps.shape[1] - 1, mixed.shape[2]), conv_dtype or mixed.dtype)
+        stated(spec, state, (batch, *state_shape), state_dtype or mixed.dtype)
+        holding = cache_variables(module, spec)
+        conv_state, held = holding['conv_state'], holding[state]
+    if coordinates.forks is not None:
+        return _forked(mixed, taps, bias, scan, state_shape, coordinates=coordinates,
+                       held=None if held is None or conv_state is None else (conv_state.value, held.value),
+                       wide=jnp.promote_types(at_least_fp32(mixed.dtype), state_dtype or mixed.dtype),
+                       parts=parts, dtype=dtype)
+    if decode:
+        assert conv_state is not None and held is not None
         if token is not None:
             out, history, final = token(mixed, conv_state.value, held.value)
-            conv_state.value = history.astype(conv_state.value.dtype)
-            held.value = final.astype(held.value.dtype)
+            # The history and the state kept in the cache's dtypes, as they always were.
+            kept(conv_state, history.astype(conv_state.value.dtype), 'conv_state')
+            kept(held, final.astype(held.value.dtype), state)
             return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
     valid = coordinates.valid
     mixed, history = held_conv1d(mixed, taps, valid,
@@ -441,11 +454,11 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
                                  bias=bias, segments=coordinates.segments,
                                  right_padded=coordinates.right_padded, parts=parts, dtype=dtype)
     if conv_state is not None:
-        conv_state.value = history.astype(conv_state.value.dtype)
+        kept(conv_state, history.astype(conv_state.value.dtype), 'conv_state')
     out, final = scan(mixed, starts=coordinates.starts, valid=valid,
                       held=None if held is None else held.value)
     if held is not None:
-        held.value = final.astype(held.value.dtype)
+        kept(held, final.astype(held.value.dtype), state)
     # The scan's output under both names a remat policy reads it by (`RESIDUALS`): a mixer's
     # 'context', as MaxText's recipes keep it, and the 'scan' only a recurrence marks.
     return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
@@ -579,22 +592,16 @@ def forked_scan(convolved, rule, coordinates: Coordinates, start):
     return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
 
 
-def _forked(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, ...], *, decode: bool,
-            coordinates: Coordinates, state: str, wide, parts, dtype):
+def _forked(mixed, taps, bias, scan, state_shape: tuple[int, ...], *, coordinates: Coordinates, held,
+            wide, parts, dtype):
     """`held_scan` of a call over forks: its conv (`forked_conv`) and its scan a level of the forks' chains
     in one pass (`forked_scan`), `scan(convolved, *, starts, valid, held, forked)` running each document from
     its table slot (`forked` its `(loads, stores, held)`, `held` its given memories, `Chunk.loads`); a cached
-    call from the layer's held conv history and state, read and
-    left as they were (a forks call continues a cache a decode call allocated)."""
+    call from the layer's held conv history and state `held`, read and left as they were."""
     if sequence_shards() > 1:
         raise LayoutRefused("documents that continue another are read whole in their rows; a sequence axis "
                             "splits them")
-    history = held = None
-    if decode:
-        if not module.has_variable('cache', state):
-            raise ValueError("a cached call over forks continues a row's cache, which a decode call "
-                             "allocates first")
-        history, held = module.get_variable('cache', 'conv_state'), module.get_variable('cache', state)
+    history, held = (None, None) if held is None else held
     convolved = forked_conv(mixed, taps, coordinates, history=history, bias=bias, parts=parts, dtype=dtype)
 
     def rule(convolved, *, valid, starts, state, loads, stores, held):
@@ -1187,6 +1194,14 @@ class GatedDeltaNet(nn.Module):
                   else wide)
         return stored, jnp.promote_types(operand, stored)
 
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """The layer's decode cache for `rows` rows (`scan_cache`): the conv's history in its projections'
+        dtype or wider, and the recurrent state as the docstring says (`_stored`)."""
+        stored, conv = self._stored(compute_dtype(self, self.dtype))
+        return scan_cache(rows, self.conv_kernel, self.conv_features, 'recurrent_state',
+                          (self.num_v_heads, self.head_k_dim, self.head_v_dim), stored, conv)
+
     def _decode_kernel(self, x, operand) -> str:
         """The kernel a decode token runs (`decode_kernel`): the fused step with the layer's conv,
         gates and norm (`_fused_token`), the step alone between them (`decode_gated_delta_rule`), or
@@ -1231,7 +1246,8 @@ class GatedDeltaNet(nn.Module):
         operand = mixed.dtype
         token, stepped = None, False
         forked = tokens.forks is not None
-        if decode and S == 1 and not forked:
+        # An initialization runs the general path, where the layer makes its parameters.
+        if decode and S == 1 and not forked and not self.is_initializing():
             kernel = self._decode_kernel(x, operand)
             token = self._fused_token(z, b, a, valid) if kernel == 'fused' else None
             stepped = kernel == 'step'
@@ -1286,9 +1302,7 @@ class GatedDeltaNet(nn.Module):
 
         # The conv state holds the projections' own values, so it is held in
         # their dtype at no cost; the recurrent state is held as the
-        # docstring says. The first decode-mode call only allocates, the way
-        # open_kv_cache's is: init_cache's dummy token must not consume a
-        # position or leave state behind. The conv normalises the queries
+        # docstring says (`cache_spec`). The conv normalises the queries
         # and keys (`l2norm`).
         stored, conv = self._stored(operand)
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
@@ -1307,10 +1321,9 @@ class GatedDeltaNet(nn.Module):
         else:
             out = held_scan(self, mixed, self.conv1d()[0], None, scan,
                             (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,
-                            coordinates=tokens, state='recurrent_state', state_dtype=stored, conv_dtype=conv,
+                            coordinates=tokens, spec=self.cache_spec(B) if decode else None,
+                            state='recurrent_state', state_dtype=stored, conv_dtype=conv,
                             parts=heads, dtype=operand if ported else wide, token=token)
-        if out is None:
-            return self.out_proj(jnp.zeros((B, S, self.value_features), self.dtype))
         if token is not None:
             # The fused step gated and normalized its output (`_fused_hooks`).
             return self.out_proj(out)

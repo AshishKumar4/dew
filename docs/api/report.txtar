@@ -1126,6 +1126,7 @@ dew data export  [dew._cli.main.DataExport]
   provision: bool = False
   tokenizer: str | None = None
   eos: bool = False
+  trust: tuple[str, ...] = ()
 dew data provision  [dew._cli.main.DataProvision]
   source: str  [Positional]
 dew data publish  [dew._cli.main.DataPublish]
@@ -1134,6 +1135,7 @@ dew data publish  [dew._cli.main.DataPublish]
   branch: Literal['train', 'validation'] = 'train'
   read: Literal['memory', 'indexed', 'streamed'] = 'streamed'
   provision: bool = False
+  trust: tuple[str, ...] = ()
 dew tpu  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
 dew tpu attach-disk  [dew._cli.tpu.AttachDisk]
   zone: str | None = None  [metavar='ZONE']

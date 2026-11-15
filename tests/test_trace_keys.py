@@ -6,6 +6,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from dew.data.text import ByteTokenizer
+from dew.decision import DecisionObjective, Specials, StateFirstLayout
 from dew.diffusion.discrete import MDLM
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.base import stated_trace
@@ -20,7 +22,21 @@ def tiny(**fields) -> CausalTransformer:
                                 "max_seq_len": 8, **fields})
 
 
+def deciding(**settings) -> DecisionObjective:
+    """A decision objective over a tiny backbone, its rows a state first, read by bytes."""
+    backbone = CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=2, max_seq_len=96)
+    specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
+    layout = StateFirstLayout(max_len=96, head_max_len=48, option_tokens=8)
+    tokenizer = ByteTokenizer()
+    return DecisionObjective(backbone, tokenizer=tokenizer, specials=specials, layout=layout, **settings)
+
+
 BUILT = {
+    # A decision objective's segments its loss reads as the windows it packs (`bounds`), never by name.
+    "decision": (deciding, {"label_smoothing": 0.1}),
+    "decision segments": (deciding, {"segments": 2}),
+    # Its model's reading of a row's context, its one setting beside the modules a key holds.
+    "decision context": (deciding, {"context_encoder": "backbone"}),
     "lm": (lambda **settings: LMObjective(tiny(), 8, **settings), {"z_loss": 1e-4}),
     "dpo": (lambda **settings: DPOObjective(tiny(), 8, **settings), {"beta": 0.5}),
     "dpo pairs": (lambda **settings: DPOObjective(tiny(), 8, **settings), {"pairs": 2}),
@@ -91,6 +107,26 @@ def test_an_ema_of_another_decay_traces_apart_and_one_given_as_a_function_keeps_
     decay = optax.linear_schedule(0.9, 0.99, 10)
     scheduled.ema = dataclasses.replace(scheduled.ema, decay=decay, stated=None)
     assert stated_trace(scheduled) is None
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("kind", ["decision", "lettered", "shared"])
+def test_a_decision_runs_refit_reads_the_step_its_first_fit_traced(tmp_path, kind):
+    """A decision run fitted again in the same process, its trainer and objective built anew from its
+    config, traces no step: it reads the one its first fit traced (`DecisionObjective.traced`, row 6253),
+    over a question layout, a letter readout, and a request's questions over one copy of its state
+    (`shared_for`)."""
+    import run_kinds
+
+    from dew.telemetry.compiles import Compiles
+
+    run = getattr(run_kinds, kind)(tmp_path, drawn=False)
+    traced = []
+    for name in ("first", "again"):
+        with Compiles("step") as compiles:
+            run_kinds.trained(run, tmp_path, name)
+        traced.append(sum(program.kind == "traced" for program in compiles.programs))
+    assert traced[0] > 0 and traced[1] == 0, traced
 
 
 def test_a_settings_value_holds_its_mappings_in_order_and_none_for_a_function():

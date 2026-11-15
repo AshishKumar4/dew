@@ -105,6 +105,8 @@ from dew.inference.serving_kernel import (
     Draws,
     Paged,
     Placement,
+    StateTypes,
+    admitted_types,
     decode_programs,
     dispatched,
     entry_programs,
@@ -704,13 +706,15 @@ class Server:
         """Whether the server's mesh spans several processes, which step it together (`run`, `step`); an
         `Engine` steps a server of one process."""
 
+        self._prefill_apart(prefill_mesh)
         with self._context():
             groups, source_shapes = packed_layout(model, variables)
             self._weight_groups.extend(groups)
             self._source_shapes = jax.tree_util.tree_flatten_with_path(source_shapes)[0]
-            shapes = jax.eval_shape(functools.partial(opened, model, pad_id=self.pad_id, slots=slots,
-                                                      capacity=capacity, plan=rows.placement.plan,
-                                                      impl=self.prng), variables)
+            # The free slots' types beside their cache: an admission's prefill's (`_admitted_types`).
+            shapes = jax.eval_shape(functools.partial(
+                opened, model, pad_id=self.pad_id, slots=slots, capacity=capacity, plan=rows.placement.plan,
+                impl=self.prng, types=(types := self._admitted_types())), variables)
             rows.check(shapes.decoder.cache)
             held = {leaf_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(shapes.decoder.cache)}
             self.group_fields = frozenset(name for name, leaf in GROUPS.items() if leaf in held)
@@ -746,9 +750,8 @@ class Server:
                 self._step = chosen
             self._resident, self._carried = split_donated(
                 opened_in(formats)(model, self.variables, self.pad_id, slots, capacity, rows.placement.plan,
-                                   self.prng))
+                                   self.prng, types))
             self._keep_states(formats)
-        self._prefill_apart(prefill_mesh)
 
     def _prefill_apart(self, mesh: Mesh | None) -> None:
         """Prefill the admitted prompts on `mesh`, apart from the decoding mesh (`from_task`'s
@@ -1272,17 +1275,47 @@ class Server:
         self._settle()
         self._pending = (error, draws)
 
+    def _admitted_types(self) -> StateTypes:
+        """The types an admission's prefill leaves its rows, which the free slots hold zeroed (`opened`):
+        traced once, for them alone, at an admission the server runs, its whole admission of blank pieces at
+        its first width bucket, as its admitting step prefills it, or on the prefill mesh as the program
+        there runs it, whose trace that program's compile at that shape then reads (`admitted_types`)."""
+        share = self.admission // self.groups
+        blank = self._admit([[] for _ in range(self.groups)], share, 1, [])
+        assert blank is not None
+        if self.prefill_mesh is None:
+            return admitted_types(self.model, self.variables, self.pad_id, blank, self.rows.placement,
+                                  self.progress)
+        rows = self._on_prefill_mesh(blank)
+        with self._prefilling():
+            traced = self._prefill.jitted.trace(self.model, self._prefill_variables, self.pad_id,
+                                                self.rows.placement, rows, self.progress)
+        return StateTypes.of(traced.out_info[0])
+
+    def _on_prefill_mesh(self, admission: Admission) -> Admission:
+        """`admission` on the prefill mesh, its rows split over the mesh's row groups where they divide,
+        else each device's all."""
+        assert self.prefill_mesh is not None
+        mesh = self.prefill_mesh
+        split = admission.slots.shape[0] % row_groups(mesh) == 0
+        return _moved(admission, NamedSharding(mesh, P(batch_axes(mesh) or None) if split else P()),
+                      phase="an admission to the prefill mesh")
+
+    def _prefilling(self) -> contextlib.AbstractContextManager:
+        """The prefill mesh's context: each weight whole on it (`FORWARD`), whether or not the decode has a
+        mesh of its own."""
+        assert self.prefill_mesh is not None
+        stack = contextlib.ExitStack()
+        for context in (jax.set_mesh(self.prefill_mesh), whole(), placing(FORWARD)):
+            stack.enter_context(context)
+        return stack
+
     def _prefilled_elsewhere(self, admission: Admission) -> Admission:
         """`admission` with its rows prefilled on the prefill mesh (`Dense.rows_prefilled`) and their decoder
         state moved onto the decoding mesh's rows, which the admitting step seats."""
         assert isinstance(self.rows.placement, Dense) and self.prefill_mesh is not None
-        mesh = self.prefill_mesh
-        # The rows split over the prefill mesh's row groups where they divide, else each device prefills all.
-        split = admission.slots.shape[0] % row_groups(mesh) == 0
-        rows = _moved(admission, NamedSharding(mesh, P(batch_axes(mesh) or None) if split else P()),
-                      phase="an admission to the prefill mesh")
-        # Each weight whole on the prefill mesh (`FORWARD`), whether or not the decode has a mesh of its own.
-        with jax.set_mesh(mesh), whole(), placing(FORWARD):
+        rows = self._on_prefill_mesh(admission)
+        with self._prefilling():
             prefilled = self._prefill(self.model, self._prefill_variables, self.pad_id, self.rows.placement,
                                       rows, self.progress)
         # Onto the decoding rows: the server's mesh's, or the default device's, where an unmeshed state is.
