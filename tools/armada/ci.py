@@ -689,9 +689,10 @@ def green_record(python: str, name: str, split: str, common: str, token: str, cl
         # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of exactly
         # these, kept by that key (`green_key`) whatever ran since; why it was not, the class's word.
         recorded_set = None if found is None else found["depends"]
-        # The last run's inputs, as `reach` reads them: the first class's that recorded any.
-        if inputs is not None and recorded_set is not None and not inputs:
-            inputs.extend(recorded_set)
+        # The last run's inputs, as `reach` reads them (`record`'s `read`, else its key's): the first class's
+        # that recorded any.
+        if inputs is not None and not inputs and found is not None and (found.get("read") or recorded_set):
+            inputs.extend(found.get("read") or recorded_set)
         key = None if recorded_set is None else cache_key(common, name, split, recorded_set, reading)
         why.append(records.missed(found, key, current))
         if key is not None:
@@ -1853,7 +1854,9 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
     row has none, so a later run never reuses an earlier green row of its file; nor has one that read a file
     the task's processes wrote (`changed`, `watched.changed`), whose key would hash the bytes they left, not
     those it read (row 2559). A check-1 site's judge keeps its map tasks' inputs with its own
-    (`site_inputs`)."""
+    (`site_inputs`). Every row keeps what its run read (`read`: its inputs, a run's that wrote them or a
+    blind watch's among them, which `depends` leaves out of a key), the paths `reached` reads a change
+    against (Main, 2026-11-15: rows whose `depends` was None were a reach's unknown)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return
@@ -1866,6 +1869,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
         ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
+        read = None if ran["depends"] is None else sorted({*ran["depends"], *(opened or ())})
         if ran["depends"] is not None:
             inputs = None if opened is None else sorted({*ran["depends"], *opened})
             ran = {**ran, "depends": None if inputs is None or wrote_inputs(inputs, changed) else inputs}
@@ -1892,6 +1896,8 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             current = begun(python, row_["name"], held, common, token, fresh_only=True)
         body = json.dumps({"key": key,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
+                           # What it read where its key keeps none (its record's size the Worker bounds).
+                           **({"read": read} if ran["depends"] is None and read is not None else {}),
                            "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"],
                            "epoch": current}).encode()
         # The record under these inputs, which `reused` reads, and the last run's, which the GPU tier and

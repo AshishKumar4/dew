@@ -1300,6 +1300,12 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
         (tmp_path / "runs").unlink(missing_ok=True)
         commit(tmp_path, test)
         assert [run(), run()] == ([1, 1] if test == "plain" else [1, 2]), test
+        # Its record keeps what it read all the same, which a change's reach reads (`reached`).
+        if test == "python":
+            place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.cpu_class())
+            kept = json.loads(cache_worker[1][place])
+            assert kept["key"] is None and kept["depends"] is None
+            assert any(path.partition(ci.followed.CODE)[0].endswith("docs/page.txt") for path in kept["read"])
 
 
 def test_a_conftest_fixture_is_the_input_of_the_files_whose_runs_took_it_alone(ci, tmp_path, monkeypatch,
