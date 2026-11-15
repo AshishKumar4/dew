@@ -1,9 +1,8 @@
 """The ordering rule's guard (rows 6027, 6471): the step users run, `dew.training.Trainer`'s, over a decoder
-of a registered mixer (`dew.registry.mixers`) or of attention blocks holding a feature's parameters
-(`FEATURES`), its figures read from the programs' own trees (`step_bytes`) and its bound asserted by `holds`.
-Its tests are files of their own (tests/test_step_memory_*.py), each a few mixers', so none outruns one task's
-deadline. The in-context memory joins them with row 6577's fix (XLA merging each layer's zero buffer for its
-chunked scan's outputs into one, held across layers)."""
+of every registered mixer (`dew.registry.mixers`) and of attention blocks holding each
+feature's parameters (`FEATURES`), its figures read from the programs' own trees (`step_bytes`) and its bound
+asserted by `holds`. Its cases (`cases`) are shared out among files of their own (tests/test_step_memory_*.py,
+`shard`), so none outruns one task's deadline and a mixer the registry gains is guarded."""
 
 import math
 
@@ -88,6 +87,9 @@ def step_bytes(kind: str, layers: int, feature: str = "plain", copies: bool = Tr
             "saved": saved // devices, "gradients": gradients}
 
 
+SHARDS = 5
+"""The files the cases are shared out among (tests/test_step_memory_<i>.py)."""
+
 FEATURES = ("plain", "sinks", "biases", "ngpt", "experts")
 """The parameters a block holds beside its mixer's and its MLP's, each through a custom reverse mode of its
 own: none, an attention's sinks (gpt-oss's: `attention_sinks`), its projections' biases stored fp32 (the
@@ -104,6 +106,20 @@ def features() -> dict[str, dict]:
             "biases": {"attention_bias": True, "mlp_bias": True},
             "ngpt": {"ngpt": NGPT(std=0.02, alpha=0.05), "pre_norms": False, "qk_norm": False},
             "experts": {"mixture": Mixture(experts=4, top_k=2)}}
+
+
+def cases() -> list[tuple[str, str]]:
+    """Every registered mixer's plain blocks, and the attention mixer's blocks of each of `FEATURES`'
+    parameters."""
+    from dew.registry import mixers
+
+    return ([(kind, "plain") for kind in sorted(mixers.paths)]
+            + [("attention", feature) for feature in FEATURES[1:]])
+
+
+def shard(index: int) -> list[tuple[str, str]]:
+    """`cases()` the `index`th file of `SHARDS` holds: every `SHARDS`th from its own."""
+    return cases()[index::SHARDS]
 
 
 def holds(kind: str, feature: str, copies: bool) -> None:
