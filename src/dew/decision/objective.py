@@ -4,7 +4,7 @@ import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -333,13 +333,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             return False
         return crosses_alone(held.get("params", {}).get("backbone", {}))
 
-    traced = ("layout", "bounds", "context_encoder", "loss_rule", "label_smoothing", "consistency",
-              "input_lm", "pass_weights", "exit_entropy")
-    """What its loss reads beside its modules and held tree: the layout its rows are laid out by (its
-    documents' forks among it), the windows it packs (`bounds`: of its tokenizer, specials, segments and
-    context window), how its model reads a row's context (`context_encoder`, its model's one setting beside
-    its backbone and head), its scoring rule and smoothing, its terms' weights, its passes' weights and its
-    exit's entropy."""
+    untraced: ClassVar[Mapping[str, str]] = {
+        "tokenizer": "it reaches a trace only as the windows its rows pack (`bounds`, of the cached "
+                     "`_shared_bounds`, which the key reads)"}
 
     def __init__(self, backbone: nn.Module | Source | Adapter | Decide, *,
                  loss: ScoringRule | None = None, tokenizer: Tokenizer | None = None,
@@ -489,11 +485,6 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def context_length(self) -> int | None:
         """The most context tokens a row carries (`DecisionModel.context_length`)."""
         return self.model.context_length
-
-    @property
-    def context_encoder(self) -> ContextEncoder:
-        """How its model reads a row's context (`DecisionModel.context_encoder`)."""
-        return self.model.context_encoder
 
     @property
     def spans_in_context(self) -> bool:

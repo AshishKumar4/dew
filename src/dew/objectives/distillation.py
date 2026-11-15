@@ -29,9 +29,9 @@ so they must share a tokenizer, and a vocabulary mismatch is refused.
 from __future__ import annotations
 
 import functools
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING, Generic, Literal
+from typing import TYPE_CHECKING, ClassVar, Generic, Literal
 
 import jax
 import jax.numpy as jnp
@@ -105,6 +105,10 @@ def _refuse_other_tokenizers(student: str, teacher: str) -> None:
 
 class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
     """Mixes the student's own loss with a frozen teacher's soft targets."""
+
+    untraced: ClassVar[Mapping[str, str]] = {
+        "_projection_shapes": "a function of its feature pairs and the modules its programs run, which the "
+                              "key holds"}
 
     def __init__(
         self,

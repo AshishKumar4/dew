@@ -245,9 +245,6 @@ class JepaObjective(ReleasesModel, Objective[Ratio]):
             raise ValueError("the JEPA target branch needs the trainer's EMA variables")
         return part(step.ema, CONTEXT_ENCODER)
 
-    traced = ("encoder", "predictor", "mask", "sample", "is_video")
-    """Its encoder, predictor, masks and what it reads."""
-
     def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.sample.key])
         batch_size = samples.shape[0]
