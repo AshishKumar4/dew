@@ -986,7 +986,7 @@ def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_
     computes (`head.RUNS`); a run laid out otherwise, or whose head computes in other numbers, does not
     average with the others, the head's field named, nor does a single run. Main refused the dropout."""
     def with_head(**fields):
-        return replace(decide, model=decide.model.clone(head=decide.model.head.clone(**fields)))
+        return replace(decide, model=replace(decide.model, head=decide.model.head.clone(**fields)))
 
     runs = trained_runs(decide, tmp_path, 1)
     with pytest.raises(ValueError):

@@ -251,7 +251,7 @@ def _head_changes(first: Mapping[str, object], other: Mapping[str, object]) -> l
         return ["head"]
     from dew import registry
 
-    stated = [record.get("fields") or {} for record in (first, other)]
+    stated = [_records.record(record.get("fields") or {}, "head.fields") for record in (first, other)]
     return [f"head.{name}" for name in registry.computing_differences(
         registry.imported(str(first["class"])), *stated, kept=(_records.NUMBERS,))]
 
