@@ -140,8 +140,8 @@ class Issuer:
                 read.clear()
             read.append(buffer)
 
-    def summed(self, products: Iterable, shape: tuple[int, int] | None = None, *, retired: bool = False,
-               into=None):
+    def summed(self, products: Sequence[Entry] | Iterator[Entry], shape: tuple[int, int] | None = None, *,
+               retired: bool = False, into=None):
         """The sum of `products`, each `(name, lhs, rhs)` as `__call__` takes it, issued into one fp32
         accumulator in place (`Family.issued`): one accumulator held where each its own held two (Kimi delta
         attention's output, `algebra.key_decayed_output`). Each product's operands are staged as it is
@@ -162,23 +162,7 @@ class Issuer:
         registers (`Family.operands_in_registers`, whose accumulator is a value the loop carries): unrolled,
         ptxas held every block's fragments at once, an A100's scores backward at keys and values 256 wide
         spilling 280 bytes a thread (wide-kv at e1f928585); elsewhere a product a block, as listed."""
-        termwise: dict[tuple[int, int], list] = {}
-        if isinstance(products, Sequence):
-            # A listed sum's products of three parts set aside, by their form, for their terms' sums: each
-            # operand its caller formed before the call, which every term reads where it stands. A stream's
-            # are each issued before the next is formed, as they come: a stream may stage its next operand
-            # into the last one's buffers (`retired`), or form it within the scope the last one issues in.
-            entries = []
-            for entry in self._entries(products):
-                counts = self._counted(entry)
-                if counts is not None and max(counts) == 3:
-                    termwise.setdefault(counts, []).append(entry)
-                else:
-                    entries.append(entry)
-            rest = iter(entries)
-        else:
-            rest = iter(self._entries(products))
-
+        rest, termwise = self._set_aside(products)
         family, interpret = self.call.family, self.call.interpret
         first = next(rest, None)
         if first is None:
@@ -263,6 +247,25 @@ class Issuer:
         for value in self._termwise(termwise, shape, retired=retired):
             total = total + value
         return total
+
+    def _set_aside(self, products: Sequence[Entry] | Iterator[Entry]
+                   ) -> tuple[Iterator[Entry], dict[tuple[int, int], list[Entry]]]:
+        """`products` (`summed`'s) to issue as they come, and those of a listed sum whose operands take three
+        parts set aside by their form for their terms' sums (`_termwise`): each operand its caller formed
+        before the call, which every term reads where it stands. A stream's are each issued before the next is
+        formed, as they come: a stream may stage its next operand into the last one's buffers (`retired`), or
+        form it within the scope the last one issues in."""
+        termwise: dict[tuple[int, int], list[Entry]] = {}
+        if not isinstance(products, Sequence):
+            return iter(self._entries(products)), termwise
+        rest = []
+        for entry in self._entries(products):
+            counts = self._counted(entry)
+            if counts is not None and max(counts) == 3:
+                termwise.setdefault(counts, []).append(entry)
+            else:
+                rest.append(entry)
+        return iter(rest), termwise
 
     def _counted(self, entry: Entry) -> tuple[int, int] | None:
         """How many parts each of `entry`'s operands (`_entries`') takes as it is issued (`_count`), staging
