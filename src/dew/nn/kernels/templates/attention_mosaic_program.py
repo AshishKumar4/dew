@@ -24,6 +24,7 @@ from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     axes,
     bundles,
+    emission,
     layout,
     mosaic,
     operands,
@@ -592,23 +593,16 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     return None
 
 
-APPROXIMATED = frozenset({jax.lax.exp_p, jax.lax.exp2_p, jax.lax.log_p, jax.lax.log2_p, jax.lax.log1p_p,
-                          jax.lax.tanh_p, jax.lax.logistic_p, jax.lax.sin_p, jax.lax.cos_p, jax.lax.sqrt_p,
-                          jax.lax.rsqrt_p, jax.lax.pow_p})
-"""The operations Mosaic GPU computes in the hardware's approximate forms under `approx_math` (its lowering's
-exp, exp2, log, log2, tanh, sin, cos, sqrt and rsqrt; jax's logistic, log1p and pow lower through them)."""
-
-
 def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differentiated: bool,
                 query: tuple | None = None) -> bool:
     """Whether a launch running `hooks` on `tile` takes the hardware's approximate transcendentals
     (`Family.kernel`'s `approx_math`): only where no hook computes one Mosaic GPU approximates
-    (`APPROXIMATED`), with `differentiated` the score hook's pullback too. The mainloop's own exponentials
-    hold check 1 at ex2.approx; a hook's need not: on an H100 a softcap's tanh.approx (2^-11 relative) beside
-    an initial state put the state's sums' gradient at 7.04 times the reference's error from float64, every
-    hook on par with exact math (the hooked backward, HOOKS-FIX-h100)."""
+    (`emission.APPROXIMATED`), with `differentiated` the score hook's pullback too. The mainloop's own
+    exponentials hold check 1 at ex2.approx; a hook's need not: on an H100 a softcap's tanh.approx (2^-11
+    relative) beside an initial state put the state's sums' gradient at 7.04 times the reference's error from
+    float64, every hook on par with exact math (the hooked backward, HOOKS-FIX-h100)."""
     traced = _hook_jaxprs(hooks, tile, value_width, differentiated=differentiated, query=query)
-    return not any(_primitives(jaxpr) & APPROXIMATED for jaxpr in traced)
+    return not any(_primitives(jaxpr) & emission.APPROXIMATED for jaxpr in traced)
 
 
 def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, flagged: bool = False,

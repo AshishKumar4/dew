@@ -118,11 +118,16 @@ them; a leading-zero count, `clz`, an integer instruction the finish's exponent 
 _REDUCTIONS = frozenset({lax.reduce_max_p, lax.reduce_min_p, lax.reduce_sum_p})
 """Reductions, one operation an input element."""
 
-_EXPONENTIALS = frozenset({lax.exp_p, lax.exp2_p, lax.log_p, lax.log2_p, lax.log1p_p, lax.tanh_p,
-                           lax.logistic_p, lax.sin_p, lax.cos_p, lax.pow_p})
+APPROXIMATED = frozenset({lax.exp_p, lax.exp2_p, lax.log_p, lax.log2_p, lax.log1p_p, lax.tanh_p,
+                          lax.logistic_p, lax.sin_p, lax.cos_p, lax.sqrt_p, lax.rsqrt_p, lax.pow_p})
+"""The operations Mosaic GPU computes in the hardware's approximate forms under `approx_math`
+(`mosaic.compiler_params`; its lowering's exp, exp2, log, log2, tanh, sin, cos, sqrt and rsqrt; jax's
+logistic, log1p and pow lower through them)."""
+
+_EXPONENTIALS = APPROXIMATED - {lax.sqrt_p, lax.rsqrt_p}
 """The special-function units' operations, one an output element: those Mosaic GPU lowers to the hardware's
-approximate forms, or through them (`attention_mosaic_program.APPROXIMATED`'s, but its square roots, which
-the CUDA cores' operations count)."""
+approximate forms, or through them (`APPROXIMATED`), but its square roots, which the CUDA cores' operations
+count."""
 
 _FREE = frozenset({
     lax.axis_index_p, gpu.barrier_arrive_p, gpu.barrier_wait_p, lax.bitcast_convert_type_p,
