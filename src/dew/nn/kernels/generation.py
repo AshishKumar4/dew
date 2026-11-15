@@ -45,20 +45,24 @@ identity (`dew.training.identity`)."""
 
 _RECORDINGS: contextvars.ContextVar[tuple[dict[Hashable, tuple[Callable[[], Hashable], Hashable]], ...]] = (
     contextvars.ContextVar("fact_recordings", default=()))
-"""The facts read within each open `recording`, innermost last: what a trace records into, no trace reads, so
-a trace held by its state (`dew._cache.traced_state`) is held in any recording's scope (`recording` registers
-it `dew._cache.untraced` as it first sets it; generation imports no JAX as it loads)."""
+"""The facts read within each open `recording`, innermost last: what a trace records into, no trace reads,
+so a trace held by its state (`dew.nn.kernels.options.trace_context`) is held in any recording's scope
+(`recording` registers it `dew._cache.untraced` as it first sets it; generation imports no JAX as it
+loads)."""
 
 
 def stated(value) -> Hashable:
     """`value` as a fact's answer or question is held and compared: by its contents, equal wherever they
     are however often its holder is built anew (a reader returning a fresh mapping): a hashable value by
     itself, a mapping, sequence or set by its members, a dataclass by its type and fields; an array, which a
-    program reading it closes over, by itself (`_Same`), as an object that states none of these is."""
+    program reading it closes over, by itself (`dew._cache.Same`), as an object that states none of these
+    is."""
     import jax
 
+    from dew import _cache
+
     if isinstance(value, jax.Array):
-        return _Same(value)
+        return _cache.Same(value)
     if isinstance(value, Mapping):
         return tuple(sorted(((key, stated(answer)) for key, answer in value.items()), key=repr))
     if isinstance(value, list | tuple):
@@ -67,23 +71,7 @@ def stated(value) -> Hashable:
         return frozenset(stated(member) for member in value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return type(value), tuple(stated(getattr(value, field.name)) for field in dataclasses.fields(value))
-    return value if isinstance(value, Hashable) else _Same(value)
-
-
-class _Same:
-    """A value held by itself (`stated`): equal to its own holder alone, and kept alive while a key holds
-    it, so no other value takes its identity."""
-
-    __slots__ = ("value",)
-
-    def __init__(self, value) -> None:
-        self.value = value
-
-    def __hash__(self) -> int:
-        return id(self.value)
-
-    def __eq__(self, other) -> bool:
-        return isinstance(other, _Same) and other.value is self.value
+    return value if isinstance(value, Hashable) else _cache.Same(value)
 
 
 @contextlib.contextmanager
