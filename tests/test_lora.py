@@ -714,13 +714,16 @@ def test_a_lora_run_served_quantized_decodes_with_its_trained_factors(decoder, l
     # Each row its prompt, then four drawn tokens.
     assert drawn.shape[-1] == 8
     np.testing.assert_array_equal(drawn[:, :4], np.broadcast_to(tokens[:1, :4], (drawn.shape[0], 4)))
-    factors = {name: leaf for name, leaf in flat_tree(thaw(task.variables)).items()
-               if name.rsplit(".", 1)[-1] in lora.FACTORS}
-    kept = flat_tree(thaw(served.variables))
+    def factors_of(tree) -> dict:
+        # Each factor by its path, among a served tree's quantized leaves (Qwix's, which are no dicts).
+        return {path: leaf for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]
+                if getattr(path[-1], "key", None) in lora.FACTORS}
+
+    factors, kept = factors_of(thaw(task.variables)), factors_of(thaw(served.variables))
     assert factors
     for name, leaf in factors.items():
         assert np.asarray(kept[name]).dtype == np.asarray(leaf).dtype, name
-        np.testing.assert_array_equal(np.asarray(kept[name]), np.asarray(leaf), err_msg=name)
+        np.testing.assert_array_equal(np.asarray(kept[name]), np.asarray(leaf), err_msg=str(name))
 
 
 CLIPPED_SEEDS = 64
