@@ -131,7 +131,6 @@ def test_a_quantized_run_trains_on_from_its_own_record(tmp_path):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
 
 
-@pytest.mark.scenario("Quantized interchange")
 @pytest.mark.parametrize("fixture", ["modelopt/mixed", "modelopt/tiny", "nvfp4_qdq/e4m3"],
                          ids=["modelopt fp8 and nvfp4", "modelopt nvfp4", "compressed-tensors nvfp4"])
 def test_a_run_of_an_input_quantized_checkpoint_reloads_with_its_input_quantization(tmp_path, fixture):
@@ -154,7 +153,6 @@ def test_a_run_of_an_input_quantized_checkpoint_reloads_with_its_input_quantizat
     assert float(np.max(np.abs(logits(plain, task.variables) - logits(task.model, task.variables)))) > 0
 
 
-@pytest.mark.scenario("Quantized interchange")
 def test_an_input_quantized_run_resumes_from_its_record_where_two_steps_would_end(tmp_path):
     """A run of an input-quantized checkpoint resumed from its own record
     rebuilds the model with no source at hand: its `init` declares the scales

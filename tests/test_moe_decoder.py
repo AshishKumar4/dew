@@ -131,7 +131,6 @@ def run_losses(trainer, steps):
     return [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
 
 
-@pytest.mark.scenario("Distributed training")
 @pytest.mark.mesh
 def test_the_expert_shards_train_the_same_model():
     """Fifty steps of the same sparse decoder at the same seed, with the

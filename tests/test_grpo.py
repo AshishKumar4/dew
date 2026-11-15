@@ -398,7 +398,6 @@ def test_a_reward_penalty_over_the_starting_weights_is_nil_half_way_through_an_a
     np.testing.assert_array_equal(advantages[5], 0)
 
 
-@pytest.mark.scenario("Online post-training")
 def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
     """A GRPO run whose rollout names a served draw (`--rollout.served.slots 8`, `ServedRollout`) trains
     on completions Dew's own server draws ahead of the trainer (`RolloutScheduler.served`), its first

@@ -189,7 +189,6 @@ def test_a_runs_recorded_forms_are_the_forms_it_trains_in(tmp_path):
     assert kernels("again") == kernels("cpu")
 
 
-@pytest.mark.scenario("Generation and serving")
 @pytest.mark.mesh(devices=8)
 def test_a_saved_run_is_served_scored_and_loaded_in_the_form_it_trained_in(tmp_path):
     """A run recorded "accurate" records its form with its checkpoints (`Objective.inference_record`), and
