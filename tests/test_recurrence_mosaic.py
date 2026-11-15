@@ -1673,38 +1673,41 @@ def _reverse_walk_certified(op=None) -> list:
     return _step_certified('sm100', 1, packed=False, op=op)
 
 
-def _certified_bodies(certified: list, kernel: str) -> list:
-    """`kernel`'s bodies `certified` compiled (each distinct module once, in order) with the binary its
-    certification read of each."""
-    found: dict[str, object] = {}
+def _certified_bodies(certified: list) -> dict[str, list]:
+    """Each kernel's bodies `certified` compiled (each distinct module once, in order) with the binary its
+    certification read of each, by the kernel's name."""
+    found: dict[str, dict[str, object]] = collections.defaultdict(dict)
     for each in certified:
         for module, binary in each.kernels.values():
-            if binary.kernel == kernel:
-                found.setdefault(module, binary)
-    return list(found.items())
+            found[binary.kernel].setdefault(module, binary)
+    return {kernel: list(bodies.values()) for kernel, bodies in found.items()}
+
+
+def assert_a_start_certifies_each_kernel_at_most_twice(certified: list) -> None:
+    """Every kernel of a training step's start certified at most twice, the body it keeps unspilled: a
+    launch spilling at its producer's least takes its consumers' statement's share next
+    (`resources.stated_producer`), and a rung asked once is never asked again
+    (`resources.Producers.stepped`)."""
+    bodies = _certified_bodies(certified)
+    assert bodies and all(len(found) <= 2 and not found[-1].refused for found in bodies.values()), bodies
 
 
 @lowers('sm100')
-def test_a_reverse_walk_starts_in_two_certifications_unspilled():
-    """The 4B training step on a compile-only B200 (`_reverse_walk_certified`) certifies its reverse walk at
-    most twice, the kernel it keeps unspilled: spilling 40 bytes at its producer's least, it takes its
-    consumers' statement's share next (`resources.stated_producer`). From the ladder's foot up it took eight,
-    95 s of the 4B's cold start."""
-    certified, _ = _reverse_walk_certified()
-    bodies = _certified_bodies(certified, 'recurrence_reverse')
-    assert len(bodies) <= 2 and not bodies[-1][1].refused, bodies
+def test_a_b200_training_steps_start_certifies_each_kernel_at_most_twice():
+    """The 4B training step on a compile-only B200 (`_reverse_walk_certified`): every kernel certified at most
+    twice, none kept spilled. Its reverse walk spills 40 bytes at its producer's least and holds at its
+    consumers' statement's share; from the ladder's foot up it took eight, 95 s of the 4B's cold start."""
+    assert_a_start_certifies_each_kernel_at_most_twice(_reverse_walk_certified()[0])
 
 
 @lowers('sm90')
-def test_a_training_steps_output_walk_starts_in_two_certifications_unspilled():
-    """The 4B training step over four packed rows on a compile-only H100 (`_step_certified`) certifies its
-    output walk at most twice, the kernel it keeps unspilled: with its consumers raised to the whole pool
-    beside the least producer, ptxas spilled the walk's tile index around the scores' warpgroup MMAs, which
-    their statement's share holds, the rung it takes next. From the top down its start took ten certifications
-    in three rounds (row 6743)."""
-    certified, _ = _step_certified('sm90', 4, packed=True)
-    bodies = _certified_bodies(certified, 'recurrence_output')
-    assert len(bodies) <= 2 and not bodies[-1][1].refused, bodies
+def test_an_h100_training_steps_start_certifies_each_kernel_at_most_twice():
+    """The 4B training step over four packed rows on a compile-only H100 (`_step_certified`): every kernel
+    certified at most twice, none kept spilled. With its consumers raised to the whole pool beside the least
+    producer, ptxas spilled the output walk's tile index around the scores' warpgroup MMAs, which their
+    statement's share holds; from the top down that start took ten certifications in three rounds (row 6743).
+    Proposed first, the statements' shares traded the output walk's ladder for the scores' backward's."""
+    assert_a_start_certifies_each_kernel_at_most_twice(_step_certified('sm90', 4, packed=True)[0])
 
 
 @lowers('sm90')
