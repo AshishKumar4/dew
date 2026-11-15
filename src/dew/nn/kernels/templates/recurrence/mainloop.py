@@ -769,6 +769,24 @@ def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, t
     return _planned_launch(call, launch), tiles, launch
 
 
+def _walk_laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, grid: tuple, *,
+               persistent: bool, stages, consumers: int, entry: int) -> tuple:
+    """`_laid`'s plan of a launch over `grid` and its stated registers: a `persistent` program walking more
+    tiles than the launch's programs carries its next tile across the walk (`_persisted`), its index, its
+    coordinates a grid axis each and its liveness, a register each, and is planned again with them.
+    Unstated, the 4B gated delta net's packed output, its walk looping, stated 168 a consumer and spilled 16
+    bytes there on an H100, none at 176, and none at 168 where its programs held every tile (jsf-out4b9: its
+    SASS 56 SYNCS and 50 branches against 32 and 15; row 6495)."""
+    tiles = math.prod(grid)
+    found, programs, planning = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
+                                      consumers=consumers, entry=entry)
+    if persistent and tiles > programs:
+        registers += len(grid) + 2
+        found, programs, planning = _laid(call, scope, registers, tiles, stages=None, consumers=consumers,
+                                          entry=entry)
+    return found, programs, planning, registers
+
+
 def _tile_at(index, grid: tuple, grid_names: tuple) -> dict:
     """`grid`'s indices by name of a persistent loop's tile `index` (its first axis the slowest)."""
     flat, indices = index[0], {}
@@ -838,17 +856,9 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     # Planned at setmaxnreg's least: a raised producer moves registers within a program's pool, which its
     # entry sets and so how many programs a multiprocessor holds, and its consumers' share beside it is the
     # assembler's to certify (`template.Mosaic._raised`), not the model's.
-    found, programs, planning = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
-                                      consumers=consumers, entry=held.entry(family))
-    if persistent and tiles > programs:
-        # A program walking more tiles than the launch's programs carries its next tile across the walk
-        # (`_persisted`): its index, its coordinates a grid axis each and its liveness, a register each.
-        # Unstated, the 4B gated delta net's packed output, its walk looping, stated 168 a consumer and
-        # spilled 16 bytes there on an H100, none at 176, and none at 168 where its programs held every
-        # tile (jsf-out4b9: its SASS 56 SYNCS and 50 branches against 32 and 15; row 6495).
-        registers += len(grid) + 2
-        found, programs, planning = _laid(call, scope, registers, tiles, stages=None, consumers=consumers,
-                                          entry=held.entry(family))
+    found, programs, planning, registers = _walk_laid(call, scope, registers, grid, persistent=persistent,
+                                                      stages=stages, consumers=consumers,
+                                                      entry=held.entry(family))
     # Where no multiprocessor holds the launch, its record says so (`Launch.resident` zero), which the
     # template's legality refuses, and it builds at its shallowest depth, as a probe of the config compiles
     # it.
