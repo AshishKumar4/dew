@@ -2383,3 +2383,19 @@ def test_phases_batched_outside_themselves_read_as_they_did():
                   (Pipeline(Memory(Indexed(2, 16))).batch(8), None))
     assert _endless_ids(once.repeat(1), 4) == [list(range(1000, 1008)), list(range(2000, 2008)),
                                                list(range(2008, 2016))]
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_mix_ends_after_its_first_exhausted_members_last_record_whatever_its_read(read):
+    """A mix's rows do not depend on how it is read: it ends at the position after its first exhausted
+    member's last record, as Grain's map mix does (data.md §3). Corpora of 100 rows and 1 at weights 2
+    and 1 read A, A, B, and end; a streamed read went on to A, A, until B's second pull failed (spec
+    alignment 2026-11-15, data.md's first finding)."""
+    many = Memory([{"id": index} for index in range(100)])
+    one = Memory([{"id": 1000}])
+    passed = held(mix([many, one], weights=[2, 1]).batch(1).read(read).loading(READ))(DataPartition())
+    try:
+        read_ids = [value for batch in ids(passed) for value in batch]
+    finally:
+        passed.close()
+    assert read_ids == [0, 1, 1000]
