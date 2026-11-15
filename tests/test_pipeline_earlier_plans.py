@@ -238,14 +238,14 @@ def test_a_position_saved_before_reached_code_is_refused_exact_and_read_on_relax
 
     loader, steps = saved_positions_support.SAVED["taken"]
     saved = (SAVED_BEFORE_REACHED / "taken.position").read_bytes()
-    exact = loader().train(DataPartition())
+    exact = dataclasses.replace(loader(), resume="exact").train(DataPartition())
     try:
         with pytest.raises(PlanChanged) as refused:
             exact.set_state(saved)
     finally:
         exact.close()
     assert [part.split(".")[0] for part in refused.value.differs] == ["code"]
-    relaxed = dataclasses.replace(loader(), resume="relaxed").train(DataPartition())
+    relaxed = loader().train(DataPartition())
     try:
         relaxed.set_state(saved)
         assert _ids(relaxed, 2) == _read(loader(), steps, 2)

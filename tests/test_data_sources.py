@@ -2384,7 +2384,7 @@ def test_an_endless_read_of_one_share_of_empty_files_is_refused(tmp_path):
         path = tmp_path / f"empty{index}.csv"
         path.write_text("id\n")
         paths.append(str(path))
-    (outcome,) = _first_read(compile(Files(tuple(paths)).repeat().batch(1), read="streamed",
+    (outcome,) = _first_read(compile(Files(tuple(paths)).repeat().batch(2), read="streamed",
                                      loading=Loading(workers=0, threads=1, read_buffer=1)),
                              DataPartition(0, 2))
     assert isinstance(outcome, ValueError), outcome

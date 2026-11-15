@@ -3,7 +3,11 @@ equal value (`stated`): what a traced program's identity holds of its function a
 (`dew.training.identity`) and what holds a data step's own code (`dew.data.plan.StepIdentity`), which reads no
 training module. A function or a class of the user's own code (`dew._sources.own_source`) is its name with
 what it reads, walked through every function, class and module of the user's it reaches; anything else by
-its type and value, or refused (`Unestablished`)."""
+its type and value, or refused (`Unestablished`).
+
+This module is the boundary where Dew reads values it has no type for: any object a call names, any module a
+process loaded. Its private readers ask each what Python's object model says of it (its module, its name, its
+file, its slots) and refuse what answers nothing."""
 
 from __future__ import annotations
 
