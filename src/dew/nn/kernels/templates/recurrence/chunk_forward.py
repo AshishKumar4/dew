@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.inputs import cu_seqlens
-from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra, tables
+from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import zero_padded
 from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.recurrence import own_pairs
@@ -193,8 +193,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
         final = run.final
     o = run.unlaid(o.reshape(call.rows, call.heads, call.value_width))[..., :run.value_width]
     if fused is None and skip is not None:
-        o = (o + skip.astype(jnp.float32)[:, None] * v.astype(jnp.float32)).astype(
-            jnp.float32 if wide else run.dtype)
+        o = recurrence.skip_added(o, skip, v, jnp.float32).astype(jnp.float32 if wide else run.dtype)
     assert final is not None, "a forward runs its states launch"
     return o, final, (run.a, (run.w, run.h, run.corrected, run.stored))
 
