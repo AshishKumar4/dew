@@ -1688,8 +1688,10 @@ def _staged_together(x, w, *, interpret):
 
             family.scheduled(1, walked, lambda: family.stream(rings, views, 0, 1))
 
+        # An accumulator of the width alone (`summed`'s) beside two together (`summed_together`'s).
+        products = (1, (columns,), (), (), (), (columns,) * 2)
         family.scoped(scope, plgpu.SMEM((rows, CHUNK_DEPTH), jnp.bfloat16),
-                      streams=family.streams(blocks, 2, 1), products=(1, (), (), (), (), (columns,) * 2))
+                      streams=family.streams(blocks, 2, 1), products=products)
 
     out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
     return family.kernel(body, out_type=(out, out), grid=(1,), grid_names=("programs",), consumers=1,
