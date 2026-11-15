@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from check1_wire import LATER, QUALIFY
 from map_judge import LaterUnits, site_id
-from reference_error import StaleSeeds, as_given, assert_as_exact, seeds_for, stored_truths
+from reference_error import MissingTruth, StaleSeeds, as_given, assert_as_exact, seeds_for, stored_truths
 
 from dew.parity_stages import staged_units
 
@@ -89,9 +89,10 @@ def test_a_prepared_site_its_first_stage_leaves_undecided_asks_for_its_second_st
     """A site under prepared truths (a GPU flow's) whose first stage leaves it undecided (this one sizes far
     above the 64 it declares): its prepare stores its first stage's draws alone; its run asks a later job
     for its second stage where that stage begins (`map_judge.ask_later`: its ask, every unit its stages
-    take, appended to `check1_wire.LATER`, and `LaterUnits`), its first stage's inputs drawn apart or one
-    drawn twice (its store then holding one truth fewer than its stage's draws); and a follow-up given that
-    ask (`check1_wire.ASKED`'s sites) prepares every draw and judges it over both stages."""
+    take, appended to `check1_wire.LATER`, and `LaterUnits`), or with no channel to ask is refused
+    (`MissingTruth`), its first stage's inputs drawn apart or one drawn twice (its store then holding one
+    truth fewer than its stage's draws); and a follow-up given that ask (`check1_wire.ASKED`'s sites)
+    prepares every draw and judges it over both stages."""
     dew, reference, truth, drawn = site()
 
     def draw(seed):
@@ -101,6 +102,11 @@ def test_a_prepared_site_its_first_stage_leaves_undecided_asks_for_its_second_st
     with stored_truths(first, prepare=True, stamp="here"):
         assert_as_exact(dew, reference, draw, LABEL, seeds=64, truth_fn=truth)
     assert len(list(first.rglob("*.truth"))) == (63 if repeated else 64)
+    # Where no later job can be asked (no LATER), refused: its second stage was never prepared.
+    monkeypatch.delenv(LATER, raising=False)
+    with stored_truths(first, prepare=False, stamp="here"), pytest.raises(MissingTruth):
+        assert_as_exact(dew, reference, draw, LABEL, seeds=64, truth_fn=truth)
+    assert not asks.exists()
     monkeypatch.setenv(LATER, str(asks))
     with stored_truths(first, prepare=False, stamp="here"), pytest.raises(LaterUnits):
         assert_as_exact(dew, reference, draw, LABEL, seeds=64, truth_fn=truth)

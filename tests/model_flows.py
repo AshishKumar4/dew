@@ -31,7 +31,7 @@ import kernel_matrix
 import numpy as np
 from check1_wire import ASKED
 from gpu_flow import Cell, run_cells
-from map_judge import LaterUnits, site_id
+from map_judge import site_id
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact, stored_truths
 
@@ -580,21 +580,13 @@ def kinds_of(flow: Flow) -> tuple[str, ...]:
     return KINDS if not later or any(site_id(f"{flow.name}: {kind}") in later for kind in KINDS) else ()
 
 
-def run(flow: Flow, later: list[str]) -> int:
+def run(flow: Flow) -> int:
     """The flow on this GPU from its prepared programs and truths: check 1 of each program its run judges
-    (`kinds_of`), each a cell (`gpu_flow.run_cells`, which reports the cells that ran), each cell whose site
-    asked a later job for its second stage (`map_judge.LaterUnits`) added to `later`; its device's peak
+    (`kinds_of`), each a cell (`gpu_flow.run_cells`, which reports the cells that ran); its device's peak
     bytes after them, which the test reports."""
     programs = loaded(flow)
-
-    def judged(kind: str) -> None:
-        try:
-            judge(flow, programs, kind)
-        except LaterUnits:
-            later.append(f"{flow.name}: {kind}")
-            raise
-
-    run_cells([Cell(f"{flow.name}: {kind}", functools.partial(judged, kind)) for kind in kinds_of(flow)])
+    run_cells([Cell(f"{flow.name}: {kind}", functools.partial(judge, flow, programs, kind))
+               for kind in kinds_of(flow)])
     return int((jax.devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0))
 
 

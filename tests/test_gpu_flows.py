@@ -11,7 +11,6 @@ user's (`lane_environment.USERS_ARITHMETIC`), each flow in the process of its va
 
 import model_flows
 import pytest
-from gpu_flow import CellsFailed
 
 from dew.nn.kernels import generation
 
@@ -29,9 +28,9 @@ def test_a_model_trains_and_decodes_on_its_gpu_routes(name, monkeypatch, record_
     `prepare_peak_bytes`, `prepare_written_bytes`), else run, its process held to its flags and precision
     first (`model_flows.held_process`), its device's peak bytes reported (`peak_bytes`). A site its first
     stage leaves undecided asks a later job for its second (`map_judge.ask_later`, `check1_wire.LATER`); a
-    flow whose every failed cell so asked reports `later`, which a follow-up job resolves: given its first
-    run's asks (`check1_wire.ASKED`), it prepares and runs the flows of the asked sites alone, every cell of
-    each, its asked sites over every stage (`model_flows.kinds_of`)."""
+    flow whose every failed cell so asked reports `later` (tests/conftest.py), which a follow-up job
+    resolves: given its first run's asks (`check1_wire.ASKED`), it prepares and runs the flows of the asked
+    sites alone, every cell of each, its asked sites over every stage (`model_flows.kinds_of`)."""
     flow = model_flows.flow_named(name)
     if not model_flows.kinds_of(flow):
         pytest.skip(f"{flow.name}: this follow-up job was asked for no site of it")
@@ -47,11 +46,4 @@ def test_a_model_trains_and_decodes_on_its_gpu_routes(name, monkeypatch, record_
     # The flags its programs were compiled under, which a load holds them to (`BuildTarget.held`): the
     # process's own but the host backend's, which compute nothing of the GPU's programs.
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
-    later: list[str] = []
-    try:
-        record_property("peak_bytes", model_flows.run(flow, later))
-    except CellsFailed as failed:
-        # Red until its follow-up judges it; waived for that only where every failed cell asked a later job.
-        if later and set(failed.labels) <= set(later):
-            record_property("later", value=True)
-        raise
+    record_property("peak_bytes", model_flows.run(flow))
