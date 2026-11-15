@@ -130,15 +130,15 @@ def _positioned(jaxpr: jcore.Jaxpr, written: fusion.Written) -> tuple:
     """`written` with its values by their positions (`_positions`), for another body of one structure."""
     at = _positions(jaxpr)
     return (written.places, tuple(at[var] for var in written.inputs),
-            tuple(at[var] for var in written.outputs), written.at, written.call)
+            tuple(at[var] for var in written.outputs), written.at, written.call, written.key)
 
 
 def _placed(jaxpr: jcore.Jaxpr, held: tuple) -> fusion.Written:
     """A positioned recognition (`_positioned`) in `jaxpr`'s own values."""
     values = [*jaxpr.constvars, *jaxpr.invars, *(var for equation in jaxpr.eqns for var in equation.outvars)]
-    places, inputs, outputs, at, call = held
+    places, inputs, outputs, at, call, key = held
     return fusion.Written(places, tuple(values[place] for place in inputs),
-                          tuple(values[place] for place in outputs), at, call)
+                          tuple(values[place] for place in outputs), at, call, key)
 
 
 def _recognizing(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int],
@@ -185,7 +185,9 @@ def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, spans: Sequence[tuple[
         chosen = _HELD_REGIONS[key]
         if chosen is not None:
             candidate = members[chosen]
-            return fusion.Written(places, candidate.operands, candidate.outputs, places[-1], candidate.call)
+            # Its call's identity: the region's (its structure and its constants' values) and the candidate.
+            return fusion.Written(places, candidate.operands, candidate.outputs, places[-1], candidate.call,
+                                  ("recognized", key, chosen))
     return None
 
 

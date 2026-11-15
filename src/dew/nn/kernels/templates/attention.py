@@ -348,7 +348,11 @@ def _read_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int, nar
     """`spans`' intervals over its key `runs` (`_within_runs`), each narrowed by places (`narrowings`, the
     spans' `by_places` and a window's sides over the call's `positions`, None for none), then the block
     holding each query's own key whole within its run (`blocks`, `(place, own, block_groups)`,
-    `_whole_blocks`) where the call has block groups."""
+    `_whole_blocks`) where the call has block groups. No run a query (R = 0, a selection of nothing) is one
+    empty run `[0, 0)`, no key, so every path reads one representation of it and no reduction over runs
+    (`block_map`'s, the reference's) is over an empty axis."""
+    if runs.shape[-2] == 0:
+        runs = jnp.zeros((*runs.shape[:-2], 1, 2), runs.dtype)
     by_places, windowed, positions = narrowings
     if windowed is not None:
         before, after = windowed

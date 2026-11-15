@@ -194,7 +194,8 @@ def logits_ahead(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, *
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
                          residuals: bool, stages: int, *, peaks: bool = False, out_dtype=None,
                          page: int | None = None, certified: bool = False, codes=None, parts: int = 1,
-                         interpret: bool = False, params: tuple = ()) -> tuple[list, dict, list]:
+                         interpret: bool = False, params: tuple = (), in_key: bool = False
+                         ) -> tuple[list, dict, list]:
     """The forward program's allocations as `Family.scoped` takes them, in `_launch`'s order, and those it
     scopes after its walks (`after_walks`): its consumers' query stages and their rows' status; each one's
     output stage where the value is not as wide as the query and as narrow, `out_dtype`, the query's by
@@ -248,7 +249,8 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     # one above the other.
     stored = dtype if codes is None else codes
     blocks = {"keys": ((parts * block_k, width), stored)}
-    if not peaks:
+    if not peaks and not in_key:
+        # A value of the keys' leading columns its tile a view of the key slot's (`MosaicForward.in_key`).
         blocks["values"] = ((parts * block_k, value_width), stored)
     keyed = tuple(blocks)
     hooked = score_streams(family, params, "keys", consumers * block_q, block_k)
@@ -301,7 +303,9 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     # A family that takes no masked rewalk in place (`Issuer.rewalks`: tcgen05's rows) rewalks in the guard's
     # branch, its plain launch's maxima the guard's (`algebra.walked_launches`).
     family = bundle_of(walk["tiles"], query.dtype)
-    in_place = family.rewalks and (masked or (hooks.output_mod is None and _copy_costs_more(query, value)))
+    # A value of the keys' columns rewalks in the guard's branch: its launch reads no value array in place.
+    in_place = family.rewalks and not walk.get("in_key") and (
+        masked or (hooks.output_mod is None and _copy_costs_more(query, value)))
     spec, launch, finished = _inference_walk(query, key, value, spans, hooks, masked=masked, flagged=in_place,
                                              **walk)
     return finished(algebra.walked_launches(spec, launch, in_place=in_place))
@@ -349,7 +353,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
                     sources: jax.Array | None = None, subtracted: bool = False,
                     flagged: bool = False, scales: tuple[jax.Array, jax.Array] | None = None,
                     parts: int = 1, scaled: bool = True, counts: bool = True,
-                    registered: ForwardRegisters | None = None):
+                    registered: ForwardRegisters | None = None, in_key: bool = False):
     """The inference walk's launches: its spec and `launch(form, live, into)` as `algebra.walked_launches`
     takes them and `finished`, its outputs from the walk's: `MosaicForward`'s launch without residuals, at
     `tiles`, under the fold's guard over whole launches (`algebra.walked_launches`), a `scaled` walk's rows'
@@ -393,7 +397,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
         # The launch on the family arranged for its own tiles (`bundle_of`), as its derivation priced it: a
         # natural rewalk's key tile its own (`Tiles.relaunch`).
         walk = _InferenceWalk(bundle_of(at, query.dtype), spec, call, hooks, hooked, k, v, interpret, rows,
-                              out_dtype, masked, splits, paged, sources, parts, counts, registered)
+                              out_dtype, masked, splits, paged, sources, parts, counts, registered, in_key)
         return _plain_launches(walk, q, form, at, at_spans, flags, in_place, stated=stated, into=into)
 
     return (spec, launch, functools.partial(_walked_outputs, queries=call.queries, width=value.shape[3],
@@ -424,6 +428,8 @@ class _InferenceWalk(NamedTuple):
     """Whether its launches state their work to Dew's FLOP count (`_launch_flops`)."""
     registered: ForwardRegisters | None = None
     """The call's facts its launches' registers read (`_launch`'s `registered`)."""
+    in_key: bool = False
+    """Whether its values are its keys' leading columns (`MosaicForward.in_key`), read from the key slot."""
 
 
 def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, at: Tiles, at_spans,
@@ -451,7 +457,7 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
                         spec=form, hooks=_unhooked(hooks) if split else hooks, tiles=at,
                         family=family, training=False, interpret=interpret, parts=parts,
                         counted=walk.counts and form.natural == spec.natural, finishes=rows, columns=first,
-                        splits=splits, registered=walk.registered,
+                        splits=splits, registered=walk.registered, in_key=walk.in_key,
                         table=paged, sources=sources,
                         out_dtype=jnp.float32 if split else out_dtype, walks=walks,
                         shared_by=len(blocks),
@@ -950,7 +956,10 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     else:
         keys = slots["keys"] if codes is None else codes.keys(slots["keys"])
         s = family.product(q, keys.transpose((1, 0)), shape, turn)
-    slots.release("keys")
+    if program.value_columns is None:
+        # A key slot whose columns are the values' tile is held until the values' product reads it, released
+        # at the step's end (`mosaic.Slots`).
+        slots.release("keys")
     # The step's key tile, its own index but where the walk is indexed (`_Program.tile_of`).
     k_first = (index if tile is None else tile(index)) * tiles.block_k
     if codes is not None:
@@ -1004,7 +1013,11 @@ def _value_tile(program: _Program, shape: tuple, dtype, turn, slots, converted=N
     codes were `converted` into (`_Codes`), an fp32 call's an fp32 tile, its parts (`_Program.parted`)."""
     def slot():
         turn(wait=False)
-        value = slots["values"] if converted is None else converted
+        if program.value_columns is not None:
+            # The key slot's columns its value tile (`MosaicForward.in_key`).
+            value = slots["keys"].at[:, pl.ds(program.value_columns, shape[1])]
+        else:
+            value = slots["values"] if converted is None else converted
         turn(arrive=False)
         return program.parted(value, shape[0])
 
@@ -1151,7 +1164,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # The values' tiles as the products read them: a quantized call's in the query's dtype (`_Codes`), an
     # fp32 call's its parts (`_Program.parted`).
     values = functools.partial(_value_tile, program, (tiles.block_k, value_width),
-                               q_smem.dtype if codes is not None else _stream_dtype(views["values"]), turn)
+                               q_smem.dtype if codes is not None else _stream_dtype(
+                                   views["values" if "values" in views else "keys"]), turn)
     dot = functools.partial(_dot, family, interpret)
 
     def step(index, slots, carry, accumulators):
@@ -1161,8 +1175,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         # The sums are the accumulator's, which the step takes the tile into (`Keys.accumulate`); the rows'
         # maxima, denominators and a scaled walk's scale the carry (`algebra.exported`).
         state = algebra.imported((accumulators[0], *carry))
-        largest = (_largest(program, hooked, (row, place[2]), k_first, slots, converted) if spec.headroom
-                   else None)
+        largest = (_largest(program, hooked, (row, place[2]), k_first, slots, converted,
+                            value_width=value_width) if spec.headroom else None)
         accumulate = family.accumulating(mosaic.declared_into(program.products, "sums"), slots,
                                          _accumulated(family, interpret))
         keys = algebra.Keys(coords, logits, tile, dot, accumulate, products, largest)
@@ -1186,7 +1200,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         known = algebra.Argmax(family.rows_of(anchors[0].at[state_rows]),
                                family.rows_of(anchors[1].at[state_rows]))
         return _trained(spec, family, start, known, scored, values, (lo, hi), streams, counted,
-                        largest=functools.partial(_largest, program, hooked, (row, place[2])),
+                        largest=functools.partial(_largest, program, hooked, (row, place[2]),
+                                                  value_width=value_width),
                         interpret=interpret, placed=program.products)
 
     # The slots its partner reads around its own, the two turns a step would have taken
@@ -1434,8 +1449,8 @@ def _small(part) -> bool:
     return isinstance(part, product.Scaled) and not isinstance(part.exponent, jax.Array)
 
 
-def _largest(program: _Program, hooked: _Hooked, place: tuple, k_first, slots, converted=None
-             ) -> Callable[[], jax.Array]:
+def _largest(program: _Program, hooked: _Hooked, place: tuple, k_first, slots, converted=None, *,
+             value_width: int) -> Callable[[], jax.Array]:
     """A step's keys' largest value magnitudes (`algebra.Keys.largest`), a key tile's columns' layout: from
     the call's (`_Hooked.magnitudes`, at the batch row and key head `place` and the tile's first key
     `k_first`) where it holds them (a scaled op's launch, whose value tiles' transposed load the
@@ -1449,7 +1464,11 @@ def _largest(program: _Program, hooked: _Hooked, place: tuple, k_first, slots, c
         row, kv_head = place
         held = hooked.magnitudes
         return lambda: family.columns_of(held.at[row, kv_head, pl.ds(k_first, program.tiles.block_k)])
-    tile = slots["values"] if converted is None else converted
+    if program.value_columns is not None:
+        # The key slot's columns its value tile (`MosaicForward.in_key`).
+        tile = slots["keys"].at[:, pl.ds(program.value_columns, value_width)]
+    else:
+        tile = slots["values"] if converted is None else converted
     if program.parts > 1:
         tile = tile.at[pl.ds(0, program.tiles.block_k)]
     return functools.partial(family.key_magnitudes, tile)
@@ -1595,7 +1614,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
             walks: "_Flags | None" = None, sources: jax.Array | None = None, shared_by: int = 1,
             certified: bool = False, into: tuple | None = None,
             keeping: jax.Array | None = None, flags: bool = False, parts: int = 1,
-            registered: ForwardRegisters | None = None):
+            registered: ForwardRegisters | None = None, in_key: bool = False):
     """The forward's launch in `spec`'s form: its rows' status `[1, B, H, Qp]` fp32, their maxima in the
     walk's units (`algebra.walked_launches`' fold guard), and its output `[B, Qp, H, Dv]` in `out_dtype`
     (the query's by default). In `training`, at the `anchors` a peak walk found, its status and residuals
@@ -1633,6 +1652,12 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
     # lowering, `_launched`: named by its first column, a width 256 compiled four, train 505's review).
     kind = "peaks" if peaks else "training" if training else "forward"
     block_width = column_width or value.shape[-1]
+    value_columns = None
+    if in_key:
+        # Its values its keys' leading columns (`MosaicForward.in_key`): the block's columns a view of the key
+        # slot's, from its first (`_Program.value_columns`), and the key itself the launch's operand in the
+        # value's place, so no slice of it is a buffer of its own.
+        value_columns, column_width, value = columns or 0, block_width, key
     # A scaled walk's launch (`algebra.SCALED_WALK`) named apart: a call compiles it beside its unscaled form
     # where some row can be scaled (`MosaicForward.scaled`).
     name = (f"attention_{kind}{NATURAL_NAME if spec.natural else ''}{'_scaled' if spec.headroom else ''}"
@@ -1642,7 +1667,9 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
     # A block of the values' columns its index a scalar the programs read, so every block's launch is one
     # kernel (`_key_views`): a static index compiled a kernel a block, four at width 256 (the forward's
     # resource gate's cases 50 to 150 s on a CPU).
-    block = None if column_width is None else jnp.full((1,), (columns or 0) // column_width, jnp.int32)
+    # A value of the keys' columns names its block statically (`_Program.value_columns`), no index read.
+    block = (None if column_width is None or value_columns is not None
+             else jnp.full((1,), (columns or 0) // column_width, jnp.int32))
     target = generation.gpu_target()
     return _launched(query, key, value,
                      _Read(spans, hooked, anchors, None if table is None else table[0],
@@ -1657,7 +1684,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
                      certified=certified, flags=flags,
                      walk_rows=None if walks is None else walks.granule, parts=parts,
                      registers=None if registered is None else registered.at(family, tiles, peaks=peaks,
-                                                                              columns=column_width))
+                                                                              columns=column_width),
+                     value_columns=value_columns)
 
 
 def _extents(query, key, value, read: _Read, *, page: int | None, column_width: int | None, parts: int
@@ -1715,7 +1743,8 @@ def _entry(program: _Program, layout: "_Layout", body: Callable, allocations: tu
 
 
 def _program_of(family: mosaic.Family, tiles: Tiles, spec: algebra.Forward, read: _Read, key, steps: int,
-                value_width: int, dtype, *, splits: int, peaks: bool, parts: int, training: bool) -> _Program:
+                value_width: int, dtype, *, splits: int, peaks: bool, parts: int, training: bool,
+                value_columns: int | None = None) -> _Program:
     """A launch's program (`_Program`) of `steps` key tiles: no more ring stages than them (a slot past them
     would load past the keys), and its keys read a step ahead where it issues its logits so
     (`logits_ahead`). Such a program's consumers take no turns on the tensor cores (FlashAttention 3's
@@ -1727,7 +1756,8 @@ def _program_of(family: mosaic.Family, tiles: Tiles, spec: algebra.Forward, read
                          coded=_codes_of(key, read.hooked.scales) is not None, scaled=spec.headroom,
                          training=training)
     return _Program(family, tiles, steps, stages, spec.keys, spec.form == "causal", spec.queries, splits,
-                    _per_span(spec, read.spans), parts=parts, products=declared(ahead, peaks=peaks))
+                    _per_span(spec, read.spans), parts=parts, products=declared(ahead, peaks=peaks),
+                    value_columns=value_columns)
 
 
 NATURAL_NAME = "_natural"
@@ -1746,52 +1776,13 @@ def declared(ahead: bool, *, peaks: bool = False) -> tuple[mosaic.Product, ...]:
     return logits, mosaic.Product("values", "sums", accumulate=True)
 
 
-@tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
-                      "counted", "finishes", "target", "name", "splits", "page", "column_width", "shared_by",
-                      "certified", "flags", "walk_rows", "parts", "registers"))
-def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
-              family: mosaic.Family, training: bool, interpret: bool,
-              peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
-              name: str, splits: int = 1, page: int | None = None,
-              column_width: int | None = None, shared_by: int = 1,
-              certified: bool = False, flags: bool = False, walk_rows: int | None = None, parts: int = 1,
-              registers: int | None = None):
-    """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
-    hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
-    (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
-    and its operands' shapes and dtypes (`tuning.lowered_once`); `target` the GPU its config is derived for,
-    `name` its kernel's (`mosaic.kernel` reports it as the launch tracing it names it) and `registers` its
-    consumer's, which it states with it (`Family.kernel`)."""
-    leaves, treedef = jax.tree.flatten(read)
-    batch, queries, heads, width, value_width, keys_count, kv_heads = _extents(
-        query, key, value, read, page=page, column_width=column_width, parts=parts)
-    group, consumers = heads // kv_heads, tiles.consumers
-    block_q, block_k = tiles.block_q, tiles.block_k
-    spec = dataclasses.replace(spec, approximate=approximate(
-        hooks, (block_q, block_k), value_width, differentiated=False, query=(block_q, width, query.dtype)))
-    pair = consumers * block_q
-    steps = keys_count // block_k
-    program = _program_of(family, tiles, spec, read, key, steps, value_width, query.dtype, splits=splits,
-                          peaks=peaks, parts=parts, training=training)
-    # The output stores through the query's stage where the two are as wide (its rows are read before the
-    # store); else it takes a stage of its own beside the query's and the rings (`_forward_allocations`).
-    out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
-    reuse = _stores_through_query(family, width, value_width, query.dtype, out_dtype)
-    # A paged call's key tile of several pages loaded as its table reads it (`paged_reads`, `_paged_views`).
-    params = param_types(hooks.score_params)
-    kinds = tuple(kind for kind, _ in params)
-    scoped, rings, after = _forward_allocations(family, tiles, width, value_width, query.dtype, training,
-                                         program.stages, peaks=peaks, out_dtype=out_dtype, page=page,
-                                         certified=certified, codes=_codes_of(key, read.hooked.scales),
-                                         parts=parts, interpret=bool(interpret), params=params)
-    out_type = _out_types(batch, queries, heads, value_width, out_dtype, splits=splits,
-                          peaks=peaks, training=training, finishes=finishes,
-                          certified=steps if certified else 0, flags=flags,
-                          in_place=read.into is not None)
-    layout = _Layout(treedef.num_leaves, treedef.unflatten, len(out_type), len(scoped) - 2,
-                     peaks or (reuse and not training),
-                     relays(family, tiles, peaks=peaks), _codes_of(key, read.hooked.scales) is not None,
-                     bool(after))
+def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks, *, group: int,
+                 page: int | None, batch: int, queries: int, kinds: tuple, peaks: bool, training: bool,
+                 finishes: bool, certified: bool, interpret: bool, value_width: int) -> Callable:
+    """`_launched`'s kernel body: its rings opened, each consumer's walk over its query block and the
+    producer's loads, the roles scheduled as its family runs them."""
+    family, tiles, parts = program.family, program.tiles, program.parts
+    consumers, block_q = tiles.consumers, tiles.block_q
 
     def body(*refs, streams, after=None):
         refs = layout.unpacked(*refs)
@@ -1850,6 +1841,62 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
         # Each role forms what it reads (`_placed`), one switch's branch (`exclusive`).
         family.scheduled(consumers, _per_role(family, consumers, consumer), producer, exclusive=True,
                          issuer=_issuer(program, streams, refs, placed))
+
+
+    return body
+
+
+@tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
+                      "counted", "finishes", "target", "name", "splits", "page", "column_width", "shared_by",
+                      "certified", "flags", "walk_rows", "parts", "registers", "value_columns"))
+def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
+              family: mosaic.Family, training: bool, interpret: bool,
+              peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
+              name: str, splits: int = 1, page: int | None = None,
+              column_width: int | None = None, shared_by: int = 1,
+              certified: bool = False, flags: bool = False, walk_rows: int | None = None, parts: int = 1,
+              registers: int | None = None, value_columns: int | None = None):
+    """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
+    hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
+    (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
+    and its operands' shapes and dtypes (`tuning.lowered_once`); `target` the GPU its config is derived for,
+    `name` its kernel's (`mosaic.kernel` reports it as the launch tracing it names it) and `registers` its
+    consumer's, which it states with it (`Family.kernel`)."""
+    leaves, treedef = jax.tree.flatten(read)
+    batch, queries, heads, width, value_width, keys_count, kv_heads = _extents(
+        query, key, value, read, page=page, column_width=column_width, parts=parts)
+    group, consumers = heads // kv_heads, tiles.consumers
+    block_q, block_k = tiles.block_q, tiles.block_k
+    spec = dataclasses.replace(spec, approximate=approximate(
+        hooks, (block_q, block_k), value_width, differentiated=False, query=(block_q, width, query.dtype)))
+    pair = consumers * block_q
+    steps = keys_count // block_k
+    program = _program_of(family, tiles, spec, read, key, steps, value_width, query.dtype, splits=splits,
+                          peaks=peaks, parts=parts, training=training, value_columns=value_columns)
+    # The output stores through the query's stage where the two are as wide (its rows are read before the
+    # store); else it takes a stage of its own beside the query's and the rings (`_forward_allocations`).
+    out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
+    reuse = _stores_through_query(family, width, value_width, query.dtype, out_dtype)
+    # A paged call's key tile of several pages loaded as its table reads it (`paged_reads`, `_paged_views`).
+    params = param_types(hooks.score_params)
+    kinds = tuple(kind for kind, _ in params)
+    scoped, rings, after = _forward_allocations(family, tiles, width, value_width, query.dtype, training,
+                                         program.stages, peaks=peaks, out_dtype=out_dtype, page=page,
+                                         certified=certified, codes=_codes_of(key, read.hooked.scales),
+                                         parts=parts, interpret=bool(interpret), params=params,
+                                         in_key=value_columns is not None)
+    out_type = _out_types(batch, queries, heads, value_width, out_dtype, splits=splits,
+                          peaks=peaks, training=training, finishes=finishes,
+                          certified=steps if certified else 0, flags=flags,
+                          in_place=read.into is not None)
+    layout = _Layout(treedef.num_leaves, treedef.unflatten, len(out_type), len(scoped) - 2,
+                     peaks or (reuse and not training),
+                     relays(family, tiles, peaks=peaks), _codes_of(key, read.hooked.scales) is not None,
+                     bool(after))
+
+    body = _launch_body(program, layout, spec, hooks, group=group, page=page, batch=batch, queries=queries,
+                        kinds=kinds, peaks=peaks, training=training, finishes=finishes, certified=certified,
+                        interpret=interpret, value_width=value_width)
 
     products = forward_products(family, tiles, value_width, query.dtype, peaks=peaks, parts=parts,
                                 ahead=bool(program.ahead), scaled=spec.headroom, training=training)
@@ -1941,7 +1988,8 @@ def _program_views(program: _Program, refs, read: _Read, *, peaks: bool, group: 
     family, tiles = program.family, program.tiles
     row, head = family.program_index("batch", fresh=fresh), family.program_index("heads", fresh=fresh)
     column = None if read.block is None else family.scalar_of(read.block)
-    named = {"keys": refs.k} if peaks else {"keys": refs.k, "values": refs.v}
+    named = ({"keys": refs.k} if peaks or program.value_columns is not None
+             else {"keys": refs.k, "values": refs.v})
     views = _key_views(named, row, lax.div(head, group), read.sources, read.table, page=page,
                        block_k=tiles.block_k, column_block=column)
     if parts > 1:
@@ -1965,7 +2013,9 @@ def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, valu
     batch, queries, heads, width = query.shape
     owned_value = 0 if peaks else value_width
     owned_query = 0 if training and not peaks else width
-    cost = (stated(spec, batch, heads, query, key, value,
+    # The key buffer counted once where it is the values' too (`MosaicForward.in_key`, one stream).
+    streamed = (query, key) if value is key else (query, key, value)
+    cost = (stated(spec, batch, heads, *streamed,
                    tile_walk=TileWalk((queries, keys_count), (tiles.block_q, tiles.block_k), tiles.consumers,
                                       common=family.feeds_itself)) if counted
             else estimate(0))

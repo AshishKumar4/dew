@@ -57,7 +57,7 @@ the accurate products), which a run's numerics name for every template call in t
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
            *, scale: float | None = None, natural: bool | None = None, accurate: bool | None = None,
-           operand_dtype=None) -> jax.Array:
+           operand_dtype=None, in_key: bool = False) -> jax.Array:
     """Attention of `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]` and `[B, K, Hk, Dv]`.
 
     Each query reads the keys its `spans` leave it, under the score hooks and initial state of `hooks`. The
@@ -71,13 +71,15 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     `operand_dtype`, where the key and value arrive wider than the mainloops compute them (a sharding
     wrapper's, so its partial gradients sum wide), narrows the operands to it and hands back the key's
     and value's gradients unrounded, in their own dtype: the wrapper sums them and rounds once.
+    `in_key` states `value` the key's leading columns (`key[..., :Dv]`, an absorbed latent attention's),
+    which the Mosaic forward reads from the key's slot, the keys loaded once (`_Config.in_key`).
     """
     hooks = Hooks() if hooks is None else hooks
     if hooks.output_mod is not None:
         raise ValueError("the attention route takes score hooks and the initial state; its backward takes "
                          "the output before an output hook, so the caller applies `output_mod` to the result")
     config = _Config(scale, *run_forms(natural, accurate),
-                     None if operand_dtype is None else jnp.dtype(operand_dtype).name)
+                     None if operand_dtype is None else jnp.dtype(operand_dtype).name, in_key)
     return _attend(config, query, key, value, spans, hooks)
 
 
@@ -98,6 +100,9 @@ class _Config:
     natural: bool
     accurate: bool
     operand_dtype: str | None
+    in_key: bool = False
+    """Whether the values are the keys' leading columns (`attention_mosaic.MosaicForward.in_key`): the
+    Mosaic forward reads them from the key's slot; every other mainloop takes the value array as given."""
 
     def narrowed(self, query: jax.Array, key: jax.Array,
                  value: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -201,11 +206,18 @@ def _mainloop(declined: selection.Refusal | None, spans: KeySpans, hooks: Hooks,
               interpret: bool = False) -> str:
     """The mainloop a pass runs, reported (`MAINLOOP`), from Mosaic's reason it `declined` the pass and the
     Triton mainloop's refusal of its spans and hooks (`attention_triton.refused`: a dropping call's) or of
-    the call, no config of whose launch fits the GPU (`unfitted()`, its own fitting); the GPU in effect's
-    mainloops where `interpret` runs them on the CPU."""
+    the call, no config of whose launch fits the GPU (`unfitted()`, its own fitting), and where the Triton
+    mainloop is the one selected, none its GPU's assembler holds (`unfitted(certified=True)`: each config
+    it derives compiled alone, a spilling one refused and the next derived, to its least tile): a call that
+    exhausts it is declined for its registers, reported so, and the plain-JAX mainloop takes it, a call
+    another mainloop takes compiling none of the Triton kernels. The GPU in effect's mainloops where
+    `interpret` runs them on the CPU."""
     on_gpu = _on_gpu() or interpret
     triton = (attention_triton.refused(spans, hooks) or unfitted()) if on_gpu else None
-    return selection.select(MAINLOOP, _Pass(on_gpu, _on_mosaic() or interpret, declined, triton)).kernel
+    case = _Pass(on_gpu, _on_mosaic() or interpret, declined, triton)
+    if on_gpu and not interpret and triton is None and selection.selected(MAINLOOP, case).name == 'triton':
+        case = dataclasses.replace(case, triton=unfitted(certified=True))
+    return selection.select(MAINLOOP, case).kernel
 
 
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
@@ -225,15 +237,17 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     else:
         kept = Kept.SPLIT
     declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=kept,
-                                                 **form) if _on_mosaic() else None
+                                                 in_key=config.in_key, **form) if _on_mosaic() else None
     mainloop = _mainloop(declined, spans, hooks, functools.partial(
         attention_triton.unfitted, query, key, value, spans, hooks, residuals=kept, **form))
     if mainloop == 'mosaic':
         if kept is Kept.NONE and attention_decode.serves(query, key, hooks, natural=config.natural,
                                                          target=generation.gpu_target()):
             # A memory-bound inference call (a decode step's, a verify block's) as the decode's work list.
-            return attention_decode.attend(query, key, value, spans, hooks, scale=config.scale)
-        return attention_mosaic.forward(query, key, value, spans, hooks, residuals=kept, **form)
+            return attention_decode.attend(query, key, value, spans, hooks, scale=config.scale,
+                                           in_key=config.in_key)
+        return attention_mosaic.forward(query, key, value, spans, hooks, residuals=kept, in_key=config.in_key,
+                                        **form)
     if mainloop == 'triton':
         return attention_triton.forward(query, key, value, spans, _spread(hooks, query), residuals=kept,
                                         **form)

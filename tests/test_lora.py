@@ -335,7 +335,6 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
                                reference["updated_logits"], atol=1e-4, rtol=0)
 
 
-@pytest.mark.scenario("Pretrained fine-tuning")
 def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, tmp_path):
     """`source.adapt(LoRA(...))` is the source with the adapted model, the
     factors and the adapter beside them. An objective over it trains the

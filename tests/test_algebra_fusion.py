@@ -3,6 +3,8 @@ their elementwise consumers fused into the GEMM template's epilogue by the compi
 template takes the product and its price says fused wins. Every program computes what it does as written,
 its gradients too, whatever the pass fuses."""
 
+import contextlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -166,6 +168,47 @@ def test_a_plain_programs_product_runs_the_template_its_call_names(layer, forms)
             jax.jit(algebra.rewritten(layer, kernels=True)).trace(*operands)
     assert not any(route.choice == "grouped_matmul" for route in written)
     assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in passed)
+
+
+def test_a_steps_relowering_traces_none_of_its_written_regions_again():
+    """A step lowered again in one process (a planner's candidate, a relowering after a launch spilled: each
+    lowering's records fresh, so JAX traces the step again) writes its regions from the traces its first
+    lowering made (`fusion._traced`): the second traces nothing but the step itself (JAX's trace events, by
+    the function each traced), where the first traced its fused products' calls too, and it writes the
+    program the first did, reporting the routes it did. One lowered under other state a trace reads (a
+    context variable of Dew's set, attention's forward mode) traces its regions again."""
+    from jax._src import dispatch
+
+    import dew
+    from dew.algebra import program
+    from dew.nn.attention import forward_mode_attention
+
+    traced: list[str] = []
+
+    def heard(event: str, duration: float, **values) -> None:
+        del duration
+        if event == dispatch.JAXPR_TRACE_EVENT:
+            traced.append(values.get("fun_name"))
+
+    jax.monitoring.register_event_duration_secs_listener(heard)
+    operands = draw()
+    step = dew.jit(chained)
+    lowerings = []
+    try:
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+            for state in (contextlib.nullcontext(), contextlib.nullcontext(), forward_mode_attention()):
+                traced.clear()
+                with state, generation.routes() as found:
+                    made = step.trace(*operands)
+                lowerings.append((set(traced), program.structure(made.jaxpr.jaxpr),
+                                  [(route.choice, route.kernel) for route in found]))
+    finally:
+        jax.monitoring.unregister_event_duration_listener(heard)
+    (first, written, routes), (again, rewritten, rerouted), (other, _, _) = lowerings
+    assert first > {chained.__name__} and again == {chained.__name__}, (first, again)
+    assert ("grouped_matmul", "mosaic") in routes
+    assert rewritten == written and rerouted == routes
+    assert other > {chained.__name__}, other
 
 
 def _template_routes(trace) -> list:

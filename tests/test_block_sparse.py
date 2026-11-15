@@ -115,6 +115,29 @@ def test_a_masked_selection_takes_each_query_blocks_selected_key_blocks():
     np.testing.assert_array_equal(selected, expected)
 
 
+def test_a_selection_of_no_blocks_attends_to_no_key():
+    """A block mask selecting none at a budget of none (`masked_selection`, `most=0`: its selection an empty
+    axis) attends to no key: its output zero, and the query's, keys' and values' gradients zero, where the
+    selection's empty run axis reached the kernel's reduction over runs and raised."""
+    rows, queries, heads, width, block = 1, 16, 2, 16, 4
+    mask = jnp.zeros((rows, queries // block, queries // block), bool)
+    selected = block_sparse.masked_selection(mask, block, queries=queries, most=0)[:, None]
+    shapes = ((rows, queries, heads, width), (rows, queries, 1, width), (rows, queries, 1, width))
+    query, key, value = (jnp.asarray(np.random.default_rng(seed).standard_normal(shape), jnp.float32)
+                         for seed, shape in enumerate(shapes))
+
+    @jax.jit
+    def attended(query, key, value):
+        out, pull = jax.vjp(lambda *operands: sparse_selection.selected_attention(
+            *operands, selected, sparse_selection.block_runs(queries, block)), query, key, value)
+        return out, pull(jnp.ones_like(out))
+
+    out, gradients = attended(query, key, value)
+    assert out.shape == (rows, queries, heads, width)
+    for array in (out, *gradients):
+        np.testing.assert_array_equal(np.asarray(array), np.zeros(array.shape, array.dtype))
+
+
 def test_attention_over_a_groups_selection_holds_check_1_against_its_dense_mask():
     """`selected_attention` over a selection a GQA group (two key heads, four query heads each, its groups
     taken into the call's batch): the output and every gradient on par with the reference attention over

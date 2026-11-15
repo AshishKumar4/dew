@@ -12,7 +12,6 @@ import collections
 import contextlib
 import contextvars
 import dataclasses
-import functools
 import hashlib
 import importlib.util
 import itertools
@@ -124,11 +123,15 @@ class Launch:
     config: Hashable
     padded: float | None = None
     kernels: dict[str, "RegisterModel"] = dataclasses.field(default_factory=dict, compare=False)
-    emitted: Callable[[str], Hashable] | None = dataclasses.field(default=None, compare=False)
-    """What each kernel's emission reads of `config`, by its name (`tuning.KernelOp.emitted`)."""
     """Each kernel the launch traced that stated its register model as it was named (`named`'s `model`), by
     its name less the launch's suffix (`kernel_of`'s): the launch's stated register allocation, whose
     producer the compile gate checks its emission lowers to."""
+    emitted: Callable[[Hashable, str], Hashable] | None = dataclasses.field(default=None, compare=False)
+    """What each kernel's emission reads of a config it is emitted at (`config`, or a level of it the launch
+    runs a call at, `forming`'s `at`), by its name (`tuning.KernelOp.emitted`)."""
+    reverse: bool = dataclasses.field(default=False, compare=False)
+    """Whether it traced as reverse mode runs it (`pulled`), the form its certification compiles
+    (`certified`): a kernel's own entry (`named`) its trace's, the launch's its first trace's."""
 
 
 @dataclasses.dataclass
@@ -139,23 +142,27 @@ class _Pending:
     op: str
     config: Hashable
     padded: Callable[[], float | None]
-    emitted: Callable[[str], Hashable]
+    emitted: Callable[[Hashable, str], Hashable]
     digest: str | None = None
+    reverse: bool = False
 
 
 _TRACING: contextvars.ContextVar[_Pending | None] = contextvars.ContextVar("tracing_launch", default=None)
 """The pending launch whose Mosaic kernels acquire their digest through `named`."""
-_FORM: contextvars.ContextVar[Hashable] = contextvars.ContextVar("kernel_form", default=())
-"""The form of the kernel tracing (`forming`): what its emission reads beside its launch's config."""
+_FORM: contextvars.ContextVar[tuple[Hashable, Hashable]] = contextvars.ContextVar("kernel_form",
+                                                                               default=((), None))
+"""The form of the kernel tracing and the config it is emitted at (`forming`)."""
 
 
 @contextlib.contextmanager
-def forming(form: Hashable) -> Iterator[None]:
+def forming(form: Hashable, at: Hashable = None) -> Iterator[None]:
     """Within the block, the kernels traced are of `form`, what their emission reads beside their launch's
     config (`tuning.lowered_once`: a launch's static arguments the config does not carry, a forward's keeping
-    its inverses for a backward or not), which their names hold (`named`): a launch traces one kernel of a
-    name in two forms (a training call's forward and a forward alone) as two bodies."""
-    token = _FORM.set(form)
+    its inverses for a backward or not), emitted `at` a config, the launch's own where None or a level of it
+    a call runs at (a training config's forward tiles, which a forward alone takes): their names hold what
+    their emission reads of it (`named`), so a launch tracing one kernel at two levels of its config (a
+    training call's forward and a forward alone, an SSD's states at 32 and 16 value columns) names two."""
+    token = _FORM.set((form, at))
     try:
         yield
     finally:
@@ -193,7 +200,8 @@ class Recorded:
     passes: list[float] = dataclasses.field(default_factory=list)
 
 
-_RECORDING: contextvars.ContextVar[tuple[Recorded, ...]] = contextvars.ContextVar("recording", default=())
+_RECORDING: contextvars.ContextVar[tuple[Recorded, ...]] = _cache.untraced(contextvars.ContextVar("recording",
+                                                                                                  default=()))
 """The `recording` scopes open in this context, innermost last."""
 
 
@@ -275,8 +283,8 @@ def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterat
     """Within the block, the kernels a template's launch traces carry its digest in their names (`named`),
     the same in every process, and their binaries name the launch (`Binary.launched`, `traced`)."""
     token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config,
-                                  lambda: op.padded(arguments, config),
-                                  functools.partial(op.emitted, config)))
+                                  lambda: op.padded(arguments, config), op.emitted,
+                                  reverse=_PULLED.get() and op.CARRIES_DERIVATIVE))
     try:
         yield
     finally:
@@ -296,7 +304,7 @@ def relaunched(digest: str | None) -> Iterator[None]:
         return
     assert launch.emitted is not None
     token = _TRACING.set(_Pending(lambda: launch.identity, launch.op, launch.config, lambda: launch.padded,
-                                  launch.emitted, digest))
+                                  launch.emitted, digest, launch.reverse))
     try:
         yield
     finally:
@@ -330,9 +338,12 @@ def named(name: str | None, *, model: "RegisterModel | None" = None) -> str | No
         launch = _LAUNCHES[digest]
         if model is not None:
             launch.kernels[kernel] = model
-        own = _digest(f"{launch.identity}|{pending.emitted(kernel)!r}|{_FORM.get()!r}")
-        # The kernel's identity names its launch too (`traced`), for a reader holding its name alone.
-        _LAUNCHES.setdefault(own, launch)
+        form, at = _FORM.get()
+        part = pending.emitted(pending.config if at is None else at, kernel)
+        own = _digest(f"{launch.identity}|{part!r}|{form!r}")
+        # The kernel's identity names its launch too (`traced`), for a reader holding its name alone, in the
+        # mode it traced in.
+        _LAUNCHES.setdefault(own, dataclasses.replace(launch, reverse=pending.reverse))
     return launch_name(kernel, own)
 
 
@@ -398,7 +409,7 @@ def launch_digest() -> str | None:
         digest = _digest(f"{identity}|{pending.config!r}|{()!r}")
         with _GUARD:
             _LAUNCHES.setdefault(digest, Launch(identity, pending.op, pending.config, pending.padded(),
-                                                emitted=pending.emitted))
+                                                emitted=pending.emitted, reverse=pending.reverse))
         pending.digest = digest
     return pending.digest
 
@@ -432,6 +443,15 @@ def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
     spilled or serialized its warpgroup MMAs (`refused_at`). A template's legality reads it, so its derivation
     takes the next config."""
     return bool(refused_at(op, arguments, config))
+
+
+def refused_state() -> frozenset:
+    """Every launch config this context's compiles refused (`refused`), with the kernels refused at it
+    (`Binary.refused`: spilling, or their warpgroup MMAs serialized): what a template's legality reads as it
+    traces, so a trace held by its state (`dew._cache.traced_state`) is traced again once a compile refuses
+    another config."""
+    with _GUARD:
+        return frozenset(_registry().refused.items())
 
 
 def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable) -> frozenset[str]:
@@ -550,7 +570,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
             return _CERTIFIED[key].refused
         if key in _UNCERTIFIED:
             return None
-    stored = _verdict_key(op, arguments, config, reverse)
+    stored = _verdict_key(_identity(op, arguments), config, reverse)
     verdict = None if stored is None else tuning.stored_verdict(device.device_kind, stored)
     if isinstance(verdict, dict):
         kernels = verdict
@@ -601,9 +621,9 @@ def rung_round() -> int:
     return max(1, len(os.sched_getaffinity(0)))
 
 
-def _verdict_key(op, arguments: tokamax.BoundArguments, config: Hashable, reverse: bool) -> str | None:
+def _verdict_key(identity: str, config: Hashable, reverse: bool) -> str | None:
     """What decides a launch's certification on a GPU model before it traces, as its stored verdict's key
-    (`tuning.stored_verdict`): the launch's identity (`_identity`, the same in every process), its config,
+    (`tuning.stored_verdict`): the launch's `identity` (`_identity`, the same in every process), its config,
     whether reverse mode runs it, Dew's code (`package_digest`: a Dew edit certifies again), the installed
     JAX, jaxlib and CUDA plugins, whose compiler assembles it (the Pallas lowering cache's seal of them), and
     the environment a kernel's lowering and compile read (that cache's policy); the store's file names the
@@ -618,8 +638,7 @@ def _verdict_key(op, arguments: tokamax.BoundArguments, config: Hashable, revers
     installed = seal().digest
     if installed is None:
         return None
-    stated = [package_digest(), installed.hex(), _identity(op, arguments), encoded(config), reverse,
-              _keyed_environment()]
+    stated = [package_digest(), installed.hex(), identity, encoded(config), reverse, _keyed_environment()]
     return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
 
 
@@ -661,9 +680,9 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
                      reverse: bool) -> dict[str, tuple[str, "Binary"]]:
     """`op`'s launch of `arguments` at `config` as a resource derivation lowers it (`KernelOp.lowering`),
     compiled alone on `device`, as a call without a gradient runs it or, `reverse`, as reverse mode does (its
-    forward and its pullback of a unit cotangent): its Mosaic GPU kernels' modules and binaries, by name and
-    launch, none for a launch of none. A launch that does not trace alone raises: certification is no
-    optional pass."""
+    forward and its pullback of a unit cotangent): its Mosaic GPU and Pallas-Triton kernels' modules (a Triton
+    call's config) and binaries, by name and launch, none for a launch of none. A launch that does not trace
+    alone raises: certification is no optional pass."""
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
     from dew.nn.kernels.lowered import kernel_calls
@@ -679,13 +698,21 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
         specs = [jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=placed) for shape in shapes]
 
         def pulled_back(*operands):
+            # Its outputs too, as a step reads them: dropped, the kernels writing only them were dead code
+            # to XLA and went uncertified (the 4B decision step's recurrence_output, LF-PROMO3, whose
+            # program then stepped its producer down a whole-step relowering a rung).
             out, pullback = jax.vjp(launch, *operands)
-            return pullback(jax.tree.map(_unit_cotangent, out))
+            return out, pullback(jax.tree.map(_unit_cotangent, out))
 
         lowered = owned_program(pulled_back if reverse else launch).trace(*specs).lower()
     # A Mosaic GPU kernel compiled alone is the one its program loads (Mosaic compiles a module once a
-    # process); a Triton kernel compiles again with each executable, so its program's compile reads it.
-    modules = kernel_modules(kernel_calls(lowered, unrun=True))
+    # process). A Pallas-Triton kernel compiles again with each executable, the same kernel the same binary:
+    # read here too, its call's config its identity, so its derivation steps a spilling config at trace as a
+    # Mosaic launch's does (an H100's float32 attention forward at width 256 spilled at every four-warp tile
+    # and held at eight, row 6507), rather than ending its program's compile Exhausted.
+    calls = kernel_calls(lowered, unrun=True)
+    modules = kernel_modules(calls) | {name: call.config for name, call in
+                                       kernel_bodies(call for call in calls if call.kind == "triton").items()}
     if not modules:
         return {}
     return {name: (modules[name], binary)
@@ -1064,7 +1091,7 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
         return _unblocked(lowered, options, relower, asked, first.error)
     executable = first.executable
     assert executable is not None
-    found = _misses_of(_refused_binaries(lowered, executable, read))
+    found, compiled_from = _misses_of(_refused_binaries(lowered, executable, read)), lowered
     while True:
         # Each step refuses a config no step refused before, of the finitely many its launches derive.
         held = _registry().refused
@@ -1090,8 +1117,10 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
         _commit(proposal)
         for refusal, kernel in [*refusals, *((refusal, report.kernel) for refusal, report, _ in alone)]:
             _record(refusal, None, frozenset({kernel}))
+        _held(found, compiled_from)
+        _held(alone, program)
         _recorded([*found, *alone], stepped=True)
-        executable, found = replacement, _misses_of(spilling)
+        executable, found, compiled_from = replacement, _misses_of(spilling), program
     # The kept program's own spills are misses alone: refused, they would have every process seeded with
     # them derive another program, not the one this compile keeps and runs.
     _recorded(found, stepped=False)
@@ -1234,6 +1263,34 @@ def _stepped_alone(relower: Callable[[], jax.stages.Lowered], options: jax.stage
         for refusal, report, _ in found:
             _record(refusal, None, frozenset({report.kernel}))
         missed += found
+
+
+def _held(found: list, program: jax.stages.Lowered) -> None:
+    """Each config `found` refuses (a compile's misses of `program`'s kernels, `_misses_of`'s form) stored as
+    its launch's certification verdict (`_verdict_key`, in the mode its kernels traced in), as `certified`
+    stores its own: the program's compile is the authority, its kernels the bodies that run, so its refusal
+    replaces an alone compile's acceptance, which no later process compiles again to write back (`certified`
+    reads a stored verdict first). A later process's derivation refuses the config at trace, no program
+    compiled and relowered to learn it again (LF-PROMO3: a warm start walked the 4B's whole step-down
+    again, 375 of its 577 s)."""
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.lowered import kernel_calls
+
+    device = _certifying_device()
+    if device is None:
+        return
+    modules = kernel_modules(kernel_calls(program, unrun=True))
+    verdicts: dict[tuple[str, Hashable, bool], dict[str, tuple[str, Binary]]] = {}
+    for refusal, binary, _ in found:
+        launch = None if binary.launch is None else traced(binary.launch)
+        if refusal is None or launch is None:
+            continue
+        name = launch_name(binary.kernel, binary.launch)
+        verdicts.setdefault((launch.identity, launch.config, launch.reverse), {})[name] = (
+            modules.get(name, ""), binary)
+    for (identity, config, reverse), kernels in verdicts.items():
+        if (key := _verdict_key(identity, config, reverse)) is not None:
+            tuning.store_verdict(device.device_kind, key, kernels)
 
 
 def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashable], str]]

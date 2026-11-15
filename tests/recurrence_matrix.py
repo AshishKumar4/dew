@@ -238,6 +238,7 @@ CASES = (
     ('sm90', 'kimi delta attention', 'fla', 'bfloat16', 'one'),
     ('sm90', 'gated delta net', 'xla', 'float32', 'one'),
     ('sm90', 'rated scan', 'xla', 'float32', 'one'),
+    ('sm90', 'write gate', 'mosaic_gpu', 'bfloat16', 'one'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("recurrence")`, regenerated where the axes or the route's support change), under
@@ -257,11 +258,14 @@ SEEDS = {
     ('sm90', 'kimi delta attention', 'fla', 'bfloat16', 'one'): 8,
     ('sm90', 'gated delta net', 'xla', 'float32', 'one'): 256,
     ('sm90', 'rated scan', 'xla', 'float32', 'one'): 512,
+    ('sm90', 'write gate', 'mosaic_gpu', 'bfloat16', 'one'): 64,
 }
 """Each cell's declared seeds, sized by `seeds_for` on its own GPU, paired against its oracle (`_reference`,
 the upstream run live or the token recurrence; an H100 and an A100, M-JS-75d at b44df0fea0e, and the fp32
 cells over `FP32_HEADS` on an A100 and a GH200, M-JS-77 and M-JS-77b at 89af07e0eda); a cell the covering
-took for its red row at fdb49a44d0a its form, kernel and dtype's sized cell's until its own GPU sizes it."""
+took for its red row at fdb49a44d0a its form, kernel and dtype's sized cell's until its own GPU sizes it, and
+the write gate's on the template (its bf16 training on it since 55cd6a126de) its form and dtype's on the
+portable math's until an H100 sizes it."""
 
 TPU_CASES = (
     ('v6e', 'rated scan', 'tpu', 'bfloat16', 'one'),
