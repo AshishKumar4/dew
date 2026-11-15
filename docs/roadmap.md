@@ -8,6 +8,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
+- A launch's call and its gradient's product shared one digest. [6780]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -62,6 +63,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [5450, 5625]
+- CROSS-05 (audit 2026-11-15 pm, validated). [6779]
 
 ## Training and parallelism
 
@@ -88,6 +90,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Dory: the release qualified and its tests' oracles. [596]
 - CausalTransformer's module (nn/backbones/causal_transformer.py, 2494 lines, one class of 141 methods) sits at SLOP009's 2500-line limit and kept under it last…. [6094]
 - A decoder computing in no dtype of its own. [6215]
+- CROSS-02 (audit 2026-11-15 pm, validated). [6778]
 
 ## Algebra
 
