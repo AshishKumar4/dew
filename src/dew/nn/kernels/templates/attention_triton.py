@@ -179,12 +179,21 @@ def unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     """Why no config of `forward`'s launch, bound as it binds this call (`_forward_call`), fits the GPU: its
     own fitting (`Template.fits`: its padding, the configs dividing it, the registers they hold and the
     shared memory they stage), and where `certified` (the route's selected mainloop alone,
-    `attention_route._mainloop`) every config it derives spilling as the GPU's assembler builds it
-    (`_holding`), or None. The route then takes another mainloop rather than a launch that cannot run; the
-    backward's own launches hold the same tiles' operands."""
+    `attention_route._mainloop`) every config it derives, of its common op or the scaled one the call can
+    launch (`_fwd`), spilling as the GPU's assembler builds it (`_holding`), or None. The route then takes
+    another mainloop rather than a launch that cannot run; the backward's own launches hold the same tiles'
+    operands."""
     op, args, _ = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
-    return _holding(op, op.bind(*args, residuals=_kept(residuals), interpret=False), "forward",
-                 certified=certified)
+    # The scaled op too where the call's values can take it (`_fwd`): a call some row of which can be scaled
+    # launches its kernel, its own tiles (`TritonForward.scaled`).
+    scaling = certified and algebra.headroom(value.dtype)
+    ops = (op, dataclasses.replace(op, scaled=True)) if scaling else (op,)
+    for each in ops:
+        refused = _holding(each, each.bind(*args, residuals=_kept(residuals), interpret=False), "forward",
+                           certified=certified)
+        if refused is not None:
+            return refused
+    return None
 
 
 def _holding(op: Template, ba: tokamax.BoundArguments, launch: str, *, certified: bool) -> Refusal | None:
@@ -499,8 +508,9 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         """The fp32 words a thread holds live across the walk, the program's spread over its threads: the
         block's weighted values `[block_q, Dv]` and a tile's logits `[block_q, block_k]`, in a compensated
         walk what the values' sums dropped beside them (`algebra.Partial.low`, fp32 values'), in a
-        training walk the anchor's value row, `[block_q, Dv]` (`algebra.training_step`), and in an fp32
-        call the products' operands its FMA pipes read from registers. Measured where
+        training walk the anchor's value row, `[block_q, Dv]` (`algebra.training_step`). It proposes: the
+        GPU's assembler judges each config it derives (`tuning`'s `_certified`), so an fp32 call's products'
+        operands, which it does not count, step a wide call past its spilling tiles (row 6507). Measured where
         it passes a thread's registers: the training walk at 128 by 64 in four warps, 320 a thread, takes
         10x the plain forward's time on an A100 and 4.6x on an H100, at 64 by 64 2.1x and 2.0x
         (TRAINTILES3-a100, TRAINTILES2-h100)."""
@@ -512,13 +522,6 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         if self._scaled(ba):
             # A scaled walk's small weights fp32 and their products' sums (`algebra.at_scale`).
             words += rows * config.block_k + rows * value.shape[-1]
-        if jnp.dtype(ba.arguments["query"].dtype).itemsize == 4:
-            # An fp32 call's IEEE products (`kernel_dot`) on the FMA pipes read their operands from a
-            # thread's registers: the query tile held across the walk and a step's key and value tiles, each
-            # fp32 (an H100's forward at 32 by 16, width 256, priced 132 without them, compiled at 255 and
-            # spilled 152 bytes, its scaled walk 1,144: the 9B release's float32 call, row 6507).
-            width = ba.arguments["query"].shape[-1]  # the keys' too
-            words += rows * width + config.block_k * (width + value.shape[-1])
         return words // (32 * config.warps)
 
     def _scaled(self, ba: tokamax.BoundArguments) -> bool:
