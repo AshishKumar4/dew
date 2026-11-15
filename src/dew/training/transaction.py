@@ -63,6 +63,7 @@ from dew.objectives.base import (
 )
 from dew.objectives.routing import refuse_fixed_routers
 from dew.optim import clips_qk, post_step_order, stepped
+from dew.optim_schedules import INJECTED
 from dew.state import Accumulation, ReplicaState, TokenCount, TrainState, apart, occupancy, together
 from dew.training.distributed import microbatch
 from dew.training.inspection import Inspection, Summaries, stacked, summaries
@@ -515,8 +516,14 @@ def checked(state: TrainState | ReplicaState) -> dict[str, Variables | optax.Opt
     """The trees of `state` (a run's, or DiLoCo's replicas' inner copies) a finite step keeps finite and a
     save refuses non-finite: the parameters, the optimizer state and the averages. The one statement of
     them, which the step's acceptance (`finish_attempt`) and a save's refusal
-    (`dew.training.trainer.refuse_non_finite`) read."""
-    return {"variables": state.variables, "opt_state": state.opt_state, "ema": state.ema}
+    (`dew.training.trainer.refuse_non_finite`) read. The optimizer state is read without the
+    hyperparameters injected beside it (`dew.optim_schedules.INJECTED`): control values a schedule or the
+    user sets, not written by a step's gradient, and legally infinite (a clip's bound of `math.inf`)."""
+    def numerical(node):
+        return node._replace(hyperparams={}) if isinstance(node, INJECTED) else node
+
+    opt_state = jax.tree.map(numerical, state.opt_state, is_leaf=lambda node: isinstance(node, INJECTED))
+    return {"variables": state.variables, "opt_state": opt_state, "ema": state.ema}
 
 
 def _finite(leaf: jax.Array) -> jax.Array:

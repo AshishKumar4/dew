@@ -326,6 +326,12 @@ def scheduled_solver(make: Callable[..., optax.GradientTransformation], rate: fl
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
+INJECTED = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
+"""Optax's injected states (`optax.inject_hyperparams`): an optimizer's state beside the hyperparameters
+it is handed at each update (`hyperparams`), control values a schedule or the user sets, not state its
+updates accumulate."""
+
+
 def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     """Return the learning rate stored in `opt_state`, if the optimizer stores one.
 
@@ -334,7 +340,7 @@ def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     wrapper of other hyperparameters is read through to the optimizer it holds. The result is None
     when the optimizer closes over the rate, or when parameter groups hold several rates.
     """
-    injected = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
+    injected = INJECTED
     rates = []
 
     def read(tree):
