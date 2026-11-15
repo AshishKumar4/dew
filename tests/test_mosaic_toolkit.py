@@ -1837,7 +1837,8 @@ def _walked_once(x, w, *, family, interpret, all_once=False, prologue=False):
     though its index map moves with the step, loaded once outside the ring and read by every step beside
     `w`'s ringed blocks, the walk's sums read out after its last step (`Walk.read`). `all_once`, `w`'s first
     block a once stream too: every step reads the two once blocks, and the walk rotates no ring. `prologue`,
-    the walk's prologue reads a row of `x` from global memory, each step taking it."""
+    the walk's prologue reads `w`'s first row from global memory, each step adding it to the walk's carry,
+    which the read adds to every row: the sums plus `PERSISTED_STEPS` times that row."""
     rows, columns = family.rows, w.shape[1]
     family = family.specialized(rows, columns)
     shape = (rows, columns)
@@ -1852,9 +1853,10 @@ def _walked_once(x, w, *, family, interpret, all_once=False, prologue=False):
     def body(x_gmem, w_gmem, o_gmem):
         def scope(*staged, streams):
             def read(carry, sums):
-                del carry
                 out = staged[0] if staged else o_gmem
                 for first, (value,) in family.chunks(sums):
+                    if prologue:
+                        value = value + carry[None, first:first + value.shape[1]]
                     out[:, pl.ds(first, value.shape[1])] = value
                 if staged:
                     pltpu.sync_copy(out, o_gmem)
@@ -1865,9 +1867,13 @@ def _walked_once(x, w, *, family, interpret, all_once=False, prologue=False):
                 once, views = {**once, **views}, {}
             step = _multiplying(family, 'x', 'w', interpret)
             if prologue:
-                step = functools.partial(lambda step, *given, loaded: step(*given), step)
+                def step(index, slots, carry, accumulators, *, loaded, multiplied=step):
+                    carry, accumulators = multiplied(index, slots, carry, accumulators)
+                    return carry + loaded.astype(jnp.float32), accumulators
+
             walk = mosaic.Walk(views, step, steps=PERSISTED_STEPS, sums=(shape,), read=read, once=once,
-                               prologue=(lambda: x_gmem[0]) if prologue else None)
+                               carry=jnp.zeros((columns,), jnp.float32) if prologue else (),
+                               prologue=(lambda: w_gmem[0]) if prologue else None)
             family.run(streams["walked"], walk, interpret, once=streams["once"])
 
         ringed, held = {'w': ((PERSISTED_DEPTH, columns), w.dtype)}, {'x': ((rows, PERSISTED_DEPTH), x.dtype)}
@@ -1920,6 +1926,24 @@ def test_a_walks_once_stream_loads_once_and_every_step_reads_it(bundle):
         got = np.asarray(_walked_once(x, w, family=family, interpret=interpret))
     blocks = np.asarray(w, np.float32).reshape(PERSISTED_STEPS, PERSISTED_DEPTH, -1).sum(axis=0)
     np.testing.assert_array_equal(got, np.asarray(x, np.float32)[:, :PERSISTED_DEPTH] @ blocks)
+
+
+@pytest.mark.parametrize("bundle", ONCE_BUNDLES[:2])
+def test_a_walks_prologue_value_reaches_every_step_beside_its_once_stream(bundle):
+    """Interpreted: the once-stream walk with a prologue (`Walk.prologue`) on a GPU's two ways of holding
+    one, the prologue reading `w`'s first row from global memory before the walk waits on its once streams
+    (row 6657; a TPU core's walk reads HBM only by a copy, its prologue none): every step adds that row to
+    the walk's carry, which its read adds to every row of the sums, so the output is the once-stream walk's
+    plus `PERSISTED_STEPS` times that row, exactly in fp32 (base review 584d4776f F1: a prologue whose value
+    no step read held only the emitted order)."""
+    family, target, interpret = _once_bundle(bundle)
+    x, w = _persisted_operands(family.rows)
+    x = x[:family.rows]
+    with generation.assumed(target):
+        got = np.asarray(_walked_once(x, w, family=family, interpret=interpret, prologue=True))
+    blocks = np.asarray(w, np.float32).reshape(PERSISTED_STEPS, PERSISTED_DEPTH, -1).sum(axis=0)
+    expected = np.asarray(x, np.float32)[:, :PERSISTED_DEPTH] @ blocks
+    np.testing.assert_array_equal(got, expected + PERSISTED_STEPS * np.asarray(w, np.float32)[0])
 
 
 @pytest.mark.parametrize("bundle", ONCE_BUNDLES)
