@@ -112,6 +112,34 @@ def pytest_runtestloop(session):
         jax.jit(lambda x: x + 1)(0).block_until_ready()
 
 
+SCENARIOS = (
+    "Dense language-model pretraining",
+    "Pretrained fine-tuning",
+    "Structured prediction",
+    "Decision ablation workflow",
+    "Diffusion training",
+    "Published diffusion pipelines",
+    "Distributed training",
+    "Online post-training",
+    "Diffusion language models",
+    "Generation and serving",
+    "Quantized interchange",
+    "Representation learning",
+    "Hybrid and state-space models",
+)
+"""The scenarios the suite runs end to end (docs/design/testing.md), each by the name a test's `scenario` mark
+gives it: the scenario suite's branch coverage is measured over the tests they mark (tools/armada/ci.py
+`coverage items --scenarios`), and CI's check refuses a scenario no test marks (`ci.py scenarios --check`)."""
+
+
+def pytest_itemcollected(item):
+    """A test marking a scenario names one of `SCENARIOS`, or its run stops at collection."""
+    for marker in item.iter_markers("scenario"):
+        if marker.args[:1] not in [(name,) for name in SCENARIOS] or len(marker.args) != 1:
+            raise pytest.UsageError(f"{item.nodeid}: its scenario mark {marker.args!r} names none of "
+                                    f"conftest.SCENARIOS")
+
+
 def pytest_collection_finish(session):
     """The session's tests, of which a compile gate's process of its own runs those of one capability
     (`kernel_compile.compiled_apart`)."""

@@ -5,14 +5,14 @@ control (`waits`, `dependent`), with its L2 prefetches issued before that wait (
 
 from __future__ import annotations
 
-import contextlib
 import contextvars
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 
 import jax
+import jax.numpy as jnp
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, launches
 
 
 def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
@@ -41,59 +41,41 @@ def dependent(entry: Callable, interpret, *, prefetched: Callable | None = None)
     b2b872c91; CUTLASS triggers after its mainloop for the same reason). Mosaic marks the launch
     (`mosaic_gpu.uses_pdl`) and the runtime launches it with programmatic stream serialization. Interpreted,
     or on a GPU without grid dependency control (`generation.Architecture.dependent_launch`, sm_90 on),
-    `entry` as it is. Its body traces knowing whether it runs interpreted (`interpreting`), as every family's
-    products read it.
+    `entry` as it is.
 
     With `prefetched`, `prefetched(*refs)`'s views of any operands each prefetched into L2 before the wait
     (`plgpu.async_prefetch`): a prefetch reads nothing into the program, and L2 is where every write
     lands, so a view the launch before it still writes is correct to prefetch, at worst early."""
-    interpreting_ = bool(interpreted(interpret))
-    waiting = waits(interpret)
-    if not waiting and not interpreting_:
+    if not waits(interpret):
         return entry
 
     def body(*refs):
-        with launched(interpreting_):
-            if waiting:
-                for view in () if prefetched is None else prefetched(*refs):
-                    plgpu.async_prefetch(view)
-                plgpu.griddepcontrol_wait()
-            entry(*refs)
-            if waiting:
-                plgpu.griddepcontrol_launch_dependents()
+        for view in () if prefetched is None else prefetched(*refs):
+            plgpu.async_prefetch(view)
+        plgpu.griddepcontrol_wait()
+        entry(*refs)
+        plgpu.griddepcontrol_launch_dependents()
 
     return body
 
 
-_INTERPRETING: contextvars.ContextVar[bool | None] = contextvars.ContextVar("interpreting", default=None)
-"""Whether the launch whose body is tracing runs in Pallas's interpreter (`launched`, which every launch's
-body passes through, `dew.nn.kernels.launches`; `dependent` too); None outside any launch's body."""
-
-
 def interpreting() -> bool:
-    """Whether the launch whose program is tracing runs in Pallas's interpreter: a family's products issue
-    no instruction the interpreter lacks there (mma.sync's sums, `mosaic_sm80.Mma.products`), whatever a
-    caller states (row 5209's A100 backward: products called with no interpret flag issued mma.sync's)."""
-    return bool(_INTERPRETING.get())
+    """Whether the launch whose program is tracing runs in Pallas's interpreter (`launches.interpreting`): a
+    family's products issue no instruction the interpreter lacks there (mma.sync's sums,
+    `mosaic_sm80.Mma.products`), whatever a caller states (row 5209's A100 backward: products called with no
+    interpret flag issued mma.sync's)."""
+    return bool(launches.interpreting())
 
 
-@contextlib.contextmanager
-def launched(interpreting_: bool) -> Iterator[None]:
-    """Within the block, a launch's body traces (`dew.nn.kernels.launches`), run in Pallas's interpreter or
-    not (`interpreting`, `subnormals`)."""
-    token = _INTERPRETING.set(interpreting_)
-    try:
-        yield
-    finally:
-        _INTERPRETING.reset(token)
-
-
-def subnormals[T](compute: Callable[..., T]) -> T:
-    """`compute(flushing=)`, `flushing` whether the arithmetic it traces flushes a subnormal operand and
-    result (XLA's CPU, per primitive, row 4023), so it keeps them itself: within a launch's body, whether
-    the launch runs in Pallas's interpreter (on XLA's CPU); outside any, XLA's CPU's program
-    (`jax.lax.platform_dependent`): the one owner of the choice (row 6302's finish, train 866's review)."""
-    within = _INTERPRETING.get()
+def subnormals[T](compute: Callable[..., T], dtype) -> T:
+    """`compute(flushing=)`, `flushing` whether the arithmetic it traces in `dtype` flushes a subnormal
+    operand and result, so it keeps them itself: fp32's on XLA's CPU (per primitive, row 4023), within a
+    launch's body whether the launch runs in Pallas's interpreter (`launches.interpreting`), outside any
+    XLA's CPU's program (`jax.lax.platform_dependent`); a wider dtype's never (a float64 truth's). The one
+    owner of the choice (row 6302's finish, train 866's and 870's reviews)."""
+    if jnp.dtype(dtype) != jnp.dtype(jnp.float32):
+        return compute(flushing=False)
+    within = launches.interpreting()
     if within is not None:
         return compute(flushing=within)
     return jax.lax.platform_dependent(cpu=lambda: compute(flushing=True),

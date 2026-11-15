@@ -112,6 +112,7 @@ def test_text_to_image_example_records_requested_seeds_and_their_real_pixels(tmp
     assert (out / "heun40/p0_s3.png").read_bytes() != (out / "heun40/p0_s17.png").read_bytes()
 
 
+@pytest.mark.scenario("Distributed training")
 def test_moe_mesh_example_routes_and_serves_on_eight_cpu_devices(tmp_path):
     """Existing tiny controls train exchange dispatch and record actual routed generations."""
     out = tmp_path / "mesh"
@@ -179,6 +180,7 @@ def fake_dataset(batch, classes=None, size=RES):
                    records=4 * batch, batch=batch)
 
 
+@pytest.mark.scenario("Diffusion training")
 @pytest.mark.mesh
 def test_train_diffusion_example_trains_samples_and_exports(tmp_path):
     example = load("train_diffusion", "examples")
@@ -209,6 +211,7 @@ def test_train_flowers_trains_on_every_record_and_its_profiling_run_draws_nothin
     assert not (tmp_path / "run" / "samples.png").exists(), "a profiling run drew samples"
 
 
+@pytest.mark.scenario("Representation learning")
 @pytest.mark.mesh
 def test_train_jepa_example_trains_probes_and_saves_the_encoder(tmp_path):
     example = load("train_jepa", "examples")
@@ -272,6 +275,7 @@ def test_train_flowers_tpu_smoke_samples_a_grid_and_scores_it(tmp_path):
     assert (tmp_path / "checkpoints" / "smoke" / "run.json").is_file()
 
 
+@pytest.mark.scenario("Diffusion language models")
 def test_train_masked_lm_smoke_trains_its_run_and_reads_it_back_as_a_masked_generator(tmp_path):
     """A run written in Python through the public API alone, as a script trains one: `LMRunConfig.run()`
     trains the masked LM its four steps and records it, and the run directory loads back with

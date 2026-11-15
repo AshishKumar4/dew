@@ -414,7 +414,7 @@ class _Paired:
     def __call__(self, *inputs, **options):
         if self.pairing.with_ynn:
             return self.plain(*inputs, **options)
-        compiled = None if options else self.ahead.get(_signature(inputs))
+        compiled = self.ahead.get(_signature(inputs)) if self.ahead and not options else None
         return (compiled or self.without)(*inputs, **options)
 
     @property
@@ -425,15 +425,18 @@ class _Paired:
 
 
 def _signature(inputs) -> tuple:
-    """A draw's inputs as a compiled program takes them: their tree, and each leaf's shape, dtype and weak
-    type, a JAX array's sharding too (a host array or a Python number is placed as the call places it)."""
+    """A draw's inputs as a compiled program takes them: whether JAX's 64-bit types are on (a float of the
+    truth's widened draw is one width or another by it), their tree, and each leaf's type, shape and dtype, a
+    JAX array's weak type and sharding too (a host array or a Python number is placed as the call places
+    it; a leaf of no dtype, which no compile takes, by its type alone)."""
     leaves, tree = jax.tree.flatten(inputs)
+
     def taken(leaf) -> tuple:
         if isinstance(leaf, jax.Array):
-            return leaf.shape, leaf.dtype, leaf.weak_type, leaf.sharding
-        return np.shape(leaf), np.result_type(leaf), isinstance(leaf, (bool, int, float, complex))
+            return type(leaf), leaf.shape, leaf.dtype, leaf.weak_type, leaf.sharding
+        return type(leaf), getattr(leaf, "shape", ()), getattr(leaf, "dtype", None)
 
-    return tree, tuple(taken(leaf) for leaf in leaves)
+    return jax.dtypes.canonicalize_dtype(np.float64), tree, tuple(taken(leaf) for leaf in leaves)
 
 
 def _paired_arms(arms) -> list[_Paired]:

@@ -188,6 +188,62 @@ def test_the_tested_pythons_are_named_once_and_a_collection_gate_for_another_set
     assert gates(ci.PYTHONS[0]) == 1 and gates(*ci.PYTHONS, "3.15") == 1
 
 
+def test_each_scenario_is_marked_by_a_test_whose_marked_tests_alone_its_coverage_runs(ci, tmp_path):
+    """`scenarios --check` refuses a scenario of tests/conftest.py's SCENARIOS no test marks and a mark naming
+    no scenario; the scenario suite's coverage items are a task a file that marks one, and such a task runs,
+    of its file, the tests that mark a scenario alone, under coverage.py."""
+    (tmp_path / "tests/conftest.py").write_text('SCENARIOS = ("Pretraining", "Serving")\n')
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\nmarkers = ["scenario(name): a scenario"]\n')
+    marked = ("import pytest\n\n@pytest.mark.scenario(\"Pretraining\")\ndef test_trains():\n    pass\n\n"
+              "def test_a_unit():\n    pass\n")
+    written(tmp_path, {"test_train.py": marked, "test_other.py": "def test_other():\n    pass\n"})
+    assert ci.scenario_marks.scenarios(ci.test_files(), check=True) == 1
+    written(tmp_path, {"test_serve.py": "import pytest\n\n@pytest.mark.scenario( \"Serving\" )\n"
+                                        "def test_serves():\n    pass\n"})
+    assert ci.scenario_marks.scenarios(ci.test_files(), check=True) == 0
+    assert ci.scenario_marks.marked(ci.test_files()) == {"Pretraining": {"tests/test_train.py"},
+                                                         "Serving": {"tests/test_serve.py"}}
+    items = ci.coverage_items(300.0, {}, scenarios=True)
+    assert [re.search(r"--tests='([^']*)'", item)[1] for item in items] == ["tests/test_serve.py",
+                                                                           "tests/test_train.py"]
+    assert all(item.endswith(" --scenarios") and f"--coverage={ci.ARTIFACTS}" in item for item in items)
+    interpreter(tmp_path, "3.12")
+    (tmp_path / "run").mkdir()
+    ci.task("3.12", ["tests/test_train.py"], "", tmp_path / "run/rows.json", 600.0, cache="off",
+            coverage=tmp_path / "run", scenarios=True)
+    report = ET.parse(tmp_path / "run/rows.json.junit.xml").getroot()
+    assert [case.get("name") for case in report.iter("testcase")] == ["test_trains"]
+    assert list((tmp_path / "run").glob(".coverage*"))
+    # A mark naming no scenario is refused, by the files that hold it.
+    written(tmp_path, {"test_typo.py": "import pytest\n\n@pytest.mark.scenario(\"Pretrain\")\n"
+                                       "def test_typo():\n    pass\n"})
+    assert ci.scenario_marks.scenarios(ci.test_files(), check=True) == 1
+
+
+def test_a_scenario_mark_naming_no_scenario_stops_collection():
+    """tests/conftest.py refuses, as each test is collected, a scenario mark naming none of its SCENARIOS."""
+    import conftest
+
+    class Marker:
+        def __init__(self, *args):
+            self.args = args
+
+    class Item:
+        nodeid = "tests/test_x.py::test_x"
+
+        def __init__(self, *marks):
+            self.marks = marks
+
+        def iter_markers(self, name):
+            return iter(self.marks if name == "scenario" else ())
+
+    conftest.pytest_itemcollected(Item(Marker(conftest.SCENARIOS[0])))
+    for wrong in (Marker("no such scenario"), Marker(), Marker(conftest.SCENARIOS[0], "extra")):
+        with pytest.raises(pytest.UsageError):
+            conftest.pytest_itemcollected(Item(wrong))
+
+
 def test_the_newest_pythons_collection_is_planned_within_the_target_at_the_slowest_rate_it_ran_at(
         ci, tmp_path, monkeypatch):
     """Each collect task holds at most the target's seconds of files at the slowest per-file rate armada

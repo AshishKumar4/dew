@@ -469,6 +469,7 @@ def test_masked_rows_and_continuations_keep_the_mesh_contract(masked_source):
     np.testing.assert_array_equal(np.asarray(placed.decoder_steps)[6:], 0)
 
 
+@pytest.mark.scenario("Diffusion language models")
 def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path):
     source, prompt = masked_source
     model = source.model.clone(dtype=jnp.bfloat16)

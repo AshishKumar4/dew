@@ -87,7 +87,14 @@ def _rebound(adapter: Adapter, base: nn.Module, **changes) -> Adapter:
 
 
 def _is_factor(path) -> bool:
-    return path[-1].key in lora.FACTORS
+    """Whether a leaf's path ends in an adapter's factor, among a quantized tree's leaves too (Qwix's
+    arrays, whose leaves an attribute names)."""
+    return getattr(path[-1], "key", None) in lora.FACTORS
+
+
+def _names(path) -> tuple:
+    """A leaf's path as names: a dict's keys and an object's attributes."""
+    return tuple(getattr(part, "key", getattr(part, "name", None)) for part in path)
 
 
 def _factors(adapter, tree, directory) -> dict[str, np.ndarray]:
@@ -328,6 +335,7 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
                                reference["updated_logits"], atol=1e-4, rtol=0)
 
 
+@pytest.mark.scenario("Pretrained fine-tuning")
 def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, tmp_path):
     """`source.adapt(LoRA(...))` is the source with the adapted model, the
     factors and the adapter beside them. An objective over it trains the
@@ -714,16 +722,24 @@ def test_a_lora_run_served_quantized_decodes_with_its_trained_factors(decoder, l
     # Each row its prompt, then four drawn tokens.
     assert drawn.shape[-1] == 8
     np.testing.assert_array_equal(drawn[:, :4], np.broadcast_to(tokens[:1, :4], (drawn.shape[0], 4)))
-    def factors_of(tree) -> dict:
-        # Each factor by its path, among a served tree's quantized leaves (Qwix's, which are no dicts).
-        return {path: leaf for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]
-                if getattr(path[-1], "key", None) in lora.FACTORS}
-
-    factors, kept = factors_of(thaw(task.variables)), factors_of(thaw(served.variables))
+    trained, held = (jax.tree_util.tree_leaves_with_path(thaw(tree))
+                     for tree in (task.variables, served.variables))
+    factors = {_names(path): leaf for path, leaf in trained if _is_factor(path)}
+    kept = {_names(path): leaf for path, leaf in held if _is_factor(path)}
     assert factors
     for name, leaf in factors.items():
         assert np.asarray(kept[name]).dtype == np.asarray(leaf).dtype, name
         np.testing.assert_array_equal(np.asarray(kept[name]), np.asarray(leaf), err_msg=str(name))
+    # Each adapted site's base kernel float as trained and a Qwix quantized array served: its codes, of no
+    # float dtype, and their scale. A site is its module's path, whatever collection holds its kernel.
+    for site in {name[1:-1] for name in factors}:
+        def kernel(leaves, site=site):
+            return [np.asarray(leaf) for path, leaf in leaves
+                    if _names(path)[1:len(site) + 2] == (*site, "kernel")]
+        base, quantized = kernel(trained), kernel(held)
+        assert base and all(np.issubdtype(leaf.dtype, np.floating) for leaf in base), site
+        assert len(quantized) >= 2, site
+        assert any(not np.issubdtype(leaf.dtype, np.floating) for leaf in quantized), site
 
 
 CLIPPED_SEEDS = 64

@@ -1811,7 +1811,7 @@ def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax
     are."""
     def divided(*, flushing: bool) -> jax.Array:
         plain = ratio(acc)
-        if not flushing or jnp.dtype(acc.dtype) != jnp.dtype(jnp.float32):
+        if not flushing:
             return plain
         divisor = expand(total, acc)
         apart = binade_of(acc) - binade_of(divisor)
@@ -1819,7 +1819,7 @@ def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax
         lifted = raised_exactly(acc, raised)
         return jnp.where(raised > 0, lowered_divide(lifted, divisor, raised), plain)
 
-    return bodies.subnormals(divided)
+    return bodies.subnormals(divided, acc.dtype)
 
 
 def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.Array, jax.Array]:
