@@ -145,6 +145,13 @@ def _written(tree, layer, index):
                                                                               index, 0), tree, layer)
 
 
+def _finite(tree) -> jax.Array:
+    """Whether every inexact leaf of `tree` is finite throughout."""
+    flags = [jnp.isfinite(leaf).all() for leaf in jax.tree.leaves(tree)
+             if jnp.issubdtype(jnp.result_type(leaf), jnp.inexact)]
+    return jnp.logical_and.reduce(jnp.stack(flags)) if flags else jnp.asarray(a=True)
+
+
 def _pulled(back: Callable, dx):
     """`back(dx)`, a layer's VJP: its parameters' gradients, the layer below's cotangent and the flowed
     state's, the cotangent returned only with the gradients formed (`with_gradients_formed`, row 6027), which
@@ -250,7 +257,17 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
                                         gradient)
             moved, moved_moments = current.update(path, index, gradient, held, held_moments)
             if ok is not None:
-                moved = jax.tree.map(lambda new, old, ok=ok: jnp.where(ok, new, old), moved, held)
+                # Finite inputs can still form a value that is not finite (a moment past its dtype): a
+                # layer whose candidate weights or moments are not takes the zero gradient's update too,
+                # formed only then, and is counted not finite, so the step is.
+                formed = _finite((moved, moved_moments))
+                zero = jax.tree.map(jnp.zeros_like, gradient)
+                moved_moments = jax.lax.cond(
+                    ok & ~formed, lambda: current.update(path, index, zero, held, held_moments)[1],
+                    lambda moments=moved_moments: moments)
+                written = ok & formed
+                moved = jax.tree.map(lambda new, old, kept=written: jnp.where(kept, new, old), moved, held)
+                bad = bad + (ok & ~formed).astype(bad.dtype)
             if due is not None:
                 moved = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old), moved, held)
                 moved_moments = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old),

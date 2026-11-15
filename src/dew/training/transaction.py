@@ -485,6 +485,32 @@ class Applied:
                                    opt_state=opt_state)
 
 
+def _formed(before: Variables, slots_before: optax.OptState, after: Variables, slots_after: optax.OptState
+            ) -> tuple[Variables, optax.OptState, jax.Array]:
+    """The parameters `after` and optimizer state `slots_after` a step formed from `before` and
+    `slots_before`, each leaf kept as it was where its candidate is not finite: a parameter with the copies
+    of it its optimizer's state holds (`_param_copies`, Adam's moments), together, and every other leaf of
+    the state by its own; and whether every leaf was written. A leaf's gate reads that leaf alone, so the
+    step holds no state beside another's (training.md, a step that is not finite)."""
+    def finite(leaf) -> jax.Array:
+        inexact = jnp.issubdtype(jnp.result_type(leaf), jnp.inexact)
+        return jnp.isfinite(leaf).all() if inexact else jnp.asarray(a=True)
+
+    def chosen(flag, new, old):
+        return jnp.where(flag, new, old)
+
+    copies_after, copies_before = _param_copies(slots_after, after), _param_copies(slots_before, before)
+    flags = jax.tree.map(lambda leaf, *copies: functools.reduce(jnp.logical_and, map(finite, copies),
+                                                                finite(leaf)), after, *copies_after)
+    kept = jax.tree.map(chosen, flags, after, before)
+    slots = _with_copies(slots_after, after, lambda index, copy: jax.tree.map(
+        chosen, flags, copy, copies_before[index]))
+    slots = jax.tree.map(lambda new, old: chosen(finite(new), new, old), slots, slots_before)
+    held = [*jax.tree.leaves(flags), *map(finite, jax.tree.leaves(slots_after))]
+    every = functools.reduce(jnp.logical_and, held, jnp.asarray(a=True))
+    return kept, slots, every
+
+
 def _unfinite_layer(runs: Sequence[jax.Array]) -> jax.Array:
     """The highest-numbered layer whose gradient held a non-finite value, of `runs`' per-layer counts in
     the model's order, the layers numbered across them: the first the backward's walk met; -1 for none."""
@@ -1126,7 +1152,15 @@ class Transaction:
                 moved = applied.onto(dataclasses.replace(current, variables=params, opt_state=opt_state))
                 params, opt_state = moved.variables, moved.opt_state
             params = {**params, "params": self.objective.projected(params["params"], updated=True)}
-            done = update_applied(current.opt_state, opt_state) & (native_finite | (not gated))
+            formed = jnp.asarray(a=True)
+            if gated:
+                # Finite inputs make no finite update for certain: an optimizer's moment or a post-step
+                # effect can overflow from them. Each leaf is written where its own candidate, and its
+                # optimizer slots, are finite, and kept as it was elsewhere (`_formed`).
+                kept, opt_state, formed = _formed(current.variables["params"], current.opt_state,
+                                                  params["params"], opt_state)
+                params = {**params, "params": kept}
+            done = update_applied(current.opt_state, opt_state) & (native_finite | (not gated)) & formed
             if self.aux_shape.effects is not None:
                 written = write_back(params, self.objective.apply_effects(
                     params, self.effects_tree.unflatten(effects)))
@@ -1146,15 +1180,23 @@ class Transaction:
                 self.inspection, stored, native, update, params["params"])
             updates = current.updates + done.astype(current.updates.dtype)
             return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
-                                       updates=updates), inspected
+                                       updates=updates), inspected, formed
 
         if current.scale is None:
-            return *apply(current), native_finite, norm
+            # A step whose update formed a value that is not finite, a leaf of it held, is not finite.
+            committed, inspected, formed = apply(current)
+            return committed, inspected, native_finite & formed, norm
         if self.size == 1:
-            applied, inspected = apply(current)
+            applied, inspected, _ = apply(current)
             return _chosen(native_finite, applied, current), inspected, native_finite, norm
-        unapplied = jax.tree.map(jnp.zeros_like, jax.eval_shape(apply, current)[1])
-        return *_only_when(native_finite, apply, lambda x: (x, unapplied), current), native_finite, norm
+
+        def applied_alone(current):
+            committed, inspected, _ = apply(current)
+            return committed, inspected
+
+        unapplied = jax.tree.map(jnp.zeros_like, jax.eval_shape(applied_alone, current)[1])
+        return (*_only_when(native_finite, applied_alone, lambda x: (x, unapplied), current), native_finite,
+                norm)
 
     def watched_summaries(self, aux, probed) -> dict[str, jax.Array]:
         """A sampled step's watched modules' summaries: their outputs' (`watched_activations`), and with
