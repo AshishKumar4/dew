@@ -1641,6 +1641,10 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
                 # Its first stage left it undecided, and its prepare stored that stage alone
                 # (`TruthStore.draws`): its second stage is a later job's, which it asks for.
                 ask_later(label, seeds, staged_units(seeds))
+                raise MissingTruth(f"{label}: its first stage leaves it undecided and its prepare stored "
+                                   "that stage alone; a later job draws its second where check1_wire.LATER "
+                                   "is set, or a prepare given its site (stored_truths' `later`) stores "
+                                   "every stage")
             if (start, stop) not in ranges:
                 draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
                                library_fn=library_fn, library_leaves=library_leaves, also=further,
