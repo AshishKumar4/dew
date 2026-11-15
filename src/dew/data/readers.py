@@ -255,6 +255,7 @@ class _PerShare(Forwarding):
         # An elastic read's position (`position.REPLICATED`), the same on every reader.
         self._replicated = replicated
         self._read: pygrain.DatasetIterator[Batch] | None = None
+        self._started = False
         self._saved: Mapping[str, object] | None = None
         self._state: Mapping[str, object] | None = None
         self._statistics = _PublishedCounts()
@@ -275,11 +276,21 @@ class _PerShare(Forwarding):
         starts at its first turn, after the one before it has read: a spawn and an import apart,
         3.5 s each on a 4-CPU host, so 30 workers read their first two minutes at 73 rows/s on an
         A100 host (ledger row 1846)."""
+        reader = self._opened()
+        if not self._started:
+            reader.start_prefetch()
+            self._started = True
+        return reader
+
+    def _opened(self) -> pygrain.DatasetIterator[Batch]:
+        """The reader opened at its saved position, if any, its loading workers not started: a position asked
+        before the first read (a resume's fresh state, `dew.training._fit.resumed_on`) starts none, so a
+        replacement whose saved plan `set_state` refuses never started its prefetch (data.md §10)."""
         if self._read is None:
             self._read = self._open()
+            self._started = False
             if self._saved is not None:
                 self._read.set_state(self._saved)
-            self._read.start_prefetch()
         return self._read
 
     def __iter__(self) -> Iterator[Batch]:
@@ -302,7 +313,7 @@ class _PerShare(Forwarding):
     def get_state(self) -> bytes:
         state = self._state
         if state is None:
-            state = self._reader().get_state()
+            state = self._opened().get_state()
             self._publish(state)
         # The position alone: the loading workers' mirror counters it carried are this read's metrics, not
         # its place (`PositionText` empties them), so every reader of an elastic read saves one position.
@@ -335,7 +346,7 @@ class _PerShare(Forwarding):
         if written == GRAIN:
             return
         try:
-            self._reader()
+            self._opened()
         except (KeyError, TypeError, ValueError, IndexError, AttributeError) as error:
             self.close()
             raise PlanChanged(("rules.grain",),
@@ -358,6 +369,7 @@ class _PerShare(Forwarding):
         if self._read is not None:
             self._read.close()
             self._read = None
+        self._started = False
         self._state = None
 
 

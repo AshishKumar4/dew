@@ -901,3 +901,31 @@ print(json.dumps({"dtypes": [str(c.dtype) for c in cosines],
     assert first == second and first["dtypes"] == ["float32", "float32"]
     cosine, wide = first["cosines"]
     assert_fp32_reduction_bound(cosine, wide, first["magnitudes"], terms=3 * 24 + 4)
+
+
+def test_a_phased_runs_phases_and_validation_read_in_one_width():
+    """Every chain a run reads binds the widths measured over them all (data.md §10, `run_widths`), a run of
+    phases' each phase too: phases asking three and five options and a validation asking seven read each in
+    seven option places, one program for them all, where each phase bound its own (spec alignment
+    2026-11-15, data.md's third finding)."""
+    from dew.data import Memory, phases
+    from dew.data.compile import fitted
+    from dew.decision import decisions
+
+    def chain(count: int):
+        keys = "abcdefg"[:count]
+        asked = Choice("Which?", {key: key.upper() for key in keys})
+        examples = [Example(f"state {index}", {"q": asked}, {"q": keys[index % count]}) for index in range(4)]
+        return Memory([{"example": example} for example in examples]).pipe(decisions).batch(2)
+
+    objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
+    data, readers = fitted(phases((chain(3), 2), (chain(5), None)), chain(7), objective=objective.data())
+    stream = data.train(DataPartition())
+    held = readers["val"](DataPartition())
+    try:
+        read = (*itertools.islice(stream, 3), next(held))
+        widths = {np.asarray(batch["options"]).shape[-1] for batch in read}
+    finally:
+        stream.close()
+        held.close()
+    assert widths == {7}

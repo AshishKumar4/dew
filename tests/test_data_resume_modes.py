@@ -211,3 +211,51 @@ def test_a_phased_run_resumed_relaxed_with_other_batches_keeps_its_phases_at_the
         held = json.loads(checkpoints.position(5, DataPartition()))["dew_global_position"]
     assert (held["records"], held["completed"][0][1], held["origin"]) == (80, 48, 16)
 
+
+
+def test_a_per_share_reader_starts_no_prefetch_before_its_saved_plan_is_checked(monkeypatch):
+    """A per-share read whose saved position another plan wrote is refused before its reader starts
+    prefetching (data.md §10): a resume asks its fresh position first (`resumed_on`), which opens the
+    reader and starts none of its loading, and the check refuses it. The fresh position started the
+    reader's prefetch, every loading worker, before the refusal (spec alignment 2026-11-15, data.md's fifth
+    finding)."""
+    import json
+
+    from dew.data import readers
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.plan import PlanChanged
+
+    started = []
+    built = readers._PerShare.__init__
+
+    def opening(self, open_reader, *args, **kwargs):
+        def opened():
+            iterator = open_reader()
+            start = iterator.start_prefetch
+
+            def counted():
+                started.append(type(iterator).__name__)
+                return start()
+
+            iterator.start_prefetch = counted
+            return iterator
+
+        built(self, opened, *args, **kwargs)
+
+    chain = Pipeline(Memory({"x": np.arange(16, dtype=np.float32)[:, None]}, shard_rows=4)).repeat().batch(2)
+    loader = compile(chain, read="streamed", loading=Loading(workers=0))
+    stream = loader.train(DataPartition())
+    next(stream)
+    decoded = json.loads(stream.get_state())
+    stream.close()
+    decoded["dew_data_plan"]["rules"].update(shuffle="another-key")
+    monkeypatch.setattr(readers._PerShare, "__init__", opening)
+    resumed = loader.train(DataPartition())
+    try:
+        resumed.get_state()
+        with pytest.raises(PlanChanged):
+            resumed.set_state(json.dumps(decoded).encode())
+    finally:
+        resumed.close()
+    assert started == []
