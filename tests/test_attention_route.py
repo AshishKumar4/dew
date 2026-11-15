@@ -1275,6 +1275,35 @@ def test_a_value_given_as_its_keys_leading_columns_is_the_slice_on_every_route()
                     "a value of the keys' leading columns", seeds=KEY_COLUMNS_SEEDS)
 
 
+def test_a_value_given_as_its_keys_leading_columns_reaches_the_mosaic_forward_on_an_h100():
+    """`KeyColumns(512)` of 576-wide keys through `scaled_dot_product_attention`, lowered for an H100 on its
+    Mosaic mainloop: the forward reads the values from the key's slot (`MosaicForward.in_key`), so every
+    Mosaic launch takes the key in its value operand's place, where the same call handed the slice streams a
+    value of its own (in blocks of its columns): the public call's path to the template's key-slot read (row
+    6644; a CPU's call takes the plain-JAX mainloop, which takes the slice either way)."""
+    from dew.nn.kernels.lowered import custom_calls
+
+    query = jax.ShapeDtypeStruct((1, 256, 4, 576), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 256, 1, 576), jnp.bfloat16)
+
+    def keyed(given: bool) -> list[bool]:
+        def attend(query, key):
+            value = attention.KeyColumns(512) if given else key[..., :512]
+            return attention.scaled_dot_product_attention(query, key, value, causal=True,
+                                                          implementation="template")
+
+        with generation.assumed("sm90"), generation.chosen(attention_mainloop="mosaic"):
+            lowered = jax.jit(attend).trace(query, key).lower(lowering_platforms=("cuda",))
+        # Each launch's operands its queries, its keys and its values, the keys' in their place where it
+        # reads the key's slot.
+        return [call.operands[2] == call.operands[1] for call in custom_calls(lowered)
+                if call.target == "mosaic_gpu_v2"]
+
+    given, sliced = keyed(given=True), keyed(given=False)
+    assert given and all(given), given
+    assert sliced and not any(sliced), sliced
+
+
 def test_a_value_given_as_its_keys_leading_columns_is_a_static_argument_of_a_jitted_call():
     """`KeyColumns` passed through `jax.jit` stays its width, never a tracer (a static pytree node): the
     jitted call is the eager one, bitwise."""
