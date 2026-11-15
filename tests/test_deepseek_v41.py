@@ -241,21 +241,27 @@ def test_the_candidate_pool_decides_the_logits(source):
 
 
 def test_a_sequence_shorter_than_its_candidate_sources_rate_computes_and_trains(source):
-    """A sequence no compressed window of the candidate source closes (fewer tokens than its rate) computes
-    its logits and trains: its candidate pool empty, no block reserved for its newest entry
-    (`candidate_pool`), and its Reindex layers' restriction over no entry, where the pool's reservation asked
-    `top_k` for a negative count and raised. Its logits and its loss's gradient finite."""
-    loaded, plain, _ = source
+    """A sequence no compressed window of the candidate source closes (fewer tokens than its rate: the
+    tiny's CSA2 layers of the source's rate pooling four tokens a window, drawn afresh) computes its logits
+    and trains: its candidate pool empty, no block reserved for its newest entry (`candidate_pool`), and its
+    Reindex layers' restriction over no entry, where the pool's reservation asked `top_k` for a negative
+    count and raised. Its logits and its loss's gradient finite."""
+    _, plain, _ = source
     rate, = {kind.mixer.compress_rate for kind in plain.kinds.values()
              if kind.mixer is not None and getattr(kind.mixer, "candidates", None) == "source"}
-    assert rate > 1
-    ids = jnp.arange(3, 3 + rate - 1, dtype=jnp.int32)[None]
+    kinds = {name: dataclasses.replace(kind, mixer=dataclasses.replace(kind.mixer, compress_rate=4))
+             if kind.mixer is not None and getattr(kind.mixer, "compressor", None) == "csa2"
+             and kind.mixer.compress_rate == rate else kind
+             for name, kind in plain.kinds.items()}
+    model = plain.clone(kinds=flax.core.freeze(kinds))
+    ids = jnp.asarray([[3, 4, 5]], jnp.int32)
+    variables = jax.jit(model.init)(jax.random.key(0), ids)
 
     def loss(params):
-        logits = plain.apply({**loaded.variables, "params": params}, ids).astype(jnp.float32)
+        logits = model.apply({**variables, "params": params}, ids).astype(jnp.float32)
         return jnp.mean(logits ** 2), logits
 
-    (value, logits), gradients = jax.jit(jax.value_and_grad(loss, has_aux=True))(loaded.variables["params"])
+    (value, logits), gradients = jax.jit(jax.value_and_grad(loss, has_aux=True))(variables["params"])
     assert logits.shape[:2] == ids.shape and np.isfinite(np.asarray(logits)).all()
     assert np.isfinite(float(value))
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(gradients))
