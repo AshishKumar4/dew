@@ -342,6 +342,7 @@ def test_a_blackwells_gathered_product_lowers_for_cuda():
                             out_dtype="float32", interpret=False)
         tile = launch.derived(bound, generation.gpu_target())
         assert tile is not None and launch.legal(bound, tile, generation.gpu_target()), tile
+        cotangent = jnp.pad(cotangent, ((0, 0), (0, -cotangent.shape[1] % tile.block_n)))
         return mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=tile, out_dtype=jnp.float32,
                                multiprocessors=148, interpret=False, gather=(table, slots))
 
