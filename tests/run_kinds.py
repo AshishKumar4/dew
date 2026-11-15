@@ -12,9 +12,8 @@ from pathlib import Path
 from types import MappingProxyType
 
 import numpy as np
-from lane_environment import without_flags
 from objective_data import IMAGES
-from process_support import fresh
+from process_support import REPO_ROOT, dew_train, worker_env
 from test_lm_recipe import SEQ, write_token_files
 from token_support import write_token_corpus
 
@@ -69,12 +68,9 @@ class Dimmed:
         return facts
 
 
-DEVICE_COUNT = "--xla_force_host_platform_device_count"
-"""The XLA flag that sets how many CPU devices a process sees."""
-
-
-def read(chain):
-    return chain.read("memory").loading(Loading(workers=0))
+def read(chain, reading: str = "memory"):
+    """`chain` read as `reading` names (memory where it names none), in this process."""
+    return chain.read(reading).loading(Loading(workers=0))
 
 
 ROWS = {"windows": {"pack": None}, "packed": {"pack": "first-fit", "bins": 2},
@@ -94,7 +90,7 @@ def lm(root: Path, drawn: bool, *, rows: str = "windows", reading: str = "memory
     def windows(path, *, drawn: bool):
         chain = TokenFiles(path).pipe(presets.lm, None, seq_len=SEQ, batch=None, **ROWS[rows])
         chain = chain.random_filter_map(MostlyKept()) if drawn else chain
-        return chain.batch(8).read(reading).loading(Loading(workers=0))
+        return read(chain.batch(8), reading)
     fields = {"emb_features": 16, "num_layers": 1, "num_heads": 2,
               **({} if dtype is None else {"dtype": dtype})}
     return LMRunConfig(model=ModelConfig("causal_transformer", fields),
@@ -314,31 +310,29 @@ def cli_settings(root: Path, name: str, assigned: Mapping[str, str] = MappingPro
             "trainer.compilation_cache_dir": "None", **assigned}
 
 
-TRAIN_RECORD = """
-import json, sys
-from dew._cli.main import main
-arguments = json.loads(sys.argv[1])
-assert main(["train", *arguments]) == 0
-print(json.dumps(0))
-"""
-"""`dew train` of the arguments its first argument holds (JSON), in a process of its own."""
+def cli_arguments(settings: Mapping[str, object], trust: tuple[str, ...] = ()) -> list[str]:
+    """`settings` as a command's `--set path=value` flags (a mapping as JSON), `trust` its `--trust`."""
+    return [*(part for path, value in settings.items()
+              for part in ("--set", f"{path}={json.dumps(value) if isinstance(value, dict) else value}")),
+            *(part for package in trust for part in ("--trust", package))]
 
 
-def trained_record(record: Path, settings: Mapping[str, str], devices: int | None = None,
+def trained_record(record: Path, settings: Mapping[str, object], devices: int | None = None,
                    trust: tuple[str, ...] = ()) -> Path:
     """The run directory `dew train` writes for the run saved at `record` with `settings` set and `trust`
     trusted, as a user's command trains it: in this process where `devices` is None, else in a fresh one
-    that sees `devices` CPU devices, a run's device count being its process's, fixed as its backend opens."""
-    arguments = [str(record / "run.json"), *(part for path, value in settings.items()
-                                             for part in ("--set", f"{path}={value}")),
-                 *(part for package in trust for part in ("--trust", package))]
+    that sees `devices` CPU devices (`process_support.worker_env`), a run's device count being its
+    process's, fixed as its backend opens. A run named with its checkpoint directory in `settings` writes
+    there; any other where its record names (the record's own directory where it resumes from it)."""
+    arguments = [str(record / "run.json"), *cli_arguments(settings, trust)]
     if devices is None:
         assert main(["train", *arguments]) == 0
     else:
-        flags = without_flags(os.environ.get("XLA_FLAGS", ""), DEVICE_COUNT)
-        assert fresh(TRAIN_RECORD, json.dumps(arguments), flags=f"{flags} {DEVICE_COUNT}={devices}".strip(),
-                     platforms="cpu") == 0
-    return Path(settings["trainer.checkpoint_dir"]) / settings["trainer.name"]
+        dew_train(REPO_ROOT, {**worker_env(devices), "PYTHONPATH": os.pathsep.join(
+            (str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")))}, *arguments)
+    if {"trainer.name", "trainer.checkpoint_dir"} <= set(settings):
+        return Path(str(settings["trainer.checkpoint_dir"])) / str(settings["trainer.name"])
+    return record
 
 
 def trained_by_cli(run: RunConfig, root: Path, name: str, assigned: dict[str, str]) -> Path:

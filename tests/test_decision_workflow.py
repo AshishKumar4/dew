@@ -18,11 +18,10 @@ import numpy as np
 import pytest
 from real_tokenizers import backbone_reading
 from reference_error import assert_fp32_reduction_bound
-from run_kinds import scalars
+from run_kinds import cli_settings, saved_record, scalars, trained_record
 from scenario_contract import assert_steps_finite, covering
 
 import dew
-from dew._cli.main import main
 from dew.config import ObjectiveConfig
 from dew.data import Files
 from dew.data.dataset import Loading
@@ -172,16 +171,13 @@ def trained(cell: Cell, backbone: Path, root: Path) -> Path:
     """The run directory `dew train` writes for the cell, bounded to every training example its layout keeps
     (`examples`) or to a share of them (`stop`), its context read through cross-attention where the cell reads
     one."""
-    record, runs = root / "record", root / "runs"
-    run_of(cell, backbone, root).save(str(record))
-    given = {"trainer.name": cell.name, "trainer.checkpoint_dir": str(runs), "trainer.log_every": "1",
-             "trainer.eval_every": "None", "trainer.checkpoint_every": "None", "trainer.multi_host": "False",
-             "trainer.compilation_cache_dir": "None", "trainer.examples": str(kept(cell)),
-             **({"trainer.stop": f'{{"fraction": {SHARE}}}'} if cell.bound == "share" else {}),
-             **({"context_layers": CONTEXT_LAYERS} if cell.context else {})}
-    assert main(["train", str(record / "run.json"),
-                 *(part for path, value in given.items() for part in ("--set", f"{path}={value}"))]) == 0
-    return runs / cell.name
+    settings = cli_settings(root, cell.name, {
+        "trainer.log_every": "1", "trainer.examples": str(kept(cell)),
+        **({"trainer.stop": f'{{"fraction": {SHARE}}}'} if cell.bound == "share" else {}),
+        **({"context_layers": CONTEXT_LAYERS} if cell.context else {})})
+    # Bounded by its examples, not by steps.
+    del settings["trainer.steps"]
+    return trained_record(saved_record(run_of(cell, backbone, root), root, cell.name), settings)
 
 
 @pytest.mark.scenario("Decision ablation workflow")

@@ -16,7 +16,7 @@ import pytest
 import test_run_budgets
 from objective_cases import cases
 from reference_error import assert_computes_the_oracle, assert_fp32_reduction_bound
-from run_kinds import KINDS, lm, scalars
+from run_kinds import KINDS, cli_arguments, cli_settings, lm, saved_record, scalars, trained_record
 
 from dew._cli.main import main
 from dew.data.dataset import Loader
@@ -197,17 +197,12 @@ def test_an_offline_view_builds_a_configured_optimizer():
 
 def test_a_recorded_run_inspects_what_its_command_line_names(tmp_path):
     """`dew train --set trainer.inspection=...` over a run.json samples what it names at its cadence."""
-    record, runs = tmp_path / "record", tmp_path / "runs"
-    lm(tmp_path, drawn=False).save(str(record))
     inspection = {"class": "dew.training.inspection:Inspection",
                   "fields": {"paths": ["*q_proj*"], "every": 2}}
-    settings = {"trainer.name": "inspected", "trainer.checkpoint_dir": str(runs), "trainer.steps": "2",
-                "trainer.log_every": "1", "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
-                "trainer.inspection": json.dumps(inspection), "trainer.multi_host": "False",
-                "trainer.compilation_cache_dir": "None"}
-    assert main(["train", str(record / "run.json"),
-                 *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
-    logged = scalars(runs / "inspected")
+    run = trained_record(saved_record(lm(tmp_path, drawn=False), tmp_path, "inspected"), cli_settings(
+        tmp_path, "inspected", {"trainer.steps": "2", "trainer.log_every": "1",
+                                "trainer.inspection": json.dumps(inspection)}))
+    logged = scalars(run)
     assert "inspect/grads/l2" in logged[2] and "inspect/grads/l2" not in logged[1]
     assert any("q_proj" in name and name.endswith("/rms") for name in logged[2])
 
@@ -217,21 +212,18 @@ def test_a_saved_runs_view_from_the_command_line_is_what_it_logs(tmp_path, capsy
     checkpoints' latest where it has them, else its start (`RunConfig.inspected`): before the run trains, the
     view its first step logs, bit for bit; it trains nothing and writes nothing (2317's offline view from
     the command line, train 332's review)."""
-    record, runs = tmp_path / "record", tmp_path / "runs"
-    lm(tmp_path, drawn=False).save(str(record))
+    runs = tmp_path / "runs"
+    record = saved_record(lm(tmp_path, drawn=False), tmp_path, "viewed")
     inspection = {"class": "dew.training.inspection:Inspection",
                   "fields": {"paths": ["*q_proj*"], "every": 1}}
-    settings = {"trainer.name": "viewed", "trainer.checkpoint_dir": str(runs), "trainer.steps": "1",
-                "trainer.log_every": "1", "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
-                "trainer.inspection": json.dumps(inspection), "trainer.multi_host": "False",
-                "trainer.compilation_cache_dir": "None"}
-    flags = [flag for path, value in settings.items() for flag in ("--set", f"{path}={value}")]
+    settings = cli_settings(tmp_path, "viewed", {"trainer.log_every": "1",
+                                                 "trainer.inspection": json.dumps(inspection)})
     capsys.readouterr()
-    assert main(["inspect", str(record / "run.json"), *flags]) == 0
+    assert main(["inspect", str(record / "run.json"), *cli_arguments(settings)]) == 0
     offline = json.loads(capsys.readouterr().out.splitlines()[-1])
     assert not runs.exists()
-    assert main(["train", str(record / "run.json"), *flags]) == 0
-    live = {name: value for name, value in scalars(runs / "viewed")[1].items() if name.startswith("inspect/")}
+    run = trained_record(record, settings)
+    live = {name: value for name, value in scalars(run)[1].items() if name.startswith("inspect/")}
     assert live and offline == live
 
 
@@ -361,19 +353,13 @@ def test_every_kinds_run_logs_the_activations_its_command_line_watches(kind, tmp
     logs a summary of each watched module's output and of the loss's cotangent there at its sampled step,
     its mean, standard deviation and non-finite share, the output's largest magnitude, and none at a step
     it does not sample: every objective's model calls carry the step's cotangent probes (row 2324)."""
-    record, runs = tmp_path / "record", tmp_path / "runs"
     (tmp_path / "data").mkdir()
-    KINDS[kind](tmp_path / "data", drawn=False).save(str(record))
+    record = saved_record(KINDS[kind](tmp_path / "data", drawn=False), tmp_path, "watched")
     inspection = {"class": "dew.training.inspection:Inspection",
                   "fields": {"modules": ["*Attention*", "*Block*", "*Mlp*", "*MLP*"], "every": 2,
                              "targets": ["params"], "cotangents": True}}
-    settings = {"trainer.name": "watched", "trainer.checkpoint_dir": str(runs), "trainer.steps": "2",
-                "trainer.log_every": "1", "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
-                "trainer.inspection": json.dumps(inspection), "trainer.multi_host": "False",
-                "trainer.compilation_cache_dir": "None"}
-    assert main(["train", str(record / "run.json"),
-                 *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
-    logged = scalars(runs / "watched")
+    logged = scalars(trained_record(record, cli_settings(tmp_path, "watched", {
+        "trainer.steps": "2", "trainer.log_every": "1", "trainer.inspection": json.dumps(inspection)})))
     watched = {name.rsplit("/", 1)[1] for name in logged[2] if name.startswith("inspect/activations/")}
     assert {"mean", "std", "abs_max", "non_finite"} <= watched
     cotangents = {name.rsplit("/", 1)[1] for name in logged[2] if name.startswith("inspect/cotangents/")}
@@ -408,19 +394,13 @@ def test_a_run_watching_a_trained_component_alone_logs_its_activations_and_cotan
     each model call the objective trains through opens the step's collections and returns what it sowed
     (audit3 O2: the head opened its attention maxima alone and a depth's pass returned its routers,
     maxima and indexer records alone, so a watch of either was refused as watching nothing)."""
-    record, runs = tmp_path / "record", tmp_path / "runs"
     (tmp_path / "data").mkdir()
     run, modules = watching_alone(kind, tmp_path / "data")
-    run.save(str(record))
     inspection = {"class": "dew.training.inspection:Inspection",
                   "fields": {"modules": modules, "every": 1, "targets": ["params"], "cotangents": True}}
-    settings = {"trainer.name": "watched", "trainer.checkpoint_dir": str(runs), "trainer.steps": "1",
-                "trainer.log_every": "1", "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
-                "trainer.inspection": json.dumps(inspection), "trainer.multi_host": "False",
-                "trainer.compilation_cache_dir": "None"}
-    assert main(["train", str(record / "run.json"),
-                 *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
-    logged = scalars(runs / "watched")[1]
+    settings = cli_settings(tmp_path, "watched", {"trainer.log_every": "1",
+                                                  "trainer.inspection": json.dumps(inspection)})
+    logged = scalars(trained_record(saved_record(run, tmp_path, "watched"), settings))[1]
     component = "head" if kind.startswith("decision") else "mtp_1"
     for log in ("activations", "cotangents"):
         found = {name.rsplit("/", 1)[1] for name in logged if name.startswith(f"inspect/{log}/{component}/")}
