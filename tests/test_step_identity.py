@@ -124,12 +124,33 @@ class Calling:
 
 
 
+
+@dataclasses.dataclass(frozen=True)
+class Applying:
+    """A step whose field holds a class, which it makes and calls on each record."""
+
+    kind: type
+
+    def __call__(self, row):
+        return self.kind()(row)
+
+
+@dataclasses.dataclass(frozen=True)
+class Picking:
+    """A step whose field holds a callable of the standard library."""
+
+    get: object
+
+    def __call__(self, row):
+        return {**row, "id": self.get(row)}
+
 @pytest.mark.parametrize("read", ["indexed", "memory"])
-@pytest.mark.parametrize("kind", ["function", "configured", "callable", "held"])
+@pytest.mark.parametrize("kind", ["function", "configured", "callable", "held", "class"])
 def test_an_exact_resume_refuses_an_external_step_whose_code_changed(tmp_path, monkeypatch, read, kind):
     """An external step that declares no identity is what its code computes: a function, a step or the
     factory that configured one, by its module's bytes (row 3938), and an object of an external class with
-    `__call__` (`callable`), alone or held in a step's field (`held`), by its class's source (data.md §10;
+    `__call__` (`callable`), alone or held in a step's field (`held`), and a class a step's field holds and
+    calls (`class`, train 898's review), by its class's source (data.md §10;
     those resumed with other rows, spec alignment 2026-11-15). Rewritten to make other rows, each refuses
     an exact resume, where the plan names the step and where a memory read's rows name the steps that made
     them, and reads on under resume='relaxed'; unchanged, it resumes exactly. A function a field holds, a
@@ -142,7 +163,8 @@ def test_an_exact_resume_refuses_an_external_step_whose_code_changed(tmp_path, m
 
     def reader(resume="exact"):
         step = {"function": shift.shifted, "configured": Configured(shift.shifting, needs=()),
-                "callable": shift.Shifting(), "held": Calling(shift.Shifting())}[kind]
+                "callable": shift.Shifting(), "held": Calling(shift.Shifting()),
+                "class": Applying(shift.Shifting)}[kind]
         pipeline = Pipeline(ROWS).map(step).shuffle(0).repeat().batch(2)
         return compile(pipeline, read=read, loading=READ, resume=resume).train(DataPartition())
 
@@ -174,3 +196,56 @@ def test_a_function_step_that_declares_its_identity_resumes_exactly_over_a_chang
     module.write_text(SHIFT.format(by=10))
     importlib.reload(shift)
     assert resumed_changes(reader(), state) == ()
+
+
+
+def test_a_step_holding_a_standard_library_callable_resumes_exactly():
+    """A callable of the standard library a step holds (`operator.itemgetter`) is the environment's code,
+    which its version states, so the step resumes exactly (train 898's review: it was refused as the
+    user's own)."""
+    import operator
+
+    def reader():
+        pipeline = Pipeline(ROWS).map(Picking(operator.itemgetter("id"))).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ).train(DataPartition())
+
+    assert resumed_changes(reader(), saved_after_one(reader)) == ()
+
+
+def test_a_notebooks_step_compiles_and_reads_its_rows(monkeypatch):
+    """A step of a notebook's own class, defined in a `__main__` with no file, has no code to hold: it
+    compiles and reads, its plan inexact, which an exact resume refuses (train 898's review: its compile
+    raised OSError looking for the file)."""
+    import sys
+
+    monkeypatch.delattr(sys.modules["__main__"], "__file__", raising=False)
+    monkeypatch.setattr(Picking, "__module__", "__main__")
+    pipeline = Pipeline(ROWS).map(Picking(len)).batch(2)
+    loader = compile(pipeline, read="indexed", loading=READ)
+    stream = loader.train(DataPartition())
+    try:
+        assert len(next(stream)["id"]) == 2
+    finally:
+        stream.close()
+    assert loader.plan is not None and not loader.plan.manifest.exact
+
+
+def test_a_position_saved_before_held_code_resumes_an_unchanged_run_exactly(tmp_path, monkeypatch):
+    """A position saved before steps' held code was saved (no `held` in its plan) resumes an unchanged run
+    exactly, its code list compared as it was saved (train 898's review: the held digests appended to the
+    code list refused every such position of a configured external factory)."""
+    import json
+
+    module = tmp_path / f"shift_{uuid4().hex}.py"
+    module.write_text(SHIFT.format(by=1))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    shift = importlib.import_module(module.stem)
+
+    def reader():
+        pipeline = Pipeline(ROWS).map(Calling(shift.Shifting())).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ).train(DataPartition())
+
+    saved = json.loads(saved_after_one(reader))
+    earlier = {**saved, "dew_data_plan": {name: value for name, value in saved["dew_data_plan"].items()
+                                          if name != "held"}}
+    assert resumed_changes(reader(), json.dumps(earlier).encode()) == ()
