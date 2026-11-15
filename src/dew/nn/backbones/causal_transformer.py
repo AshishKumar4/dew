@@ -94,7 +94,6 @@ from ..precision import (
     head_product,
     l2norm,
     output_dtype,
-    scaled,
     scaled_logits,
 )
 from ..progress import Progress
@@ -112,8 +111,8 @@ from ..residuals import MLP_RESIDUALS, RESIDUALS
 from ..rope import LongRopeScaling, Scaling
 from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, pipeline_stages
 from ..value_experts import ValueExperts
-from . import decoder_counts, decoder_refusals
-from .call_metadata import call_metadata, prepared_embeddings
+from . import decoder_counts, decoder_refusals, embeddings
+from .call_metadata import call_metadata
 from .decoder_block import (
     DECODER_REMAT,
     REMAT_POLICIES,
@@ -144,6 +143,7 @@ from .decoder_stack import (
     split_stages,
     stored_by_stage,
 )
+from .embeddings import prepared_embeddings
 from .layer_names import group_layers, layer_index
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, layer_streams, run_period, scan_groups
 from .looping import run_loop
@@ -1415,54 +1415,21 @@ class CausalTransformer(LinearProducts):
         return self._logits(state), prediction
 
     def token_embeddings(self, tokens):
-        """Return the embeddings a prediction depth pairs with `tokens`.
-
-        `mtp_hidden_states` reads the unscaled table, so this method does that
-        lookup, with `embedding_zero_ids` read as token zero, and nothing else.
-        A drawn token is always text, so no media embedding replaces it.
-        """
-        lookup = tokens
-        for token_id in self.embedding_zero_ids:
-            lookup = jnp.where(tokens == token_id, 0, lookup)
-        return self.embed_tokens(lookup)
+        """The embeddings a prediction depth pairs with `tokens` (`embeddings.token_embeddings`)."""
+        return embeddings.token_embeddings(self, tokens)
 
     def stream_embeddings(self, tokens):
-        """`token_embeddings` at the stream's width, through `project_in` past an embedding's own: what a
-        prediction depth pairs with `tokens`, and a context's tokens a cross-attention reads by the table."""
-        looked = self.token_embeddings(tokens)
-        return looked if self.embedding_features is None else self.project_in(looked)
+        """`token_embeddings` at the stream's width (`embeddings.stream_embeddings`)."""
+        return embeddings.stream_embeddings(self, tokens)
 
     def scaled_embeddings(self, x):
-        """Return the token embeddings `x` scaled the way the first layer reads them.
-
-        `x` is normalized first where the norm reads the lookup alone
-        (`embedding_norm_reads`, Muse Glimmer), multiplied by
-        sqrt(emb_features) when `embedding_scale` is set (Gemma), then by
-        `embedding_multiplier` (lm-engine, GraniteMoeHybrid).
-        The decoder, the multimodal wrapper and the Qwen-Image conditioner all
-        scale here.
-
-        Gemma casts embed_scale to the embedding weight dtype. The lookup holds
-        that table in fp32, so the factor stays fp32 and only the product is
-        rounded (a bf16 factor would be 34.0 at hidden size 1152, not
-        33.941...). lm-engine multiplies in fp32, and `scaled` does the same.
-        """
-        # Gemma's cast: modeling_gemma3.py:117. lm-engine's fp32 opmath:
-        # mixins/dense/base.py at 45b6b57b.
-        if self.embedding_norm and self.embedding_norm_reads == 'lookup':
-            x = self.embedding_layernorm(x)
-        if self.embedding_scale:
-            x = (x * jnp.asarray(math.sqrt(self.emb_features),
-                                 self.embed_tokens.embedding.dtype)).astype(x.dtype)
-        x = scaled(x, self.embedding_multiplier)
-        return x if self.embedding_features is None else self.project_in(x)
+        """The token embeddings `x` scaled as the first layer reads them (`embeddings.scaled_embeddings`)."""
+        return embeddings.scaled_embeddings(self, x)
 
     @property
     def embedding_factor(self) -> float:
-        """The factor `scaled_embeddings` scales an embedding by, unrounded,
-        for a mixture of the table's rows to take in its own arithmetic
-        (`dew.nn.diffusion_gemma.soft_embeddings`)."""
-        return (math.sqrt(self.emb_features) if self.embedding_scale else 1.0) * self.embedding_multiplier
+        """The factor `scaled_embeddings` scales an embedding by (`embeddings.embedding_factor`)."""
+        return embeddings.embedding_factor(self)
 
     def draft(self, context, tokens, *, decode: bool = True, coordinates: Coordinates | None = None,
               choose=None):
