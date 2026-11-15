@@ -142,6 +142,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from collections.abc import Container, Mapping, Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 
 @functools.cache
@@ -563,25 +564,72 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str, missed: dict
     return found
 
 
+class Change(NamedTuple):
+    """A change from a base as a key reads it (`changed_inputs`): each module unit whose digest it changed
+    (`path::unit`, as a run records what it executed), each file it changed that a key reads whole (not a
+    module that compiles at both ends: data, a module added, removed or not compiling), and every path it
+    changed."""
+
+    units: frozenset[str]
+    whole: frozenset[str]
+    paths: frozenset[str]
+
+
+def changed_inputs(base: str, paths: set[str]) -> Change:
+    """The checkout's change from `base` to its files `paths` as the keys read it (`Change`): a module's units
+    by their digests at both ends (`digests.digested`, as `Reading` keys them), so a change to one function
+    reaches the runs that executed it, not every importer of its module."""
+    units, whole = set(), set()
+    for path in paths:
+        before = at_commit(base, path)
+        now = Path(path).read_bytes() if Path(path).is_file() else None
+        was, is_ = ((digests.digested(before, path), digests.digested(now, path))
+                    if path.endswith(".py") and before is not None and now is not None else (None, None))
+        if isinstance(was, dict) and isinstance(is_, dict):
+            units |= {f"{path}{followed.CODE}{unit}" for unit in was.keys() | is_.keys()
+                      if was.get(unit) != is_.get(unit)}
+        else:
+            whole.add(path)
+    return Change(frozenset(units), frozenset(whole), frozenset(paths))
+
+
+def touched(inputs: list[str], change: Change) -> bool:
+    """Whether a run's recorded `inputs` hold what `change` changed: a unit it executed whose digest changed,
+    a file it read whole that changed (a module's own `WHOLE`, data, one wholly changed), or an import lookup
+    that finds a file added or removed (`wrote_inputs`)."""
+    for item in inputs:
+        if item.startswith(followed.LOOKUP):
+            if wrote_inputs([item], change.whole):
+                return True
+            continue
+        plain = item.removeprefix(followed.PROBED)
+        path, _, unit = plain.partition(followed.CODE)
+        if (path in change.whole or plain in change.units
+                or (path in change.paths and unit in ("", followed.WHOLE))):
+            return True
+    return False
+
+
 def reached(rows: list[tuple[str, str]], kept: Container[tuple[str, str]],
-            last: dict[tuple[str, str], list[str]], changed: set[str]) -> dict:
-    """Which of a Python's `rows` (each a file and its group) a change of the files `changed` reaches, read
-    from the keys the cache keeps (`reach`): none it keeps (`kept`, green on exactly these inputs); one whose
-    own file changed; one whose last run's inputs (`last`, the record `cache_key` hashed) hold a changed file
-    (`wrote_inputs`); and one whose last run recorded none, unknown, which runs. A row the change leaves
-    unread is no reach of it, whatever the cache's state for it (a red run since its green one, a miss of
-    the cache's own). {"files": every reached row's file, "unknown": the files reached only through a row with
-    no recorded inputs, which the receipt names apart}."""
+            last: dict[tuple[str, str], list[str]], change: Change) -> dict:
+    """Which of a Python's `rows` (each a file and its group) `change` reaches, read from the keys the cache
+    keeps (`reach`): none it keeps (`kept`, green on exactly these inputs); one whose own file changed; one
+    whose last run's inputs (`last`, what `record` kept of its reads) hold what it changed (`touched`, a
+    module's units as a key reads them); and one whose last run recorded none, unknown. A row the change
+    leaves unread is no reach of it, whatever the cache's state for it (a red run since its green one, a miss
+    of the cache's own). {"files": every reached row's file, "unknown": the files reached only through a row
+    with no recorded inputs, which the receipt names apart}."""
     files: set[str] = set()
     known: set[str] = set()
     for name, group in rows:
         if (name, group) in kept:
             continue
         inputs = last.get((name, group))
-        if name in changed or (inputs and wrote_inputs(inputs, changed)):
+        if name in change.paths or (inputs and touched(inputs, change)):
             known.add(name)
-        if name in changed or not inputs or wrote_inputs(inputs, changed):
+        if not inputs:
             files.add(name)
+    files |= known
     return {"files": sorted(files), "unknown": sorted(files - known)}
 
 
@@ -1221,7 +1269,7 @@ def plan(target: float, timings: dict, census: bool = False,
         found = reusable(python, rows_of, shared(python), missed, last) if cache != "off" else {}
         # A change every key covers, or none places (the policy cold or off), reaches every row.
         if reach is not None:
-            reach[python] = (reached(rows_of, found, last, reach["changed"]) if cache == "on" else
+            reach[python] = (reached(rows_of, found, last, reach["change"]) if cache == "on" else
                              {"files": sorted({name for name, _ in rows_of}), "unknown": []})
         print(f"plan: {python}: kept {len(found)} of {len(rows_of)}; not kept: {missed}", file=sys.stderr)
         # A lookup a row, in seconds: a kept task's weight is its container's start and those lookups.
@@ -2513,10 +2561,10 @@ def main() -> int:
             changed = set(subprocess.run(["git", "diff", "--name-only", "--no-renames", f"{base}...HEAD"],
                                          capture_output=True, text=True, check=True).stdout.split())
             os.environ["DEW_TEST_CACHE"] = cache = policy(base)  # the plan's, as a run's scope sets it
-            reach: dict = {"changed": changed}
+            reach: dict = {"change": changed_inputs(base, changed)}
             plan(args.target, timings, reach=reach)
             print(json.dumps({"base": base, "policy": cache, "changed": sorted(changed),
-                              **{python: reach[python] for python in reach if python != "changed"}}))
+                              **{python: reach[python] for python in reach if python != "change"}}))
             return 0
         print(json.dumps({"include": plan(args.target, timings, census=args.census)}))
         return 0
