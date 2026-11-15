@@ -234,10 +234,12 @@ class LaterUnits(AssertionError):
 
 def ask_later(label: str, held: int, stop: int) -> None:
     """Where LATER names a file, raise `LaterUnits` for site `label`, whose judgement needs units `held` to
-    `stop` its pool does not hold, the file written first; else nothing (the pool is short, `PoolRefused`)."""
+    `stop` it does not hold (a judge's pool, or a GPU run's prepared first stage), its ask appended to the
+    file first, a line a site, so a process that asks for several keeps each; else nothing (the pool is
+    short, `PoolRefused`)."""
     asked = os.environ.get(LATER)
     if asked:
         Path(asked).parent.mkdir(parents=True, exist_ok=True)
-        Path(asked).write_text(json.dumps({"site": site_id(label), "from": held, "to": stop}))
-        raise LaterUnits(f"{label}: its judgement needs units {held} to {stop}, which its later map tasks "
-                         "draw")
+        with open(asked, "a", encoding="utf-8") as file:
+            file.write(json.dumps({"site": site_id(label), "from": held, "to": stop}) + "\n")
+        raise LaterUnits(f"{label}: its judgement needs units {held} to {stop}, which a later job draws")
