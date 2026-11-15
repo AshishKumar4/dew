@@ -21,6 +21,7 @@ from process_support import relayed
 from reference_error import MissingTruth, assert_as_exact, stored_truths
 
 from dew.nn.kernels import generation
+from dew.nn.kernels.selection import Refusal
 from dew.parity import FEWEST_SEEDS, GateFailure
 
 
@@ -41,9 +42,10 @@ def _routes(program, *, reference: bool = False) -> list:
 @pytest.mark.parametrize("name", [flow.name for flow in model_flows.FLOWS])
 def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monkeypatch):
     """The flow's training step and decode loop traced as `target`'s GPU chooses (`generation.assumed`) and
-    held as its prepare holds them: every route the flow is for taken off the reference path or by the
-    kernel it names (`model_flows.held_routes`), but by the portable math where it is native on other GPUs
-    alone (`Flow.families`); its reference arm on the reference path alone (`model_flows.held_reference`)."""
+    held as its prepare holds them: every route the flow is for that a native kernel claims there
+    (`model_flows.claimed`, read from the routes) taken off the reference path or by the kernel it names
+    (`model_flows.held_routes`); its reference arm on the reference path alone
+    (`model_flows.held_reference`)."""
     flow = model_flows.flow_named(name)
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
@@ -56,22 +58,24 @@ def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monk
 
 
 def test_a_training_step_on_the_templates_plain_jax_mainloop_does_not_reach_its_route(monkeypatch):
-    """An attention flow whose training step runs the template on the plain-JAX mainloop
-    (`generation.chosen`'s `attention_mainloop='portable'`, as a GPU's mainloops declining it would), its
-    decode loop on the GPU's own, does not hold: each program is held to its own routes, and the template's
-    every pass to a GPU's mainloop (`model_flows.EVERY`), so a training step whose one pass, its backward,
-    took the plain-JAX one beside a native forward does not hold either."""
+    """An attention flow whose training step took the plain-JAX mainloop in one pass, its backward, beside a
+    GPU's own in the rest (the GPU's preferred mainloop turned down there, as one declining a call would),
+    does not hold: the template's every pass is held to a GPU's mainloop where one claims it
+    (`model_flows.EVERY`, `model_flows.claimed`). Forced onto the plain-JAX mainloop by the caller
+    (`generation.chosen`), no GPU mainloop claims it and the flow holds, as it does on its own routes."""
     flow = model_flows.flow_named("dense bf16, the lane's")
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
     with generation.assumed("sm90"), jax.default_matmul_precision(flow.precision):
         native = {kind: _routes(programs[f"{kind} dew"]) for kind in model_flows.KINDS}
         with generation.chosen(attention_mainloop="portable"):
-            portable = _routes(programs["train dew"])
+            forced = _routes(programs["train dew"])
     model_flows.held_routes(flow, native, "sm90")
-    with pytest.raises(model_flows.Unreached):
-        model_flows.held_routes(flow, {**native, "train": portable}, "sm90")
-    one_pass = [route for route in portable if str(route.choice) == "attention_mainloop"][:1]
+    model_flows.held_routes(flow, {**native, "train": forced}, "sm90")
+    preferred = {str(route.choice): route.preferred for route in native["train"]}
+    one_pass = [dataclasses.replace(route, preferred=preferred[str(route.choice)], forced=None,
+                                    refusal=Refusal("declined", "the GPU's mainloop declines the call"))
+                for route in forced if str(route.choice) == "attention_mainloop"][:1]
     assert one_pass
     with pytest.raises(model_flows.Unreached):
         model_flows.held_routes(flow, {**native, "train": [*native["train"], *one_pass]}, "sm90")
