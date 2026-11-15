@@ -1282,7 +1282,8 @@ def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_g
     """A persistent warpgroup-MMA walk, one consumer beside its producer, launched at each residency its
     family admits a multiprocessor on an H100 (`RegisterModel.most`) and compiled as the GPU gate compiles
     it: the registers its consumer raises to in its PTX (`setmaxnreg.inc`) are the gate's cap for it at that
-    residency (`RegisterModel.cap`), and its binary holds its registers within them, spilling nothing."""
+    residency (`RegisterModel.cap`), the cap its record states its launch runs at, and its binary holds its
+    registers within them, spilling nothing."""
     import kernel_compile
     from fla_gdn_support import KernelCase
 
@@ -1298,7 +1299,7 @@ def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_g
         [record] = kernel_compile.compile_mosaic_kernels([case], "sm90")
         [kernel] = record["kernels"]
         cap = model.cap(programs, honored=True)
-        assert (kernel["raised"], kernel["spilled"]) == (cap, 0), (programs, record.get("error"), kernel)
+        assert (kernel["raised"], kernel["cap"], kernel["spilled"]) == (cap, cap, 0), (programs, kernel)
         assert kernel["registers"] <= cap
 
 

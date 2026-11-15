@@ -1091,6 +1091,20 @@ def test_the_sass_rules_find_what_ptxas_left_of_a_kernel(listing, found):
     assert "register operand A before its group retired" in finding
 
 
+def test_the_compile_gate_fails_a_kernel_above_the_register_cap_its_launch_runs_at():
+    """A kernel allocating more registers a thread than the cap its launch runs at (its record's `cap`, as its
+    compile states it: its consumers' raise, else its threads' share of the multiprocessor's registers at the
+    programs it is launched to hold), spilling nothing, is a kernel the gate fails, and one at its cap passes
+    (row 6670): an allocation above the launch's leaves a multiprocessor fewer programs than it was planned
+    for."""
+    import kernel_compile as kc
+
+    held = kc.Report("kernel", 1024, 0, 168, 0, cap=168)
+    assert held.failure(232448, 512) is None
+    over = dataclasses.replace(held, registers=192)
+    assert "above its launch's 168" in over.failure(232448, 512)
+
+
 def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read():
     """The SASS rules' disassembler comes with the compile gate (nvdisasm, the ci extra's, in every lock the
     suite runs on), and a kernel whose machine code went unread (no disassembler) is no kernel the gate

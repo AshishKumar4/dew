@@ -109,6 +109,9 @@ class Report:
     binary_frame: int | None = None
     """Its registers a thread and stack frame's bytes as its executable's binary carries them
     (`report.Binary`): this process's assembly, which `inherited` reads where no PTX of it was dumped."""
+    cap: int | None = None
+    """The registers its launch runs a thread at, as its compile states them (`_compiled_here`'s), None where
+    unstated."""
 
     @property
     def traced(self) -> str:
@@ -117,10 +120,11 @@ class Report:
 
     def failure(self, shared_limit: int, tmem_limit: int) -> str | None:
         """Why the kernel is not within a multiprocessor's `shared_limit` bytes and `tmem_limit` tensor memory
-        columns without spilling registers, with its warpgroup MMAs in flight together and its register raises
-        taken, or None where it is: a kernel ptxas serializes runs its MMAs one at a time, its registers and
-        spills clean (row 3615; the kernel challenge's C7511 at 112 registers, C7512 at 96), and one whose
-        raises it ignores keeps its consumers at the entry's registers (C7507, row 4071)."""
+        columns without spilling registers, within its launch's register cap (`cap`), with its warpgroup MMAs
+        in flight together and its register raises taken, or None where it is: a kernel ptxas serializes runs
+        its MMAs one at a time, its registers and spills clean (row 3615; the kernel challenge's C7511 at 112
+        registers, C7512 at 96), and one whose raises it ignores keeps its consumers at the entry's registers
+        (C7507, row 4071)."""
         if self.unread:
             return f"its reports state no {', '.join(self.unread)}"
         if self.losses:
@@ -129,6 +133,8 @@ class Report:
                  else "serializes its warpgroup MMAs") + f" ({code})" for code in self.losses)
         if self.sass:
             return "its machine code holds " + "; ".join(self.sass)
+        if self.registers is not None and self.cap is not None and self.registers > self.cap:
+            return f"{self.registers} registers a thread, above its launch's {self.cap}"
         if (self.shared is not None and self.tmem is not None and self.shared <= shared_limit
                 and self.tmem <= tmem_limit and self.spilled == 0):
             return None
@@ -699,6 +705,9 @@ DECREASED = re.compile(r"setmaxnreg\.dec\.sync\.aligned\.u32 (\d+);")
 
 THREADS = re.compile(r"\.maxntid (\d+),")
 """A kernel's threads a block (`.maxntid`'s first), as a kernel record states them (`threads`)."""
+PROGRAMS = re.compile(r"\.minnctapersm (\d+)")
+"""The programs a multiprocessor holds of a kernel at once (`.minnctapersm`, Mosaic's `min_blocks_per_sm`), as
+ptxas bounds its registers by them (`cap`)."""
 
 
 RELOCATABLE = not resources.RAISES_HONORED
@@ -790,6 +799,14 @@ def _compiled_here(cases, generation: str) -> list[dict]:
                 # Its threads a block, as its PTX states (`.maxntid`); None likewise. A record compiled in a
                 # process of its own (`compiled_apart`) carries it where this process's `PTX` holds none.
                 kernel["threads"] = int(threads.group(1)) if (threads := THREADS.search(ptx)) else None
+                # The registers its launch runs a thread at, as its compile states them: its consumers' raise
+                # where it raises, else its threads' share of the multiprocessor's registers at the programs
+                # it is launched to hold (`resources.thread_share`); None where no PTX states its threads.
+                programs = int(held.group(1)) if (held := PROGRAMS.search(ptx)) else 1
+                with assumed(gpu_target(generation)):
+                    kernel["cap"] = (kernel["raised"] if kernel["raised"] is not None
+                                     else None if kernel["threads"] is None
+                                     else resources.thread_share(kernel["threads"], programs))
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
         found.append(record)
     return found
