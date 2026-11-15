@@ -402,15 +402,12 @@ def _split[Held](takes: Held, placed: Held) -> tuple[Held, Held]:
                                is_leaf=lambda leaf: leaf is None)
 
 
-def taking_over[Held, Result](function: Callable[[Held, jax.Array], Result], taken: Held, kept: Held,
-                              shardings: Placements) -> Callable[[jax.Array], Result]:
-    """`function` jitted onto `shardings`, a placement of its result's structure, over the held tree
-    `placed_held` splits: `taken` donated, for the outputs to take its buffers over, and `kept` not, as no
-    output takes those and JAX only warns of a donation it cannot use. They are freed as the caller drops
-    them."""
-
-    return functools.partial(start_program(function, shardings, taken), _held_leaves(taken),
-                             _held_leaves(kept))
+def taking_over[Held, Result](program: OuterProgram, taken: Held, kept: Held
+                              ) -> Callable[[jax.Array], Result]:
+    """The start's `program` (`StartBuild.program`) over the held tree `placed_held` splits: `taken`
+    donated, for the outputs to take its buffers over, and `kept` not, as no output takes those and JAX only
+    warns of a donation it cannot use. They are freed as the caller drops them."""
+    return functools.partial(program, _held_leaves(taken), _held_leaves(kept))
 
 
 def _held_leaves(tree) -> list:
@@ -448,68 +445,75 @@ def _rest(initial_state: Callable[[Initializer, jax.Array], TrainState], built: 
 
 
 @dataclasses.dataclass(frozen=True)
-class _Start:
-    """How a fresh state is built and placed (`_start`), whether its arrays or their shapes are placed: the
-    function its program runs over the held tree and the key, where that program puts its results, the
+class StartBuild:
+    """How a fresh state is built and placed (`start_build`), whether its arrays or their shapes are placed:
+    the function its program runs over the held tree and the key, where that program puts its results, the
     held leaves the state keeps as they are (`shared`, by id, where it keeps them), and where the init
     passes some frozen leaves through (`through`), the frozen tree's placements and structure and the
-    leaves the program builds (`built`, by index among the frozen tree's leaves)."""
+    leaves the program builds (`built`, by index among the frozen tree's leaves). Its program is built once
+    (`program`), so the start a run compiles beside its step (`start_compiling`) and the one it places
+    (`placed_start`) are one program, whose lowering the compile point keeps."""
 
     function: Callable[[Initializer, jax.Array], Any]
     out_shardings: Any
     shared: Mapping[int, NamedSharding]
+    through: Mapping[int, int]
     frozen: tuple[list[NamedSharding], Any] | None = None
     built: tuple[int, ...] = ()
+    programs: dict = dataclasses.field(default_factory=dict, compare=False, repr=False)
+
+    def program(self, like) -> OuterProgram:
+        """The start's program (`start_program`) over a held tree split as `like` is (its arrays or their
+        shapes), built the first time it is asked for."""
+        structure = jax.tree.structure(like, is_leaf=lambda leaf: leaf is None)
+        if structure not in self.programs:
+            self.programs[structure] = start_program(self.function, self.out_shardings, like)
+        return self.programs[structure]
 
 
-def _start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-           shardings: Placement[TrainState], through: Mapping[int, int]) -> _Start:
+def start_build(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
+                shardings: Placement[TrainState], through: Mapping[int, int]) -> StartBuild:
     """The one way a fresh state is built and placed, which a run's start runs (`placed_start`) and a run
     compiled ahead compiles (`start_compiled`): where its init passes no frozen leaf through, one program
     builds the state; where it does, the passed leaves are the held arrays placed where the state keeps them,
     and the program builds the rest (`_rest`)."""
     moving, frozen = apart(shardings)
     if not frozen or not through:
-        return _Start(initial_state, shardings, {})
+        return StartBuild(initial_state, shardings, {}, through)
     inputs = jax.tree.leaves(initializer)
     where, structure = jax.tree.flatten(frozen)
     built = tuple(index for index in range(len(where)) if index not in through)
     # Each passed leaf is placed once, where the state keeps it, whatever path the init moves it to.
-    return _Start(_rest(initial_state, list(built)), (moving, tuple(where[index] for index in built)),
-                  {id(inputs[given]): where[index] for index, given in through.items()}, (where, structure),
-                  built)
+    return StartBuild(_rest(initial_state, list(built)), (moving, tuple(where[index] for index in built)),
+                      {id(inputs[given]): where[index] for index, given in through.items()}, through,
+                      (where, structure), built)
 
 
-def start_compiled(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-                   key: jax.ShapeDtypeStruct, abstract: TrainState, shardings: Placement[TrainState],
-                   through: Mapping[int, int], mesh: Mesh) -> jax.stages.Compiled:
-    """The program `placed_start` runs to build a fresh state on `mesh` (`_start`), compiled through Dew's
-    compile point over the shapes of its arguments (`held_shapes`, `key`'s): what a run compiled ahead
+def start_compiled(start: StartBuild, initializer: Initializer, key: jax.ShapeDtypeStruct,
+                   abstract: TrainState, shardings: Placement[TrainState], mesh: Mesh) -> jax.stages.Compiled:
+    """The program `placed_start` runs to build a fresh state on `mesh` (`start_build`), compiled through
+    Dew's compile point over the shapes of its arguments (`held_shapes`, `key`'s): what a run compiled ahead
     compiles of its start, whose devices compile none of it (`dew.training.ahead.AheadOfTime.starts`)."""
-    program, arguments = _start_shapes(initial_state, initializer, abstract, shardings, through, mesh)
+    program, arguments = _start_shapes(start, initializer, abstract, shardings, mesh)
     return program.compiled(*arguments, key)
 
 
-def start_compiling(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-                    key: jax.ShapeDtypeStruct, abstract: TrainState, shardings: Placement[TrainState],
-                    through: Mapping[int, int], mesh: Mesh) -> Compiling:
+def start_compiling(start: StartBuild, initializer: Initializer, key: jax.ShapeDtypeStruct,
+                    abstract: TrainState, shardings: Placement[TrainState], mesh: Mesh) -> Compiling:
     """`start_compiled`'s program lowered and its compile begun in a thread of its own (`compiling`): a run
     compiled ahead compiles its start beside its step's planning, which reads none of it, and takes it
     where `start_compiled` lowers it (`attempting`). A Qwen3.5-4B's start took 97 s to compile for an
     H100 after its step's 110 s."""
-    program, arguments = _start_shapes(initial_state, initializer, abstract, shardings, through, mesh)
+    program, arguments = _start_shapes(start, initializer, abstract, shardings, mesh)
     return compiling(program, *arguments, key)
 
 
-def _start_shapes(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-                  abstract: TrainState, shardings: Placement[TrainState], through: Mapping[int, int],
-                  mesh: Mesh) -> tuple[OuterProgram, tuple[list, list]]:
-    """The start's program and its held tree's two trees' shapes (`held_shapes`): what `start_compiled`
-    compiles over them and the key."""
-    start = _start(initial_state, initializer, shardings, through)
+def _start_shapes(start: StartBuild, initializer: Initializer, abstract: TrainState,
+                  shardings: Placement[TrainState], mesh: Mesh) -> tuple[OuterProgram, tuple[list, list]]:
+    """The start's program (`StartBuild.program`) and its held tree's two trees' shapes (`held_shapes`):
+    what `start_compiled` compiles over them and the key."""
     taken, kept = held_shapes(initializer, abstract.variables, shardings.variables, mesh, start.shared)
-    program = start_program(start.function, start.out_shardings, taken)
-    return program, (_held_leaves(taken), _held_leaves(kept))
+    return start.program(taken), (_held_leaves(taken), _held_leaves(kept))
 
 
 def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
@@ -536,18 +540,17 @@ def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], 
     return abstract, through, replaying(trace.jaxpr, jax.tree.structure(abstract), (), ())
 
 
-def placed_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-                 key: jax.Array, abstract: TrainState, shardings: Placement[TrainState],
-                 through: Mapping[int, int], mesh: Mesh) -> TrainState:
+def placed_start(start: StartBuild, initializer: Initializer, key: jax.Array, abstract: TrainState,
+                 shardings: Placement[TrainState], mesh: Mesh) -> TrainState:
     """A fresh state on `mesh`, built by `initial_state` from the objective's held tree (`placed_held`).
     The frozen leaves the objective's init passes through as they are (`through`, `traced_start`),
     which no step donates (`apart`), are the held arrays themselves, placed where the state keeps
     them, the same arrays where they are placed already: the run and the objective then hold one
     frozen tree between them. One program builds the rest, a frozen leaf the init builds among it,
-    taking the other held arrays over (`_start`)."""
-    start = _start(initial_state, initializer, shardings, through)
+    taking the other held arrays over (`start_build`), the program the start compiled beside the step
+    where it did (`StartBuild.program`)."""
     taken, kept = placed_held(initializer, abstract.variables, shardings.variables, mesh, start.shared)
-    built = taking_over(start.function, taken, kept, start.out_shardings)(key)
+    built = taking_over(start.program(taken), taken, kept)(key)
     if start.frozen is None:
         return built
     state, made = built
@@ -560,7 +563,7 @@ def placed_start(initial_state: Callable[[Initializer, jax.Array], TrainState], 
         if index in drawn:
             return drawn[index]
         # A held leaf an init passes through at two places of other shardings is placed at the second too.
-        held = placed[through[index]]
+        held = placed[start.through[index]]
         return held if held.sharding == where[index] else jax.device_put(held, where[index])
 
     return together(state, jax.tree.unflatten(structure, [leaf(index) for index in range(len(where))]))
