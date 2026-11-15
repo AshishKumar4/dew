@@ -706,9 +706,9 @@ def test_the_backward_walks_many_key_tiles(case):
 def every_backward_config_on_a_gpu(case):
     """Every tile a derivation or a pin may run (`BACKWARD_TILES`), bf16, a softcap, sinks and
     ALiBi, over causal documents under a window and over the irregular full and causal calls (`IRREGULAR`):
-    those the launch holds at the call (`TritonBackward.legal`: its threads within their registers, its
-    programs within a block's shared memory) on par with the reference in one check, and each other
-    refused where it is pinned (`tuning.Unpinnable`), so no call runs it."""
+    those the launch takes at the call (`TritonBackward.legal`: its programs within a block's shared memory,
+    its registers the assembler's) on par with the reference in one check, and each other refused where it
+    is pinned (`tuning.Unpinnable`), so no call runs it."""
     import tokamax
 
     from dew.nn.kernels import generation
@@ -806,7 +806,7 @@ def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, conf
     launches = [(attention_triton.TritonForward(score_kinds=score_kinds), config)]
     if step:
         launches.append((attention_triton.TritonBackward(score_kinds=score_kinds), backward))
-    if not all(op.legal(tokamax.BoundArguments(op, arrays), tiles, target) for op, tiles in launches):
+    if not all(op.takes(tokamax.BoundArguments(op, arrays), tiles, target) for op, tiles in launches):
         return {}
     pins = {attention_triton.TritonForward: config, attention_triton.TritonBackward: backward}
     record: dict = {}

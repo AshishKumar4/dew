@@ -203,18 +203,21 @@ leaves the Mosaic template, with Mosaic's own reason."""
 
 
 def _mainloop(declined: selection.Refusal | None, spans: KeySpans, hooks: Hooks, unfitted, *,
-              interpret: bool = False) -> str:
+              interpret: bool = False, uncertified=None) -> str:
     """The mainloop a pass runs, reported (`MAINLOOP`), from Mosaic's reason it `declined` the pass and the
     Triton mainloop's refusal of its spans and hooks (`attention_triton.refused`: a dropping call's) or of
-    the call, no config of whose launch fits the GPU (`unfitted()`, its own fitting), and where the Triton
-    mainloop is the one selected, none its GPU's assembler holds (`unfitted(certified=True)`: each config
-    it derives compiled alone, a spilling one refused and the next derived, to its least tile): a call that
-    exhausts it is declined for its registers, reported so, and the plain-JAX mainloop takes it, a call
-    another mainloop takes compiling none of the Triton kernels. The GPU in effect's mainloops where
-    `interpret` runs them on the CPU."""
+    the call, no config of whose launch fits the GPU (`unfitted()`, its own fitting); the GPU in effect's
+    mainloops where `interpret` runs them on the CPU. The selected mainloop's launch is certified, the GPU's
+    assembler refusing each config that spills or serializes its products: Mosaic's (`uncertified()`) and,
+    where the Triton mainloop is the one selected, Triton's (`unfitted(certified=True)`: each config it
+    derives compiled alone, a spilling one refused and the next derived, to its least tile). A call every
+    config of which is refused is declined for its registers, reported so, and the next mainloop takes it, a
+    call another mainloop takes compiling none of the refused mainloop's kernels."""
     on_gpu = _on_gpu() or interpret
     triton = (attention_triton.refused(spans, hooks) or unfitted()) if on_gpu else None
     case = _Pass(on_gpu, _on_mosaic() or interpret, declined, triton)
+    if uncertified is not None and declined is None and selection.selected(MAINLOOP, case).name == 'mosaic':
+        case = dataclasses.replace(case, mosaic=uncertified())
     if on_gpu and not interpret and triton is None and selection.selected(MAINLOOP, case).name == 'triton':
         case = dataclasses.replace(case, triton=unfitted(certified=True))
     return selection.select(MAINLOOP, case).kernel
@@ -238,11 +241,16 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         kept = Kept.SPLIT
     declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=kept,
                                                  in_key=config.in_key, **form) if _on_mosaic() else None
+    # A decode step's work list certifies the launches its plan derives (`attention_decode.plan`).
+    decodes = kept is Kept.NONE and attention_decode.serves(query, key, hooks, natural=config.natural,
+                                                            target=generation.gpu_target())
     mainloop = _mainloop(declined, spans, hooks, functools.partial(
-        attention_triton.unfitted, query, key, value, spans, hooks, residuals=kept, **form))
+        attention_triton.unfitted, query, key, value, spans, hooks, residuals=kept, **form),
+        uncertified=None if decodes else functools.partial(
+            attention_mosaic.forward_declined, query, key, value, spans, hooks, residuals=kept,
+            in_key=config.in_key, certified=True, **form))
     if mainloop == 'mosaic':
-        if kept is Kept.NONE and attention_decode.serves(query, key, hooks, natural=config.natural,
-                                                         target=generation.gpu_target()):
+        if decodes:
             # A memory-bound inference call (a decode step's, a verify block's) as the decode's work list.
             return attention_decode.attend(query, key, value, spans, hooks, scale=config.scale,
                                            in_key=config.in_key)
@@ -322,7 +330,9 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     declined = (attention_mosaic.backward_declined(*call, residuals=residuals, **form)
                 if _on_mosaic() or interpret else None)
     mainloop = _mainloop(declined, spans, hooks, functools.partial(
-        attention_triton.backward_unfitted, *call, residuals=residuals, **form), interpret=interpret)
+        attention_triton.backward_unfitted, *call, residuals=residuals, **form), interpret=interpret,
+        uncertified=functools.partial(attention_mosaic.backward_declined, *call, residuals=residuals,
+                                      certified=True, **form))
     if mainloop == 'mosaic':
         return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, interpret=interpret,
                                          **form)

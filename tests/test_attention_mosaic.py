@@ -1259,10 +1259,10 @@ def test_a_run_refuses_a_kernel_whose_warpgroup_products_ptxas_serialized_as_a_s
 @pytest.mark.parametrize(("width", "value_width"), [(128, 64), (128, 128), (128, 256), (256, 256)])
 def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, residuals):
     """On an H100 the forward's tiles derived from the facts (`MosaicForward.derived`) stage within its
-    block (`generation.shared_budget`) and a consumer's registers (`register_budget`), whatever the widths,
-    the training forward's too (its anchored walk keeps no value row): no table's tile, which at heads 256
-    wide staged 320 KiB against its 227 (ledger 1582); the anchored training forward of values 256 wide
-    rewalks a block of its value columns a launch (`Tiles.relaunch_columns`, row 2526)."""
+    block (`generation.shared_budget`), whatever the widths, the training forward's too (its anchored walk
+    keeps no value row): no table's tile, which at heads 256 wide staged 320 KiB against its 227 (ledger
+    1582); the anchored training forward of values 256 wide rewalks a block of its value columns a launch
+    (`Tiles.relaunch_columns`, row 2526). Its registers are the assembler's to judge (`legal`)."""
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         op, ba = _forward_call((2, 4096, 32, 8), width, value_width, residuals)
@@ -1270,7 +1270,6 @@ def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, resi
         assert derived is not None
         assert op.legal(ba, derived, target)
         assert op.staged_bytes(ba, derived, target) <= generation.shared_budget(target)
-        assert op.registers(ba, derived) <= op.register_budget(derived)
 
 
 @pytest.mark.parametrize(("target", "width", "hooks", "queries"), [

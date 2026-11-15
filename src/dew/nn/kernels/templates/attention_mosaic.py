@@ -86,6 +86,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     few_rows,
     fewer_rows,
     fuses,
+    held_walked,
     holders,
     hook_reduces,
     launch_scope,
@@ -291,7 +292,9 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """Why the launch runs no call of `ba` on `target`, or None: its family has no bundle here, the call
         is one it does not take (`refusal`, each reason with its ledger row), it is interpreted in a GPU
         process (`grouped_matmul._Mosaic.eligible`: the interpreter's callbacks are ordered effects, which a
-        GPU process's lowering cannot carry), or no config fits the device (`derived`)."""
+        GPU process's lowering cannot carry), or no config fits the device (`derived`), certification
+        refusing each it derives (`tuning`'s `_certified`: an A100's accurate backward 128 wide under a
+        temperature, every config spilling at 255 registers, which the Pallas-Triton backward takes)."""
         name = generation.family(target.generation)
         query = ba.arguments["query"]
         family = self._bundle(target.generation, query.dtype)
@@ -304,6 +307,23 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         if self.derived(ba, target) is None:
             return Refusal('resources',
                            f"no config of the Mosaic mainloop fits {target.generation}'s block and registers")
+        return None
+
+    def uncertified(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Refusal | None:
+        """Why the launch the route selected runs no call of `ba` on `target` as the GPU assembles its
+        configs (`tuning`'s `_certified`: each that spills or serializes its warpgroup MMAs refused, the next
+        derived in its place), or None: a call the route sends here alone is certified, once it is selected
+        (`attention_route._mainloop`), so a call another mainloop takes compiles none of its kernels. A
+        process compiling for no GPU certifies none, and its derived config holds."""
+        config = self.derived(ba, target)
+        if config is None:
+            return self.declined(ba, target)
+        try:
+            self._certified(ba, config)
+        except Unfitted:
+            # Certification refused every config the derivation offers.
+            return Refusal('resources', f"every config of the Mosaic mainloop spills or serializes its "
+                           f"products as {target.generation}'s assembler builds them")
         return None
 
     def legal(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
@@ -633,10 +653,10 @@ class MosaicForward(_Mainloop[Tiles]):
         """`config` as it launches, its natural rewalk's tiles named (`_relaunched`), where that is legal
         (`legal`: a compile's refusal of the launch among its rules, keyed by this config); None where it is
         not or no tile holds the rewalk."""
-        if not self._launch_legal(ba, config, target):
+        if not (self._launch_legal(ba, config, target) and self.proposes(ba, config, target)):
             return None
         launched = self._relaunched(ba, config, target)
-        return launched if launched is not None and self.legal(ba, launched, target) else None
+        return launched if launched is not None and self.takes(ba, launched, target) else None
 
     def streaming(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> Tiles:
         """`config` for a call whose walk the device's memory bounds (`streams`), its key tile the least its
@@ -736,7 +756,8 @@ class MosaicForward(_Mainloop[Tiles]):
                       for consumers in range(config.consumers, 0, -1)
                       for block in walked_extents(family, query.dtype, config.block_k)
                       if config.block_k % block == 0)
-        relaunch = next((tiles for tiles in relaunches if self._launch_legal(ba, tiles, target)), None)
+        relaunch = next((tiles for tiles in relaunches
+                         if self._launch_legal(ba, tiles, target) and self.proposes(ba, tiles, target)), None)
         if relaunch is None:
             return None
         return dataclasses.replace(config, relaunch_k=relaunch.block_k, relaunch_consumers=relaunch.consumers,
@@ -756,7 +777,7 @@ class MosaicForward(_Mainloop[Tiles]):
         while (fallback := self._tiles(ba, target, skip=family, refused=refused)) is not None:
             relaunch = fallback.relaunch if fallback.relaunch_k is not None else dataclasses.replace(
                 fallback, natural_form=True)
-            if not self._launch_legal(ba, relaunch, target):
+            if not (self._launch_legal(ba, relaunch, target) and self.proposes(ba, relaunch, target)):
                 return None
             launched = dataclasses.replace(config, relaunch_family=relaunch.family,
                                            relaunch_q=relaunch.block_q, relaunch_k=relaunch.block_k,
@@ -1067,15 +1088,18 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 
 def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                      hooks: Hooks | None = None, *, scale: float | None = None, natural: bool = NATURAL,
-                     residuals: Kept = Kept.NONE, in_key: bool = False) -> Refusal | None:
-    """Why `forward` runs no call of these arrays compiled on this device, or None
-    (`MosaicForward.declined`)."""
+                     residuals: Kept = Kept.NONE, in_key: bool = False,
+                     certified: bool = False) -> Refusal | None:
+    """Why `forward` runs no call of these arrays compiled on this device (`MosaicForward.declined`), and
+    where `certified` (the route's selected mainloop alone) as the GPU assembles its configs
+    (`MosaicForward.uncertified`), or None."""
     spans = spans.per_query() if residuals is Kept.SPLIT else spans
     in_key = reads_in_key(in_key, key, value, hooks, residuals)
     key, hooks = key_prologue_taken(key, Hooks() if hooks is None else hooks)
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
                              residuals=residuals, in_key=in_key)
-    return op.declined(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target())
+    ba, target = op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target()
+    return op.uncertified(ba, target) if certified else op.declined(ba, target)
 
 
 def reads_in_key(in_key: bool, key: jax.Array, value: jax.Array, hooks: Hooks | None,
@@ -1293,16 +1317,15 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         and of their cotangents, a step's walked tile each, beside its kept sums' shares of their columns
         (`BackwardTiles.columns`)."""
         query = ba.arguments["query"]
-        keys_first = isinstance(family, placed.Tcgen05KeysFirst)
         # Its operands 16-bit of one part (bf16: fp16's weights and cotangents two scaled parts, whose
         # products no placed walk issues), a fused walk's dQ products a 64- or 128-row tile of its queries
         # (tcgen05's M).
         if (jnp.dtype(query.dtype) != jnp.dtype(jnp.bfloat16) or self.accurate or self.score_kinds
                 or ba.arguments["drop"] is not None or self.per_span > 1 or config.staged_logits
                 or config.shared_keys or tiles.consumers != family.consumers
-                or (config.fused and (not keys_first or tiles.block_q not in (64, 128)))):
+                or (config.fused and (not family.holds_keys or tiles.block_q not in (64, 128)))):
             return False
-        held, walked = (tiles.block_k, tiles.block_q) if keys_first else (tiles.block_q, tiles.block_k)
+        held, walked = held_walked(family, tiles)
         if held != family.rows:
             return False
         # Its scratch as its launch allocates it (`placed_scratch`, the head widths as staged, `_width`).
@@ -1310,7 +1333,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                               for name in ("query", "value"))
         halves = dq_halves(width * config.columns) if config.fused else ()
         products = placed_scratch(family, walked, query.dtype, halves,
-                                  (width, value_width) if keys_first else (width,))["products"]
+                                  (width, value_width) if family.holds_keys else (width,))["products"]
         return family.product_columns(products) <= (target.tmem_columns or 0)
 
     def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:
@@ -1453,11 +1476,13 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                           family=queries.name, columns=columns)
                for columns in (1, 2, 4) for walked in walked_extents(queries, query.dtype, key.shape[1])
                for step in steps] if queries is not None else []
-        return next((config for config in (*fused, *two) if self.legal(ba, config, target)), None)
+        return next((config for config in (*fused, *two) if self.takes(ba, config, target)), None)
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
         """Its tiles from the facts (`_derived`): each dK/dV consumer a unit of keys, the query tile both
-        launches walk the largest their registers and the block hold, two stages, one consumer, whose step
+        launches walk the largest the block holds, its registers the assembler's to judge (`ranks_alone`: a
+        config that spills is refused where it compiles, and the derivation steps past it), two stages, one
+        consumer, whose step
         issues its products back to back (TRAINC-h100: 6.88 against 3.72 ms causal, 9.68 against 7.56 full,
         at 64 x 64 with two consumers and one). The fast form of a hookless call (or one whose hook takes no
         parameters, a softcap, or under an initial state, sinks) takes one launch where one holds the whole
@@ -1480,7 +1505,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         query, key = ba.arguments["query"], ba.arguments["key"]
 
         def fits(config: BackwardTiles) -> bool:
-            return self.legal(ba, config, target)
+            return self.takes(ba, config, target)
 
         derive = functools.partial(_derived, least_held=_role_rows)
 
@@ -1636,14 +1661,14 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         return BackwardRegisters(query.dtype, query.shape[-1], value.shape[-1], self.accurate, params,
                                  self.score_slopes, drop is not None, config.queries_first, self.score_reads)
 
-    def _held(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> bool:
-        # Each launch's registers within its own layout's budget (`Family.registers`); every config where
-        # the family budgets none (`Family.budgets_registers`).
-        if not bundle_of(config, ba.arguments["query"].dtype).budgets_registers:
-            return True
-        dq, dkv = self._launch_registers(ba, config)
-        held = dkv <= self.register_budget(config.dkv)
-        return held and (config.fused or dq <= self.register_budget(config))
+    def ranks_alone(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
+        # A backward takes its ranking's first legal config, the assembler judging its registers and its
+        # products' issue (a kernel that spills or whose warpgroup MMAs ptxas serializes refused,
+        # `report.Binary.refused`, and the next ranked in its place): the one its register model proposed
+        # ran slower on every launch measured (M-FS-15: a GH200's 0.692, an A100's six at 0.62 to 0.94).
+        del ba, target
+        return True
+
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
@@ -1683,12 +1708,15 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
 def backward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                       hooks: Hooks | None, dout: jax.Array, *,
                       residuals: tuple[jax.Array, jax.Array, jax.Array, Split], scale: float | None = None,
-                      natural: bool = NATURAL, accurate: bool = ACCURATE) -> Refusal | None:
-    """Why `backward` runs no call of these arrays compiled on this device, or None
-    (`MosaicBackward.declined`)."""
+                      natural: bool = NATURAL, accurate: bool = ACCURATE, certified: bool = False
+                      ) -> Refusal | None:
+    """Why `backward` runs no call of these arrays compiled on this device (`MosaicBackward.declined`), and
+    where `certified` (the route's selected mainloop alone) as the GPU assembles its configs
+    (`MosaicBackward.uncertified`), or None."""
     op, args = _backward_call(query, key, value, spans, hooks, dout, residuals, scale=scale, natural=natural,
                               accurate=accurate)
-    return op.declined(op.bind(*args, interpret=False), generation.gpu_target())
+    ba, target = op.bind(*args, interpret=False), generation.gpu_target()
+    return op.uncertified(ba, target) if certified else op.declined(ba, target)
 
 
 def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,

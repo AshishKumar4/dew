@@ -439,7 +439,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         family = bundle(self.launched())
         return resources.facts().thread_registers if family is None else family.registers(1)
 
-    def _held(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> bool:
+    def held(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> bool:
         """Whether every forward launch's consumer threads hold their registers at its own roles' budget
         (`Family.registers` at `Launch.consumers`: a walk of `Tiles.walkers` roles holds less a role than a
         launch of one) and a multiprocessor holds a program of it (`Launch.resident`): the forwards' at the
@@ -447,12 +447,12 @@ class Mosaic(base.Template[mainloop.Tiles]):
         target = self.launched()
         family = bundle(target, _dtype(ba))
         if family is None:
-            return super()._held(ba, config)
+            return super().held(ba, config)
         return self._launches_hold(self._forwards(ba, config, target), family)
 
     def _launches_hold(self, launches: tuple[mainloop.Launch, ...], family: mosaic.Family) -> bool:
         """Whether `launches`' consumer threads hold their registers and a multiprocessor a program of each
-        (`_launches_held`): the one rule `_held` and `_product_holds` read."""
+        (`_launches_held`): the one rule `held` and `_product_holds` read."""
         return _launches_held(launches, family)
 
     def _product_holds(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
@@ -467,7 +467,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         launch's 2,304 programs 15.6 waves of one a multiprocessor (row 5668)."""
         family = bundle(target, _dtype(ba))
         if family is None:
-            return self.legal(ba, tiles, target)
+            return self.takes(ba, tiles, target)
         return (self._product_fits(ba, tiles, target, training=training)
                 and not self._refused(ba, tiles, target))
 
