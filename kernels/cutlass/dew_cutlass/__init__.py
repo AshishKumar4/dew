@@ -5,6 +5,7 @@ generations they are for (Ampere's, run by every compute capability 8.x, and Hop
 other device)."""
 
 import ctypes
+import functools
 from pathlib import Path
 from typing import NamedTuple
 
@@ -68,3 +69,14 @@ def targets() -> dict[str, object]:
     import jax
 
     return {name: jax.ffi.pycapsule(getattr(_library, name)) for name in TARGETS}
+
+
+@functools.cache
+def registered() -> None:
+    """Registers the library's FFI targets (`TARGETS`) with jax, once. Its entry point in the
+    `dew.kernel_wheels` group names it; Dew calls it at the first launch that calls a target, and before it
+    loads a program compiled ahead."""
+    import jax
+
+    for name, handler in targets().items():
+        jax.ffi.register_ffi_target(name, handler, platform="CUDA")
