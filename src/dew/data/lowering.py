@@ -53,6 +53,7 @@ from dew.data.analysis import (
     _volatile,
     _written,
     ends,
+    member_length,
 )
 from dew.data.cache import _Mapped
 from dew.data.completion import Completed, Numbered, cuts, reach, released
@@ -95,6 +96,7 @@ from dew.data.mixing import (
     Proportions,
     TokenDeficit,
     _weights,
+    mix_end,
     mixed_indexed,
     rewound,
 )
@@ -1447,7 +1449,12 @@ class _Build:
                 labels=[_label(child) for child in source.pipelines],
                 stamped=self.stamped,
             )
-        return KeyedMix(streams, source.weights, keys, source.seed, stamped=self.stamped)
+        # Its end is its indexed read's where every member's length is known, in one order (`mix_end`).
+        lengths = [member_length(child, analyzed)
+                   for child, analyzed in zip(children(pipeline), self.lowering.children, strict=True)]
+        known = [length for length in lengths if length is not None]
+        end = mix_end(known, source) if partition.count == 1 and len(known) == len(lengths) else None
+        return KeyedMix(streams, source.weights, keys, source.seed, stamped=self.stamped, end=end)
 
     def counted_members(self, pipeline: Pipeline) -> tuple[tuple[str, str, str], ...]:
         """The members of `pipeline`'s mixture, each's key (`_member_keys`), name and label, where a read

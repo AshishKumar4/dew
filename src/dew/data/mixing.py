@@ -1110,10 +1110,11 @@ class KeyedMix(pygrain.IterDataset[Batch]):
     (`dew.data.compile._delivered`)."""
 
     def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float],
-                 keys: Sequence[str], seed: int | None = None, *, stamped: frozenset[str] = frozenset()):
+                 keys: Sequence[str], seed: int | None = None, *, stamped: frozenset[str] = frozenset(),
+                 end: int | None = None):
         super().__init__(parents)
         self._corpora, self._weights, self._keys = tuple(parents), tuple(weights), tuple(keys)
-        self._seed, self._stamped = seed, stamped
+        self._seed, self._stamped, self._end = seed, stamped, end
         self._slice: slice | None = None
 
     def set_slice(self, selection: slice, sequential_slice: bool = False) -> None:
@@ -1125,7 +1126,7 @@ class KeyedMix(pygrain.IterDataset[Batch]):
         group = _MixReads(self._corpora)
         stamping = Stamping(self._stamped & set(self._keys), node_of(self._slice)) if self._stamped else None
         reads = {key: _MixRead(group, index, key, stamping) for index, key in enumerate(self._keys)}
-        return _ProportionalMix(reads, Proportions.of(self._weights, self._seed), stamping)
+        return _ProportionalMix(reads, Proportions.of(self._weights, self._seed), stamping, self._end)
 
 
 class _Captured:
@@ -1162,15 +1163,17 @@ class _ProportionalMix(pygrain.DatasetIterator[Batch]):
     and whether a corpus ended the mix, so a restore finds the corpora it holds and starts the rest."""
 
     def __init__(self, reads: Mapping[str, _MixRead], proportions: Proportions,
-                 stamping: Stamping | None = None):
+                 stamping: Stamping | None = None, end: int | None = None):
         super().__init__()
-        self._reads, self._keys, self._proportions = dict(reads), tuple(reads), proportions
+        self._reads, self._keys, self._proportions, self._end = dict(reads), tuple(reads), proportions, end
         self._index, self._stop = 0, False
         self._positions = _Captured(self._reads)
         self._stamping = stamping
 
     def __next__(self) -> Batch:
-        if self._stop:
+        # A mix whose members' lengths are known ends where its indexed read does (`mix_end`); one of a
+        # member of unknown length, at its first failed pull.
+        if self._stop or (self._end is not None and self._index >= self._end):
             raise StopIteration
         corpus, _ = self._proportions.at(self._index)
         self._index += 1
@@ -1355,8 +1358,20 @@ def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
 def mixed_indexed(members: Sequence[pygrain.MapDataset], mixture: Mixture) -> pygrain.MapDataset:
     """`members`, `mixture`'s indexed corpora, drawn from as its weights and seed say
     (`ProportionalSelection`): its read's mix, and its twin of draws' (`dew.data.compile`)."""
-    selection = ProportionalSelection([len(member) for member in members], _weights(mixture), mixture.seed)
-    return pygrain.MapDataset.select_from_datasets(members, selection)
+    return pygrain.MapDataset.select_from_datasets(members, _selection([len(member) for member in members],
+                                                                       mixture))
+
+
+def mix_end(lengths: Sequence[int], mixture: Mixture) -> int:
+    """The positions `mixture` reads over corpora of `lengths` records before it ends, the position after
+    its first member's last record, as Grain's map mix ends (data.md §3): the one end every read of a mix
+    whose members' lengths are known reads, an indexed one by its selection's length and a streamed one
+    by this (`KeyedMix`), so its rows do not depend on how it is read."""
+    return len(_selection(lengths, mixture))
+
+
+def _selection(lengths: Sequence[int], mixture: Mixture) -> ProportionalSelection:
+    return ProportionalSelection(lengths, _weights(mixture), mixture.seed)
 
 
 def _weights(mixture: Mixture) -> Sequence[float]:
