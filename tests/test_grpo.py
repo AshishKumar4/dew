@@ -412,27 +412,13 @@ def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
 
     import rl_support
 
-    from dew.config import ObjectiveConfig
-    from dew.config.lm import LMRunConfig, PromptRollout
-    from dew.data import Memory, presets
-    from dew.registry import ModelConfig
+    from dew.config.lm import LMRunConfig
     from dew.training import LocalTracker
 
-    tokenizer = str(Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat")
-    rows = [{"prompt": "hi there", "data_source": "rule", "ground_truth": "a"}] * 8
-    rollout = PromptRollout(reward=f"{rl_support.__name__}:completion_length", groups=2, max_new_tokens=4)
-    model = ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1, "num_heads": 2,
-                                               "dtype": "float32"})
-    default = LMRunConfig(data=Memory(rows).pipe(presets.prompts, tokenizer, max_prompt_len=8, batch=8),
-                          tokenizer=tokenizer, objective=ObjectiveConfig("grpo"), rollout=rollout,
-                          model=model, max_new_tokens=0)
-    config = LMRunConfig.cli(["--trainer.steps", "3", "--trainer.name", "served", "--trainer.checkpoint-dir",
-                              str(tmp_path), "--trainer.compilation-cache-dir", "None",
-                              "--trainer.multi-host", "False", "--trainer.log-every", "1",
-                              "--rollout.served.slots", "8", "--rollout.served.sync-every", "2",
-                              "--rollout.served.max-lag", "2", "--rollout.served.page-size", "4",
-                              "--objective.behavior-importance", "2.0"],
-                             default=default)
+    config = rl_support.recorded_grpo_config(
+        tmp_path, "--trainer.steps", "3", "--trainer.name", "served", "--rollout.served.slots", "8",
+        "--rollout.served.sync-every", "2", "--rollout.served.max-lag", "2",
+        "--rollout.served.page-size", "4", "--objective.behavior-importance", "2.0", prompt="hi there")
     state = config.run()
     assert int(state.step) == 3
     # The server and its reward pool end with the run: no engine or scorer thread outlives it.
@@ -543,8 +529,9 @@ def test_a_grpo_policy_rewarded_for_its_language_learns_it():
             return (counting_prompts([run, step]) for step in itertools.count())
         return Loader(replayed(prompts), None, batch=8, records=None)
 
-    before, after = held_out_measures(objective, optax.adam(1e-2), loader, held_out, runs=COUNT_RUNS,
-                                      steps=COUNT_STEPS, measure=reward, rollout=rollout)
-    gains = np.log(after / before)
-    assert_learns(lambda runs: {"training raises the held-out reward": gains[runs]},
-                  "a GRPO policy learning its language", units=COUNT_RUNS)
+    def gains(runs):
+        before, after = held_out_measures(objective, optax.adam(1e-2), loader, held_out, runs=runs,
+                                          steps=COUNT_STEPS, measure=reward, rollout=rollout)
+        return {"training raises the held-out reward": np.log(after / before)}
+
+    assert_learns(gains, "a GRPO policy learning its language", units=COUNT_RUNS)

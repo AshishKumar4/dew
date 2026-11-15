@@ -60,11 +60,12 @@ def test_a_plain_flax_model_trains_on_a_loss_function():
     def loader(run):
         return dataset(train=lambda: Replaying(lambda step: batch(seed=[run, step])), batch=8)
 
-    drop = cut(*held_out_measures(objective, optax.adam(0.1), loader,
-                                lambda run: batch(rows=256, seed=[run, 10_000]), runs=RUNS, steps=60),
-               margin=4)
-    assert_learns(lambda runs: {"training cuts the held-out loss to a quarter": drop[runs]},
-                  "a plain flax model", units=RUNS)
+    def drop(runs):
+        return {"training cuts the held-out loss to a quarter": cut(*held_out_measures(
+            objective, optax.adam(0.1), loader, lambda run: batch(rows=256, seed=[run, 10_000]), runs=runs,
+            steps=60), margin=4)}
+
+    assert_learns(drop, "a plain flax model", units=RUNS)
 
 
 def test_a_model_named_by_its_input_field_alone_takes_the_shape_its_data_gives():
@@ -246,11 +247,12 @@ def test_the_autoencoders_evidence_bound_falls_over_independent_runs():
     def loader(run):
         return dataset(train=lambda: Replaying(lambda step: points([run, step])), batch=32)
 
-    drop = cut(*held_out_measures(objective, config.optim.build(config.trainer.steps), loader,
-                                lambda run: points([run, 10_000], rows=256), runs=RUNS,
-                                steps=config.trainer.steps), margin=2)
-    assert_learns(lambda runs: {"training halves the held-out evidence bound": drop[runs]},
-                  "the autoencoder experiment", units=RUNS)
+    def drop(runs):
+        return {"training halves the held-out evidence bound": cut(*held_out_measures(
+            objective, config.optim.build(config.trainer.steps), loader,
+            lambda run: points([run, 10_000], rows=256), runs=runs, steps=config.trainer.steps), margin=2)}
+
+    assert_learns(drop, "the autoencoder experiment", units=RUNS)
 
 
 class Normed(nn.Module):

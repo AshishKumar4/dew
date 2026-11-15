@@ -93,12 +93,13 @@ def completion_length(text: str, record) -> float:
     return float(len(text))
 
 
-def recorded_grpo_config(tmp_path, *cli: str):
+def recorded_grpo_config(tmp_path, *cli: str, prompt: str = "hi there " * 8):
     """An LM run that names GRPO and records its rollout (`LMRunConfig.rollout`): a one-layer decoder over
-    the tiny chat tokenizer, eight prompts each longer than its width of 8 ids (the preset's `long='truncate'`
-    keeps each prompt's last 8), its completions' length the reward (`completion_length`, by import path),
-    two groups of four new tokens; one step, logged, checkpointed under `tmp_path`, and `cli`'s flags on
-    top (`LMRunConfig.cli`). test_grpo's recorded run and a scenario's online RL cell each build from it."""
+    the tiny chat tokenizer, eight rows of `prompt` (by default longer than the width of 8 ids, whose last 8
+    the preset's `long='truncate'` keeps), its completions' length the reward (`completion_length`, by
+    import path), two groups of four new tokens; one step, logged, checkpointed under `tmp_path`, and
+    `cli`'s flags on top (`LMRunConfig.cli`, a later flag over an earlier). test_grpo's recorded and served
+    runs and a scenario's online RL cell each build from it."""
     from pathlib import Path
 
     from dew.config import ObjectiveConfig
@@ -107,7 +108,7 @@ def recorded_grpo_config(tmp_path, *cli: str):
     from dew.registry import ModelConfig
 
     tokenizer = str(Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat")
-    rows = [{"prompt": "hi there " * 8, "data_source": "rule", "ground_truth": "a"}] * 8
+    rows = [{"prompt": prompt, "data_source": "rule", "ground_truth": "a"}] * 8
     rollout = PromptRollout(reward=f"{__name__}:completion_length", groups=2, max_new_tokens=4)
     model = ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1, "num_heads": 2,
                                                "dtype": "float32"})
