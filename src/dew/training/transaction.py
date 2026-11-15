@@ -1220,8 +1220,8 @@ class Transaction:
         finite = pending.local_finite & _all_finite((loss, gradient, effects, qk, aux.variables))
         # A step with no loss scale is gated in its commit (`commit`), but one whose optimizer holds updates
         # back is rejected whole, its optimizer state kept, as a scaled step's is.
-        held = holds_back(state.opt_state)
-        accepted = jnp.asarray(a=True) if scale is None and not held else finite
+        holding = holds_back(state.opt_state)
+        accepted = jnp.asarray(a=True) if scale is None and not holding else finite
         numerical = dataclasses.replace(state, variables=write_back(state.variables, aux.variables),
                                         microstep=state.microstep + 1)
         # Runs that updated in their backward wrote it only where the step commits (`in_backward.gated`).
@@ -1261,7 +1261,7 @@ class Transaction:
         finite = finite & native_finite
         if scale is not None:
             accepted = finite & _all_finite(checked(numerical))
-        elif held:
+        elif holding:
             accepted = finite
         if previous is not None:
             numerical = dataclasses.replace(
