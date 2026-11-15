@@ -12,7 +12,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_masks import causal_attention_mask
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import AttentionMetadata, MixerCall
-from dew.nn.kv_cache import cached_validity, open_kv_cache
+from dew.nn.kv_cache import KVCache, KVSpec, cached_validity, open_kv_cache
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.mla import MultiHeadLatentAttention
 
@@ -20,7 +20,9 @@ from dew.nn.mla import MultiHeadLatentAttention
 class CachedAttention(nn.Module):
     @nn.compact
     def __call__(self, values, valid):
-        positions, append = open_kv_cache(self, values, 8, valid=valid)
+        rows, _, heads, width = values.shape
+        stored = KVSpec(KVCache(), rows, 8, heads, width, values.dtype)
+        positions, append = open_kv_cache(self, stored, values, valid=valid)
         keys, cached_values = append(values, values)
         mask = causal_attention_mask(
             positions, keys.shape[1], key_valid=cached_validity(self, keys.shape[1]))

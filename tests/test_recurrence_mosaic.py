@@ -353,11 +353,12 @@ def drawn_forward(case: str, dtype: str) -> Callable:
                   COVERED[case, dtype, 'forward'])
 
 
-@pytest.mark.check1_shards(seeds=256, per_task=16)
+@pytest.mark.check1_shards(seeds=256, per_task=8)
 @drawn_forward('one sequence', 'fp32')
 def test_the_mosaic_forward_over_one_fp32_sequence_is_as_exact_as_its_reference():
     """`the_mosaic_forward_is_as_exact_as_its_reference` at an fp32 call over one sequence, under either
-    forms."""
+    forms: eight draws a task, an fp32 draw over its routes 42 s at CI's rate (sixteen took 670 s, past a
+    train's bound, train 860's CI)."""
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=16)
@@ -1649,6 +1650,39 @@ def test_a_launch_whose_producer_must_rise_is_certified_at_its_ladders_top_in_on
     certified, _ = _reverse_walk_certified()
     raised = [each.config.producers.of('recurrence_reverse') for each in certified]
     assert [cap for cap in raised if cap is not None] == [resources.entry_registers(2, 2)], raised
+
+
+TOP_RUNG_LOWERED = """
+import collections, json
+from jax._src import monitoring
+from dew.training.runtime import ready_process
+import test_recurrence_mosaic as gate
+
+served = collections.Counter()
+monitoring.register_event_listener(
+    lambda event, **_: served.update([event.rsplit("/", 1)[-1]]) if "lowering_cache" in event else None)
+ready_process()
+certified, _ = gate._reverse_walk_certified()
+print(json.dumps({"served": dict(served), "kernels": [len(each.kernels) for each in certified],
+                  "raised": [each.config.producers.of("recurrence_reverse") for each in certified]}))
+"""
+"""A process configured as a run's (`ready_process`: its compilation cache and its kernels' lowerings kept
+beside it) certifying the 4B reverse walk (`_reverse_walk_certified`): the lowering cache's hits and misses,
+each certification's kernels and its reverse walk's producer."""
+
+
+@lowers('sm100')
+def test_a_ladders_top_reads_every_kernel_but_the_raised_one_from_the_lowering_cache(tmp_path):
+    """In a process that keeps its lowerings as a run does (`TOP_RUNG_LOWERED`), the reverse walk's top
+    rung lowers only the kernel its producer changed: every other kernel of the launch is the module it was
+    at the floor (its identity, `report.named`), read back from the Pallas lowering cache, whose key holds no
+    caller metadata (Dew's JAX build, post93). Named by their launch's whole config, each rung lowered all
+    nine of the launch's kernels again in Python."""
+    from process_support import fresh
+
+    found = fresh(TOP_RUNG_LOWERED, cache_dir=tmp_path / "cache", platforms="cpu")
+    assert found["raised"][1:] and found["raised"][-1] is not None, found
+    assert found["served"].get("hit", 0) >= found["kernels"][-1] - 1, found
 
 
 @lowers('sm100')

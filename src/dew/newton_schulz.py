@@ -198,9 +198,12 @@ def newton_schulz(x: jax.Array, coeffs, steps: int, eps: float,
     preconditioning optax's: the Frobenius or spectral norm, or the AOL or Schatten-4 rescaling of the first
     step; `coeffs` one triple, `steps` times, or a schedule of them, rounded to the iteration's dtype as optax
     rounds them: constants of the program where the caller's are (`dew.optim.scale_by_muon`'s, not its
-    state's), which a product's scaling and its added term may fold into (`a X + B X` one product's
-    epilogue; with them read from the state at run time, the scalings ran as passes of their own, 50 ms of
-    row 5669's step)."""
+    state's), which a product's scaling may fold into (with them read from the state at run time, the
+    scalings ran as passes of their own, 50 ms of row 5669's step). A step is one product applied,
+    `(a I + b A + c A²) X`: the iterate's own term added to the polynomial on the Gram side, the short one,
+    where `a X + B X` summed after the product read and wrote the whole stack once more (row 5669: on a
+    GH200 the 4B's stacks' Newton-Schulz 330.5 to 305.9 ms, its decision step at four rows 3,768 to
+    3,753 ms, its peak 84.5 to 84.7 GB)."""
     rows, columns = x.shape[-2:]
     tall = rows > columns
     last = x.ndim - 1
@@ -215,8 +218,10 @@ def newton_schulz(x: jax.Array, coeffs, steps: int, eps: float,
             polynomial, matrices, (last, last - 1))
 
     def stepped(matrices: jax.Array, a: jax.Array, triple: jax.Array) -> jax.Array:
-        polynomial = triple[1] * a + triple[2] * batched_product(a, a, (last, last - 1))
-        return triple[0] * matrices + applied(polynomial, matrices)
+        # One product (the docstring's): the iterate's term on the Gram side.
+        squared = batched_product(a, a, (last, last - 1))
+        polynomial = triple[0] * jnp.eye(a.shape[-1], dtype=a.dtype) + triple[1] * a + triple[2] * squared
+        return applied(polynomial, matrices)
 
     def base(matrices: jax.Array, triple: jax.Array) -> jax.Array:
         return stepped(matrices, gram(matrices), triple)

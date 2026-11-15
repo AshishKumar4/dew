@@ -1591,15 +1591,14 @@ def watched_pytest(command: list[str], environment: dict[str, str], deadline: fl
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, kept: Mapping[str, tuple[str, str]] | None = None, recorded: bool = True,
-           variant: str = "", options: Sequence[str] = ()) -> int:
+           variant: str = "") -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
     Hub open, recorded on the network lane's class (`device_class`). A check-1
     site's map task (`session.SITE`) is never reused: its draws, among its artifacts, are what its judge
     reads. A run that is no test of its files (a GPU lane's prepare, `recorded` false) records no row. A
     process of the files under other flags than the lane's (`variant`, a GPU lane's `VARIANTS`) runs the
-    same cut of them, its rows and their records named apart (`varied`). `options` go to its pytest after its
-    tests (a GPU lane's `--owed`)."""
+    same cut of them, its rows and their records named apart (`varied`)."""
     began = time.monotonic()
     group = varied(split, variant)
     site = session.SITE.fullmatch(group)
@@ -1626,7 +1625,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     done_before = resumed(tests) if resumes else {}
     aside = out.with_name(f"{out.name}.set-aside.json")
     aside.write_text(json.dumps(sorted(done_before)))
-    command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if resumes else []), *options]
+    command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if resumes else [])]
     environment = session.pytest_environment({**environ, **site_environment(site),
                                               "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
                                               "DEW_UNRECORDED": str(unrecorded), "DEW_PYTEST_PID": str(pid),
@@ -2011,7 +2010,7 @@ marked `PREPARES`, each of which then prepares rather than runs (tests/model_flo
 
 
 def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, deadline: float,
-                 owed: Path | None = None) -> int:
+                 asked: Path | None = None) -> int:
     """A GPU lane's prepare, on its node's CPU before its files' GPU run (`gpu_lane`) and with no GPU drawn:
     each of `tests` that holds a test marked `PREPARES` run once in a process of its own under `PREPARING`,
     at most `processes` at once, as its run will select and cut it (a group `<file>#G/N` holds in its prepare
@@ -2052,8 +2051,8 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
                 "output": "not prepared: its lane's prepare had no time left for it"}]}))
             return 0
         return tested(python, [file], group, verdict, mine, "off", session.GRACE, "",
-                      {**PREPARING, "OMP_NUM_THREADS": threads, **(VARIANTS[variant][1] if variant else {})},
-                      recorded=False, variant=variant, options=owed_options(owed))
+                      {**PREPARING, "OMP_NUM_THREADS": threads, **(VARIANTS[variant][1] if variant else {}),
+                       **asked_environment(asked)}, recorded=False, variant=variant)
 
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
         for done in [pool.submit(prepared, name, verdict) for name, verdict in verdicts.items()]:
@@ -2099,15 +2098,22 @@ def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str
             for name, (file, group, _) in units.items()}
 
 
-def owed_options(owed: Path | None) -> list[str]:
-    """The pytest options that hand a GPU lane's files the accuracy gate's owed sites (`--owed FILE`: the
-    sites whose first stage left them undecided, which a follow-up's prepare draws and its run judges over
-    both stages); none where it owes none."""
-    return [] if owed is None else ["--owed", str(owed)]
+def asked_environment(asked: Path | None) -> dict[str, str]:
+    """What hands a GPU lane's files a follow-up's asks (`asked`, check 1's ASKED: the later units sites of an
+    earlier run asked for, check1_wire.LATER), which its prepare draws and its run judges over every stage;
+    nothing where it was asked for none."""
+    return {} if asked is None else {check1_wire().ASKED: str(asked)}
+
+
+def later_asks(verdict: Path) -> Path:
+    """Where a GPU lane's file whose verdict is `verdict` writes its sites' asks for their later units (check
+    1's LATER, `map_judge.ask_later`, a JSON line each), beside its JUnit report, so its receipt carries them
+    to a follow-up (dew-ops)."""
+    return verdict.with_name(f"{verdict.name}.later.jsonl")
 
 
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes: int,
-             deadline: float, network: bool = False, owed: Path | None = None) -> int:
+             deadline: float, network: bool = False, asked: Path | None = None) -> int:
     """Run `tests` on this process's share of the one GPU it sees, each once, as a task of its own
     (`tested`), and write their verdict rows to `out`: a test file, or one group of one as CI names it
     (`<file>#G/N`, the Gth of N runs of the tests the file's collection here finds, split.py), whose row is
@@ -2188,11 +2194,14 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                            "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
                            "OMP_NUM_THREADS": threads}
                 file, group, variant = units[fits]
-                # A follow-up that judges owed sites (`owed`) reuses no row: its run is another than theirs.
+                # A site's asks for its later units go beside the file's report; a follow-up of asks
+                # (`asked`) reuses no row: its run is another than theirs.
+                later_asks(verdicts[fits]).unlink(missing_ok=True)
                 running[pool.submit(tested, python, [file], group, verdicts[fits], deadline,
-                                    "off" if owed is not None else cache, session.GRACE, common,
-                                    {**environ, **(VARIANTS[variant][1] if variant else {})}, None, network,
-                                    variant=variant, options=owed_options(owed))] = fits
+                                    "off" if asked is not None else cache, session.GRACE, common,
+                                    {**environ, **(VARIANTS[variant][1] if variant else {}),
+                                     check1_wire().LATER: str(later_asks(verdicts[fits])),
+                                     **asked_environment(asked)}, None, network, variant=variant)] = fits
                 continue
             done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
@@ -2363,12 +2372,12 @@ def lane_asked(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         if args.network or args.cache is not None:
             parser.error("gpu-lane --prepare names its --tests, and takes neither --network nor --cache")
         return gpu_prepared(PYTHONS[0], args.tests.split(), args.out, processes=args.processes,
-                            deadline=args.deadline, owed=args.owed)
+                            deadline=args.deadline, asked=args.asked)
     if args.cache is None:
         parser.error("gpu-lane names the test cache's policy (--cache)")
     tests = args.tests.split() if args.tests is not None else list(network_files(PYTHONS[0]))
     return gpu_lane(PYTHONS[0], tests, args.out, cache=args.cache, processes=args.processes,
-                    deadline=args.deadline, network=args.network, owed=args.owed)
+                    deadline=args.deadline, network=args.network, asked=args.asked)
 
 
 def main() -> int:

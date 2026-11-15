@@ -205,7 +205,9 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
             refusals['hand'] = '; '.join(refusal.detail for refusal in SCAN.kernel('pallas').refusals(case))
             cotangents = (given['dy'], given['dfinal'])
         elif shape.kind == 'loglinear':
-            inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'], given['scales'])
+            # The level weights in bf16 as fla's arm takes them, the two arms' inputs one draw's.
+            inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'],
+                      given['scales'].astype(bf16))
 
             def template(q, k, v, g, scales):
                 # Scaled by one, as fla's kernel is unscaled.
