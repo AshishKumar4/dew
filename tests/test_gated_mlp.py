@@ -111,9 +111,8 @@ def test_a_gated_mlp_named_fused_on_a_data_split_mesh_runs_its_products_per_shar
     a projection's product maps its rows (`projections.mapped_shards`), where the template's launch was
     refused the split rows (row 6594). Its numerics per shard are the matrix's (tests/gated_mlp_matrix.py)."""
     from flax import linen as nn
-    from jax.sharding import Mesh
 
-    from dew.distributed.placement import Layout
+    from dew.distributed.placement import Layout, MeshSpec
     from dew.mesh import DEFAULT_RULES
     from dew.nn.mlp import GatedMLP
     from dew.nn.sharding import placing
@@ -121,7 +120,8 @@ def test_a_gated_mlp_named_fused_on_a_data_split_mesh_runs_its_products_per_shar
     layer = GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, dtype=jnp.bfloat16)
     x = jax.ShapeDtypeStruct((2, 64, FEATURES), jnp.bfloat16)
     params = jax.eval_shape(layer.init, jax.random.key(0), x)
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:2]), ("data",)), generation_name)
+    # A run's mesh of two devices, its data axis taking both (`MeshSpec`), each other axis one.
+    mesh = generation.gpu_mesh(MeshSpec().build(jax.devices()[:2]), generation_name)
     with (generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh),
           nn.logical_axis_rules(DEFAULT_RULES), placing(Layout(min_shard=1)),
           generation.chosen(grouped_matmul="mosaic", gated_mlp="fused"), generation.routes() as routes):
