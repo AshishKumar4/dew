@@ -657,19 +657,25 @@ def missed(op, arguments: tokamax.BoundArguments, config: Hashable, refused: Seq
 
 
 def _certifying_device():
-    """The device a launch is certified on (`certified`): a block's (`certifying`), else this process's GPU
-    where it compiles for that GPU's own generation (`generation.device_target`, whatever `assumed` says: an
-    A100 tracing for an assumed sm90 compiled the sm90 launch on itself, and Mosaic refused its TMA copies,
-    rows 6677 and 6678), else none."""
+    """The device a launch is certified on (`certified`): a block's (`certifying`), else the GPU the trace's
+    program runs on, the concrete mesh's (`jax.set_mesh`: a compile-only GPU's where a run's start compiles
+    ahead for one, `dew.training.ahead`), else this process's own GPU; either where it compiles for that
+    GPU's own generation (`generation.device_target`, whatever `assumed` says: an A100 tracing for an
+    assumed sm90 compiled the sm90 launch on itself, and Mosaic refused its TMA copies, rows 6677 and 6678),
+    else none. A trace under a compile-only GPU's mesh certified on the host's own GPU certified each launch a
+    second time, apart, where the start's compile certified it on the mesh's (row 6791)."""
+    from jax._src import mesh as mesh_lib
+
     named = _CERTIFYING.get()
     if named is not None:
         return named
-    if jax.default_backend() != "gpu":
+    placed = mesh_lib.get_concrete_mesh()
+    devices = jax.local_devices() if placed.empty else [
+        device for device in placed.devices.flat if device.process_index == jax.process_index()]
+    # A device of another generation (a CPU's, an A100's under an assumed sm90) certifies nothing.
+    if not devices or generation.device_target(devices[0]).generation != generation.gpu_target().generation:
         return None
-    device = jax.local_devices()[0]
-    if generation.device_target(device).generation != generation.gpu_target().generation:
-        return None
-    return device
+    return devices[0]
 
 
 def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, device,
