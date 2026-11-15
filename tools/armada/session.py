@@ -262,10 +262,14 @@ def drawn_from(counts: ast.expr, tree: ast.Module) -> bool:
     through names (`held = shards.get(...)`, `shards = CHECK1_SHARDS if ... else shards`)."""
     bound: dict[str, list[ast.expr]] = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    bound.setdefault(target.id, []).append(node.value)
+        # Each binding's names to what it binds them from: an assignment's value, a loop's or a
+        # comprehension's iterable (`for form, counts in held.items()`).
+        pairs = ([(target, node.value) for target in node.targets] if isinstance(node, ast.Assign) else
+                 [(node.target, node.iter)] if isinstance(node, ast.For | ast.comprehension) else
+                 [(node.target, node.value)] if isinstance(node, ast.NamedExpr) else [])
+        for target, value in pairs:
+            for name in (each.id for each in ast.walk(target) if isinstance(each, ast.Name)):
+                bound.setdefault(name, []).append(value)
     seen: set[str] = set()
     pending = [counts]
     while pending:
