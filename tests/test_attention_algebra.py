@@ -993,7 +993,7 @@ def test_a_quotient_below_the_least_normal_is_correctly_rounded_on_a_flushing_cp
     arguments = (jax.device_put(rows, on_cpu), jax.device_put(totals, on_cpu))
 
     def divided(acc, total):
-        return algebra.quotient(lambda held: held / total[:, None], acc, total, subnormals=True)
+        return algebra.quotient(lambda held: held / total[:, None], acc, total)
 
     found = np.asarray(jax.jit(divided)(*arguments))
     plain = np.asarray(jax.jit(lambda acc, total: acc / total[:, None])(*arguments))

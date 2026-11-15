@@ -146,16 +146,10 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
                                           most=keys // block_k)
 
         def finished(form: algebra.Forward, carry):
-            # A walk's outputs in `form` (`attention_program.finished`), as the Triton mainloop's; on XLA's
-            # CPU, which flushes a subnormal ratio, rounded once into it (`algebra.finish`'s `subnormals`).
-            def outputs(*, subnormals: bool):
-                out, *kept = attention_program.finished(form, carry, anchor_rows, resumed, training=residuals,
-                                                        output_mod=output_mod, output_params=out_params,
-                                                        subnormals=subnormals)
-                return (out.astype(query.dtype), *kept) if residuals else out.astype(query.dtype)
-
-            return jax.lax.platform_dependent(cpu=lambda: outputs(subnormals=True),
-                                              default=lambda: outputs(subnormals=False))
+            # A walk's outputs in `form` (`attention_program.finished`), as the Triton mainloop's.
+            out, *kept = attention_program.finished(form, carry, anchor_rows, resumed, training=residuals,
+                                                    output_mod=output_mod, output_params=out_params)
+            return (out.astype(query.dtype), *kept) if residuals else out.astype(query.dtype)
 
         return algebra.walked(spec, walk, finished)
 

@@ -38,6 +38,7 @@ import jax.numpy as jnp
 from dew._hashing import fmix32
 from dew.nn.derivatives import Protected, contracted
 from dew.nn.kernels import generation, tuning
+from dew.nn.kernels.templates import bodies
 from dew.nn.precision import (
     at_least_fp32,
     binade_of,
@@ -1644,7 +1645,8 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     padded to whole `block`s (`padded_call`), `launch(query, key, value, dout, peak0, total0, initial_term,
     maximum, key_index, anchor_value, others, own, others_total, total, start, end, query_ids, key_ids,
     score_params, *, score_mod, score_kinds, score_dtypes, scale, prescale)` giving dQ, the softmax's rows (`D
-    - c`, `c`, `m`, `T`, the keys' mass), each query's anchor key as it chose it, the dQ program's hook
+    - c`, `c`, `m`, `T`, the keys' mass, and what `D - c`'s rounding lost, `attention_gradient.dq_finish`),
+    each query's anchor key as it chose it, the dQ program's hook
     gradients (`DQ_GRADS`), then dK, dV and the dK/dV program's (`DKV_GRADS`); each gradient fp32, then
     rounded to its input's dtype. D is taken two ways, about 0 and about the anchor key's `v_c · dO`, each
     query the nearer, from the forward's split sums (`attention_gradient.split_delta`) or a first pass of the
@@ -1721,7 +1723,9 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         held = (total > 0) & jnp.isfinite(starts[0])
         half = jnp.where(held, jnp.exp(jnp.minimum(starts[0] - peak, 0.0) * 0.5), 0.0)
 
-        def kept() -> jax.Array:
+        def weighed_by(*, flushing: bool) -> jax.Array:
+            if not flushing or jnp.dtype(delta.dtype) != jnp.dtype(jnp.float32):
+                return share * factor
             # `delta * half * half / total` with D raised from its bits until its products stay normal,
             # divided and lowered in one rounding (`lowered_divide`).
             nonzero = (binade_of(delta) > -1024) & (binade_of(half) > -1024) & (total > 0)
@@ -1732,7 +1736,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
             divisor = jnp.where(total > 0, total, 1.0)
             return jnp.where(nonzero, lowered_divide(numerator, divisor, raised), 0.0)
 
-        weighed = jax.lax.platform_dependent(cpu=kept, default=lambda: share * factor)
+        weighed = bodies.subnormals(weighed_by)
         initial = Initial(m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
                           total=(-weighed).astype(state.total.dtype),
                           acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
