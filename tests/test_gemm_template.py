@@ -918,7 +918,7 @@ def test_two_launches_whose_padded_shapes_meet_name_their_own_kernels():
 
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
         lowered = jax.jit(both).trace(shorter, longer, weight).lower(lowering_platforms=("cuda",))
-    launches = [call.launch for call in kernel_calls(lowered) if call.name == "dew_gmm"]
+    launches = [call.launched for call in kernel_calls(lowered) if call.name == "dew_gmm"]
     assert len(launches) == 2 and None not in launches and len(set(launches)) == 2
 
 

@@ -170,12 +170,15 @@ def stacked_groups(shapes: Sequence[tuple[int, ...]]) -> tuple[tuple[int, ...], 
     return tuple(tuple(group) for group in grouped.values())
 
 
-def stacked_zeros(shapes: Sequence[tuple[int, ...]], groups: tuple[tuple[int, ...], ...]) -> list:
+def stacked_zeros(shapes: Sequence[tuple[int, ...]], groups: tuple[tuple[int, ...], ...], anchor: jax.Array,
+                  *anchors: jax.Array) -> list:
     """Zeroed fp32 refs a launch adds into in place, one for each of `shapes`, a ref a group of one shape
     (`stacked_groups`), a leading axis of them: two refs of equal zeros are one value to XLA, which a
     dynamic-slice fusion wrapping the launch passes once for both aliased operands, so both were one buffer
-    (row 3180; `checked` refuses two such refs)."""
-    return [jax.new_ref(jnp.zeros((len(group), *shapes[group[0]]), jnp.float32)) for group in groups]
+    (row 3180; `checked` refuses two such refs); each bound to the launch's operands, `anchor` and `anchors`
+    (`launches.filled`), so no other launch's zeros are its."""
+    return [jax.new_ref(launches.filled((len(group), *shapes[group[0]]), jnp.float32, anchor, *anchors))
+            for group in groups]
 
 
 def stacked_views(refs, groups: tuple[tuple[int, ...], ...]) -> list:

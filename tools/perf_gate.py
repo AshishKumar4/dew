@@ -210,7 +210,7 @@ def _stepped(out: Path) -> tuple:
     return step["ms_per_step"], peak(step), None if mfu is None else 100.0 * mfu
 
 
-STALL = 1.5  # benchmark_step's STALL, which keeps the stalled parts' stacks
+STALL = 1.5
 """How many times its window's median a part of a step's timed window takes to be said stalled (`stalled`)."""
 
 

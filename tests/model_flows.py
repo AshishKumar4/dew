@@ -312,10 +312,12 @@ library's fused kernel where one takes the call, FlashAttention among them, whic
 dense fp32 flow on XLA's declared fp32 route, and the SSD port in fp32 too, as a user's process runs it (its
 products in TF32 at the default precision, which the lane's whole fp32 products refuse).
 Lightning attention's decay without the delta rule takes the recurrence template on a Hopper or an Ampere GPU
-(an A100's once its output launch's phases were stated apart, row 6233): fla's port hands it to the portable
-math (`recurrence_chunk.PORT_SUPPORTS`). A latent attention flow's decode loop
-attends in XLA (the latent decode's own form), and a KDA flow's decode step's softmax layer too: no native
-attention route of theirs there."""
+(an A100's once its output launch's phases were stated apart, row 6233), and its training on a Hopper GPU
+(the fast backward's intermediates in fp32's three parts, `mainloop_backward.fast_backward_form`), an A100's
+training the portable math's at its 128-wide heads, whose fast backward's launches pass an A100's registers
+(`template.backward_holds`): fla's port hands it to the portable math (`recurrence_chunk.PORT_SUPPORTS`).
+A latent attention flow's decode loop attends in XLA (the latent decode's own form), and a KDA flow's decode
+step's softmax layer too: no native attention route of theirs there."""
 
 
 def flow_named(name: str) -> Flow:

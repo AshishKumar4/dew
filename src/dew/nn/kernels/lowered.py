@@ -30,8 +30,8 @@ class KernelCall:
     lowers under, its kernel's hash where its location names none; any other call's target), a Pallas
     kernel's IR as Pallas serialized it (Triton IR, or Mosaic's module bytecode), its `config` (Triton's
     warps and stages, a Mosaic GPU kernel's hash), the FLOPs its kernel states (its cost estimate), None
-    where it states none, and the launch that traced a Mosaic GPU kernel, which its location's name carried
-    (`report.named`), None where it carried none."""
+    where it states none, and the digest its kernel's name carries, a Mosaic GPU call's by its location: its
+    kernel's identity within the launch that traced it (`report.named`), None where it carried none."""
 
     kind: str | None
     name: str
@@ -45,6 +45,15 @@ class KernelCall:
     operands: tuple[tuple[int, ...], ...] = ()
     """The shapes of the arrays the call reads, as its program reads them: a device's shard's where the
     call runs per shard (within a `shard_map`), the whole array's otherwise."""
+    caller: str | None = None
+    """The launch that traced a Mosaic GPU kernel, as its call's caller states it (`report.launch_metadata`),
+    beside its name; None where its call states none."""
+
+    @property
+    def launched(self) -> str | None:
+        """The digest of the launch that traced the call's kernel: its caller's, else its name's, which is its
+        launch's where the launch states no kernel's part (`report.named`; a Triton kernel's name whole)."""
+        return self.caller or self.launch or report.kernel_of(self.name)[1]
 
 
 @dataclass(frozen=True)
@@ -330,13 +339,11 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
                   if "cost_estimate_json" in config else {})
         hashed = ir.StringAttr(config["kernel_hash"]).value_bytes.hex()[:16]
         named = _kernel_name(operation.location)
-        # Its launch is its call's metadata (`report.launch_metadata`), its name's suffix its kernel's own
-        # identity (`report.named`), which is its launch's where the launch states no kernel's part.
-        launch = (ir.StringAttr(config["metadata"]).value if "metadata" in config
-                  else named[1] if named else None)
+        caller = ir.StringAttr(config["metadata"]).value if "metadata" in config else None
         # A call whose location names no kernel is named by its kernel's hash, apart from every other.
         return KernelCall(kind, named[0] if named else hashed, ir.StringAttr(config["module"]).value_bytes,
-                          hashed, stated.get("flops"), launch, _model_flops(attributes))
+                          hashed, stated.get("flops"), named[1] if named else None, _model_flops(attributes),
+                          caller=caller)
     if kind == "mosaic_tpu":
         config = json.loads(ir.StringAttr(attributes["backend_config"]).value)["custom_call_config"]
         return KernelCall(kind, ir.StringAttr(attributes["kernel_name"]).value, config["body"].encode(), "",

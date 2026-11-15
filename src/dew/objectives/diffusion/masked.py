@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -85,6 +85,11 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
     (`LMObjective`). `balance` trains the routers of a mixture as an LM's does
     (`ExpertBalance`, `dew.objectives.routing`).
     """
+
+    untraced: ClassVar[Mapping[str, str]] = {
+        "samples": "its preview's count (`preview`), which its loss, draw and optimizer do not read",
+        "decode": "its preview's decoding of ids to text (`preview`), which its loss, draw and optimizer do "
+                  "not read"}
 
     saved_task = MaskedGeneration
     settings = MaskedSettings

@@ -136,11 +136,12 @@ def holds(launches: tuple[mainloop.Launch, ...], family: mosaic.Family, shared: 
 
 def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: mosaic.Family,
                    target: generation.GpuTarget, starts=None, max_segments: int | None = None,
-                   delta: bool = True, rounded: bool = False,
+                   delta: bool = True, rounded: bool = False, wide: bool = False,
                    ranged: bool = False, skip=None,
                    forked: chunk_forward.ForkedTable | None = None) -> bool:
     """Whether the launches a fast backward runs (`mainloop_backward.gradients`'s and the forward it takes,
-    `chunk_forward.kept_forward`'s) hold on `family`'s bundle at `tiles` on `target`, planned there and within
+    `chunk_forward.kept_forward`'s, its output fp32 where `wide`) hold on `family`'s bundle at `tiles` on
+    `target`, planned there and within
     its block's shared memory (`holds`); where they do not, the rule's gradient is the portable math's.
     Planned on the device's own target off a GPU, an interpreted call's states launch held no program at the
     interpreted target's shared budget (`Launch.resident`). Each plan is the call's cached one (`_planned`):
@@ -150,7 +151,7 @@ def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: 
     *shapes, skip = (None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype)
                      for x in (q, k, v, g, beta, h0, starts, skip))
     both = _planned(tuple(shapes), tiles, family, target, max_segments, delta, backward=True,
-                    rounded=rounded, ranged=ranged, skip=skip, forked=_shaped(forked))
+                    rounded=rounded, wide=wide, ranged=ranged, skip=skip, forked=_shaped(forked))
     return holds(both, family, generation.shared_budget(target))
 
 PLANS_KEPT = 1024
@@ -218,9 +219,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     port's operands and results (`recurrence_chunk.fla_rule`'s), the operands in their common dtype and beta
     with them, the decay and the memory fp32, on one device, by the bundle of its instruction family
     (`mainloop.family_of`, `bundles.of`), interpreted off a GPU (Mosaic GPU's interpreter, the interpreted
-    target's bundle, `mainloop.issued`). Its gradient: the gated delta rule's in a 16-bit call on the mainloop
-    (`mainloop_backward.gradients`, fla's DAG, fla's rounding) where its launches hold on the device
-    (`backward_holds`); it takes no other call's, which raises NotImplementedError as the gradient is traced:
+    target's bundle, `mainloop.issued`). Its gradient: the fast backward's on the mainloop
+    (`mainloop_backward.gradients`, fla's DAG) where it takes the call's form
+    (`mainloop_backward.fast_backward_form`) and its launches hold on the device (`backward_holds`); it takes
+    no other call's, which raises NotImplementedError as the gradient is traced:
     the delta rule's selector gives a training call it refuses another kernel (`Mosaic.trains`), and a call
     that names the mainloop insists on it (ledger 1926: no kernel falls back inside itself). Its states and
     output launches take `tiles` (`mainloop.Tiles`, the template's config); a `family` given is the bundle it
@@ -254,11 +256,11 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                                                                    tiles.chunk)
         state = starts = firsts = max_segments = None
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
-    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4)
+    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=wide)
             and backward_holds(
                 query, key, value, g, beta, state, tiles=tiles, family=issuing,
                 target=Mosaic.launched(), starts=starts,
-                max_segments=max_segments, delta=delta, rounded=rounded, ranged=run["ranged"],
+                max_segments=max_segments, delta=delta, rounded=rounded, wide=wide, ranged=run["ranged"],
                 skip=skip, forked=table))
 
     # The launch tracing the forward (`report.launch_digest`), whose name the fast backward's kernels carry
@@ -396,7 +398,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         assert family is not None, f"no bundle of the mainloop claims {target.generation}"
         delta = arguments.get("delta", True)
         fast = (backward or training_forward) and mainloop_backward.fast_backward_form(
-            delta, arguments.get("rounded", False), dtype, per_key=arguments["g"].ndim == 4)
+            delta, arguments.get("rounded", False), dtype, per_key=arguments["g"].ndim == 4,
+            wide=arguments.get("wide", False))
         # The skip fused into the output and reverse walk where given (its tiles their registers').
         skip = arguments.get("skip")
         forked, table, max_segments = arguments.get("forked"), None, arguments.get("max_segments")
@@ -482,9 +485,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _refused(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                  ) -> bool:
         """Whether a compile refused `tiles` past what its derivation's raise answers: a kernel spilled
-        (`report.spilled`) whose launch's producer can rise no further, or would leave its tiles unheld
+        (`report.refused_at`) whose launch's producer can rise no further, or would leave its tiles unheld
         (`_raised`)."""
-        spilled = report.spilled(self, ba, tiles)
+        spilled = report.refused_at(self, ba, tiles)
         return bool(spilled) and self._raised(ba, tiles, spilled, target) is None
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mainloop.Tiles | None:
@@ -526,8 +529,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
           0.095 32 wide five deep (batch-window-h100-0b202f7cc).
         None where no block is legal: the launch refuses the call.
 
-        A compile that refused the joined tiles (`report.spilled`: kernels of the launch spilled) refuses the
-        tiles each spilling kernel's product ran at, the training call's or the forward alone's
+        A compile that refused the joined tiles (`report.refused_at`: kernels of the launch spilled) refuses
+        the tiles each spilling kernel's product ran at, the training call's or the forward alone's
         (`Tiles.forward`), and that product's rules take the next they give: its ring a stage shallower, else
         the next narrower value block, as a refusal of a product's own tiles steps it (`legal`)."""
         family = bundle(target, _dtype(ba))
@@ -572,20 +575,21 @@ class Mosaic(base.Template[mainloop.Tiles]):
             forward = trained if alone in (None, trained) else alone
             joined = self._settled(ba, trained if forward is trained
                                    else dataclasses.replace(trained, forward=alone), target)
-            if not _spilled(self, ba, joined):
+            if not _refused_kernels(self, ba, joined):
                 return joined
             # Each product's tiles refused where a kernel it runs spilled past the last raise: the training
             # call's launches at its tiles, a forward alone's at its own (`Tiles.forward`, the training call's
             # where None). A refusal of the joined tiles is no refusal of either's (`legal`'s), so a forked
             # forward's spilling scan once refused its whole value block where a shallower ring held
             # (Nemotron-H 4B's on sm100).
-            spilled = report.spilled(self, ba, joined)
+            spilled = report.refused_at(self, ba, joined)
             products = ((refused[True], trained, self.launches(ba, joined, target, backward=True), spilled),
-                        (refused[False], forward, self.launches(ba, joined.forward or joined, target,
-                                                                backward=False), _spilled(self, ba, joined)))
+                        (refused[False], forward,
+                         self.launches(ba, joined.forward or joined, target, backward=False),
+                         _refused_kernels(self, ba, joined)))
             ran = [(tiles_refused, tiles) for tiles_refused, tiles, launches, kernels in products
                    if _owners(kernels, launches)]
-            assert ran, (f"the spilled kernels {sorted(_spilled(self, ba, joined))} are none of the "
+            assert ran, (f"the spilled kernels {sorted(_refused_kernels(self, ba, joined))} are none of the "
                          "call's launches")
             for tiles_refused, tiles in ran:
                 tiles_refused.add(tiles)
@@ -593,7 +597,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _settled(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                  ) -> mainloop.Tiles:
         """`tiles` with their spilling launches' producers stepped down their ladders for as long as a
-        compile found them spilling (`report.spilled`: a training call's at its tiles, a forward alone's at
+        compile refused them (`report.refused_at`: a training call's at its tiles, a forward alone's at
         its own, `Tiles.forward`) and a rung answers it (`_raised`): first each producer's top, the program's
         entry share, which every role holds with no register moved, then a setmaxnreg step lower at a time,
         each rung giving its consumers a step more: the assembler, not a model, finds a producer's registers.
@@ -601,22 +605,29 @@ class Mosaic(base.Template[mainloop.Tiles]):
         wherever the producer's need and the consumers' meet. Tiles still spilling at the ladder's foot their
         derivation refuses (`_chunked`). From the foot up, the 4B's reverse walk took eight compiles of a
         B200's cold start, 95 s, to the 80 registers its producer holds; its top, 128, holds in one."""
-        while (spilled := _spilled(self, ba, tiles)) and (
+        while (spilled := _refused_kernels(self, ba, tiles)) and (
                 raised := self._raised(ba, tiles, spilled, target)) is not None:
             tiles = _producing(tiles, raised)
         return tiles
 
     def emitted(self, config: Hashable, kernel: str) -> Hashable:
         """What `kernel` reads of `config` as it is emitted: all of it but the other launches' producers
-        (`Tiles.producers`, each launch's own setmaxnreg cap), so a producer's raise leaves every other kernel
-        of the launch the module it was, which a rung's certification then reads from the lowering cache and
-        Mosaic's compile (`rungs`): a rung re-lowered and recompiled every kernel of the 4B's training launch,
-        7 and 5 s of each 12."""
+        (`Tiles.producers`, each launch's own setmaxnreg cap, the call's tiles' and its forward's apart, each
+        a level a launch reads), so a producer's raise leaves every other kernel of the launch the module it
+        was, which a rung's certification then reads from the lowering cache and Mosaic's compile (`rungs`):
+        a rung re-lowered and recompiled every kernel of the 4B's training launch, 7 and 5 s of each 12."""
         if not self._typed(config):
             return config
-        owner = _owner(kernel, dict(config.producers.raised_to))
-        return _producing(config, resources.Producers(tuple(
-            (launch, cap) for launch, cap in config.producers.raised_to if launch == owner)))
+
+        def own(tiles: mainloop.Tiles) -> mainloop.Tiles:
+            # The cap its emission reads: its launch's by its name, which the launch passes to `report.named`
+            # and to `Call.producers` alike.
+            cap = tiles.producers.of(kernel)
+            return dataclasses.replace(tiles, producers=resources.Producers(
+                () if cap is None else ((kernel, cap),)))
+
+        forward = None if config.forward is None else own(config.forward)
+        return dataclasses.replace(own(config), forward=forward)
 
     def rungs(self, ba: tokamax.BoundArguments, config: Hashable) -> Iterator[mainloop.Tiles]:
         """The tiles a refused `config`'s spilling launches' producers step through (`_raised`): each one's
@@ -625,7 +636,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         (`tuning.KernelOp._climbed`)."""
         if not self._typed(config):
             return
-        target, spilled, rung = generation.gpu_target(), _spilled(self, ba, config), config
+        target, spilled, rung = generation.gpu_target(), _refused_kernels(self, ba, config), config
         while spilled and (raised := self._raised(ba, rung, spilled, target)) is not None:
             rung = _producing(rung, raised)
             yield rung
@@ -744,8 +755,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def trains(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         """Whether the call's gradient runs on `target`: its fast backward takes its form
-        (`mainloop_backward.fast_backward_form`: the delta rule with a decay a head or a key dimension, the
-        SSD's rated scan in bf16 under the fast forms, either in fp32 under the fast forms) and its launches
+        (`mainloop_backward.fast_backward_form`: the delta rule with a decay a head or a key dimension, a bf16
+        call without it and a decay a head or none, its output's gradient bf16 where it is not rounded,
+        either in fp32 under the fast forms) and its launches
         hold at the call's derived tiles (`_backward_holds`), the rule's gradient (`mosaic_rule`) refusing
         every other call."""
         if generation.backend() == "cpu" and bundle(target) is None:
@@ -754,7 +766,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
         forms = mainloop_backward.fast_backward_form(arguments.get("delta", True),
                                                      arguments.get("rounded", False), dtype,
-                                                     per_key=arguments["g"].ndim == 4)
+                                                     per_key=arguments["g"].ndim == 4,
+                                                     wide=arguments.get("wide", False))
         if not forms:
             return False
         fits = self.fits(ba, target)
@@ -888,11 +901,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
 
 
-def _spilled(op, ba: tokamax.BoundArguments, tiles: mainloop.Tiles) -> frozenset[str]:
-    """The kernels a compile found spilling at `tiles` (`report.spilled`): its training call's and its
-    forward alone's, at its own tiles where it has them (`Tiles.forward`)."""
-    return report.spilled(op, ba, tiles) | (report.spilled(op, ba, tiles.forward) if tiles.forward
-                                            else frozenset())
+def _refused_kernels(op, ba: tokamax.BoundArguments, tiles: mainloop.Tiles) -> frozenset[str]:
+    """The kernels a compile refused at `tiles` (`report.refused_at`): its training call's and its forward
+    alone's, at its own tiles where it has them (`Tiles.forward`)."""
+    return report.refused_at(op, ba, tiles) | (report.refused_at(op, ba, tiles.forward) if tiles.forward
+                                               else frozenset())
 
 
 def _owner(kernel: str, names: Iterable[str]) -> str | None:

@@ -31,7 +31,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import generation, tuning
+from dew.nn.kernels import generation, launches, tuning
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     mosaic,
@@ -1289,10 +1289,11 @@ def certified_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
     batch, padded, heads, _ = q.shape
     value_width, steps = v.shape[-1], k.shape[1] // at.block_k
-    held = (jax.new_ref(jnp.zeros((batch, padded, heads, value_width), query.dtype)),
-            jax.new_ref(jnp.stack([jnp.full((batch, heads, steps, padded), -jnp.inf, jnp.float32),
-                                   jnp.zeros((batch, heads, steps, padded), jnp.float32)])),
-            jax.new_ref(jnp.zeros((batch, heads, steps, padded, value_width), jnp.float32)))
+    rows = (batch, heads, steps, padded)
+    held = (jax.new_ref(launches.filled((batch, padded, heads, value_width), query.dtype, q, k, v)),
+            jax.new_ref(jnp.stack([launches.filled(rows, jnp.float32, q, k, v, fill=-jnp.inf),
+                                   launches.filled(rows, jnp.float32, q, k, v)])),
+            jax.new_ref(launches.filled((batch, heads, steps, padded, value_width), jnp.float32, q, k, v)))
     _launch(q, k, v, at_spans, hooked, spec=form, hooks=hooks, tiles=at, family=family, training=False,
             interpret=interpret, certified=True, into=held, registered=registered)
     out, rows, sums = (jax.freeze(ref) for ref in held)

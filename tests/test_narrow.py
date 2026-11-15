@@ -5,6 +5,7 @@ import numpy as np
 import optax
 import pytest
 from arm_arithmetic import summed_as_run
+from map_judge import drawing
 from placement_parity import layouts_agree, x64
 
 from dew.checkpoints import _filled
@@ -350,9 +351,14 @@ def _copies_of(narrow):
     return paths
 
 
-@pytest.mark.check1_shards(seeds=8, per_task=2)
-@pytest.mark.parametrize("fsdp", [1, pytest.param(2, marks=pytest.mark.mesh(devices=2)),
-                                  pytest.param(8, marks=pytest.mark.mesh(devices=8))])
+# Each mesh a site of its own, its map tasks compiling its arms alone (one site of three took 141 s a task).
+@pytest.mark.parametrize("fsdp", [
+    pytest.param(1, id="1", marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
+    pytest.param(2, id="2", marks=[pytest.mark.mesh(devices=2),
+                                   pytest.mark.check1_shards(seeds=8, per_task=4)]),
+    pytest.param(8, id="8", marks=[pytest.mark.mesh(devices=8),
+                                   pytest.mark.check1_shards(seeds=8, per_task=4)]),
+])
 def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradients(fsdp):
     """Through the trainer, a tied decoder's projection kernels are read
     through bf16 copies and its tied table and norm scales are not. Under
@@ -368,6 +374,8 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
     mesh = MeshSpec(fsdp=fsdp)
     _on_par_with_the_plain_update(lambda: KEEPING_SGD, "a tied decoder's copies",
                                   mesh=mesh)
+    if drawing():
+        return
     narrow, _, _ = _trained(KEEPING_SGD, copies=True, mesh=mesh)
     names = {"/".join(path) for path in _copies_of(narrow)}
     assert names and all(name.endswith("kernel") and "proj" in name for name in names), names
@@ -387,17 +395,23 @@ def test_a_scanned_decoder_reads_every_layers_kernels_through_copies_with_the_sa
     assert {f"layers_{index}" for index in range(4)} <= layers, names
 
 
-# One draw a map task: a mixture's draw first clears its routing margin, its longest task 662 s for two draws
-# in CI (row 6237).
-@pytest.mark.check1_shards(seeds=8, per_task=1)
+# Each cell a site of its own, its map tasks compiling its arms alone: one site over the six, each task
+# compiling every cell's arms for its draws, took 470 to 560 s a task in CI, setting each train's wall
+# (rows 6237, 6332, 4765). On armada a pooled cell's four draws take 50 to 80 s a task, a replayed (mixture)
+# cell's two draws about 100, each clearing its routing margin first.
 @pytest.mark.parametrize(("accumulation", "split", "mixture", "fsdp"), [
-    (2, 1, False, 1), (1, 2, True, 1),
-    pytest.param(2, 1, True, 2, marks=pytest.mark.mesh(devices=2)),
-    pytest.param(1, 2, False, 2, marks=pytest.mark.mesh(devices=2)),
-    pytest.param(2, 1, False, 8, marks=pytest.mark.mesh(devices=8)),
-    pytest.param(1, 2, True, 8, marks=pytest.mark.mesh(devices=8)),
-], ids=["accumulated-pooled", "split-replayed", "accumulated-replayed-fsdp2", "split-pooled-fsdp2",
-        "accumulated-pooled-fsdp8", "split-replayed-fsdp8"])
+    pytest.param(2, 1, False, 1, id="accumulated-pooled",
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
+    pytest.param(1, 2, True, 1, id="split-replayed", marks=pytest.mark.check1_shards(seeds=8, per_task=2)),
+    pytest.param(2, 1, True, 2, id="accumulated-replayed-fsdp2",
+                 marks=[pytest.mark.mesh(devices=2), pytest.mark.check1_shards(seeds=8, per_task=2)]),
+    pytest.param(1, 2, False, 2, id="split-pooled-fsdp2",
+                 marks=[pytest.mark.mesh(devices=2), pytest.mark.check1_shards(seeds=8, per_task=4)]),
+    pytest.param(2, 1, False, 8, id="accumulated-pooled-fsdp8",
+                 marks=[pytest.mark.mesh(devices=8), pytest.mark.check1_shards(seeds=8, per_task=4)]),
+    pytest.param(1, 2, True, 8, id="split-replayed-fsdp8",
+                 marks=[pytest.mark.mesh(devices=8), pytest.mark.check1_shards(seeds=8, per_task=2)]),
+])
 def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
         accumulation, split, mixture, fsdp):
     """A step that pools several microbatches, by accumulation or a batch
@@ -416,6 +430,9 @@ def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
     run = {"steps": 2 * accumulation, "accumulation": accumulation, "split": split, "mixture": mixture,
            "rows": split * max(8, jax.device_count()), "ragged": True, "mesh": MeshSpec(fsdp=fsdp)}
     _on_par_with_the_plain_update(lambda: KEEPING_SGD, "a window's copies", **run)
+    if drawing():
+        # A map task records its draws; the judge holds the run's copies.
+        return
     narrow, _, _ = _trained(KEEPING_SGD, copies=True, **run)
     assert int(narrow.updates) == 2
     assert _copies_of(narrow)

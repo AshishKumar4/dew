@@ -22,7 +22,7 @@ from __future__ import annotations
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal
+from typing import ClassVar, Literal
 
 import jax
 import jax.numpy as jnp
@@ -376,6 +376,10 @@ class WorldModelObjective(Objective[Ratio]):
     tokenizer's weights are state, under `TOKENIZER` beside the dynamics' (`held_variables`), as a
     diffusion objective's frozen towers are: they reach the compiled step as arguments, placed and
     checkpointed with the rest, and the optimizer never sees them."""
+
+    untraced: ClassVar[Mapping[str, str]] = {
+        "_tokenizer": "its tokenizer's held tree, which the key states by its shapes as part of the tree it "
+                      "starts from (`held_variables`)"}
 
     shown: Mapping[str, Shown] = {"loss": Shown()}
 

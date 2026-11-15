@@ -3,9 +3,12 @@ call held to the per-shard boundary (`dew.nn.sharding.per_shard`), so no route l
 operands an automatic mesh axis splits, where every device would run the whole batch (rows 1897, 1923,
 4077)."""
 
+import contextvars
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
+import jax
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
@@ -14,14 +17,40 @@ from dew.nn.sharding import per_shard
 
 def pallas_call(kernel: Callable, *, name: str, **params) -> Callable:
     """`jax.experimental.pallas.pallas_call(kernel, name=name, **params)` held per shard (`_held`), named by
-    its `name`, which its profile names it by."""
-    return _held(pl.pallas_call(kernel, name=name, **params), name)
+    its `name`, which its profile names it by, its body traced as a launch's (`_traced`)."""
+    return _held(pl.pallas_call(_traced(kernel, params.get("interpret")), name=name, **params), name)
 
 
 def kernel(entry: Callable, *, name: str, **params) -> Callable:
     """`jax.experimental.pallas.mosaic_gpu.kernel(entry, **params)` held per shard (`_held`), named by
-    `name`."""
-    return _held(plgpu.kernel(entry, **params), name)
+    `name`, its body traced as a launch's (`_traced`)."""
+    return _held(plgpu.kernel(_traced(entry, params.get("interpret")), **params), name)
+
+
+_INTERPRETING: contextvars.ContextVar[bool | None] = contextvars.ContextVar("interpreting", default=None)
+"""Whether the launch whose body is tracing runs in Pallas's interpreter (`_traced`, every launch's body);
+None outside any launch's body."""
+
+
+def interpreting() -> bool | None:
+    """Whether the launch whose body is tracing runs in Pallas's interpreter (`pallas_call`, `kernel`): None
+    outside any launch's body."""
+    return _INTERPRETING.get()
+
+
+def _traced(body: Callable, interpret) -> Callable:
+    """`body`, tracing within its launch, run in Pallas's interpreter where `interpret` is given
+    (`interpreting`)."""
+
+    @functools.wraps(body)
+    def traced(*refs, **options):
+        token = _INTERPRETING.set(bool(interpret))
+        try:
+            return body(*refs, **options)
+        finally:
+            _INTERPRETING.reset(token)
+
+    return traced
 
 
 def _held(launch: Callable, name: str) -> Callable:
@@ -33,3 +62,21 @@ def _held(launch: Callable, name: str) -> Callable:
         return launch(*operands, **options)
 
     return launched
+
+
+def filled(shape: Sequence[int], dtype, anchor: jax.Array, *anchors: jax.Array, fill: float = 0.0
+           ) -> jax.Array:
+    """A buffer of `shape` filled with `fill` that one launch alone takes in place (a ref its programs add
+    into atomically: an accumulator's zeros, a state's start), its fill passed through an optimization
+    barrier with that launch's own operands (`anchor` and `anchors`, one at least) and broadcast after it:
+    each launch's broadcast has an operand of its own, which XLA's common-subexpression elimination cannot
+    merge with another's, as jax.checkpoint's `prevent_cse` passes a computation's inputs through a barrier
+    it then consumes. XLA merges every equal `broadcast(constant)` of one shape (HloCSE sets aside only
+    instructions with no operands or with side effects), and a barrier after the broadcast forwards its
+    buffer: unbound, one buffer served every layer's launch and lived from the first backward to the last
+    (the 4B's split-1 step: the shared-keys backward's dQ zeros, 805 MB, live from layer 31's backward to
+    layer 3's). The launch cannot zero its own target in its kernel: other programs add into it with no
+    grid-wide barrier before their first add, so the fill is made before the launch, each launch its own,
+    on every family (Mosaic's, Pallas-Triton's and the recurrence's alike)."""
+    value, _ = jax.lax.optimization_barrier((jnp.asarray(fill, dtype), (anchor, *anchors)))
+    return jnp.broadcast_to(value, tuple(shape))

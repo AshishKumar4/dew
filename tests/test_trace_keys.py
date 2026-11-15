@@ -8,6 +8,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from objective_cases import cases
 from objective_data import corpus_windows
@@ -55,9 +56,53 @@ BUILT = {
 }
 
 
+RUN_KINDS = ("lm", "decision", "jepa", "diffusion")
+"""The run kinds whose objective a cell builds as its config does (`RunConfig.prepare`), what a run holds
+beyond the bare objective (its tokenizer's processor, its preview, its pretrained source) among it."""
+
+
 @pytest.fixture(scope="module")
-def windows(tmp_path_factory):
-    return corpus_windows(tmp_path_factory.mktemp("corpus"))
+def built_objectives(tmp_path_factory):
+    """Per name, a builder of an objective and the first batch it trains on: every registered objective as
+    its recipe builds it bare (`objective_cases.cases`), each run kind's as its config builds it (`run
+    <kind>`, `RunConfig.prepare` over the first batch of the run's own data, a pretrained source's and a
+    preview's settings among what it holds), as a run builds it, and the objectives no recipe registers (an
+    indexer's LM, the world model's two), by their key alone."""
+    import run_kinds
+    from objective_data import first
+
+    def run(kind: str):
+        # A directory of each build's own, as each run's data writes its own cache.
+        configured = run_kinds.KINDS[kind](tmp_path_factory.mktemp(kind), drawn=False)
+        bounded = dataclasses.replace(configured, trainer=dataclasses.replace(configured.trainer, steps=1))
+        objective = bounded.prepare().objective
+        return objective, first(configured.data, objective)
+
+    def indexed():
+        # An LM whose sparse attention's indexer it trains beside the decoder.
+        from test_indexer_training import SEQ, deepseek_stack
+
+        from dew.objectives.lm.objective import IndexerTraining
+
+        return LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse", weight=0.5)), None
+
+    def world(objective: str):
+        # The world model's two objectives over a tiny tokenizer and its drawn tree.
+        from test_world_model import _tiny_models
+
+        from dew.objectives.world_model import TokenizerObjective, WorldModelObjective
+
+        tokenizer, tokens, dynamics = _tiny_models()
+        built = (TokenizerObjective(tokenizer) if objective == "tokenizer"
+                 else WorldModelObjective(dynamics, tokenizer, tokens))
+        return built, None
+
+    # Built for its key alone (`None`, no batch): the cells that trace or fit an objective read the ones a
+    # recipe or a config trains on.
+    keyed = {"lm indexer": indexed, "world model": functools.partial(world, "dynamics"),
+             "world tokenizer": functools.partial(world, "tokenizer")}
+    windows = corpus_windows(tmp_path_factory.mktemp("corpus"))
+    return {**cases(windows), **{f"run {kind}": functools.partial(run, kind) for kind in RUN_KINDS}, **keyed}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -68,15 +113,24 @@ class Other:
 
 
 KEYLESS = frozenset({"diffusion", "distillation", "flow_grpo", "guidance_distillation", "ladd", "mean_flow",
-                     "rcm", "shortcut"})
+                     "rcm", "shortcut", "run diffusion"})
 """The registered objectives that state no key, so a refit of theirs traces its step again: each holds what
 states no value and no class leaves out (a diffusion process, its grid's class, a distillation's
 schedules; rows 6297 and 6303)."""
 
 
+def rolled_out(name: str, batch):
+    """A case's batch as its step trains on it: a PPO pack with the columns its rollout adds (`PPORollout`),
+    the critic's baseline and its targets; every other case's as it is."""
+    if name != "ppo":
+        return batch
+    mask = np.asarray(batch["response_mask"], np.float32)
+    return {**batch, "old_values": np.zeros_like(mask), "returns": mask}
+
+
 def unvalued(objective) -> list[str]:
     """The attributes of an objective that state no value, the ones of an objective it holds by its name."""
-    left = {held for klass in type(objective).__mro__ for held in vars(klass).get("untraced", {})}
+    left = type(objective)._untraced()
     found = []
     for held, value in sorted(vars(objective).items()):
         if held in left or held in HELD:
@@ -88,18 +142,18 @@ def unvalued(objective) -> list[str]:
     return found
 
 
-def test_every_objective_keys_every_attribute_it_holds_or_names_why_not(windows):
-    """Every registered objective, as its recipe builds it (`objective_cases.cases`), states a key but those
-    that hold what states no value (`KEYLESS`), and every attribute it holds reaches it: each, replaced by a
-    value no setting holds, keys apart, but for its held tree and EMA (`HELD`), the modules its programs run
-    (`program_key`), which other cells key apart, and what its classes leave out by name with a reason
-    (`Objective.untraced`), each an attribute it holds."""
+def test_every_objective_keys_every_attribute_it_holds_or_names_why_not(built_objectives):
+    """Every registered objective, as its recipe builds it and as a run's config builds it
+    (`built_objectives`), states a key but those that hold what states no value (`KEYLESS`), and every
+    attribute it holds reaches it: each, replaced by a value no setting holds, keys apart, but for its held
+    tree and EMA (`HELD`), the modules its programs run (`program_key`), which other cells key apart, and what
+    its classes leave out by name with a reason (`Objective.untraced`), each an attribute it holds."""
     problems = {}
-    for name, build in sorted(cases(windows).items()):
+    for name, build in sorted(built_objectives.items()):
         objective, _ = build()
         key = stated_trace(objective)
         mro = type(objective).__mro__
-        left = {held: why for klass in mro for held, why in vars(klass).get("untraced", {}).items()}
+        left = type(objective)._untraced()
         if (key is None) != (name in KEYLESS):
             problems[name] = {"no key": unvalued(objective)} if key is None else "a key, which KEYLESS denies"
             continue
@@ -109,10 +163,9 @@ def test_every_objective_keys_every_attribute_it_holds_or_names_why_not(windows)
                   if isinstance(member, functools.cached_property)}
         holds = set(vars(objective)) | cached
         run = {id(entry.module) for entry in objective.program_key()}
-        # What a class of its own leaves out, each an attribute it holds; every objective's own memos
-        # (`Objective.untraced`: its draw's, which `init` writes) only once it is drawn.
-        own = {held for klass in mro if klass is not Objective for held in vars(klass).get("untraced", {})}
-        stale = sorted(held for held, why in left.items() if (held in own and held not in holds) or not why)
+        # What its classes leave out, each with its reason (an attribute set only where it is used, a
+        # preview's prompt, held or not).
+        stale = sorted(held for held, why in left.items() if not why)
         unreached = []
         for held in sorted(holds - set(left) - HELD):
             if id(vars(objective).get(held)) in run:
@@ -132,23 +185,22 @@ def test_every_objective_keys_every_attribute_it_holds_or_names_why_not(windows)
     assert not problems, "; ".join(f"{name} {problem}" for name, problem in problems.items())
 
 
-def test_every_keyed_objectives_key_is_the_same_after_its_loss_is_traced_and_built_anew(windows):
-    """Every registered objective but those that state no key (`KEYLESS`) states one, the same once its loss
-    and its gradient are traced (over the first batch its recipe trains on, its tree drawn abstractly) as
-    before, and as an objective built anew states: nothing a trace writes on it (a memo) keys it apart from
-    its equal's, so a refit reads its equal's step."""
+def test_every_keyed_objectives_key_is_the_same_after_its_loss_is_traced_and_built_anew(built_objectives):
+    """Every objective a recipe or a run's config builds (`built_objectives`) but those that state no key
+    (`KEYLESS`) states one, the same once its loss and its gradient are traced (over the first batch its
+    recipe trains on, its tree drawn abstractly) as before, and as an objective built anew states: nothing a
+    trace writes on it (a memo) keys it apart from its equal's, so a refit reads its equal's step."""
     from dew.batch import select
     from dew.objectives.base import Step
 
     moved = {}
-    for name, build in sorted(cases(windows).items()):
+    for name, build in sorted(built_objectives.items()):
         if name in KEYLESS:
             continue
         objective, batch = build()
-        if name == "ppo":
-            # The columns its rollout adds to a pack (`PPORollout`): the critic's baseline and its targets.
-            mask = jnp.asarray(batch["response_mask"], jnp.float32)
-            batch = {**batch, "old_values": jnp.zeros_like(mask), "returns": mask}
+        if batch is None:
+            continue
+        batch = rolled_out(name, batch)
         before = stated_trace(objective)
         held = {key: frozen_value(value) for key, value in vars(objective).items()}
         variables = objective.drawn_shapes()
@@ -170,14 +222,13 @@ def test_every_keyed_objectives_key_is_the_same_after_its_loss_is_traced_and_bui
     assert not moved, "; ".join(f"{name} {how}" for name, how in moved.items())
 
 
-def test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew(windows):
-    """Every registered objective that states a key states the same one after a fit of a step over the first
-    batch its recipe trains on, its heads (its own, a policy's actor's) put back at the rung they were built
-    at (`restore_head`, as a fit's ladder puts them back), as an objective built anew states: nothing a fit
-    writes on it (its draw's memos, the programs it made, what its first step records) keys it apart from
-    its equal's, so a refit in the same process reads its equal's step. A head the ladder moved keys apart,
-    its programs another's."""
-    import numpy as np
+def test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew(built_objectives):
+    """Every objective a recipe or a run's config builds (`built_objectives`) that states a key states the
+    same one after a fit of a step over the first batch its recipe trains on, its heads (its own, a policy's
+    actor's) put back at the rung they were built at (`restore_head`, as a fit's ladder puts them back), as an
+    objective built anew states: nothing a fit writes on it (its draw's memos, the programs it made, what its
+    first step records) keys it apart from its equal's, so a refit in the same process reads its equal's step.
+    A head the ladder moved keys apart, its programs another's."""
     import optax
 
     from dew.data.dataset import Loader
@@ -187,14 +238,13 @@ def test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew(window
     # One device: a recipe's first batch holds a couple of rows.
     mesh = MeshSpec().build(jax.devices()[:1])
     moved = {}
-    for name, build in sorted(cases(windows).items()):
+    for name, build in sorted(built_objectives.items()):
         if name in KEYLESS:
             continue
         objective, batch = build()
-        if name == "ppo":
-            # The columns its rollout adds to a pack (`PPORollout`): the critic's baseline and its targets.
-            mask = np.asarray(batch["response_mask"], np.float32)
-            batch = {**batch, "old_values": np.zeros_like(mask), "returns": mask}
+        if batch is None:
+            continue
+        batch = rolled_out(name, batch)
         rows = len(next(iter(batch.values())))
         loader = Loader(train=lambda partition, batch=batch: iter([batch] * 2), val=None, records=None,
                         batch=rows)
@@ -316,7 +366,6 @@ def test_a_refit_on_a_sequence_split_mesh_reads_the_step_its_first_fit_traced():
     again, 4 now, its batches' placement and its evaluation alone); the kept step's spreads are its
     trace's (`Candidate.spread`)."""
     import jax.monitoring
-    import numpy as np
 
     from dew.data.dataset import Loader
     from dew.optim import OptimConfig

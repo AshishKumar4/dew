@@ -35,6 +35,8 @@ def task_arguments(running: argparse.ArgumentParser, pythons: Sequence[str], dea
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     running.add_argument("--coverage", type=Path, default=None,
                          help="run the files under coverage.py, its data file in this directory")
+    running.add_argument("--scenarios", action="store_true",
+                         help="run the files' tests that mark a scenario alone (tests/conftest.py SCENARIOS)")
 
 
 def tier_arguments(choosing: argparse.ArgumentParser) -> None:
@@ -68,6 +70,8 @@ def parser(pythons: Sequence[str], deadline: float) -> argparse.ArgumentParser:
     itemizing = stages.add_parser("items")
     itemizing.add_argument("--target", type=float, required=True)
     itemizing.add_argument("--timings", type=Path, required=True)
+    itemizing.add_argument("--scenarios", action="store_true",
+                           help="the scenario suite alone: a task a file marking one, its marked tests")
     reporting = stages.add_parser("report")
     reporting.add_argument("directory", type=Path)
     tier_arguments(operations.add_parser("gpu-tier"))
@@ -86,6 +90,9 @@ def parser(pythons: Sequence[str], deadline: float) -> argparse.ArgumentParser:
                       help="a follow-up's asks (check 1's ASKED: JSON lines of {site, from, to}), which each "
                            "file's prepare draws and its run judges over every stage, no row reused")
     operations.add_parser("gangs")
+    listing = operations.add_parser("scenarios", help="each scenario and the test files that mark it")
+    listing.add_argument("--check", action="store_true",
+                         help="refuse a scenario no test marks and a mark naming no scenario")
     versions = operations.add_parser("pythons")
     versions.add_argument("--check", action="store_true",
                           help="refuse a .python-version other than the oldest, or a smoke of other versions")

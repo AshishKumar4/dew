@@ -13,7 +13,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import tuning
+from dew.nn.kernels import launches, tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, stores, swizzling
 from dew.nn.kernels.templates.attention_mosaic_fused import staged_parts, walked_sums
 from dew.nn.kernels.templates.attention_mosaic_program import (
@@ -245,8 +245,9 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
                                        sharing=consumers)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
-    dq = jax.new_ref(jnp.zeros((batch, queries, heads, width), jnp.float32))
-    dkv = mosaic.stacked_zeros(shapes, groups)
+    # The accumulators' zeros this launch's own (`launches.filled`): unbound, every layer's were one buffer.
+    dq = jax.new_ref(launches.filled((batch, queries, heads, width), jnp.float32, query, dout))
+    dkv = mosaic.stacked_zeros(shapes, groups, query, dout)
     launch(query, key, value, dout, peak, total, anchor, delta, key_index, *leaves, dq, *dkv)
     dk, dv = mosaic.stacked_read(dkv, groups)
     return jax.freeze(dq), dk, dv

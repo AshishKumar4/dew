@@ -211,24 +211,35 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # numbers are read once, as the selector reads them: a remat's pullback runs the launch later, under
         # whatever precision its caller set then (a saved fp32 gradient under 'highest' took the accurate
         # forms' three parts, whose solve no sm90 thread holds, past the fast ones the selector gave it).
-        wide_out = hooks.skip or hooks.output is not None or dtype != jnp.result_type(query, key, value)
+        epilogue = hooks.output is not None or dtype != jnp.result_type(query, key, value)
+        wide_out = hooks.skip or epilogue
         rounded = chunk_rounding(hooks.delta, jnp.result_type(query, key, value))
+        skip = given['skip'] if hooks.skip else None
+        # Without the delta rule the template takes the skip, its output wide where an epilogue or the
+        # caller reads it so (`chunk_forward.forward`).
+        fused_wide = wide_out if hooks.delta else epilogue
 
         def product_kernel(product: str) -> str:
             return port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                               scale=scale, wide=wide_out, bound=hooks.inverse_bound,
+                               scale=scale, wide=fused_wide, bound=hooks.inverse_bound,
                                product=product, forked=forked, delta=hooks.delta,
-                               decayed=hooks.decay != 'none')
+                               decayed=hooks.decay != 'none', skip=None if hooks.delta else skip)
 
         def run(kernel, query, key, value, g, beta, skip, state, starts, firsts, *walked):
             # Every kernel walks the packed rows, each document from its own memory, its values read once
-            # with the skip's (`_read_once`).
+            # with the skip's (`_read_once`). Without the delta rule the template takes the skip, its
+            # values' gradient summed with the recurrence's before it rounds once (`chunk_forward.forward`):
+            # added after, the template's rounded to the values' dtype apart from the skip's, Mamba2's step
+            # gates' values' gradient's worst row of 40 draws was 2.9e-2 from float64 against the portable
+            # math's 3.5e-3 (interpreted).
             carried = None if forked is None else forked.carrying(*walked)
             wide, own = _read_once(value, work)
+            fused = kernel == 'mosaic_gpu' and not hooks.delta
             if kernel == 'mosaic_gpu':
-                out, final = template_rule(query, key, own, g, beta, state, starts, firsts, forked=carried,
+                out, final = template_rule(query, key, own, g, beta, state, starts, firsts,
+                                           skip if fused else None, forked=carried,
                                            max_segments=max_segments, scale=scale, delta=hooks.delta,
-                                           wide=wide_out, bound=hooks.inverse_bound, rounded=rounded)
+                                           wide=fused_wide, bound=hooks.inverse_bound, rounded=rounded)
             elif kernel == 'fla':
                 out, final = fla_rule(query, key, own, g, beta, state, starts=starts,
                                       max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
@@ -237,11 +248,11 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                 out, final = xla_mainloop(Tiles(size), query, key, wide, g, beta, state, starts, firsts,
                                           scale=scale, delta=hooks.delta, dtype=work,
                                           bound=hooks.inverse_bound, forked=carried)
-            return recurrence.skipped(hooks, out.astype(work), wide, {'skip': skip}, work), final
+            out = out.astype(work)
+            return (out if fused else recurrence.skipped(hooks, out, wide, {'skip': skip}, work)), final
 
-        out, final = _per_product(product_kernel, run, query, key, value, g, beta,
-                                  given['skip'] if hooks.skip else None, state, starts, firsts,
-                                  *(() if forked is None else forked.walked))
+        out, final = _per_product(product_kernel, run, query, key, value, g, beta, skip, state, starts,
+                                  firsts, *(() if forked is None else forked.walked))
     # The epilogue in the working precision, and the output rounded once.
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
 
@@ -913,11 +924,12 @@ def _walk(forms, width: int, recomputed: bool, held: int = 0):
 def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segments: int | None = None,
                 scale: float | None = None, wide: bool = False,
                 bound: float | None = None, product: str = 'forward', report: bool = True, delta: bool = True,
-                decayed: bool = True, forked: Forked | None = None) -> str:
+                decayed: bool = True, forked: Forked | None = None, skip=None) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
     ('forward', 'training'), of the form `delta` and `decayed` state and the chunk inverse's `bound` its form
     proves (`recurrence.Hooks.inverse_bound`; `PortCase`), the template's
-    implementations bound to it, on the target (`generation`'s, an assumed one's within `assumed`):
+    implementations bound to it, its `skip` among them where it takes one (`chunk`: a form without the delta
+    rule's), on the target (`generation`'s, an assumed one's within `assumed`):
     reported as its route, or not where not `report` (`selected`). A kernel a call names
     (`generation.chosen`) insists on it (`selection.KernelRefused`: the port named over varying operands),
     but for a form the rule's kernels do not run, which the portable math takes."""
@@ -926,7 +938,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
                      max_segments=max_segments, scale=scale, delta=delta, wide=wide, bound=bound,
                      rounded=chunk_rounding(delta, jnp.result_type(query, key, value)),
-                     recomputed=recomputed_memory(), forked=forked)
+                     recomputed=recomputed_memory(), forked=forked, skip=skip)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1],
@@ -1263,38 +1275,35 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     (`_ported_documents`), their table's given memories `state` `[B, S', Hv, Dk, Dv]`."""
     rate = given['rate'].astype(work)
     skip = given['skip'].astype(work) if hooks.skip else jnp.zeros(rate.shape, work)
-    # Under the fast forms the skip in the template's own output and walk (`output.output_launch`,
-    # `_reverse`), as mamba_ssm's kernels add it, the output in the operands' dtype where the caller asks it
-    # so and no epilogue reads it after (`hooks.output`'s norm), else wide: added after, its fp32 output's
-    # skip and cast took 0.045 ms past an H100's launches, and its gradient's 0.094
-    # (ssd-rounded-h100-fdab2424c, window-h100-c70aaa8-b8109ee). Where the template holds no 16-bit values
-    # ungated (`mainloop.Call.gated_keys`: the accurate forms, or an fp32 call's two parts under the fast
-    # forms), the skip is added after. Decided once: the selector judges the call the run makes (its skip's
-    # reverse tile).
+    # The skip the template's own (`chunk_forward.forward`) and its gradient's (`mainloop_backward._reverse`),
+    # as mamba_ssm's kernels add it: under the fast forms in its output launch, else added to its output
+    # after its launches where the template holds no 16-bit values ungated (`mainloop.Call.gated_keys`: the
+    # accurate forms, or an fp32 call's two parts under the fast forms); the output in the operands' dtype
+    # where the caller asks it so and no epilogue reads it after (`hooks.output`'s norm), else wide: added
+    # after the template, its fp32 output's skip and cast took 0.045 ms past an H100's launches, and its
+    # gradient's 0.094 (ssd-rounded-h100-fdab2424c, window-h100-c70aaa8-b8109ee). Decided once: the selector
+    # judges the call the run makes (its skip's reverse tile).
     operand = jnp.dtype(jnp.result_type(query, key, value))
     fast = fast_rounding(operand)
-    fused = fast and hooks.skip and operand.itemsize == 2
-    narrow = fused and hooks.output is None and jnp.dtype(dtype) == operand
+    narrow = hooks.output is None and jnp.dtype(dtype) == operand
+    taken = skip if hooks.skip else None
 
     def product_kernel(product: str) -> str:
         return scan_kernel(query, key, value, g, beta, state, starts, chunk_size=chunk_size,
-                           max_segments=max_segments, product=product, skip=skip if fused else None,
-                           wide=not narrow, forked=forked)
+                           max_segments=max_segments, product=product, skip=taken, wide=not narrow,
+                           forked=forked)
 
     def run(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts, *walked):
         carried = None if forked is None else forked.carrying(*walked)
         return launched(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts, carried)
 
     def launched(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts, forked):
-        # The values read once with the skip's where it is added here (`_read_once`), the ports' own.
-        wide, own = _read_once(value, work)
         if kernel == 'mosaic_gpu':
-            out, final = template_rule(query, key, own, g, beta, state, starts, firsts,
-                                       skip=skip if fused else None, forked=forked,
+            out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
+                                       skip=skip if hooks.skip else None, forked=forked,
                                        max_segments=max_segments, scale=1.0, delta=False, wide=not narrow,
                                        rounded=fast)
-            out = out.astype(work)
-            return (out if fused else recurrence.skipped(hooks, out, wide, {'skip': skip}, work)), final
+            return out.astype(work), final
         operand = jnp.result_type(query, key, value)
         x, B, C = (jnp.asarray(t, operand) for t in (value, key, query))
         batch, _, heads, head_dim = x.shape
@@ -1328,6 +1337,8 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
             if aligned is not None:
                 out = aligned.unlaid(out)
             return out, jnp.swapaxes(final[..., :head_dim, :state_size], -1, -2)
+        # The values widened once for the mainloop and the skip, their gradients summed before they round.
+        wide = value.astype(work)
         out, final = xla_mainloop(Tiles(chunk_size), query, key, wide, g, beta, state, starts, firsts,
                                   scale=1.0, delta=False, dtype=work, forked=forked)
         return recurrence.skipped(hooks, out, wide, {'skip': skip}, work), final
@@ -1526,9 +1537,10 @@ template's: 1.418 ms against the port's 1.506 on Nemotron-H
 4B's and 0.510 against 0.541 on 30B's (ssd-rounded-a100-fdab2424c), and warpgroup MMA's: on an H100 80GB HBM3
 0.211 ms against 0.241 on 30B's and 0.522 against 0.617 on 4B's, on a GH200 480GB 0.207 against 0.225 and
 0.509 against 0.595 (FS-RECROUTES-h100 and -gh200 at 26d3fdf5df: cold, exclusive, two rounds alternating the
-arms' order). The template trains the rated scan under
-the fast forms (`mainloop_backward.fast_backward_form`); under the accurate ones it does not, by its refusal,
-not a cell: at the default precision the port then trains an fp32 call, its products one TF32 as
+arms' order). The template trains the rated scan's bf16
+calls under either forms, its intermediates in fp32's three parts under the accurate ones, and an fp32 call
+under the fast forms (`mainloop_backward.fast_backward_form`); an fp32 call under the accurate ones it does
+not, by its refusal, not a cell: at the default precision the port then trains it, its products one TF32 as
 mamba_ssm's, and at a precision above it (the accurate numerics', `dew.nn.precision.ACCURATE`) the port
 declines too (`_port_precision`) and the portable math trains it at that precision. An fp16 call's
 gradient the template refuses alike (no recording holds mamba_ssm's fp16 backward against it), so the port,

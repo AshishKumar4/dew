@@ -735,7 +735,7 @@ def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
         jax.jit(apart).trace()
 
     def stacked():
-        refs = mosaic.stacked_zeros(shapes, groups)
+        refs = mosaic.stacked_zeros(shapes, groups, jnp.zeros(()))
         launched(*refs)
         return mosaic.stacked_read(refs, groups)
 

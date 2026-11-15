@@ -15,7 +15,17 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from run_kinds import TINY_LAYA, decision, diffusion, lm, scalars, trained
+from run_kinds import (
+    TINY_LAYA,
+    cli_settings,
+    decision,
+    diffusion,
+    lm,
+    saved_record,
+    scalars,
+    trained,
+    trained_record,
+)
 from test_block_sft import assert_tree_equal
 from test_eval_harness import instance
 from test_lm_recipe import SEQ, export_tiny_decoder, recipe_args, write_token_files
@@ -78,19 +88,17 @@ def test_a_saved_run_scores_a_split_at_its_own_cadence_and_writes_its_local_tier
     every second, a plateau of one test evaluation that nothing improves past stops the run at the
     fourth, and the host's own directory holds that step under the run's name, which another run
     sharing the directory does not resume."""
-    record, runs, local = tmp_path / "record", tmp_path / "runs", tmp_path / "local"
+    runs, local = tmp_path / "runs", tmp_path / "local"
     run = lm(tmp_path, drawn=False)
-    dataclasses.replace(run, validation={"val": run.validation, "test": run.validation}).save(str(record))
+    held = {"val": run.validation, "test": run.validation}
+    record = saved_record(dataclasses.replace(run, validation=held), tmp_path, "cadenced")
     plateau = {"class": "dew.training.budget:Plateau",
                "fields": {"metric": "test/perplexity", "evals": 1, "min_delta": 1e9}}
-    settings = {"trainer.checkpoint_dir": str(runs), "trainer.steps": "8", "trainer.log_every": "1",
-                "trainer.eval_every": "1", "val_every": json.dumps({"test": 2}),
-                "trainer.stop": json.dumps(plateau), "trainer.checkpoint_every": "None",
-                "trainer.local_directory": str(local), "trainer.local_every": "1",
-                "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None"}
-    flags = [flag for path, value in settings.items() for flag in ("--set", f"{path}={value}")]
     for name in ("cadenced", "other"):
-        assert main(["train", str(record / "run.json"), "--set", f"trainer.name={name}", *flags]) == 0
+        trained_record(record, cli_settings(tmp_path, name, {
+            "trainer.steps": "8", "trainer.log_every": "1", "trainer.eval_every": "1",
+            "val_every": json.dumps({"test": 2}), "trainer.stop": json.dumps(plateau),
+            "trainer.local_directory": str(local), "trainer.local_every": "1"}))
     logged = scalars(runs / "cadenced")
     assert sorted(step for step, row in logged.items() if "val/loss" in row) == [1, 2, 3, 4]
     assert sorted(step for step, row in logged.items() if "test/loss" in row) == [2, 4]
@@ -139,14 +147,10 @@ def test_an_optax_factory_named_by_its_path_makes_its_own_updates_in_a_saved_run
         peak_value=0.85, init_value=0.95, end_value=0.95)),)).build(10)
     grouped.update(gradients[0], grouped.init(params), params)
 
-    record, runs = tmp_path / "record", tmp_path / "runs"
-    dataclasses.replace(lm(tmp_path, drawn=False), optim=config).save(str(record))
-    settings = {"trainer.name": "sgd", "trainer.checkpoint_dir": str(runs), "trainer.steps": "2",
-                "trainer.log_every": "1", "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
-                "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None"}
-    assert main(["train", str(record / "run.json"),
-                 *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
-    assert all(row["train/learning_rate"] == float(np.float32(0.05)) for row in scalars(runs / "sgd").values()
+    record = saved_record(dataclasses.replace(lm(tmp_path, drawn=False), optim=config), tmp_path, "sgd")
+    settings = cli_settings(tmp_path, "sgd", {"trainer.steps": "2", "trainer.log_every": "1"})
+    run = trained_record(record, settings)
+    assert all(row["train/learning_rate"] == float(np.float32(0.05)) for row in scalars(run).values()
                if "train/learning_rate" in row)
 
 
@@ -185,10 +189,11 @@ def test_a_runs_recorded_forms_are_the_forms_it_trains_in(tmp_path):
     assert not lowered("fast", {}) & {"template", "reference"}
     trained(run, tmp_path, "cpu", trainer={"precision": ACCURATE_FORMS})
     recorded_run = tmp_path / "runs" / "cpu" / "run.json"
-    assert main(["train", str(recorded_run), "--set", "trainer.name=again"]) == 0
+    trained_record(recorded_run.parent, {"trainer.name": "again"})
     assert kernels("again") == kernels("cpu")
 
 
+@pytest.mark.scenario("Generation and serving")
 @pytest.mark.mesh(devices=8)
 def test_a_saved_run_is_served_scored_and_loaded_in_the_form_it_trained_in(tmp_path):
     """A run recorded "accurate" records its form with its checkpoints (`Objective.inference_record`), and
@@ -361,16 +366,11 @@ def test_a_runs_numerics_are_named_on_the_command_line_in_its_record_and_at_a_lo
     from dew.interop import Pretrained
     from dew.nn.precision import ACCURATE
 
-    record, runs = tmp_path / "record", tmp_path / "runs"
     run = lm(tmp_path, drawn=False)
-    run.save(str(record))
-    settings = {"trainer.checkpoint_dir": str(runs), "trainer.steps": "1", "trainer.log_every": "1",
-                "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
-                "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None",
-                "trainer.precision": "accurate"}
-    flags = [flag for path, value in settings.items() for flag in ("--set", f"{path}={value}")]
-    assert main(["train", str(record / "run.json"), "--set", "trainer.name=named", *flags]) == 0
-    assert RunConfig.load(str(runs / "named")).trainer.precision == ACCURATE
+    record = saved_record(run, tmp_path, "named")
+    named = trained_record(record, cli_settings(tmp_path, "named", {"trainer.log_every": "1",
+                                                                    "trainer.precision": "accurate"}))
+    assert RunConfig.load(str(named)).trainer.precision == ACCURATE
     written = json.loads((record / "run.json").read_text())
     for name, numerics in (("accurate", ACCURATE), ("bf16-true", Numerics(DTYPE_PRESETS["bf16-true"]))):
         written["fields"]["trainer"] = {**written["fields"]["trainer"], "precision": name}
@@ -382,7 +382,7 @@ def test_a_runs_numerics_are_named_on_the_command_line_in_its_record_and_at_a_lo
     with pytest.raises(ValueError):
         Pretrained.load(llama, precision="accurate", dtype=jnp.float16)
     with pytest.raises(ValueError):
-        dew.pipeline(str(runs / "named"), precision="accurate")
+        dew.pipeline(str(named), precision="accurate")
 
 
 def test_a_runs_numerics_read_back_from_its_record(tmp_path):
@@ -452,17 +452,13 @@ def test_a_decoder_returns_its_logits_in_its_runs_output_dtype():
 def test_a_run_recorded_before_its_stop_took_a_plateau_still_pauses(tmp_path):
     """A run.json written while `trainer.stop` held a Pause alone records the pause by its fields, with no
     class; `dew train` of it pauses where it says (row 2239's review): half of four steps."""
-    record, runs = tmp_path / "record", tmp_path / "runs"
-    lm(tmp_path, drawn=False).save(str(record))
+    record = saved_record(lm(tmp_path, drawn=False), tmp_path, "paused")
     written = json.loads((record / "run.json").read_text())
     written["fields"]["trainer"]["stop"] = {"fraction": 0.5}
     (record / "run.json").write_text(json.dumps(written))
-    settings = {"trainer.name": "paused", "trainer.checkpoint_dir": str(runs), "trainer.steps": "4",
-                "trainer.log_every": "1", "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
-                "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None"}
-    assert main(["train", str(record / "run.json"),
-                 *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
-    assert max(scalars(runs / "paused")) == 2
+    settings = cli_settings(tmp_path, "paused", {"trainer.steps": "4", "trainer.log_every": "1"})
+    run = trained_record(record, settings)
+    assert max(scalars(run)) == 2
 
 
 def earlier(run: RunConfig, root: Path, **fields) -> Path:

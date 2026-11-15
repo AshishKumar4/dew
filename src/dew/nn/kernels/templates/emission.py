@@ -110,18 +110,24 @@ _OPERATIONS = frozenset({
     lax.gt_p, lax.le_p, lax.lt_p, lax.max_p, lax.min_p, lax.mul_p, lax.ne_p, lax.neg_p, lax.not_p, lax.or_p,
     lax.rem_p, lax.select_n_p, lax.shift_left_p, lax.shift_right_logical_p, lax.shift_right_arithmetic_p,
     lax.sign_p, lax.sub_p, lax.xor_p, lax.integer_pow_p, lax.sqrt_p, lax.rsqrt_p, lax.square_p, lax.round_p,
-    lax.one_minus_square_p, ad_util.add_jaxvals_p})
+    lax.one_minus_square_p, ad_util.add_jaxvals_p, lax.clz_p})
 """Elementwise operations of the CUDA cores, one an output element (a cotangent's sum, `add_any`, among
-them)."""
+them; a leading-zero count, `clz`, an integer instruction the finish's exponent reads a subnormal's by,
+`dew.nn.precision.binade_of`)."""
 
 _REDUCTIONS = frozenset({lax.reduce_max_p, lax.reduce_min_p, lax.reduce_sum_p})
 """Reductions, one operation an input element."""
 
-_EXPONENTIALS = frozenset({lax.exp_p, lax.exp2_p, lax.log_p, lax.log2_p, lax.log1p_p, lax.tanh_p,
-                           lax.logistic_p, lax.sin_p, lax.cos_p, lax.pow_p})
+APPROXIMATED = frozenset({lax.exp_p, lax.exp2_p, lax.log_p, lax.log2_p, lax.log1p_p, lax.tanh_p,
+                          lax.logistic_p, lax.sin_p, lax.cos_p, lax.sqrt_p, lax.rsqrt_p, lax.pow_p})
+"""The operations Mosaic GPU computes in the hardware's approximate forms under `approx_math`
+(`mosaic.compiler_params`; its lowering's exp, exp2, log, log2, tanh, sin, cos, sqrt and rsqrt; jax's
+logistic, log1p and pow lower through them)."""
+
+_EXPONENTIALS = APPROXIMATED - {lax.sqrt_p, lax.rsqrt_p}
 """The special-function units' operations, one an output element: those Mosaic GPU lowers to the hardware's
-approximate forms, or through them (`attention_mosaic_program.APPROXIMATED`'s, but its square roots, which
-the CUDA cores' operations count)."""
+approximate forms, or through them (`APPROXIMATED`), but its square roots, which the CUDA cores' operations
+count."""
 
 _FREE = frozenset({
     lax.axis_index_p, gpu.barrier_arrive_p, gpu.barrier_wait_p, lax.bitcast_convert_type_p,

@@ -5,11 +5,15 @@ is set from, and the `dew train` step that trains one (`trained_by_cli`)."""
 import csv
 import dataclasses
 import json
+import os
 import typing
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 from objective_data import IMAGES
+from process_support import REPO_ROOT, dew_train, worker_env
 from test_lm_recipe import SEQ, write_token_files
 from token_support import write_token_corpus
 
@@ -64,18 +68,32 @@ class Dimmed:
         return facts
 
 
-def read(chain):
-    return chain.read("memory").loading(Loading(workers=0))
+def read(chain, reading: str = "memory"):
+    """`chain` read as `reading` names (memory where it names none), in this process."""
+    return chain.read(reading).loading(Loading(workers=0))
 
 
-def lm(root: Path, drawn: bool) -> RunConfig:
-    corpus = write_token_files(root / "tokens", 40 * SEQ, 8 * SEQ)
+ROWS = {"windows": {"pack": None}, "packed": {"pack": "first-fit", "bins": 2},
+        "padded": {"pack": "first-fit", "segments": 1}}
+"""How `lm`'s rows lay its tokens: fixed windows over the store, documents first-fit beside each other
+(their segment ids apart), or one document a row, padded (`presets.lm`'s `segments=1`)."""
+
+
+def lm(root: Path, drawn: bool, *, rows: str = "windows", reading: str = "memory",
+       dtype: str | None = "float32") -> RunConfig:
+    """A tiny decoder's language-model run over a token store, its rows laid as `rows` names (`ROWS`, its
+    store of documents, an end of text every seventh token, where they are packed or padded), read as
+    `reading` names, its training rows passed through a random filter where `drawn`; its model's `dtype`
+    stated, or none (None), so the run's precision derives it (`RunConfig.numerics_fields`)."""
+    corpus = write_token_files(root / "tokens", 40 * SEQ, 8 * SEQ, eos_id=None if rows == "windows" else 0)
 
     def windows(path, *, drawn: bool):
-        chain = TokenFiles(path).pipe(presets.lm, None, seq_len=SEQ, batch=None, pack=None)
-        return read((chain.random_filter_map(MostlyKept()) if drawn else chain).batch(8))
-    return LMRunConfig(model=ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1,
-                                                                "num_heads": 2, "dtype": "float32"}),
+        chain = TokenFiles(path).pipe(presets.lm, None, seq_len=SEQ, batch=None, **ROWS[rows])
+        chain = chain.random_filter_map(MostlyKept()) if drawn else chain
+        return read(chain.batch(8), reading)
+    fields = {"emb_features": 16, "num_layers": 1, "num_heads": 2,
+              **({} if dtype is None else {"dtype": dtype})}
+    return LMRunConfig(model=ModelConfig("causal_transformer", fields),
                        data=windows(corpus.train, drawn=drawn), validation=windows(corpus.val, drawn=False))
 
 
@@ -276,18 +294,51 @@ def blocked(root: Path, drawn: bool) -> RunConfig:
         text_only=True, attention={"full_attention": "block_bidirectional"}))
 
 
-def trained_by_cli(run: RunConfig, root: Path, name: str, assigned: dict[str, str]) -> Path:
-    """The run directory one step of `dew train` writes for `run` with each `path=value` of `assigned`,
-    its programs compiled into the suite's cache, which a run naming its own would leave this process
-    holding."""
-    record, runs = root / f"{name}-record", root / "runs"
+def saved_record(run: RunConfig, root: Path, name: str) -> Path:
+    """`run` saved as the run record `dew train` replays, under `root`."""
+    record = root / f"{name}-record"
     run.save(str(record))
-    given = {"trainer.name": name, "trainer.checkpoint_dir": str(runs), "trainer.steps": "1",
-             "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
-             "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None", **assigned}
-    assert main(["train", str(record / "run.json"),
-                 *(part for path, value in given.items() for part in ("--set", f"{path}={value}"))]) == 0
-    return runs / name
+    return record
+
+
+def cli_settings(root: Path, name: str, assigned: Mapping[str, str] = MappingProxyType({})) -> dict[str, str]:
+    """`dew train`'s settings (`--set path=value`) for a run named `name` under `root`: one step, no
+    evaluation or checkpoint between steps, one host, its programs compiled into the suite's cache, which a
+    run naming its own would leave the training process holding; each of `assigned` over them."""
+    return {"trainer.name": name, "trainer.checkpoint_dir": str(root / "runs"), "trainer.steps": "1",
+            "trainer.eval_every": "None", "trainer.checkpoint_every": "None", "trainer.multi_host": "False",
+            "trainer.compilation_cache_dir": "None", **assigned}
+
+
+def cli_arguments(settings: Mapping[str, object], trust: tuple[str, ...] = ()) -> list[str]:
+    """`settings` as a command's `--set path=value` flags (a mapping as JSON), `trust` its `--trust`."""
+    return [*(part for path, value in settings.items()
+              for part in ("--set", f"{path}={json.dumps(value) if isinstance(value, dict) else value}")),
+            *(part for package in trust for part in ("--trust", package))]
+
+
+def trained_record(record: Path, settings: Mapping[str, object], devices: int | None = None,
+                   trust: tuple[str, ...] = ()) -> Path:
+    """The run directory `dew train` writes for the run saved at `record` with `settings` set and `trust`
+    trusted, as a user's command trains it: in this process where `devices` is None, else in a fresh one
+    that sees `devices` CPU devices (`process_support.worker_env`), a run's device count being its
+    process's, fixed as its backend opens. A run named with its checkpoint directory in `settings` writes
+    there; any other where its record names (the record's own directory where it resumes from it)."""
+    arguments = [str(record / "run.json"), *cli_arguments(settings, trust)]
+    if devices is None:
+        assert main(["train", *arguments]) == 0
+    else:
+        dew_train(REPO_ROOT, {**worker_env(devices), "PYTHONPATH": os.pathsep.join(
+            (str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")))}, *arguments)
+    if {"trainer.name", "trainer.checkpoint_dir"} <= set(settings):
+        return Path(str(settings["trainer.checkpoint_dir"])) / str(settings["trainer.name"])
+    return record
+
+
+def trained_by_cli(run: RunConfig, root: Path, name: str, assigned: dict[str, str]) -> Path:
+    """The run directory one step of `dew train` writes for `run` with each `path=value` of `assigned`
+    (`saved_record`, `cli_settings`, `trained_record`), in this process."""
+    return trained_record(saved_record(run, root, name), cli_settings(root, name, assigned))
 
 
 def requested(task) -> object:

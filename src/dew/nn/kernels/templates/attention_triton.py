@@ -681,12 +681,14 @@ def _key_param(ref, kind: Kind, head, rows):
     return scored(ref[axes.placed(_held(kind), {"queries": rows})], kind)
 
 
-def _issued(a: jax.Array, b: jax.Array, *, interpret: bool) -> jax.Array:
+def _issued(a: jax.Array, b: jax.Array, *, interpret: bool, accurate: bool = False) -> jax.Array:
     """A product the backward's derived forms issue (`Derived.step`'s `product`) as a tensor-core dot takes
     it, `a @ b` summed in fp32: a float32 left operand (the forms' weights and cotangents) against a 16-bit
     one narrowed by its parts, each scaled into the other's range and taken back after its product
     (`algebra.cotangent_product`: a cotangent past a 16-bit dtype's largest stays finite), as the hand steps
-    narrowed theirs; the accurate form issues its parts, each of the other's dtype already."""
+    narrowed theirs, the `accurate` form's in its three parts (dK's cotangents in one bf16 part tied two
+    keys' dK the reference keeps 4 ulps apart, row 6302); a dQ walk's accurate form issues its parts
+    itself (`attention_program.accurate_sums`), each of the other's dtype already."""
     def dot(x: jax.Array, y: jax.Array) -> jax.Array:
         if not interpret:
             return kernel_dot(x, y, interpret=False)
@@ -694,7 +696,7 @@ def _issued(a: jax.Array, b: jax.Array, *, interpret: bool) -> jax.Array:
         # walk forms them): its operands taken to fp32, where 16-bit products are exact, summed in fp32.
         return interpreted_dot(x.astype(jnp.float32), y.astype(jnp.float32))
     if jnp.dtype(a.dtype).itemsize > jnp.dtype(b.dtype).itemsize:
-        return algebra.cotangent_product(a, b, dot, accurate=False)
+        return algebra.cotangent_product(a, b, dot, accurate=accurate)
     return dot(a, b.astype(a.dtype))
 
 
@@ -708,7 +710,8 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     # The forward's split sums and denominator, where it gives them (`gradient.split_delta`).
     split_refs = [refs.pop(0) for _ in range(4 if split else 0)]
     score_refs = [refs.pop(0) for _ in score_kinds]
-    dq_ref, delta_ref, anchor_ref, peak_out_ref, total_out_ref, mass_ref, index_out_ref, *outputs = refs
+    (dq_ref, delta_ref, anchor_ref, peak_out_ref, total_out_ref, mass_ref, lost_ref, index_out_ref,
+     *outputs) = refs
     grad_refs = {place: outputs.pop(0) for place, kind in enumerate(score_kinds) if kind in DQ_GRADS}
     block_q = query_ref.shape[0]
     head = pl.program_id(2)
@@ -779,10 +782,11 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
                            key_index, None, hooked=score_mod is not None, score_kinds=score_kinds,
                            summed=summed, prescale=prescale, grad_scale=grad_scale, how=how,
                            accurate=accurate, dot=product)
-    dq, delta, total, mass, grads = gradient.dq_finish(sums, prior, state_total, peak0, shares, peak, anchor,
-                                                      delta, accurate=accurate)
+    dq, delta, lost, total, mass, grads = gradient.dq_finish(sums, prior, state_total, peak0, shares, peak,
+                                                            anchor, delta, accurate=accurate)
     dq_ref[...] = dq
     delta_ref[...] = delta
+    lost_ref[...] = lost
     anchor_ref[...] = anchor
     peak_out_ref[...] = peak
     total_out_ref[...] = total
@@ -850,7 +854,7 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
     dk, dv, grads = program.dkv_sums(formed, key, value, ranges_ref[0], ranges_ref[1], pulled, sums,
                                      hooked=score_mod is not None, dropped=False, grad_scale=grad_scale,
                                      how=how, accurate=accurate, score_kinds=score_kinds,
-                                     dot=functools.partial(_issued, interpret=interpret))
+                                     dot=functools.partial(_issued, interpret=interpret, accurate=accurate))
     dk_ref[...] = dk
     dv_ref[...] = dv
     for place, (grad, kind) in enumerate(zip(grads, score_kinds, strict=True)):
@@ -938,7 +942,7 @@ class TritonBackward(AttentionLaunch, Template[BackwardTiles]):
                             stages=config.dq_stages, **shared)
         delta, anchor, peak, total = dq_out[1:5]
         # Each query's anchor key as the dQ launch chose it, -1 where it took D about 0.
-        dkv_out = _dkv_launch(query, key, value, dout, peak, total, anchor, delta, dq_out[6], *spans,
+        dkv_out = _dkv_launch(query, key, value, dout, peak, total, anchor, delta, dq_out[7], *spans,
                               warps=config.dkv_warps, stages=config.dkv_stages, **shared)
         return (*dq_out, *dkv_out), None
 
@@ -1072,7 +1076,8 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
     initial state's maximum, denominator and its values' mean's term (`peak`, `total`, `initial_term`;
     `gradient.off_anchor_start`, `gradient.off_anchor_delta`); then walks them for dQ under the weights
     `exp(s - m)`, normalized at the end by their own sum `T`, refining `D - c` from its own sums. Returns dQ
-    `[B, Qp, H, Dp]` fp32, `D - c`, `c`, `m`, `T` and the keys' mass `[B, H, Qp]`, the anchor key it took
+    `[B, Qp, H, Dp]` fp32, `D - c`, `c`, `m`, `T`, the keys' mass and what `D - c`'s rounding lost
+    (`gradient.dq_finish`) `[B, H, Qp]`, the anchor key it took
     (-1 where about 0) `[B, H, Qp]` int32, and the gradients of the score hook's head (`[nQb, B, H, 1]`
     partials) and query (`[B, H, Qp]`) parameters."""
     from jax.experimental.pallas import triton as plgpu
@@ -1103,10 +1108,10 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         in_specs.append(_param_spec(kind, param, block_q, keys))
         arrays.append(param)
     out_shape = [jax.ShapeDtypeStruct(query.shape, jnp.float32),
-                 *[jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 5,
+                 *[jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 6,
                  jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32)]
     out_specs = [pl.BlockSpec((None, block_q, None, width), lambda i, b, h: (b, i, h, 0)),
-                 *[per_head] * 6]
+                 *[per_head] * 7]
     for param, kind in zip(score_params, score_kinds, strict=True):
         match kind:
             case Kind.HEAD:
@@ -1173,7 +1178,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             columns = pl.BlockSpec((None, None, queries, block_k), lambda j, b, h: (b, h, 0, j))
             aliases[len(arrays)] = len(out_shape)
             in_specs.append(columns)
-            arrays.append(jnp.zeros(param.shape, jnp.float32))
+            arrays.append(launches.filled(param.shape, jnp.float32, query, dout))
             out_shape.append(jax.ShapeDtypeStruct(param.shape, jnp.float32))
             out_specs.append(columns)
     kernel = functools.partial(_dkv_kernel, ids=ids, score_kinds=score_kinds,

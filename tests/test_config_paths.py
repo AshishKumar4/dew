@@ -10,9 +10,11 @@ import dataclasses
 import json
 import typing
 
+import numpy as np
 import pytest
 from option_witness import alternatives, flag, held_at, replaced
-from run_kinds import KINDS, scalars, trained_by_cli
+from process_support import logged_losses
+from run_kinds import KINDS, cli_settings, lm, saved_record, scalars, trained_by_cli, trained_record
 
 from dew import registry
 from dew.config import RunConfig, TrainerConfig
@@ -114,3 +116,17 @@ def test_a_run_trained_from_python_trains_as_dew_train_trains_it(kind, tmp_path)
     python, cli = (RunConfig.load(str(runs / name)) for name in ("python", "cli"))
     renamed = dataclasses.replace(python, trainer=dataclasses.replace(python.trainer, name=cli.trainer.name))
     assert renamed.record() == cli.record()
+
+
+@pytest.mark.parametrize("rows", ["packed", "padded"])
+def test_an_lm_run_trains_by_its_command_in_a_process_that_sees_two_devices(tmp_path, rows):
+    """A language-model run whose documents are packed beside each other or padded one a row, saved and
+    trained by `dew train` in a process of its own that sees two CPU devices, split over both (fsdp), logs a
+    finite loss for each step (`run_kinds.trained_record`, the one way the tests run a command)."""
+    settings = cli_settings(tmp_path, rows, {"trainer.steps": "2", "trainer.log_every": "1",
+                                              "trainer.mesh.fsdp": "2", "trainer.layout.min_shard": "8"})
+    record = saved_record(lm(tmp_path, drawn=False, rows=rows), tmp_path, rows)
+    run = trained_record(record, settings, devices=2)
+    losses = logged_losses(run)
+    assert len(losses) == 2 and np.isfinite(losses).all(), losses
+
