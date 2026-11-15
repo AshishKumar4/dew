@@ -38,6 +38,7 @@ from dew.mesh import LayoutRefused
 from dew.nn import rope
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
+from dew.nn.derivatives import portable_formed
 from dew.nn.flops import projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels.recurrence import Hooks, skip_added
@@ -92,6 +93,15 @@ def rotated(x, angles):
     (`angles` broadcast against `x` but its last axis, `A` wide), `(v_2j + i v_2j+1) e^{i phi}`, the rest
     as given: `rope.rotate`'s adjacent pairs."""
     return rope.rotate(x, jnp.cos(angles), jnp.sin(angles), pairs='adjacent')
+
+
+def _biased(value, bias):
+    """`value` plus the parameter `bias` (broadcast against it) through the rule
+    (`derivatives.portable_formed`): its reverse mode returns `value`'s cotangent only with the bias's
+    gradient formed, so XLA puts no layer's bias gradient off to the step's end with the cotangents it sums
+    (row 6471's guard: a Mamba-3 step's `B` and `C` biases' gradients, put off so, held every layer's rotated
+    keys' and queries' cotangents and the rotation's sines to the end)."""
+    return portable_formed(jnp.add)(value, bias)
 
 
 def _per_head(t, heads: int):
@@ -523,8 +533,8 @@ class Mamba3(nn.Module):
         for t, norm, bias in ((B, self.B_norm, self.B_bias), (C, self.C_norm, self.C_bias)):
             ranked = t.reshape(batch, length, self.mimo_rank, self.n_groups, self.state_size)
             normed = _per_head(norm(ranked).astype(wide), self.num_heads)
-            keys.append((normed + jnp.swapaxes(bias, 0, 1)).astype(projected.dtype))
-        step = nn.softplus(dt.astype(wide) + self.dt_bias)
+            keys.append(_biased(normed, jnp.swapaxes(bias, 0, 1)).astype(projected.dtype))
+        step = nn.softplus(_biased(dt.astype(wide), self.dt_bias))
         decay = jnp.minimum(-_heavy_tail(A.astype(wide)), -self.A_floor)
         rates = (jnp.tanh(angles.astype(wide)) * jnp.pi)[:, :, None]
         x, z = (t.reshape(batch, length, 1, self.num_heads, self.head_dim) for t in (x, z))

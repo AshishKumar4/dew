@@ -499,12 +499,16 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
 
     def pulled(saved, operands, cotangent):
         del saved
-        # The step's cotangents leave together (`with_gradients_formed`): its gates', skip's and taps'
-        # parameters beside the state and the token.
+        # The rows' cotangents leave only with the parameters' formed (`with_gradients_formed`): a field no
+        # row marks (`ROW`: the taps, the gates' log_a and bias, the skip's D, the epilogue's weight, a rate).
         (pulled_operands,) = jax.vjp(portable, *operands)[1](cotangent)
-        first, *rest = jax.tree.leaves(pulled_operands)
-        first, rest = with_gradients_formed(first, tuple(rest))
-        return (jax.tree.unflatten(jax.tree.structure(pulled_operands), [first, *rest]),)
+        rows = {field.name for field in dataclasses.fields(pulled_operands) if field.metadata == ROW}
+        values = {field.name: getattr(pulled_operands, field.name)
+                  for field in dataclasses.fields(pulled_operands)}
+        inputs, formed = with_gradients_formed(
+            {name: value for name, value in values.items() if name in rows},
+            {name: value for name, value in values.items() if name not in rows})
+        return (dataclasses.replace(pulled_operands, **inputs, **formed),)
 
     launched = functools.partial(_launched, hooks, dtype=dtype)
     return contracted("test_the_decode_step_holds_every_order")(

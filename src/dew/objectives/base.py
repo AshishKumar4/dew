@@ -61,7 +61,7 @@ from dew.batch import (
     unboxed,
 )
 from dew.distributed.placement import Layout, RefinesLayout
-from dew.nn.derivatives import contracted, surrogate, with_tangents_formed
+from dew.nn.derivatives import contracted, surrogate
 from dew.nn.inspection import INSPECTED, QK, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options, owned_program
 from dew.nn.precision import (
@@ -872,14 +872,13 @@ class ProgramModule(NamedTuple):
 
 
 def _ruled_tangent(primals, tangents, value) -> jax.Array:
-    """`_ruled`'s tangent: the value's own, and in `params` the rule's inner product with their tangent,
-    each through the rule's dual (`with_tangents_formed`): the value's cotangent leaves only with the rule's
-    gradients. A symbolic zero adds nothing."""
+    """`_ruled`'s tangent: the value's own, and in `params` the rule's inner product with their tangent; a
+    symbolic zero adds nothing. The value's side is a stopped gradient's, so no input's cotangent leaves
+    beside the rule's gradients for the rule to tie."""
     from jax.custom_derivatives import SymbolicZero
 
     _, rule, _ = primals
     moved_value, _, moved = tangents
-    moved_value, moved = with_tangents_formed(moved_value, moved)
     changes = jax.tree.leaves(moved, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
     total = jnp.zeros_like(value) if isinstance(moved_value, SymbolicZero) else moved_value
     for leaf, change in zip(jax.tree.leaves(rule), changes, strict=True):

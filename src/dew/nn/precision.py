@@ -50,7 +50,7 @@ from dew.nn.derivatives import (
     declared_derivative,
     declared_tangent,
     surrogate,
-    with_gradients_formed,
+    with_gradients_formed_at,
     with_tangents_formed,
 )
 from dew.nn.nested import nested
@@ -272,8 +272,7 @@ def _biased_tangent(primals, tangents):
 
     product, bias = primals
     d_product, d_bias = tangents
-    if not any(isinstance(direction, SymbolicZero) for direction in tangents):
-        d_product, d_bias = with_tangents_formed(d_product, d_bias)
+    d_product, d_bias = with_tangents_formed(d_product, d_bias)
     value = _biased_value(product, bias)
     dtype = value.dtype
     leading = product.ndim - bias.ndim
@@ -748,11 +747,9 @@ def _summed_wide(product: Callable, preferred_element_type, *operands, counts: i
                 (gradient,) = jax.linear_transpose(alone, wide[index])(wide_cotangent)
                 return gradient.astype(operands[index].dtype)
 
-            # Each operand's cotangent leaves only with the others' formed (`with_gradients_formed`): a
-            # product's matrix is any of them.
-            first, *rest = (transposed(index) for index in live)
-            first, rest = with_gradients_formed(first, tuple(rest))
-            return (first, *rest)
+            # No barrier here: which operand is a parameter is the caller's to know, and a projection's
+            # own reverse mode, over this product, ties its kernel's gradient (`projections.dot_general`).
+            return tuple(transposed(index) for index in live)
 
     # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
     wide = contracted("test_a_wide_cpu_sum_of_products_holds_every_order")(
@@ -1750,12 +1747,13 @@ def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.A
                                           default=native)
 
     def pulled(saved, operands, cotangent):
-        """Each operand's cotangent: the product's transpose to it over the cotangent rounded to bf16."""
+        """Each operand's cotangent: the product's transpose to it over the cotangent rounded to bf16. No
+        barrier: which operand is a parameter is its caller's to know, a projection's own reverse mode over
+        it tying its kernel's gradient (`projections.dot_general`)."""
         del saved
         rounded = cotangent.astype(jnp.bfloat16)
-        left, right = (_transposed(rounded, operands, numbers, side, typed).astype(operands[side].dtype)
-                       for side in (0, 1))
-        return with_gradients_formed(left, right)
+        return tuple(_transposed(rounded, operands, numbers, side, typed).astype(operands[side].dtype)
+                     for side in (0, 1))
 
     def forward(lhs, rhs):
         return typed(lhs, rhs, numbers)
@@ -1805,7 +1803,7 @@ def _bf16_product(lhs: jax.Array, rhs: jax.Array, dimension_numbers, precision=N
     return product if out_sharding is None else jax.sharding.reshard(product, out_sharding)
 
 
-def at_precision[Output](precision: jax.lax.PrecisionLike
+def at_precision[Output](precision: jax.lax.PrecisionLike, parameters: tuple[int, ...] = ()
                          ) -> Callable[[Callable[..., Output]], Callable[..., Output]]:
     """`fn` traced, forward and backward, at `precision`, the default included: a product that takes no
     precision of its own (a Pallas dot, jax.nn's xla attention) reads it from the configuration at trace
@@ -1817,7 +1815,9 @@ def at_precision[Output](precision: jax.lax.PrecisionLike
     A fused attention route under a call's stated precision (`attention._attention_kernel`), and Mosaic's
     TPU kernels at the default: they refuse a 16-bit matmul at HIGHEST ("Bad lhs type"); 16-bit dots are
     exact at any precision, and an fp32 dot takes one bf16 pass on a TPU, so splash's P·V rounds P to
-    bf16 as every default-precision run does (`attention_tpu`)."""
+    bf16 as every default-precision run does (`attention_tpu`). The arguments at `parameters` are the
+    call's parameters (an attention's bias and sinks), whose gradients its backward forms with the others'
+    cotangents (`derivatives.with_gradients_formed_at`)."""
     name = _configured_name(precision)
 
     def held(fn: Callable[..., Output]) -> Callable[..., Output]:
@@ -1829,12 +1829,8 @@ def at_precision[Output](precision: jax.lax.PrecisionLike
                 return jax.vjp(fn, *args)
 
         def backward(pullback, cotangent):
-            # The arguments' cotangents leave together (`with_gradients_formed`): a call's parameters (an
-            # attention's bias and sinks) beside its inputs.
             with jax.default_matmul_precision(name):
-                first, *rest = pullback(cotangent)
-            first, rest = with_gradients_formed(first, tuple(rest))
-            return (first, *rest)
+                return with_gradients_formed_at(tuple(pullback(cotangent)), parameters)
 
         # A protected span: the precision it holds is the kernels' own, which no rewrite may change.
         @contracted("test_a_default_precision_call_holds_every_order_it_takes")

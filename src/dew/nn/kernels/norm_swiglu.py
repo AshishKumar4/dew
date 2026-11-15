@@ -962,25 +962,34 @@ def _varying(operands: tuple, outputs):
 def _typed(backward, parameters: int = 0):
     """`backward(saved, operands, cotangents)` with each operand's cotangent of the operand's varying type and
     dtype: summed over each manual axis it varies over and its operand does not (a weight replicated in a
-    checked `shard_map`, whose shards' partial gradients its varying cast's transpose sums: `_varying`), as
-    it is formed, then rounded to the operand's dtype (a norm's weight, summed widened over the shards); the
-    inputs' cotangents returned only with the last `parameters` operands' gradients formed in their stored
-    dtype (a norm's weight, `derivatives.with_gradients_formed`)."""
+    checked `shard_map`, whose shards' partial gradients its varying cast's transpose sums: `_varying`),
+    then rounded to the operand's dtype (summed widened over the shards); the inputs' cotangents returned
+    only with the last `parameters` operands' gradients formed (a norm's weight,
+    `derivatives.with_gradients_formed`), each as its device forms it: a gradient no shards sum rounded to
+    its stored dtype, a per-shard partial before its sum, so an input's cotangent waits on no cross-device
+    sum, as a projection's per-shard reverse mode ties its own."""
     def typed(saved, operands, cotangents):
         gradients = backward(saved, operands, cotangents)
-        typed = tuple(gradient if gradient is None or operand is None
-                      else _summed_to(gradient, operand).astype(jax.typeof(operand).dtype)
+        local = tuple(gradient if gradient is None or operand is None or _shard_axes(gradient, operand)
+                      else gradient.astype(jax.typeof(operand).dtype)
                       for gradient, operand in zip(gradients, operands, strict=True))
-        if not parameters:
-            return typed
-        inputs, formed = with_gradients_formed(typed[:-parameters], typed[-parameters:])
-        return (*inputs, *formed)
+        if parameters:
+            inputs, formed = with_gradients_formed(local[:-parameters], local[-parameters:])
+            local = (*inputs, *formed)
+        return tuple(gradient if gradient is None or operand is None
+                     else _summed_to(gradient, operand).astype(jax.typeof(operand).dtype)
+                     for gradient, operand in zip(local, operands, strict=True))
     return typed
 
 
+def _shard_axes(gradient: jax.Array, operand: jax.Array) -> tuple[str, ...]:
+    """The manual axes `gradient` varies over that `operand` does not: its shards' partials to sum."""
+    return tuple(sorted(jax.typeof(gradient).mat.varying - jax.typeof(operand).mat.varying))
+
+
 def _summed_to(gradient: jax.Array, operand: jax.Array) -> jax.Array:
-    """`gradient` summed over each manual axis it varies over that `operand` does not."""
-    axes = tuple(sorted(jax.typeof(gradient).mat.varying - jax.typeof(operand).mat.varying))
+    """`gradient` summed over each manual axis it varies over that `operand` does not (`_shard_axes`)."""
+    axes = _shard_axes(gradient, operand)
     return jax.lax.psum(gradient, axes) if axes else gradient
 
 

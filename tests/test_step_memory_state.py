@@ -7,7 +7,9 @@ from step_memory import holds
 
 CASES = [
     ("mamba", "plain"),
+    ("mamba2", "plain"),
     ("mamba3", "plain"),
+    ("parallel", "plain"),
     ("short_conv", "plain"),
     ("mlp", "plain"),
 ]
