@@ -542,6 +542,9 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
     gathers_rows = True  # its one warpgroup's cp.async copies gather a step's rows (`_gathered_walk`)
+    # `emit_pipeline` would allocate a folded once block a slot per stage in the walk's scope, where its
+    # planned once allocation (`lifetimes`) holds one: no once stream walks here until the plan counts it.
+    walks_once = False
     gathers_alone = False  # its walk gathers every stream's rows or none (`streams`)
     gathers_interpreted = True
 
@@ -606,12 +609,6 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             raise ValueError("an A100's pipeline loads a step's block in one copy, not in pieces")
         return Pipeline(blocks, stages, dict(swizzles or {}), tuple(gathered))
 
-
-    def folded(self, allocated: Pipeline, once: Pipeline) -> Pipeline:
-        # `emit_pipeline` would allocate a folded block a slot per stage in the walk's scope, where its
-        # planned once allocation (`lifetimes`) holds one: no once stream walks here until the plan counts it.
-        del allocated, once
-        raise NotImplementedError("a cp.async walk folds no once stream: its pipeline allocates one a stage")
 
     def lifetimes(self, streams: Pipeline, steps: int | None = None) -> tuple[tuple, tuple]:
         # `emit_pipeline` allocates a walk's slots in its own scope, no more of them than the walk's steps.

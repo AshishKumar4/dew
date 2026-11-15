@@ -1003,11 +1003,11 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
 def _walked_once(call: Call, streams: dict) -> tuple[dict, dict]:
     """`_query_key`'s `streams` (its views or its blocks, by part name) as those its steps stream and those
     its walk loads once (`mosaic.Walk.once`): without the delta rule the key head's queries, keys and scores'
-    gradient, which every value head's step reads alike (a plain walk's; under the delta rule its tiles
-    persist, whose once streams the recurrence's bundles do not load, each step its value head's scores'
-    gradient): streamed, a step each of a group's value heads loaded them again, the 4B SSD's twelve where
-    one serves."""
-    once = () if call.delta else ("queries", "keys", "ds")
+    gradient, which every value head's step reads alike (a plain walk's, on a family whose walks load them,
+    `Family.walks_once`; under the delta rule its tiles persist, whose once streams the recurrence's bundles
+    do not load, each step its value head's scores' gradient): streamed, a step each of a group's value heads
+    loaded them again, the 4B SSD's twelve where one serves."""
+    once = () if call.delta or not call.family.walks_once else ("queries", "keys", "ds")
     held = {name: value for name, value in streams.items() if name.rstrip("0123456789") in once}
     return {name: value for name, value in streams.items() if name not in held}, held
 

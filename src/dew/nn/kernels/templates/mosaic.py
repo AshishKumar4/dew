@@ -1419,6 +1419,11 @@ class Transport[Allocated, Opened](abc.ABC):
     where a producer's asynchronous copies run beside the consumers (TMA), more where the consumers issue
     them between their own products (`Mma`'s cp.async)."""
 
+    walks_once: bool = False
+    """Whether its walks load a walk's once streams (`Walk.once`, `run`'s `once`) apart from its steps':
+    held one deep beside its rings, or folded into its walked streams where its own loads take them
+    (`walked_once`). Where not, `run` refuses them, and a launch streams them each step."""
+
     takes_pingpong: bool = False
     """Whether its two consumers may take alternate tiles whole, their products in turn (`persist`'s
     `pingpong`): where a producer of its own loads every tile's steps (`RingFamily`'s), so neither consumer
@@ -1693,6 +1698,8 @@ class Transport[Allocated, Opened](abc.ABC):
         others."""
         if not once_views:
             return self.opened(allocated, views), views, {}
+        if not self.walks_once:
+            raise NotImplementedError(f"{self.name} walks no once streams (`walks_once`)")
         if once is None:
             raise ValueError("a walk's once streams take their allocations (`Transport.run`'s `once`)")
         return self.held_once(allocated, views, once, once_views)
@@ -2129,6 +2136,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     fixes_up = True
     gathers_rows = True
     takes_pingpong = True
+    walks_once = True
     # Mosaic GPU's default for a warpgroup (its CompilerParams' 128 x 4 x 4 bytes).
     warpgroup_reduction_scratch = 2048
     stores_through_registers = False

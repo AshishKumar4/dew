@@ -187,6 +187,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     consumers = 1
 
     bounded_loads = False  # a DMA past its operand's rows is refused, not filled with zeros
+    walks_once = True  # a once stream folded into its walked streams (`folded`), each step's block the one
 
     stores_through_registers = False
 
