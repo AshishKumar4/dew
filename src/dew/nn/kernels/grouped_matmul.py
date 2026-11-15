@@ -282,7 +282,7 @@ class _Triton(_GroupedLaunch[Tile]):
             for floor in (3, 2):
                 for step in self.steps(ba):
                     tile = next((tile for stages in range(MOST_STAGES, floor - 1, -1)
-                                 if self.legal(ba, tile := self.tile(output, step, stages), target)), None)
+                                 if self.takes(ba, tile := self.tile(output, step, stages), target)), None)
                     if tile is None:
                         continue
                     if extents is None or (extents[0] % self.contraction(tile) == 0
@@ -1333,7 +1333,7 @@ class MosaicGmm(_Mosaic):
         splits = 1 if ba.arguments['exact_sums'] else pricing.split_count(
             dataclasses.replace(tile, swapped=False), **self._contraction(ba, tile, target))
         split = dataclasses.replace(tile, splits=splits)
-        tile = split if splits > 1 and self.legal(ba, split, target) else tile
+        tile = split if splits > 1 and self.takes(ba, split, target) else tile
         walked = {each: pricing.walk_seconds(each, self._contraction(ba, each, target))
                   for each in (tile, plain) if each is not None}
         return plain if plain is not None and walked[plain] <= walked[tile] else tile
@@ -1376,7 +1376,7 @@ class MosaicGmm(_Mosaic):
             return tile
         splits = pricing.split_count(tile, **self._contraction(ba, tile, target))
         split = dataclasses.replace(tile, splits=splits)
-        return split if splits > 1 and self.legal(ba, split, target) else tile
+        return split if splits > 1 and self.takes(ba, split, target) else tile
 
     def _left_fits(self, ba, config: mosaic_gpu.Tiles) -> bool:
         """Whether a swapped tile reads `ba`'s matrix as its products' left operand: a matrix lying `[depth,
@@ -1993,7 +1993,7 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
     config_cls: ClassVar[type[mosaic_gpu.Tiles]] = mosaic_gpu.Tiles
 
     def eligible(self, ba, target) -> bool:
-        return cutlass_built_for(target.generation) is not None and self.takes(ba)
+        return cutlass_built_for(target.generation) is not None and self.in_contract(ba)
 
     def tile(self, ba) -> mosaic_gpu.Tiles | None:
         """The record of the kernel the build holds for the GPU being selected for (`generation.gpu_target`,
@@ -2002,7 +2002,7 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
         return None if built is None else cutlass_tile(built, ba.arguments['out_dtype'])
 
     @staticmethod
-    def takes(ba) -> bool:
+    def in_contract(ba) -> bool:
         """Whether its kernels take the call wherever dew_cutlass holds them (`eligible` adds the installed
         library's generations): bf16 operands, bf16 or fp32 out, int32 sizes, every extent a multiple of 8
         elements (16-byte aligned rows of every operand and output, as its TMA copies and each group's
@@ -2023,6 +2023,12 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         # Its build's kernel is the one it runs (`cutlass_tile`), sized to every part of its architecture.
         return self.space(ba)
+
+    def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
+        """Whether `config` runs the call: its build's one kernel (`space`), which CUTLASS sized to every part
+        of its architecture, its shared memory and registers its own; a pin or a tuned pick names it."""
+        del target
+        return config in self.space(ba)
 
 
 @dataclasses.dataclass(frozen=True)

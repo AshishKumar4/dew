@@ -6,7 +6,6 @@ are tests/test_attention_mosaic.py's."""
 
 
 import dataclasses
-from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -70,7 +69,8 @@ SPILLING = {("sm86", 64, False, "temperature"), ("sm89", 64, False, "temperature
 """The gate's cases that spill, each an open row's: an sm86's and an sm89's dK/dV at width 64 under a
 temperature, 64 bytes, the operand pipeline's per-thread shared offsets formed at the launch's entry and
 held through its loop beside the statistics' reads (row 5483, the owner's exception). Each fails here until
-it compiles spill-free, and is deleted with the fix."""
+it compiles spill-free, and is deleted with the fix: a cell held to spill-free qualification, never to the
+declined form below, which would make an owed fix a green cell."""
 SPILLS = pytest.mark.xfail(strict=True, reason="row 5483: 64 bytes spilled")
 BACKWARD_GATE = [pytest.param(*case, marks=SPILLS) if case in SPILLING else case for case in BACKWARD_GATE]
 """The backward resource gate's cases, each a form its GPU's bundles take (`_takes`; a form of two
@@ -115,18 +115,15 @@ def _gated_backward(generation_name: str, width: int, accurate: bool, hooks: str
 
 def _least_beyond(op, ba, generation_name: str):
     """The tile `op`'s derivation takes for `ba` on `generation_name` grown by the least factor that holds one
-    (its block's shared memory and its consumers' registers each that many times their own, bisected up to
-    four), or None where none at four holds one: the least the model says its launches stage and hold."""
+    (its block's shared memory that many times its own, bisected up to four), or None where none at four
+    holds one: the least the model says its launches stage."""
     with generation.assumed(generation_name):
         target = generation.gpu_target()
         own = generation.shared_budget(target)
-    budget = type(op).register_budget
 
     def derived(factor: float):
         grown = dataclasses.replace(target, shared_limit=int(own * factor))
-        with (generation.assumed(generation_name),
-              mock.patch.object(type(op), "register_budget",
-                                lambda self, config: int(budget(self, config) * factor))):
+        with generation.assumed(generation_name):
             return op.derived(ba, grown)
 
     low, high = 1.0, 4.0
@@ -526,14 +523,11 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
         return grads.query, grads.key, grads.value
 
     op, ba, config = _gated_backward(generation_name, width, accurate, hooks)
-    if config is None and accurate and hooks != "none":
-        pytest.skip(f"the accurate form under {hooks} derives no tile {width} wide on {generation_name}: "
-                    "its registers hold none, and the Pallas-Triton mainloop takes the call")
     if config is None:
-        # No tile its block and registers hold: the least the model takes past them (`_least_beyond`) fails
-        # the compile for them too, past the block or spilling, the refusal true (an sm86's 64 x 64 dQ launch
-        # 101,392 bytes at width 128 under a score hook, its dK/dV 131,088, of 101,376; the Pallas-Triton
-        # backward takes the call).
+        # No tile its block holds: the least the model takes past it (`_least_beyond`) fails the compile
+        # too, past the block or spilling, the refusal true (an sm86's 64 x 64 dQ launch 101,392 bytes at
+        # width 128 under a score hook, its dK/dV 131,088, of 101,376; the Pallas-Triton backward takes the
+        # call).
         least = _least_beyond(op, ba, generation_name)
         assert least is not None, f"the Mosaic backward derives no config {width} wide on {generation_name}"
         with generation.assumed(generation_name):
@@ -545,12 +539,35 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
                              or any(kernel.get("spilled") for kernel in record.get("kernels", ()))
                              for record in found), found
         return
+    # Certified as the route certifies it (`MosaicBackward.uncertified`): each config the derivation offers
+    # compiled alone, the GPU's assembler refusing each that spills or serializes its warpgroup MMAs, as the
+    # case's records state them (`kernel_compile._compiled`'s, wherever its process compiled them).
     with generation.assumed(generation_name):
         shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), residuals)
         found = compile_mosaic_kernels(
             [KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)))], generation_name)
     failed = mosaic_failures(found)
-    assert not failed, "\n".join(failed)
+    offered = [cert for record in found for cert in record.get("certifications", ())
+               if cert["op"] == type(op).__name__]
+    # The claimed and declined table by target, the LAND's and the route census's receipt (no assertion of
+    # either: a cell made to fit stays green).
+    def kernels(cert: dict) -> str:
+        return ", ".join(f"{kernel} {registers} registers {frame} bytes"
+                         f"{' serialized' if refused and not frame else ''}"
+                         for kernel, (registers, frame, refused) in cert["kernels"].items())
+
+    print(f"GATE backward {generation_name} {width} {'accurate' if accurate else 'fast'} {hooks}: "
+          + ("claimed" if not failed else "declined " + "; ".join(f"{cert['config']}: {kernels(cert)}"
+                                                                   for cert in offered)))
+    if not failed or (generation_name, width, accurate, hooks) in SPILLING:
+        assert not failed, "\n".join(failed)
+        return
+    # Declined: the family claims no config of the call, every one it derives refused by the assembler,
+    # spilling or serializing (each certification's own record, not the failure's message), and none failing
+    # to build for another reason; the Pallas-Triton backward takes it (`attention_route.backward`).
+    assert not any(record.get("uncertified") for record in found), found
+    assert offered and all(any(refused for _, _, refused in cert["kernels"].values()) for cert in offered), (
+        "\n".join(failed))
 
 
 @COMPILES_ON_CPU

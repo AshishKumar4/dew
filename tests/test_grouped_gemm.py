@@ -277,8 +277,8 @@ def test_a_kept_calls_identity_states_the_installed_cutlass_wheel(tmp_path, monk
 
 def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     """Where the installed dew-cutlass holds this GPU's kernels, the projection's forward and both
-    gradients through CUTLASS's launches, chosen by name, are as exact as XLA's ragged dot from float64,
-    unrouted rows and empty groups included."""
+    gradients through CUTLASS's launches, chosen by name and the forward's kernel pinned, are as exact as
+    XLA's ragged dot from float64, unrouted rows and empty groups included."""
     # The wheel is optional: a process without it, or whose wheel holds no kernel for its GPU, runs the
     # template's launches, which the suite checks apart.
     here = generation.gpu_target().generation
@@ -293,8 +293,13 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     def projection(implementation, dtype=jnp.bfloat16):
         return lambda x, w: expert_projection(x, w, group_sizes, dtype, implementation, None)
 
+    # Its build's kernel pinned, as a tuned pick names it: the pin taken as legal for the wheel's one kernel
+    # (`_Cutlass.legal`), where a template's shared-memory model, which CUTLASS has none of, raised.
+    pinned = {grouped_matmul.CutlassGmm: grouped_matmul.cutlass_tile(grouped_matmul.cutlass_built_for(here),
+                                                                     jnp.bfloat16)}
+
     def through_cutlass(x, w, dy):
-        with generation.chosen(grouped_matmul="cutlass"):
+        with generation.chosen(grouped_matmul="cutlass"), tuning.pinned(pinned):
             return with_gradients(projection("pallas"))(x, w, dy)
 
     assert_as_exact(jax.jit(through_cutlass), jax.jit(with_gradients(projection("xla"))), draw,

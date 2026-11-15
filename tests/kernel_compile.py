@@ -285,6 +285,16 @@ def triton_evidence(calls: dict[str, int], launched: list[tuple[str, int]]) -> d
     return {"shared": max(size for name in calls for size in launches[name])}
 
 
+def _certified_since(count: int) -> list[dict]:
+    """Each launch certification compiled since the first `count` (`report.certifications`): its op and
+    config and each kernel's registers, stack frame and verdict (`Binary.refused`), what a cell a family
+    declines proves the decline by, read where a process of its own compiled it (`compiled_apart`)."""
+    return [{"op": found.op, "config": repr(found.config),
+             "kernels": {name: [binary.registers, binary.frame, binary.refused]
+                         for name, (_, binary) in found.kernels.items()}}
+            for found in report.certifications()[count:]]
+
+
 def _compiled(case, generation: str, record: dict,
               directory: str | None = None) -> tuple[list[tuple[str, int]], dict[str, int]] | None:
     """`case` lowered as on the CUDA `generation` (`lowered_for`) and compiled by XLA for a
@@ -306,6 +316,7 @@ def _compiled(case, generation: str, record: dict,
     estimating = (_printed(MOSAIC_GPU_DUMP_RESOURCES="1", MOSAIC_GPU_DUMP_PTX="1") if directory
                   else contextlib.nullcontext([]))
     uncertified = report.uncertified()
+    certifying = len(report.certifications())
     try:
         with estimating as estimated, report.certifying(compile_only_gpus(generation)[0]):
             lowered = lowered_for(fn, args, generation, expected)
@@ -316,6 +327,8 @@ def _compiled(case, generation: str, record: dict,
             record["error"] = f"it does not lower: {str(error)[-800:]}"
         else:
             record["shared"] = int(refused.group(1))
+        # A derivation the assembler exhausted refuses at trace: its certifications are its proof.
+        record["certifications"] = _certified_since(certifying)
         return None
     # A launch the lowering could not certify (`report.certified`) is a failure of its own: its run would
     # find its spills only as its whole program compiles.
@@ -329,6 +342,10 @@ def _compiled(case, generation: str, record: dict,
     # Each kernel certification compiled alone in this process, by name and launch: its module.
     record["certified"] = {name: module for found in report.certifications()
                            for name, (module, _) in found.kernels.items()}
+    # Each launch certification compiled for this case, its op and config and each kernel's registers, stack
+    # frame and verdict (`Binary.refused`): what a cell a family declines proves the decline by, read where
+    # a process of its own compiled it (`compiled_apart`) as here.
+    record["certifications"] = _certified_since(certifying)
     if directory is not None:
         record["estimates"] = _estimates(calls, "".join(estimated))
     # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
