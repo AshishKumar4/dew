@@ -67,6 +67,7 @@ from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
 from dew._devices import COMPILE_ONLY_MEMORY, device_memory
 from dew._records import JSON, boolean, record
+from dew._stated import Unestablished
 from dew.batch import Batch
 from dew.nn.kernels import options
 from dew.nn.kernels.generation import (
@@ -739,7 +740,7 @@ class Keeping:
         try:
             call = identity.call_identity(program, key)
             serialized = Executable.of(executable)
-        except identity.Unestablished as refusal:
+        except Unestablished as refusal:
             self.refused[named] = str(refusal)
             return
         except (NotImplementedError, ValueError) as refusal:
@@ -821,7 +822,7 @@ def kept(path: str | Path, *, verify: bool = False) -> Iterator[AheadPrograms]:
     def give(program: OuterProgram, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled | None:
         try:
             found = programs.kept.get(identity.digest(identity.call_identity(program, key)))
-        except identity.Unestablished as refusal:
+        except Unestablished as refusal:
             _log.info("a call with no stated identity is handed no kept program, and compiles: %s", refusal)
             return None
         if found is None:

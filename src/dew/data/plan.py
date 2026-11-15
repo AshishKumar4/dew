@@ -11,10 +11,8 @@ import json
 import logging
 import platform
 import re
-import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import Enum
-from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import jax
@@ -33,6 +31,7 @@ from dew._records import (
     moved_spelling,
     record,
 )
+from dew._stated import Unestablished, stated
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 
@@ -235,9 +234,10 @@ class StepIdentity:
         # part that runs code no file holds (a partial, a callable that is no dataclass, a lambda) leaves it
         # inexact, which an exact resume refuses (data.md §10).
         held, holdable = ([], True) if declared else _held_code(step, set())
-        # Each held class or function by the code its methods or body reach (`_code_digest`), where that
-        # reaches what no statement holds (`_Unheld`) leaving the step inexact.
-        reached = [_code_digest(holder) for holder in dict.fromkeys(held) if holder is not step]
+        # Each held class or function, a function step itself among them, by the code its methods or body
+        # reach (`_code_digest`), where that reaches what no statement holds (`Unestablished`) leaving the
+        # step inexact.
+        reached = [_code_digest(holder) for holder in dict.fromkeys(held)]
         digests = [digest for digest in reached if isinstance(digest, str)]
         holdable = holdable and len(digests) == len(reached)
         exact = bool(declared) or (not stating and not unstable and holdable
@@ -288,84 +288,18 @@ class StepIdentity:
         return {name: value for name, value in self.record().items() if name != "modules"}
 
 
-def _code_digest(holder: Callable | type) -> str | _Unheld:
-    """The digest of the code `holder`, a function or a class of the user's (`_held`), runs: what its body,
-    or its methods and its bases' (an inherited `__call__` among them), reach (`_reached`), so a helper they
-    call that changes changes it, and an edit to its module that nothing reached touches leaves it as it
-    was (row 5862); where that reaches a value no statement holds, what it is (`_Unheld`)."""
+def _code_digest(holder: Callable | type) -> str | Unestablished:
+    """The digest of the code `holder`, a function or a class of the user's (`_held`), runs, as the one
+    statement of a user's code states it (`dew._stated.stated`, which a traced program's identity reads
+    too): its body, or its methods and its bases' (an inherited `__call__` among them), with what they read,
+    so a helper they call that changes changes it, and an edit to its module that nothing reached touches
+    leaves it as it was (row 5862); where that reaches a value no statement holds, the refusal
+    (`Unestablished`)."""
     try:
-        reached = _reached(holder, frozenset())
-    except _Unheld as unheld:
-        return unheld
+        reached = stated(holder, f"the data step code {holder.__module__}.{holder.__qualname__}")
+    except Unestablished as refusal:
+        return refusal
     return hashlib.sha256(json.dumps(reached, sort_keys=True).encode()).hexdigest()
-
-
-class _Unheld(Exception):
-    """What a step's code reaches holds a value no statement of `_reached` holds."""
-
-
-def _reached(value, walking: frozenset[int]) -> JSON:
-    """The code a function or a class of the user's runs, as plain data, by the one statement of what code
-    reads (`dew._sources`): a function by its code (its instructions, constants and names), its defaults and
-    each value its body reads (`function_reads`); a class by the members of every class of the user's it is
-    made of (`own_classes`, `members`); one met again within its own walk is itself. A value it reaches is
-    the user's code walked in turn, a module of the user's by its file's bytes (code that names it may read
-    any of it), Dew's, the standard library's or an installed distribution's by its name, which the
-    environment versions, and plain data as itself; anything else is refused (`_Unheld`)."""
-    if id(value) in walking:
-        return ["itself", value.__qualname__]
-    within = walking | {id(value)}
-    if isinstance(value, type):
-        return ["class", value.__qualname__,
-                {kind.__qualname__: {name: _reached_value(member, within) for name, member in
-                                     _sources.members(kind)} for kind in _sources.own_classes(value)}]
-    cells, read = _sources.function_reads(value)
-    return ["function", value.__qualname__, _code_statement(value.__code__),
-            _reached_value((value.__defaults__, value.__kwdefaults__), within),
-            {name: _reached_value(held, within) for name, held in sorted((cells | read).items())}]
-
-
-def _code_statement(code: types.CodeType) -> JSON:
-    """`code` as plain data: its instructions, its constants (a nested function's code by this in turn) and
-    the names it reads."""
-    constants = [_code_statement(constant) if isinstance(constant, types.CodeType) else repr(constant)
-                 for constant in code.co_consts]
-    return [code.co_code.hex(), constants, list(code.co_names)]
-
-
-def _reached_value(value, walking: frozenset[int]) -> JSON:
-    """A value a step's code reaches (`_reached`), as plain data."""
-    if value is None or isinstance(value, bool | int | float | str | bytes):
-        return [type(value).__name__, repr(value)]
-    if isinstance(value, list | tuple):
-        return [type(value).__name__, [_reached_value(entry, walking) for entry in value]]
-    if isinstance(value, Mapping):
-        entries: list[JSON] = [[repr(key), _reached_value(value[key], walking)]
-                               for key in sorted(value, key=repr)]
-        return ["mapping", entries]
-    if isinstance(value, types.ModuleType):
-        if not _sources.own_source(value.__name__):
-            return ["module", value.__name__]
-        place = vars(value).get("__file__")
-        if place is None:
-            raise _Unheld(value.__name__)
-        return ["module", value.__name__, hashlib.sha256(Path(place).read_bytes()).hexdigest()]
-    if isinstance(value, type | types.FunctionType):
-        if _sources.own_source(value.__module__) or value.__module__ == "__main__":
-            if "<lambda>" in value.__qualname__ or _sources.source_file(value) is None:
-                raise _Unheld(value.__qualname__)
-            return _reached(value, walking)
-        return ["named", value.__module__, value.__qualname__]
-    if dataclasses.is_dataclass(value):
-        return ["dataclass", _reached_value(type(value), walking),
-                [[field.name, _reached_value(getattr(value, field.name), walking)]
-                 for field in dataclasses.fields(value)]]
-    if isinstance(value, Enum):
-        return ["enum", type(value).__module__, type(value).__qualname__, value.name]
-    if callable(value) and not _sources.own_source(type(value).__module__):
-        # A library's callable (a ufunc, a builtin) by its type and name, which the environment versions.
-        return ["callable", type(value).__module__, type(value).__qualname__, repr(value)]
-    raise _Unheld(type(value).__qualname__)
 
 
 def _held(holder: Callable | type) -> tuple[list[Callable | type], bool]:
@@ -989,7 +923,7 @@ class Plan:
             "lowering": self.lowering,
             "manifest": manifest,
             "code": json_value(self.manifest.code(), "code"),
-            "held": json_value(self.manifest.held(), "held"),
+            "reached": json_value(self.manifest.held(), "reached"),
             "order": referenced(self.spelled_order(), _identities(manifest["steps"])),
             "derived": json_value(self.derived, "derived"),
             "topology": json_value(self.topology, "topology"),
@@ -1021,7 +955,7 @@ class Plan:
         reads, which only the position it saves keeps: the manifest's parts each apart, and a list's entries,
         such as each source's content and each step's identity, one by one."""
         recorded = self.record()
-        for name in ("order", "code", "held", "manifest", "version"):
+        for name in ("order", "code", "reached", "manifest", "version"):
             del recorded[name]
         recorded["topology"] = json_value(
             {name: value for name, value in self.topology.items() if name != "share"}, "topology"
@@ -1133,32 +1067,33 @@ class Plan:
             saved_code = _saved_code(saved, (*self.manifest.ran, *self.manifest.steps))
             steps = (*self.manifest.ran, *self.manifest.steps)
             # A position main saved for an hour (2026-11-15) holds each step's held code after its own in its
-            # code list, and no `held`: read as the two it is.
-            appended = "held" not in saved
-            rewritten = [step.name for step, before, now, held in zip(
-                steps, saved_code, self.manifest.code(), self.manifest.held(), strict=False)
-                if before is not None and before != now and not (appended and before == [*now, *held])]
-            # The user's code a step runs beside its module's (`Manifest.held`), where its position holds it.
-            if "held" in saved:
-                saved_held = listed(saved["held"], "saved data held code", read=json_value,
-                                    what="each step's held code")
-                rewritten += [step.name for step, before, now in zip(steps, saved_held, self.manifest.held(),
-                                                                     strict=False)
+            # code list, and no `held`: its own places are its list's first.
+            appended = "held" not in saved and "reached" not in saved
+            rewritten = [step.name for step, before, now in zip(steps, saved_code, self.manifest.code(),
+                                                                strict=False)
+                         if before is not None and before != now
+                         and not (appended and list(before)[:len(now)] == list(now))]
+            # The code a step's own code reaches beside its module's (`Manifest.held`, `dew._stated.stated`),
+            # where its position holds it (`reached`).
+            if "reached" in saved:
+                saved_reached = listed(saved["reached"], "saved data reached code", read=json_value,
+                                       what="each step's reached code")
+                reached = zip(steps, saved_reached, self.manifest.held(), strict=False)
+                rewritten += [step.name for step, before, now in reached
                               if before != now and step.name not in rewritten]
-            # A position saved before held code was saved holds none of it, and nothing it saved proves that
-            # code unchanged (its module digests are no part of a position since row 5862): a step that holds
-            # such code (a callable object of the user's, a class or one a field holds) is refused an exact
-            # resume rather than read as unchanged; a function step's code places were always saved.
-            unproven = [step.name for step, before, held in zip(steps, saved_code, self.manifest.held(),
-                                                                 strict=False)
-                        if appended and held and step.name not in rewritten
-                        and before != [*self.manifest.code()[steps.index(step)], *held]]
+            # A position saved before Dew saved the code a step's own code reaches holds none of it (or, saved
+            # since train 901 as `held`, its class's text alone), and nothing it saved proves that code
+            # unchanged (its module digests are no part of a position since row 5862): a step that holds such
+            # code (a function or a callable object of the user's, a class or one a field holds) is refused an
+            # exact resume rather than read as unchanged.
+            unproven = [step.name for step, held in zip(steps, self.manifest.held(), strict=False)
+                        if "reached" not in saved and held and step.name not in rewritten]
             if unproven and resume != "relaxed":
                 raise PlanChanged(
                     tuple(f"code.{name}" for name in unproven),
-                    f"the position was saved before Dew saved the code of the callable objects a data step "
-                    f"runs, so nothing it holds proves the code of {', '.join(unproven)} unchanged; declare "
-                    "the step's identity (identity='name@version') to resume exactly, or resume relaxed "
+                    f"the position was saved before Dew saved the code a data step's own code reaches, so "
+                    f"nothing it holds proves the code of {', '.join(unproven)} unchanged; declare the "
+                    "step's identity (identity='name@version') to resume exactly, or resume relaxed "
                     "(`data_resume='relaxed'`)")
             rewritten += unproven
             if rewritten and resume != "relaxed":

@@ -231,13 +231,14 @@ def test_a_notebooks_step_compiles_and_reads_its_rows(monkeypatch):
     assert loader.plan is not None and not loader.plan.manifest.exact
 
 
-@pytest.mark.parametrize("saved", ["without held", "held in its code list"])
-def test_a_position_saved_before_held_code_is_held_to_what_it_saved(tmp_path, monkeypatch, saved):
-    """A position saved before steps' held code was saved apart: one main saved for an hour, each step's held
-    code appended to its code list (`held in its code list`), resumes an unchanged run exactly and refuses
-    a change; one saved before held code at all (`without held`) holds nothing that proves its callable's
-    code unchanged, so its exact resume is refused, changed or not, and a relaxed one reads on naming the
-    step (Main: missing evidence is not proof of unchanged code)."""
+@pytest.mark.parametrize("saved", ["without held", "held in its code list", "held apart"])
+def test_a_position_saved_before_reached_code_is_held_to_what_it_saved(tmp_path, monkeypatch, saved):
+    """A position saved before steps' reached code was saved under its own key (`reached`): one saved before
+    any held code (`without held`), one main saved for an hour with each step's class text appended to its
+    code list (`held in its code list`) and one saved since with it under `held` (`held apart`) hold nothing
+    that proves the code the step reaches unchanged, so an exact resume is refused, changed or not, and a
+    relaxed one reads on naming the step (Main: missing evidence is not proof of unchanged code; train 909's
+    F8: the class text read as changed code)."""
     import json
 
     module = tmp_path / f"shift_{uuid4().hex}.py"
@@ -250,22 +251,18 @@ def test_a_position_saved_before_held_code_is_held_to_what_it_saved(tmp_path, mo
         return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
 
     place = json.loads(saved_after_one(reader))[_position.ENVELOPE]
-    plan = {name: value for name, value in place["plan"].items() if name != "held"}
+    plan = {name: value for name, value in place["plan"].items() if name != "reached"}
     if saved == "held in its code list":
-        plan["code"] = [[*code, *held] for code, held in zip(plan["code"], place["plan"]["held"],
+        plan["code"] = [[*code, *held] for code, held in zip(plan["code"], place["plan"]["reached"],
                                                                strict=True)]
+    if saved == "held apart":
+        plan["held"] = place["plan"]["reached"]
     position = json.dumps({_position.ENVELOPE: {**place, "plan": plan}}).encode()
-    if saved == "without held":
-        with pytest.raises(ValueError):
-            resumed_changes(reader(), position)
-        (changed,) = resumed_changes(reader("relaxed"), position)
-        assert changed.startswith("code.")
-        return
-    assert resumed_changes(reader(), position) == ()
-    module.write_text(SHIFT.format(by=10))
-    importlib.reload(shift)
     with pytest.raises(ValueError):
         resumed_changes(reader(), position)
+    (changed,) = resumed_changes(reader("relaxed"), position)
+    assert changed.startswith("code.")
+
 
 REACHING = """import dataclasses
 
@@ -285,46 +282,66 @@ class Reaching:
 """
 
 
-CHILD = """import dataclasses
+CALLER = """import dataclasses
 
-from {base} import Base
+import grain.python as grain
+
+from {base} import Reaching, delta
 
 
 @dataclasses.dataclass(frozen=True)
-class Child(Base):
+class Child(Reaching):
     pass
+
+
+def shifted(row):
+    return {{**row, "id": row["id"] + delta()}}
+
+
+@dataclasses.dataclass(frozen=True)
+class Shifting(grain.MapTransform):
+    def map(self, element):
+        return {{**element, "id": element["id"] + delta()}}
 """
+"""A module of the user's whose steps run `REACHING`'s `delta`: a class inheriting its `__call__`, a function
+calling it, and a Grain transform (`abc.ABC`'s) calling it."""
 
 
-@pytest.mark.parametrize("kind", ["a helper it calls", "an inherited method"])
+@pytest.mark.parametrize("kind", ["a helper it calls", "an inherited method", "a function step",
+                                  "a Grain transform"])
 def test_an_exact_resume_holds_the_code_a_steps_methods_reach(tmp_path, monkeypatch, kind):
-    """A step of the user's own class is held by the code its methods reach, not its class's text alone:
-    its `__call__` calls a module-level `delta` (`a helper it calls`), or it inherits `__call__` from a
-    base of another module of the user's that does (`an inherited method`); `delta` changed from returning
-    1 to 2, an exact resume is refused, naming the step, where the class's unchanged source let it resume
-    with other rows (the evening audit's CROSS-01 and its inherited case); a change to a function of the
-    module no method reaches (`unread`) refuses nothing (row 5862)."""
+    """A step of the user's own code is held by the code it reaches, not its own text alone: a class whose
+    `__call__` calls a module-level `delta` (`a helper it calls`), one that inherits that `__call__` from a
+    base in another module of the user's (`an inherited method`), a function that calls `delta` from
+    another module (`a function step`), and a frozen Grain transform, an `abc.ABC`, whose `map` calls it (`a
+    Grain transform`); `delta` changed from returning 1 to 10, an exact resume is refused, naming the step,
+    where its unchanged text let it resume with other rows (the evening audit's CROSS-01, its inherited
+    case, train 909's F1 and F3); a change to a function of the module nothing reaches (`unread`) refuses
+    nothing (row 5862)."""
     module = tmp_path / f"reaching_{uuid4().hex}.py"
     module.write_text(REACHING.format(by=1, other=1))
     monkeypatch.syspath_prepend(str(tmp_path))
     reaching = importlib.import_module(module.stem)
-    child = tmp_path / f"child_{uuid4().hex}.py"
-    child.write_text(CHILD.replace("{base}", module.stem).replace("Base", "Reaching"))
-    children = importlib.import_module(child.stem)
+    caller = tmp_path / f"caller_{uuid4().hex}.py"
+    caller.write_text(CALLER.format(base=module.stem))
+    callers = importlib.import_module(caller.stem)
 
     def reader(resume="exact"):
-        step = reaching.Reaching() if kind == "a helper it calls" else children.Child()
+        steps = {"a helper it calls": lambda: reaching.Reaching(),
+                 "an inherited method": lambda: callers.Child(), "a function step": lambda: callers.shifted,
+                 "a Grain transform": lambda: callers.Shifting()}
+        step = steps[kind]()
         pipeline = Pipeline(ROWS).map(step).shuffle(0).repeat().batch(2)
         return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
 
     state = saved_after_one(reader)
     module.write_text(REACHING.format(by=1, other=10))
     importlib.reload(reaching)
-    importlib.reload(children)
+    importlib.reload(callers)
     assert resumed_changes(reader(), state) == ()
     module.write_text(REACHING.format(by=10, other=10))
     importlib.reload(reaching)
-    importlib.reload(children)
+    importlib.reload(callers)
     with pytest.raises(ValueError):
         resumed_changes(reader(), state)
     (changed,) = resumed_changes(reader("relaxed"), state)

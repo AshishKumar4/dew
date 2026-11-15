@@ -5,6 +5,7 @@ or an installed distribution's, which its version states. One statement, which a
 
 from __future__ import annotations
 
+import abc
 import functools
 import importlib.metadata
 import inspect
@@ -180,15 +181,22 @@ def own_classes(kind: type) -> list[type]:
     return [held for held in kind.__mro__ if own_source(held.__module__)]
 
 
+_ABC_STATE = type(vars(abc.ABC)["_abc_impl"])
+"""The type of what `abc.ABCMeta` keeps in each class it makes (its registry and caches), machinery no
+statement of the user's code holds (`members`)."""
+
+
 def members(held) -> list[tuple]:
     """What a class or a module of the user's holds, by name, in order: a method as the function its
     descriptor wraps (`wrapped`), anything else as itself. Of Python's own entries (`__dict__`, `__doc__`,
     `__annotations__`) only the methods the user wrote (`__call__`), which a call runs; the rest are its
-    machinery's, the methods a dataclass makes among them, which the class's description states."""
+    machinery's, the methods a dataclass makes among them, which the class's description states, and the
+    state `abc.ABCMeta` writes into every class it makes (`_ABC_STATE`), a Grain transform's among them."""
     found = []
     for name, member in sorted(vars(held).items()):
         member = wrapped(member)
-        if name.startswith("__") and name.endswith("__") and not hand_written(member):
+        if ((name.startswith("__") and name.endswith("__") and not hand_written(member))
+                or isinstance(member, _ABC_STATE)):
             continue
         found.append((name, member))
     return found
