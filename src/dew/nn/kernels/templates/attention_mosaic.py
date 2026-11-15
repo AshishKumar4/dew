@@ -134,7 +134,8 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                                                 least_held: Callable[..., int] = query_rows
                                                 ) -> Config | None:
     """A launch's config from its family's facts and the call's extents (design §7), no space ranked: its
-    consumers the family's (`Family.consumers`) where its step `overlapped` (a softmax between its products,
+    consumers the family's first count (`Family.derived_consumers`, at most a launch's `most_consumers`)
+    where its step `overlapped` (a softmax between its products,
     which runs under its partner's products as the consumers take turns, FlashAttention-3's), else one (a
     step issuing its products back to back, which turns only make wait); fewer where the `held` rows a
     consumer accumulates (a forward's queries, a dK/dV launch's keys) fill fewer of the family's units; each
@@ -160,7 +161,8 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     (`query_rows`: the issuer's rows for a decode step's few), a backward's a role's rows (`_role_rows`).
     None where no tile fits."""
     unit = least_held(family, dtype, held) if rows is None else rows
-    most = most_consumers(family, tiles(unit, family.rows, 1)) if overlapped else 1
+    most = (min(most_consumers(family, tiles(unit, family.rows, 1)), family.derived_consumers) if overlapped
+            else 1)
     wide = rows is None and overlapped and most == 1 and family.budgets_registers
 
     def padded(rows: int, consumers: int) -> int:

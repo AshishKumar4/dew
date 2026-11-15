@@ -194,10 +194,17 @@ class Wgmma(WgmmaIssuer, mosaic.RingFamily):
     blocks."""
 
     # Three consumers beside the producer, 504 of a lane's 512 registers raised (160 each, the producer's 24):
-    # FlashAttention 3's d64 forward's 192-row tile (hopper's tile_size_fwd_sm90, row 1299), which a
-    # derivation trying every count up to it takes where it holds.
+    # FlashAttention 3's d64 forward's 192-row tile (hopper's tile_size_fwd_sm90, row 1299), the most a
+    # program takes.
     consumers = 3
     cluster = 2  # TMA multicast to a pair, CUTLASS's grouped GEMM's and cuBLASLt's on an H100
+
+    @property
+    def derived_consumers(self) -> int:
+        # Two first: the forward's two consumers (128-row programs) ran every causal cell measured faster
+        # than its three at equal peak, 1.29x to 1.57x, at widths 64 and 128, eight heads to 128 (M-ET-79, a
+        # GH200).
+        return 2
 
 
 WGMMA = Wgmma()
