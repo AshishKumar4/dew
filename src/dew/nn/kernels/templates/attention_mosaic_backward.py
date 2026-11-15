@@ -117,8 +117,9 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
             dq, dk, dv = _fused_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
                                        spans, drop, walk=walk)
         mass = gradient.split_mass(own, others_total, forward_total, shift)
-        return (dq[..., :width], delta, anchor, maximum, forward_total, mass, chosen, dk[..., :width],
-                dv[..., :value_width])
+        # The forward's D, no refinement of it, so nothing a rounding lost (`gradient.dq_finish`).
+        return (dq[..., :width], delta, anchor, maximum, forward_total, mass, jnp.zeros_like(mass), chosen,
+                dk[..., :width], dv[..., :value_width])
     # The dQ program reads its queries for their logits alone.
     dq_sum, keyed, rows = _dq_launch(scaled, key, value, dout, maximum, forward_total,
                                      anchor, delta, chosen, spans, score_params, drop, walk=walk)
@@ -126,13 +127,13 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     # The fast form's keyed sums are never read (`dq_finish`): a placeholder there.
     keyed = jnp.zeros_like(dq_swapped) if keyed is None else jnp.swapaxes(keyed, 1, 2)
     sums = dq_sums(dq_swapped, keyed, rows, sum(walk.summed))
-    dq, refined, denominator, mass, dq_grads = gradient.dq_finish(sums, forward_total, state_total, peak0,
-                                                                  (total0, initial_term), maximum, anchor,
-                                                                  delta, accurate=accurate)
+    dq, refined, lost, denominator, mass, dq_grads = gradient.dq_finish(
+        sums, forward_total, state_total, peak0, (total0, initial_term), maximum, anchor, delta,
+        accurate=accurate)
     dk, dv, *key_tile = _dkv_launch(query, key, value, dout, maximum, denominator, anchor, refined, chosen,
                                     spans, score_params, drop, scaled, walk=dkv_walk)
     summed_kinds = [kind for kind in score_kinds if kind in DQ_GRADS]
     head_query = tuple(grad.sum(axis=-1)[None, :, :, None] if kind == Kind.HEAD else grad
                        for grad, kind in zip(dq_grads, summed_kinds, strict=True))
-    return (jnp.swapaxes(dq, 1, 2)[..., :width], refined, anchor, maximum, denominator, mass, chosen,
+    return (jnp.swapaxes(dq, 1, 2)[..., :width], refined, anchor, maximum, denominator, mass, lost, chosen,
             *head_query, dk[..., :width], dv[..., :value_width], *key_tile)

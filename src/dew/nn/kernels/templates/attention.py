@@ -38,7 +38,16 @@ import jax.numpy as jnp
 from dew._hashing import fmix32
 from dew.nn.derivatives import Protected, contracted
 from dew.nn.kernels import generation, tuning
-from dew.nn.precision import at_least_fp32, compensated_sum, exact_float32, float32_einsum
+from dew.nn.precision import (
+    at_least_fp32,
+    binade_of,
+    compensated_sum,
+    exact_float32,
+    float32_einsum,
+    lowered_divide,
+    raised_exactly,
+    two_sum,
+)
 
 
 @jax.tree_util.register_dataclass
@@ -1658,12 +1667,13 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     state = hooks.initial
     kinds = params["score_kinds"]
     outputs = launch(*arrays, **params)
-    dq, softmax = outputs[0], outputs[1:6]
-    grads_out = list(outputs[7:])
+    dq, softmax = outputs[0], outputs[1:7]
+    grads_out = list(outputs[8:])
     dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
     dk, dv, *key_grads = grads_out
-    delta, anchor, peak, total, mass = (array[:, :, :queries] for array in softmax)
-    delta = anchor + delta
+    delta, anchor, peak, total, mass, lost = (array[:, :, :queries] for array in softmax)
+    # D and what its two roundings lost, its refinement's (`lost`, `gradient.dq_finish`) and its anchor's sum.
+    delta, low = two_sum(anchor, delta)
     padded_k, padded_d, padded_dv = call.key.shape[1], call.key.shape[-1], call.value.shape[-1]
     if dk.shape[2] != kv_heads:
         # A launch's gradients a query head's each, a key head's summed here (in a fixed order); a launch
@@ -1696,13 +1706,35 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
         # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
         # Its weight before any product, as the launch takes it (`attention_gradient.refinement`).
-        moved = (starts[2] - delta) * ((starts[1] * factor) * inverse)
+        # Less D's rounded parts: a state that holds nearly all the weight has `starts[2]` and D equal in fp32
+        # where they differ by D's refinement alone (an fp16 call beside a state near fp32's largest, 4,094 of
+        # its maxima's gradients 0 in place of 1e-34, row 6302).
+        moved = (((starts[2] - delta) - low) - lost) * ((starts[1] * factor) * inverse)
         # Its denominator's: D over T in one division, as the reference's derivative of its own division
         # rounds it, not D times T's rounded inverse (row 2466: 1.5 to 1.66 times the reference's error from
         # float64 at fp32 sums).
         share = jnp.where(total > 0, delta / jnp.where(total > 0, total, 1.0), 0.0)
+        # Its product with the state's factor, below fp32's least normal where the state's denominator is
+        # large or its maximum lies far under the walk's, kept on a CPU, which flushes the share, the factor
+        # and their product: the factor as two normal halves `exp(d / 2)` (row 6302, 161 of a resumed
+        # state's denominators' gradients 0).
+        held = (total > 0) & jnp.isfinite(starts[0])
+        half = jnp.where(held, jnp.exp(jnp.minimum(starts[0] - peak, 0.0) * 0.5), 0.0)
+
+        def kept() -> jax.Array:
+            # `delta * half * half / total` with D raised from its bits until its products stay normal,
+            # divided and lowered in one rounding (`lowered_divide`).
+            nonzero = (binade_of(delta) > -1024) & (binade_of(half) > -1024) & (total > 0)
+            binades = binade_of(delta) + 2 * binade_of(half)
+            ceiling = jnp.maximum(126 - binade_of(delta), 0)
+            raised = jnp.where(nonzero, jnp.clip(-124 - binades, 0, ceiling), 0)
+            numerator = raised_exactly(delta, raised) * half * half
+            divisor = jnp.where(total > 0, total, 1.0)
+            return jnp.where(nonzero, lowered_divide(numerator, divisor, raised), 0.0)
+
+        weighed = jax.lax.platform_dependent(cpu=kept, default=lambda: share * factor)
         initial = Initial(m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
-                          total=(-share * factor).astype(state.total.dtype),
+                          total=(-weighed).astype(state.total.dtype),
                           acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
     # Unrounded (`rounded` False), dK and dV stay in at least fp32 for a caller that sums them across
     # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
