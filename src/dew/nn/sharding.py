@@ -347,6 +347,20 @@ def placing(layout: Placing | None) -> Iterator[None]:
         yield
 
 
+@contextlib.contextmanager
+def tracing(layout: Placing, rules: LogicalAxisRules, microbatches: int | None, links: Mapping[str, Link],
+            declared: contextlib.AbstractContextManager) -> Iterator[Schedule]:
+    """What a run's every traced program reads from context, its step's (`Trainer._traced_on`) and its
+    evaluations' (`Evaluator.scoring`) alike: the pipeline's microbatch count (`pipeline_microbatches`), the
+    axes its modules declared (`declared`, a `boxed`), the layout's `rules`, which place the activations
+    the model constrains (`constrain`) as they place the parameters, the links of the axes the run measured
+    (`measured_links`), and the layout itself (`placing`), where a projection mapped per shard reads its
+    weight's placement. A program cached by what it traced under keys on these (`trace_context`)."""
+    with (pipeline_microbatches(microbatches) as schedule, declared, nn.logical_axis_rules(rules),
+          measured_links(links), placing(layout)):
+        yield schedule
+
+
 def placed_layout() -> Placing | None:
     """The layout traced under (`placing`), None outside one."""
     return _cache.PLACING.value

@@ -520,9 +520,12 @@ def test_a_step_that_does_not_fit_drops_its_copies_before_it_recomputes_where_th
     first, second = probes[0], probes[1]
     assert (first["narrow"], first["fits"], second["narrow"]) == (True, False, False)
     assert second["remat"] == first["remat"] and probes[-1]["fits"] is True
-    # Kept where the step without them fell no less short (its headroom no greater).
-    assert trainer.plan["narrow"] is (second["headroom"] <= first["headroom"])
-    assert (state.compute is None) is not trainer.plan["narrow"]
+    # On a CPU the step without them falls less short, and they stay dropped; on a GPU it falls no less
+    # short, and they come back.
+    frees = jax.default_backend() == "cpu"
+    assert (second["headroom"] > first["headroom"]) is frees
+    assert trainer.plan["narrow"] is not frees
+    assert (state.compute is None) is frees
 
 
 def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monkeypatch):

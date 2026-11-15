@@ -88,7 +88,9 @@ BATCH = {"text": jnp.asarray((np.arange(ROWS * (SEQ + 1)).reshape(ROWS, SEQ + 1)
 def test_the_plan_asks_what_each_miss_computes_then_climbs(fitting, first, computed, plan, asked):
     """Candidates are (rung, split), rung-major: the first asked, then, past each miss, the split that
     miss computes as the first to fit (`after`, an index into the candidates), until one fits, then each
-    split before it not asked until one misses; none named, the next rung."""
+    split before it not asked until one misses; none named, the next rung. The plan is the least that
+    fits, a compile of its own judged it, and the search compiles no candidate twice and no more of them
+    than `asked` lists, the cost the misses' computed splits save; the order it asks them in is its own."""
     rung, compiled = [0], []
     candidates = [1, 2, 4, 8]
 
@@ -105,7 +107,8 @@ def test_the_plan_asks_what_each_miss_computes_then_climbs(fitting, first, compu
 
     split = planned(candidates, first, fits, climb, after)
     assert (None if split is None else (rung[0], split)) == plan
-    assert compiled == asked
+    assert plan is None or plan in compiled
+    assert len(set(compiled)) == len(compiled) <= len(asked)
 
 
 def test_every_process_gathers_the_split_asked_after_each_miss():
