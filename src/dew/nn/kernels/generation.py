@@ -43,7 +43,7 @@ launch reads them within `dew.nn.kernels.tuning.reading` alone, and a call insid
 identity (`dew.training.identity`)."""
 
 
-_RECORDINGS: contextvars.ContextVar[tuple[dict[Hashable, tuple[Callable[[], object], Hashable]], ...]] = (
+_RECORDINGS: contextvars.ContextVar[tuple[dict[Hashable, tuple[Callable[[], Hashable], Hashable]], ...]] = (
     contextvars.ContextVar("fact_recordings", default=()))
 """The facts read within each open `recording`, innermost last."""
 
@@ -85,11 +85,11 @@ class _Same:
 
 
 @contextlib.contextmanager
-def recording() -> Iterator[dict[Hashable, tuple[Callable[[], object], Hashable]]]:
+def recording() -> Iterator[dict[Hashable, tuple[Callable[[], Hashable], Hashable]]]:
     """Each fact read within the block (`traced_fact`), by its reader and question, with the answer it got
     (`stated`): what a trace kept for a later one read, which holds where each answers as it did (`still`).
     Recordings nest; a read records into each open one."""
-    reads: dict[Hashable, tuple[Callable[[], object], Hashable]] = {}
+    reads: dict[Hashable, tuple[Callable[[], Hashable], Hashable]] = {}
     token = _RECORDINGS.set((*_RECORDINGS.get(), reads))
     try:
         yield reads
@@ -97,12 +97,12 @@ def recording() -> Iterator[dict[Hashable, tuple[Callable[[], object], Hashable]
         _RECORDINGS.reset(token)
 
 
-def still(reads: Mapping[Hashable, tuple[Callable[[], object], Hashable]]) -> bool:
+def still(reads: Mapping[Hashable, tuple[Callable[[], Hashable], Hashable]]) -> bool:
     """Whether each fact of `reads` (a `recording`'s) answers now as it did when it was read."""
-    return all(stated(asked()) == answer for asked, answer in reads.values())
+    return all(asked() == answer for asked, answer in reads.values())
 
 
-def replay(reads: Mapping[Hashable, tuple[Callable[[], object], Hashable]]) -> None:
+def replay(reads: Mapping[Hashable, tuple[Callable[[], Hashable], Hashable]]) -> None:
     """`reads`, a kept trace's (`recording`'s), recorded into each open recording, as if read again: a trace
     taking a kept one read what it read."""
     for recorded in _RECORDINGS.get():
@@ -125,7 +125,7 @@ def traced_fact[**Question, Answer](reader: Callable[Question, Answer]) -> Calla
         if recordings := _RECORDINGS.get():
             held = stated((question, named))
             for recorded in recordings:
-                recorded[name, held] = functools.partial(reader, *question, **named), stated(answer)
+                recorded[name, held] = (lambda: stated(reader(*question, **named))), stated(answer)
         return answer
 
     if not inspect.signature(reader).parameters:
