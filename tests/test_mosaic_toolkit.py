@@ -765,10 +765,11 @@ def test_a_streams_three_part_products_are_each_issued_before_the_next_is_formed
     assert_fp32_reduction_bound(found, expected, magnitudes, terms=ISSUED * 7)
 
 
-def test_groups_summed_together_take_a_three_part_products_terms_apart():
+def test_groups_summed_together_take_a_three_part_products_terms_into_their_groups_accumulator():
     """Traced for an H100: a group of a product of three parts summed by `summed_together`'s reader takes
-    each of its six terms into an accumulator of its own, one at a time, as `summed` does (`_termwise`), not
-    every term into one."""
+    each of its six terms into the group's one accumulator, one after another (`Family.issued`), no
+    accumulator a term: an accumulator a term held beside the groups' spilled MiniMax's lightning training
+    query/key walk 200 bytes a thread (jsf-lightning-fs)."""
     from reference_error import equations
 
     a, b = (x[0] for x in _termwise_operands())
@@ -777,7 +778,7 @@ def test_groups_summed_together_take_a_three_part_products_terms_apart():
         traced = jax.make_jaxpr(lambda *xs: _mixed_sums(*xs, interpret=False, together=True))(a, b, c, d)
 
     scopes = [equation for equation in equations(traced.jaxpr) if _accumulator(equation)]
-    assert len(scopes) == 6, len(scopes)
+    assert len(scopes) == 1, len(scopes)
     assert not any(_accumulator(inner) for scope in scopes for inner in equations(scope.params["jaxpr"]))
 
 

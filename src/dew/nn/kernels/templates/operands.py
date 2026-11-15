@@ -324,20 +324,22 @@ class Issuer:
 
     def summed_together(self, groups: list) -> tuple[Callable[[], jax.Array], ...]:
         """Readers of `groups`' sums (each a list `summed` takes), none of which reads another's: issued
-        together where every product is unscaled, a pair of tiles in memory (no `product.Blocks`) of fewer
-        than three parts with no register left operand (`Family.summed_together`: one wait for them all where
-        products are awaited, tcgen05's), each its own accumulator; else each summed where it is read
-        (`summed`), in the reader's order, as `Family.summed_together`'s default is. Groups an operand of
+        together where every product is unscaled, a pair of tiles in memory (no `product.Blocks`) with no
+        register left operand (`Family.summed_together`: one wait for them all where products are awaited,
+        tcgen05's), each its own accumulator, a product of three parts issuing its terms into its group's one
+        at a time (`Family.issued`): summed apart term by term (`summed`), each term's accumulator held beside
+        the groups' spilled MiniMax's lightning training query/key walk 200 bytes a thread on an H100
+        (jsf-lightning-fs); else each summed where it is read (`summed`), in the reader's order, as
+        `Family.summed_together`'s default is. Groups an operand of
         which is staged as its product issues (a register value, an exact one, one formed then) are issued
         apart, each awaited before the next (`apart`): a staging waits for the products in flight that may
         read its tile (`_settle`) within its group alone, so another group's product still reading the tile
         would read the new operand."""
-        counted = [[(self._counted(entry), entry) for entry in self._entries(group)] for group in groups]
-        entries = [[entry for _, entry in found] for found in counted]
+        entries = [list(self._entries(group)) for group in groups]
         triples = [[entry for entry in found if not isinstance(entry, product.Blocks)] for found in entries]
-        # A group of a product of three parts summed as `summed` sums it (`_termwise`), its terms apart.
         plain = (all(len(found) == len(entry) for found, entry in zip(triples, entries, strict=True))
-                 and all(counts is not None and max(counts) < 3 for found in counted for counts, _ in found))
+                 and all(not isinstance(lhs, product.Scaled) and self._registered(name, lhs) is None
+                         for found in triples for name, lhs, _ in found))
         if not plain:
             return tuple(functools.partial(self.summed, found) for found in entries)
         family, interpret = self.call.family, self.call.interpret
