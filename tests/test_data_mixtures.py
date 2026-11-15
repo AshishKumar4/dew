@@ -2386,13 +2386,17 @@ def test_phases_batched_outside_themselves_read_as_they_did():
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-def test_a_mix_ends_after_its_first_exhausted_members_last_record_whatever_its_read(read):
+@pytest.mark.parametrize("short", ["one row", "a hundred taken to one"])
+def test_a_mix_ends_after_its_first_exhausted_members_last_record_whatever_its_read(read, short):
     """A mix's rows do not depend on how it is read: it ends at the position after its first exhausted
     member's last record, as Grain's map mix does (data.md §3). Corpora of 100 rows and 1 at weights 2
-    and 1 read A, A, B, and end; a streamed read went on to A, A, until B's second pull failed (spec
-    alignment 2026-11-15, data.md's first finding)."""
+    and 1 read A, A, B, and end, the one row a corpus of one or a hundred taken to one (`Pipeline.take`,
+    counted as an epoch is, `dew.data.epochs.held_records`); a streamed read went on to A, A, until B's
+    second pull failed (spec alignment 2026-11-15, data.md's first finding), and past a member a take
+    bounds (train 898's review, row 6701)."""
     many = Memory([{"id": index} for index in range(100)])
-    one = Memory([{"id": 1000}])
+    one = (Memory([{"id": 1000}]) if short == "one row"
+           else Pipeline(Memory([{"id": 1000 + index} for index in range(100)])).take(1))
     passed = held(mix([many, one], weights=[2, 1]).batch(1).read(read).loading(READ))(DataPartition())
     try:
         read_ids = [value for batch in ids(passed) for value in batch]

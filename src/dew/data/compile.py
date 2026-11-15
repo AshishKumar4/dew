@@ -84,19 +84,17 @@ from dew.data.dataset import (
     rows_of,
     take_batch,
 )
+from dew.data.epochs import epoch_records, order_records, tail
 from dew.data.facts import laid_out, merge_facts, row_lengths
 from dew.data.handoff import record_stage_of
 from dew.data.lowering import (
     _as_iter,
     _Build,
-    _epoch_records,
     _Locality,
     _member_key,
-    _order_records,
     _Present,
     _repeated,
     _split_spans,
-    _tail,
     _workers,
 )
 from dew.data.materialize import _materialize, _Memory
@@ -923,7 +921,7 @@ def _staged(
     elif epochs is not None:
         # Epochs of a read with a record count count it, read endlessly; of one with none, the source
         # examples a pass holds, its prepared rows as held, bounded to that many passes (`_bounded`).
-        passes = None if _epoch_records(train, build) is not None else _pass_examples(train, read, build)
+        passes = None if epoch_records(train, build) is not None else _pass_examples(train, read, build)
         original, train = ((_endless(original), _endless(train)) if passes is None else
                            (_bounded(original, epochs * passes), _bounded(train, epochs * passes)))
         build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
@@ -937,8 +935,8 @@ count, set to its epochs' passes once it holds them (`_rebound`, `_staged`)."""
 
 
 def _pass_examples(train: Pipeline, read: Read, build: _Build) -> int | None:
-    """The source examples one pass of a training read with no record count holds (`_epoch_records`,
-    `Loader.pass_examples`): those reaching where a bound in examples stands (`dew.data.compile._bounded`:
+    """The source examples one pass of a training read with no record count holds (`Loader.pass_examples`,
+    `dew.data.epochs.epoch_records`): those reaching where a bound in examples stands (`_bounded`:
     the first step that packs or windows them or makes several rows of each, else the batch), before any
     repeat. Its source's records, as a memory read holds them (its leading steps run, the present ones),
     or a streamed source's rows as its shards state or count them at the build's plan version
@@ -1083,7 +1081,7 @@ def _run_batches(staged: _Staged, *, steps: int | None, examples: int | None, ep
     if examples is not None:
         return -(-examples // batch)
     if epochs is not None:
-        records = staged.passes if staged.passes is not None else _epoch_records(staged.train, staged.build)
+        records = staged.passes if staged.passes is not None else epoch_records(staged.train, staged.build)
         return None if records is None else epochs * -(-records // batch)
     if tokens is not None:
         row = _row_tokens(staged.train)
@@ -1162,11 +1160,11 @@ def _compiled(
             host=_held_coordinated(validation, packed) + _held_steps(validation) + host,
         )
     )
-    records = _epoch_records(train, build)
+    records = epoch_records(train, build)
     if records == 0:
         raise ValueError(f"corpus {_name(train)} has no accepted rows")
-    order_records = _order_records(train, build)
-    if order_records is None and _native_after_bound(train):
+    ordered = order_records(train, build)
+    if ordered is None and _native_after_bound(train):
         # A native Grain step rebuilds or reorders rows as it likes, so the examples each row consumes
         # (`CONSUMED`), which a run no plan counts ahead reads its progress off, are kept by no contract.
         raise ValueError(f"{_name(train)} runs a native Grain step (`grain`) after its examples bound, which "
@@ -1186,8 +1184,8 @@ def _compiled(
         batch_tokens=staged.batch_tokens,
         device=device,
         widths=_bound_widths(original),
-        tail=_tail(train, build),
-        order_records=order_records,
+        tail=tail(train, build),
+        order_records=ordered,
     )
 
 
