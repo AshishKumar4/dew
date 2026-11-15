@@ -737,19 +737,28 @@ def checkpointed_swiglu(a, b):
     return (widened * jax.checkpoint(jax.nn.sigmoid)(widened)).astype(a.dtype) * b
 
 
-def test_a_norm_or_swiglu_region_never_crosses_a_checkpoint():
-    """A SwiGLU written around a checkpointed sigmoid (`checkpointed_swiglu`) is no SwiGLU region on an
-    H100 (`recognize.recognized`): a call written across the checkpoint would remove the boundary the
-    program states, changing what its derivative saves (§6.2), so the checkpoint stays where it was."""
+def test_a_swiglu_region_never_crosses_a_checkpoint():
+    """A SwiGLU written around a checkpointed sigmoid (`checkpointed_swiglu`) runs as written through
+    `dew.jit` on an H100, its checkpoint kept, where the same product without it runs Dew's fused kernel: a
+    call written across the checkpoint would remove the boundary the program states, changing what its
+    derivative saves (§6.2)."""
     from jax.extend.core import primitives
 
-    from dew.algebra import fusion, recognize
+    import dew
+    from dew.nn.programs import equations
 
     shapes = [jax.ShapeDtypeStruct(ROWS, jnp.bfloat16)] * 2
-    closed = jax.make_jaxpr(checkpointed_swiglu)(*shapes)
-    assert any(equation.primitive is primitives.remat_p for equation in closed.jaxpr.eqns)
+
+    def traced(program):
+        with generation.routes() as found:
+            made = dew.jit(program).trace(*shapes)
+        return made, any(route.choice == "swiglu" and route.kernel != "xla" for route in found)
+
     with generation.assumed("sm90"):
-        assert not recognize.recognized(closed, fusion.Index(closed), recognize.NORMS)
+        _, fused = traced(gated_product_of)
+        checkpointed, crossed = traced(checkpointed_swiglu)
+    assert fused and not crossed
+    assert any(equation.primitive is primitives.remat_p for equation in equations(checkpointed.jaxpr.jaxpr))
 
 
 def _rows_inverse(x):
