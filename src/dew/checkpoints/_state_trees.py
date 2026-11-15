@@ -6,8 +6,13 @@ through them."""
 
 from __future__ import annotations
 
+import atexit
+import concurrent.futures
 import dataclasses
 import functools
+import logging
+import threading
+import time
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -138,6 +143,62 @@ def _decode_delta(planes: jax.Array, live: jax.Array, dtype) -> jax.Array:
     return _from_delta_planes(planes, live).astype(dtype)
 
 
+logger = logging.getLogger(__name__)
+
+_DECODING = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dew-delta-decode")
+"""The thread a save's restore decodes compile in (`decoded_ahead`): off the step, which never waits on it.
+A process that exits drops the decodes not begun and waits for the one compiling (`_closing`)."""
+_DECODED: dict[tuple, concurrent.futures.Future] = {}
+_DECODED_LOCK = threading.Lock()
+
+
+def decoded_ahead(planes: jax.Array, live: jax.Array, dtype) -> None:
+    """Compile the program a restore reads `planes` back by (`_decode_delta`, over the planes and the
+    weight they are the difference from as a restore holds them, typed `dtype`) where the save that wrote
+    them runs: in a thread of its own (`_DECODING`), once a process for its signature (the arrays' shapes,
+    dtypes and shardings: equal for a mesh rebuilt over the same devices and spec, `NamedSharding`'s
+    equality), so the program is in the persistent compilation cache when a run resumes from the
+    checkpoint, which then compiles no program the runs before it did not (testing.md, a resumed run reuses
+    its compiled programs). The step never waits on it; a checkpoint's wait for its writes waits for it too
+    (`decodes_done`). A compile ahead that fails is no failed save: it is logged, and the resume compiles
+    the program as it would have."""
+    abstract = [jax.ShapeDtypeStruct(array.shape, array.dtype, sharding=array.sharding)
+                for array in (planes, live)]
+    key = (*((each.shape, each.dtype, each.sharding) for each in abstract), np.dtype(dtype))
+
+    def compiled() -> None:
+        began = time.perf_counter()
+        try:
+            _decode_delta.compiled(*abstract, np.dtype(dtype))
+        except jax.errors.JaxRuntimeError:
+            # XLA's refusal of the compile (its memory, its device): the resume compiles it as it would.
+            logger.warning("a checkpoint average's restore decode %s did not compile ahead; a resume "
+                           "compiles it", key, exc_info=True)
+            return
+        logger.info("compiled a checkpoint average's restore decode %s ahead, off the step, in %.3f s",
+                    abstract[0].shape, time.perf_counter() - began)
+
+    with _DECODED_LOCK:
+        if key in _DECODED:
+            return
+        _DECODED[key] = _DECODING.submit(compiled)
+
+
+def decodes_done() -> None:
+    """Wait for every restore decode a save began compiling (`decoded_ahead`)."""
+    with _DECODED_LOCK:
+        begun = list(_DECODED.values())
+    concurrent.futures.wait(begun)
+
+
+@atexit.register
+def _closing() -> None:
+    """At the process's exit, drop the restore decodes not begun and wait for the one compiling: a process
+    that saves and exits without closing its checkpoints neither blocks on them nor leaves one half
+    compiled."""
+    _DECODING.shutdown(wait=True, cancel_futures=True)
+
+
 def _planes_sharding(sharding):
     """Where a leaf's byte planes go: the leaf's placement, with the plane axis
     whole on every device, in device memory."""
@@ -252,7 +313,9 @@ def _with_ema_deltas(state_tree: Mapping[str, object]) -> tuple[Mapping[str, obj
             continue
         for index in chosen:
             encode = program(_delta_planes, out_shardings=_planes_sharding(leaves[index].sharding))
-            leaves[index] = encode(leaves[index], lives[index])
+            planes = encode(leaves[index], lives[index])
+            decoded_ahead(planes, lives[index], leaves[index].dtype)
+            leaves[index] = planes
         state_tree = _with(state_tree, path, jax.tree.unflatten(structure, leaves))
         recorded[_named(path)] = [jax.tree_util.keystr(paths_leaves[index][0]) for index in chosen]
     return state_tree, recorded
