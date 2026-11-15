@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, replace
@@ -103,6 +104,20 @@ def run_plan(run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | 
     return native_plan(run.variables(ema=ema, mesh=mesh, layout=layout), run.record, run.step,
                        why=plan.reason, averaged=run.averaged(ema),
                        records=[(path, path.relative_to(run.directory)) for path in records])
+
+
+RELEASES = "saved_runs"
+"""The folder of Dew's cache that holds each saved run's release, one directory a key (`released_run`)."""
+
+HELD_FILE = "dew_saved_run.json"
+"""A cache release's own record of the saved run it holds (`released_run`): the run's directory, and the
+step and EMA choice it was exported at, which a run that reads the release carries beside the paths it names
+within it (`release_sources`)."""
+
+RELEASE_SOURCES = "releases"
+"""The field of a step's inference declaration mapping each cache release its paths lie within to the saved
+run that release holds (`release_sources`), which a host lacking the release writes its own from
+(`releases_here`)."""
 
 
 def is_saved_run(name_or_dir: str | Path) -> bool:
@@ -279,15 +294,151 @@ def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema:
     if samples_images(run):
         raise ValueError(f"{name_or_dir} is a diffusion run, which Dew writes no release of: a diffusion run "
                          "starts from it (load_diffusion_source), and TextToImage.from_run serves it")
-    release = Path(dew_cache_dir()) / "saved_runs" / _fingerprint(run, ema)
+    release = Path(dew_cache_dir()) / RELEASES / _fingerprint(run, ema)
     lacking = any(from_every_process(not release.is_dir()))
     if not lacking:
+        if not (release / HELD_FILE).is_file():
+            # A release written before releases recorded what they hold: its key is a function of the run,
+            # the step and the EMA choice (`_fingerprint`), so it holds these.
+            _write_held(release, run, ema)
         return release
     # One that holds the release already keeps it (`staged`). A key reads each host's own checkpoint
     # files (`_fingerprint`), which copies of one checkpoint on several hosts may stamp apart, so a pool
     # shares a release only where every process asks for the one.
     pooled_export(run, release, ema=ema, mesh=mesh, layout=layout, staging=True)
     return release
+
+
+@dataclass(frozen=True)
+class Held:
+    """The saved run a cache release holds, as its own record states it (`HELD_FILE`): the run's directory,
+    and the step and EMA choice it was exported at (`released_run`)."""
+
+    run: str
+    step: int
+    ema: bool | None
+
+    @classmethod
+    def of(cls, run: SavedRun, ema: bool | None) -> Held:
+        """What `run`'s release with `ema` holds, its directory absolute where it is local."""
+        return cls(run.directory if "://" in run.directory else os.path.abspath(run.directory), run.step, ema)
+
+    @classmethod
+    def read(cls, value: JSON) -> Held:
+        """A release's record `value` (`record`), refused where it is not one."""
+        match value:
+            case {"run": str(run), "step": int(step), "ema": bool() | None as ema}:
+                return cls(run, step, ema)
+            case _:
+                raise ValueError(f"{value!r} is no record of the saved run a release holds")
+
+    def record(self) -> dict[str, JSON]:
+        """This as a release's record (`read`)."""
+        return {"run": self.run, "step": self.step, "ema": self.ema}
+
+
+def _write_held(release: Path, run: SavedRun, ema: bool | None) -> None:
+    """Write `release`'s own record of the saved run it holds (`HELD_FILE`, `Held`), whole or not at all
+    (a rename onto the file)."""
+    written = release / f".{HELD_FILE}.{os.getpid()}"
+    written.write_text(json.dumps(Held.of(run, ema).record()))
+    os.replace(written, release / HELD_FILE)
+
+
+def release_sources(record: Mapping[str, object]) -> dict[str, JSON]:
+    """The cache releases `record`, a step's inference declaration, names paths within, each mapped to the
+    saved run it holds as its own record states it (`HELD_FILE`): a path within a directory of this host's
+    cache's `RELEASES` that holds that record names it; any other path names none. A run's checkpoints
+    carry it (`RELEASE_SOURCES`, `with_release_sources`), so a host lacking a release writes its own of the
+    same saved run (`releases_here`)."""
+    cache = Path(dew_cache_dir()) / RELEASES
+    sources: dict[str, JSON] = {}
+    named = {key: json_value(field, key) for key, field in record.items() if key != RELEASE_SOURCES}
+    for name in _strings(named):
+        path = Path(name)
+        if not path.is_absolute() or not path.is_relative_to(cache) or path == cache:
+            continue
+        root = cache / path.relative_to(cache).parts[0]
+        if str(root) not in sources and (root / HELD_FILE).is_file():
+            sources[str(root)] = Held.read(json.loads((root / HELD_FILE).read_text())).record()
+    return sources
+
+
+def with_release_sources(artifact: JSON) -> JSON:
+    """`artifact`, a step's inference declaration, with the cache releases it names paths within mapped to
+    the saved runs they hold (`release_sources`), where it names any: what a run's checkpoint carries
+    (`Trainer`)."""
+    if not isinstance(artifact, dict) or "objective" not in artifact:
+        return artifact
+    sources = release_sources(artifact)
+    return {**artifact, RELEASE_SOURCES: sources} if sources else artifact
+
+
+def releases_here(record: Mapping[str, object], *, mesh: MeshSpec | Mesh | None = None,
+                  layout: Layout | None = None, trust: Sequence[str] = ()) -> Mapping[str, object]:
+    """`record`, a step's inference declaration, with each path it names within a cache release its map
+    lists (`RELEASE_SOURCES`) that this host lacks named within this host's release of the saved run that
+    release holds, which `released_run` writes here as the first load did, where the load places it
+    (`mesh`, `layout`): a run's processor and tokenizer lie in the release of the saved run it started from,
+    under its training host's cache, which a resume on another host, or a host serving it, lacks. Every
+    process of a pool agrees on whether any of them lacks one, and then all write theirs. A saved run a
+    listed release holds that this host lacks is refused, naming it; a path within a release the map does
+    not list is the record's as it stands."""
+    listed = record.get(RELEASE_SOURCES)
+    if not isinstance(listed, dict) or not any(from_every_process(
+            any(not Path(root).is_dir() for root in listed))):
+        return record
+    held = {root: Held.read(json_value(source, root)) for root, source in sorted(listed.items())}
+    missing = sorted(f"{source.run} at step {source.step} (EMA {source.ema})"
+                     for source in held.values() if not is_saved_run(source.run))
+    if any(from_every_process(bool(missing))):
+        raise FileNotFoundError(
+            f"this step reads the releases of saved runs that this host lacks, and the runs as well "
+            f"({missing or 'on another process of the pool'}): place each run where its record names it")
+    fields = {key: json_value(field, key) for key, field in record.items() if key != RELEASE_SOURCES}
+    names = _strings(fields)
+    renamed: dict[str, str] = {}
+    sources: dict[str, JSON] = {}
+    # Every process writes the same releases in one order: an export is collective.
+    for root, source in held.items():
+        here = Path(released_run(source.run, step=source.step, ema=source.ema, trust=trust, mesh=mesh,
+                                 layout=layout))
+        if Path(root).is_dir():
+            sources[root] = source.record()
+            continue
+        sources[str(here)] = source.record()
+        # This host's release takes the trust the recorded one had, or its run has (`released_source`).
+        if root in trust or trusts_source(root) or trusts_source(source.run):
+            trust_sources((str(here),))
+        renamed.update({name: str(here / Path(name).relative_to(root)) for name in names
+                        if Path(name).is_relative_to(root)})
+    return {**{key: _renamed(field, renamed) for key, field in fields.items()}, RELEASE_SOURCES: sources}
+
+
+def _strings(record: JSON) -> list[str]:
+    """Every string `record` holds at any depth."""
+    match record:
+        case str():
+            return [record]
+        case dict():
+            return [held for field in record.values() for held in _strings(field)]
+        case list():
+            return [held for element in record for held in _strings(element)]
+        case _:
+            return []
+
+
+def _renamed(record: JSON, names: Mapping[str, str]) -> JSON:
+    """`record` with each string `names` holds at any depth replaced by its new name."""
+    match record:
+        case str():
+            return names.get(record, record)
+        case dict():
+            return {key: _renamed(field, names) for key, field in record.items()}
+        case list():
+            return [_renamed(element, names) for element in record]
+        case _:
+            return record
 
 
 def pooled_export(run: SavedRun, destination: Path, *, ema: bool | None = None,
@@ -308,6 +459,8 @@ def pooled_export(run: SavedRun, destination: Path, *, ema: bool | None = None,
     elif staging:
         with staged(destination) as staged_at:
             export_run(run, staged_at, ema=ema, mesh=mesh, layout=layout)
+            # A cache release states the saved run it holds, which a run that reads it carries.
+            _write_held(staged_at, run, ema)
     else:
         export_run(run, destination, ema=ema, mesh=mesh, layout=layout)
     from_every_process(None)  # every process reads the release once it is published

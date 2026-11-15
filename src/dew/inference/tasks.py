@@ -358,29 +358,36 @@ class SavedRun:
         return replace(task, precision=self.precision)
 
     @classmethod
-    def pinned(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
+    def pinned(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = (), *,
+               mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> SavedRun:
         """The selected checkpoint of the run in `directory`: `step`, or where none is asked the step its
         task loads by default (`SavedRunTask.default_step`), its latest unless the task names another, so
         every reader of a run (a task, `dew.pipeline`, `dew export`) pins the one step. A task loaded
         from it compiles into the persistent cache (`persist_compilations`). `trust` names the
-        packages outside Dew whose modules the record may import (`dew.registry.imported`)."""
-        run = cls.at(directory, step, trust)
+        packages outside Dew whose modules the record may import (`dew.registry.imported`); `mesh` and
+        `layout`, where a loader places the weights, where a release its record reads is written (`at`)."""
+        run = cls.at(directory, step, trust, mesh=mesh, layout=layout)
         task = run.objective.saved_task
         chosen = (task.default_step(directory) if step is None and task is not None
                   and issubclass(task, SavedRunTask) else None)
         if chosen is None:
             return run
-        again = cls.at(directory, chosen, trust)
+        again = cls.at(directory, chosen, trust, mesh=mesh, layout=layout)
         if again.objective.saved_task is not task:
             raise ValueError(f"step {chosen} of {directory}, which its task loads by default, was written by "
                              f"{again.objective.__name__}, whose task is another; load a step with `step`")
         return again
 
     @classmethod
-    def at(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
+    def at(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = (), *,
+           mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> SavedRun:
         """The checkpoint of the run in `directory` at `step`, its latest where None, whatever step its task
-        loads by default (`pinned`): the step an average of runs reads (`dew.checkpoints.averaged`)."""
+        loads by default (`pinned`): the step an average of runs reads (`dew.checkpoints.averaged`). Its
+        record's paths within a release of a saved run that this host lacks (the release its training host
+        read, which the step names, `RELEASE_SOURCES`) name this host's release of that run, written here
+        where a loader places the weights (`mesh`, `layout`; `saved_sources.releases_here`)."""
         from dew.checkpoints import Checkpoints
+        from dew.interop.saved_sources import releases_here
         from dew.registry import import_trusted
         persist_compilations()
         with Checkpoints(directory) as checkpoints:
@@ -390,7 +397,8 @@ class SavedRun:
         if record is None:
             raise ValueError("this checkpoint's objective declares no inference record; declare "
                              "Objective.inference_record, or call objective.pipeline(state)")
-        return cls.declared(str(directory), record, step)
+        return cls.declared(str(directory), releases_here(record, mesh=mesh, layout=layout, trust=trust),
+                            step)
 
     @classmethod
     def declared(cls, directory: str, record: Mapping[str, object], step: int) -> Self:
@@ -402,7 +410,9 @@ class SavedRun:
             raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
         objective = declared_objective(record)
         declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
-        stray = set(record) - {'objective', 'model', 'precision', UNREAD, *declared}
+        from dew.interop.saved_sources import RELEASE_SOURCES
+
+        stray = set(record) - {'objective', 'model', 'precision', UNREAD, RELEASE_SOURCES, *declared}
         if stray:
             raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                              f"{sorted(stray)}")
@@ -518,7 +528,7 @@ class SavedRunTask:
         (`default_step`, `SavedRun.pinned`) or at `step`. `trust` names the packages outside Dew the run's
         record may import, and the sources whose own code its load may run (a media processor's,
         `dew.registry.trusts_source`), as `trust_remote_code` does in transformers."""
-        run = SavedRun.pinned(directory, step, trust)
+        run = SavedRun.pinned(directory, step, trust, mesh=mesh, layout=layout)
         return run.formed(cls.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype,
                                          param_dtype=param_dtype))
 

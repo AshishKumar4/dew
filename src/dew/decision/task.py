@@ -704,6 +704,7 @@ class Decide(SavedRunTask, InItsForm):
         import optax
 
         from dew.decision.objective import DecisionObjective
+        from dew.interop.saved_sources import with_release_sources
         from dew.state import TrainState
 
         assert self.weights is not None
@@ -718,7 +719,9 @@ class Decide(SavedRunTask, InItsForm):
                                window_size=jax.device_put(jnp.asarray(1, jnp.int32), replicated))
             # The record names the numerics the average answers under (`traced`).
             with self.traced():
-                record = DecisionObjective(self).inference_record()
+                # The releases of saved runs its paths lie within mapped to the runs they hold, as a
+                # trainer's checkpoint carries them (`with_release_sources`).
+                record = with_release_sources(DecisionObjective(self).inference_record())
             checkpoints.save(self.weights.step, state, artifact=record, weights_only=True)
             checkpoints.wait()
 

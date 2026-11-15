@@ -105,6 +105,60 @@ def test_a_decision_run_starts_from_a_saved_run_whose_export_is_its_native_relea
     assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
 
 
+def test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches_lack_its_releases(
+        tmp_path, monkeypatch):
+    """A decision run started from a saved decision run (`--pretrained <run>`) reads its tokenizer within its
+    source's release, a key under its training host's Dew cache, which each step's record names beside the
+    saved run that release holds (`RELEASE_SOURCES`, the release's own `HELD_FILE`). Resumed on another host,
+    whose cache lacks it, the run trains on, reading its own release of the source, and every step serves on
+    a third host lacking both, by each reader of a run (`Decide.from_run`, `dew.pipeline`), as it served
+    where it trained: the pin they share writes this host's release of the same saved run
+    (`SavedRun.at`, `releases_here`), where the record's paths raised Hugging Face's repo-id error. A step
+    whose source this host lacks too is refused, naming the saved run."""
+    from dew.decision import Choice, Decide
+    from dew.inference.loading import pipeline
+    from dew.interop.saved_sources import HELD_FILE, RELEASE_SOURCES, RELEASES
+
+    def cache(name: str) -> Path:
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / name))
+        return tmp_path / name / "dew" / RELEASES
+
+    trained_on = cache("training_host")
+    first = decision(tmp_path, drawn=False)
+    trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
+    source = tmp_path / "runs" / "first"
+    run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest"], default=first)
+    trained(run, tmp_path, "second", trainer={"checkpoint_final": True})
+    second = str(tmp_path / "runs" / "second")
+    held = {"run": str(source), "step": SavedRun.pinned(str(source)).step, "ema": None}
+    (release,) = SavedRun.at(second, 1).record[RELEASE_SOURCES]
+    assert Path(release).parent == trained_on
+    assert json.loads((Path(release) / HELD_FILE).read_text()) == held
+    team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
+
+    def answered(task) -> np.ndarray:
+        return np.asarray(task("charged twice", {"team": team})["team"].probabilities)
+
+    served = answered(Decide.from_run(second, step=1))
+    # Another host, the training host's cache nowhere: the run resumes there and trains a second step.
+    shutil.move(trained_on.parent.parent, tmp_path / "kept")
+    resumed_on = cache("resuming_host")
+    trained(run, tmp_path, "second", trainer={"steps": 2, "checkpoint_final": True})
+    (later,) = SavedRun.at(second, 2).record[RELEASE_SOURCES]
+    assert Path(later).parent == resumed_on
+    stepped = answered(Decide.from_run(second, step=2))
+    # A third host, lacking both releases: each step serves as it did, by each reader.
+    cache("serving_host")
+    np.testing.assert_array_equal(answered(Decide.from_run(second, step=1)), served)
+    np.testing.assert_array_equal(answered(pipeline(second, step=2)), stepped)
+    # A host lacking the saved run too.
+    shutil.move(source, tmp_path / "moved")
+    cache("bare_host")
+    with pytest.raises(FileNotFoundError) as refused:
+        Decide.from_run(second, step=1)
+    assert str(source) in str(refused.value)
+
+
 @pytest.mark.mesh(devices=8)
 def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(tmp_path, monkeypatch):
     """A language model run whose decoder no family's layout holds (GPT-J's parallel layout under a gated
