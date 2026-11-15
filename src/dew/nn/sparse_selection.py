@@ -214,12 +214,10 @@ def selected_runs(selected, bounds, *, own=None, slots=None, causal: bool = True
     empty run for none: a row's blocks, `block_runs`, or a document's windows), -1 for none, beside each
     query's `own` run `[B, Q, 2]` where given; under causality each up to the query's own key (`slots`
     `[B, Q]`, each query's key, its index where None; -1 for a query with none); sorted, repeats and empty
-    runs an empty run after the rest, as `scaled_dot_product_attention`'s `key_runs` takes them. A selection
-    of no entries and no own run (a budget of none) is one empty run `[0, 0)` a query, which the attention
-    reads as no key. A selection takes no gradient."""
-    rows, queries, budget = selected.shape
-    if budget == 0 and own is None:
-        return jnp.zeros((rows, queries, 1, 2), jnp.int32)
+    runs an empty run after the rest, as `scaled_dot_product_attention`'s `key_runs` takes them, which reads
+    a selection of no entries and no own run as no key (the span builder's `_read_runs`). A selection takes
+    no gradient."""
+    rows, queries, _ = selected.shape
     bounds = jnp.broadcast_to(bounds, (rows, *bounds.shape[-2:]))
     slots = jnp.broadcast_to(jnp.arange(queries) if slots is None else slots, (rows, queries))
     taken = selected.astype(jnp.int32)
