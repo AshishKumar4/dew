@@ -653,7 +653,8 @@ def test_a_step_whose_loss_is_finite_and_its_gradient_not_is_reported_not_finite
     state = stepper.initial_state()
     bad = batches()[1]
     step = stepper.compile(state, bad)
+    # The step consumes the state.
+    before = np.asarray(state.variables["params"]["w"])
     advanced, loss, _, finite, _, committed = step(state, bad)
     assert bool(jnp.isfinite(loss)) and not bool(finite) and int(committed.count) == 0
-    np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]),
-                                  np.asarray(state.variables["params"]["w"]))
+    np.testing.assert_array_equal(np.asarray(advanced.variables["params"]["w"]), before)

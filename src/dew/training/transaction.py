@@ -123,10 +123,11 @@ class Committed:
     """The microbatch's own loss statistics, which a step read in several pools into its batch's loss
     (`dew.training.planning.whole_step`) and lets go; None past the step."""
     finite: jax.Array | None = None
-    """Whether the attempt's values were finite, its gradient and forward as well as its loss, which the
-    step reports (`outcome`) and a run's streak of steps that are not reads (`dew.training.interval`): a
-    finite loss over a gradient that is not trains nothing. None past the step, whose own finiteness the
-    whole of its parts states (`whole_step`)."""
+    """Whether an attempt with no loss scale was finite, its gradient and forward as well as its loss, which
+    the step reports (`outcome`) and a run's streak of steps that are not reads (`dew.training.interval`): a
+    finite loss over a gradient that is not trains nothing. None under a loss scale, whose overflow its
+    scale backs off from, the step reporting its loss's finiteness, and past the step, whose own finiteness
+    the whole of its parts states (`whole_step`)."""
 
 
 def _chosen(take, taken, kept):
@@ -1299,7 +1300,7 @@ class Transaction:
         return advanced, loss, aux, Committed(
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
             jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted),
-            own=pending.own if self.split > 1 else None, finite=finite)
+            own=pending.own if self.split > 1 else None, finite=finite if scale is None else None)
 
     def planned(self, state: TrainState) -> _Planned | None:
         """The plan by which the runs a one-stage scanned state holds stacked update in their backward
