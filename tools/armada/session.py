@@ -234,9 +234,10 @@ def declared(tree: ast.Module, found: dict[str, tuple[str, dict[str, int], int]]
     try:
         entries = ast.literal_eval(literal.value)
     except ValueError:
-        return
+        entries = None
     if not isinstance(entries, dict):
-        return
+        raise SystemExit(f"{CHECK1_SHARDS}, line {literal.lineno}: a literal dict the plan reads from the "
+                         "source, {\"test[id]\": {\"seeds\": S, \"per_task\": P}}")
     for site, counts in entries.items():
         test, _, rest = site.partition("[")
         if not (isinstance(counts, dict) and set(counts) == {"seeds", "per_task"} and test.startswith("test")

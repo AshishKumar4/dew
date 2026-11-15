@@ -445,7 +445,8 @@ def test_a_generated_cell_is_a_site_its_files_check1_shards_literal_declares(ci,
     assert [entry["split"] for entry in judges] == ["test_form[heavy-one]"]
     for entry in ('"test_form[heavy one]": {"seeds": 128, "per_task": 16}',
                   '"test_form[heavy-one]": {"seeds": 128, "per_task": 16, "units": 4}',
-                  '"test_form[heavy-one]": {"seeds": 0, "per_task": 16}'):
+                  '"test_form[heavy-one]": {"seeds": 0, "per_task": 16}',
+                  '**{"test_form[heavy-one]": {"seeds": 128, "per_task": 16}}'):
         written(tmp_path, {"test_site.py": GENERATED.replace(
             '"test_form[heavy-one]": {"seeds": 128, "per_task": 16}', entry)})
         with pytest.raises(SystemExit):
