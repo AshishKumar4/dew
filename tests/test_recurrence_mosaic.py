@@ -849,12 +849,18 @@ def test_the_rated_hook_over_packed_documents_is_as_exact_as_the_recurrence_inte
 
 RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kda': (32, 32, 128, 128, True),
                    'nemotron-h-4b-ssd': (8, 96, 128, 80, False),
+                   'minimax-text-01-lightning': (64, 64, 128, 128, False),
                    'a write gate': (2, 2, 64, 64, False),
                    'a 192-wide value head': (16, 16, 128, 192, False)}
-"""The scoreboard's geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`), an unrounded
-write gate, and a gated delta rule's value head 192 wide, whose training launches take whole staged blocks (a
-bf16 output gradient's 64-column swizzle; 96 columns cut one): key heads, value heads, key and value widths,
-and whether the decay is a key dimension's."""
+"""The scoreboard's geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`,
+MiniMax-Text-01's lightning layer among them), an unrounded write gate, and a gated delta rule's value head
+192 wide, whose training launches take whole staged blocks (a bf16 output gradient's 64-column swizzle; 96
+columns cut one): key heads, value heads, key and value widths, and whether the decay is a key dimension's."""
+
+WHOLE = frozenset({'minimax-text-01-lightning', 'a write gate'})
+"""The gate's forms without the delta rule whose numbers the run's fast forms leave whole
+(`recurrence_chunk.chunk_rounding`): lightning attention's and a write gate's, their intermediates in fp32's
+three parts."""
 
 RATED = frozenset({'nemotron-h-4b-ssd'})
 """The gate's rated scans (Mamba2's SSD): no delta rule, its 16-bit call `rounded` (the fast forms), its
@@ -1135,15 +1141,16 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                                                            ('qwen3.5-27b-gdn', jnp.float32),
                                                            ('kimi-linear-kda', jnp.bfloat16),
                                                            ('nemotron-h-4b-ssd', jnp.bfloat16),
+                                                           ('minimax-text-01-lightning', jnp.bfloat16),
                                                            ('a write gate', jnp.bfloat16),
                                                            ('a 192-wide value head', jnp.bfloat16)})
                and not (variant == TWO_ROLES and not (training and not packed))
                and not (isinstance(variant, int) and (training or packed or dtype == jnp.float32))]
 """The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group: every
 geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the training pass of the
-gated delta rule in both and of Kimi delta attention, the SSD and the write gate in 16 bits (Kimi's keys, 128
-wide, past what an fp32 call takes under a decay a key dimension; the write gate's intermediates in fp32's
-three parts), and the 192-wide value head's 16-bit training pass alone;
+gated delta rule in both and of Kimi delta attention, the SSD, lightning attention and the write gate in 16
+bits (Kimi's keys, 128 wide, past what an fp32 call takes under a decay a key dimension; lightning's and the
+write gate's intermediates in fp32's three parts), and the 192-wide value head's 16-bit training pass alone;
 one row's 16-bit forward at its derived tiles apart from
 each of its variants (`variant`, a test each: an fp32 forward, which every family refuses, has none), and one
 row's training pass at its derived tiles apart from its walks at two roles (`TWO_ROLES`). One test
@@ -1157,7 +1164,7 @@ def _form(name: str, dtype) -> dict:
     """A resource case's call form beside its operands under the run's fast forms (`rounded`, `fast_rounding`,
     an fp32 call's operands in two parts), as its route gives it: a rated scan's without the delta rule and
     wide, as Mamba-2's mixer reads its output (`chunk`'s fp32 `dtype`)."""
-    if name == 'a write gate':
+    if name in WHOLE:
         return {'delta': False}
     return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {'rounded': True}
 
