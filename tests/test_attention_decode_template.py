@@ -329,6 +329,26 @@ def test_a_split_decode_step_at_aligned_keys_beside_an_empty_row_is_on_par_inter
 
 
 @INTERPRETS
+def test_a_split_decode_steps_slices_at_fp32s_largest_merge_to_it_interpreted():
+    """An fp32 decode step on an H100 over 4096 keys whose plan cuts its row into slices
+    (`algebra.merged_slices`, `finished_merged`), one weighted key a slice: key 0 at logit 0 and key 4095 at
+    logit -ln 29, each value fp32's largest, the keys between far below with values 0. Each slice's output is
+    fp32's largest at a total of 1, their shares 29/30 and 1/30, so the step's output is fp32's largest
+    exactly, where the merge's sum of shares passed it to inf (row 6826; the primitive's case,
+    test_attention_algebra.py's)."""
+    keys, heads, width = 4096, 8, 64
+    largest = float(np.finfo(np.float32).max)
+    spans = template.spans(1, keys, 1, lengths=jnp.asarray([keys], jnp.int32))
+    query = jnp.zeros((1, 1, heads, width), jnp.float32).at[..., 0].set(1.0)
+    logits = jnp.full((keys,), -1000.0).at[0].set(0.0).at[keys - 1].set(-np.log(29.0))
+    key = jnp.zeros((1, keys, heads, width), jnp.float32).at[0, :, :, 0].set(logits[:, None] * np.sqrt(width))
+    value = jnp.zeros((1, keys, heads, width), jnp.float32).at[0, jnp.asarray([0, keys - 1])].set(largest)
+    with generation.assumed("sm90"):
+        out = attention_decode.attend(query, key, value, spans, interpret=True)
+    assert (np.asarray(out) == largest).all(), np.asarray(out).ravel()[:4]
+
+
+@INTERPRETS
 @pytest.mark.parametrize("hook", ["plain", "sinks"])
 @pytest.mark.parametrize("keys", [KEYS, 4096])
 def test_a_decode_steps_state_resumed_over_the_rest_of_its_keys_is_its_whole_softmax_interpreted(keys, hook):
