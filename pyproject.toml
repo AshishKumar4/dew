@@ -23,15 +23,15 @@ dependencies = [
     "flax>=0.12.10,<0.13",
     # Dew's JAX build: 0.12.0.1 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post94; a release sorts below it, so an
+    # first build with every fix is post95; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). The CUDA and PJRT plugins the
     # cuda12 and cuda13 extras name are Dew's builds of its native code,
     # post81's on every machine (the comment above the extras; post82 to post87
-    # and post90 to post94 are Python alone). A bump runs the GPU
+    # and post90 to post95 are Python alone). A bump runs the GPU
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
-    "jax>=0.12.0.1.post94,<0.12.1",
+    "jax>=0.12.0.1.post95,<0.12.1",
     # optax 0.2.8's Muon: the preconditionings Dew's Muon iterates by (`preconditioning`, its AOL and Schatten
     # first steps, whose clamp dew.newton_schulz reads) and the iteration, layout and shape scalings it calls.
     "optax>=0.2.8",
@@ -123,11 +123,11 @@ dew = "dew._cli.main:main"
 # resolves for every machine at once, carrying each machine's pins under its markers
 # (tools/lock_environment.sh).
 cuda12 = ["jax-cuda12-plugin[with-cuda]==0.12.0.1.post81", "jax-cuda12-pjrt==0.12.0.1.post81", "jaxlib==0.12.0.1",
-          "dew-flash-attn-cu12~=0.3.9; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-          "dew-cutlass-cu12~=0.2.2; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
+          "dew-flash-attn-cu12~=0.3.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+          "dew-cutlass-cu12~=0.2.3; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 cuda13 = ["jax-cuda13-plugin[with-cuda]==0.12.0.1.post81", "jax-cuda13-pjrt==0.12.0.1.post81", "jaxlib==0.12.0.1",
-          "dew-flash-attn-cu13~=0.3.9; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-          "dew-cutlass-cu13~=0.2.2; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
+          "dew-flash-attn-cu13~=0.3.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+          "dew-cutlass-cu13~=0.2.3; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 tpu = ["libtpu==0.0.50.*", "requests"]
 # dew.telemetry.profile reads XProf's native converters, the same in 2.23.1
 # and 2.23.2. xprof 2.23.2 declares setuptools<70.0.0, which torch>=2.13's
@@ -298,8 +298,8 @@ kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post81; sys_platform == 'linux' a
                   "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc==13.0.88; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "libtpu==0.0.50.*; sys_platform == 'linux' and platform_machine == 'x86_64'",
-                  "dew-flash-attn-cu12~=0.3.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
-                  "dew-cutlass-cu12~=0.2.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "dew-flash-attn-cu12~=0.3.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "dew-cutlass-cu12~=0.2.3; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-runtime-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
@@ -391,6 +391,7 @@ markers = [
     "check1_shards(seeds, per_task, conditioning, conditioning_per_task): a check-1 site too long for one task, which CI runs as armada's map and judge: its (1 + REDRAW) times seeds draws sharded across map tasks of per_task each, a weighed check's (1 + REDRAW) times conditioning units in later map tasks of conditioning_per_task each (both declared where the site weighs, neither otherwise), and one judge that pools them and reports the site's row; written on the test's own decorator, of literal counts, as the plan reads it (tools/armada/ci.py `sites`)",
     "shards(units, per_task): a test's work of units too long for one task, split as check1_shards splits a check-1 site: its units 0 to units sharded across map tasks of per_task each, given them by the same environment (DEW_CHECK1_DRAWS, DEW_CHECK1_RECORDS, DEW_CHECK1_POOL), and one judge that pools them and reports the test's row; written on the test's own decorator, of literal counts, as the plan reads it (tools/armada/ci.py `sites`)",
     "shared_setup(name): tests that share one expensive setup (a module- or class-scoped fixture's making), kept in one group where CI splits their file so it is paid once; written on each test's own decorator, of a literal name, as the plan reads it (tools/armada/session.py `shared_setups`); never for a fixture that only cleans up or one every test takes",
+    "scenario(name): a test that runs one of the suite's scenarios end to end, named as tests/conftest.py's SCENARIOS names it (an unknown name stops collection); the scenario suite's branch coverage is measured over these tests alone (tools/armada/ci.py coverage items --scenarios), and CI's check refuses a scenario no test marks",
     "kernel: tests of a GPU kernel's code (Pallas, Triton, fla): the CPU suite lowers and interprets them, and the kernel lab's GPU tier runs every one, with every gpu test, on each target GPU before the kernel lands, but for check 1 on the TPU SSD kernel, which no user runs on a GPU",
 ]
 # A warning is a failure waiting to be reported, so the ones dew is

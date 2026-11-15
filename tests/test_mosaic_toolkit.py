@@ -326,22 +326,25 @@ def test_a_launch_whose_producer_holds_more_lowers_it_to_its_own_floor_and_its_c
 
 @pytest.mark.parametrize("generation_name", gate_generations(
     needs=lambda family, architecture: architecture.multiprocessor.register_raises is not None))
-def test_a_spilled_launchs_producer_rises_a_step_at_a_time_to_setmaxnregs_most(generation_name):
-    """A derivation's raise (`resources.Producers.raised`): a spilled launch's producer a setmaxnreg step
-    above the last it spilled at, from the least; every other launch's left where it was; none past the
-    most, so the derivation steps its tiles down instead."""
+def test_a_spilled_launchs_producer_steps_down_its_ladder_from_its_top(generation_name):
+    """A derivation's rung (`resources.Producers.stepped`): a spilled launch's producer to its top first (its
+    program's entry share), then a setmaxnreg step lower each time; every other launch's left where it was;
+    none at the ladder's foot, a step above the least, so the derivation steps its tiles down instead; a top
+    past setmaxnreg's most bounded at it."""
     from dew.nn.kernels.templates import resources
 
     with generation.assumed(generation_name):
         steps = resources.facts().raises()
-        raised = resources.Producers().raised({"states"})
-        twice = raised.raised({"states", "scan"})
-        assert (raised.of("states"), raised.of("scan")) == (steps.lowest + steps.step, None)
-        assert (twice.of("states"), twice.of("scan")) == (steps.lowest + 2 * steps.step,
-                                                          steps.lowest + steps.step)
-        highest = resources.Producers((("states", steps.highest),))
-        assert highest.raised({"scan"}).of("states") == steps.highest
-        assert highest.raised({"states"}) is None
+        top = steps.lowest + 13 * steps.step
+        first = resources.Producers().stepped({"states": top})
+        second = first.stepped({"states": top, "scan": top})
+        assert (first.of("states"), first.of("scan")) == (top, None)
+        assert (second.of("states"), second.of("scan")) == (top - steps.step, top)
+        foot = resources.Producers((("states", steps.lowest + steps.step),))
+        assert foot.stepped({"states": top}) is None
+        assert resources.Producers().stepped({"states": steps.lowest}) is None
+        assert resources.Producers().stepped({"states": steps.highest + steps.step}).of("states") == (
+            steps.highest)
 
 
 @pytest.mark.parametrize("generation_name", gate_generations(

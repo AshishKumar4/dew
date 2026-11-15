@@ -112,6 +112,34 @@ def pytest_runtestloop(session):
         jax.jit(lambda x: x + 1)(0).block_until_ready()
 
 
+SCENARIOS = (
+    "Dense language-model pretraining",
+    "Pretrained fine-tuning",
+    "Structured prediction",
+    "Decision ablation workflow",
+    "Diffusion training",
+    "Published diffusion pipelines",
+    "Distributed training",
+    "Online post-training",
+    "Diffusion language models",
+    "Generation and serving",
+    "Quantized interchange",
+    "Representation learning",
+    "Hybrid and state-space models",
+)
+"""The scenarios the suite runs end to end (docs/design/testing.md), each by the name a test's `scenario` mark
+gives it: the scenario suite's branch coverage is measured over the tests they mark (tools/armada/ci.py
+`coverage items --scenarios`), and CI's check refuses a scenario no test marks (`ci.py scenarios --check`)."""
+
+
+def pytest_itemcollected(item):
+    """A test marking a scenario names one of `SCENARIOS`, or its run stops at collection."""
+    for marker in item.iter_markers("scenario"):
+        if marker.args[:1] not in [(name,) for name in SCENARIOS] or len(marker.args) != 1:
+            raise pytest.UsageError(f"{item.nodeid}: its scenario mark {marker.args!r} names none of "
+                                    f"conftest.SCENARIOS")
+
+
 def pytest_collection_finish(session):
     """The session's tests, of which a compile gate's process of its own runs those of one capability
     (`kernel_compile.compiled_apart`)."""
@@ -181,9 +209,20 @@ def pytest_runtest_makereport(item, call):
         # report reads a test's properties from where only one phase fails.
         outcome.get_result().user_properties.append(found)
         item.user_properties.append(found)
+    # A test whose judgement waits on units a later job draws (`map_judge.LaterUnits`, its asks written to
+    # `check1_wire.LATER`), or a GPU flow every failed cell of which does (`gpu_flow.CellsFailed`), the JUnit
+    # property `later`: red until that job judges it.
+    judge, flow = sys.modules.get("map_judge"), sys.modules.get("gpu_flow")
+    raised = None if call.excinfo is None else call.excinfo.value
+    if flow is not None and isinstance(raised, flow.CellsFailed):
+        asked = all(raised.asked)
+    else:
+        asked = judge is not None and isinstance(raised, judge.LaterUnits)
+    if asked:
+        outcome.get_result().user_properties.append(("later", True))
+        item.user_properties.append(("later", True))
     # A GPU flow's counts (`gpu_flow.REPORTED`), the JUnit property `cells`: a flow none of whose cells ran is
     # unqualified on the GPU it ran for, never green.
-    flow = sys.modules.get("gpu_flow")
     if call.when == "call" and flow is not None and flow.REPORTED:
         counted = ("cells", json.dumps({key: sum(run[key] for run in flow.REPORTED)
                                         for key in ("passed", "failed", "skipped")}

@@ -42,6 +42,7 @@ from dew.nn.flops import projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
 from dew.nn.linear import forked_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
@@ -107,6 +108,10 @@ class Carried(NamedTuple):
     angle: jax.Array
     key: jax.Array
     value: jax.Array
+
+
+CARRIED = ('ssm_state', 'angle_state', 'k_state', 'v_state')
+"""`Carried`'s leaves in a decode cache, in its order (`Mamba3.cache_spec`)."""
 
 
 def _ranked(t):
@@ -528,12 +533,12 @@ class Mamba3(nn.Module):
                     for t, weight in ((x, self.mimo_x), (z, self.mimo_z)))
         return x, step, decay, *keys, nn.sigmoid(trap.astype(wide)), rates, z
 
-    def _cache(self, batch: int, dtype) -> tuple[bool, tuple[nn.Variable, ...]]:
-        """Whether the cache was allocated before this call, and its four variables, `Carried`'s in order."""
-        allocated = self.has_variable('cache', 'ssm_state')
-        names = ('ssm_state', 'angle_state', 'k_state', 'v_state')
-        return allocated, tuple(self.variable('cache', name, jnp.zeros, shape, dtype)
-                                for name, shape in zip(names, self._shapes(batch), strict=True))
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """The layer's decode cache for `rows` rows: `Carried`'s four leaves in order (`_shapes`), in at
+        least fp32, where the scan runs."""
+        wide = at_least_fp32(compute_dtype(self, self.dtype))
+        return {name: Opened(shape, wide) for name, shape in zip(CARRIED, self._shapes(rows), strict=True)}
 
     def _shapes(self, batch: int) -> tuple[tuple[int, ...], ...]:
         """`Carried`'s four shapes for `batch` rows: the state, its angle, the last token's keys and
@@ -558,10 +563,11 @@ class Mamba3(nn.Module):
         values, dt, A, B, C, lam, theta, z = self._operands(projected)
         carried, cache = None, ()
         if call.decode:
-            allocated, cache = self._cache(batch, wide)
-            if not allocated:
-                # Allocation only: init_cache's dummy token leaves no state behind.
-                return self.out_proj(jnp.zeros((batch, length, self.intermediate_size), self.dtype))
+            spec = self.cache_spec(batch)
+            for name, shape in zip(CARRIED, self._shapes(batch), strict=True):
+                stated(spec, name, shape, wide)
+            held = cache_variables(self, spec)
+            cache = tuple(held[name] for name in CARRIED)
             state, angle, key, value = (variable.value for variable in cache)
             carried = Carried(state, angle, key, value)
         if tokens.forks is not None:
@@ -583,8 +589,9 @@ class Mamba3(nn.Module):
             out, carried = chunk_mamba3(values, dt, A, B, C, lam, theta, carried, starts=tokens.starts,
                                         valid=valid, chunk_size=self.chunk_size)
         if call.decode and carried is not None:
-            for variable, value in zip(cache, carried, strict=True):
-                variable.value = value.astype(variable.value.dtype)
+            # The scan's carry kept in the cache's dtype, as it always was.
+            for name, variable, value in zip(CARRIED, cache, carried, strict=True):
+                kept(variable, value.astype(variable.value.dtype), name)
         # The scan's output under both names a remat policy reads it by (`RESIDUALS`), as `held_scan` marks
         # it.
         out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)

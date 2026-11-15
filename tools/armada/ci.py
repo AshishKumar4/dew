@@ -8,8 +8,9 @@
     python3 tools/armada/ci.py gpu-lane --tests="tests/b.py#1/2" --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py gpu-lane --network [--tests=...] --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py gpu-lane --prepare --tests="tests/b.py#1/2" --out=FILE --processes=N
-    python3 tools/armada/ci.py coverage items --target=SECONDS --timings=FILE > ITEMS
+    python3 tools/armada/ci.py coverage items --target=SECONDS --timings=FILE [--scenarios] > ITEMS
     python3 tools/armada/ci.py coverage report DIR
+    python3 tools/armada/ci.py scenarios [--check]
     python3 tools/armada/ci.py gangs
 
 The plan prints a task matrix for each Python CI proves. Whole test files are
@@ -108,7 +109,10 @@ items, each running its files under coverage.py (pyproject.toml's
 test cache off, since a reused row covers nothing, and writing its data among
 the task's artifacts; a traced task records nothing in the cache either.
 `report` combines the artifacts' data under DIR and writes DIR/coverage.json and
-DIR/coverage.md, a module a line, the least covered first:
+DIR/coverage.md, a module a line, the least covered first. `items --scenarios` measures the
+scenario suite alone (docs/design/testing.md): a task a file whose tests mark a scenario
+(tests/conftest.py SCENARIOS), running those tests alone; `scenarios --check` refuses a scenario
+no test marks:
 
     armada map --commit=SHA --artifacts=DIR --items=ITEMS --timeout=6000 --secrets=DEW_XLA_CACHE_TOKEN \
         -- sh -c {item}
@@ -167,6 +171,7 @@ PARITY_STAGES = HERE.parents[1] / "src" / "dew" / "parity_stages.py"
 child_groups = _loaded(HERE / "child_groups.py")
 session = _loaded(HERE / "session.py")
 coverage_report = _loaded(HERE / "coverage_report.py")
+scenario_marks = _loaded(HERE / "scenarios.py")
 records = _loaded(HERE / "records.py")
 r2 = records.r2
 watched = _loaded(HERE / "watched.py")
@@ -1358,7 +1363,8 @@ def ynn_switched(cases) -> list[dict]:
 
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
-         grace: float = session.GRACE, coverage: Path | None = None, census: bool = False) -> int:
+         grace: float = session.GRACE, coverage: Path | None = None, census: bool = False,
+         scenarios: bool = False) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
     their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
 
@@ -1368,7 +1374,8 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     at 300 seconds ran a median of 392. A task that ran out of time times its rows otherwise
     (`deadline_shares`): the file its tests were running in at least what it needs, a file that never
     started none. With `coverage`, pytest runs under coverage.py, whose data file goes there
-    (`coverage_items`)."""
+    (`coverage_items`); with `scenarios`, of its files the tests that mark a scenario alone
+    (scenarios.py)."""
     # Before any test writes under tests/, the inputs as the plan saw them; the rows its plan kept read
     # where it found their green runs (`kept_of`), a heavy file's kept groups each its own, and run where
     # their green run is not found there.
@@ -1379,8 +1386,9 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     # The census's tests run under check 1's CENSUS (tests/check1_wire.py, where the gate reads it), which
     # also keeps their rows from the records (`tested`).
     environ = {check1_wire().CENSUS: "1"} if census else {}
+    options = ("-m", f"({session.SELECTION[1]}) and scenario") if scenarios else ()
     code = tested(python, names, split, out, deadline, cache, grace, common, environ, coverage,
-                  kept=whole_files)
+                  kept=whole_files, options=options)
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
     site = session.SITE.fullmatch(split)
@@ -1401,7 +1409,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
             continue
         part = out.with_name(f"{out.name}.{index}")
         code = max(code, tested(python, [name], group, part, left, cache, grace, common, environ, coverage,
-                                kept={name: at}))
+                                kept={name: at}, options=options))
         rows += json.loads(part.read_text())["rows"]
     out.write_text(json.dumps({"rows": rows}))
     return told(out, code)
@@ -1599,7 +1607,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     reads. A run that is no test of its files (a GPU lane's prepare, `recorded` false) records no row. A
     process of the files under other flags than the lane's (`variant`, a GPU lane's `VARIANTS`) runs the
     same cut of them, its rows and their records named apart (`varied`). `options` go to its pytest after its
-    tests (a GPU lane's `--owed`)."""
+    tests (a scenario coverage task's selection)."""
     began = time.monotonic()
     group = varied(split, variant)
     site = session.SITE.fullmatch(group)
@@ -2011,7 +2019,7 @@ marked `PREPARES`, each of which then prepares rather than runs (tests/model_flo
 
 
 def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, deadline: float,
-                 owed: Path | None = None) -> int:
+                 asked: Path | None = None) -> int:
     """A GPU lane's prepare, on its node's CPU before its files' GPU run (`gpu_lane`) and with no GPU drawn:
     each of `tests` that holds a test marked `PREPARES` run once in a process of its own under `PREPARING`,
     at most `processes` at once, as its run will select and cut it (a group `<file>#G/N` holds in its prepare
@@ -2052,8 +2060,8 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
                 "output": "not prepared: its lane's prepare had no time left for it"}]}))
             return 0
         return tested(python, [file], group, verdict, mine, "off", session.GRACE, "",
-                      {**PREPARING, "OMP_NUM_THREADS": threads, **(VARIANTS[variant][1] if variant else {})},
-                      recorded=False, variant=variant, options=owed_options(owed))
+                      {**PREPARING, "OMP_NUM_THREADS": threads, **(VARIANTS[variant][1] if variant else {}),
+                       **asked_environment(asked)}, recorded=False, variant=variant)
 
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
         for done in [pool.submit(prepared, name, verdict) for name, verdict in verdicts.items()]:
@@ -2099,15 +2107,22 @@ def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str
             for name, (file, group, _) in units.items()}
 
 
-def owed_options(owed: Path | None) -> list[str]:
-    """The pytest options that hand a GPU lane's files the accuracy gate's owed sites (`--owed FILE`: the
-    sites whose first stage left them undecided, which a follow-up's prepare draws and its run judges over
-    both stages); none where it owes none."""
-    return [] if owed is None else ["--owed", str(owed)]
+def asked_environment(asked: Path | None) -> dict[str, str]:
+    """What hands a GPU lane's files a follow-up's asks (`asked`, check 1's ASKED: the later units sites of an
+    earlier run asked for, check1_wire.LATER), which its prepare draws and its run judges over every stage;
+    nothing where it was asked for none."""
+    return {} if asked is None else {check1_wire().ASKED: str(asked)}
+
+
+def later_asks(verdict: Path) -> Path:
+    """Where a GPU lane's file whose verdict is `verdict` writes its sites' asks for their later units (check
+    1's LATER, `map_judge.ask_later`, a JSON line each), beside its JUnit report, so its receipt carries them
+    to a follow-up (dew-ops)."""
+    return verdict.with_name(f"{verdict.name}.later.jsonl")
 
 
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes: int,
-             deadline: float, network: bool = False, owed: Path | None = None) -> int:
+             deadline: float, network: bool = False, asked: Path | None = None) -> int:
     """Run `tests` on this process's share of the one GPU it sees, each once, as a task of its own
     (`tested`), and write their verdict rows to `out`: a test file, or one group of one as CI names it
     (`<file>#G/N`, the Gth of N runs of the tests the file's collection here finds, split.py), whose row is
@@ -2188,11 +2203,14 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                            "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
                            "OMP_NUM_THREADS": threads}
                 file, group, variant = units[fits]
-                # A follow-up that judges owed sites (`owed`) reuses no row: its run is another than theirs.
+                # A site's asks for its later units go beside the file's report; a follow-up of asks
+                # (`asked`) reuses no row: its run is another than theirs.
+                later_asks(verdicts[fits]).unlink(missing_ok=True)
                 running[pool.submit(tested, python, [file], group, verdicts[fits], deadline,
-                                    "off" if owed is not None else cache, session.GRACE, common,
-                                    {**environ, **(VARIANTS[variant][1] if variant else {})}, None, network,
-                                    variant=variant, options=owed_options(owed))] = fits
+                                    "off" if asked is not None else cache, session.GRACE, common,
+                                    {**environ, **(VARIANTS[variant][1] if variant else {}),
+                                     check1_wire().LATER: str(later_asks(verdicts[fits])),
+                                     **asked_environment(asked)}, None, network, variant=variant)] = fits
                 continue
             done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
@@ -2269,13 +2287,18 @@ COVERAGE_DEADLINE = 5400.0
 its files' coverage partial, which `coverage_report.report` refuses."""
 
 
-def coverage_items(target: float, timings: dict) -> list[str]:
+def coverage_items(target: float, timings: dict, scenarios: bool = False) -> list[str]:
     """The plan's tasks for the oldest Python, as armada map items: each runs its files under coverage.py
     with the test cache off, its rows and data among its artifacts, by `COVERAGE_DEADLINE`. A check-1 site's
-    map tasks run its code over every seed; its judge, which pools their draws, has none to pool here."""
-    return [f"mkdir -p {ARTIFACTS} && python3 tools/armada/ci.py task --python={entry['python']} "
-            f"--tests='{entry['tests']}' --split='{entry['split']}' --out={ARTIFACTS}/rows.json --cache=off "
-            f"--deadline={COVERAGE_DEADLINE:.0f} --coverage={ARTIFACTS}"
+    map tasks run its code over every seed; its judge, which pools their draws, has none to pool here. With
+    `scenarios`, the scenario suite alone: a task a file that marks a scenario (scenarios.py), running its
+    marked tests alone."""
+    task = (f"mkdir -p {ARTIFACTS} && python3 tools/armada/ci.py task --python={PYTHONS[0]} --out={ARTIFACTS}"
+            f"/rows.json --cache=off --deadline={COVERAGE_DEADLINE:.0f} --coverage={ARTIFACTS}")
+    if scenarios:
+        marking = sorted(set().union(*scenario_marks.marked(test_files()).values()))
+        return [f"{task} --tests='{name}' --scenarios" for name in marking]
+    return [f"{task} --tests='{entry['tests']}' --split='{entry['split']}'"
             for entry in plan(target, timings)
             if entry["python"] == PYTHONS[0] and entry["split"] != COLLECT and "after" not in entry]
 
@@ -2363,12 +2386,12 @@ def lane_asked(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
         if args.network or args.cache is not None:
             parser.error("gpu-lane --prepare names its --tests, and takes neither --network nor --cache")
         return gpu_prepared(PYTHONS[0], args.tests.split(), args.out, processes=args.processes,
-                            deadline=args.deadline, owed=args.owed)
+                            deadline=args.deadline, asked=args.asked)
     if args.cache is None:
         parser.error("gpu-lane names the test cache's policy (--cache)")
     tests = args.tests.split() if args.tests is not None else list(network_files(PYTHONS[0]))
     return gpu_lane(PYTHONS[0], tests, args.out, cache=args.cache, processes=args.processes,
-                    deadline=args.deadline, network=args.network, owed=args.owed)
+                    deadline=args.deadline, network=args.network, asked=args.asked)
 
 
 def main() -> int:
@@ -2376,6 +2399,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.operation == "pythons":
         return pythons(check=args.check)
+    if args.operation == "scenarios":
+        return scenario_marks.scenarios(test_files(), check=args.check)
     if args.operation == "gangs":
         print(json.dumps(gangs()))
         return 0
@@ -2434,7 +2459,7 @@ def main() -> int:
         if args.stage == "report":
             return coverage_report.report(args.directory)
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
-        print(json.dumps(coverage_items(args.target, timings)))
+        print(json.dumps(coverage_items(args.target, timings, scenarios=args.scenarios)))
         return 0
     if args.operation == "policy":
         print(policy(args.base))
@@ -2446,7 +2471,7 @@ def main() -> int:
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
     return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
-                coverage=args.coverage, census=args.census == "1")
+                coverage=args.coverage, census=args.census == "1", scenarios=args.scenarios)
 
 
 def pinned(argv: list[str]) -> None:

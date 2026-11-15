@@ -69,7 +69,11 @@ def log_linear_attention(query, key, value, g, level_scales, *, scale: float | N
         # A key in its block's left half; a query in the right half reads them; a block starts afresh.
         left, opened = (positions & half) == 0, positions % (2 * half) == 0
         blocks = min(length, -(-length // (2 * half)) + documents)
-        read, _ = chunk(hooks, Chunk(q, k * left[..., None, None], v, log_decay=g, starts=opened),
+        # The level's recurrence takes the operands as given, its output in at least fp32 (`chunk`'s
+        # `dtype`): a kernel takes a 16-bit call's products whole. Widened first, every level was an fp32
+        # call, which no GPU's template took (an A100's portable math; a GH200's output and states launches
+        # past their registers in every config, M-JS-125b at 3cd06f7f305).
+        read, _ = chunk(hooks, Chunk(query, key * left[..., None, None], value, log_decay=g, starts=opened),
                         max_segments=blocks, dtype=work)
         out = out + read * jnp.where(left[..., None], 0.0, weights[..., level])[..., None]
     return out.astype(dtype)

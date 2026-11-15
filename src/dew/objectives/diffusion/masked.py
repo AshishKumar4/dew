@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -85,6 +85,11 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
     (`LMObjective`). `balance` trains the routers of a mixture as an LM's does
     (`ExpertBalance`, `dew.objectives.routing`).
     """
+
+    untraced: ClassVar[Mapping[str, str]] = {
+        "samples": "its preview's count (`preview`), which its loss, draw and optimizer do not read",
+        "decode": "its preview's decoding of ids to text (`preview`), which its loss, draw and optimizer do "
+                  "not read"}
 
     saved_task = MaskedGeneration
     settings = MaskedSettings
@@ -194,10 +199,6 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
     def row_tokens(self, batch: Batch) -> int | None:
         """The tokens of each row, every one of them a slot the corruption may mask."""
         return self.inputs.sample.held(batch)[-1] if self.inputs is not None else None
-
-    traced = ("seq_len", "balance", "head_chunks", "process", "steps", "solver", "block", "eos_token_ids")
-    """Its window, balance, head chunks, process, its sampler's steps and solver, its blocks and end
-    tokens."""
 
     def loss(self, variables, batch, step: Step):
         nelbo, aux, _ = self._scored(variables, batch, step, train=step.training)

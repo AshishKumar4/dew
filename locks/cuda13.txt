@@ -1641,13 +1641,13 @@ deprecated==1.3.1 \
     # via
     #   daytona
     #   deltalake
-dew-cutlass-cu13==0.2.2 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') \
-    --hash=sha256:4aebcd552e6d9a8724927c160672552a53f53ca774c3df9cc28ce56b034cec65 \
-    --hash=sha256:ad18898bb51c76e5d19660bb4b23c1a9dbe8d5561705ef25f1173004455783a3
+dew-cutlass-cu13==0.2.3 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') \
+    --hash=sha256:a087bf822eb5c6e0d97b30c531bcf8b769e377c064fb2abf0f2da7b100d13b93 \
+    --hash=sha256:e870b6ee88450d2aac81fed1e8486c6ff20faa9bd1aa7c05b131bd4e5611210a
     # via dewml (pyproject.toml)
-dew-flash-attn-cu13==0.3.9 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') \
-    --hash=sha256:12230a0544c6050828fefc58c39afd7faf696a5e2ec792b84dc731badfe982e9 \
-    --hash=sha256:1798dc91ec0a13fc91e190a909638ee34e43c88bb67059727145f3e315c0046b
+dew-flash-attn-cu13==0.3.12 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') \
+    --hash=sha256:29dd8b7858a15c87ba3814d110fad086119b0b68aae1275800bbb4eb79c14d2c \
+    --hash=sha256:eb95cca1abdfe778942cd9ebb066e99a04716ae3b3adbe16febd498438c81ce4
     # via dewml (pyproject.toml)
 diffusers==0.39.0 \
     --hash=sha256:14bb1d98c85a0e463d734c99aaa73b480a7bc9bad22af30fbf730ef8f09c1d67 \
@@ -2687,8 +2687,8 @@ jaraco-functools==4.6.0 \
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post94 \
-    --hash=sha256:9da3e842cde88c05ab4cb58db531f96cc5d632d0b2e64b1afb8c4f863e38699d
+jax==0.12.0.1.post95 \
+    --hash=sha256:aaca7846d221b4618804dd3a55d23bad374d2152b01c602817793ef0c6e8bfb0
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)

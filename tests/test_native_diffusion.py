@@ -274,6 +274,7 @@ def test_a_bfloat16_safety_head_decides_as_its_checkpoint_states(saved_pipelines
             np.testing.assert_array_equal(blocked, expected, err_msg=f"the {name} checker at {storage}")
 
 
+@pytest.mark.scenario("Published diffusion pipelines")
 @pytest.mark.parametrize("scheduler", ["shipped", "lms"])
 def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(saved_pipelines, tmp_path,
                                                                               scheduler):

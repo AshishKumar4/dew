@@ -14,6 +14,7 @@ import types
 from collections.abc import Callable
 from importlib import import_module
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -32,7 +33,7 @@ from dew.batch import unboxed
 from dew.config import ObjectiveConfig
 from dew.distributed.batches import shard_batch
 from dew.distributed.placement import Layout, MeshSpec
-from dew.lora import _updated as lora_update
+from dew.lora import _low_rank as lora_low_rank, _updated as lora_update
 from dew.nn.attention_residuals import depth_mixed
 from dew.nn.blocks import torch_bicubic_resize
 from dew.nn.kv_cache import hadamard, rotated
@@ -1482,6 +1483,8 @@ def zone_cases(dtype) -> dict[str, tuple[Callable[..., jax.Array], tuple, dict]]
         "dew.nn.quantizers.nearest_codewords": (nearest_codewords, (rows, codebook), {}),
         "dew.nn.kv_cache.rotated": (rotated, (normal(2, 4, 8), hadamard(8)), {}),
         "dew.lora._updated": (lora_update, (normal(8, 6), normal(8, 2), normal(2, 6)), {"scale": 2.0}),
+        "dew.lora._low_rank": (lora_low_rank, (SimpleNamespace(dtype=None, precision=None), normal(3, 8),
+                                               normal(8, 2), normal(2, 6), 2.0, (1,)), {"rowwise": False}),
     }
 
 
@@ -1745,8 +1748,8 @@ def test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention
         listed = {route.kernel for route in routes if route.site.endswith("._one_work_list")}
         return kernels, listed
 
-    # Every route each step's own program takes (the cache's allocation, traced for its shapes alone,
-    # reports none: `generation.unforced`), by its selector and kernel, the kernels a rule never sees among
+    # Every route each step's own program takes (the cache's opening traces no forward, so reports none:
+    # `CausalTransformer.init_cache`), by its selector and kernel, the kernels a rule never sees among
     # them or not, each by what it is: a fused attention kernel of whole products, every paged kernel but
     # the generic one, which reads the rows through the layer's attention, and the template's work list,
     # which forms its products whole wherever it runs.

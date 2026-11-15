@@ -1115,6 +1115,67 @@ def two_sum(left, right):
     return total, (left - (total - part)) + (right - part)
 
 
+def binade_of(x: jax.Array) -> jax.Array:
+    """`floor(log2(|x|))` of an fp32 `x` from its bits, int32, a subnormal's by its significand's leading
+    bit (its arithmetic on a process that flushes subnormal operands reads none of it), -1024 for zero."""
+    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
+    biased = ((bits >> 23) & np.uint32(0xFF)).astype(jnp.int32)
+    fraction = bits & np.uint32(0x7FFFFF)
+    leading = 31 - jax.lax.clz(fraction).astype(jnp.int32)
+    subnormal = jnp.where(fraction > 0, leading - 149, -1024)
+    return jnp.where(biased > 0, biased - 127, subnormal)
+
+
+def raised_exactly(x: jax.Array, k: jax.Array) -> jax.Array:
+    """An fp32 `x` times `2^k` (`k` int32, at least 0, broadcast against `x`), exactly, from its bits: a
+    subnormal `x` normalized by its significand's leading bit, so a process whose float32 multiply flushes a
+    subnormal operand (XLA's CPU, row 4023) still raises it. The result at most fp32's largest; an infinity
+    or NaN as it is."""
+    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
+    sign = bits & np.uint32(0x80000000)
+    biased = ((bits >> 23) & np.uint32(0xFF)).astype(jnp.int32)
+    fraction = bits & np.uint32(0x7FFFFF)
+    target = binade_of(x) + k
+    # A subnormal's significand, its leading bit at bit 23 of a normal one, the rest its fraction.
+    leading = 31 - jax.lax.clz(fraction).astype(jnp.int32)
+    up = jnp.clip(23 - leading, 0, 23).astype(jnp.uint32)
+    normalized = jnp.where(biased > 0, fraction, (fraction << up) & np.uint32(0x7FFFFF))
+    normal = sign | (jnp.clip(target + 127, 1, 254).astype(jnp.uint32) << 23) | normalized
+    # Still below the least normal: the subnormal's significand shifted up by `k`.
+    below = sign | (fraction << jnp.clip(k, 0, 31).astype(jnp.uint32))
+    raised = jnp.where(target >= -126, normal, below)
+    kept = (biased == 0xFF) | ((biased == 0) & (fraction == 0))
+    return jnp.where(kept, x.astype(jnp.float32), jax.lax.bitcast_convert_type(raised, jnp.float32))
+
+
+def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
+    """`x` (fp32) times `2^-k` (`k` int32, at least 0, broadcast against `x`) rounded once to nearest even
+    into fp32 however far below its least normal, in integer arithmetic on its bits: a process whose
+    float32 multiply or conversion flushes a subnormal result (XLA's CPU, per primitive, row 4023) still
+    returns it, as an IEEE multiply by the power of two would. A finite `x` alone; an infinity or NaN
+    returns as it is."""
+    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
+    sign = bits & np.uint32(0x80000000)
+    biased = ((bits >> 23) & np.uint32(0xFF)).astype(jnp.int32)
+    fraction = bits & np.uint32(0x7FFFFF)
+    # A subnormal `x` holds its significand at the least normal's exponent, its leading bit none.
+    held = jnp.maximum(biased, 1)
+    significand = jnp.where(biased > 0, fraction | np.uint32(0x800000), fraction)
+    target = held - k
+    normal = sign | (jnp.maximum(target, 1).astype(jnp.uint32) << 23) | fraction
+    # Below the least normal: the significand shifted right by the binades past it, rounded to nearest even.
+    shift = jnp.clip(1 - target, 0, 31).astype(jnp.uint32)
+    kept = significand >> shift
+    rest = significand & ((np.uint32(1) << shift) - np.uint32(1))
+    half = np.uint32(1) << (jnp.maximum(shift, np.uint32(1)) - np.uint32(1))
+    even = (kept & np.uint32(1)) == np.uint32(1)
+    up = (shift > 0) & ((rest > half) | ((rest == half) & even))
+    subnormal = sign | (kept + up.astype(jnp.uint32))
+    lowered = jnp.where((target >= 1) & (biased > 0), normal, subnormal)
+    rounded = jax.lax.bitcast_convert_type(lowered, jnp.float32)
+    return jnp.where(biased == 0xFF, x.astype(jnp.float32), rounded)
+
+
 @_protected
 def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
                 rounding: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
@@ -1170,31 +1231,54 @@ def _correctly_rounded_divide(numerator: jax.typing.ArrayLike,
     CUDA division does (compressed-tensors' NVFP4, the FP8 block cast, PyTorch's
     schedulers).
 
-    Each operand's significand, in [0.5, 1), divides apart from its exponent
-    (`_rounded_significand`), so every intermediate stays normal whatever the
-    operands' range; the exponents' difference then scales the rounded
-    significand by its exponent bits, exact for a normal result. A quotient
-    below the normal range rounds once to the subnormal grid: the significand
-    scaled onto that grid rounds to its nearest integer, ties to even, the exact
-    residual settling a scaled significand that lands on a half, and the
-    integer is the result's bits, which no flush to zero reaches. Past the
-    largest float the quotient is infinite. A zero, infinite or NaN operand,
-    or a subnormal one, which XLA:CPU reads as zero, is the division's. It is
-    the lowering of a primitive of its own (`correctly_rounded_divide`), so no
-    pass sees its error-free steps to reassociate them.
+    Each operand's significand, its fraction bits under the exponent of one, in
+    [1, 2), divides apart from its exponent field (`_rounded_significand`), so
+    every intermediate stays normal whatever the operands' range; the fields'
+    difference then scales the rounded significand by its exponent bits, exact
+    for a normal result. A quotient below the normal range rounds once to the
+    subnormal grid: the significand scaled onto that grid rounds to its nearest
+    integer, ties to even, the exact residual settling a scaled significand that
+    lands on a half, and the integer is the result's bits, which no flush to zero
+    reaches. Past the largest float the quotient is infinite. A zero, infinite or
+    NaN operand, or a subnormal one, which XLA:CPU reads as zero (an exponent field
+    of 0 or 255), is the division's. Every step is a bit operation or a float32
+    operation on normal values, about 140 operations a quotient where frexp's and
+    nextafter's own special cases took 210 (row 6312). It is the lowering of a
+    primitive of its own (`correctly_rounded_divide`), so no pass sees its
+    error-free steps to reassociate them.
     """
+    return _divided(numerator, denominator)
+
+
+def lowered_divide(numerator: jax.Array, denominator: jax.Array, lowered: jax.Array) -> jax.Array:
+    """`numerator / denominator * 2^-lowered` (`lowered` int32, at least 0, broadcast), rounded once to fp32
+    however far below its least normal (`_divided`, `correctly_rounded_divide`'s): a quotient a CPU flushes
+    (row 4023), its numerator raised by `lowered` from its bits by its caller (`raised_exactly`), so both
+    operands are normal; a subnormal operand is the division's (row 6302's finish and an initial state's
+    gradient)."""
+    return _divided(numerator, denominator, lowered)
+
+
+def _divided(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike,
+             lowered: jax.typing.ArrayLike = 0) -> jax.Array:
+    """`correctly_rounded_divide`'s quotient times `2^-lowered`, rounded once
+    (`_correctly_rounded_divide`); a special operand's division lowered in integers (`lowered_rounded`)."""
     numerator, denominator = jnp.broadcast_arrays(jnp.asarray(numerator, jnp.float32),
                                                   jnp.asarray(denominator, jnp.float32))
     plain = numerator / denominator
-    tiny = jnp.finfo(jnp.float32).tiny
-    special = ((jnp.abs(numerator) < tiny) | (jnp.abs(denominator) < tiny)
-               | ~jnp.isfinite(numerator) | ~jnp.isfinite(denominator))
-    negative = (numerator < 0) != (denominator < 0)
-    # Away from the specials both operands are normal: frexp's significands are exact, in [0.5, 1).
-    held = jnp.where(special, 1.0, numerator), jnp.where(special, 1.0, denominator)
-    (top, top_exponent), (bottom, bottom_exponent) = (jnp.frexp(jnp.abs(value)) for value in held)
+    if not (isinstance(lowered, int) and lowered == 0):
+        plain = lowered_rounded(plain, jnp.broadcast_to(jnp.asarray(lowered, jnp.int32), plain.shape))
+    top_bits, bottom_bits = (jax.lax.bitcast_convert_type(value, jnp.uint32)
+                             for value in (numerator, denominator))
+    top_field, bottom_field = (((bits >> 23) & 0xFF).astype(jnp.int32) for bits in (top_bits, bottom_bits))
+    special = (top_field == 0) | (top_field == 255) | (bottom_field == 0) | (bottom_field == 255)
+    negative = ((top_bits ^ bottom_bits) >> 31) != 0
+    # A normal operand's significand, exact in [1, 2); any bits give one in that range, so a special
+    # lane's steps stay normal too, and its result is the division's.
+    top, bottom = (jax.lax.bitcast_convert_type((bits & 0x007FFFFF) | 0x3F800000, jnp.float32)
+                   for bits in (top_bits, bottom_bits))
     significand, residual = _rounded_significand(top, bottom)
-    exponent = top_exponent - bottom_exponent
+    exponent = top_field - bottom_field - lowered
     bits = jax.lax.bitcast_convert_type(significand, jnp.int32)
     # The rounded significand's biased exponent once scaled: 1 to 254 is a normal float.
     field = ((bits >> 23) & 0xFF) + exponent
@@ -1217,33 +1301,39 @@ def _correctly_rounded_divide(numerator: jax.typing.ArrayLike,
 
 @_protected
 def _rounded_significand(numerator: jax.Array, denominator: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """The correctly rounded fp32 quotient of two significands in [0.5, 1), and the sign of the exact
+    """The correctly rounded fp32 quotient of two significands in [1, 2), and the sign of the exact
     quotient's distance from it (+1 above, -1 below, 0 exact).
 
     A Dekker TwoProduct gives the exact residual of the approximate
     quotient, split into two fp32 values. One residual correction puts the
     quotient within one ulp; comparing its exact residual with each
-    neighbour's half-spacing times the divisor chooses nearest-even.
-    That threshold product is exact because the half-spacing is a power
-    of two, and every intermediate is normal at these magnitudes. Each
-    residual is an error-free step, so the whole is one protected span."""
+    neighbour's half-spacing times the divisor chooses nearest-even. Its
+    neighbours are its bits' (a positive normal float's next and previous
+    floats), and that threshold product is exact because the half-spacing
+    is a power of two, every intermediate normal at these magnitudes. The
+    rounded quotient's residual is the corrected one's less the move, one
+    spacing times the divisor, exact, and within a factor of two of the
+    corrected residual where the quotient moves (Sterbenz), so its sign needs
+    no further product. Each residual is an error-free step, so the whole is
+    one protected span."""
     quotient = numerator / denominator
     product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
     residual = (numerator - product) - error
     quotient = quotient + residual / denominator
     product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
     high, low = two_sum(numerator - product, -error)
-    above, below = jnp.nextafter(quotient, jnp.inf), jnp.nextafter(quotient, -jnp.inf)
+    bits = jax.lax.bitcast_convert_type(quotient, jnp.uint32)
+    above, below = (jax.lax.bitcast_convert_type(bits + step, jnp.float32) for step in (1, -1))
     upper = (above - quotient) * 0.5 * denominator
     lower = (quotient - below) * 0.5 * denominator
-    odd = (jax.lax.bitcast_convert_type(quotient, jnp.uint32) & 1) != 0
+    odd = (bits & 1) != 0
     up = (high > upper) | ((high == upper) & ((low > 0) | ((low == 0) & odd)))
     down = (high < -lower) | ((high == -lower) & ((low < 0) | ((low == 0) & odd)))
     rounded = jnp.where(up, above, jnp.where(down, below, quotient))
-    # The exact quotient's side of the rounded one: the sign of its exact residual, the product's
-    # difference from the numerator less its error, which is zero only where the two are equal.
-    product, error = two_product(rounded, denominator, bit_split=True, subtract=True)
-    return rounded, jnp.sign((numerator - product) - error)
+    # The exact quotient's side of the rounded one: the rounded quotient's exact residual, the numerator
+    # less its product with the divisor, which is zero only where the two are equal.
+    side = jnp.where(up, (high - 2 * upper) + low, jnp.where(down, (high + 2 * lower) + low, high))
+    return rounded, jnp.sign(side)
 
 
 correctly_rounded_divide_p = core.Primitive("correctly_rounded_divide")

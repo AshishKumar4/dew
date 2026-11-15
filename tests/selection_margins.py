@@ -255,6 +255,13 @@ def margin(config, captured, label: str, *, stable: bool = True) -> float:
         scores = np.asarray(operands["scores"], np.float64)
         visible = operands["visible"].astype(bool) if "visible" in operands else causal(scores)
         budget = int(operands["budget"]) if "budget" in operands else fields["index_topk"]
+        if "agreements" not in operands:
+            # A gate ranked as it is, no relu's zero tie a head's agreement decides (MoBA's,
+            # `dew.nn.block_sparse`): its top-`budget` among the keys it may take.
+            if budget:
+                ranked = np.where(visible, scores, -np.inf)
+                smallest = min(smallest, float(np.min(top_margin(ranked, budget))))
+            continue
         agreements = np.asarray(operands["agreements"], np.float64)
         smallest = min(smallest, float(np.min(indexer_margins(scores, agreements, visible, budget,
                                                               stable=stable))))

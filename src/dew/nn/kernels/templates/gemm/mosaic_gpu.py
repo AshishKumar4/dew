@@ -2251,10 +2251,13 @@ def _tgmm_scheduled(index, *, groups: tuple, operands: tuple, tail: tail_of.Tail
              if family.pairs_product else
              {'ring_0': (lhs_gmem.at[depth], rows_block), 'ring_1': (rhs_gmem.at[columns], rows_block)}
              if k_major else
-             {name: (gmem.at[:, extent], row_block) if table is None else (gmem, gathered_rows(table, block))
-              for name, gmem, table, extent, block in zip(('ring_0', 'ring_1'), (lhs_gmem, rhs_gmem),
-                                                          table_gmems, (depth, columns), (m_i, n_i),
-                                                          strict=True)})
+             # A gathered operand's block this program's own, as its view's extent (`depth`, `columns`: a
+             # pair's program's half of the pair's rows).
+             {name: (gmem.at[:, extent], row_block) if table is None
+              else (gmem, gathered_rows(table, extent.start // width_of))
+              for name, gmem, table, extent, width_of in zip(('ring_0', 'ring_1'), (lhs_gmem, rhs_gmem),
+                                                             table_gmems, (depth, columns),
+                                                             (tiles.block_m, width), strict=True)})
     if scale_gmems is not None:
         # Its depth rows' scales and its columns', a step's row of each at the tile's (`step_scales`).
         views['row_scales'] = (scale_gmems[0].at[:, depth], row_block)

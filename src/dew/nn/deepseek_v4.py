@@ -59,7 +59,23 @@ from dew.nn.documents import DocumentWindows, document_windows
 from dew.nn.fake_quant import FakeQuantizing
 from dew.nn.flops import cross_attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places
-from dew.nn.kv_cache import KVCache, KVStore, cache_positions, cached_validity, open_kv_cache, write_cache
+from dew.nn.kv_cache import (
+    CURSOR,
+    CacheSpec,
+    KVCache,
+    KVSpec,
+    KVStore,
+    Opened,
+    cache_positions,
+    cache_variables,
+    cached_validity,
+    compute_dtype,
+    cursor,
+    kept,
+    open_kv_cache,
+    write_cache,
+    written_as,
+)
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mla import IndexerFront, sow_selection
 from dew.nn.norms import RMSNorm, unweighted_rmsnorm
@@ -88,6 +104,9 @@ _CSA2_CANDIDATES = 'csa2_candidates'
 rotated entries and index keys, the latest selection and the candidate
 pool's entries. One name each, since every layer reads the latest (section
 2.3.1)."""
+CSA2_INDEX_KEYS = 'index_keys'
+"""A CSA2 Full layer's cache leaf of its index keys, one a closed window
+(`DeepseekV4Attention._csa2_keys`)."""
 
 
 _rotate_rope = functools.partial(rotate, pairs='adjacent', span='trailing')
@@ -332,9 +351,36 @@ class CompressedEntries(FakeQuantizing):
         rotated = self.rotate(latents, origins)
         return self.fp4(rotated, 16, e4m3_scale=True) if self.quantized else rotated
 
+    @nn.nowrap
+    def entries_spec(self, rows: int, capacity: int) -> CacheSpec:
+        """The entry cache for `rows` rows of `capacity` tokens, as a model opens it (`init_cache`): its own
+        leaves (`_entries`), a subclass's children's beside them."""
+        return self._entries(rows, capacity)
+
+    @nn.nowrap
+    def _entries(self, rows: int, capacity: int) -> dict[str, Opened]:
+        """The leaves its `cached_entries` keeps for `rows` rows of `capacity` tokens: the rotated entries
+        of the closed windows in the entries' dtype, and, where windows pool several tokens, the open
+        window's projections and gates in the pooling's dtype, its origin, and under `overlap` the last
+        closed window's, its gates -inf where none has closed."""
+        projected = compute_dtype(self, self.pool_dtype if self.gated and self.pool_dtype is not None
+                                  else self.dtype)
+        leaves = {}
+        if self.gated:
+            series = 2 if self.overlap else 1
+            leaves.update(buffer_kv=Opened((rows, self.rate, series * self.width), projected),
+                          buffer_gate=Opened((rows, self.rate, series * self.width), projected))
+            if self.overlap:
+                leaves.update(overlap_kv=Opened((rows, self.rate, self.width), projected),
+                              overlap_gate=Opened((rows, self.rate, self.width), projected, -jnp.inf))
+            leaves["buffer_origin"] = Opened((rows,), jnp.int32)
+        entries = compute_dtype(self, self.dtype)
+        leaves["compressed"] = Opened((rows, capacity // self.rate, self.width), entries)
+        return leaves
+
     @nn.compact
-    def cached_entries(self, x, slots, capacity: int, write: bool, places):
-        """Append closed windows to the rotated-entry cache; allocation writes none.
+    def cached_entries(self, x, slots, capacity: int, places):
+        """Append closed windows to the rotated-entry cache (`_entries`).
 
         Returns the cache, the latents this call closed, the window each one
         is (-1 for none) and its origin, its first token's place among
@@ -343,37 +389,30 @@ class CompressedEntries(FakeQuantizing):
         token is an entry at once, at its own place, with no buffer and no
         scan.
         """
+        held = cache_variables(self, self._entries(x.shape[0], capacity))
         kv, gate = self._projections(x)
         if gate is None:
             latents, emitted, origins = self.kv_norm(kv), slots, jnp.broadcast_to(places, slots.shape)
         else:
             if self.position_bias:
                 gate = gate + self.bias[jnp.maximum(slots, 0) % self.rate].astype(gate.dtype)
-            shape = (x.shape[0], self.rate, kv.shape[-1])
-            buffer_kv = self.variable('cache', 'buffer_kv', jnp.zeros, shape, kv.dtype)
-            buffer_gate = self.variable('cache', 'buffer_gate', jnp.zeros, shape, gate.dtype)
-            prior = overlap = None
-            if self.overlap:
-                overlap = (self.variable('cache', 'overlap_kv', jnp.zeros,
-                                         (x.shape[0], self.rate, self.width), kv.dtype),
-                           self.variable('cache', 'overlap_gate', jnp.full,
-                                         (x.shape[0], self.rate, self.width), -jnp.inf, gate.dtype))
-                prior = (overlap[0].value, overlap[1].value)
-            buffer_origin = self.variable('cache', 'buffer_origin', jnp.zeros, (x.shape[0],), jnp.int32)
+            for name, written in (("buffer_kv", kv), ("buffer_gate", gate)):
+                written_as(name, held[name].value.dtype, written.dtype)
+            prior = (held["overlap_kv"].value, held["overlap_gate"].value) if self.overlap else None
             pooled, emitted, origins, buffered, prior, origin = append_windows(
-                kv, gate, slots, places, (buffer_kv.value, buffer_gate.value), prior, buffer_origin.value,
-                self.rate, self.width)
-            if write:
-                buffer_kv.value, buffer_gate.value = buffered
-                buffer_origin.value = origin
-                if overlap is not None and prior is not None:
-                    overlap[0].value, overlap[1].value = prior
+                kv, gate, slots, places, (held["buffer_kv"].value, held["buffer_gate"].value), prior,
+                held["buffer_origin"].value, self.rate, self.width)
+            kept(held["buffer_kv"], buffered[0], "buffer_kv")
+            kept(held["buffer_gate"], buffered[1], "buffer_gate")
+            kept(held["buffer_origin"], origin, "buffer_origin")
+            if prior is not None:
+                kept(held["overlap_kv"], prior[0], "overlap_kv")
+                kept(held["overlap_gate"], prior[1], "overlap_gate")
             latents = self._normed(pooled, x.dtype)
-        entries = self.variable('cache', 'compressed', jnp.zeros,
-                                (x.shape[0], capacity // self.rate, self.width), latents.dtype)
-        if write:
-            entries.value = write_cache(entries.value, self._stored(latents, origins), emitted)
-        return entries.value, latents, emitted, origins
+        stored = self._stored(latents, origins)
+        written_as("compressed", held["compressed"].value.dtype, stored.dtype)
+        kept(held["compressed"], write_cache(held["compressed"].value, stored, emitted), "compressed")
+        return held["compressed"].value, latents, emitted, origins
 
 
 class IndexScorer(nn.Module):
@@ -460,6 +499,15 @@ class Compressor(CompressedEntries):
                 rope_theta=self.rope_theta, rope_scaling=self.rope_scaling, norm_eps=self.norm_eps,
                 n_heads=self.index_n_heads, top_k=self.index_topk,
                 dtype=self.dtype, precision=self.precision, name='indexer')
+
+    @nn.nowrap
+    def entries_spec(self, rows: int, capacity: int) -> CacheSpec:
+        """Its entry cache (`CompressedEntries.entries_spec`), and on a CSA layer its lightning indexer's
+        beside it, under the indexer's name."""
+        own = self._entries(rows, capacity)
+        if self.index_topk is None:
+            return own
+        return {**own, "indexer": self.indexer.entries_spec(rows, capacity)}
 
     def __call__(self, x, q_resid, positions, places, cos, sin, cache=None, valid=None,
                  windows: DocumentWindows | None = None):
@@ -656,6 +704,35 @@ class DeepseekV4Attention(FakeQuantizing):
                 index_head_dim=self.index_head_dim, index_topk=self.index_topk,
                 dtype=self.dtype, precision=self.precision, name='compressor')
 
+    @nn.nowrap
+    def _window(self, rows: int) -> KVSpec:
+        """The sliding window's cache for `rows` rows (`KVSpec`): the shared key head as its keys and its
+        values, kept once where the layout stores it as given, in the dtype the head's projection gives
+        it (`compute_dtype`)."""
+        return KVSpec(self.kv_cache, rows, self.max_seq_len, 1, self.head_dim,
+                      compute_dtype(self, self.dtype), keys_as_values=True)
+
+    @nn.nowrap
+    def _csa2_keys(self, rows: int) -> dict[str, Opened]:
+        """A CSA2 Full layer's index keys for `rows` rows, one a closed window, in its entries' dtype."""
+        rate, (_, _, width) = self._csa2_geometry()
+        return {CSA2_INDEX_KEYS: Opened((rows, self.max_seq_len // rate, width),
+                                        compute_dtype(self, self.dtype))}
+
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> CacheSpec:
+        """The layer's decode cache for `rows` rows: its window (`_window`) with its cursor, and its
+        compressor's entries under the compressor's name where it compresses; a CSA2 Full layer's index
+        keys beside them, a Reindex or Reuse layer reading its Full layer's."""
+        spec: dict = {**self._window(rows).leaves(), **cursor(rows)}
+        if self.compressor == "csa2":
+            if not self.kv_shared and not self.reindex:
+                spec["compressor"] = self.compress.entries_spec(rows, self.max_seq_len)
+                spec.update(self._csa2_keys(rows))
+        elif self.compressor is not None and self.compress_rate is not None:
+            spec["compressor"] = self.compress.entries_spec(rows, self.max_seq_len)
+        return spec
+
     def _csa2_geometry(self) -> tuple[int, tuple[int, int, int]]:
         """A CSA2 layer's rate and its indexer's (top_k, heads, head width),
         which setup has already required."""
@@ -676,7 +753,7 @@ class DeepseekV4Attention(FakeQuantizing):
         if self.kv_shared:
             return (_published(kv_store, _CSA2_ENTRIES, 'Reuse'),
                     _published(kv_store, _CSA2_SELECTED, 'Reuse'))
-        rate, (top_k, _, index_head_dim) = self._csa2_geometry()
+        rate, (top_k, _, _) = self._csa2_geometry()
         if self.reindex:
             entries = _published(kv_store, _CSA2_ENTRIES, 'Reindex')
             keys = _published(kv_store, _CSA2_INDEX_KEYS, 'Reindex')
@@ -686,16 +763,14 @@ class DeepseekV4Attention(FakeQuantizing):
                                                             rope_scaling=self.rope_scaling,
                                                             dtype=at_least_fp32(latents.dtype)))
         else:
-            slots, capacity, allocated = cache
-            entries, latents, windows, origins = self.compress.cached_entries(x, slots, capacity, allocated,
-                                                                             places)
-            held = self.variable('cache', 'index_keys', jnp.zeros,
-                                 (x.shape[0], capacity // rate, index_head_dim), latents.dtype)
+            slots, capacity = cache
+            entries, latents, windows, origins = self.compress.cached_entries(x, slots, capacity, places)
+            held = cache_variables(self, self._csa2_keys(x.shape[0]))[CSA2_INDEX_KEYS]
             fresh = self.indexer.keys(latents, *rotary_freqs(origins, self.rope_dim, self.rope_theta,
                                                              rope_scaling=self.rope_scaling,
                                                              dtype=at_least_fp32(latents.dtype)))
-            if allocated:
-                held.value = write_cache(held.value, fresh, windows)
+            written_as(CSA2_INDEX_KEYS, held.value.dtype, fresh.dtype)
+            kept(held, write_cache(held.value, fresh, windows), CSA2_INDEX_KEYS)
             keys = held.value
         seen = (entries_visible(positions, entries.shape[1], rate) if by_document is None
                 else by_document.visible(rate))
@@ -756,9 +831,8 @@ class DeepseekV4Attention(FakeQuantizing):
             # The window's shared key head is the attention cache's keys and its values, one head, kept once
             # where the layout stores it as given (`keys_as_values`).
             shape = jax.ShapeDtypeStruct((batch, length, 1, self.head_dim), x.dtype)
-            slots, append = open_kv_cache(self, shape, self.max_seq_len, valid=valid, layout=self.kv_cache,
-                                          keys_as_values=True)
-            cache = (slots, self.max_seq_len, append.allocated)
+            slots, append = open_kv_cache(self, self._window(batch), shape, valid=valid)
+            cache = (slots, self.max_seq_len)
             if positions is None:
                 positions = slots
         positions = jnp.arange(length) if positions is None else jnp.asarray(positions)
@@ -952,19 +1026,19 @@ class DSparkAttention(DeepseekV4Attention):
             # The target's context in the window cache's layout, one shared head as its keys and values,
             # kept once where the layout stores it as given; a call without context reads it and writes
             # nothing.
-            held = KVStore.open(self, self.kv_cache, batch, self.max_seq_len, 1, self.head_dim, x.dtype,
-                                keys_as_values=True)
+            held = KVStore.open(self, self._window(batch))
             if main is not None:
-                slots, allocated = cache_positions(self, batch, main.shape[1], store.get(DRAFT_VALID))
-                if allocated:
-                    written = self._window_keys(
-                        main, *rotary_freqs(slots, self.rope_dim, self.rope_theta,
-                                            rope_scaling=self.rope_scaling, dtype=at_least_fp32(main.dtype)),
-                        down_projection(main, self.head_dim))[:, :, None]
-                    held.write(written, written, slots)
+                slots = cache_positions(self, batch, main.shape[1], store.get(DRAFT_VALID))
+                written = self._window_keys(
+                    main, *rotary_freqs(slots, self.rope_dim, self.rope_theta,
+                                        rope_scaling=self.rope_scaling, dtype=at_least_fp32(main.dtype)),
+                    down_projection(main, self.head_dim))[:, :, None]
+                held.write(written, written, slots)
+            else:
+                cache_variables(self, cursor(batch))
             main_keys, main_values = held.read()
             main_keys, main_values = held.plain(main_keys)[:, :, 0], main_values[:, :, 0]
-            last = jnp.asarray(self.get_variable('cache', 'cache_index')) - 1
+            last = self.get_variable('cache', CURSOR) - 1
             places, real = jnp.arange(main_keys.shape[1])[None], None
         elif main is None:
             raise ValueError(f"uncached, a DSpark stage's attention reads the whole context "

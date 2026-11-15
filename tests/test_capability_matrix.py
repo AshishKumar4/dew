@@ -59,9 +59,10 @@ from capability_modules import (
 from decision_support import decision_rows
 from flax.nnx import bridge
 from recording import RecordingTracker, finite
+from scenario_contract import assert_steps_finite
 from steady_state import steady_state
 from test_text_rollout_contract import assert_generation_scores_as_full_forwards
-from tiny_configs import PER_ARCH, TINY
+from tiny_configs import MATRIX_DECODER, PER_ARCH, TINY
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Loader, replayed
@@ -244,10 +245,6 @@ def torch_fallback() -> Loaded:
     return Loaded(source, source.model, source.variables)
 
 
-DECODER = {"vocab_size": 256, "emb_features": 16, "num_layers": 2, "num_heads": 2, "num_kv_heads": 1,
-           "mlp_features": 32, "max_seq_len": 64, "attention_impl": "reference"}
-"""A two-layer causal transformer 16 wide over the byte vocabulary."""
-
 CAUSAL_LM = frozenset({LOGITS, STATES, CAUSAL})
 DECODER_LM = CAUSAL_LM | {PACKING, CACHE}
 BIDIRECTIONAL_LM = frozenset({LOGITS, STATES, BIDIRECTIONAL})
@@ -318,15 +315,16 @@ def registered[V](registry: Mapping[str, object], rows: Mapping[str, V], kind: s
 FAMILIES: Mapping[str, tuple[Family, ...]] = registered(models, {
     "causal_transformer": (
         Family("causal_transformer", "causal_transformer", DECODER_LM | {TEXT}, 256,
-               built("causal_transformer", **DECODER)),
+               built("causal_transformer", **MATRIX_DECODER)),
         # The head as its own biased matrix, then a nonlinear head under a
         # softcap: the first is a table with a bias, the second no table.
         Family("causal_transformer+untied_biased_head", "causal_transformer", DECODER_LM, 256,
-               built("causal_transformer", **DECODER, tie_embeddings=False, head_bias=True)),
+               built("causal_transformer", **MATRIX_DECODER, tie_embeddings=False, head_bias=True)),
         Family("causal_transformer+nonlinear_head", "causal_transformer", DECODER_LM, 256,
-               built("causal_transformer", **DECODER, head_transform="gelu", final_logit_softcap=30.0)),
+               built("causal_transformer", **MATRIX_DECODER, head_transform="gelu",
+                     final_logit_softcap=30.0)),
         Family("causal_transformer+lora_with_head", "causal_transformer", DECODER_LM | {TEXT}, 256,
-               adapted(built("causal_transformer", **DECODER, tie_embeddings=False),
+               adapted(built("causal_transformer", **MATRIX_DECODER, tie_embeddings=False),
                        "q_proj", "v_proj", "lm_head")),
         Family("causal_transformer+mla_moe", "causal_transformer", DECODER_LM, 256,
                released("deepseek-v3-tiny")),
@@ -336,7 +334,8 @@ FAMILIES: Mapping[str, tuple[Family, ...]] = registered(models, {
         # A parallel hybrid's layers (`dew.nn.mixers.parallel`, Falcon-H1's): Mamba-2 beside attention on one
         # norm, each branch scaled in and out, their caches kept side by side.
         Family("causal_transformer+parallel_hybrid", "causal_transformer", DECODER_LM, 256,
-               built("causal_transformer", **DECODER, mixer={"class": "parallel", "fields": {"branches": [
+               built("causal_transformer", **MATRIX_DECODER,
+                     mixer={"class": "parallel", "fields": {"branches": [
                    {"name": "mamba", "input_multiplier": 1.3, "output_multiplier": 0.7,
                     "mixer": {"class": "mamba2", "fields": {"num_heads": 4, "head_dim": 8, "state_size": 8,
                                                             "n_groups": 1, "chunk_size": 8}}},
@@ -345,7 +344,7 @@ FAMILIES: Mapping[str, tuple[Family, ...]] = registered(models, {
         # Block-selected attention (`dew.nn.block_sparse`, MoBA's selection): each query its own block of two
         # places and the one earlier block its gate picks, of up to three.
         Family("causal_transformer+block_sparse", "causal_transformer", DECODER_LM, 256,
-               built("causal_transformer", **DECODER, mixer={"class": "block_sparse_attention",
+               built("causal_transformer", **MATRIX_DECODER, mixer={"class": "block_sparse_attention",
                                                             "fields": {"block": 2, "top_k": 2}})),
         Family("causal_transformer+mamba", "causal_transformer", DECODER_LM, 64, released("mamba-tiny")),
         Family("causal_transformer+mimo_v2_flash", "causal_transformer", DECODER_LM, 64,
@@ -356,7 +355,7 @@ FAMILIES: Mapping[str, tuple[Family, ...]] = registered(models, {
         Family("causal_transformer+dory", "causal_transformer", DECODER_LM | {TEXT}, 64,
                released("dory-tiny")),
         Family("causal_transformer+bidirectional", "causal_transformer", BIDIRECTIONAL_LM | {TEXT}, 256,
-               built("causal_transformer", **DECODER, causal=False)),
+               built("causal_transformer", **MATRIX_DECODER, causal=False)),
         Family("causal_transformer+modernbert", "causal_transformer", BIDIRECTIONAL_LM, 64,
                released("modernbert-tiny")),
         Family("causal_transformer+llada", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 128,
@@ -477,7 +476,8 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     The first batch passes the objective's input check, and one whose sample
     runs a position past its declared bound, which no geometry admits, fixed
     or variable, does not. The trainer builds the tree, and its step on the batch logs a finite
-    loss and leaves every trained leaf finite, some of them moved: Adam's
+    loss, takes a finite gradient at every step (`scenario_contract.assert_steps_finite`, read from
+    what the run logged) and leaves every trained leaf finite, some of them moved: Adam's
     first update moves a leaf exactly where its gradient is nonzero, and a
     gradient that is not finite would leave the leaf so. The run trains two
     steps, checkpointing each, and evaluation scores `evaluated` (the batch by default) to
@@ -508,6 +508,7 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     checkpoints.wait()
     losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
     assert len(losses) == 2 and np.all(np.isfinite(losses)), losses
+    assert_steps_finite(tracker.scalars, "the cell's run")
     variables = jax.device_get(state.variables)
     assert finite(variables), "a trained leaf is not finite"
     # The second step's update, from the first's checkpoint: Adam moves a leaf where its gradient is nonzero.

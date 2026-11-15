@@ -38,6 +38,7 @@ from dew.nn.flops import projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, Chunk, chunk
+from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
 from dew.nn.linear import fork_start, forked_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
@@ -69,6 +70,9 @@ def lightning_slopes(heads: int) -> tuple[float, ...]:
 
     return tuple(slopes(heads))
 
+
+STATE = 'recurrent_state'
+"""A lightning layer's decode cache leaf, each head's memory (`LightningAttention.cache_spec`)."""
 
 class LightningAttention(nn.Module):
     """The token mixer of a MiniMax `linear_attention` layer. Parameter names are the release's:
@@ -127,6 +131,13 @@ class LightningAttention(nn.Module):
         self.norm = RMSNorm(epsilon=self.norm_eps, scale_after_cast=True, dtype=self.dtype, name='norm')
         self.out_proj = dense(self.emb_features, name='out_proj', kernel_axes=('attention', 'embed'))
 
+    @nn.nowrap
+    def cache_spec(self, rows: int) -> dict[str, Opened]:
+        """The layer's decode cache for `rows` rows: each head's memory, in at least fp32, where the
+        recurrence runs."""
+        return {STATE: Opened((rows, self.num_heads, self.head_dim, self.head_dim),
+                              at_least_fp32(compute_dtype(self, self.dtype)))}
+
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
         batch, length, _ = x.shape
@@ -153,12 +164,9 @@ class LightningAttention(nn.Module):
             value = jnp.where(tokens.valid[:, :, None, None], value, 0)
         held = None
         if call.decode:
-            allocated = self.has_variable('cache', 'recurrent_state')
-            held = self.variable('cache', 'recurrent_state', jnp.zeros,
-                                 (batch, self.num_heads, self.head_dim, self.head_dim), wide)
-            if not allocated:
-                # The allocation-only call: init_cache's dummy token leaves no memory behind.
-                return self.out_proj(jnp.zeros((batch, length, self.features), qkv.dtype))
+            spec = self.cache_spec(batch)
+            stated(spec, STATE, (batch, self.num_heads, self.head_dim, self.head_dim), wide)
+            held = cache_variables(self, spec)[STATE]
         if tokens.forks is not None:
             # Each document from the memory its parent leaves, a root from the row's; a cached call's memory
             # left as it was.
@@ -186,7 +194,8 @@ class LightningAttention(nn.Module):
                                                 starts=tokens.starts, firsts=tokens.firsts),
                                chunk_size=self.chunk_size, max_segments=tokens.max_segments)
         if held is not None:
-            held.value = final.astype(held.value.dtype)
+            # The memory kept in the cache's dtype, as it always was.
+            kept(held, final.astype(held.value.dtype), STATE)
         # The recurrence's output under both names a remat policy reads it by (`RESIDUALS`).
         out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
         out = self.norm(out.reshape(batch, length, self.features))

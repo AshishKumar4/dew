@@ -562,6 +562,11 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     only they read, `pad_id` and `token_accuracy`.
     """
 
+    untraced: ClassVar[Mapping[str, str]] = {
+        "samples": "its preview's budget and sampling (`preview`, `task_settings`), which its loss, draw and "
+                   "optimizer do not read",
+        "_prompt": "its preview's prompt (`preview`), which its loss, draw and optimizer do not read"}
+
     saved_task = TextGeneration
     settings = TextSettings
     shown: Mapping[str, Shown] = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
@@ -1450,6 +1455,10 @@ class LMObjective(TokenScorer):
     `policy` and records no task.
     """
 
+    untraced: ClassVar[Mapping[str, str]] = {
+        "phase": "the parameters its draw freezes (`_phase_filter`), a function of its indexer, its model "
+                 "and the settings the key holds"}
+
     def __init__(
         self,
         model,
@@ -1671,12 +1680,6 @@ class LMObjective(TokenScorer):
             return None
         scored = self._scored_loss(variables, batch, step, train=step.training)
         return scored.statistics, scored.units * self.row_weights(batch, scored.units.shape[0])[:, None]
-
-    traced = ("seq_len", "balance", "head_chunks", "head_tile", "head_fused", "pad_id", "token_accuracy",
-              "prefix", "exit_entropy", "pass_weights", "mtp_weight", "z_loss", "loss_role", "indexer",
-              "adaptation")
-    """Its window, balance, head policy and every setting its loss reads; its indexer phase is its
-    indexer's."""
 
     def loss(self, variables, batch, step: Step) -> tuple[Ratio | RoutedStatistics, Aux[Variables]]:
         if self._warmup:

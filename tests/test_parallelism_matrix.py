@@ -165,14 +165,28 @@ def test_each_layout_of_a_model_matches_one_device_or_is_refused(model, layout, 
     assert_matches_one_device(model, layout, devices, references, SEEDS[model])
 
 
+SHARDED = ("dense_grpo", "moe_grpo", "unet", "edm2", "edm2_level")
+"""The models whose cells run as armada's map tasks, each cell a site of its own, its parameter written out
+with its mark (the plan reads them from the source, tools/armada/ci.py `sites`), so a map task compiles one
+cell's layout and its references: one site over a model's cells compiled each cell for its draws in every
+task (the U-Net's three, 452 s a task in CI, 2026-11-15). `test_the_sharded_sites_are_the_matrixs_cells`
+holds them to CELLS."""
+
+
 def marked_seeds(request) -> int:
     """The seeds a sharded cell declares: its test's `check1_shards` mark's, which CI's plan reads."""
     return request.node.get_closest_marker("check1_shards").kwargs["seeds"]
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layout", "devices"), cells("dense_grpo"), ids=named(cells("dense_grpo")))
-@pytest.mark.check1_shards(seeds=512, per_task=128)
+@pytest.mark.parametrize(("model", "layout", "devices"), [
+    pytest.param("dense_grpo", "tensor4", None, id="dense_grpo-tensor4",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
+    pytest.param("dense_grpo", "sequence4", None, id="dense_grpo-sequence4",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
+    pytest.param("dense_grpo", "data4_explicit", None, id="dense_grpo-data4_explicit",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
+])
 def test_a_grpo_decoders_layouts_match_one_device(model, layout, devices, references, request):
     """The matrix's cells (`assert_matches_one_device`) of the dense GRPO decoder, its draws as map tasks:
     its tensor4 cell judged 512 draws in 65 s whole (armada vq-layout-judge, 11-06)."""
@@ -180,8 +194,16 @@ def test_a_grpo_decoders_layouts_match_one_device(model, layout, devices, refere
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layout", "devices"), cells("moe_grpo"), ids=named(cells("moe_grpo")))
-@pytest.mark.check1_shards(seeds=512, per_task=64)
+@pytest.mark.parametrize(("model", "layout", "devices"), [
+    pytest.param("moe_grpo", "expert4", None, id="moe_grpo-expert4",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=64)),
+    pytest.param("moe_grpo", "expert2_fsdp2", None, id="moe_grpo-expert2_fsdp2",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=64)),
+    pytest.param("moe_grpo", "tensor4", None, id="moe_grpo-tensor4",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=64)),
+    pytest.param("moe_grpo", "sequence4", None, id="moe_grpo-sequence4",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=64)),
+])
 def test_a_grpo_mixtures_layouts_match_one_device(model, layout, devices, references, request):
     """The matrix's cells (`assert_matches_one_device`) of the GRPO mixture of experts, its draws as map
     tasks."""
@@ -202,8 +224,14 @@ def test_a_routed_tails_pipeline_matches_one_device(model, layout, devices, refe
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layout", "devices"), cells("unet"), ids=named(cells("unet")))
-@pytest.mark.check1_shards(seeds=128, per_task=24)
+@pytest.mark.parametrize(("model", "layout", "devices"), [
+    pytest.param("unet", "tensor4", None, id="unet-tensor4",
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=24)),
+    pytest.param("unet", "fsdp2_tensor2", None, id="unet-fsdp2_tensor2",
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=24)),
+    pytest.param("unet", "sequence4", None, id="unet-sequence4",
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=24)),
+])
 def test_a_unets_layouts_match_one_device(model, layout, devices, references, request):
     """The matrix's cells (`assert_matches_one_device`) of the U-Net, its draws as map tasks: its tensor4
     cell judged 128 draws in 116 s whole (armada vq-layout-judge, 11-06)."""
@@ -211,8 +239,14 @@ def test_a_unets_layouts_match_one_device(model, layout, devices, references, re
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layout", "devices"), cells("edm2"), ids=named(cells("edm2")))
-@pytest.mark.check1_shards(seeds=512, per_task=64)
+@pytest.mark.parametrize(("model", "layout", "devices"), [
+    pytest.param("edm2", "tensor4", None, id="edm2-tensor4",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=64)),
+    pytest.param("edm2", "fsdp2_tensor2", None, id="edm2-fsdp2_tensor2",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=64)),
+    pytest.param("edm2", "sequence4", None, id="edm2-sequence4",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=64)),
+])
 def test_edm2s_layouts_match_one_device(model, layout, devices, references, request):
     """The matrix's cells (`assert_matches_one_device`) of EDM2's magnitude-preserving U-Net, its draws as
     map tasks: its fsdp2_tensor2 cell judged 512 draws in 117 s whole (armada vq-layout-judge, 11-06), where
@@ -221,8 +255,12 @@ def test_edm2s_layouts_match_one_device(model, layout, devices, references, requ
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layout", "devices"), cells("edm2_level"), ids=named(cells("edm2_level")))
-@pytest.mark.check1_shards(seeds=256, per_task=64)
+@pytest.mark.parametrize(("model", "layout", "devices"), [
+    pytest.param("edm2_level", "tensor4", None, id="edm2_level-tensor4",
+                 marks=pytest.mark.check1_shards(seeds=256, per_task=64)),
+    pytest.param("edm2_level", "fsdp2_tensor2", None, id="edm2_level-fsdp2_tensor2",
+                 marks=pytest.mark.check1_shards(seeds=256, per_task=64)),
+])
 def test_edm2s_level_conditioned_layouts_match_one_device(model, layout, devices, references, request):
     """The matrix's cells (`assert_matches_one_device`) of EDM2's level-conditioned U-Net, its draws as map
     tasks."""
@@ -237,3 +275,14 @@ def test_each_split_draws_a_models_initial_parameters_as_one_device_does(model, 
     its own random bits, which every layout draws alike (`layout_parity.held_draw`)."""
     tool, _ = references
     tool.held_draw(model, layout, seeds=DRAW_SEEDS, devices=devices)
+
+
+def test_the_sharded_sites_are_the_matrixs_cells():
+    """Each sharded model's sites, written out one a cell, are its cells in CELLS, each once."""
+    tests = (test_a_grpo_decoders_layouts_match_one_device, test_a_grpo_mixtures_layouts_match_one_device,
+             test_a_unets_layouts_match_one_device, test_edm2s_layouts_match_one_device,
+             test_edm2s_level_conditioned_layouts_match_one_device)
+    written = sorted(tuple(param.values) for test in tests
+                     for mark in test.pytestmark if mark.name == "parametrize" for param in mark.args[1])
+    assert written == sorted(cells(*SHARDED))
+

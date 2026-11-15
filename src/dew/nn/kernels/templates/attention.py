@@ -38,7 +38,17 @@ import jax.numpy as jnp
 from dew._hashing import fmix32
 from dew.nn.derivatives import Protected, contracted
 from dew.nn.kernels import generation, tuning
-from dew.nn.precision import at_least_fp32, compensated_sum, exact_float32, float32_einsum
+from dew.nn.kernels.templates import bodies
+from dew.nn.precision import (
+    at_least_fp32,
+    binade_of,
+    compensated_sum,
+    exact_float32,
+    float32_einsum,
+    lowered_divide,
+    raised_exactly,
+    two_sum,
+)
 
 
 @jax.tree_util.register_dataclass
@@ -1378,6 +1388,20 @@ def whole(count: int, block: int) -> int:
     return -(-count // block) * block
 
 
+WIDEST_POWER = 256
+"""The widest head a TMA family's launch pads to a power of two (`head_width`): past it, a power of two
+pads an absorbed MLA key's 576 columns to 1024."""
+
+
+def head_width(width: int) -> int:
+    """The head width a TMA family's launch tiles (`padded_call`'s `widths`): a power of two to
+    `WIDEST_POWER` (`power_of_two`), whole groups of 64 columns past it, an absorbed MLA key's 576 (its
+    latent's 512 and its rotary 64) and its value's 512 as they are, which a copy loads whole (a tiled
+    box's dimensions, `mosaic.Family.copy_extent`). 64 is a 128-byte swizzle's columns of a 16-bit dtype,
+    the Mosaic mainloop's only operands (`attention_mosaic_program.refused`'s 'dtype')."""
+    return power_of_two(width) if width <= WIDEST_POWER else whole(width, 64)
+
+
 def _padded(param: Param, queries: int, keys: int, value_width: int, *, widened: bool = True) -> jax.Array:
     """A hook parameter at the padded call's shape, in fp32 as the kernels compute a score or output hook
     (its gradient returns in its own dtype), in its own where not `widened` (a prologue's, which takes it as
@@ -1447,18 +1471,19 @@ class PaddedCall:
 
 def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
                 block: int, table: jax.Array | None = None, *, query_block: int | None = None,
-                by_position: bool = False) -> PaddedCall:
+                by_position: bool = False, widths: Callable[[int], int] = power_of_two) -> PaddedCall:
     """A call's one padding for every mainloop of the template (`PaddedCall`): its queries and keys at
     whole `block`s (a backend's largest tile), its queries at whole `query_block`s instead where a launch
-    walks no key block of its own over them (an inference forward's), its head widths at powers of two, its
-    spans an interval a query unless the caller's programs read them `by_position` (`KeySpans.per_span`). A
-    paged call's (`table`, its page table) `key` and `value` are its pools `[KV, P, page, D]`, flattened,
-    padded in their widths alone: its keys are its table's slots, whole blocks where its page is."""
+    walks no key block of its own over them (an inference forward's), its head widths at powers of two
+    (`widths`; a TMA family's `head_width`), its spans an interval a query unless the caller's programs
+    read them `by_position` (`KeySpans.per_span`). A paged call's (`table`, its page table) `key` and
+    `value` are its pools `[KV, P, page, D]`, flattened, padded in their widths alone: its keys are its
+    table's slots, whole blocks where its page is."""
     queries, width = query.shape[1], query.shape[3]
     page = None if table is None else key.shape[2]
     keys, value_width = (key.shape[1] if table is None else table.shape[1] * key.shape[2]), value.shape[-1]
     padded_q, padded_k = whole(max(queries, 1), query_block or block), whole(max(keys, 1), block)
-    padded_d, padded_dv = power_of_two(width), power_of_two(value_width)
+    padded_d, padded_dv = widths(width), widths(value_width)
     if table is not None and keys % block:
         # A row's pages padded to whole blocks with page 0, whose slots no span of the call reaches.
         if block % key.shape[2]:
@@ -1757,7 +1782,8 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     padded to whole `block`s (`padded_call`), `launch(query, key, value, dout, peak0, total0, initial_term,
     maximum, key_index, anchor_value, others, own, others_total, total, start, end, query_ids, key_ids,
     score_params, *, score_mod, score_kinds, score_dtypes, scale, prescale)` giving dQ, the softmax's rows (`D
-    - c`, `c`, `m`, `T`, the keys' mass), each query's anchor key as it chose it, the dQ program's hook
+    - c`, `c`, `m`, `T`, the keys' mass, and what `D - c`'s rounding lost, `attention_gradient.dq_finish`),
+    each query's anchor key as it chose it, the dQ program's hook
     gradients (`DQ_GRADS`), then dK, dV and the dK/dV program's (`DKV_GRADS`); each gradient fp32, then
     rounded to its input's dtype. D is taken two ways, about 0 and about the anchor key's `v_c · dO`, each
     query the nearer, from the forward's split sums (`attention_gradient.split_delta`) or a first pass of the
@@ -1780,12 +1806,13 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     state = hooks.initial
     kinds = params["score_kinds"]
     outputs = launch(*arrays, **params)
-    dq, softmax = outputs[0], outputs[1:6]
-    grads_out = list(outputs[7:])
+    dq, softmax = outputs[0], outputs[1:7]
+    grads_out = list(outputs[8:])
     dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
     dk, dv, *key_grads = grads_out
-    delta, anchor, peak, total, mass = (array[:, :, :queries] for array in softmax)
-    delta = anchor + delta
+    delta, anchor, peak, total, mass, lost = (array[:, :, :queries] for array in softmax)
+    # D and what its two roundings lost, its refinement's (`lost`, `gradient.dq_finish`) and its anchor's sum.
+    delta, low = two_sum(anchor, delta)
     padded_k, padded_d, padded_dv = call.key.shape[1], call.key.shape[-1], call.value.shape[-1]
     if dk.shape[2] != kv_heads:
         # A launch's gradients a query head's each, a key head's summed here (in a fixed order); a launch
@@ -1818,13 +1845,37 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
         # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
         # Its weight before any product, as the launch takes it (`attention_gradient.refinement`).
-        moved = (starts[2] - delta) * ((starts[1] * factor) * inverse)
+        # Less D's rounded parts: a state that holds nearly all the weight has `starts[2]` and D equal in fp32
+        # where they differ by D's refinement alone (an fp16 call beside a state near fp32's largest, 4,094 of
+        # its maxima's gradients 0 in place of 1e-34, row 6302).
+        moved = (((starts[2] - delta) - low) - lost) * ((starts[1] * factor) * inverse)
         # Its denominator's: D over T in one division, as the reference's derivative of its own division
         # rounds it, not D times T's rounded inverse (row 2466: 1.5 to 1.66 times the reference's error from
         # float64 at fp32 sums).
         share = jnp.where(total > 0, delta / jnp.where(total > 0, total, 1.0), 0.0)
+        # Its product with the state's factor, below fp32's least normal where the state's denominator is
+        # large or its maximum lies far under the walk's, kept on a CPU, which flushes the share, the factor
+        # and their product: the factor as two normal halves `exp(d / 2)` (row 6302, 161 of a resumed
+        # state's denominators' gradients 0).
+        held = (total > 0) & jnp.isfinite(starts[0])
+        half = jnp.where(held, jnp.exp(jnp.minimum(starts[0] - peak, 0.0) * 0.5), 0.0)
+
+        def weighed_by(*, flushing: bool) -> jax.Array:
+            if not flushing:
+                return share * factor
+            # `delta * half * half / total` with D raised from its bits until its products stay normal,
+            # divided and lowered in one rounding (`lowered_divide`).
+            nonzero = (binade_of(delta) > -1024) & (binade_of(half) > -1024) & (total > 0)
+            binades = binade_of(delta) + 2 * binade_of(half)
+            ceiling = jnp.maximum(126 - binade_of(delta), 0)
+            raised = jnp.where(nonzero, jnp.clip(-124 - binades, 0, ceiling), 0)
+            numerator = raised_exactly(delta, raised) * half * half
+            divisor = jnp.where(total > 0, total, 1.0)
+            return jnp.where(nonzero, lowered_divide(numerator, divisor, raised), 0.0)
+
+        weighed = bodies.subnormals(weighed_by, delta.dtype)
         initial = Initial(m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
-                          total=(-share * factor).astype(state.total.dtype),
+                          total=(-weighed).astype(state.total.dtype),
                           acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
     # Unrounded (`rounded` False), dK and dV stay in at least fp32 for a caller that sums them across
     # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).

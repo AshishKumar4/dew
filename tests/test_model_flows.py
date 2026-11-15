@@ -4,6 +4,7 @@ its reference arm the reference path alone, and its truth computes in float64; a
 truths (`reference_error.stored_truths`) judge as the truths a site computes itself, a missing or stale
 one refused."""
 
+import dataclasses
 import os
 import sys
 import tempfile
@@ -15,12 +16,13 @@ import jax.numpy as jnp
 import model_flows
 import numpy as np
 import pytest
+from map_judge import site_id
 from process_support import relayed
 from reference_error import MissingTruth, assert_as_exact, stored_truths
 
 from dew.nn.kernels import generation
-from dew.parity import GateFailure
-from dew.parity_stages import staged_units
+from dew.nn.kernels.selection import Refusal
+from dew.parity import FEWEST_SEEDS, GateFailure
 
 
 def _routes(program, *, reference: bool = False) -> list:
@@ -40,9 +42,10 @@ def _routes(program, *, reference: bool = False) -> list:
 @pytest.mark.parametrize("name", [flow.name for flow in model_flows.FLOWS])
 def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monkeypatch):
     """The flow's training step and decode loop traced as `target`'s GPU chooses (`generation.assumed`) and
-    held as its prepare holds them: every route the flow is for taken off the reference path or by the
-    kernel it names (`model_flows.held_routes`), but by the portable math where it is native on other GPUs
-    alone (`Flow.families`); its reference arm on the reference path alone (`model_flows.held_reference`)."""
+    held as its prepare holds them: every route the flow is for that a native kernel claims there
+    (`model_flows.claimed`, read from the routes) taken off the reference path or by the kernel it names
+    (`model_flows.held_routes`); its reference arm on the reference path alone
+    (`model_flows.held_reference`)."""
     flow = model_flows.flow_named(name)
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
@@ -55,22 +58,24 @@ def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monk
 
 
 def test_a_training_step_on_the_templates_plain_jax_mainloop_does_not_reach_its_route(monkeypatch):
-    """An attention flow whose training step runs the template on the plain-JAX mainloop
-    (`generation.chosen`'s `attention_mainloop='portable'`, as a GPU's mainloops declining it would), its
-    decode loop on the GPU's own, does not hold: each program is held to its own routes, and the template's
-    every pass to a GPU's mainloop (`model_flows.EVERY`), so a training step whose one pass, its backward,
-    took the plain-JAX one beside a native forward does not hold either."""
+    """An attention flow whose training step took the plain-JAX mainloop in one pass, its backward, beside a
+    GPU's own in the rest (the GPU's preferred mainloop turned down there, as one declining a call would),
+    does not hold: the template's every pass is held to a GPU's mainloop where one claims it
+    (`model_flows.EVERY`, `model_flows.claimed`). Forced onto the plain-JAX mainloop by the caller
+    (`generation.chosen`), no GPU mainloop claims it and the flow holds, as it does on its own routes."""
     flow = model_flows.flow_named("dense bf16, the lane's")
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
     with generation.assumed("sm90"), jax.default_matmul_precision(flow.precision):
         native = {kind: _routes(programs[f"{kind} dew"]) for kind in model_flows.KINDS}
         with generation.chosen(attention_mainloop="portable"):
-            portable = _routes(programs["train dew"])
+            forced = _routes(programs["train dew"])
     model_flows.held_routes(flow, native, "sm90")
-    with pytest.raises(model_flows.Unreached):
-        model_flows.held_routes(flow, {**native, "train": portable}, "sm90")
-    one_pass = [route for route in portable if str(route.choice) == "attention_mainloop"][:1]
+    model_flows.held_routes(flow, {**native, "train": forced}, "sm90")
+    preferred = {str(route.choice): route.preferred for route in native["train"]}
+    one_pass = [dataclasses.replace(route, preferred=preferred[str(route.choice)], forced=None,
+                                    refusal=Refusal("declined", "the GPU's mainloop declines the call"))
+                for route in forced if str(route.choice) == "attention_mainloop"][:1]
     assert one_pass
     with pytest.raises(model_flows.Unreached):
         model_flows.held_routes(flow, {**native, "train": [*native["train"], *one_pass]}, "sm90")
@@ -98,15 +103,17 @@ def store():
 @pytest.mark.parametrize("name", [flow.name for flow in model_flows.FLOWS])
 def test_a_flows_truth_computes_in_float64(name, store, monkeypatch):
     """The flow's truths prepared on a CPU as its node prepares them, its first draw's of each program held to
-    float64 (check 1's `_of_float64`), every draw its two stages may take written to the store."""
-    flow = model_flows.flow_named(name)
+    float64 (check 1's `_of_float64`), each site's first stage written to the store: here at the fewest
+    seeds check 1 takes (`parity.FEWEST_SEEDS`), where its node's prepare writes its declared count (a
+    params-sized gradient a draw, which at the sinks flows' 128 would write 9 GB a flow on this CPU)."""
+    fewest = dict.fromkeys(model_flows.KINDS, FEWEST_SEEDS)
+    flow = dataclasses.replace(model_flows.flow_named(name), seeds=fewest)
     monkeypatch.setenv(model_flows.TRUTHS, str(store))
     monkeypatch.setenv(model_flows.PREPARE, "1")
     for kind in model_flows.KINDS:
         model_flows.judge(flow, {}, kind)
     written = sorted((model_flows.store_of(flow) / "truths").iterdir())
-    assert len(written) == 2
-    assert all(len(list(site.glob("*.truth"))) == staged_units(flow.seeds) for site in written)
+    assert [len(list(site.glob("*.truth"))) for site in written] == list(fewest.values())
 
 
 @pytest.mark.parametrize("lane", [True, False], ids=["the lane's", "a user's"])
@@ -170,21 +177,22 @@ def _site(salt: int = 5461):
 
 
 def test_a_prepared_site_judges_as_one_that_computes_its_truth_and_refuses_a_missing_or_stale_one(tmp_path):
-    """A site prepared (`stored_truths(prepare=True)`) writes every draw's truth and runs no arm; judged from
-    that store it passes as it passes computing its own; a store of another stamp, or none, is a red
-    (`MissingTruth`), never a truth computed in its place."""
+    """A site prepared (`stored_truths(prepare=True)`, every stage's draws: a later job's, `later`) writes
+    every draw's truth and runs no arm; judged from that store it passes as it passes computing its own; a
+    store of another stamp, or none, is a red (`MissingTruth`), never a truth computed in its place."""
     dew, reference, draw = _site()
-    with stored_truths(tmp_path, prepare=True, stamp="a"):
+    later_sites = {site_id("a prepared product"), site_id("another product")}
+    with stored_truths(tmp_path, prepare=True, stamp="a", later=later_sites):
         assert_as_exact(None, reference, draw, "a prepared product", seeds=8)
         with pytest.raises(ValueError):
             assert_as_exact(None, reference, draw, "a prepared product", seeds=8)
     assert len(list(tmp_path.iterdir())) == 1
     assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
-    with stored_truths(tmp_path, prepare=False, stamp="a"):
+    with stored_truths(tmp_path, prepare=False, stamp="a", later=later_sites):
         assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
-    with stored_truths(tmp_path, prepare=False, stamp="b"), pytest.raises(MissingTruth):
+    with stored_truths(tmp_path, prepare=False, stamp="b", later=later_sites), pytest.raises(MissingTruth):
         assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
-    with stored_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
+    with stored_truths(tmp_path, prepare=False, stamp="a", later=later_sites), pytest.raises(MissingTruth):
         assert_as_exact(dew, reference, draw, "another product", seeds=8)
     # The same site over another seed stream: draws its prepare did not make.
     _, _, other = _site(5462)
@@ -210,12 +218,13 @@ def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
     def leaving_a_term(a, b):
         return cancelling(a, b).at[16].add(a[0, 0] * b[0, :])
 
-    with stored_truths(tmp_path, prepare=True, stamp="a"):
+    later_sites = {site_id("a cancelling product")}  # every stage's draws prepared
+    with stored_truths(tmp_path, prepare=True, stamp="a", later=later_sites):
         assert_as_exact(None, cancelling, draw, "a cancelling product", seeds=8)
     assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
     with pytest.raises(GateFailure) as computing:
         assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product", seeds=8)
-    with stored_truths(tmp_path, prepare=False, stamp="a"):
+    with stored_truths(tmp_path, prepare=False, stamp="a", later=later_sites):
         assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
         with pytest.raises(GateFailure) as stored:
             assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product", seeds=8)

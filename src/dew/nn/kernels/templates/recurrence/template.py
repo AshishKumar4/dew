@@ -17,7 +17,7 @@ import dataclasses
 import functools
 import math
 import threading
-from collections.abc import Iterable, Set
+from collections.abc import Hashable, Iterable, Iterator, Set
 from typing import ClassVar
 
 import jax
@@ -595,26 +595,54 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def _settled(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                  ) -> mainloop.Tiles:
-        """`tiles` with their spilling launches' producers raised a setmaxnreg step at a time for as long as a
+        """`tiles` with their spilling launches' producers stepped down their ladders for as long as a
         compile found them spilling (`report.spilled`: a training call's at its tiles, a forward alone's at
-        its own, `Tiles.forward`) and a raise answers it (`_raised`): the assembler, not a model, finds a
-        producer's registers. Tiles still spilling past the last raise their derivation refuses
-        (`_chunked`)."""
+        its own, `Tiles.forward`) and a rung answers it (`_raised`): first each producer's top, the program's
+        entry share, which every role holds with no register moved, then a setmaxnreg step lower at a time,
+        each rung giving its consumers a step more: the assembler, not a model, finds a producer's registers.
+        A spill at the top is the consumers', the producer holding there all it may; a rung below holds
+        wherever the producer's need and the consumers' meet. Tiles still spilling at the ladder's foot their
+        derivation refuses (`_chunked`). From the foot up, the 4B's reverse walk took eight compiles of a
+        B200's cold start, 95 s, to the 80 registers its producer holds; its top, 128, holds in one."""
         while (spilled := _spilled(self, ba, tiles)) and (
                 raised := self._raised(ba, tiles, spilled, target)) is not None:
             tiles = _producing(tiles, raised)
         return tiles
 
+    def emitted(self, config: Hashable, kernel: str) -> Hashable:
+        """What `kernel` reads of `config` as it is emitted: all of it but the other launches' producers
+        (`Tiles.producers`, each launch's own setmaxnreg cap), so a producer's raise leaves every other kernel
+        of the launch the module it was, which a rung's certification then reads from the lowering cache and
+        Mosaic's compile (`rungs`): a rung re-lowered and recompiled every kernel of the 4B's training launch,
+        7 and 5 s of each 12."""
+        if not self._typed(config):
+            return config
+        owner = _owner(kernel, dict(config.producers.raised_to))
+        return _producing(config, resources.Producers(tuple(
+            (launch, cap) for launch, cap in config.producers.raised_to if launch == owner)))
+
+    def rungs(self, ba: tokamax.BoundArguments, config: Hashable) -> Iterator[mainloop.Tiles]:
+        """The tiles a refused `config`'s spilling launches' producers step through (`_raised`): each one's
+        top first, then a setmaxnreg step lower a rung, each planned as it is asked for: the ladder `_settled`
+        takes a compile at a time, which certification asks its top alone and then a round at a time
+        (`tuning.KernelOp._climbed`)."""
+        if not self._typed(config):
+            return
+        target, spilled, rung = generation.gpu_target(), _spilled(self, ba, config), config
+        while spilled and (raised := self._raised(ba, rung, spilled, target)) is not None:
+            rung = _producing(rung, raised)
+            yield rung
+
     def _raised(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                 target: generation.GpuTarget) -> resources.Producers | None:
-        """`joined`'s producers with those of its `spilled` launches (each kernel's own, `_owners`) a
-        setmaxnreg step higher (`resources.Producers.raised`), each a launch whose program moves registers
-        from its producer at its planned residency (`resources.moves_registers`, as its schedule does); None
-        where none does, one can rise no further, or its consumers' share beside the raised producer would
-        fall below setmaxnreg's least (its tiles then refused, the next derived). A raise moves registers
-        within a program's pool, which its launch plans at the least (`mainloop.launch_kernel`): whether the
-        consumers hold beside the raised producer is the assembler's, a compile that spills them refusing
-        it."""
+        """`joined`'s producers with those of its `spilled` launches (each kernel's own, `_owners`) at the
+        next rung of their ladders (`resources.Producers.stepped`): the top, the program's entry share at its
+        planned residency, which bounds a producer (past it the roles' moves invert and the assembler rejects
+        the kernel), then a setmaxnreg step lower; each a launch whose program moves registers from its
+        producer (`resources.moves_registers`, as its schedule does). None where none does or one is at its
+        ladder's foot (its tiles then refused, the next derived). A rung moves registers within a program's
+        pool, which its launch plans at the least (`mainloop.launch_kernel`): whether its roles hold is the
+        assembler's, a compile that spills them refusing it."""
         family = bundle(target, _dtype(ba))
         assert family is not None
         launches = (*self.launches(ba, joined, target, backward=True),
@@ -625,15 +653,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
         moving = [launch for launch in launches if launch.name in owned
                   and resources.moves_registers(launch.registers, (launch.family or family).warpgroups(
                       launch.consumers), launch.consumers, launch.resident)]
-        producers = joined.producers.raised({launch.name for launch in moving}) if moving else None
-        if producers is None:
-            return None
-        least = resources.facts().raises().lowest
-        # Each raised launch's consumers keep a share setmaxnreg can move them to.
-        expressed = all(min(resources.role_registers((1,) * launch.consumers + (0,), launch.resident,
-                                                     floor=producers.of(launch.name))[:-1]) >= least
-                        for launch in moving)
-        return producers if expressed else None
+        tops = {launch.name: resources.entry_registers(
+            (launch.family or family).warpgroups(launch.consumers), launch.resident) for launch in moving}
+        return joined.producers.stepped(tops) if moving else None
 
     def _derive(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, chunk: int, *,
                 training: bool, refused: Set[mainloop.Tiles] = frozenset()) -> mainloop.Tiles | None:
@@ -878,12 +900,16 @@ def _spilled(op, ba: tokamax.BoundArguments, tiles: mainloop.Tiles) -> frozenset
                                             else frozenset())
 
 
+def _owner(kernel: str, names: Iterable[str]) -> str | None:
+    """The launch of `names` that ran `kernel`: the longest it starts with, a name another launch's extends
+    (`recurrence_intra` beside `recurrence_intra_solve`) owning only its own."""
+    return next((name for name in sorted(names, key=len, reverse=True) if kernel.startswith(name)), None)
+
+
 def _owners(kernels: Iterable[str], launches: Iterable[mainloop.Launch]) -> frozenset[str]:
-    """The launches that ran `kernels`, by name: each kernel's the longest launch name it starts with, a name
-    another launch's extends (`recurrence_intra` beside `recurrence_intra_solve`) owning only its own."""
-    names = sorted({launch.name for launch in launches}, key=len, reverse=True)
-    return frozenset(owner for kernel in kernels
-                     if (owner := next((name for name in names if kernel.startswith(name)), None)))
+    """The launches that ran `kernels`, by name (`_owner`)."""
+    names = {launch.name for launch in launches}
+    return frozenset(owner for kernel in kernels if (owner := _owner(kernel, names)))
 
 
 def _producing(tiles: mainloop.Tiles, producers: resources.Producers) -> mainloop.Tiles:

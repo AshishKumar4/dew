@@ -28,7 +28,7 @@ import functools
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NotRequired, TypedDict
+from typing import TYPE_CHECKING, ClassVar, NotRequired, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -567,6 +567,10 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio, Variables]):
     policy's loss (SkyDreamer, arXiv 2510.14783 Eq 11, its 0.002: on the mean alone, so the entropy bonus
     is untouched)."""
 
+    untraced: ClassVar[Mapping[str, str]] = {
+        "_bins": "its return bins (`bins`), an array of its model's `bins` (`twohot_bins`), which the key "
+                 "holds as the module its programs run"}
+
     shown: Mapping[str, Shown] = {"loss": Shown(), "episode_return": Shown(better="higher")}
     resumable = ("entropy",)
     """The entropy bonus weighs how the policy explores, which SkyDreamer lowers for its last phase; the
@@ -613,14 +617,15 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio, Variables]):
         self.slow_targets, self.smoothness = slow_targets, smoothness
         self.ema = EMASpec(optax.constant_schedule(slow_decay), under("params", "value"),
                            stated=("constant", slow_decay, "params/value"))
-        self.bins = twohot_bins(model.bins)
+        self._bins = twohot_bins(model.bins)
+
+    @property
+    def bins(self) -> jax.Array:
+        """Its return bins, of its model's count (`twohot_bins`): read alone, never set apart from it."""
+        return self._bins
 
     def held_variables(self) -> Variables | None:
         return self.variables
-
-    traced = ("horizon", "imagination", "lam", "entropy", "free_nats", "return_rate", "scales", "imitates",
-              "slow_targets", "smoothness")
-    """Its settings; its return bins are its model's, its slow targets' decay its EMA's."""
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         params_key, latent = jax.random.split(key)

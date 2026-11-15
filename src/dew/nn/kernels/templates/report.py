@@ -12,10 +12,13 @@ import collections
 import contextlib
 import contextvars
 import dataclasses
+import functools
 import hashlib
 import importlib.util
+import itertools
 import json
 import logging
+import os
 import re
 import shutil
 import struct
@@ -37,7 +40,7 @@ from google.protobuf.unknown_fields import UnknownFieldSet
 from jax._src.thunky import thunky
 from jax.extend.mlir import ir
 
-from dew import communicators
+from dew import _cache, communicators
 from dew._devices import deviceless, xla_flag
 from dew.nn.kernels import generation
 
@@ -59,16 +62,18 @@ def shared_asked(error: BaseException) -> int | None:
 
 
 LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})$")
-"""The suffix a kernel's name carries for the launch that traced it (`named`): the digest of its launch."""
+"""The suffix a kernel's name carries within the launch that traced it (`named`): the digest of its identity
+there, its launch's digest where the launch states no kernel's part (`tuning.KernelOp.emitted`)."""
 KERNEL_FUNCTION = re.compile(r"(?P<kernel>.*)_mosaic_gpu_kernel")
 """A Mosaic GPU kernel's function in its binary: its kernel's name, the host function's `_mosaic_gpu`
 (jax/experimental/mosaic/gpu/core.py) and GPU outlining's `_kernel`."""
 
 
 def kernel_of(name: str) -> tuple[str, str | None]:
-    """`(kernel, launch)` of a kernel's `name` as it traced (`named`), its function in its binary or its PTX
-    entry (`KERNEL_FUNCTION`) or its call's location: its name less the launch's suffix, and the launch's
-    digest, None where it carries none."""
+    """`(kernel, identity)` of a kernel's `name` as it traced (`named`), its function in its binary or its PTX
+    entry (`KERNEL_FUNCTION`) or its call's location: its name less its suffix, and the suffix's digest
+    (`LAUNCH_SUFFIX`: its launch's, where its launch states no kernel's part; a Mosaic GPU call carries its
+    launch beside, `launch_metadata`), None where it carries none."""
     function = KERNEL_FUNCTION.fullmatch(name)
     kernel = function.group("kernel") if function else name
     launch = LAUNCH_SUFFIX.search(kernel)
@@ -79,6 +84,9 @@ MOSAIC_TARGET = b"mosaic_gpu_v2"
 """The custom call target of a Mosaic GPU kernel, which its thunk names (`_kernels`)."""
 SHARED_BYTES = 10
 """The `MosaicGpuKernelProto` field of the dynamic shared memory a kernel's launch asks for (`smem_bytes`)."""
+CALLER_METADATA = 12
+"""The `MosaicGpuKernelProto` field of what its call's caller stated of the launch (`caller_metadata`, Dew's
+JAX build's kernel-metadata): Dew's launch's digest (`launch_metadata`)."""
 CUSTOM_KERNEL_THUNK = 36
 """The `ThunkProto` field of a custom kernel's thunk, a Pallas-Triton launch's (`CustomKernelThunkProto`): its
 kernel (3, `CustomKernelProto`), whose loader spec (2) holds its cubin (2, `CudaCubinProto`; 1) and which
@@ -102,6 +110,8 @@ class Launch:
     config: Hashable
     padded: float | None = None
     kernels: dict[str, "RegisterModel"] = dataclasses.field(default_factory=dict, compare=False)
+    emitted: Callable[[str], Hashable] | None = dataclasses.field(default=None, compare=False)
+    """What each kernel's emission reads of `config`, by its name (`tuning.KernelOp.emitted`)."""
     """Each kernel the launch traced that stated its register model as it was named (`named`'s `model`), by
     its name less the launch's suffix (`kernel_of`'s): the launch's stated register allocation, whose
     producer the compile gate checks its emission lowers to."""
@@ -115,6 +125,7 @@ class _Pending:
     op: str
     config: Hashable
     padded: Callable[[], float | None]
+    emitted: Callable[[str], Hashable]
     digest: str | None = None
 
 
@@ -220,7 +231,8 @@ def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterat
     """Within the block, the kernels a template's launch traces carry its digest in their names (`named`),
     the same in every process, and their binaries name the launch (`Binary.launch`, `traced`)."""
     token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config,
-                                  lambda: op.padded(arguments, config)))
+                                  lambda: op.padded(arguments, config),
+                                  functools.partial(op.emitted, config)))
     try:
         yield
     finally:
@@ -238,8 +250,9 @@ def relaunched(digest: str | None) -> Iterator[None]:
     if launch is None:
         yield
         return
+    assert launch.emitted is not None
     token = _TRACING.set(_Pending(lambda: launch.identity, launch.op, launch.config, lambda: launch.padded,
-                                  digest))
+                                  launch.emitted, digest))
     try:
         yield
     finally:
@@ -255,21 +268,37 @@ def named(name: None, *, model: "RegisterModel | None" = None) -> str | None: ..
 
 
 def named(name: str | None, *, model: "RegisterModel | None" = None) -> str | None:
-    """A kernel's name carrying the launch tracing it (`launching`; `kernel` for an unnamed one), as is
-    where none is; its register `model`, where given, recorded on that launch (`Launch.kernels`)."""
+    """A kernel's name carrying its identity within the launch tracing it (`launching`; `kernel` for an
+    unnamed one), as is where none is: the digest of the launch's identity and of what the kernel's emission
+    reads of the launch's config (`tuning.KernelOp.emitted`, the whole config unless the op states a
+    kernel's part), so a kernel a change to its launch leaves alone keeps its name, its module, and the
+    lowering cache's and Mosaic's compile of it; a launch that states no part names its kernels by its
+    digest. The launch itself travels beside the name, as its call's metadata (`launch_metadata`). Its
+    register `model`, where given, is recorded on that launch (`Launch.kernels`)."""
     digest = launch_digest()
     if digest is None:
         return name
     kernel = name or "kernel"
+    pending = _TRACING.get()
+    assert pending is not None
     if model is not None:
         with _GUARD:
             _LAUNCHES[digest].kernels[kernel] = model
-    return launch_name(kernel, digest)
+    return launch_name(kernel, _digest(f"{_LAUNCHES[digest].identity}|{pending.emitted(kernel)!r}"))
+
+
+def launch_metadata() -> bytes:
+    """The launch tracing (`launching`) as its kernels' calls carry it beside their names (`named`): its
+    digest, a Mosaic GPU call's caller metadata (`plgpu.CompilerParams.metadata`, kept in its compiled call's
+    serialization, `Binary.launch`; not its module's, so no lowering or compile of the kernel reads it);
+    none where no launch traces."""
+    digest = launch_digest()
+    return b"" if digest is None else digest.encode()
 
 
 def launch_name(kernel: str, launch: str | None) -> str:
-    """`kernel`'s name carrying `launch`'s digest (`LAUNCH_SUFFIX`), as is where None: `kernel_of`'s
-    inverse."""
+    """`kernel`'s name carrying the digest `launch` (`LAUNCH_SUFFIX`), as is where None: `kernel_of`'s
+    inverse, the key a kernel's evidence goes by beside its launch."""
     return kernel if launch is None else f"{kernel}__l{launch}"
 
 
@@ -317,7 +346,8 @@ def launch_digest() -> str | None:
         identity = pending.identity()
         digest = _digest(f"{identity}|{pending.config!r}")
         with _GUARD:
-            _LAUNCHES.setdefault(digest, Launch(identity, pending.op, pending.config, pending.padded()))
+            _LAUNCHES.setdefault(digest, Launch(identity, pending.op, pending.config, pending.padded(),
+                                                emitted=pending.emitted))
         pending.digest = digest
     return pending.digest
 
@@ -381,12 +411,18 @@ class Certification:
     pulled: bool
     kernels: dict[str, tuple[str, "Binary"]]
     stored: bool
+    round: int
+    """The round of certification it was compiled or read in (`certified_together`): configs certified at once
+    share one."""
 
     @property
     def spilling(self) -> tuple["Binary", ...]:
         """Its kernels that spill as the GPU assembles them."""
         return tuple(binary for _, binary in self.kernels.values() if binary.frame)
 
+
+_ROUNDS = itertools.count()
+"""Each round of certification's number (`Certification.round`)."""
 
 _CERTIFIED: dict[tuple, Certification] = {}
 """Each launch certified (`certified`), by its identity, config, device and product."""
@@ -425,7 +461,8 @@ def certifying(device) -> Iterator[None]:
         _CERTIFYING.reset(token)
 
 
-def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple["Binary", ...]:
+def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round: int | None = None
+              ) -> tuple["Binary", ...] | None:
     """`op`'s kernels at `config` for `arguments` that spill as the GPU assembles them, each launch compiled
     alone before its program is: its kernels' binaries (`binaries`) as the plugin's own compiler makes them
     for the device the process compiles for (`_certifying_device`: its own GPU, or a compile-only one a
@@ -433,9 +470,10 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     launch's derivation refuses a config that spills and takes its next (`tuning`'s `_chosen`), with no
     program retraced, where a compile's refusal retraces the whole program (`settled`): a B200's 4B step
     stepped its attention forward 19 times that way, 42 minutes, every rewalk a step's trace. None on a
-    process compiling for no GPU or an interpreted launch; none for a launch XLA or the GPU's compiler
-    refuses to compile alone though it lowered (a collective's, its devices the program's; an assembly the
-    PTX compiler rejects), which its program's compile reads as before (`settled`) and `uncertified` names;
+    process compiling for no GPU or an interpreted launch; None, read nowhere, for a launch XLA or the GPU's
+    compiler refuses to compile alone though it lowered (a collective's, its devices the program's; an
+    assembly the PTX compiler rejects), which its program's compile reads as before (`settled`) and
+    `uncertified` names;
     a launch Mosaic refuses as it lowers (a block past its shared memory) raises here as its program's
     lowering would. Once a process, by launch (`certifications`), and once a GPU model a
     machine: each verdict, an accepted config's and a refused one's, is stored with the kernel picks
@@ -450,6 +488,8 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     with _GUARD:
         if key in _CERTIFIED:
             return _CERTIFIED[key].spilling
+        if key in _UNCERTIFIED:
+            return None
     stored = _verdict_key(op, arguments, config, reverse)
     verdict = None if stored is None else tuning.stored_verdict(device.device_kind, stored)
     if isinstance(verdict, dict):
@@ -464,13 +504,41 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
                          type(op).__name__, config, str(error)[:200])
             with _GUARD:
                 _UNCERTIFIED[key] = str(error)[:400]
-            return ()
+            return None
         if stored is not None:
             tuning.store_verdict(device.device_kind, stored, kernels)
-    found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None)
+    found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None,
+                          next(_ROUNDS) if round is None else round)
     with _GUARD:
         _CERTIFIED[key] = found
     return found.spilling
+
+
+def certified_together(op, arguments: tokamax.BoundArguments, configs: Sequence[Hashable]
+                       ) -> list[tuple["Binary", ...] | None]:
+    """Each of `configs` certified (`certified`) in one round, all at once on as many threads, each tracing
+    under this thread's states (`dew._cache.carried`: the assumed GPU, the kernel choices, JAX's per-thread
+    settings) in a copy of this context: a search's rungs, which the assembler answers only one yes or no each
+    (`rung_round` bounds a round by the host's cores)."""
+    round = next(_ROUNDS)
+    if len(configs) < 2:
+        return [certified(op, arguments, config, round=round) for config in configs]
+    entered = _cache.carried()
+
+    def asked(config: Hashable) -> tuple["Binary", ...] | None:
+        with entered():
+            return certified(op, arguments, config, round=round)
+
+    with ThreadPoolExecutor(len(configs), thread_name_prefix="dew-certify") as pool:
+        submitted = [pool.submit(contextvars.copy_context().run, asked, config) for config in configs]
+        return [each.result() for each in submitted]
+
+
+def rung_round() -> int:
+    """The most rungs a round of certification compiles at once (`certified_together`): the cores this
+    process may run on, so a small host takes fewer rungs a round rather than sharing its cores among more
+    compiles."""
+    return max(1, len(os.sched_getaffinity(0)))
 
 
 def _verdict_key(op, arguments: tokamax.BoundArguments, config: Hashable, reverse: bool) -> str | None:
@@ -1340,8 +1408,10 @@ def proto_fields(message: bytes) -> dict[int, list]:
 
 def _kernels(message: bytes, decoded: bool = False) -> tuple[list[Binary], int]:
     """The kernels of each `MosaicGpuKernelProto` within a thunk's serialized proto (a message of jaxlib's
-    version, field 1, whose binary, 8, is an ELF, whose kernel name, 9, its function's, and whose
-    `SHARED_BYTES` its launch's dynamic shared memory), and how many Mosaic GPU custom calls it names
+    version, field 1, whose binary, 8, is an ELF, whose kernel name, 9, its function's, whose
+    `SHARED_BYTES` its launch's dynamic shared memory, and whose `CALLER_METADATA` the launch its call carried
+    (`launch_metadata`), the launch its name states where it carries none), and how many Mosaic GPU custom
+    calls it names
     (`MOSAIC_TARGET`, a custom call thunk's target). A message holding neither the target's bytes nor an ELF's
     holds neither, and is not parsed: most of a program's thunks and their messages (a 4B decoder's step read
     223,561 messages, 1.8 of its compile point's 3.5 seconds)."""
@@ -1352,7 +1422,10 @@ def _kernels(message: bytes, decoded: bool = False) -> tuple[list[Binary], int]:
     if (fields.get(1) == [KERNEL_PROTO_VERSION] and len(binary) == len(name) == 1
             and isinstance(binary[0], bytes) and binary[0][:4] == ELF and isinstance(name[0], bytes)):
         stated = shared[0] if len(shared) == 1 and isinstance(shared[0], int) else None
-        return [dataclasses.replace(_binary(name[0].decode(), binary[0], decoded), shared=stated)], 0
+        found = _binary(name[0].decode(), binary[0], decoded)
+        caller = fields.get(CALLER_METADATA, [])
+        launch = caller[0].decode() if len(caller) == 1 and isinstance(caller[0], bytes) else found.launch
+        return [dataclasses.replace(found, shared=stated, launch=launch)], 0
     found, calls = [], 0
     for values in fields.values():
         for value in values:

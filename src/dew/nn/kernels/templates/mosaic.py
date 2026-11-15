@@ -73,9 +73,11 @@ def compiler_params(*, approx_math: bool = False, reduction_scratch: int = 0,
     bytes, which Mosaic GPU splits between the block's warpgroups; with none, such a reduction fails to
     lower rather than share one. `resident`, the programs a multiprocessor holds at once, caps each thread's
     registers so that many fit its register file (CUDA's `__launch_bounds__` minimum blocks, Mosaic GPU's
-    `min_blocks_per_sm`, nvvm.minctasm); at one, ptxas takes up to 255."""
+    `min_blocks_per_sm`, nvvm.minctasm); at one, ptxas takes up to 255. The launch tracing it travels as the
+    call's metadata (`report.launch_metadata`), beside the kernel's name."""
     return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math,
-                                reduction_scratch_bytes=reduction_scratch, min_blocks_per_sm=resident)
+                                reduction_scratch_bytes=reduction_scratch, min_blocks_per_sm=resident,
+                                metadata=report.launch_metadata())
 
 
 def cluster_index(cluster: int) -> jax.Array | int:
@@ -1490,9 +1492,11 @@ class Transport[Allocated, Opened](abc.ABC):
 
     copy_extent: int | None = None
     """The most elements one asynchronous copy moves along a dimension of its box after the copy's tiling
-    (TMA's, 256): an operand block tiled in 8 rows by a swizzled row stays far below it at any tile its
-    registers hold, and a one-dimensional side operand's block, untiled, is at most it
-    (`grouped_matmul._Mosaic.fitting`); None where cp.async moves a block (mma.sync's)."""
+    (TMA's, 256; Mosaic GPU's launch_context refuses a tiled slice past it along any dimension): a dimension
+    of the tiled box, never a block's row: a 16-bit block swizzled at 128 bytes tiles as (rows / 8, columns /
+    64, 8, 64), so a row 576 wide is 9 tiles of 64 (an absorbed MLA key's, `attention.head_width`), and a
+    one-dimensional side operand's block, untiled, is at most it (`grouped_matmul._Mosaic.fitting`); None
+    where cp.async moves a block (mma.sync's)."""
 
     copies_in_pieces: bool = True
     """Whether a step's block may arrive in several copies (`streams`' `copies`, `Pieces`), TMA's each into

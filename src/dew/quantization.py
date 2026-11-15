@@ -114,6 +114,9 @@ UNQUANTIZED = {
     "dew.nn.kv_cache.rotated": "the rotation a quantized cache applies before it rounds keys and values",
     "dew.lora._updated": "an adapter's factor product merged into the kernel it updates, a weight and not an "
                          "activation",
+    "dew.lora._low_rank": "an adapter's update beside its base's product, its factors trained in float and "
+                          "served so, as QLoRA serves them: no quantized tree holds them, and its base's "
+                          "product quantizes",
 }
 """The functions whose products a quantized model keeps in float, at the precision they pin, each
 with why. Every other product a rule matches quantizes, whatever precision it pins: a quantized

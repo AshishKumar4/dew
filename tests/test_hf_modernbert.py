@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -92,6 +93,8 @@ def modernbert_states_in_bf16_on_the_gpu_kernels():
         transformers_model(DIRECTORY, masked=True, dtype='bfloat16'),
         lambda model, ids: model.model(ids).last_hidden_state,
         source=transformers_model(DIRECTORY, masked=True))
+    # One program a shape, as a user compiles the model, where an eager call compiled each op apart.
+    @jax.jit
     def states(ids):
         return loaded.model.apply(loaded.variables, ids, method=CausalTransformer.hidden_states)
 

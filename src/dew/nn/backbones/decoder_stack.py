@@ -302,10 +302,11 @@ class SharedPassView:
     (`first`), every entry: its cursors where the first pass's started, so it writes the step's keys
     and values over the last pass's, and each recurrent mixer's state, convolution tail and memory
     as the step entered them, so it takes the step's tokens once rather than again after the pass
-    before took them. A pass that allocates the cache finds none, so the later ones allocate too and
-    advance nothing (`cache_positions`). The step leaves the cache as its last pass did. The entries of
-    layers outside the block `layers`, [first, end), stay as each pass finds them: the prelude's, and
-    those an exit's coda writes between the passes (`looping.run_loop`)."""
+    before took them; a step over no cache enters none, so each pass opens its own fresh, and writes
+    nothing to it (`dew.nn.kv_cache.Opening`), which the scanned passes read as the first pass opened it.
+    The step leaves the cache as its last pass did. The entries of layers outside the block `layers`,
+    [first, end), stay as each pass finds them: the prelude's, and those an exit's coda writes between
+    the passes (`looping.run_loop`)."""
     layers: tuple[int, int]
     entering: Mapping | None = None
 

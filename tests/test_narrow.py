@@ -5,6 +5,7 @@ import numpy as np
 import optax
 import pytest
 from arm_arithmetic import summed_as_run
+from map_judge import drawing
 from placement_parity import layouts_agree, x64
 
 from dew.checkpoints import _filled
@@ -350,9 +351,14 @@ def _copies_of(narrow):
     return paths
 
 
-@pytest.mark.check1_shards(seeds=8, per_task=2)
-@pytest.mark.parametrize("fsdp", [1, pytest.param(2, marks=pytest.mark.mesh(devices=2)),
-                                  pytest.param(8, marks=pytest.mark.mesh(devices=8))])
+# Each mesh a site of its own, its map tasks compiling its arms alone (one site of three took 141 s a task).
+@pytest.mark.parametrize("fsdp", [
+    pytest.param(1, id="1", marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
+    pytest.param(2, id="2", marks=[pytest.mark.mesh(devices=2),
+                                   pytest.mark.check1_shards(seeds=8, per_task=4)]),
+    pytest.param(8, id="8", marks=[pytest.mark.mesh(devices=8),
+                                   pytest.mark.check1_shards(seeds=8, per_task=4)]),
+])
 def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradients(fsdp):
     """Through the trainer, a tied decoder's projection kernels are read
     through bf16 copies and its tied table and norm scales are not. Under
@@ -368,6 +374,8 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
     mesh = MeshSpec(fsdp=fsdp)
     _on_par_with_the_plain_update(lambda: KEEPING_SGD, "a tied decoder's copies",
                                   mesh=mesh)
+    if drawing():
+        return
     narrow, _, _ = _trained(KEEPING_SGD, copies=True, mesh=mesh)
     names = {"/".join(path) for path in _copies_of(narrow)}
     assert names and all(name.endswith("kernel") and "proj" in name for name in names), names
@@ -387,17 +395,23 @@ def test_a_scanned_decoder_reads_every_layers_kernels_through_copies_with_the_sa
     assert {f"layers_{index}" for index in range(4)} <= layers, names
 
 
-# One draw a map task: a mixture's draw first clears its routing margin, its longest task 662 s for two draws
-# in CI (row 6237).
-@pytest.mark.check1_shards(seeds=8, per_task=1)
+# Each cell a site of its own, its map tasks compiling its arms alone: one site over the six, each task
+# compiling every cell's arms for its draws, took 470 to 560 s a task in CI, setting each train's wall
+# (rows 6237, 6332, 4765). On armada a pooled cell's four draws take 50 to 80 s a task, a replayed (mixture)
+# cell's two draws about 100, each clearing its routing margin first.
 @pytest.mark.parametrize(("accumulation", "split", "mixture", "fsdp"), [
-    (2, 1, False, 1), (1, 2, True, 1),
-    pytest.param(2, 1, True, 2, marks=pytest.mark.mesh(devices=2)),
-    pytest.param(1, 2, False, 2, marks=pytest.mark.mesh(devices=2)),
-    pytest.param(2, 1, False, 8, marks=pytest.mark.mesh(devices=8)),
-    pytest.param(1, 2, True, 8, marks=pytest.mark.mesh(devices=8)),
-], ids=["accumulated-pooled", "split-replayed", "accumulated-replayed-fsdp2", "split-pooled-fsdp2",
-        "accumulated-pooled-fsdp8", "split-replayed-fsdp8"])
+    pytest.param(2, 1, False, 1, id="accumulated-pooled",
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
+    pytest.param(1, 2, True, 1, id="split-replayed", marks=pytest.mark.check1_shards(seeds=8, per_task=2)),
+    pytest.param(2, 1, True, 2, id="accumulated-replayed-fsdp2",
+                 marks=[pytest.mark.mesh(devices=2), pytest.mark.check1_shards(seeds=8, per_task=2)]),
+    pytest.param(1, 2, False, 2, id="split-pooled-fsdp2",
+                 marks=[pytest.mark.mesh(devices=2), pytest.mark.check1_shards(seeds=8, per_task=4)]),
+    pytest.param(2, 1, False, 8, id="accumulated-pooled-fsdp8",
+                 marks=[pytest.mark.mesh(devices=8), pytest.mark.check1_shards(seeds=8, per_task=4)]),
+    pytest.param(1, 2, True, 8, id="split-replayed-fsdp8",
+                 marks=[pytest.mark.mesh(devices=8), pytest.mark.check1_shards(seeds=8, per_task=2)]),
+])
 def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
         accumulation, split, mixture, fsdp):
     """A step that pools several microbatches, by accumulation or a batch
@@ -416,6 +430,9 @@ def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
     run = {"steps": 2 * accumulation, "accumulation": accumulation, "split": split, "mixture": mixture,
            "rows": split * max(8, jax.device_count()), "ragged": True, "mesh": MeshSpec(fsdp=fsdp)}
     _on_par_with_the_plain_update(lambda: KEEPING_SGD, "a window's copies", **run)
+    if drawing():
+        # A map task records its draws; the judge holds the run's copies.
+        return
     narrow, _, _ = _trained(KEEPING_SGD, copies=True, **run)
     assert int(narrow.updates) == 2
     assert _copies_of(narrow)
@@ -481,13 +498,14 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     assert copies > 0 and held[0] - held[1] == copies
 
 
-def test_a_step_that_does_not_fit_drops_its_copies_before_it_recomputes(monkeypatch):
+def test_a_step_that_does_not_fit_drops_its_copies_before_it_recomputes_where_that_frees_bytes(monkeypatch):
     """The narrow copies are the fit ladder's first rung. In the geometry of row 1661's run, a window of
-    two steps, a step that does not fit with its copies drops them before it recomputes more, and its plan
-    says so (`narrow`), on devices that hold the step fully recomputed without its copies alone. Whether
-    the drop gives bytes back is the backend's: on a CPU it does, the step's casts fused into their uses;
-    on a GPU the step casts its weights whole, holding no fewer (a GH200: 68.352 MB without its copies,
-    68.344 MB with them, row 5041), and the ladder goes on to recompute."""
+    two steps, a step that does not fit with its copies drops them before it recomputes more, and keeps
+    them dropped where the step without them falls less short; where it falls no less short, the copies
+    come back, their 1-2% of a step kept, and the ladder recomputes with them. The plan says which
+    (`narrow`). On a CPU the drop frees bytes, the step's casts fused into their uses; on a GPU the step
+    casts its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with them, rows
+    5041, train 857 F2). The devices hold the step fully recomputed without its copies."""
     free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
@@ -502,7 +520,9 @@ def test_a_step_that_does_not_fit_drops_its_copies_before_it_recomputes(monkeypa
     first, second = probes[0], probes[1]
     assert (first["narrow"], first["fits"], second["narrow"]) == (True, False, False)
     assert second["remat"] == first["remat"] and probes[-1]["fits"] is True
-    assert trainer.plan["narrow"] is False and state.compute is None
+    # Kept where the step without them fell no less short (its headroom no greater).
+    assert trainer.plan["narrow"] is (second["headroom"] <= first["headroom"])
+    assert (state.compute is None) is not trainer.plan["narrow"]
 
 
 def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monkeypatch):
@@ -628,12 +648,12 @@ def test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits
     assert run.plan["probes"][-1]["split"] == 2
 
 
-def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_dropped(monkeypatch):
+def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_only_where_dropping_them_helped(monkeypatch):
     """A window of one step that recomputes nothing holds about as much without its copies as with them:
     its backward keeps the whole gradient, in float32 where the copies' is bfloat16. Where it fits its
-    own rung neither way, the plan climbs past the rung that dropped them, and keeps them dropped at the
-    rung and split it reaches: once a plan fits, a run compiles no other (whether the copies would be
-    faster there is the offline plan's to weigh, `compile_ahead`)."""
+    own rung neither way, the plan climbs past the rung that dropped them, and at the rung and split it
+    reaches holds them dropped where dropping them left the step less short, and back where it did not
+    (train 857 F2): once a plan fits, a run compiles no other."""
     free, limit = 2 ** 39, 2 ** 40
     monkeypatch.setattr(jax.Device, "memory_stats",
                         lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
@@ -649,9 +669,10 @@ def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_dropped(monkeypatch):
     rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults")
     planned = {key: plan[key] for key in rung}
     last = probes[-1]
+    kept = probes[1]["headroom"] <= probes[0]["headroom"]
     assert planned != {key: base[key] for key in rung}
-    assert {key: last[key] for key in rung} == planned and (last["narrow"], last["fits"]) == (False, True)
-    assert not plan["narrow"] and state.compute is None
+    assert {key: last[key] for key in rung} == planned and (last["narrow"], last["fits"]) == (kept, True)
+    assert plan["narrow"] is kept and (state.compute is None) is not kept
 
 
 @pytest.mark.check1_shards(seeds=8, per_task=2)

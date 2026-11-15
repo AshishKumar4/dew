@@ -87,7 +87,14 @@ def _rebound(adapter: Adapter, base: nn.Module, **changes) -> Adapter:
 
 
 def _is_factor(path) -> bool:
-    return path[-1].key in lora.FACTORS
+    """Whether a leaf's path ends in an adapter's factor, among a quantized tree's leaves too (Qwix's
+    arrays, whose leaves an attribute names)."""
+    return getattr(path[-1], "key", None) in lora.FACTORS
+
+
+def _names(path) -> tuple:
+    """A leaf's path as names: a dict's keys and an object's attributes."""
+    return tuple(getattr(part, "key", getattr(part, "name", None)) for part in path)
 
 
 def _factors(adapter, tree, directory) -> dict[str, np.ndarray]:
@@ -328,6 +335,7 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
                                reference["updated_logits"], atol=1e-4, rtol=0)
 
 
+@pytest.mark.scenario("Pretrained fine-tuning")
 def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, tmp_path):
     """`source.adapt(LoRA(...))` is the source with the adapted model, the
     factors and the adapter beside them. An objective over it trains the
@@ -662,6 +670,76 @@ def _adapted(model, tree, *, contracted=1, rank=2, alpha=4.0, seed=0):
     adapter = Adapter.bound(model, adapted_tree, {("params", "proj"): Target(rank, alpha)}, rslora=False,
                             dropout=0.0, layouts={})
     return adapter, adapter.model, adapted_tree, adapter.merge(adapted_tree)
+
+
+def test_an_adapter_served_quantized_adds_its_float_update_to_its_quantized_base():
+    """A LoRA fine-tune quantized after training for serving (`quantize_for_serving`, Qwix's PTQ) quantizes
+    its base's product alone: the served output is the quantized base's, the same layer served without its
+    adapter, plus the adapter's update in float, its factors stored as they trained, where the adapter's
+    product fed Qwix's PTQ factors no quantized tree held and the call raised."""
+    from dew.nn.precision import FP32_SUMS
+    from dew.quantization import Quantization, quantize_for_serving
+
+    model = _BranchHost(nn.Dense(6))
+    x = jnp.asarray(np.random.RandomState(0).randn(3, 8), jnp.float32)
+    tree = nn.unbox(model.init(jax.random.key(0), x))
+    adapter, adapted, adapted_tree, _ = _adapted(model, tree)
+    served, served_tree = quantize_for_serving(adapted, adapted_tree, Quantization(), x)
+    base, base_tree = quantize_for_serving(model, tree, Quantization(), x)
+    factors = adapted_tree["params"]["proj"]
+    for factor in ("lora_A", "lora_B"):
+        np.testing.assert_array_equal(served_tree["params"]["proj"][factor], factors[factor])
+    # The update as a quantized model's float products sum, as Qwix's do (`FP32_SUMS`).
+    with jax.default_matmul_precision(FP32_SUMS):
+        update = lora._low_rank(nn.Dense(6), x, factors["lora_A"], factors["lora_B"],
+                                adapter.scale(adapter.targets[("params", "proj")]), (1,), rowwise=False)
+    np.testing.assert_array_equal(served.apply(served_tree, x), base.apply(base_tree, x) + update)
+
+
+def test_a_lora_run_served_quantized_decodes_with_its_trained_factors(decoder, loaded, reference, tmp_path):
+    """A LoRA run's decoder loaded as its task (`TextGeneration.from_run`) and quantized for serving
+    (`TextGeneration.quantized`, Qwix's PTQ over its adapted projections) decodes, its factors held as they
+    trained, in float, beside its quantized base, where the adapter's products fed Qwix's PTQ factors no
+    quantized tree held and the decode raised."""
+    from dew.inference import TextGeneration
+    from dew.quantization import Quantization
+
+    adapter = _rebound(loaded, decoder.model, dropout=0.0)
+    tokens = np.asarray(reference["input_ids"])
+    rows = 2 * jax.device_count()
+    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
+    data = Loader(train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}]), val=None,
+                  records=rows, batch=rows)
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
+                      layout=Layout(min_shard=2**30), checkpoints=checkpoints)
+    trainer.fit(data, steps=1, log_every=1, checkpoint_every=1)
+    checkpoints.wait()
+
+    task = TextGeneration.from_run(str(tmp_path / "run"), ema=False)
+    served = task.quantized(Quantization())
+    drawn = np.asarray(served(tokens[:1, :4], 4, key=0).tokens)
+    # Each row its prompt, then four drawn tokens.
+    assert drawn.shape[-1] == 8
+    np.testing.assert_array_equal(drawn[:, :4], np.broadcast_to(tokens[:1, :4], (drawn.shape[0], 4)))
+    trained, held = (jax.tree_util.tree_leaves_with_path(thaw(tree))
+                     for tree in (task.variables, served.variables))
+    factors = {_names(path): leaf for path, leaf in trained if _is_factor(path)}
+    kept = {_names(path): leaf for path, leaf in held if _is_factor(path)}
+    assert factors
+    for name, leaf in factors.items():
+        assert np.asarray(kept[name]).dtype == np.asarray(leaf).dtype, name
+        np.testing.assert_array_equal(np.asarray(kept[name]), np.asarray(leaf), err_msg=str(name))
+    # Each adapted site's base kernel float as trained and a Qwix quantized array served: its codes, of no
+    # float dtype, and their scale. A site is its module's path, whatever collection holds its kernel.
+    for site in {name[1:-1] for name in factors}:
+        def kernel(leaves, site=site):
+            return [np.asarray(leaf) for path, leaf in leaves
+                    if _names(path)[1:len(site) + 2] == (*site, "kernel")]
+        base, quantized = kernel(trained), kernel(held)
+        assert base and all(np.issubdtype(leaf.dtype, np.floating) for leaf in base), site
+        assert len(quantized) >= 2, site
+        assert any(not np.issubdtype(leaf.dtype, np.floating) for leaf in quantized), site
 
 
 CLIPPED_SEEDS = 64

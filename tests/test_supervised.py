@@ -17,19 +17,18 @@ from affine_run import BATCH, Affine, Counting, Replaying, dataset
 from flax import linen as nn
 from learning_gate import assert_learns
 from recording import RecordingTracker
+from scenario_contract import HELD_OUT, held_out_losses
 
 from dew.batch import VALID_ROWS
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
 from dew.data.dataset import Loader
 from dew.data.pipeline import DeviceStep
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import Step
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
 from dew.registry import ModelConfig
 from dew.training import Trainer
 
 INPUTS = InputSpec(Field("x", (3,)))
-STEP = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
 
 
 def squared(outputs, batch):
@@ -47,31 +46,23 @@ RUNS = 32
 gate's t threshold is 38.7, past what these runs' spread of initial losses reaches."""
 
 
-def learned(objective, optimizer, loader_of, held_out_of, steps: int, margin: float) -> np.ndarray:
-    """Each of RUNS independent runs' contrast for "training lowers the held-out loss by `margin` times":
-    the log of the loss before over the loss after, less the log of `margin`, on the run's own held-out
-    batch, each run from its own initialization key and data. A ratio's claim in logs, so a run's
-    initial loss scales none of it."""
-    contrasts = []
-    for run in range(RUNS):
-        trainer = Trainer(objective, optimizer, key=jax.random.key(run))
-        start = trainer.initial_state()
-        state = trainer.fit(loader_of(run), steps=steps, log_every=steps)
-        held_out = held_out_of(run)
-        before, _ = objective.scalar_loss(start.variables, held_out, STEP)
-        after, _ = objective.scalar_loss(state.variables, held_out, STEP)
-        contrasts.append(float(np.log(float(before) / float(after)) - np.log(margin)))
-    return np.asarray(contrasts)
+def cut(before: np.ndarray, after: np.ndarray, margin: float) -> np.ndarray:
+    """Each run's contrast for "training cuts the held-out loss by `margin` times": the log of its loss
+    before over its loss after, less the log of `margin`. A ratio's claim in logs, so a run's initial loss
+    scales none of it."""
+    return np.log(before / after) - np.log(margin)
 
 
 def test_a_plain_flax_model_trains_on_a_loss_function():
     """Over independent runs, each from its own key on its own data, sixty steps of Adam cut the affine
     model's held-out squared error to under a quarter (`assert_learns`)."""
     objective = Supervised(Affine(), squared, inputs=INPUTS)
-    drop = learned(objective, optax.adam(0.1),
-                   lambda run: dataset(train=lambda run=run: Replaying(lambda step: batch(seed=[run, step])),
-                                       batch=8),
-                   lambda run: batch(rows=256, seed=[run, 10_000]), steps=60, margin=4)
+    def loader(run):
+        return dataset(train=lambda: Replaying(lambda step: batch(seed=[run, step])), batch=8)
+
+    drop = cut(*held_out_losses(objective, optax.adam(0.1), loader,
+                                lambda run: batch(rows=256, seed=[run, 10_000]), runs=RUNS, steps=60),
+               margin=4)
     assert_learns(lambda runs: {"training cuts the held-out loss to a quarter": drop[runs]},
                   "a plain flax model", units=RUNS)
 
@@ -162,10 +153,10 @@ def test_a_decorated_flax_call_trains_through_its_actual_calling_convention():
     objective = Supervised(model, squared, inputs=INPUTS)
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(0))
     initial = trainer.initial_state()
-    before = float(objective.scalar_loss(initial.variables, sample, STEP)[0])
+    before = float(objective.scalar_loss(initial.variables, sample, HELD_OUT)[0])
     trained, _, _, _, accepted, _ = trainer.compile(initial, sample)(initial, sample)
     assert bool(accepted) and int(trained.updates) == 1
-    assert float(objective.scalar_loss(trained.variables, sample, STEP)[0]) < before
+    assert float(objective.scalar_loss(trained.variables, sample, HELD_OUT)[0]) < before
 
 
 def test_the_loss_is_the_mean_over_the_real_rows_and_metrics_report_by_name():
@@ -177,8 +168,8 @@ def test_the_loss_is_the_mean_over_the_real_rows_and_metrics_report_by_name():
     real = batch(6)
     padded = {name: np.concatenate([value, value[:2]]) for name, value in real.items()}
     padded[VALID_ROWS] = np.arange(8) < 6
-    alone, aux = objective.scalar_loss(variables, real, STEP)
-    np.testing.assert_allclose(objective.scalar_loss(variables, padded, STEP)[0], alone, rtol=1e-6)
+    alone, aux = objective.scalar_loss(variables, real, HELD_OUT)
+    np.testing.assert_allclose(objective.scalar_loss(variables, padded, HELD_OUT)[0], alone, rtol=1e-6)
     outputs = Affine().apply(variables, real["x"])
     np.testing.assert_allclose(aux.metrics["accuracy"],
                                np.mean(np.argmax(outputs, -1) == real["label"]), rtol=1e-6)
@@ -197,8 +188,8 @@ def test_the_run_record_builds_the_same_objective_again():
     rebuilt = RunConfig.from_dict(record)
     original, again = (config.objective.build(model=config.model.build()) for config in (run, rebuilt))
     variables = original.init(jax.random.key(0))
-    np.testing.assert_array_equal(again.scalar_loss(variables, batch(), STEP)[0],
-                                  original.scalar_loss(variables, batch(), STEP)[0])
+    np.testing.assert_array_equal(again.scalar_loss(variables, batch(), HELD_OUT)[0],
+                                  original.scalar_loss(variables, batch(), HELD_OUT)[0])
     assert record["objective"]["fields"]["loss"] == {
         "class": "dew.objectives.supervised:CrossEntropy", "fields": {"labels": "label", "output": []}}
 
@@ -252,10 +243,12 @@ def test_the_autoencoders_evidence_bound_falls_over_independent_runs():
 
     config = autoencoder_experiment.run()
     objective = config.objective.build(model=config.model.build())
-    drop = learned(objective, config.optim.build(config.trainer.steps),
-                   lambda run: dataset(train=lambda run=run: Replaying(lambda step: points([run, step])),
-                                       batch=32),
-                   lambda run: points([run, 10_000], rows=256), steps=config.trainer.steps, margin=2)
+    def loader(run):
+        return dataset(train=lambda: Replaying(lambda step: points([run, step])), batch=32)
+
+    drop = cut(*held_out_losses(objective, config.optim.build(config.trainer.steps), loader,
+                                lambda run: points([run, 10_000], rows=256), runs=RUNS,
+                                steps=config.trainer.steps), margin=2)
     assert_learns(lambda runs: {"training halves the held-out evidence bound": drop[runs]},
                   "the autoencoder experiment", units=RUNS)
 

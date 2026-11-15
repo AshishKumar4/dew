@@ -143,12 +143,13 @@ def _finished(prepared: Dataset, *, batch: int | None, records: int | None, host
 def lm(dataset: Dataset, tokenizer: str | SavedTokenizer | None, *, seq_len: int, batch: int | None,
        field: str = "text", eos: bool | None = None,
        pack: Literal["first-fit", "best-fit", "concat"] | None = PACK_POLICY, bins: int = PACK_BINS,
-       stride: int | None = None, cache: str | Cached | None = None,
+       segments: int | None = None, stride: int | None = None, cache: str | Cached | None = None,
        records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Documents in `field` tokenized, ended by the tokenizer's EOS where it has one (`eos=True`
     always, `False` never), cut into pieces that keep every next-token target, and packed into
     rows of `seq_len + 1` tokens (the last a target) by `pack`, first-fit with `bins` open rows,
-    best-fit, or concatenated, in batches of `batch` rows (`records` and `host` as `images` takes
+    best-fit, or concatenated, `segments` documents at most a row (`segments=1`: one a row, the rest
+    padding, a padded run's rows), in batches of `batch` rows (`records` and `host` as `images` takes
     them). `pack=None` joins the documents into one stream of tokens instead and cuts it into
     windows `stride` apart (`windows`), which carry no document coordinates. With
     `tokenizer=None` the documents are token ids already, under "text", such as a token store's,
@@ -163,12 +164,15 @@ def lm(dataset: Dataset, tokenizer: str | SavedTokenizer | None, *, seq_len: int
 
     if pack is not None and stride is not None:
         raise ValueError("stride places fixed windows, pack=None; a pack lays documents out whole")
+    if segments is not None and pack is None:
+        raise ValueError("segments caps the documents a pack lays in a row; pack=None lays no document whole")
     documents = dataset if tokenizer is None else dataset.map(text_steps.tokenize(tokenizer, field=field,
                                                                                   eos=eos))
     if pack is None:
         windows = _cached(documents, cache).windows(seq_len, stride=stride)
     else:
-        windows = _next_token_windows(documents, Pack(seq_len + 1, bins=bins, policy=pack), cache=cache)
+        windows = _next_token_windows(documents, Pack(seq_len + 1, bins=bins, policy=pack, segments=segments),
+                                      cache=cache)
     return _finished(windows, batch=batch, records=records, host=host)
 
 
@@ -201,19 +205,19 @@ def token_windows(dataset: Dataset, *, seq_len: int, batch: int | None, stride: 
 def sft(dataset: Dataset, tokenizer: str | SavedTokenizer, *, seq_len: int, batch: int | None,
         messages: str = "messages", long: Literal["chunk", "truncate", "drop"] = "chunk",
         pack: Literal["first-fit", "best-fit", "concat"] = PACK_POLICY, bins: int = PACK_BINS,
-        cache: str | Cached | None = None, records: int | None = None,
+        segments: int | None = None, cache: str | Cached | None = None, records: int | None = None,
         host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat
     template, each token's speaker kept beside it for an assistant-only loss,
-    and packed into rows of `seq_len + 1` tokens by `pack`, as `lm` packs,
-    in batches of `batch` rows (`batch=None`, `records` and `host` as
+    and packed into rows of `seq_len + 1` tokens by `pack`, as `lm` packs (`segments` conversations at
+    most a row, as `lm` takes them), in batches of `batch` rows (`batch=None`, `records` and `host` as
     `images` takes them). A conversation longer than a row is cut into pieces that keep
     every turn (`long="chunk"`), cut at its end (`"truncate"`), or dropped
     and counted (`"drop"`). `cache` holds the rendered conversations so cut or fitted, as `lm` holds
     its documents, so the cache is that `seq_len`'s and `long`'s alone."""
 
     rendered = dataset.map(chat.template(tokenizer, messages=messages))
-    packing = Pack(seq_len + 1, _CHAT_FIELDS, bins=bins, policy=pack)
+    packing = Pack(seq_len + 1, _CHAT_FIELDS, bins=bins, policy=pack, segments=segments)
     windows = _conversation_windows(rendered, packing, long=long, cache=cache)
     return _finished(windows, batch=batch, records=records, host=host)
 

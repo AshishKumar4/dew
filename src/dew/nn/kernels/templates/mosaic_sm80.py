@@ -578,7 +578,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                                 name=name or self.name,
                                 out_type=out_type, grid=grid, grid_names=grid_names,
                                 compiler_params=plgpu.CompilerParams(approx_math=approx_math,
-                                                                     min_blocks_per_sm=resident),
+                                                                     min_blocks_per_sm=resident,
+                                                                     metadata=report.launch_metadata()),
                                 interpret=bodies.interpreted(interpret),
                                 kernel_name=report.named(
                                     name, model=(None if registers is None

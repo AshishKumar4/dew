@@ -731,6 +731,16 @@ def test_the_forward_is_on_par_at_head_widths_interpreted(width, value_width):
                    value_width=value_width, tiles=tiles)
 
 
+@INTERPRETS
+def test_an_absorbed_mla_forward_of_576_wide_keys_and_512_wide_values_is_on_par_interpreted():
+    """An absorbed MLA call's widths (DeepSeek's latent 512 and rotary 64 a key, its latent 512 a value;
+    kernel-templates.md §A row 25) through the Mosaic forward an H100 runs, interpreted: its heads padded
+    to whole groups of 64 columns past 256 (`attention.head_width`), not to 1024, each loaded by one copy,
+    at its derived tiles: on par with the reference (check 1)."""
+    _check_forward("causal", jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=576,
+                   value_width=512, target=generation.gpu_target("sm90"))
+
+
 @ON_EACH_FAMILY
 @INTERPRETS
 def test_the_backward_at_a_width_of_256_is_on_par_under_bidirectional_blocks_interpreted():

@@ -398,6 +398,7 @@ def test_a_reward_penalty_over_the_starting_weights_is_nil_half_way_through_an_a
     np.testing.assert_array_equal(advantages[5], 0)
 
 
+@pytest.mark.scenario("Online post-training")
 def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
     """A GRPO run whose rollout names a served draw (`--rollout.served.slots 8`, `ServedRollout`) trains
     on completions Dew's own server draws ahead of the trainer (`RolloutScheduler.served`), its first
@@ -486,3 +487,88 @@ def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
         dataclasses.replace(config, rollout=None)
     with pytest.raises(ValueError):
         dataclasses.replace(config, objective=ObjectiveConfig("lm"))
+
+
+COUNT_LOW, COUNT_HIGH = 3, 11
+"""The counting language's ids: each token follows its predecessor by one, wrapping from COUNT_HIGH to
+COUNT_LOW."""
+COUNT_RUNS, COUNT_STEPS, COUNT_GROUPS, COUNT_TOKENS = 21, 80, 8, 4
+"""A GRPO policy's runs, each its own initialization and prompts, and each run's updates over eight prompts
+of two tokens, `COUNT_GROUPS` completions of `COUNT_TOKENS` a prompt: the runs `learning_gate.units_for`
+sizes from a pilot of 96 (runs 1000 to 1095 on armada's CPUs, its contrasts' mean 1.90 and spread 0.47)."""
+
+
+def counted(start, length: int) -> np.ndarray:
+    """`length` ids counting up from `start` by the language's rule."""
+    span = COUNT_HIGH - COUNT_LOW
+    steps = np.asarray(start)[..., None] - COUNT_LOW + np.arange(length)
+    return (COUNT_LOW + steps % span).astype(np.int32)
+
+
+def counting_reward(text: str, record) -> float:
+    """The share of a completion's tokens that follow the language's rule from the token before, the
+    prompt's last for the first (its record's `ground_truth`)."""
+    previous = int(record.ground_truth)
+    followed = []
+    for token in (int(word) for word in text.split()):
+        followed.append(token == counted(previous, 2)[1])
+        previous = token
+    return float(np.mean(followed)) if followed else 0.0
+
+
+def counting_prompts(seed) -> dict:
+    """Eight two-token prompts of the language from drawn first ids, each record naming its last token."""
+    starts = np.random.default_rng(seed).integers(COUNT_LOW, COUNT_HIGH, size=8)
+    prompts = counted(starts, 2)
+    return {PROMPT_KEY: prompts, LENGTH_KEY: np.full(8, 2, np.int32),
+            SOURCE_KEY: np.stack([_utf8("count", 8) for _ in starts]),
+            TRUTH_KEY: np.stack([_utf8(str(int(last)), 8) for last in prompts[:, -1]]),
+            INFO_KEY: np.stack([_utf8("", 8) for _ in starts])}
+
+
+def counting_gains(runs, *, steps: int = COUNT_STEPS, learning_rate: float = 1e-2) -> np.ndarray:
+    """Each of `runs`' contrast for "training raises the held-out reward": the log of its policy's held-out
+    reward after over before. A run is a GRPO policy from its
+    own initialization trained `steps` updates on its own prompts; its held-out reward is the expected
+    share of rule-following tokens its policy draws after 64 prompts no run trained on, each continuation
+    on the rule so far, read off the policy's own likelihoods (`per_token_log_probs`), no draw's noise."""
+    import itertools
+
+    import optax
+
+    from dew.data.dataset import Loader, replayed
+    from dew.training import Trainer
+
+    objective = GRPOObjective(TinyHead(vocab_size=COUNT_HIGH + 1), 2 + COUNT_TOKENS - 1)
+    rollout = RolloutScheduler.sampled(objective, counting_reward, groups=COUNT_GROUPS,
+                                       max_new_tokens=COUNT_TOKENS, sampling=Sampling(temperature=1.0))
+    scored = jax.jit(objective.per_token_log_probs)
+
+    def reward(variables, run: int) -> float:
+        starts = np.random.default_rng([run, 10_000]).integers(COUNT_LOW, COUNT_HIGH, size=64)
+        rows = jnp.asarray(counted(starts, 2 + COUNT_TOKENS))
+        return float(jnp.mean(jnp.exp(scored(objective.model_variables(variables), rows)[:, 1:])))
+
+    gains = []
+    for run in runs:
+        trainer = Trainer(objective, optax.adam(learning_rate), key=jax.random.key(int(run)), rollout=rollout)
+        start = trainer.initial_state()
+        data = Loader(replayed(lambda partition, run=run: (counting_prompts([run, step])
+                                                           for step in itertools.count())),
+                      None, batch=8, records=None)
+        state = trainer.fit(data, steps=steps, log_every=steps)
+        gains.append(np.log(reward(state.variables, run) / reward(start.variables, run)))
+    return np.asarray(gains)
+
+
+def test_a_grpo_policy_rewarded_for_its_language_learns_it():
+    """Language RL's scenario (docs/design/testing.md: collect rollouts, score them, update a policy): a
+    policy drawing completions of two-token prompts, rewarded for each token that follows the counting
+    language's rule (`counting_reward`), trained by GRPO on its own draws (`RolloutScheduler.sampled`),
+    raises its held-out reward (`counting_gains`), the spec's claim at no margin past it, over independent
+    runs, each from its own initialization and prompts, as the learning gate judges a learning claim
+    (`learning_gate.assert_learns`)."""
+    from learning_gate import assert_learns
+
+    assert_learns(lambda runs: {"training raises the held-out reward": counting_gains(runs)},
+                  "a GRPO policy learning its language", units=COUNT_RUNS)
