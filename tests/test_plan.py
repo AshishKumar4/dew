@@ -829,7 +829,6 @@ RESUMED_SEEDS = 128
 slow-theme, 2026-11-14): 128, where sizing them live at every run cost 418 s of 522 fits (row 5673)."""
 
 
-@pytest.mark.check1_shards(seeds=128, per_task=32)
 def test_a_run_resumed_at_a_finer_split_lands_where_the_uninterrupted_run_does(tmp_path):
     """A run saved at an update's end in two microbatches a step and resumed in four, a memory setting
     alone, lands where the run nobody stopped lands: its weights as exact as that run's (check 1), from

@@ -130,11 +130,9 @@ def pipeline_arms(_):
     return STEPS_FIXTURE, steps_draw, fine_tuned, ("loss", "grad_norm")
 
 
-@pytest.mark.check1_shards(seeds=128, per_task=64)
 def test_lm_fine_tune_steps_are_as_exact_as_torch():
     """Eight AdamW steps of the trainer, each step's loss and gradient norm on par with torch's over drawn
-    rows whose first update decides each element's sign (check 1), the truth torch's float64 run. Its
-    declared seeds, the recording's, in map tasks of 64: one task of them took 152 s in CI (row 5566)."""
+    rows whose first update decides each element's sign (check 1), the truth torch's float64 run."""
     assert_arms_as_recorded(pipeline_arms(None), "lm-steps", STEPS_SEEDS, "LM fine-tune steps", host=True)
 
 

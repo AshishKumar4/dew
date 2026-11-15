@@ -121,7 +121,6 @@ def decision_objective(model, weights):
                              shuffle_options=False, pass_weights=weights)
 
 
-@pytest.mark.check1_shards(seeds=64, per_task=16)
 def test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_weight():
     """`pass_weights` over a decision model's looped backbone, a consistency term beside the label loss
     over a group of two questions, one negated (`test_decision_consistency.NEGATED`), whose divergence is
