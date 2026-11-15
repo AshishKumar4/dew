@@ -426,6 +426,12 @@ class MosaicForward(_Mainloop[Tiles]):
     """Whether its caller has bounded the call's values below where any row can be scaled (a cache's call
     over the largest magnitudes its cache states, `attention_decode.attend`'s `bounds`), so its kernels walk
     unscaled, a `cached` call's too, reading no value to choose them."""
+    in_key: bool = False
+    """Whether the call's values are its keys' leading columns (an absorbed latent attention's: DeepSeek's
+    key the latent 512 and the rotary 64, its value the latent 512; `dew.nn.attention.KeyColumns`): its
+    programs stream the keys alone and take each step's value tile as a view of the key tile's columns, the
+    slot held until the values' product is issued, the keys read once: its inference walk's (a training
+    walk's anchored launches stream the value array the call gives, the keys' columns sliced)."""
 
     def _hooks(self, score_params, output_params, initial, drop, query_params=()) -> Hooks:
         """The call's hooks from its parameters, state and draw, its static hooks the op's."""
@@ -460,7 +466,8 @@ class MosaicForward(_Mainloop[Tiles]):
                     return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
                                           out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
                                           table=table, sources=sources, subtracted=self.subtracted,
-                                          scales=scales, parts=self.parts, scaled=scaled, **form)
+                                          scales=scales, parts=self.parts, scaled=scaled, in_key=self.in_key,
+                                          **form)
 
         if scaled or self.bounded or hooks.rounds is not None or not algebra.headroom(value.dtype):
             return launched(), None
@@ -804,7 +811,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                            ba.arguments.get("residuals") is Kept.SPLIT,
                                            min(config.stages, steps), out_dtype=out_dtype, page=page,
                                            codes=_codes_of(ba.arguments["key"], ba.arguments.get("scales")),
-                                           parts=self.parts, params=self.score_types)
+                                           parts=self.parts, params=self.score_types, in_key=self.in_key)
         # An inference launch may flag its rows for the fold's rewalk, and a cache's scaled walk reads its
         # keys' value magnitudes from its value slots (`algebra.SCALED_WALK`; another scaled walk the call's,
         # `attention_mosaic_forward._largest`), each a reduction across warps (`reducing`).
@@ -910,9 +917,29 @@ class MosaicForward(_Mainloop[Tiles]):
         if self.parts > 1 and not loads_parts(family):
             return Refusal('dtype', f"the Mosaic mainloop's fp32 parts load in pieces, which {family.name}'s "
                            "pipeline does not")
+        if self.in_key and (reason := self._in_key_refusal(ba, family)) is not None:
+            return reason
         if family.places_on_role and (reason := self._placed_refusal(ba, hooks, family)) is not None:
             return reason
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
+
+    def _in_key_refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
+        """Why a call whose values are its keys' leading columns (`in_key`) runs on no program of `family`,
+        or None: its value tile a view of the key slot's whole swizzled groups of columns, no wider than the
+        key's (a view ending within a group is one no product reads), read where its
+        family streams the keys of 16-bit operands into one slot a step (no fp32 parts, quantized codes or
+        paged gather), its products issued from its own consumers (a family placing them on an issuing role
+        declares the values' stream)."""
+        key, value = ba.arguments["key"], ba.arguments["value"]
+        group = swizzling.swizzle_columns(key.dtype, swizzling.SWIZZLE_BYTES)
+        if value.shape[3] > key.shape[3] or value.shape[3] % group:
+            return Refusal('columns', f"a value of the keys' leading {value.shape[3]} columns is read as "
+                           f"whole groups of {group} of the key's {key.shape[3]}")
+        if self.parts > 1 or ba.arguments["scales"] is not None or ba.arguments["table"] is not None:
+            return Refusal('columns', "a value read from the key's slot is a dense 16-bit call's")
+        if family.places_on_role:
+            return Refusal('columns', f"{family.name} declares the values' stream of its issuing role")
+        return None
 
     def _placed_refusal(self, ba: tokamax.BoundArguments, hooks: Hooks, family: mosaic.Family
                         ) -> Refusal | None:
@@ -988,7 +1015,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             masked: bool = False, splits: int = 1, table: jax.Array | None = None,
             sources: jax.Array | None = None, subtracted: bool = False,
             scales: tuple[jax.Array, jax.Array] | None = None, scaled: bool = False,
-            bounded: bool = False) -> jax.Array:
+            bounded: bool = False, in_key: bool = False) -> jax.Array:
     ...
 
 
@@ -998,8 +1025,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             residuals: Literal[Kept.SPLIT, Kept.OUTPUT], interpret: bool = False,
             out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
             sources: jax.Array | None = None, subtracted: bool = False,
-            scales: tuple[jax.Array, jax.Array] | None = None, scaled: bool = False, bounded: bool = False
-            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+            scales: tuple[jax.Array, jax.Array] | None = None, scaled: bool = False, bounded: bool = False,
+            in_key: bool = False) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     ...
 
 
@@ -1007,7 +1034,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             *, scale: float | None = None, natural: bool = NATURAL, residuals: Kept = Kept.NONE,
             interpret: bool = False, out_dtype=None, masked: bool = False, splits: int = 1,
             table: jax.Array | None = None, sources: jax.Array | None = None, subtracted: bool = False,
-            scales: tuple[jax.Array, jax.Array] | None = None, scaled: bool = False, bounded: bool = False):
+            scales: tuple[jax.Array, jax.Array] | None = None, scaled: bool = False, bounded: bool = False,
+            in_key: bool = False):
     """The template's forward on this mainloop (`MosaicForward`): `query` `[B, Q, H, D]` over `key`
     `[B, K, Hk, D]` and `value` `[B, K, Hk, Dv]`, and the keys `spans` leaves each query under `hooks`, as
     `dew.nn.kernels.templates.attention.reference` computes it; with `residuals` `Kept.SPLIT` the training
@@ -1030,10 +1058,13 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     dequantize to, each converted to the query's dtype in its program (`_Codes`). `scaled` launches the
     scaled op whatever the call's values (`MosaicForward.scaled`: a mainloop whose own kernel holds no scale
     gives it a call some row of which can be scaled); `bounded` the unscaled
-    one, a cache's call too, where its caller bounded its values (`MosaicForward.bounded`).
+    one, a cache's call too, where its caller bounded its values (`MosaicForward.bounded`). `in_key` states
+    `value` its keys' leading columns (`MosaicForward.in_key`): its programs read them from the key's slot,
+    and the value array, a view of the key's, is no operand of the launch.
     """
     # The key prologue taken as XLA's program before the launch (`key_prologue_taken`); the query's where the
     # call's consumers cannot take it (`_forward_call`).
+    in_key = reads_in_key(in_key, hooks, residuals)
     key, hooks = key_prologue_taken(key, Hooks() if hooks is None else hooks)
     if residuals is Kept.SPLIT:
         # The training walk reads an interval a query (`KeySpans.per_query`); the inference walk by position.
@@ -1041,20 +1072,29 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
                              out_dtype=out_dtype, masked=masked, splits=splits, table=table, sources=sources,
                              subtracted=subtracted, scales=scales, scaled=scaled, bounded=bounded,
-                             residuals=residuals)
+                             residuals=residuals, in_key=in_key)
     return op(*args, residuals=residuals, interpret=interpret)
 
 
 def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                      hooks: Hooks | None = None, *, scale: float | None = None, natural: bool = NATURAL,
-                     residuals: Kept = Kept.NONE) -> Refusal | None:
+                     residuals: Kept = Kept.NONE, in_key: bool = False) -> Refusal | None:
     """Why `forward` runs no call of these arrays compiled on this device, or None
     (`MosaicForward.declined`)."""
     spans = spans.per_query() if residuals is Kept.SPLIT else spans
+    in_key = reads_in_key(in_key, hooks, residuals)
     key, hooks = key_prologue_taken(key, Hooks() if hooks is None else hooks)
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
-                             residuals=residuals)
+                             residuals=residuals, in_key=in_key)
     return op.declined(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target())
+
+
+def reads_in_key(in_key: bool, hooks: Hooks | None, residuals: Kept = Kept.NONE) -> bool:
+    """Whether a call whose values are its keys' leading columns (`in_key`) reads them from the key's slot:
+    not under a key prologue, whose keys the slot holds, the values being the keys as given, nor where it
+    keeps residuals, whose anchored training launches stream the values as given (`_trained_forward`); such
+    a call reads them from the slice it was handed."""
+    return in_key and residuals is Kept.NONE and (hooks is None or hooks.key_mod is None)
 
 
 def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
@@ -1092,8 +1132,8 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                   scale: float | None, natural: bool, out_dtype=None, masked: bool = False,
                   splits: int = 1, table: jax.Array | None = None, sources: jax.Array | None = None,
                   subtracted: bool = False, scales: tuple[jax.Array, jax.Array] | None = None,
-                  scaled: bool = False, bounded: bool = False, residuals: Kept = Kept.NONE
-                  ) -> tuple[MosaicForward, tuple]:
+                  scaled: bool = False, bounded: bool = False, residuals: Kept = Kept.NONE,
+                  in_key: bool = False) -> tuple[MosaicForward, tuple]:
     """`forward`'s op and its arguments, a dropping call's draw among them, which its legality rule refuses
     (`refused`): the op it launches, `scaled` or `bounded` as the call names (`MosaicForward.scaled`,
     `MosaicForward.bounded`), so a plan of it derives that launch's config and reads that launch's
@@ -1131,7 +1171,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
                        splits=splits, subtracted=subtracted, per_span=spans.per_span,
-                       parts=parts, rounds=hooks.rounds, scaled=scaled, bounded=bounded,
+                       parts=parts, rounds=hooks.rounds, scaled=scaled, bounded=bounded, in_key=in_key,
                        query_mod=hooks.query_mod,
                        query_kinds=tuple(param.kind for param in hooks.query_params),
                        query_dtypes=tuple(jnp.dtype(param.value.dtype).name for param in hooks.query_params),
@@ -1145,7 +1185,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         return _forward_call(prologued(query, hooks.query_mod, hooks.query_params), key, value, spans, taken,
                              scale=scale, natural=natural, out_dtype=out_dtype, masked=masked, splits=splits,
                              table=table, sources=sources, subtracted=subtracted, scales=scales,
-                             scaled=scaled, bounded=bounded, residuals=residuals)
+                             scaled=scaled, bounded=bounded, residuals=residuals, in_key=in_key)
     return op, args
 
 

@@ -1252,6 +1252,9 @@ class _Program[T: (Tiles, BackwardTiles)]:
     products: tuple[mosaic.Product, ...] = ()
     """Its walks' steps' products declared as data (`mosaic.Family.walk`'s `products`, which the family
     places): a forward's logits and its weighted values' sums (`attention_mosaic_forward.declared`)."""
+    value_columns: int | None = None
+    """Where a forward's values are its keys' leading columns (`MosaicForward.in_key`), the first of the key
+    columns its value tile views in the key slot; None where it streams its values."""
 
     @property
     def ahead(self) -> bool:

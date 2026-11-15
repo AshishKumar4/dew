@@ -437,7 +437,6 @@ SHARDED_CELLS = [*THREE_D_UNET_CELLS, *UNET_CELLS, *HIERARCHICAL_MMDIT_CELLS, *Q
 UNSHARDED_CELLS = [cell for cell in LAYOUT_CELLS if cell not in SHARDED_CELLS]
 
 
-@pytest.mark.scenario("Distributed training")
 @pytest.mark.parametrize(("case", "steps", "layout"), UNSHARDED_CELLS, ids=cell_ids(UNSHARDED_CELLS))
 def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
     """One device and a layout, 8x1 data parallelism (every parameter
@@ -489,7 +488,6 @@ def test_a_hierarchical_mmdit_trains_on_every_layout_as_on_one_device(case, step
     assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
 
 
-@pytest.mark.scenario("Hybrid and state-space models")
 @pytest.mark.parametrize(("case", "steps", "layout"), QWEN35_CELLS, ids=cell_ids(QWEN35_CELLS))
 @pytest.mark.check1_shards(seeds=64, per_task=16)
 def test_a_qwen35_decoder_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
