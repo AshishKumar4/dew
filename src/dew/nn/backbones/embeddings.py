@@ -71,7 +71,3 @@ def prepared_embeddings(x: jax.Array, input_embeddings) -> jax.Array:
     if prepared.shape != x.shape:
         raise ValueError(f"input_embeddings are the whole {x.shape} sequence, got {prepared.shape}")
     return prepared.astype(x.dtype)
-
-
-__all__ = ["embedding_factor", "prepared_embeddings", "scaled_embeddings", "stream_embeddings",
-           "token_embeddings"]

@@ -136,31 +136,24 @@ def test_a_routed_or_hybrid_model_writes_its_release_from_its_own_fields_and_rea
             assert np.array_equal(np.asarray(read[path]), np.asarray(leaf)), (collection, path)
 
 
-def test_a_decoders_layout_traces_its_parameters_once_a_record(monkeypatch):
+def test_a_decoders_layout_traces_its_parameters_once_a_record():
     """Every writer asks `source_layout` of the model it writes (a decision format, a bundle, its export,
     each draw of a parity rule): a decoder's parameter tree is traced once whatever module holds its
-    record, and a decoder of another record traces its own."""
+    record (each trace a miss of `_abstract_variables`, whose body is the trace), and a decoder of another
+    record traces its own."""
     from dew.interop import layouts
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
-    traced = []
-    init = CausalTransformer.init
-
-    def counted(self, *args, **kwargs):
-        traced.append(self.num_layers)
-        return init(self, *args, **kwargs)
-
-    monkeypatch.setattr(CausalTransformer, "init", counted)
     layouts._abstract_variables.cache_clear()
     fields = {"vocab_size": 32, "emb_features": 16, "num_layers": 3, "num_heads": 2, "num_kv_heads": 2,
               "head_dim": 8, "mlp_features": 32, "max_seq_len": 16}
     decoder = CausalTransformer(**fields)
     for model in (decoder, decoder.clone(), CausalTransformer(**fields)):
         assert source_layout(model)
-    assert traced == [3]
+    assert layouts._abstract_variables.cache_info().misses == 1
     deeper = source_layout(decoder.clone(num_layers=4))
     assert deeper and deeper.config["num_hidden_layers"] == 4
-    assert traced == [3, 4]
+    assert layouts._abstract_variables.cache_info().misses == 2
 
 
 def test_a_model_its_layout_cannot_hold_is_unwritable_with_its_reason():
