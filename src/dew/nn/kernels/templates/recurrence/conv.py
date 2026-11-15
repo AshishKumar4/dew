@@ -12,7 +12,6 @@ summed tap by tap from the oldest (`short_conv.preactivation`'s order), the SiLU
 norm's root and inverse each rounded once, its transpose `scale (dy - (u . dy) u)`.
 """
 
-import functools
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +20,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, short_conv, tuning
-from dew.nn.kernels.templates import mosaic, scan
+from dew.nn.kernels.templates import mosaic, outputs, scan
 from dew.nn.precision import compensated_add
 
 TOKENS = 64
@@ -216,7 +215,9 @@ def forward(x, taps, bias, valid, documents, *, parts: tuple, activation: bool, 
                 walk(_Piece(found, first=first, local=(program - lo) * lanes_, length=length, count=count,
                             tokens=tokens, lanes_=lanes_), out_ref, exchanged, head)
 
-    out_type = tuple(jax.ShapeDtypeStruct((rows, length, width), dtype) for width, _ in parts)
+    # Each piece's rows and tokens `x`'s, its width its own (a share of the channels the config sets).
+    out_type = tuple(outputs.output(dtype, outputs.axis(x, 0), outputs.axis(x, 1), width)
+                     for width, _ in parts)
     grid = (rows, pl.cdiv(length, tokens), x.shape[-1] // lanes_)
     launched = mosaic.kernel(entry, out_type=out_type, grid=grid,
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
@@ -281,9 +282,12 @@ def _backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation:
                 _backward_walk(piece, dy_ref, (dx_ref, dw_ref, db_ref), exchanged, head=head,
                                activation=activation, eps=eps, tokens=tokens, interpret=interpret)
 
-    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
-    out_type = (jax.ShapeDtypeStruct((rows, length, channels), x.dtype), f32((rows, blocks, count, channels)),
-                f32((rows, blocks, channels)))
+    # The input's gradient `x`'s axes; the taps' and bias's partials a program's rows by its token spans
+    # (`x`'s tokens over `tokens`), the taps' count and the channels.
+    row, spans, channel = outputs.axis(x, 0), outputs.axis(x, 1).ceil_div(tokens), outputs.axis(x, 2)
+    out_type = (outputs.output(x.dtype, row, outputs.axis(x, 1), channel),
+                outputs.output(jnp.float32, row, spans, outputs.axis(operands[1], 1), channel),
+                outputs.output(jnp.float32, row, spans, channel))
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, blocks, channels // lanes_),
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
                              family=family.name, name=_named("short_conv_backward", parts),
