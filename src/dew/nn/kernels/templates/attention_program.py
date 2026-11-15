@@ -36,13 +36,13 @@ def walk(spec: algebra.Forward, lo, hi, keys_at: Callable[[jax.Array], algebra.K
 
 def finished(spec: algebra.Forward, walked, rows: Callable[[jax.Array], jax.Array],
              resumed: tuple[jax.Array, jax.Array, jax.Array] | None, *, training: bool, output_mod=None,
-             output_params: tuple = (), subnormals: bool = False) -> tuple:
+             output_params: tuple = ()) -> tuple:
     """A program's outputs from its walk (`walk`): the normalized output, its rows' maximum and denominator
-    (`algebra.finish`, its ratio rounded once into a subnormal where `subnormals`: a program on XLA's CPU),
-    and with `training` its anchor keys and split sums and their rows' shift (`algebra.split_residuals`)."""
+    (`algebra.finish`), and with `training` its anchor keys and split sums and their rows' shift
+    (`algebra.split_residuals`)."""
     state = algebra.joined(walked, rows) if training else walked
     out, m, denominator = algebra.finish(spec, state, initial=resumed is not None, output_mod=output_mod,
-                                         output_params=output_params, subnormals=subnormals)
+                                         output_params=output_params)
     if not training:
         return out, m, denominator
     split, arg, own, others_total = walked

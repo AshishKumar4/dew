@@ -32,15 +32,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import (
-    attention_algebra as algebra,
-    bodies,
-    mosaic,
-    operands,
-    product,
-    rings,
-    swizzling,
-)
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, operands, product, rings, swizzling
 from dew.nn.kernels.templates.attention import (
     Hooks,
     KeySpans,
@@ -566,11 +558,7 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         acc = algebra.split_output(split.others, own, value_rows)
         # The joined sums over the denominator at their rows' scale (`algebra.split_residuals`).
         total = rows[1] if not form.headroom else algebra.power2(rows[1], -split.shift, reach=2 * 127)
-        guarded = form.guarded or hooks.initial is not None
-        # On XLA's CPU, which flushes a subnormal ratio, rounded once into it (`algebra.quotient`).
-        out = jax.lax.platform_dependent(
-            cpu=lambda: algebra.output_of(acc, total, guarded=guarded, subnormals=True),
-            default=lambda: algebra.output_of(acc, total, guarded=guarded))
+        out = algebra.output_of(acc, total, guarded=form.guarded or hooks.initial is not None)
         out = _output_hooked(out, hooks, hooked)
         return (jnp.swapaxes(out, 1, 2).astype(q.dtype), rows[0], rows[1], anchors, split), status[0], None
 
@@ -1234,11 +1222,8 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
         out_params = tuple(_param(family, ref, param.kind, row, head, first, state.acc)
                            for ref, param in zip(hooked.output, hooks.output_params, strict=True))
 
-        # The interpreter runs on XLA's CPU, which flushes a subnormal ratio (`algebra.finish`'s
-        # `subnormals`); a GPU's finish keeps its own arithmetic (M-ET-76).
         output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
-                                                      output_mod=hooks.output_mod, output_params=out_params,
-                                                      subnormals=bodies.interpreting())
+                                                      output_mod=hooks.output_mod, output_params=out_params)
         out_stage(lambda stage: family.stored((_kept_rows(family, keep, output, out_view),), (out_view,),
                                               smem=stage))
         finished = stored().finished
