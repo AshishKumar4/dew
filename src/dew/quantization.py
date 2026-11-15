@@ -86,7 +86,13 @@ from dew.nn.fake_quant import (
 )
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import owned_program
-from dew.nn.precision import accumulated, at_least_fp32, correctly_rounded_divide, float32_einsum
+from dew.nn.precision import (
+    accumulated,
+    at_least_fp32,
+    correctly_rounded_divide,
+    float32_einsum,
+    twice_scaled,
+)
 from dew.nn.sharding import abstract
 
 if TYPE_CHECKING:
@@ -629,18 +635,7 @@ def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
     product = gemm.gemm(codes, rows, transpose_rhs=True, out_dtype=jnp.float32)
-    return _scaled(product, scales, row_scales.T)
-
-
-def _scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax.Array:
-    """`product` times two scales, each entry in the order whose intermediate is a normal float32: an
-    input's block scale near float32's largest (2**113 for inputs near 2**122) overflows the codes' product
-    the kernel's scale (2**-9) brings back in range, and one near the least normal underflows it the other
-    way (ledger 2715), so no one order holds both ends; the result overflows only where the product does."""
-    tiny = jnp.finfo(product.dtype).tiny
-    once = product * first
-    kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (product == 0))
-    return jnp.where(kept, once * second, product * second * first)
+    return twice_scaled(product, scales, row_scales.T)
 
 
 def _frozen_fp8_value(x: jax.Array, forward: jax.Array, forward_scale: jax.Array, dgrad: jax.Array,

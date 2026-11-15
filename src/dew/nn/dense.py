@@ -106,13 +106,21 @@ def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dim
     one of them, its dtype the product's), the bias added past it as here."""
     take = taken or (lambda product: product(inputs, kernel))
     if bias is not None and _rounds_once(layer, inputs, kernel, bias, stored):
-        widened = take(lambda inputs, kernel: _widened(inputs, kernel, dimensions, layer.precision))
+        widened = take(lambda inputs, kernel: _summed(inputs, kernel, dimensions, layer.precision))
         return biased(widened, shaped(stored)).astype(inputs.dtype)
     product = take(lambda inputs, kernel: _product(layer)(inputs, kernel, dimensions,
                                                           precision=layer.precision))
     if bias is None:
         return product
     return biased(product, shaped(bias))
+
+
+def _summed(inputs: Array, kernel: Array, dimensions, precision) -> jax.Array:
+    """A biased layer's product left unrounded in fp32, its bias added past it (`_biased`): the run's
+    low-precision recipe's where it takes the projection (`projections.recipe_general`: its fp32 sums and its
+    own gradients), else XLA's (`_widened`)."""
+    recipe = projections.recipe_general(inputs, kernel, dimensions, jnp.float32)
+    return recipe if recipe is not None else _widened(inputs, kernel, dimensions, precision)
 
 
 def _rounds_once(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, bias: Array,

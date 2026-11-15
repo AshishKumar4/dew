@@ -1,5 +1,6 @@
-"""The 'fp8' run numerics (`dew.nn.precision.FP8`, row 2513): DeepSeek-V3's blockwise FP8 recipe on the
-projections whose role it takes, the rest in the run's dtypes."""
+"""The low-precision run numerics (`dew.nn.precision.FP8`, `MXFP8`, `NVFP4`, rows 2513 and 6658): a recipe
+(DeepSeek-V3's blockwise FP8, MXFP8, NVFP4) on the projections whose role it takes, the rest in the run's
+dtypes."""
 
 import contextlib
 import dataclasses
@@ -14,11 +15,14 @@ from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bou
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import generation, low_rank, projections
-from dew.nn.precision import FP8, LowPrecision, Numerics, RecipeRefused, numerics_of
+from dew.nn.precision import FP8, NUMERICS_PRESETS, LowPrecision, Numerics, RecipeRefused, numerics_of
 
 VOCAB, WIDTH = 256, 128
 SEEDS = 64
 """The recipe's check-1 seeds, the projection's and the step's (the step's sized by `seeds_for` on armada)."""
+RECIPE_NUMERICS = {numerics.low_precision.recipe: numerics for numerics in NUMERICS_PRESETS.values()
+                   if numerics.low_precision is not None}
+"""Each low-precision recipe's run numerics, as the presets name them (`precision.NUMERICS_PRESETS`)."""
 
 
 def mixed(dtype=jnp.bfloat16) -> CausalTransformer:
@@ -39,7 +43,7 @@ def test_the_fp8_preset_names_the_recipe_and_keeps_the_runs_dtypes():
     with pytest.raises(ValueError):
         LowPrecision(roles=("mixer", "norm"))
     with pytest.raises(ValueError):
-        LowPrecision(recipe="nvfp4")
+        LowPrecision(recipe="fp6")
 
 
 def test_the_routers_gates_and_head_never_reach_the_fp8_projection():
@@ -247,10 +251,105 @@ def laid_projection(dtype):
     return run
 
 
+@pytest.mark.parametrize("recipe", RECIPE_NUMERICS)
+def test_a_biased_layer_takes_the_recipes_product_and_rounds_once_after_its_bias(recipe):
+    """A biased bf16 `Dense` whose bias is stored fp32 (one rounding of its product and bias, as torch's
+    addmm), under each recipe's numerics in a role the recipe takes: its output is the recipe's fp32 sums
+    plus the bias, rounded once (`projections.recipe_projection`), bitwise; MXFP8 rounds inputs of 1.0625 to
+    1, so 128 of them against unit weights give 128, where XLA's product gives 136."""
+    from dew.nn.dense import Dense
+    from dew.nn.precision import projection_role
+
+    rng = np.random.default_rng(6658)
+    rows = jnp.concatenate([jnp.full((1, 128), 1.0625, jnp.bfloat16),
+                            jnp.asarray(rng.normal(size=(7, 128)), jnp.bfloat16)])
+    layer = Dense(128, dtype=jnp.bfloat16, use_bias=True)
+    kernel = jnp.ones((128, 128), jnp.float32).at[:, 1:].set(jnp.asarray(rng.normal(size=(128, 127)) / 8,
+                                                                         jnp.float32))
+    params = {"params": {"kernel": kernel,
+                         "bias": jnp.asarray(rng.normal(size=(128,)), jnp.float32).at[0].set(0.0)}}
+    with generation.run_precision(RECIPE_NUMERICS[recipe]), projection_role("mlp"):
+        out = jax.jit(layer.apply)(params, rows)
+        summed = projections.recipe_projection(rows, params["params"]["kernel"].astype(jnp.bfloat16),
+                                               out_dtype=jnp.float32)
+    expected = (summed + params["params"]["bias"]).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.asarray(expected, np.float32))
+    if recipe == "mxfp8":
+        assert float(out[0, 0]) == 128.0, float(out[0, 0])
+
+
+@pytest.mark.parametrize("recipe", RECIPE_NUMERICS)
+def test_joined_projections_under_a_recipe_are_each_its_own(recipe):
+    """Gate and up projections a recipe takes (a `GatedMLP`'s join, `joined.joins`), under each recipe's
+    numerics on a compile-only A100 that joins them where no recipe runs: each quantized as its own, as
+    apart: a unit gate kernel and an up kernel of 2**24 against unit inputs give 128 in every gate output
+    (joined, NVFP4's one tensor scale for both kernels rounded every gate code to zero)."""
+    from dew.nn.dense import Dense
+    from dew.nn.joined import joined_dense, joins
+    from dew.nn.kernels.generation import Choice
+    from dew.nn.precision import projection_role
+
+    class Pair(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            projections = [Dense(128, dtype=jnp.bfloat16, use_bias=False, name=name)
+                           for name in ("gate", "up")]
+            apart = jnp.stack([projection(x) for projection in projections], axis=-2)
+            taken = (joined_dense(x, projections, axis=-2) if joins(projections, Choice.GATE_UP)
+                     else apart)
+            return apart, taken
+
+    x = jnp.ones((128, 128), jnp.bfloat16)
+    params = {"params": {"gate": {"kernel": jnp.ones((128, 128), jnp.float32)},
+                         "up": {"kernel": jnp.full((128, 128), 2.0 ** 24, jnp.float32)}}}
+    with (generation.assumed("sm80"), generation.chosen(gate_up="joined"),
+          generation.run_precision(RECIPE_NUMERICS[recipe]), projection_role("mlp")):
+        apart, taken = jax.jit(Pair().apply)(params, x)
+    np.testing.assert_array_equal(np.asarray(taken, np.float32), np.asarray(apart, np.float32))
+    np.testing.assert_array_equal(np.asarray(taken[:, 0], np.float32), 128.0)
+
+
+def test_an_nvfp4_product_of_tiny_operands_is_normal_where_its_value_is():
+    """A bf16 `Dense(128)` under the 'nvfp4' numerics of inputs and a kernel of 2**-65: each operand's tensor
+    scale near 2**-76, whose product underflows float32, applied each in turn
+    (`precision.twice_scaled`), so the output is the quantized operands' product in float64 rounded once
+    (near 128 * 2**-130 = 2**-123, a normal float), where it was zero."""
+    from mx_matrix import nvfp4_values
+
+    from dew.nn.dense import Dense
+    from dew.nn.precision import NVFP4, projection_role
+
+    x = jnp.full((128, 128), 2.0 ** -65, jnp.bfloat16)
+    params = {"params": {"kernel": jnp.full((128, 128), 2.0 ** -65, jnp.float32)}}
+    with generation.run_precision(NVFP4), projection_role("mlp"):
+        out = jax.jit(Dense(128, dtype=jnp.bfloat16, use_bias=False).apply)(params, x)
+    with jax.enable_x64(new_val=True):
+        rows, kernel = (nvfp4_values(jnp.asarray(operand, jnp.float64)) for operand in
+                        (x, params["params"]["kernel"].astype(jnp.bfloat16).T))
+        truth = np.asarray((rows @ kernel.T).astype(jnp.bfloat16), np.float32)
+    assert truth.min() > 0, truth.min()
+    np.testing.assert_array_equal(np.asarray(out, np.float32), truth)
+
+
+def test_an_mxfp8_product_of_operands_whose_scales_are_subnormal_is_their_value():
+    """A bf16 `Dense(32)` under the 'mxfp8' numerics of inputs of 2**-120 against weights of 2**120: the
+    inputs' E8M0 scale is 2**-128, below float32's least normal, applied as its exponent
+    (`formats.MxFp8.decoded`), so each product is 1 and the output 32, where the scale read as a float
+    flushed to zero."""
+    from dew.nn.dense import Dense
+    from dew.nn.precision import MXFP8, projection_role
+
+    x = jnp.full((128, 32), 2.0 ** -120, jnp.bfloat16)
+    params = {"params": {"kernel": jnp.full((32, 32), 2.0 ** 120, jnp.float32)}}
+    with generation.run_precision(MXFP8), projection_role("mlp"):
+        out = jax.jit(Dense(32, dtype=jnp.bfloat16, use_bias=False).apply)(params, x)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), 32.0)
+
+
 def test_a_recipe_projection_of_rows_an_explicit_axis_splits_is_each_devices_own():
     """Row 4854: under the 'fp8' numerics, a dense projection of rows an Explicit data axis splits over eight
     devices (`projections.recipe_projection`, through a layer's product too: `projections.dot_general`'s
-    `_recipe_general`) runs each device's rows apart (`projections._projected_apart`, `jax.shard_map`), each
+    `recipe_general`) runs each device's rows apart (`projections._projected_apart`, `jax.shard_map`), each
     laid in whole 128-row blocks of its own: its value and the rows' gradient bitwise each device's rows'
     projection alone, the matrix's gradient their gradients' sum. Integers, so every quantization and sum is
     exact whatever adds them."""
@@ -324,13 +423,42 @@ def test_a_recipes_experts_of_rows_an_explicit_axis_splits_are_each_devices_shar
     np.testing.assert_array_equal(np.asarray(d_matrices), np.sum([leaves[2] for leaves in alone], axis=0))
 
 
+def recipe_reference(recipe: str, dtype, sizes):
+    """`projections.recipe_projection` of a projection's rows written apart in `dtype` under `recipe`, its
+    groups' `sizes` given: each group's rows sliced out and padded with zero rows to whole 128-row blocks,
+    the groups concatenated in order, the recipe's step over them (the blockwise recipe emulated,
+    `emulated`, or a block-scaled one's, `mx_matrix.recipe_truth`, its operands' values quantized along each
+    product's contraction), and each group's rows sliced back, a row outside every group's zero."""
+    from mx_matrix import mx_values, nvfp4_values, recipe_truth
+
+    starts = np.cumsum([0, *sizes])
+    blocks = [-(-size // 128) for size in sizes]
+
+    def run(rows, matrices):
+        laid = jnp.concatenate([jnp.pad(rows[first:last], ((0, 128 * count - (last - first)), (0, 0)))
+                                for first, last, count in zip(starts[:-1], starts[1:], blocks, strict=True)])
+        if recipe == "blockwise_fp8":
+            out = emulated(dtype)(laid, matrices, jnp.asarray(blocks, jnp.int32), out_dtype=dtype)
+        else:
+            quantized = mx_values if recipe == "mxfp8" else nvfp4_values
+            out = recipe_truth(np.asarray(blocks), wide=dtype, quantized=quantized)(laid, matrices)
+        places = np.cumsum([0, *blocks]) * 128
+        kept = [out[place:place + size] for place, size in zip(places[:-1], sizes, strict=True)]
+        past = jnp.zeros((rows.shape[0] - starts[-1], out.shape[1]), out.dtype)
+        return jnp.concatenate([*kept, past])
+
+    return run
+
+
+@pytest.mark.parametrize("recipe", RECIPE_NUMERICS)
 @pytest.mark.parametrize("role", ["mlp", "experts"])
-def test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference(role):
-    """A projection the 'fp8' numerics take (`projections.recipe_projection`, which a layer of the role hands
-    its rows): a dense one's, every row its one group's, and experts' of ragged groups, one empty, with rows
-    past them; its output and both gradients on par with the recipe written apart in float32 over the same
-    groups' whole 128-row blocks (`laid_projection`: the fake-quantized reference a recipe is measured
-    against), from it in float64 (check 1)."""
+def test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference(role, recipe):
+    """A projection each low-precision recipe takes (`projections.recipe_projection`, which a layer of the
+    role hands its rows, under the 'fp8', 'mxfp8' or 'nvfp4' numerics): a dense one's, every row its one
+    group's, and experts' of ragged groups, one empty, with rows past them; its output and both gradients on
+    par with the recipe written apart in float32 over the same groups' whole 128-row blocks
+    (`recipe_reference`: the fake-quantized reference a recipe is measured against), from it in float64
+    (check 1)."""
     from dew.nn.precision import projection_role
 
     sizes = (200,) if role == "mlp" else (70, 0, 129)
@@ -344,7 +472,7 @@ def test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference(role
                 jnp.asarray(rng.normal(size=(count, WIDTH)), jnp.float32))
 
     def projected(rows, matrix):
-        with generation.run_precision(FP8), projection_role(role):
+        with generation.run_precision(RECIPE_NUMERICS[recipe]), projection_role(role):
             sized = None if role == "mlp" else jnp.asarray(sizes, jnp.int32)
             return projections.recipe_projection(rows, matrix, sized, out_dtype=jnp.float32)
 
@@ -354,13 +482,14 @@ def test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference(role
             return reference(jnp.float64)(*widened((rows, matrix, cotangent)))
 
     def reference(dtype):
+        laid = recipe_reference(recipe, dtype, sizes)
+
         def run(rows, matrix):
-            return laid_projection(dtype)(rows, matrix if matrix.ndim == 3 else matrix[None],
-                                          jnp.asarray(sizes, jnp.int32))
+            return laid(rows, matrix if matrix.ndim == 3 else matrix[None])
         return with_gradients(run)
 
     assert_as_exact(jax.jit(with_gradients(projected)), jax.jit(reference(jnp.float32)), draw,
-                    f"recipe projection {role}", seeds=SEEDS, truth_fn=truth)
+                    f"{recipe} recipe projection {role}", seeds=SEEDS, truth_fn=truth)
 
 
 def fake_quantized(dtype):

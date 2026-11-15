@@ -33,7 +33,6 @@ from dew.nn.joined import Projections, projection_requirements, projections_of
 from dew.nn.kernels import gemm, grouped_matmul, projections
 from dew.nn.kernels.generation import INHERENT, Choice, device_generation, gpu_target
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
-from dew.nn.precision import recipe_role
 from dew.nn.sharding import on_shards, seen_whole
 
 FUSION_ROW = 'ledger 1958'
@@ -44,8 +43,7 @@ FUSION_ROW = 'ledger 1958'
 class GatedCase:
     """A gated MLP's three projections (gate, up, down) as the fused MLP's selector reads them
     (`GATED_MLP`): their `joined.Projections`, whether they agree in dtype, precision and promotion
-    (`uniform`), whether any adds a bias (`biased`), whether the run's low-precision recipe takes the
-    products (`recipe`, `precision.recipe_role`), the rows the products multiply in the dtype they run at
+    (`uniform`), whether any adds a bias (`biased`), the rows the products multiply in the dtype they run at
     (`rows`, flattened, `fused_products`'), the gate's and the down projection's kernels in it (`kernels`,
     None where a projection holds none), whether the rows and kernels are seen whole (`whole`, `seen_whole`)
     and the products' `precision`."""
@@ -53,7 +51,6 @@ class GatedCase:
     projections: Projections
     uniform: bool
     biased: bool
-    recipe: bool
     rows: jax.ShapeDtypeStruct
     kernels: tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct] | None
     whole: bool
@@ -94,9 +91,6 @@ FUSED_SUPPORTS: tuple[Requirement[GatedCase], ...] = (
     Requirement('biased', lambda case: not case.biased,
                 "a projection adds a bias, which no hook of the fused MLP adds yet", row=FUSION_ROW,
                 kind='handoff'),
-    Requirement('recipe', lambda case: not case.recipe,
-                "the run's low-precision recipe takes the projections' products (`projections."
-                "recipe_projection`), which the fused MLP's products do not", row=FUSION_ROW, kind='handoff'),
     Requirement('launched', lambda case: case.launched(),
                 "no launch of the GEMM template takes the up or the down product here (a mesh axis splitting "
                 "them, a CPU, a declared XLA cell), or its hooks the gated product's operations (an exact "
@@ -140,7 +134,6 @@ def gated_case(x: jax.Array, projections_: Sequence[nn.Module], activation: str,
         uniform=len({(projection.dtype, projection.precision, projection.promote_dtype)
                      for projection in projections_}) == 1,
         biased=any(projection.use_bias for projection in projections_),
-        recipe=recipe_role() is not None,
         rows=jax.ShapeDtypeStruct(rows, dtype),
         kernels=None if kernels is None else (jax.ShapeDtypeStruct(kernels[0].shape, dtype),
                                               jax.ShapeDtypeStruct(kernels[2].shape, dtype)),

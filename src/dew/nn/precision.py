@@ -63,7 +63,9 @@ __all__ = [
     "L2NORM_EPS",
     "LOW_PRECISION_RECIPES",
     "MATMUL_PRECISIONS",
+    "MXFP8",
     "NUMERICS_PRESETS",
+    "NVFP4",
     "PROJECTION_ROLES",
     "ROUNDING_STREAM",
     "WIDE_CPU_ARITHMETIC",
@@ -128,6 +130,7 @@ __all__ = [
     "spread",
     "sqrt_or_zero",
     "stochastic_bf16",
+    "twice_scaled",
     "two_product",
     "two_sum",
     "weighted_total",
@@ -859,10 +862,14 @@ token mixer's (attention's queries, keys, values and output, a linear mixer's), 
 routed experts', a router's scores, a shared expert's gate. A projection that plays none of them, a head's
 or an embedding's, keeps the run's dtypes under every recipe."""
 
-LOW_PRECISION_RECIPES = ("blockwise_fp8",)
-"""The low-precision recipes a run's projections train in: DeepSeek-V3's blockwise FP8, each product's
-operands E4M3 by 1 x 128 activation tiles and 128 x 128 weight blocks, power-of-two scales, fp32 sums, and
-its gradients FP8 products of requantized operands (`dew.nn.kernels.projections.blockwise_fp8_projection`)."""
+LOW_PRECISION_RECIPES = ("blockwise_fp8", "mxfp8", "nvfp4")
+"""The low-precision recipes a run's projections train in, each product's sums fp32 and its gradients the
+recipe's own products of requantized operands (`dew.nn.kernels.projections.recipe_projection`): DeepSeek-V3's
+blockwise FP8, its operands E4M3 by 1 x 128 activation tiles and 128 x 128 weight blocks under power-of-two
+scales (`blockwise_fp8_projection`); MXFP8 (OCP MX), E4M3 under a power-of-two scale every 32 of each
+product's contraction (`mxfp8_projection`); and NVFP4, E2M1 under an E4M3 scale every 16 of it and a tensor
+scale (`nvfp4_projection`). Blackwell's block-scaled tensor cores multiply the last two; elsewhere their
+block-scaled values, each exact in bfloat16, are summed as XLA sums fp32 products."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -968,7 +975,15 @@ FP8 = Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision())
 experts' projections in blockwise FP8 (`LowPrecision`), the routers, norms, embeddings and head in the run's
 dtypes."""
 
-NUMERICS_PRESETS = {"accurate": ACCURATE, "fp8": FP8}
+MXFP8 = Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision(recipe="mxfp8"))
+"""MXFP8 training (OCP MX): bf16-mixed, the token mixers', dense feed-forwards' and routed experts'
+projections in MXFP8 (`LowPrecision`), the routers, norms, embeddings and head in the run's dtypes."""
+
+NVFP4 = Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision(recipe="nvfp4"))
+"""NVFP4 training: bf16-mixed, the token mixers', dense feed-forwards' and routed experts' projections in
+NVFP4 (`LowPrecision`), the routers, norms, embeddings and head in the run's dtypes."""
+
+NUMERICS_PRESETS = {"accurate": ACCURATE, "fp8": FP8, "mxfp8": MXFP8, "nvfp4": NVFP4}
 """The named run numerics beside the default (`Numerics()`)."""
 
 
@@ -1417,6 +1432,18 @@ def vanishing(dtype, base2: bool = False) -> float:
     (`dew.algebra.scan`'s decays)."""
     least = math.log(float(jnp.finfo(dtype).smallest_subnormal))
     return math.floor(least / (math.log(2.0) if base2 else 1.0)) - 1
+
+
+def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax.Array:
+    """`product` times two scales, each entry in the order whose intermediate is a normal float32: an
+    input's block scale near float32's largest (2**113 for inputs near 2**122) overflows the codes' product
+    the kernel's scale (2**-9) brings back in range, and one near the least normal underflows it the other
+    way (ledger 2715), as two tensor scales near 2**-76 do multiplied first (an NVFP4 product of operands
+    near 2**-65), so no one order holds both ends; the result overflows only where the product does."""
+    tiny = jnp.finfo(product.dtype).tiny
+    once = product * first
+    kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (product == 0))
+    return jnp.where(kept, once * second, product * second * first)
 
 
 @_protected

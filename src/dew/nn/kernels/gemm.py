@@ -50,7 +50,7 @@ from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, scattered
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed, parts, terms
-from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products
+from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import read_by
 from dew.nn.sharding import seen_whole
 
@@ -883,7 +883,7 @@ def nvfp4_block_product(lhs: NvFp4Block, matrices: NvFp4Block, group_blocks: jax
     (`mosaic_gpu.gmm`'s `mx_scales`, `kind::mxf4nvf4`), else the decoded operands' product in XLA; `gather`
     as `mxfp8_product`'s."""
     summed = _block_scaled(lhs, matrices, group_blocks, NVFP4_BLOCK_OP, interpret_on_cpu, gather)
-    return (summed * (lhs.scale * matrices.scale)).astype(out_dtype)
+    return twice_scaled(summed, lhs.scale, matrices.scale).astype(out_dtype)
 
 
 def nvfp4_quantized_product(lhs: jax.Array, matrix: NvFp4, *, out_dtype,
