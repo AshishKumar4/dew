@@ -1710,6 +1710,68 @@ def test_a_ladders_top_reads_every_kernel_but_the_raised_one_from_the_lowering_c
     assert found["served"].get("hit", 0) >= found["kernels"][-1] - 1, found
 
 
+SHARED_NAME = """
+import dataclasses
+import json
+
+import jax
+import jax.numpy as jnp
+import test_recurrence_mosaic as gate
+from kernel_compile import _device, lowered_for
+
+from dew.nn.kernels import generation, tuning
+from dew.nn.kernels.lowered import kernel_calls
+from dew.nn.kernels.templates import report
+from dew.nn.kernels.templates.recurrence import template
+
+target = "sm90"
+facts = generation.gpu_target(target)
+device = _device(target).devices.flat[0]
+# Two rungs of a launch's producer ladder past a training case's tiles (`_ladders`).
+with generation.assumed(facts):
+    label, bound, pulled, configs = next(
+        (unit[0], unit[1], unit[4], ladder) for unit in gate._identity_units(target)
+        if unit[3] == 'launch' and unit[4]
+        and len(ladder := gate._walked(unit[1], unit[2], 'launch', unit[5], facts)) >= 3)
+rungs = configs[1:3]
+programs = []
+with report.refusals(), generation.assumed(facts), report.certifying(device):
+    for rung in rungs:
+        traced, shapes = template.MOSAIC.lowering(bound, rung)
+
+        def program(*given, traced=traced):
+            out, pullback = jax.vjp(traced, *given)
+            return pullback(jax.tree.map(lambda leaf: jnp.ones(leaf.shape, leaf.dtype), out))
+
+        programs.append(lowered_for(program if pulled else traced, tuple(shapes), target))
+    first, second = (set(report.kernel_modules(kernel_calls(program, unrun=True))) for program in programs)
+    binary = next(binary for binary in report.binaries(programs[1].compile())
+                  if report.launch_name(binary.kernel, binary.launch) in first & second)
+    # The second rung's program refuses a kernel whose name the first rung's shares.
+    found = report._misses_of([dataclasses.replace(binary, frame=8)])
+    report._held(found, programs[1])
+    (identity, _), _, refused = found[0]
+    stored = [tuning.stored_verdict(device.device_kind, report._verdict_key(identity, rung, refused.reverse))
+              is not None for rung in rungs]
+print(json.dumps({"stored": stored}))
+"""
+"""Two rungs of one launch's producer ladder lowered for a compile-only H100 with certification on, the
+second's program refusing a kernel whose name (its body's) the first rung's program shares, and where each
+rung's verdict is stored."""
+
+
+@lowers("sm90")
+def test_a_programs_refusal_is_stored_as_its_own_configs_verdict_whatever_body_name_it_shares(tmp_path):
+    """A refusal of a program's compile is stored as the verdict of the config the program ran
+    (`report._held`, its refusal's own launch and config), never another config's whose kernel shares the
+    refused kernel's name: a rung's unchanged kernels keep their names along a ladder (`Mosaic.emitted`), so
+    the name's first launch is another rung's, and a refusal stored there left the refused rung's acceptance
+    standing, a later start taking it and compiling the program to refuse it again (row 6536)."""
+    from process_support import fresh
+
+    assert fresh(SHARED_NAME, cache_dir=tmp_path / "cache")["stored"] == [False, True]
+
+
 @lowers('sm100')
 def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
     """A ladder whose first rung the assembler rejects (the reverse walk's producer past its program's entry

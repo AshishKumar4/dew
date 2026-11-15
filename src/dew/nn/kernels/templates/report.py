@@ -1281,13 +1281,12 @@ def _held(found: list, program: jax.stages.Lowered) -> None:
         return
     modules = kernel_modules(kernel_calls(program, unrun=True))
     verdicts: dict[tuple[str, Hashable, bool], dict[str, tuple[str, Binary]]] = {}
-    for refusal, binary, _ in found:
-        launch = None if binary.launch is None else traced(binary.launch)
+    for refusal, binary, launch in found:
         if refusal is None or launch is None:
             continue
+        identity, config = refusal
         name = launch_name(binary.kernel, binary.launch)
-        verdicts.setdefault((launch.identity, launch.config, launch.reverse), {})[name] = (
-            modules.get(name, ""), binary)
+        verdicts.setdefault((identity, config, launch.reverse), {})[name] = (modules.get(name, ""), binary)
     for (identity, config, reverse), kernels in verdicts.items():
         if (key := _verdict_key(identity, config, reverse)) is not None:
             tuning.store_verdict(device.device_kind, key, kernels)
