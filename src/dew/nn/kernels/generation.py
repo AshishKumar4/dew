@@ -464,15 +464,6 @@ class GpuTarget:
     (`device_memory`) and a build states none (`built_target`): a program compiled for an A100 may run on
     one of 40 GB, so a plan for the 80 GB part's memory kept an attention whose peak only that part holds
     and failed to load on the other. An attached device states its allocator's own limit."""
-    cluster_placed: Mapping[tuple[int, int], int] = dataclasses.field(default_factory=dict, hash=False)
-    """The multiprocessors a launch's clusters of more than a pair's programs place on, by the part's
-    multiprocessors and the cluster's programs (`placed_multiprocessors`): a cluster's programs share one
-    GPC, so clusters of four or eight leave the multiprocessors of a GPC's remainder unplaced, which a
-    persistent launch's grid of every multiprocessor runs as a second wave of whole walks (M-EM-52-gh200:
-    a 2 x 2 kernel gradient's 132 CTAs read 1.10 waves, a 2 x 4's 128 1.07, 1.63x the pair's time;
-    cuBLASLt's 2 x 4 launched 120, 1 wave). The driver's `cudaOccupancyMaxActiveClusters` states it on the
-    part, which an attached device's target reads in place of the table's (`runtime_facts`); unknown for a
-    part of another count of multiprocessors."""
     l2_bytes: int | None = None
     """The L2 cache's bytes, which a launch whose operands are re-read across its programs (a split
     contraction's) holds its re-read footprint against: the datasheet's, where NVIDIA's tuning guide states
@@ -705,9 +696,6 @@ TARGETS = {target.generation: target for target in (
               step_seconds=4.93e-6,
               # The Hopper Tuning Guide's "Increased L2 Capacity": H100's 50 MB.
               l2_bytes=50 * 2 ** 20,
-              # Clusters of four and of eight place on 120 of a 132-multiprocessor part's (M-EM-52-gh200's
-              # ncu: 1.10 and 1.07 waves at 132 and 128 CTAs; cuBLASLt's 2 x 4 at 120, 1 wave).
-              cluster_placed={(132, 4): 120, (132, 8): 120},
               # A step whose head takes its gradient in the backward a tile at a time, unfused, compiled for
               # an H100: Qwen3.5-4B's at 2 x 4096 tokens under 'full' holds 36.6 GiB of temporaries, 29
               # layers' four [8192, 9216] product operands at its peak and no layer's gradient, its weight
@@ -844,15 +832,6 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
     if matches:
         return dataclasses.replace(max(matches, key=lambda entry: entry[0])[1], device_kind=identifier)
     return GpuTarget(identifier, identifier)
-
-
-def placed_multiprocessors(target: GpuTarget, programs: int) -> int | None:
-    """The multiprocessors a launch of clusters of `programs` programs places on `target`: every one alone
-    or a pair a cluster (a pair's two programs a TPC's, whose two multiprocessors every GPC holds whole);
-    where more, the target's stated placement (`GpuTarget.cluster_placed`); None where it states none."""
-    if programs <= 2 or target.multiprocessors is None:
-        return target.multiprocessors
-    return target.cluster_placed.get((target.multiprocessors, programs))
 
 
 def built_target(generation: str, multiprocessors: int | None = None, memory: int | None = None) -> GpuTarget:
@@ -1040,38 +1019,19 @@ def _one_kind(devices) -> None:
                          "be of one kind")
 
 
-def runtime_facts(target: GpuTarget, device, *, read: Callable[[int, int], int | None] | None = None,
-                  place: Callable[[int, int], int | None] | None = None) -> GpuTarget:
+def runtime_facts(target: GpuTarget, device, *, read: Callable[[int, int], int | None] | None = None
+                  ) -> GpuTarget:
     """`target` with the facts a real CUDA `device` reports of itself in place of the table's: its
     multiprocessors, its block's shared memory, its clock, memory bandwidth and L2 cache from the CUDA
-    driver (`_driver_facts`, read by `read`, `dew._devices.gpu_attribute` by default), and the
-    multiprocessors its clusters of four and eight place on (`_placed`, read by `place`,
-    `dew.nn.kernels.clusters.cluster_placement` by default), read free at runtime, its family's facts its
-    capability's (`architecture`). A GPU the table does not name so keeps every resource a kernel's
-    requirements and cost read."""
+    driver (`_driver_facts`, read by `read`, `dew._devices.gpu_attribute` by default), read free at
+    runtime, its family's facts its capability's (`architecture`). A GPU the table does not name so
+    keeps every resource a kernel's requirements and cost read."""
     if read is None:
         from dew._devices import gpu_attribute
         read = gpu_attribute
-    if place is None:
-        from dew.nn.kernels.clusters import cluster_placement
-        place = cluster_placement
     facts = {'multiprocessors': _multiprocessors(device), 'shared_limit': _shared_memory(device),
              **dict(_driver_facts(device.local_hardware_id, read))}
-    attached = dataclasses.replace(target, **{name: value for name, value in facts.items()
-                                              if value is not None})
-    placed = _placed(device.local_hardware_id, attached.multiprocessors, place)
-    return dataclasses.replace(attached, cluster_placed=dict(placed)) if placed else attached
-
-
-@functools.cache
-def _placed(ordinal: int, multiprocessors: int | None, place: Callable[[int, int], int | None]
-            ) -> tuple[tuple[tuple[int, int], int], ...]:
-    """The visible GPU `ordinal`'s placement of clusters of four and of eight (`GpuTarget.cluster_placed`,
-    keyed by its `multiprocessors`), as `place` reads it, once a process; none where it reads none."""
-    if multiprocessors is None:
-        return ()
-    read = ((programs, place(ordinal, programs)) for programs in (4, 8))
-    return tuple(((multiprocessors, programs), placed) for programs, placed in read if placed is not None)
+    return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None})
 
 
 SHARED_BUDGET = 99 * 1024

@@ -958,10 +958,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
                 or (family.pairs_product and ba.arguments['interpret'])
                 or self._pair_refuses(ba, config, family) or self._pingpong_refuses(config, family)
-                or not self._divides(ba, config) or report.refused(self, ba, config)
-                # A cluster the target states the placement of, its grid one wave (`_programs`).
-                or generation.placed_multiprocessors(target, config.cluster * config.cluster_columns)
-                is None):
+                or not self._divides(ba, config) or report.refused(self, ba, config)):
             return False
         # A family fixing its accumulator's rows takes a tile of exactly them a consumer, and one holding its
         # accumulators in tensor memory a tile whose accumulators it holds (a paired product's two).
@@ -1109,20 +1106,14 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def _programs(self, config: mosaic_gpu.Tiles) -> int:
         """The programs the persistent kernel's schedule spreads its tiles over: the tile's programs on each
-        multiprocessor (`Tiles.programs`) its clusters place on (`generation.placed_multiprocessors`), a
-        cluster's programs each one's, so its clusters run in one wave."""
-        target = generation.gpu_target()
-        placed = generation.placed_multiprocessors(target, config.cluster * config.cluster_columns)
-        if placed is None:
-            raise ValueError(f"{target.generation} states no placement of a {config.cluster} x "
-                             f"{config.cluster_columns} cluster (`GpuTarget.cluster_placed`)")
-        return placed * config.programs
+        multiprocessor (`Tiles.programs`)."""
+        return _multiprocessors(generation.gpu_target()) * config.programs
 
     def _launched(self, config: mosaic_gpu.Tiles, interpret: bool) -> int:
         """The programs the persistent kernel launches: its schedule's (`_programs`); the interpreter runs
-        one cluster (jax/_src/pallas/mosaic_gpu/interpret), one program alone or a cluster's
-        (`Tiles.cluster`, `Tiles.cluster_columns`)."""
-        return config.cluster * config.cluster_columns if interpret else self._programs(config)
+        one cluster (jax/_src/pallas/mosaic_gpu/interpret), one program alone or a pair's two
+        (`Tiles.cluster`)."""
+        return config.cluster if interpret else self._programs(config)
 
 
 SWAPPED_ROWS = 128
@@ -1182,9 +1173,6 @@ class MosaicGmm(_Mosaic):
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
         family = pricing.family_of(config, dtype)
         columns = pricing.tile_columns(config, family)
-        if config.cluster_columns > 1:
-            # A product's cluster stacks its programs along the rows alone (`mosaic_gpu.gmm`).
-            return False
         runs = mosaic_gpu.partial_runs(config, dtype, ba.arguments['interpret'],
                                        transpose_rhs=ba.arguments['trans_rhs'],
                                        gathered=ba.arguments.get('gather') is not None,
@@ -1800,8 +1788,7 @@ class MosaicTgmm(_Mosaic):
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
         whole = (rows % pricing.tile_rows(config, family) == 0
                  or (self._ragged(ba, family) and config.cluster == 1))
-        # A cluster's column tiles side by side, whole (`pricing.walk_columns`).
-        return whole and width % pricing.walk_columns(config, family) == 0
+        return whole and width % pricing.tile_columns(config, family) == 0
 
     def _ragged(self, ba, family: mosaic.Family) -> bool:
         # A depth no cooperative tile's rows divide takes a partial last row tile where the family's loads

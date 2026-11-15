@@ -1121,10 +1121,10 @@ def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():
     so a launch sized by them sizes itself rather than taking a default for want of a row."""
     blackwell = runtime_facts(GpuTarget("sm100", "NVIDIA B200"), SimpleNamespace(
         compute_capability="10.0", core_count=148, shared_memory_per_block_optin=232448, local_hardware_id=0,
-        device_kind="NVIDIA B200"), place=lambda ordinal, programs: None)
+        device_kind="NVIDIA B200"))
     hopper = runtime_facts(GpuTarget("sm90", "NVIDIA H100 80GB HBM3"), SimpleNamespace(
         compute_capability="9.0", core_count=132, shared_memory_per_block_optin=232448, local_hardware_id=0,
-        device_kind="NVIDIA H100 80GB HBM3"), place=lambda ordinal, programs: None)
+        device_kind="NVIDIA H100 80GB HBM3"))
     assert (blackwell.multiprocessors, blackwell.shared_limit, blackwell.wgmma) == (148, 232448, False)
     assert (hopper.multiprocessors, hopper.shared_limit, hopper.wgmma) == (132, 232448, True)
 
@@ -1141,33 +1141,11 @@ def test_a_gpu_target_takes_the_clocks_bandwidth_and_l2_its_driver_reports():
                              local_hardware_id=3, device_kind="NVIDIA H100 80GB HBM3")
     table = GpuTarget("sm90", "NVIDIA H100 80GB HBM3", clock_hz=1830e6, memory_bandwidth=3350e9,
                       l2_bytes=50 * 2 ** 20)
-    driven = runtime_facts(table, device, read=lambda ordinal, attribute: reported[attribute],
-                           place=lambda ordinal, programs: None)
+    driven = runtime_facts(table, device, read=lambda ordinal, attribute: reported[attribute])
     assert (driven.clock_hz, driven.memory_bandwidth, driven.l2_bytes) == (
         1_755_000e3, 2 * 2_619_000e3 * 5120 / 8, 52_428_800)
-    undriven = runtime_facts(table, device, read=lambda ordinal, attribute: None,
-                             place=lambda ordinal, programs: None)
+    undriven = runtime_facts(table, device, read=lambda ordinal, attribute: None)
     assert (undriven.clock_hz, undriven.memory_bandwidth, undriven.l2_bytes) == (1830e6, 3350e9, 50 * 2 ** 20)
-
-
-def test_a_gpu_target_takes_the_cluster_placement_its_driver_reports():
-    """A real Hopper's target takes the multiprocessors its clusters of four and of eight place on from the
-    CUDA driver (`place`, `dew.nn.kernels.clusters.cluster_placement`'s signature), in place of the table's
-    (`GpuTarget.cluster_placed`), and a launch's clusters place by it (`placed_multiprocessors`); where no
-    driver loads, the table's stay. A placement the table states wrongly so leaves no multiprocessor idle and
-    runs no second wave on a device."""
-    from dew.nn.kernels.generation import placed_multiprocessors
-
-    device = SimpleNamespace(compute_capability="9.0", core_count=132, shared_memory_per_block_optin=232448,
-                             local_hardware_id=5, device_kind="NVIDIA H100 80GB HBM3")
-    table = GpuTarget("sm90", "NVIDIA H100 80GB HBM3", cluster_placed={(132, 4): 120, (132, 8): 120})
-    reported = {4: 128, 8: 112}
-    driven = runtime_facts(table, device, read=lambda ordinal, attribute: None,
-                           place=lambda ordinal, programs: reported[programs])
-    undriven = runtime_facts(table, device, read=lambda ordinal, attribute: None,
-                             place=lambda ordinal, programs: None)
-    assert [placed_multiprocessors(driven, programs) for programs in (2, 4, 8)] == [132, 128, 112]
-    assert [placed_multiprocessors(undriven, programs) for programs in (2, 4, 8)] == [132, 120, 120]
 
 
 def test_a_parts_gpu_facts_are_the_facts_its_kernels_read():
