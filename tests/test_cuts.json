@@ -19,9 +19,6 @@
 "tests/test_algebra_fusion.py::test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes[a causal window]",
 "tests/test_algebra_fusion.py::test_a_plain_programs_product_runs_the_template_its_call_names[grouped-fast]"
 ],
-"tests/test_algebra_laws.py": [
-"tests/test_algebra_laws.py::test_every_structure_of_the_backward_tile_is_certified[True-False-True]"
-],
 "tests/test_algebra_scan.py": [
 "tests/test_algebra_scan.py::test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient[kimi_delta-after]"
 ],
@@ -233,7 +230,7 @@
 "tests/test_attention_mosaic.py::test_the_training_forward_under_every_score_hook_lowers_for_an_h100[tile-bias-natural-64]"
 ],
 "tests/test_attention_mosaic_compile.py": [
-"tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm100-32-bfloat16-prefill]",
+"tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm100-64-bfloat16-decode]",
 "tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm103-128-float32-decode]",
 "tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm103-64-float32-decode]",
 "tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm120-128-int8-decode]",
@@ -554,8 +551,8 @@
 "tests/test_attention_triton.py::test_the_backward_is_on_par_over_every_call_form[causal-window-Tiles(block_q=128, block_k=64, warps=4, stages=2)-accurate]",
 "tests/test_attention_triton.py::test_the_backward_is_on_par_over_every_call_form[documents-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
 "tests/test_attention_triton.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[causal-chunk]",
-"tests/test_attention_triton.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[documents-lengths]",
-"tests/test_attention_triton.py::test_the_backward_is_on_par_under_every_score_hook[resumed-float16-accurate]",
+"tests/test_attention_triton.py::test_the_backward_is_on_par_under_every_score_hook[custom-vjp-float32-default]",
+"tests/test_attention_triton.py::test_the_backward_is_on_par_under_every_score_hook[sinks-float16-accurate]",
 "tests/test_attention_triton.py::test_the_backward_is_on_par_under_every_score_hook[softcap-sinks-alibi-float32-accurate]",
 "tests/test_attention_triton.py::test_the_backward_walks_many_key_tiles[causal-irregular]",
 "tests/test_attention_triton.py::test_the_derived_launches_compile_within_a_99_kb_block[sm120-128]",
@@ -569,10 +566,15 @@
 "tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[0-causal]"
 ],
 "tests/test_barren_reads.py": [
-"tests/test_barren_reads.py::test_a_repeated_read_by_workers_reads_each_kept_input_once_a_pass[cached]",
+"tests/test_barren_reads.py::test_a_mixture_edit_that_moves_a_kept_corpus_to_other_workers_reads_on",
+"tests/test_barren_reads.py::test_a_mixture_of_corpora_each_kept_in_one_workers_inputs_reads_on[streamed]",
+"tests/test_barren_reads.py::test_a_worker_with_no_inputs_ends_and_the_others_read_on_and_resume",
 "tests/test_barren_reads.py::test_a_workers_read_of_a_dropping_corpus_resumes_where_it_stopped",
+"tests/test_barren_reads.py::test_a_workers_read_of_bytes_hands_them_on_before_a_prefetch",
 "tests/test_barren_reads.py::test_a_written_workers_split_reads_on_whatever_the_loadings_workers",
-"tests/test_barren_reads.py::test_workers_whose_inputs_a_filter_drops_read_on_from_their_shares_others[indexed-written after the filter]"
+"tests/test_barren_reads.py::test_streamed_workers_whose_shards_a_filter_drops_read_on_from_their_shares_others",
+"tests/test_barren_reads.py::test_workers_whose_inputs_a_filter_drops_read_on_from_their_shares_others[indexed-written after the filter]",
+"tests/test_barren_reads.py::test_workers_whose_inputs_a_filter_drops_read_on_from_their_shares_others[memory-the share's own]"
 ],
 "tests/test_beam_search.py": [
 "tests/test_beam_search.py::test_beams_are_transformers_beam_search[qwen3-tiny]"
@@ -813,7 +815,9 @@
 "tests/test_data_automatic_cache.py::test_a_chain_resumes_across_its_automatic_cache_turned_on_or_off[saved-uncached-2-indexed-keeping]"
 ],
 "tests/test_data_elastic.py": [
-"tests/test_data_elastic.py::test_an_elastic_read_whose_map_rejects_records_reads_one_readers_order[4]"
+"tests/test_data_elastic.py::test_an_elastic_expansion_reads_one_readers_pieces_in_or_out_of_workers[2]",
+"tests/test_data_elastic.py::test_an_elastic_read_of_a_volatile_source_over_several_shares_is_refused[random_map]",
+"tests/test_data_elastic.py::test_an_elastic_stream_saved_inside_a_group_resumes_on_another_count_of_workers[0-2]"
 ],
 "tests/test_data_matrix.py": [
 "tests/test_data_matrix.py::test_a_saved_position_resumes_where_an_uninterrupted_pool_lands[indexed,cache,all,rows-saved-by-1-then-4-same]",
@@ -1891,6 +1895,9 @@
 "tests/test_mamba2.py::test_the_chunk_size_does_not_change_the_scan[256]",
 "tests/test_mamba2.py::test_the_layer_matches_mamba2_mixer"
 ],
+"tests/test_mamba3.py": [
+"tests/test_mamba3.py::test_a_mimo_layer_draws_as_its_full_forward_scores"
+],
 "tests/test_mamba_ssd.py": [
 "tests/test_mamba_ssd.py::test_a_packed_calls_skip_gradient_on_the_template_is_as_exact_as_on_mamba_ssms_port",
 "tests/test_mamba_ssd.py::test_the_port_keeps_the_kernel_contract_on_a_mesh[data-split0]",
@@ -2123,10 +2130,10 @@
 "tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[llama4-gradient]",
 "tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[llama4-inputs]",
 "tests/test_multimodal_model.py::test_a_float64_gemma4_audio_tower_computes_in_float64_throughout",
-"tests/test_multimodal_model.py::test_a_text_sites_slip_is_another_function[qwen35-inputs]",
-"tests/test_multimodal_model.py::test_source_backward_matches_reference[gemma3n]",
-"tests/test_multimodal_model.py::test_source_processor_and_cached_generation_match_reference[gemma3n]",
-"tests/test_multimodal_model.py::test_source_trained_export_and_frozen_buffers_match_reference[gemma4]",
+"tests/test_multimodal_model.py::test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training",
+"tests/test_multimodal_model.py::test_source_backward_matches_reference[gemma4]",
+"tests/test_multimodal_model.py::test_source_forward_matches_reference[gemma4]",
+"tests/test_multimodal_model.py::test_source_trained_export_and_frozen_buffers_match_reference[gemma3n]",
 "tests/test_multimodal_model.py::test_training_reaches_the_gemma3n_vision_drop_path"
 ],
 "tests/test_multiprocess.py": [
@@ -2290,17 +2297,21 @@
 "tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[dense fp32]",
 "tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[gated delta net and its short conv]",
 "tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[latent attention, a user's]",
+"tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[latent attention, the lane's]",
 "tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[lightning attention]",
 "tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[selective scan]",
 "tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[sinks, a user's]",
 "tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[sinks, the lane's]",
 "tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[state-space duality (SSD), bf16]",
+"tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[state-space duality (SSD), fp32, a user's]",
 "tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[window and softcap, a user's]",
 "tests/test_per_shard.py::test_a_kernel_every_split_flow_launches_has_a_cell[window and softcap, the lane's]",
-"tests/test_per_shard.py::test_a_kernel_runs_per_shard[attention-template-tensor]",
-"tests/test_per_shard.py::test_a_kernel_runs_per_shard[gated_delta_rule-fla-data]",
-"tests/test_per_shard.py::test_a_kernel_runs_per_shard[grouped_matmul-cutlass-joined-fsdp]",
-"tests/test_per_shard.py::test_a_kernel_runs_per_shard[short_conv-mosaic_gpu-fsdp]"
+"tests/test_per_shard.py::test_a_kernel_runs_per_shard[attention-cudnn-tensor]",
+"tests/test_per_shard.py::test_a_kernel_runs_per_shard[delta_gates-joined-data]",
+"tests/test_per_shard.py::test_a_kernel_runs_per_shard[gated_delta_rule-fla-fsdp]",
+"tests/test_per_shard.py::test_a_kernel_runs_per_shard[low_rank-fused-data]",
+"tests/test_per_shard.py::test_a_kernel_runs_per_shard[short_conv-mosaic_gpu-fsdp]",
+"tests/test_per_shard.py::test_a_kernel_runs_per_shard[ssd-pallas-data]"
 ],
 "tests/test_perturbation.py": [
 "tests/test_perturbation.py::test_a_routed_decoder_trains_its_composite_statistics_without_backpropagation",
