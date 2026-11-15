@@ -421,3 +421,27 @@ def test_a_position_main_saved_under_plan_14_resumes_as_it_was_read(saved):
     for stream in streams:
         stream.close()
     assert after[1] == after[0] and after[0]
+
+
+def test_a_profile_window_in_a_phase_that_reads_an_earlier_phases_batches_names_that_program(tmp_path):
+    """A run over phases of batches of sixteen rows, then eight, then sixteen again, profiled in its third
+    phase, names the program its window ran: the one compiled for the first phase's batches, which the third
+    reuses with no compile of its own (`ProfileTraced.program`, `StepCompiled.program`). The latest compile
+    before the window, the second phase's, was the program a profile reported (the head review of the
+    training theme, row 6822)."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    from recording import RecordingTracker
+
+    from dew.telemetry.records import ProfileTraced, StepCompiled
+    from dew.training import ProfileWindow
+
+    data = compile(phases((_budget(1, 256), 2), (_budget(2, 128), 2), (_budget(3, 256), None)),
+                   read="indexed", loading=READ)
+    tracker = RecordingTracker()
+    Trainer(Counted(), optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
+            tracker=tracker, profile=ProfileWindow(str(tmp_path / "window"), steps=1, warmup=4)).fit(
+                data, steps=6, log_every=100)
+    compiled = [value for _, value in tracker.artifacts if isinstance(value, StepCompiled)]
+    (window,) = [value for _, value in tracker.artifacts if isinstance(value, ProfileTraced)]
+    assert len(compiled) == 2 and compiled[0].program != compiled[1].program
+    assert window.program == compiled[0].program
