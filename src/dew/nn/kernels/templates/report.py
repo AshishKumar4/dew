@@ -486,6 +486,8 @@ class Certification:
     round: int
     """The round of certification it was compiled or read in (`certified_together`): configs certified at once
     share one."""
+    device: Hashable
+    """The GPU it was certified on (`_certifying_device`, a `jax.Device`), whose assembler's answer it is."""
 
     @property
     def refused(self) -> tuple["Binary", ...]:
@@ -581,7 +583,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable, *, round:
         if stored is not None:
             tuning.store_verdict(device.device_kind, stored, kernels)
     found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None,
-                          next(_ROUNDS) if round is None else round)
+                          next(_ROUNDS) if round is None else round, device)
     with _GUARD:
         _CERTIFIED[key] = found
     return found.refused
@@ -591,15 +593,18 @@ def certified_together(op, arguments: tokamax.BoundArguments, configs: Sequence[
                        ) -> list[tuple["Binary", ...] | None]:
     """Each of `configs` certified (`certified`) in one round, all at once on as many threads, each tracing
     under this thread's states (`dew._cache.carried`: the assumed GPU, the kernel choices, JAX's per-thread
-    settings) in a copy of this context: a search's rungs, which the assembler answers only one yes or no each
-    (`rung_round` bounds a round by the host's cores)."""
+    settings) in a copy of this context, on the device this thread certifies on: a search's rungs, which the
+    assembler answers only one yes or no each (`rung_round` bounds a round by the host's cores)."""
     round = next(_ROUNDS)
-    if len(configs) < 2:
+    # The device this thread certifies on, named to each thread: one read of this thread's mesh, which JAX
+    # holds per thread (`jax.set_mesh`), and no other thread sees (row 6791; train 909's review F4).
+    device = _certifying_device()
+    if len(configs) < 2 or device is None:
         return [certified(op, arguments, config, round=round) for config in configs]
     entered = _cache.carried()
 
     def asked(config: Hashable) -> tuple["Binary", ...] | None:
-        with entered():
+        with entered(), certifying(device):
             return certified(op, arguments, config, round=round)
 
     with ThreadPoolExecutor(len(configs), thread_name_prefix="dew-certify") as pool:
