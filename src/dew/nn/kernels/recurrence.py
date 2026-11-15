@@ -372,8 +372,16 @@ def log_gates(hooks: Hooks, given: dict, work):
 
 
 def skipped(hooks: Hooks, out, value, given: dict, work):
-    """An output `[..., Hv, Dv]` in `work` with the skip `D v` added where the hooks have one (`_skip`)."""
-    return out + _skip(given['skip'].astype(work), value.astype(work)) if hooks.skip else out
+    """An output `[..., Hv, Dv]` in `work` with the skip `D v` added where the hooks have one
+    (`skip_added`)."""
+    return skip_added(out, given['skip'], value, work) if hooks.skip else out
+
+
+def skip_added(out, skip, value, work):
+    """An output `[..., Hv, Dv]` in `work` with the skip `D v` added (`_skip`), `D` `[Hv]` against values
+    `[..., Hv, Dv]`, each in `work`: the chunked op's epilogue's and a layer's adding its own skip
+    (Mamba-3's), one owner of the skip's product and its gradient's sum."""
+    return out + _skip(skip.astype(work), value.astype(work))
 
 
 def _skip_product(skip, value):
