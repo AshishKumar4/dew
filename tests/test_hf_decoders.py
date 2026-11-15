@@ -157,6 +157,22 @@ def fixture_config(name):
     return json.loads((FIXTURES / name / "config.json").read_text())
 
 
+def test_the_metadata_fields_are_transformers_and_reading_a_config_imports_none_of_it():
+    """The fields a translator leaves out as metadata (`HF_METADATA`) are those transformers' base config
+    writes, and `torch_dtype`; a fresh process that translates a released config imports no transformers,
+    whose import took 6.6 s on armada (row 3895)."""
+    from transformers import PretrainedConfig
+
+    from dew.interop.config_records import HF_METADATA
+
+    assert frozenset(PretrainedConfig().to_dict()) | {"torch_dtype"} == HF_METADATA
+    read = ("import json, sys\nfrom dew.interop.hf_decoders import translate_config\n"
+            "translate_config(json.loads(open(sys.argv[1]).read()))\nprint('transformers' in sys.modules)\n")
+    found = subprocess.run([sys.executable, "-c", read, str(FIXTURES / "llama-tiny" / "config.json")],
+                           check=True, capture_output=True, text=True)
+    assert found.stdout.strip() == "False", found.stdout
+
+
 def fp32_decoder(directory, **kwargs):
     """The fixture as a model plus variables, in fp32 on the reference kernel."""
     pretrained = Pretrained.load(str(directory), dtype='float32',
