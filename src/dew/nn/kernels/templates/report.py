@@ -705,16 +705,23 @@ def certified_together(op, arguments: tokamax.BoundArguments, configs: Sequence[
     under this thread's states (`dew._cache.carried`: the assumed GPU, the kernel choices, JAX's per-thread
     settings) in a copy of this context, on the device this thread certifies on: a search's rungs, which the
     assembler answers only one yes or no each (`rung_round` bounds a round by the host's cores)."""
+    from jax._src import mesh as mesh_lib
+
     round = next(_ROUNDS)
-    # The device this thread certifies on, named to each thread: one read of this thread's mesh, which JAX
-    # holds per thread (`jax.set_mesh`), and no other thread sees (row 6791; train 909's review F4).
+    # The device this thread certifies on and the meshes its program is set on and traced under (its axes
+    # manual within a map), named to each thread: JAX holds both per thread (`jax.set_mesh`,
+    # `jax.sharding.use_abstract_mesh`), which no other thread sees (row 6791; train 909's review F4), and a
+    # launch certified off them lowers its kernels as its program does not (`_certifying_placement`).
     device = _certifying_device()
+    placed, abstract = mesh_lib.get_concrete_mesh(), jax.sharding.get_abstract_mesh()
     if len(configs) < 2 or device is None:
         return [certified(op, arguments, config, round=round) for config in configs]
     entered = _cache.carried()
 
     def asked(config: Hashable) -> tuple["Binary", ...] | None:
-        with entered(), certifying(device):
+        with (entered(), certifying(device),
+              contextlib.nullcontext() if placed.empty else jax.set_mesh(placed),
+              contextlib.nullcontext() if abstract.empty else jax.sharding.use_abstract_mesh(abstract)):
             return certified(op, arguments, config, round=round)
 
     with ThreadPoolExecutor(len(configs), thread_name_prefix="dew-certify") as pool:
