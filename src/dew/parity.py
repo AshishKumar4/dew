@@ -474,7 +474,8 @@ def _typical_status(mine: np.ndarray, theirs: np.ndarray,
 def _sized(mine: np.ndarray, theirs: np.ndarray, typical: bool = False,
            examples: list[np.ndarray] | None = None, scalar: bool = False) -> bool:
     """Whether a paired sizing takes a leaf as sized by these draws, Dew's squared errors `mine` against
-    the reference's `theirs`: its pooled ratio's interval resolved (no wider than PARITY), or, with
+    the reference's `theirs` (each seed's log, `log_errors`: -inf where exact): its pooled ratio's interval
+    resolved (no wider than PARITY), or, with
     `typical` (a leaf the pooled ratio does not size within MOST_SEEDS, `seeds_for`), its typical draw's
     interval resolved and its draws qualifying as `_typical_status` asks (`examples` as it reads them)."""
     low, high = _interval(mine, theirs)
@@ -816,19 +817,22 @@ def _compiled(statistics):
 
 
 def _width(leaf) -> int:
-    """A leaf's row width: its last axis's, 0 for a leaf of rank under two, which has no rows."""
-    return np.shape(leaf)[-1] if np.ndim(leaf) >= 2 else 0
+    """A leaf's row width: its last axis's, a vector's its own (one row), 0 for a scalar, which has no
+    rows."""
+    return np.shape(leaf)[-1] if np.ndim(leaf) >= 1 else 0
 
 
 def _laid(leaf, xp):
     """`leaf` in float64, in C order: its sums run alike whatever layout it came in (numpy's follow
     memory order; a compiled program's leaves are C-ordered)."""
-    return np.ascontiguousarray(leaf, np.float64) if xp is np else jnp.asarray(leaf, jnp.float64)
+    # Its own shape kept: numpy lays a scalar out as one value of rank one, which has a row a scalar has not.
+    return (np.ascontiguousarray(leaf, np.float64).reshape(np.shape(leaf)) if xp is np
+            else jnp.asarray(leaf, jnp.float64))
 
 
 def _truth_rows(truths, terms, *, xp):
     """Each truth leaf's rows' own RMS and size (`_row_sizes`, with the leaf's float64 terms where `terms`
-    holds them), and whether its every value is finite. A leaf of rank under two has no rows."""
+    holds them), and whether its every value is finite. A scalar leaf has no rows (`_width`)."""
     found = []
     for truth, term in zip(truths, terms, strict=True):
         truth = _laid(truth, xp)
@@ -881,7 +885,7 @@ def _largest_share(rows, xp=np):
 @dataclasses.dataclass(frozen=True)
 class _LaidTruths:
     """A draw's truth leaves read once for both arms (`_summaries`), every leaf that is not empty in its
-    order, its rows in C order (its last axis's, none for a leaf of rank under two). Each row has its own
+    order, its rows in C order (its last axis's, none for a scalar). Each row has its own
     RMS (`_scaled_rms`) and its size, the RMS where it is past RESOLUTION of its leaf, else zero
     (`row_errors`'), computed where the leaves live in one program a draw (`_truth_rows`): only these
     rows' statistics leave the device. `truths` is every leaf as given, `laid` the leaves that are not
@@ -978,7 +982,8 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
 
 @dataclasses.dataclass
 class _Draws:
-    """Each leaf's errors over a run of seeds: Dew's and the reference's mean squared error from
+    """Each leaf's errors over a run of seeds: Dew's and the reference's mean squared error's log
+    (`log_errors`: -inf where exact; `mine` and `theirs`, never the errors themselves) from
     float64 (seed by leaf), the log of each seed's worst sized row over its size (Dew's, the
     reference's; `log_over`), each
     seed's rows of float64 zero with Dew's and the reference's errors on them (`ZeroRows`, seed by leaf;
@@ -1247,7 +1252,7 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
     row = []
     for path, leaf, their_leaf, true, their_true, was, summary, their_summary in zip(
             paths, leaves, references, truths, their_truths, recorded, prepared.mine, theirs, strict=True):
-        their = their_leaf if was else their_summary
+        their = _one_row(their_leaf, their_true) if was else their_summary
         if np.size(leaf) == 0:
             # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
             # reference's dtype (its shape is held above; the truth's dtype, float64, is its own), it
@@ -1260,6 +1265,19 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
         paired = (was and not own) or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
         row.append(_paired(path, summary, their, paired=paired))
     return row
+
+
+def _one_row(recorded: RecordedLeaf, truth) -> RecordedLeaf:
+    """A recorded reference's evidence on a vector leaf, which is one row (`_width`): that row's RMS error is
+    the leaf's, the root of its recorded mean squared error, sized by its truth (`rows_summary`), so the row
+    the gate reads is the one the recording measured, whatever row evidence the recording kept (a recording
+    made while a vector had no row kept none). Its example evidence as recorded, and its row's element
+    share unknown, as a recording of row distances keeps none; any other leaf's as recorded."""
+    if np.ndim(truth) != 1:
+        return recorded
+    row = rows_summary(np.exp([recorded.log_mse / 2]), truth, finite=recorded.finite, dtype=recorded.dtype,
+                       log_mse=recorded.log_mse)
+    return dataclasses.replace(row, example_mse=recorded.example_mse, example_worst=recorded.example_worst)
 
 
 def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool = True) -> tuple:
@@ -1684,7 +1702,7 @@ def _judged_leaves(dew, weighing) -> tuple[list[str], tuple[int, ...]]:
     `weighing` each floating leaf's classes, each compacted by its values a row (`Weighed.classed`)."""
     judged = dew if weighing is None else weighing.classed(jax.device_get(dew))
     return ([jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(judged)],
-            tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0 for leaf in jax.tree.leaves(judged)))
+            tuple(int(_width(leaf)) for leaf in jax.tree.leaves(judged)))
 
 
 def _drawn_from(names: list[str], widths: tuple[int, ...], evidence: list[list[tuple]], examples=None,

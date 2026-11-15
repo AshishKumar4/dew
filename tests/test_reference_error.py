@@ -839,6 +839,44 @@ def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
         assert_as_exact_as_the_reference(dew, reference, truth, "small row")
 
 
+VECTOR_SEEDS = 512
+"""Draws of a three-value vector: one draw in them erring eight units of float32 on every value moves the
+pooled RMS ratio by sqrt(575 / 512) alone, where its row is eight times the reference's worst."""
+
+
+@pytest.mark.parametrize("shape", [(3,), (1, 3)], ids=["a vector", "one row of a matrix"])
+def test_a_vectors_values_are_one_row_held_by_the_worst_row_rule(shape):
+    """A leaf of rank one is one row along its last axis, as a matrix's rows are (testing.md: a leaf's rows
+    run along its last axis): three values tripled, Dew erring eight units of float32 on every value of
+    the one draw of `VECTOR_SEEDS` whose values sum largest, fail check 1's worst-row rule laid as a vector
+    as laid as one row of a matrix, the pooled ratio within PARITY; a leaf of rank one had no rows, and
+    passed (row 6688)."""
+    def draw(seed):
+        return (np.random.default_rng(seed).standard_normal(shape).astype(np.float32),)
+
+    sums = sorted(float(np.sum(np.asarray(draw(seed)[0], np.float64))) for seed in range(VECTOR_SEEDS))
+    largest = (sums[-1] + sums[-2]) / 2
+
+    # NumPy arms, as given: the erring draw is chosen on the host by its float64 sum.
+    @as_given
+    def tripled(x):
+        return np.asarray(x, np.float32) * np.float32(3)
+
+    @as_given
+    def erring(x):
+        made = np.asarray(x, np.float32) * np.float32(3)
+        off = np.float32(1 + 8 * 2.0 ** -23)
+        return made * off if np.sum(np.asarray(x, np.float64)) > largest else made
+
+    @as_given
+    def exact(x):
+        return np.asarray(x, np.float64) * 3
+
+    with pytest.raises(GateFailure):
+        assert_as_exact(erring, tripled, draw, f"three values laid {shape}", seeds=VECTOR_SEEDS,
+                        truth_fn=exact)
+
+
 def test_a_row_that_cancels_is_held_to_what_it_sums():
     """A query that keeps one key has a zero gradient: its terms, about 1 each, cancel. Both
     sides round them by about a float32 unit, which over the row's near-zero float64 value is a
@@ -2028,7 +2066,8 @@ def test_a_leaf_in_any_layout_reads_as_its_c_ordered_copy():
     dew, reference, laid = otherwise(arm()), otherwise(arm()), otherwise(truth)
     assert not any(np.asarray(value).flags.c_contiguous for tree in (dew, reference, laid)
                    for value in tree.values() if np.ndim(value) >= 2)
-    ordered = [{name: np.ascontiguousarray(value) for name, value in tree.items()}
+    # Each copy its leaf's own shape: numpy lays a scalar out as one value of rank one.
+    ordered = [{name: np.ascontiguousarray(value).reshape(np.shape(value)) for name, value in tree.items()}
                for tree in (dew, reference, laid)]
 
     def evidence(dew, reference, truth):
