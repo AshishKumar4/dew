@@ -29,21 +29,28 @@ def assert_steps_finite(scalars: Iterable[tuple[int, Mapping[str, float]]], labe
     assert not lost, f"{label}: the updates at steps {lost} applied a gradient that was not finite"
 
 
-def held_out_losses(objective, optimizer, loader_of: Callable[[int], object],
-                    held_out_of: Callable[[int], Mapping], *, runs: int,
-                    steps: int) -> tuple[np.ndarray, np.ndarray]:
-    """Each of `runs` independent runs' held-out loss before training and after `steps` steps: on the run's
-    own held-out batch (`held_out_of(run)`, read at `HELD_OUT`), each run from its own initialization key
-    and data (`loader_of(run)`). A learning claim's contrasts are formed of them, one a run, and judged by
-    the learning gate (`learning_gate.assert_learns`)."""
+def held_out_measures(objective, optimizer, loader_of: Callable[[int], object],
+                      held_out_of: Callable[[int], Mapping], *, runs: int, steps: int,
+                      measure: Callable[[Mapping, Mapping], float] | None = None,
+                      **trainer) -> tuple[np.ndarray, np.ndarray]:
+    """Each of `runs` independent runs' held-out measure before training and after `steps` steps: on the
+    run's own held-out batch (`held_out_of(run)`), each run from its own initialization key and data
+    (`loader_of(run)`), a Trainer of `trainer`'s options (a rollout's among them). The measure is
+    `measure(variables, held_out)`, the objective's loss read at `HELD_OUT` where None. A learning claim's
+    contrasts are formed of them, one a run, and judged by the learning gate
+    (`learning_gate.assert_learns`)."""
+    def loss(variables: Mapping, held_out: Mapping) -> float:
+        return float(objective.scalar_loss(variables, held_out, HELD_OUT)[0])
+
+    measured = loss if measure is None else measure
     before, after = [], []
     for run in range(runs):
-        trainer = Trainer(objective, optimizer, key=jax.random.key(run))
-        start = trainer.initial_state()
-        state = trainer.fit(loader_of(run), steps=steps, log_every=steps)
+        fitted = Trainer(objective, optimizer, key=jax.random.key(run), **trainer)
+        start = fitted.initial_state()
+        state = fitted.fit(loader_of(run), steps=steps, log_every=steps)
         held_out = held_out_of(run)
-        before.append(float(objective.scalar_loss(start.variables, held_out, HELD_OUT)[0]))
-        after.append(float(objective.scalar_loss(state.variables, held_out, HELD_OUT)[0]))
+        before.append(measured(start.variables, held_out))
+        after.append(measured(state.variables, held_out))
     return np.asarray(before), np.asarray(after)
 
 

@@ -17,7 +17,7 @@ from affine_run import BATCH, Affine, Counting, Replaying, dataset
 from flax import linen as nn
 from learning_gate import assert_learns
 from recording import RecordingTracker
-from scenario_contract import HELD_OUT, held_out_losses
+from scenario_contract import HELD_OUT, held_out_measures
 
 from dew.batch import VALID_ROWS
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
@@ -60,7 +60,7 @@ def test_a_plain_flax_model_trains_on_a_loss_function():
     def loader(run):
         return dataset(train=lambda: Replaying(lambda step: batch(seed=[run, step])), batch=8)
 
-    drop = cut(*held_out_losses(objective, optax.adam(0.1), loader,
+    drop = cut(*held_out_measures(objective, optax.adam(0.1), loader,
                                 lambda run: batch(rows=256, seed=[run, 10_000]), runs=RUNS, steps=60),
                margin=4)
     assert_learns(lambda runs: {"training cuts the held-out loss to a quarter": drop[runs]},
@@ -246,7 +246,7 @@ def test_the_autoencoders_evidence_bound_falls_over_independent_runs():
     def loader(run):
         return dataset(train=lambda: Replaying(lambda step: points([run, step])), batch=32)
 
-    drop = cut(*held_out_losses(objective, config.optim.build(config.trainer.steps), loader,
+    drop = cut(*held_out_measures(objective, config.optim.build(config.trainer.steps), loader,
                                 lambda run: points([run, 10_000], rows=256), runs=RUNS,
                                 steps=config.trainer.steps), margin=2)
     assert_learns(lambda runs: {"training halves the held-out evidence bound": drop[runs]},
