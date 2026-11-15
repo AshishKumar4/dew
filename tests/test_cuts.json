@@ -835,11 +835,11 @@
 ],
 "tests/test_decision_workflow.py": [
 "tests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[joint-plain-0.0-examples]",
-"tests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[letters-context-0.0-share]",
-"tests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[letters-plain-0.5-examples]",
-"tests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[question-context-0.0-examples]",
-"tests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[question-plain-0.5-share]",
-"tests/test_decision_workflow.py::test_the_cells_cover_every_pair"
+"tests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[joint-plain-0.5-share]",
+"tests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[letters-context-0.5-examples]",
+"tests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[letters-plain-0.0-share]",
+"tests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[question-context-0.5-share]",
+"tests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[question-plain-0.0-examples]"
 ],
 "tests/test_decode_attention.py": [
 "tests/test_decode_attention.py::test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config[bfloat16-both-fold-16]",
@@ -1324,6 +1324,10 @@
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[float16-all-empty]",
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[float16-tile-boundaries]"
 ],
+"tests/test_grpo.py": [
+"tests/test_grpo.py::test_a_grpo_policy_rewarded_for_its_language_learns_it",
+"tests/test_grpo.py::test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server"
+],
 "tests/test_guidance_distillation.py": [
 "tests/test_guidance_distillation.py::test_a_saved_student_samples_one_branch_at_its_conditioners_guidance[flow]",
 "tests/test_guidance_distillation.py::test_a_student_whose_process_reads_raw_outputs_otherwise_is_refused[edm]",
@@ -1750,9 +1754,6 @@
 "tests/test_mamba2.py::test_the_chunk_size_does_not_change_the_scan[256]",
 "tests/test_mamba2.py::test_the_layer_matches_mamba2_mixer"
 ],
-"tests/test_mamba3.py": [
-"tests/test_mamba3.py::test_a_mimo_layer_draws_as_its_full_forward_scores"
-],
 "tests/test_mamba_ssd.py": [
 "tests/test_mamba_ssd.py::test_a_packed_calls_skip_gradient_on_the_template_is_as_exact_as_on_mamba_ssms_port",
 "tests/test_mamba_ssd.py::test_the_port_keeps_the_kernel_contract_on_a_mesh[data-split0]",
@@ -1837,9 +1838,6 @@
 "tests/test_mla.py::test_a_paged_latent_cache_decodes_what_the_compact_cache_decodes[mla_v32-None]",
 "tests/test_mla.py::test_a_quantized_latent_cache_decodes_what_dequantizing_in_the_own_basis_computes[mla_v3-int8]",
 "tests/test_mla.py::test_dense_mla_reads_a_padded_row_under_a_window_as_its_unpadded_twin"
-],
-"tests/test_model_flops.py": [
-"tests/test_model_flops.py::test_decision_heads_match_every_forward_product_including_pooling[joint]"
 ],
 "tests/test_model_flops_families.py": [
 "tests/test_model_flops_families.py::test_each_family_matches_every_traced_forward_product[edm2]",
@@ -2670,6 +2668,22 @@
 "tests/test_scenario_learning.py::test_a_model_loaded_from_a_quantized_file_learns_its_language",
 "tests/test_scenario_learning.py::test_a_released_decoder_learns_its_language[a gated delta hybrid]",
 "tests/test_scenario_learning.py::test_a_released_decoder_learns_its_language[a mixture of experts]"
+],
+"tests/test_scenario_runs.py": [
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[JEPA-precision=bf16-mixed,devices=1,read=streamed]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[dense LM-precision=32-true,rows=packed,memory=None,devices=2,read=memory]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[dense LM-precision=bf16-mixed,rows=packed,memory=full,devices=2,read=indexed]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[diffusion-precision=32-true,quantization=qat,memory=False,devices=2]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[diffusion-precision=bf16-mixed,quantization=qat,memory=full,devices=2]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[distributed-model=moe,mesh=expert,precision=bf16-mixed]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[hybrid-mixer=gdn,precision=bf16-mixed,rows=padded,devices=1]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[hybrid-mixer=mamba,precision=bf16-mixed,rows=packed,devices=1]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[masked diffusion LM-precision=bf16-mixed,rows=padded,devices=1]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[online RL-method=grpo,precision=bf16-mixed,devices=1]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[pretrained-precision=32-true,adapter=full,quantization=None,devices=1]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[pretrained-precision=32-true,adapter=lora,quantization=None,devices=2]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[pretrained-precision=bf16-mixed,adapter=lora,quantization=qat,devices=2]",
+"tests/test_scenario_runs.py::test_a_scenarios_cell_holds_the_contracts_its_flow_touches[quantized interchange-format=Q8_0,use=train]"
 ],
 "tests/test_sd3_source.py": [
 "tests/test_sd3_source.py::test_native_sd3_matches_the_source_forward_and_every_gradient[deep]"
