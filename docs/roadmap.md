@@ -8,7 +8,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- The attention launches' outputs state no dimensions. [6733]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -76,6 +75,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
+- Src/dew/optim.py _placement refuses Muon for a rank-2 kernel declared with one named axis and one None. [6746]
 
 ## Data
 
