@@ -381,10 +381,13 @@ def spread_over(axes: Iterable[str]) -> None:
 
 
 def trace_context() -> tuple:
-    """What a model reads from context as it traces, beside the mesh (which jax keys on itself): the
-    pipeline's microbatch count, the logical-axis rules, the measured links and the layout placing its
-    parameters (`placing`). A program cached by its arguments' shapes is reused only under the same
-    (`Objective.program`)."""
+    """What a model reads from context as it traces, beside the mesh (which jax keys on itself), by value:
+    the pipeline's microbatch count, the logical-axis rules, the measured links and the layout placing its
+    parameters (`placing`). A step's own entry sets its context variables anew (`STATED`), so they are
+    stated by what a trace reads of them, not by the objects that hold it: here, as a rung record names it
+    (`dew.training.rungs`), and in the one key of a trace kept outside the compile point
+    (`dew.nn.kernels.options.trace_context`), which holds this statement and the declared axes' table
+    (`current_boxes`) in their place."""
     schedule = _SCHEDULE.get()
     links = tuple(sorted((axis, link.bytes_per_second, link.flops_per_second)
                          for axis, link in _LINKS.get().items()))
@@ -781,6 +784,11 @@ def ruled_boxes(table: Mapping[Suffix, LogicalAxes], rules: LogicalAxisRules) ->
     named = {name for name, _ in rules}
     return {path: names for path, names in table.items()
             if named.intersection(names) or all(name is None for name in names)}
+
+
+STATED: frozenset[contextvars.ContextVar] = frozenset({_SCHEDULE, _LINKS, _BOXED})
+"""The context variables a step's entry sets anew, stated by what a trace reads of them (`trace_context`, and
+the declared axes' table frozen, `current_boxes`)."""
 
 
 def current_boxes() -> Mapping[Suffix, LogicalAxes]:

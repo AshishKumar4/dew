@@ -29,7 +29,7 @@ from jax.sharding import Sharding
 
 from dew import _cache, algebra
 from dew._devices import xla_flag
-from dew.nn.kernels.generation import backend, gpu_target, traced_fact
+from dew.nn.kernels.generation import backend, gpu_target, stated, traced_fact
 from dew.nn.nested import staged
 from dew.telemetry.benchmark import UNGRAPHED_FLAG, options_of
 
@@ -687,11 +687,39 @@ def _given_tuple(given) -> tuple:
 
 
 def trace_context() -> Hashable:
-    """What JAX keys a trace on beside its arguments (its configuration's traced states, Dew's own run
-    precision among them, and the abstract mesh), and the concrete mesh in place: what a call's executable
-    is kept under beside its arguments (`OuterProgram.key_of`), for a cache of traces kept outside the
-    compile point (`dew.training._candidates`)."""
-    return jax_config.trace_context(), jax.sharding.get_mesh()
+    """What a trace reads of this thread's context beside its function and its arguments' types: the key a
+    trace kept outside the compile point is held by (a step's candidates, `dew.training._candidates`; a
+    fused region's written program, `dew.algebra.fusion`). What JAX keys a trace on (its configuration's
+    traced states, Dew's own run precision among them, its meshes and contexts, and Dew's contexts but those
+    a trace records into, `_cache.RECORDING`), and the concrete mesh in place, read as it stands within a
+    trace too (where `jax.sharding.get_mesh` refuses); what a model reads from the step's own entry, by value
+    (`dew.nn.sharding.trace_context` and the declared axes' table frozen, in place of the variables that
+    entry sets anew, `sharding.STATED`); every other context variable set in this context but those no trace
+    reads (`_cache.untraced`, and Python's decimal context); the logical axis rules Flax holds; and the
+    environment's variables of Dew's own, each value by its contents (`generation.stated`). The process's
+    facts a trace reads (`generation.TRACED_FACTS`) are no part of it: each is answered where a trace asks
+    it, under the trace's own target, and one read outside a trace may have no answer (a compile-only GPU
+    mesh's devices hold no memory statistics); a caller whose trace reads one names it beside this key (the
+    compiles' refusals, `report.refused_launches`). A value it leaves out costs a trace, never a program
+    traced under other state."""
+    import decimal
+    import os
+
+    from flax import linen as nn
+    from jax._src import mesh as mesh_lib
+
+    from dew.nn import sharding
+
+    with _cache.KERNEL_SEEN(None), _cache.KERNEL_ROUTES(()):
+        traced = jax_config.trace_context()
+    variables = sorted(((variable, stated(value)) for variable, value in contextvars.copy_context().items()
+                        if variable not in _cache.UNTRACED | sharding.STATED
+                        and not isinstance(value, decimal.Context)),
+                       key=lambda pair: (pair[0].name, id(pair[0])))
+    entry = sharding.trace_context(), tuple(sorted(sharding.current_boxes().items(), key=repr))
+    return (traced, mesh_lib.get_concrete_mesh(), entry, tuple(variables),
+            stated(nn.get_logical_axis_rules()),
+            tuple(sorted((name, value) for name, value in os.environ.items() if name.startswith("DEW_"))))
 
 
 def _signature(leaf) -> Hashable:

@@ -1486,15 +1486,15 @@ def test_a_refusal_applies_only_to_the_target_capacities_that_generated_its_kern
 
 
 def test_a_trace_held_by_its_state_is_held_in_any_recordings_scope():
-    """The state a held trace is keyed by (`dew._cache.traced_state`, the algebra's written regions') is the
+    """The state a held trace is keyed by (`options.trace_context`, the algebra's written regions') is the
     same in two fresh recordings (`generation.recording`): a recording is what a trace records into, no
     trace reads it, so identical regions traced in two of them share one trace (row 6668)."""
-    from dew import _cache
+    from dew.nn.kernels import options
 
     with generation.recording():
-        first = _cache.traced_state()
+        first = options.trace_context()
     with generation.recording():
-        second = _cache.traced_state()
+        second = options.trace_context()
     assert first == second
 
 
