@@ -5,9 +5,11 @@ operations it composes, and refuses each one that reads a later position or that
 none; a program that computes otherwise past a length is proven below it and refused above. Dew's own
 attention and token-wise programs are read by their rules where Dew's code bound them (`attested`); a
 program merely named like one is walked inside. Attention written out (transformers' own) is causal where
-its mask zeroes each later key's weight, by minus infinity or its dtype's lowest, and not where a key ahead
-is seen, a query sees none, or a bias is too small to vanish; a token's routing weights taken by its own
-row, keys assembled by slice assignment and halves unstacked and stacked keep each position's own."""
+its mask zeroes each later key's weight, by minus infinity or its dtype's lowest (its scores below half an
+ulp of their dtype's largest, the walk's domain), a query seeing none reading nothing; and not where a key
+ahead is seen, a bias is too small to vanish, a cast takes masked and unmasked scores to one value, or a
+row is taken less another's maximum. A token's routing weights taken by its own row, keys assembled by
+slice assignment and halves unstacked and stacked keep each position's own."""
 
 import jax
 import jax.numpy as jnp
@@ -46,13 +48,12 @@ def visible(length: int, ahead: int = 0, first_sees: bool = True):
     return seen if first_sees else seen & (jnp.arange(length) > 0)[:, None]
 
 
-def biased_attention(tokens, bias: float, *, dropout: bool = False, scale: float = D ** -0.5):
-    """Transformers' eager attention: scores scaled by `scale` plus a mask of `bias` past each query's
-    own key, a float32 softmax, its weights dropped out where `dropout`, over the values. A finite mask
-    zeroes a later key's weight only where the scores are small beside it: none the walk can show."""
+def biased_attention(tokens, bias: float, *, dropout: bool = False):
+    """Transformers' eager attention: scaled scores plus a mask of `bias` past each query's own key, a
+    float32 softmax, its weights dropped out where `dropout`, over the values."""
     q = k = v = embedded(tokens)
     length = tokens.shape[1]
-    scores = jnp.einsum("bqd,bkd->bqk", q, k) * scale
+    scores = jnp.einsum("bqd,bkd->bqk", q, k) * D ** -0.5
     weights = jax.nn.softmax(scores + jnp.where(visible(length), 0.0, bias), axis=-1)
     if dropout:
         weights = weights * jax.random.bernoulli(jax.random.key(0), 0.9, weights.shape) / 0.9
@@ -163,6 +164,10 @@ ADMITTED = {
         *(embedded(tokens),) * 3, causal=True),
     "attention written out, masked by minus infinity added": lambda tokens: biased_attention(
         tokens, -jnp.inf),
+    "attention written out, masked by its dtype's lowest added": lambda tokens: biased_attention(
+        tokens, float(jnp.finfo(jnp.float32).min)),
+    "attention whose first query sees no key": lambda tokens: attention(*(embedded(tokens),) * 3,
+                                                                       causal=True, first_sees=False),
     "attention masked by minus infinity, its weights dropped out": lambda tokens: biased_attention(
         tokens, -jnp.inf, dropout=True),
     "a token's top routing weights taken by its row": routed,
@@ -184,13 +189,9 @@ REFUSED = {
     "plain attention": lambda tokens: attention(*(embedded(tokens),) * 3, causal=False),
     "attention written out, masked a key ahead": lambda tokens: attention(*(embedded(tokens),) * 3,
                                                                          causal=True, ahead=1),
-    "attention whose first query sees no key": lambda tokens: attention(*(embedded(tokens),) * 3,
-                                                                       causal=True, first_sees=False),
     "attention masked by a bias too small to vanish": lambda tokens: biased_attention(tokens, -1.0),
     "a token's top routing weights taken from the next token's": lambda tokens: routed(tokens, shift=1),
     "attention masked by its dtype's lowest, cast through bytes": lambda tokens: cast_attention(tokens),
-    "attention masked by its dtype's lowest, its scores unbounded": lambda tokens: biased_attention(
-        tokens, float(jnp.finfo(jnp.float32).min), scale=1e37),
     "attention less a maximum of other rows": shuffled_maximum,
     "keys assembled by slice assignment from the next position": lambda tokens: assembled(tokens, shift=1),
     "a left shift named as Dew's attention": lambda tokens: named(lambda q, k, v: shifted_left(v),

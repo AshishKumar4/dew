@@ -13,9 +13,9 @@ scans (step by step, their carries and initial state included) each move those p
 entries; a contraction, reduction, sort or selection across the positions' axis gives every entry the latest
 of all, as does any operation the walk holds no rule for (`_RULES`, `dew.nn.programs.positionwise`). A
 contraction of two values along their positions on two axes of its own (attention's scores written out)
-reads along both (`Pair`), each value the tokens reach taken as finite, so a mask that takes each later
-key's score to minus infinity zeroes its softmax there, and the weighted values read no later key; a mask
-by a finite value zeroes nothing it can show. Dew's
+reads along both (`Pair`), each value the tokens reach taken as finite and below half an ulp of its
+dtype's largest, so a mask that takes each later key's score to minus infinity or its dtype's lowest zeroes
+its softmax there, and the weighted values read no later key. Dew's
 causal attention (`CAUSAL_ATTENTION`) gives each query its own position's latest and its keys' up to its own;
 attention under a visibility its caller states (`STATED_ATTENTION`) gives each position its own query's, key's
 and value's, the caller's visibility being the call's and not the source's; a computation Dew states is token
@@ -138,11 +138,12 @@ class Pair:
     (i, j) along them reads none past `latest[i, j]`, and where `held[i, j]` its value is `value[i, j]`
     whatever the tokens, reading nothing. A contraction of two values the tokens reach along their
     positions on two axes makes one (attention's scores), none of its entries held. The walk takes every
-    value a program computes from the tokens as finite: so a score plus minus infinity is minus infinity,
-    its exponential zero, and zero times a value the later key reads zero, whatever that value is (masked
-    attention written out, transformers' own, with an infinite mask); a mask by a finite value, its dtype's
-    lowest, holds no score and reads it. An operation the walk holds no such rule for reads it as
-    `collapsed`."""
+    value a program computes from the tokens as finite and below half an ulp of its dtype's largest in
+    magnitude (2^103 in float32, 2^119 in bfloat16): the values for which a mask at the dtype's lowest,
+    added, leaves the lowest, as it rounds, so transformers' masks are causal exactly there. So a score plus
+    minus infinity, or plus the lowest, is that mask; its exponential, less the row's maximum, zero; and zero
+    times a value the later key reads zero (masked attention written out, transformers' own). An operation
+    the walk holds no such rule for reads it as `collapsed`."""
 
     axes: tuple[int, int]
     latest: np.ndarray
@@ -521,7 +522,7 @@ def _pair_entrywise(eqn: core.JaxprEqn, given: list[Held], operands: list[np.nda
     if eqn.primitive is jax.lax.select_n_p:
         latest, held, value = _selected(reads, helds, values, latest, held, value)
     else:
-        absorbed, taken = _absorbed(eqn.primitive, helds, values)
+        absorbed, taken = _absorbed(eqn, helds, values)
         held |= absorbed
         value = np.where(absorbed & ~every, taken, value)
     return Pair(axes, np.where(held, NONE, latest), held, np.where(held, value, 0.0))
@@ -563,24 +564,28 @@ def _entries(value: Held, operand: np.ndarray | None, shape: tuple[int, ...],
     return reads, held, np.where(held, low, 0.0)
 
 
-def _absorbed(primitive: core.Primitive, helds: list[np.ndarray],
+def _absorbed(eqn: core.JaxprEqn, helds: list[np.ndarray],
               values: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    """Where an operation's held operands decide its value whatever the other's finite value is, and that
-    value: a sum with an infinite term, a difference from or of one, a product with a zero factor, a
-    quotient of a zero or by an infinity; nowhere for any other operation."""
+    """Where an operation's held operands decide its value whatever the other's value is (`Pair`: finite,
+    below half an ulp of its dtype's largest), and that value: a sum with an infinite term or one at the
+    dtype's largest magnitude (which such a term leaves as it is, as it rounds), a difference from or of
+    one, a product with a zero factor, a quotient of a zero or by an infinity; nowhere for any other
+    operation."""
+    primitive = eqn.primitive
     size = helds[0].shape
     nowhere = np.zeros(size, bool), np.zeros(size)
     if len(helds) != 2:
         return nowhere
     (left, right), (first, second) = helds, values
     only_left, only_right = left & ~right, right & ~left
+    dtype = _dtype(eqn.outvars[0])
+    if primitive in (jax.lax.add_p, jax.lax.sub_p) and jnp.issubdtype(dtype, jnp.floating):
+        largest = float(jnp.finfo(dtype).max)
+        # A term at the largest magnitude, or past it, absorbs one below half its ulp.
+        kept = (only_left & (np.abs(first) >= largest)) | (only_right & (np.abs(second) >= largest))
+        sign = -1.0 if primitive is jax.lax.sub_p else 1.0
+        return kept, np.where(only_left, first, sign * second)
     with np.errstate(invalid="ignore"):
-        if primitive is jax.lax.add_p:
-            return ((only_left & np.isinf(first)) | (only_right & np.isinf(second)),
-                    np.where(only_left, first, second))
-        if primitive is jax.lax.sub_p:
-            return ((only_left & np.isinf(first)) | (only_right & np.isinf(second)),
-                    np.where(only_left, first, -second))
         if primitive is jax.lax.mul_p:
             return (only_left & (first == 0)) | (only_right & (second == 0)), np.zeros(size)
         if primitive is jax.lax.div_p:
