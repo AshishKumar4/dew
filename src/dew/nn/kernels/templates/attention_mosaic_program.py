@@ -28,6 +28,7 @@ from dew.nn.kernels.templates import (
     layout,
     mosaic,
     operands,
+    outputs,
     placed,
     resources,
     swizzling,
@@ -542,6 +543,16 @@ def most_consumers(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> int
     """The consumers a launch of `tiles` takes at most on `family`: a forward's the family's own
     (`Family.consumers`), a backward's at most `BACKWARD_CONSUMERS`."""
     return family.consumers if isinstance(tiles, Tiles) else min(family.consumers, BACKWARD_CONSUMERS)
+
+
+def column_share(array: jax.Array, count: int) -> outputs.Dim:
+    """A program's `count` of `array`'s columns as an output dimension (`outputs.Dim`): its last axis, or that
+    axis over the shares it is split into (`BackwardTiles.columns`), each a whole share."""
+    width = array.shape[-1]
+    if width % count:
+        raise ValueError(f"a share of {count} of {width} columns is not a whole one")
+    columns = outputs.axis(array, -1)
+    return columns if count == width else columns // (width // count)
 
 
 def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:

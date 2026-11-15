@@ -22,6 +22,7 @@ from dew.nn.kernels.templates import (
     attention_gradient as gradient,
     mosaic,
     mosaic_sm100,
+    outputs,
     placed,
     stores,
     swizzling,
@@ -34,6 +35,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    column_share,
     held_params,
     holders,
     issued_into,
@@ -525,7 +527,11 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
     keys_padded, value_width = key.shape[1], value.shape[-1]
     family, consumers, tiles = walk.program.family, walk.consumers, walk.program.tiles
     del graded
-    dk, dv = (jax.ShapeDtypeStruct((batch, keys_padded, heads, share), jnp.float32) for _, share in shares)
+    # Each a query head's (`outputs.Output`): the query's batch rows and heads, the key's padded keys, a share
+    # of the columns.
+    rows, keys, heads_of = outputs.axis(query, 0), outputs.axis(key, 1), outputs.axis(query, 2)
+    dk, dv = (outputs.output(jnp.float32, rows, keys, heads_of, column_share(array, share))
+              for array, (_, share) in zip((key, value), shares, strict=True))
     return family.kernel(
         entry, out_type=(dk, dv),
         grid=(heads, keys_padded // (holders(family, consumers) * tiles.block_k), batch),

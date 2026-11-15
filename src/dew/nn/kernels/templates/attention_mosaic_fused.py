@@ -11,7 +11,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, launches, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, resources
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, outputs, resources
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
     STATISTICS,
@@ -317,8 +317,10 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after))
 
-    gradients = tuple(jax.ShapeDtypeStruct((batch, keys_padded, kv_heads, width),
-                                           array.dtype if typed else jnp.float32) for array in (key, value))
+    # dK and dV as their own arrays' axes (`outputs.Output`).
+    gradients = tuple(outputs.output(array.dtype if typed else jnp.float32,
+                                     *(outputs.axis(array, index) for index in range(3)), width)
+                      for array in (key, value))
     launch = family.kernel(
         entry, out_type=() if grouped else gradients, grid=(heads, keys_padded // pair, batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
