@@ -665,15 +665,18 @@ def missed(op, arguments: tokamax.BoundArguments, config: Hashable, refused: Seq
 
 def _certifying_device():
     """The device a launch is certified on (`certified`): a block's (`certifying`), else this process's GPU
-    where it compiles for that GPU's generation, else none."""
+    where it compiles for that GPU's own generation (`generation.device_target`, whatever `assumed` says: an
+    A100 tracing for an assumed sm90 compiled the sm90 launch on itself, and Mosaic refused its TMA copies,
+    rows 6677 and 6678), else none."""
     named = _CERTIFYING.get()
     if named is not None:
         return named
     if jax.default_backend() != "gpu":
         return None
-    if generation.device_generation() != generation.gpu_target().generation:
+    device = jax.local_devices()[0]
+    if generation.device_target(device).generation != generation.gpu_target().generation:
         return None
-    return jax.local_devices()[0]
+    return device
 
 
 def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, device,
