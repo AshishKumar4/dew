@@ -2105,13 +2105,14 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                                              swizzles=SCALE_SWIZZLES if step_scales is not None else None,
                                              **_tgmm_gathered(tables, allocations.blocks, bool(interpret))))
 
-    # Each group's depth by width, stated as its operands' axes (`outputs.output`): the groups the sizes',
-    # the depth `lhs`'s and the width `rhs`'s, each where `k_major` lays it.
-    out_type = outputs.output(out_dtype, outputs.axis(groups[0], 0), outputs.axis(lhs, 0 if k_major else 1),
-                              outputs.axis(rhs, 0 if k_major else 1))
-    if out_type.struct.shape != (g, m, n):
-        raise ValueError(f"a tgmm's outputs are its groups by its depth by its width, {(g, m, n)}, not its "
-                         f"operands' {out_type.struct.shape}")
+    # Each group's depth by width, stated as its operands' axes (`outputs.output`): the groups the sizes', the
+    # depth `lhs`'s and the width `rhs`'s, each where `k_major` lays it, at the sizes the launch computes of
+    # them (their operands padded past them).
+    out_type = outputs.output(out_dtype, outputs.axis(groups[0], 0),
+                              outputs.axis(lhs, 0 if k_major else 1).sized(m),
+                              outputs.axis(rhs, 0 if k_major else 1).sized(n))
+    if out_type.struct.shape[0] != g:
+        raise ValueError(f"a tgmm's outputs are its {g} groups, not its sizes' {out_type.struct.shape[0]}")
     kernel = family.kernel(body, out_type=out_type,
                            grid=(1 if interpret else multiprocessors // pair,), grid_names=("programs",),
                            consumers=consumers + rewritten, interpret=interpret, approx_math=False,
