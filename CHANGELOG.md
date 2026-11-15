@@ -7,6 +7,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A run refused before it takes its start, whose start program still compiles in its own thread, exits with
+  its refusal's status once that compile ends: JAX's exit cleanup and the C runtime's exit tore XLA down under
+  the running compile, and 12 of 48 such exits ended by a segmentation fault
+  (`dew.nn.kernels.options.compiling`). A run's cooldown branches are checked before its start begins to
+  compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
+  compile runs.
+
 - A fit searches its step's plan once: the search made before the state is placed keeps the plan it finds
   even where candidates missed on the way, and the run's first compile takes it, its executable compiled
   once, where a second search from the ladder's foot over the placed state lowered every candidate again

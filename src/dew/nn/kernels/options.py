@@ -17,6 +17,7 @@ import hashlib
 import threading
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
+from concurrent import futures
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
 
@@ -258,8 +259,9 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
     """`program` over these arguments (arrays or shapes) lowered here and its first compile begun in a
     daemon thread of its own (`report.attempted`: XLA's compile alone, which releases the GIL), so it
     compiles while this thread runs on: a run's start beside its step's planning, which does not read it.
-    Only `attempting` waits for it: a run refused before its start is taken exits without waiting for a
-    compile no one reads (row 5966), where an executor's worker held the interpreter's exit for it."""
+    `attempting` takes it; the process's exit waits for it where it still runs (`_exit_waits`), so a run
+    refused before its start is taken exits with its refusal once the compile ends, never through a
+    compile XLA's exit tears down under it."""
     from dew.nn.kernels.templates import report
 
     lowered = program.lower(*args, **kwargs)
@@ -274,10 +276,40 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
         except BaseException as error:
             # Its reader raises it (`attempting`).
             attempt.set_exception(error)
+        finally:
+            with _IN_FLIGHT_GUARD:
+                _IN_FLIGHT.discard(attempt)
 
+    with _IN_FLIGHT_GUARD:
+        _IN_FLIGHT.add(attempt)
+    _exit_waits()
     threading.Thread(target=attempted, name="dew-compile-ahead", daemon=True).start()
     abstract = program.abstract_of(args, kwargs) if isinstance(program, OuterProgram) else None
     return Compiling(program, abstract, lowered, attempt)
+
+
+_IN_FLIGHT: set[Future] = set()
+"""The compiles `compiling` began that have not ended."""
+_IN_FLIGHT_GUARD = threading.Lock()
+
+
+@functools.cache
+def _exit_waits() -> None:
+    """The process's exit waits for every compile `compiling` began that still runs, registered once one
+    begins, after JAX is imported, so it runs before JAX's own exit cleanup (`atexit` runs the last
+    registered first): neither JAX's clearing of its backends nor the C runtime's exit, which destroys
+    XLA's static objects, meets a running compile. A run refused while its start compiles exits with its
+    refusal, the compile's remaining time later; it ended by a segmentation fault in 12 of 48 such exits
+    (row 6837). Its cost falls on a refusal that comes after the start's compile begins, which only one that
+    needs what runs beside it is (`dew.training.trainer.Trainer._compiled_fresh`)."""
+    import atexit
+
+    def waited() -> None:
+        with _IN_FLIGHT_GUARD:
+            running = list(_IN_FLIGHT)
+        futures.wait(running)
+
+    atexit.register(waited)
 
 
 _ATTEMPTING: contextvars.ContextVar[Compiling | None] = _cache.untraced(
