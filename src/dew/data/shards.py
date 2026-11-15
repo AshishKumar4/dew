@@ -49,23 +49,16 @@ def streamed(
         reader = _Taken(manifest.reader)
         return _ShardPass(grain.MapDataset.source(places), reader, cycle_length, loading, described)
     shards = _shards(manifest, partition=partition, loading=loading)
-    # An endless read whose run of empty shards covers a whole pass of its shards reads nothing forever
-    # (data.md §10: a repeated stream whose complete pass yields nothing is refused): shards whose store
-    # counts their rows only where asked (a Parquet store's files) are counted then, as a store of empty
-    # shards is refused above, and shards no store counts (a CSV's, a JSONL file's) are read empty by that
-    # run itself, every one of them in it, so it is refused then (`_EmptyRun`).
-    nothing = (None if epochs is not None
-               else _read_empty if manifest.counted is None
-               else functools.partial(_holds_nothing, manifest, loading.threads))
+    # An endless read whose shards are found empty, every one of them, with no row read between, reads
+    # nothing forever, which data.md §10 refuses (`_EmptyRun`): shards whose store counts their rows only
+    # where asked (a Parquet store's files) are counted then, as a store of empty shards is refused above,
+    # and those no store counts (a CSV's, a JSONL file's) are refused on the run itself.
+    nothing = (functools.partial(_holds_nothing, manifest, loading.threads)
+               if epochs is None and manifest.counted is not None else None)
     root = _dealt(shards, seed=seed, epochs=epochs)[partition.cut()]
     return _ShardPass(root, manifest.reader, cycle_length, loading, described, quota,
-                      None if nothing is None else (nothing, 2 * len(shards)))
-
-
-def _read_empty() -> bool:
-    """That a run of empty shards covering a whole pass of shards no store counts read them all empty: the run
-    itself is the count (`streamed`)."""
-    return True
+                      None if nothing is None else (nothing, 2 * len(shards)),
+                      len(shards) if epochs is None and manifest.counted is None else None)
 
 
 def _holds_nothing(manifest: ShardManifest, reads: int) -> bool:
@@ -187,10 +180,11 @@ class _ShardPass[Place](grain.IterDataset):
 
     def __init__(self, root: grain.MapDataset, reader: Callable[..., grain.IterDataset], cycle: int,
                  loading: Loading, name: str, quota: int | None = None,
-                 nothing: tuple[Callable[[], bool], int] | None = None):
+                 nothing: tuple[Callable[[], bool], int] | None = None, uncounted: int | None = None):
         super().__init__(root)
         self.root, self.reader = root, reader
         self.cycle, self.loading, self.name, self.quota, self.nothing = cycle, loading, name, quota, nothing
+        self.uncounted = uncounted
 
     def set_slice(self, selection: slice, sequential_slice: bool = False) -> None:
         self.root = self.root[selection]
@@ -202,7 +196,7 @@ class _ShardPass[Place](grain.IterDataset):
             # A worker dealt no place or no row of the bound reads nothing (Grain's interleave of no dataset
             # raises).
             return _Passing(None)
-        reader = _Reader(self.reader, _EmptyRun(self.name, self.nothing), self.loading)
+        reader = _Reader(self.reader, _EmptyRun(self.name, self.nothing, self.uncounted), self.loading)
         rows = (_Sequential(self.root, reader, self.loading) if self.cycle == 1
                 else interleaved(self.root, reader, self.cycle, self.loading))
         limited = rows if self.quota is None else experimental.LimitIterDataset(rows, self.quota)
@@ -326,24 +320,35 @@ class _Passing(grain.DatasetIterator):
 
 
 class _EmptyRun:
-    """How many shards in a row one read found empty, which it logs at each doubling. Grain reads
-    each shard on a prefetch thread of its own, so the count is kept under a lock. Given `nothing`, whether
+    """How many shards in a row one read found empty, no row read anywhere between them (`rows`, which every
+    row read moves, an interleave's open shards' among them), which it logs at each doubling. Grain reads
+    each shard on a prefetch thread of its own, so the run is kept under a lock. Given `nothing`, whether
     its store holds no row and a run long enough to hold every shard the read reads (twice the store's,
     whatever pass it starts in), an endless read of shards that state no rows is refused once such a run
     finds its store holds none, as one of shards that state none is (`streamed`), where it would read
-    nothing forever; the store is asked once."""
+    nothing forever; the store is asked once. Given `uncounted`, the shards an endless read of a store that
+    counts none reads, it is refused once the run has found every one of them empty, by its place."""
 
-    def __init__(self, name: str, nothing: tuple[Callable[[], bool], int] | None = None):
-        self.name, self.count, self.nothing = name, 0, nothing
+    def __init__(self, name: str, nothing: tuple[Callable[[], bool], int] | None = None,
+                 uncounted: int | None = None):
+        self.name, self.count, self.nothing, self.uncounted = name, 0, nothing, uncounted
+        self.rows = self.seen = 0
+        self.empty: set[object] = set()
         self.lock = threading.Lock()
 
-    def ended(self, yielded: bool) -> None:
+    def ended(self, yielded: bool, place: object) -> None:
         with self.lock:
-            self.count = 0 if yielded else self.count + 1
-            count, nothing = self.count, self.nothing
+            if yielded or self.rows != self.seen:
+                self.count, self.empty = 0, set()
+            self.seen = self.rows
+            if not yielded:
+                self.count += 1
+                self.empty.add(place)
+            count, nothing, found = self.count, self.nothing, len(self.empty)
             if nothing is not None and count >= nothing[1]:
                 self.nothing = None
-        if nothing is not None and count >= nothing[1] and nothing[0]():
+        if ((nothing is not None and count >= nothing[1] and nothing[0]())
+                or (self.uncounted is not None and found >= self.uncounted)):
             raise ValueError(f"{self.name} holds no rows, so reading it endlessly reads nothing forever")
         if logged_run(count, LONG_RUN):
             _log.warning("%s: its last %d shards held no row; the read goes on to the next", self.name, count)
@@ -376,33 +381,35 @@ class _Reader[Place]:
 
     def __call__(self, place: Place) -> grain.IterDataset:
         options = grain.ReadOptions(self.loading.threads, self.loading.read_buffer)
-        return _Watched(self.reader(place, options), self.empty)
+        return _Watched(self.reader(place, options), self.empty, place)
 
 
 class _Watched(grain.IterDataset):
     """One shard's rows, telling `empty` whether it held any as it ends."""
 
-    def __init__(self, parent: grain.IterDataset, empty: _EmptyRun):
+    def __init__(self, parent: grain.IterDataset, empty: _EmptyRun, place: object):
         super().__init__(parent)
-        self.input_parent, self.empty = parent, empty
+        self.input_parent, self.empty, self.place = parent, empty, place
 
     def __iter__(self) -> grain.DatasetIterator:
-        return _WatchedIterator(self.input_parent.__iter__(), self.empty)
+        return _WatchedIterator(self.input_parent.__iter__(), self.empty, self.place)
 
 
 class _WatchedIterator(grain.DatasetIterator):
-    def __init__(self, parent: grain.DatasetIterator, empty: _EmptyRun):
+    def __init__(self, parent: grain.DatasetIterator, empty: _EmptyRun, place: object):
         super().__init__(parent)
-        self.input_parent, self.empty = parent, empty
+        self.input_parent, self.empty, self.place = parent, empty, place
         self.yielded = False
 
     def __next__(self):
         try:
             row = next(self.input_parent)
         except StopIteration:
-            self.empty.ended(self.yielded)
+            self.empty.ended(self.yielded, self.place)
             raise
         self.yielded = True
+        # Any row read ends a run of empty shards, an open shard's under an interleave among them.
+        self.empty.rows += 1
         return row
 
     def get_state(self) -> Mapping[str, object]:
