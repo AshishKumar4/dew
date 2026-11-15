@@ -164,9 +164,8 @@ def lm(dataset: Dataset, tokenizer: str | SavedTokenizer | None, *, seq_len: int
 
     if pack is not None and stride is not None:
         raise ValueError("stride places fixed windows, pack=None; a pack lays documents out whole")
-    if segments is not None and pack in (None, "concat"):
-        raise ValueError(f"segments caps the documents a fitting pack lays in a row; pack={pack!r} lays no "
-                         "document whole")
+    if segments is not None and pack is None:
+        raise ValueError("segments caps the documents a pack lays in a row; pack=None lays no document whole")
     documents = dataset if tokenizer is None else dataset.map(text_steps.tokenize(tokenizer, field=field,
                                                                                   eos=eos))
     if pack is None:
@@ -206,19 +205,19 @@ def token_windows(dataset: Dataset, *, seq_len: int, batch: int | None, stride: 
 def sft(dataset: Dataset, tokenizer: str | SavedTokenizer, *, seq_len: int, batch: int | None,
         messages: str = "messages", long: Literal["chunk", "truncate", "drop"] = "chunk",
         pack: Literal["first-fit", "best-fit", "concat"] = PACK_POLICY, bins: int = PACK_BINS,
-        cache: str | Cached | None = None, records: int | None = None,
+        segments: int | None = None, cache: str | Cached | None = None, records: int | None = None,
         host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat
     template, each token's speaker kept beside it for an assistant-only loss,
-    and packed into rows of `seq_len + 1` tokens by `pack`, as `lm` packs,
-    in batches of `batch` rows (`batch=None`, `records` and `host` as
+    and packed into rows of `seq_len + 1` tokens by `pack`, as `lm` packs (`segments` conversations at
+    most a row, as `lm` takes them), in batches of `batch` rows (`batch=None`, `records` and `host` as
     `images` takes them). A conversation longer than a row is cut into pieces that keep
     every turn (`long="chunk"`), cut at its end (`"truncate"`), or dropped
     and counted (`"drop"`). `cache` holds the rendered conversations so cut or fitted, as `lm` holds
     its documents, so the cache is that `seq_len`'s and `long`'s alone."""
 
     rendered = dataset.map(chat.template(tokenizer, messages=messages))
-    packing = Pack(seq_len + 1, _CHAT_FIELDS, bins=bins, policy=pack)
+    packing = Pack(seq_len + 1, _CHAT_FIELDS, bins=bins, policy=pack, segments=segments)
     windows = _conversation_windows(rendered, packing, long=long, cache=cache)
     return _finished(windows, batch=batch, records=records, host=host)
 
