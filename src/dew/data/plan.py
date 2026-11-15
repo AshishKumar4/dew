@@ -210,6 +210,10 @@ class StepIdentity:
     declared: str | None = None
     dependencies: Mapping[str, object] = dataclasses.field(default_factory=dict)
     code: tuple[int, ...] = ()
+    held: tuple[str, ...] = ()
+    """The digests of the code of each external callable object it runs that declares no identity, its own
+    and its fields' (`_held_code`, `_code_digest`), which `Manifest.code` compares beside `code`'s; no
+    record holds it."""
 
     @classmethod
     def of(cls, step: object, identity: str | None = None, *, cache: bool = False) -> StepIdentity:
@@ -236,9 +240,11 @@ class StepIdentity:
         path = (
             None if inspect.isbuiltin(step) or kind.__module__ == "builtins" else inspect.getsourcefile(kind)
         )
-        own = [kind] if external and path is not None and Path(path).is_file() else []
-        holders = [*own, *(holder for holder in dict.fromkeys(held) if holder not in own)]
-        modules = tuple(_code_digest(holder) for holder in holders)
+        modules = (
+            (hashlib.sha256(Path(path).read_bytes()).hexdigest(),)
+            if external and path is not None and Path(path).is_file()
+            else ()
+        )
         config = re.sub(r" at 0x[0-9a-fA-F]+", "", config)
         dependencies = (
             step.dependencies()
@@ -249,8 +255,9 @@ class StepIdentity:
         )
         if frozen and dataclasses.is_dataclass(step) and not isinstance(step, type):
             config = json.dumps(structured(step), sort_keys=True)
-        code = tuple(holders.index(holder) for holder in dict.fromkeys(held))
-        named = cls(name, config, exact, modules, declared, dependencies, code)
+        code = (0,) if inspect.isfunction(step) and declared is None and modules else ()
+        named = cls(name, config, exact, modules, declared, dependencies, code,
+                    tuple(_code_digest(holder) for holder in dict.fromkeys(held) if holder is not step))
         if cache and not named.keyable(function=inspect.isfunction(step), external=external):
             raise ValueError(f"cache prefix step {name} needs identity='name@version'")
         return named
@@ -258,14 +265,15 @@ class StepIdentity:
     def record(self) -> dict[str, JSON]:
         """The identity as a manifest records it: every field but `code`, which its modules' places say."""
         return {field.name: json_value(getattr(self, field.name), field.name)
-                for field in dataclasses.fields(self) if field.name != "code"}
+                for field in dataclasses.fields(self) if field.name not in ("code", "held")}
 
     def composed(self, factory: StepIdentity, config: str) -> StepIdentity:
         """This step's identity as the `Configured` stage `factory` resolved it, under `config`: the
         factory's modules after its own, and their places of code (`code`) with them."""
         return dataclasses.replace(
             self, config=config, modules=(*self.modules, *factory.modules),
-            code=(*self.code, *(len(self.modules) + place for place in factory.code)))
+            code=(*self.code, *(len(self.modules) + place for place in factory.code)),
+            held=(*self.held, *factory.held))
 
     def keyable(self, *, function: bool, external: bool) -> bool:
         """Whether a cache can key what the step computes: a stable identity,
@@ -283,12 +291,15 @@ def _code_digest(holder: Callable | type) -> str:
     """The digest of what `holder`'s code is: a function's module's bytes (row 3938), a class's own source,
     so an edit to its module outside it decides no rows (row 5862), or its module's where Python finds no
     source of it apart."""
-    if isinstance(holder, type):
-        try:
-            return hashlib.sha256(inspect.getsource(holder).encode()).hexdigest()
-        except (OSError, TypeError):
-            pass
-    return hashlib.sha256(Path(inspect.getsourcefile(holder) or "").read_bytes()).hexdigest()
+    place = Path(inspect.getsourcefile(holder) or "")
+    if not isinstance(holder, type):
+        return hashlib.sha256(place.read_bytes()).hexdigest()
+    try:
+        source = inspect.getsource(holder)
+    except OSError:
+        # A class whose source Python cannot find apart (made by `type`) is its module's.
+        source = place.read_text()
+    return hashlib.sha256(source.encode()).hexdigest()
 
 
 def _held_code(value, seen: set[int]) -> tuple[list[Callable | type], bool]:
@@ -630,9 +641,11 @@ class Manifest:
     def code(self) -> list[list[JSON]]:
         """What decides a step's rows that its identity does not state: each step's module digests at its
         own code's places (`StepIdentity.code`), a function outside Dew that declares no identity being what
-        its code computes, a step that declares one none; the steps a memory read ran, then the plan's
+        its code computes, then the digests of the callable objects it runs (`StepIdentity.held`), a step
+        that declares one none; the steps a memory read ran, then the plan's
         (row 5862)."""
-        return [[step.modules[place] for place in step.code] for step in (*self.ran, *self.steps)]
+        return [[*(step.modules[place] for place in step.code), *step.held]
+                for step in (*self.ran, *self.steps)]
 
     @property
     def canonical(self) -> bytes:
