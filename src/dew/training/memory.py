@@ -310,9 +310,9 @@ def rung_record[LossT, EffectsT](objective: Objective[LossT, EffectsT], xla_defa
     """The rung of the fit ladder a step compiles at, as a checkpoint records
     it: the objective's head tile and whether that head is fused, its trained
     modules' remat (`recompute_record`), whether the step keeps XLA's
-    default options, the half rung above each, and whether it reads the
-    parameters through narrow copies (`dew.training.narrow`), the ladder's
-    first rung. Each decides the program a step runs."""
+    default options, beside each head (`dew.training.planning.FitSearch.ladder`),
+    and whether it reads the parameters through narrow copies
+    (`dew.training.narrow`). Each decides the program a step runs."""
     tile = head_tile_of(objective)
     return {'head_tile': None if tile is None else list(tile), 'head_fused': head_fused_of(objective),
             'remat': recompute_record(objective), 'xla_defaults': xla_defaults, 'narrow': narrow}
@@ -647,44 +647,14 @@ def recompute_more[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     where a tile holds a tile's: at an 8B's head on an A100 (4096 tokens in
     one chunk) 58.4 ms against 64.9.
     """
-    return climbed(objective, base) is not None
-
-
-def climbed[LossT, EffectsT](objective: Objective[LossT, EffectsT],
-                             base: tuple[int, int] | None = None, *, remat: bool = True) -> str | None:
-    """Move the objective one rung up its ladder as `recompute_more` does, and say what it moved to,
-    None where there was no rung: the words a search that compiles again there logs
-    (`dew.training.planning.FitSearch.climb`).
-    Without `remat` the ladder ends at its head's rungs (the generation's tile for the whole logits, then
-    that tile unfused): a run that states its remat keeps it (docs/design/training.md, every choice can be
-    overridden)."""
-    if head_tile_of(objective) == base:
-        moved = objective.tile_head()
-        if moved is not None:
-            return f"with the whole logits kept; compiling it again with {moved}"
-    moved = objective.unfuse_head()
-    if moved is not None:
-        return f"with the head fused; compiling it again with {moved}"
-    current = recompute_record(objective)
-    if not remat or not remat_more(objective):
-        return None
+    if head_tile_of(objective) == base and objective.tile_head() is not None:
+        return True
+    if objective.unfuse_head() is not None:
+        return True
+    if not remat_more(objective):
+        return False
     objective.restore_head(base, fused=True)
-    return f"under remat {current!r}; compiling it again under {recompute_record(objective)!r}"
-
-
-def remat_half[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list | None:
-    """Move each module the objective trains to its half rung, where it has
-    one (`Recomputing.recompute_half`), and return the modules it held, which
-    `objective.substitute` restores; None where no module has one."""
-    entries = objective.program_key()
-    half = [entry.module.recompute_half() if entry.trained and isinstance(entry.module, Recomputing)
-            else None for entry in entries]
-    if all(module is None for module in half):
-        return None
-    held = [entry.module for entry in entries]
-    objective.substitute([entry.module if module is None else module
-                          for module, entry in zip(half, entries, strict=True)])
-    return held
+    return True
 
 
 def remat_more[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:

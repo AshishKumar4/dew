@@ -305,17 +305,21 @@ def test_each_phase_of_a_phased_run_is_planned_at_its_own_split(monkeypatch, tmp
     from test_plan import LIMIT, free
 
     from dew.checkpoints import Checkpoints
+    from dew.distributed.placement import placed_bytes
 
     tokens, _ = phased_draw(0)
 
-    def needed(model, split):
+    def needed(model, split, *, startup=False):
         free(monkeypatch, LIMIT)
         trainer = phased_trainer(model, 0, None, split=split)
         state, _, _ = trainer.place()
         trainer.compile(state, {"text": jnp.asarray(tokens)})
-        return LIMIT - trainer.plan["probes"][0]["headroom"]
+        return LIMIT - trainer.plan["probes"][0]["headroom"] + (placed_bytes(state) if startup else 0)
 
-    once, whole, halves = needed(looped(steps=1), 1), needed(looped(), 1), needed(looped(), 2)
+    # The first phase is planned before its state is placed, the state's bytes beside its step
+    # (`StepCompiler.planned_unplaced`), and the run keeps that plan: the devices' free bytes, which
+    # `free` states, do not fall as the state is placed, so its room counts the state's bytes.
+    once, whole, halves = needed(looped(steps=1), 1, startup=True), needed(looped(), 1), needed(looped(), 2)
     assert max(once, halves) < whole, (once, halves, whole)
     free(monkeypatch, (max(once, halves) + whole) // 2)
     planned = phased_trainer(looped(), 0)
