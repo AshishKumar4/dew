@@ -80,7 +80,7 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
         # Their products are exact and accumulate in fp32; splash's fp32 P·V
         # takes one bf16 pass, as at any default-precision run
         # (`at_precision`).
-        return at_precision('default')(attend)(query, key, value, bias, sinks)
+        return at_precision('default', parameters=(3, 4))(attend)(query, key, value, bias, sinks)
     return attend(query, key, value, bias, sinks)
 
 

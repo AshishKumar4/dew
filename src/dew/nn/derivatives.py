@@ -26,7 +26,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import inspect
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -55,7 +55,9 @@ __all__ = [
     "surrogate",
     "with_cotangent_arrived",
     "with_gradients_formed",
+    "with_gradients_formed_at",
     "with_tangents_formed",
+    "with_tangents_formed_at",
 ]
 
 
@@ -74,13 +76,13 @@ def with_gradients_formed[Input, Gradients](d_input: Input, gradients: Gradients
     memory schedulers built unordered. Bound at a layer's boundary instead, over its variables' cotangents,
     it held 28.35 GB: there it frees the optimizer's per-parameter update to move into the backward and hold
     its momenta to the update's stacked Newton-Schulz at the step's end, and leaves each gradient in its
-    accumulation dtype until then. Its guard is tests/test_declared_cells_memory.py: a stack of every kernel
-    family's products and of every registered mixer's blocks whose temporaries grow by at most a layer's
-    input and parameter gradients a layer, which a reverse mode forming a parameter gradient without it
-    fails. Only floating arrays enter the barrier: an integer operand's zero cotangent (`float0`) and an
-    unreached one (None) pass through as they are, and where no gradient is a floating array (an unhooked
-    call's, a sinkless attention's) there is nothing to form and the cotangents leave as they are, fusing
-    into their readers."""
+    accumulation dtype until then. Its guards are tests/step_memory.py's (the step users run over every
+    registered mixer, tests/test_step_memory_*.py), which a reverse mode forming a parameter gradient
+    without it fails, and tests/test_declared_cells_memory.py's stack of every kernel family's products.
+    Only floating arrays enter the barrier: an integer operand's zero cotangent (`float0`) and an unreached
+    one (None) pass through as they are, and where no gradient is a floating array (an unhooked call's, a
+    sinkless attention's) there is nothing to form and the cotangents leave as they are, fusing into their
+    readers."""
     if not any(_floating(leaf) for leaf in jax.tree.leaves(gradients)):
         return d_input, gradients
     return _held(d_input, gradients)
@@ -110,13 +112,53 @@ def _held(first, second):
 def with_tangents_formed[Input, Parameters](t_input: Input, t_parameters: Parameters
                                             ) -> tuple[Input, Parameters]:
     """The rule's dual (`with_gradients_formed`), for a reverse mode JAX derives by transposing a tangent
-    rule (a `declared_tangent`, a custom JVP, a surrogate's tangent): the input's and the parameters' live
-    tangents enter the rule's linear part through the same barrier, whose transpose returns the input's
-    cotangent only with the parameters' gradients formed; forward mode passes them through unchanged. A
-    symbolic zero (a frozen parameter, an input no derivative reaches) is none of them: the rule passes its
-    live tangents alone, so its tangent rule takes symbolic zeros (`symbolic_zeros=True`): a zero JAX
-    instantiates is a constant beside the tangents, which the barrier's transpose cannot take."""
-    return with_gradients_formed(t_input, t_parameters)
+    rule (a `declared_tangent`, a custom JVP, a surrogate's tangent): where both the input and a parameter
+    move, their live tangents enter the rule's linear part through the same barrier, whose transpose returns
+    the input's cotangent only with the parameters' gradients formed; forward mode passes them through
+    unchanged. Where either side moves nothing (a frozen parameter's, an input no derivative reaches: no
+    floating array, its tangent a symbolic zero) there is nothing to tie and the tangents pass as they are,
+    so a tangent rule takes symbolic zeros (`symbolic_zeros=True`): a zero JAX instantiates is a constant
+    beside the tangents, which the barrier's transpose cannot take."""
+    if not (any(_floating(leaf) for leaf in _leaves(t_input))
+            and any(_floating(leaf) for leaf in _leaves(t_parameters))):
+        return t_input, t_parameters
+    return _held(t_input, t_parameters)
+
+
+def with_gradients_formed_at(cotangents: tuple, parameters: Collection[int]) -> tuple:
+    """A reverse mode's cotangents by operand (`cotangents`), those at `parameters` its parameters' (an
+    attention's bias and sinks, a recurrence's skip and rate), through the rule
+    (`with_gradients_formed`): the inputs' leave only with the parameters' formed; where no parameter's
+    cotangent is a floating array (a sinkless, biasless call's) they leave as they are."""
+    inputs, formed = with_gradients_formed(*_apart(cotangents, parameters))
+    return _together(inputs, formed, parameters)
+
+
+def with_tangents_formed_at(tangents: tuple, parameters: Collection[int]) -> tuple:
+    """A tangent rule's tangents by operand, those at `parameters` its parameters', through the rule's dual
+    (`with_tangents_formed`)."""
+    inputs, formed = with_tangents_formed(*_apart(tangents, parameters))
+    return _together(inputs, formed, parameters)
+
+
+def _apart(values: tuple, parameters: Collection[int]) -> tuple[tuple, tuple]:
+    """`values` the rest's and the `parameters` positions', in order."""
+    return (tuple(value for index, value in enumerate(values) if index not in parameters),
+            tuple(value for index, value in enumerate(values) if index in parameters))
+
+
+def _together(inputs: tuple, formed: tuple, parameters: Collection[int]) -> tuple:
+    """`_apart`'s inverse: the values back at their positions."""
+    rest, held = iter(inputs), iter(formed)
+    return tuple(next(held) if index in parameters else next(rest)
+                 for index in range(len(inputs) + len(formed)))
+
+
+def _leaves(tree) -> list:
+    """`tree`'s leaves, a symbolic zero one of them."""
+    from jax.custom_derivatives import SymbolicZero
+
+    return jax.tree.leaves(tree, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
 
 
 def _floating(leaf) -> bool:
@@ -128,7 +170,7 @@ def _floating(leaf) -> bool:
     return not isinstance(leaf, SymbolicZero) and dtype is not None and jnp.issubdtype(dtype, jnp.inexact)
 
 
-def portable_formed(portable: Callable[..., jax.Array], /) -> Callable[..., jax.Array]:
+def portable_formed[Value](portable: Callable[..., Value], /) -> Callable[..., Value]:
     """`portable`, an XLA program whose last operand is a parameter (a projection's kernel, a norm's weight,
     an attention's sinks), its value and every derivative XLA's of it (`generation.linear_tangent`), its
     reverse mode the rule's: it reads its operands only once its cotangent has arrived

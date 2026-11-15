@@ -1311,10 +1311,9 @@ def _grouped_convolution_gradient() -> type:
                 lhs.astype(dtype), rhs.astype(dtype), window_strides, padding, lhs_dilation, rhs_dilation,
                 dimension_numbers, feature_group_count, batch_group_count)
 
-        # The rule's dual (`with_tangents_formed`) where both move: the input's cotangent leaves only with
-        # the kernel's. An operand no derivative moves takes zeros past it.
-        if not any(isinstance(tangent, SymbolicZero) for tangent in tangents):
-            tangents = with_tangents_formed(*tangents)
+        # The rule's dual (`with_tangents_formed`): the input's cotangent leaves only with the kernel's. An
+        # operand no derivative moves takes zeros past it.
+        tangents = with_tangents_formed(*tangents)
         tangents = tuple(jnp.zeros_like(operand) if isinstance(tangent, SymbolicZero) else tangent
                          for operand, tangent in zip(operands, tangents, strict=True))
         return jax.jvp(convolve, tuple(operands), tuple(tangents))[1], jax.jvp(quantize, tuple(primals),

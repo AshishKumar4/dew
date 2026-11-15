@@ -3,8 +3,7 @@ of a registered mixer (`dew.registry.mixers`) or of attention blocks holding a f
 (`FEATURES`), its figures read from the programs' own trees (`step_bytes`) and its bound asserted by `holds`.
 Its tests are files of their own (tests/test_step_memory_*.py), each a few mixers', so none outruns one task's
 deadline. The in-context memory joins them with row 6577's fix (XLA merging each layer's zero buffer for its
-chunked scan's outputs into one, held across layers), Mamba-2 and the parallel mixer with row 6718's (their
-chunked recurrence's launch fits no config in the step)."""
+chunked scan's outputs into one, held across layers)."""
 
 import math
 
