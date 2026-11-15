@@ -663,8 +663,10 @@ class FitSearch[LossT, EffectsT]:
     run's tile `base` at each remat rung (`recompute_more`). It holds what it lowered, compiled and
     measured, and where on the ladder it stands.
 
-    The first rung climbed drops the narrow copies, and a plan above it keeps them dropped: taking them
-    back would compile another plan once one fits. A split missing at a rung with a half rung
+    The first rung climbed drops the narrow copies, and the next judges the drop: where the step without
+    them fell less short, a plan above keeps them dropped; where it fell no less short (a GPU's step casts
+    its weights whole either way), they come back and the ladder climbs on with them (`copies_freed`).
+    Once a plan fits, no other compiles. A split missing at a rung with a half rung
     (`remat_half`) is compiled there, the plan staying where it fits; climbing passes
     every half rung asked (`onward`). Each compile that misses names the split asked next (`after`);
     `resumed`, a checkpoint's rung, is warned of where it misses; where nothing fits it raises with the
@@ -693,13 +695,14 @@ class FitSearch[LossT, EffectsT]:
     gather: Callable[[object], list] = from_every_process
     """How every process's figure is read (`from_every_process`), so each asks the same split."""
     misses: dict[tuple[str, int], MemoryMiss] = dataclasses.field(default_factory=dict)
-    dropped_from: str | None = None
-    """The rung (`rung`) the search dropped the narrow copies from, whose miss at a split the step without
-    them must hold fewer temporaries than for the drop to stand (`copies_freed`)."""
-    copies_kept: bool = False
-    """Whether the copies came back after their drop freed nothing, so no later rung drops them again."""
     """What each compile that did not fit read, by its rung and split (`MemoryMiss`), which names the split
     the search asks next (`after`)."""
+    dropped_from: str | None = None
+    """The rung (`rung`) the search dropped the narrow copies from, whose miss at a split the step without
+    them must fall less short than for the drop to stand (`copies_freed`)."""
+    copies_kept: bool = False
+    """Whether the copies came back after their drop left the step no less short, so no later rung drops
+    them again."""
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled, jax.stages.CompilerOptions | None] | None = None
     """The plan the search last found to fit: its candidate, executable and the options it compiled under."""
