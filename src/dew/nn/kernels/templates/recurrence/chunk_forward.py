@@ -133,9 +133,11 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     in the operands' dtype, and an fp32 call's products take its operands as TF32 where its family's products
     take them transposed (mma.sync's), else in `FAST_PARTS` bf16 parts (`prepared`, `_parts`). A `ranged`
     16-bit delta rule, whose form proves no bound on its chunk inverse, solves it at fp32's range (`_merged`).
-    A `skip` `[HV]` adds `D v` to the output of a call whose write gate takes the keys' side
-    (`Call.gated_keys`, Mamba2's SSD), as mamba_ssm's output kernel adds it. A `forked` call's documents,
-    laid from chunks' edges, take their memories up from its table (`ForkedTable`)."""
+    A `skip` `[HV]` of a call without the delta rule adds `D v` to the output: in the output launch where the
+    write gate takes the keys' side (`Call.gated_keys`, Mamba2's SSD), as mamba_ssm's output kernel adds it,
+    else to the output after it, landed fp32 and rounded once, the launches holding the values gated. A
+    `forked` call's documents, laid from chunks' edges, take their memories up from its table
+    (`ForkedTable`)."""
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, keeps=False,
@@ -175,19 +177,24 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, keeps=keeps, firsts=firsts,
                    rounded=rounded, ranged=ranged, scans=scans, forked=forked,
-                   out_dtype=jnp.float32 if wide else None)
-    call, tiles = run.call, run.tiles
-    out_dtype = jnp.float32 if wide else run.dtype
+                   out_dtype=jnp.float32 if wide else None, skipped=skip is not None)
+    call, tiles, out_dtype = run.call, run.tiles, run.landed
+    # The skip in the launch that holds the values as given (`Call.gated_keys`); where they hold them gated,
+    # added to the output after it, landed fp32 (the output rounded once).
+    fused = skip if call.gated_keys else None
     if run.scans:
         o, final = _scan(run.q, run.keys, run.a, run.v, run.hi, run.lo, run.beta, run.h0, run.sequences,
-                         run.taken, call, tiles, scale=run.scale, out_dtype=out_dtype, skip=skip,
+                         run.taken, call, tiles, scale=run.scale, out_dtype=out_dtype, skip=fused,
                          table=run.table)
         final = run.shaped(final)
     else:
         o = output_launch(run.q, run.k, run.h, run.corrected, run.hi, run.lo, run.taken, run.beta, call,
-                          tiles, scale=run.scale, out_dtype=out_dtype, scores=run.scores, skip=skip)
+                          tiles, scale=run.scale, out_dtype=out_dtype, scores=run.scores, skip=fused)
         final = run.final
     o = run.unlaid(o.reshape(call.rows, call.heads, call.value_width))[..., :run.value_width]
+    if fused is None and skip is not None:
+        o = (o + skip.astype(jnp.float32)[:, None] * v.astype(jnp.float32)).astype(
+            jnp.float32 if wide else run.dtype)
     assert final is not None, "a forward runs its states launch"
     return o, final, (run.a, (run.w, run.h, run.corrected, run.stored))
 
@@ -228,9 +235,11 @@ class _Run:
     h0: jax.Array | None = None
     """Each row's entering memory `[B * HV * Dk, Dv]` fp32, as the states launch takes it."""
     table: Table | None = None
+    """A forked call's table, as its walks take it (`tabled`)."""
     scans: bool = False
     """Whether the forward walks its states and output in one launch (`_scan`; `prepared`'s choice)."""
-    """A forked call's table, as its walks take it (`tabled`)."""
+    landed: jnp.dtype | None = None
+    """The dtype the output launches land the output in (`prepared`'s)."""
     stored: jax.Array | None = None
     """A forked call's stored slots, the finals its storing documents left `[B * held * HV * Dk, Dv]` fp32
     (`mainloop._states`'), where its table holds any."""
@@ -253,11 +262,32 @@ def _paired(q, k, decays, beta, taken, call, *, scale: float, solves: bool) -> t
               for found, mine in zip(walked, own, strict=True)), hi, lo)
 
 
+def _taken(dtype, family: mosaic.Family | None, *, per_key: bool, rounded: bool, delta: bool,
+           skipped: bool) -> mosaic.Family:
+    """The bundle a call of these forms issues by (`family`, the device's where None, `family_of`), refusing
+    a call the mainloop does not take (`prepared`'s): a device no bundle claims, operands neither 16-bit nor
+    fp32, a decay a key dimension's form it refuses (`per_key_refusal`), and a skip beside the delta rule,
+    whose gradient no launch of the delta rule takes (the chunked op adds it after the template)."""
+    family = family_of(dtype) if family is None else family
+    if family is None:
+        raise NotImplementedError(f"the mainloop has no bundle for the "
+                                  f"{generation.family(generation.device_generation())!r} family")
+    if dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16), jnp.dtype(jnp.float32)):
+        raise NotImplementedError(f"the mainloop takes 16-bit and fp32 operands, not {dtype}")
+    if per_key and (refused := per_key_refusal(dtype, rounded=rounded)):
+        raise NotImplementedError(refused)
+    if skipped and delta:
+        raise NotImplementedError("the template takes the skip of a call without the delta rule alone, its "
+                                  "reverse walk the skip's gradient (`mainloop_backward._reverse`); the "
+                                  "delta rule's is added after it (`recurrence_chunk.chunk`)")
+    return family
+
+
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
              firsts=None,
              inverse=None, kept=None, keeps: bool = True,
              rounded: bool = False, ranged: bool = False, scans: bool = False, forked=None,
-             out_dtype=None) -> _Run:
+             out_dtype=None, skipped: bool = False) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
     `kept` values, `(w, h, corrected, stored)`, are (`kept_forward`'s; its final memory then None), or but the
@@ -266,22 +296,17 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     slices at its tiles too (`mainloop.scan_holds`), else its states and output launches apart: at a B200's
     248 registers the walk beside a table spilled Nemotron-H 4B's SSD 16 bytes and a write gate 60 to 80 at
     every ring's depth under the cuda13 build's ptxas, which an H100's write gate holds (row 5761), its output
-    landing in `out_dtype` (the operands' where None); `_Run.scans` says which. The solve stores its inverse
+    landing in `out_dtype` (the operands' where None), or in fp32 where a skip is added to it after the
+    launches (`skipped`, `kept_forward`), so it rounds once (`_Run.landed`); `_Run.scans` says which. A
+    skip is a call's without the delta rule alone (`skipped` with `delta` refused). The solve stores its
+    inverse
     where the call `keeps` it (`_solved`). A forked call's documents laid from chunks' edges
     (`chunked_launch.AlignedDocuments`) give `forked` (`tabled`): its walks take up each document's memory
     from its table (`table.Table`)."""
-    family = family_of(jnp.result_type(q, k, v)) if family is None else family
-    if family is None:
-        raise NotImplementedError(f"the mainloop has no bundle for the "
-                                  f"{generation.family(generation.device_generation())!r} family")
+    dtype, per_key = jnp.result_type(q, k, v), g.ndim == 4
+    family = _taken(dtype, family, per_key=per_key, rounded=rounded, delta=delta, skipped=skipped)
     batch, length, _, key_width = k.shape
     heads, value_width = v.shape[2:]
-    dtype = jnp.result_type(q, k, v)
-    per_key = g.ndim == 4
-    if dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16), jnp.dtype(jnp.float32)):
-        raise NotImplementedError(f"the mainloop takes 16-bit and fp32 operands, not {dtype}")
-    if per_key and (refused := per_key_refusal(dtype, rounded=rounded)):
-        raise NotImplementedError(refused)
     scale = key_width ** -0.5 if scale is None else scale
     width, columns = padded_widths(family, key_width, value_width, kept=keeps, per_key=per_key, tiles=tiles)
     q, k = (zero_padded(x.astype(dtype), 3, width) for x in (q, k))
@@ -312,7 +337,9 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                 interpret, generation.gpu_target(), tiles.chunk, ranged=ranged, producers=tiles.producers)
     table = None if forked is None else tabled(forked, width, columns)
-    scans = scans and (table is None or scan_holds(call, tiles, out_dtype or dtype, table))
+    # A skip reads the values a launch holds as given (`Call.gated_keys`); else it is added after them.
+    landed = jnp.dtype(jnp.float32 if skipped and not call.gated_keys else out_dtype or dtype)
+    scans = scans and (table is None or scan_holds(call, tiles, landed, table))
     beta = laid(beta).reshape(rows, heads).T
     q, k, v = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v))
     a, w, u, keys, scores, system = None, None, v, k, None, []
@@ -360,7 +387,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     h0 = h0.reshape(-1, columns)
     run = _Run(call, tiles, dtype, scale, key_width, value_width, batch, q, k, v, hi, lo, beta, a,
                w, keys, scores, None, None, None, taken, sequences, laid, unlaid, u=u, h0=h0,
-               table=table, scans=scans)
+               table=table, scans=scans, landed=landed)
     if kept is not None:
         # The forward's saved states, with the delta rule's weights or without them (`w` None).
         (w, h, corrected, stored) = kept

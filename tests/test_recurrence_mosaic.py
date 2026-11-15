@@ -271,9 +271,12 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     query, key = given.query, given.key
     dtype = jnp.result_type(query, key, given.value)
     rounded = fast_rounding(dtype) if hooks.rated else chunk_rounding(hooks.delta, dtype)
+    # Without the delta rule the template takes the skip, its output wide where an epilogue reads it; the
+    # delta rule's skip is added after it, to its wide output.
+    wide = hooks.output is not None or (hooks.skip and hooks.delta)
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
-                                delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
-                                bound=hooks.inverse_bound, rounded=rounded)
+                                delta=hooks.delta, wide=wide, bound=hooks.inverse_bound, rounded=rounded,
+                                skip=None if hooks.delta else given.skip)
 
 
 def refuses_its_gradient(fn, *drawn) -> None:
@@ -989,6 +992,28 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     assert legal and stepped != first and taken == (stepped,)
 
 
+@pytest.mark.parametrize('product', ['forward', 'fast backward'])
+def test_the_template_refuses_a_skip_beside_the_delta_rule(product):
+    """A delta rule's call handing the template a skip, its forward or its fast backward (interpreted, traced
+    alone): refused (`chunk_forward.prepared`), as no launch of the delta rule takes the skip's gradient;
+    taken, its forward added `D v` while its backward left `D do` out of the values' gradient and gave the
+    skip none. The chunked op adds the delta rule's skip after the template (`recurrence_chunk.chunk`)."""
+    q, k, v, g, beta, h0 = (jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
+        ((1, 64, 1, 64), jnp.bfloat16), ((1, 64, 1, 64), jnp.bfloat16), ((1, 64, 2, 64), jnp.bfloat16),
+        ((1, 64, 2), jnp.float32), ((1, 64, 2), jnp.bfloat16), ((1, 2, 64, 64), jnp.float32)))
+    skip = jax.ShapeDtypeStruct((2,), jnp.float32)
+    options = {'tiles': mainloop.Tiles(32, 1, None, 1, chunk=64), 'starts': None, 'max_segments': None,
+               'family': bundles.of('sm90', jnp.bfloat16), 'interpret': True, 'delta': True, 'skip': skip}
+    if product == 'forward':
+        traced = functools.partial(chunk_forward.forward, **options)
+        operands = (q, k, v, g, beta, h0)
+    else:
+        traced = functools.partial(mainloop_backward.gradients, **options)
+        operands = (q, k, v, g, beta, h0, v, h0)
+    with pytest.raises(NotImplementedError):
+        jax.eval_shape(traced, *operands)
+
+
 def test_a_refusal_under_the_remat_rung_reaches_the_route():
     """Under the remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`), a refusal of
     every tile of the run's training call's launch (its identity as its lowering for an H100 names it,
@@ -1090,13 +1115,15 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                                                            ('qwen3.5-27b-gdn', jnp.float32),
                                                            ('kimi-linear-kda', jnp.bfloat16),
                                                            ('nemotron-h-4b-ssd', jnp.bfloat16),
+                                                           ('a write gate', jnp.bfloat16),
                                                            ('a 192-wide value head', jnp.bfloat16)})
                and not (variant == TWO_ROLES and not (training and not packed))
                and not (isinstance(variant, int) and (training or packed or dtype == jnp.float32))]
 """The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group: every
 geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the training pass of the
-gated delta rule in both and of Kimi delta attention and the SSD in 16 bits (Kimi's keys, 128 wide, past what
-an fp32 call takes under a decay a key dimension), and the 192-wide value head's 16-bit training pass alone;
+gated delta rule in both and of Kimi delta attention, the SSD and the write gate in 16 bits (Kimi's keys, 128
+wide, past what an fp32 call takes under a decay a key dimension; the write gate's intermediates in fp32's
+three parts), and the 192-wide value head's 16-bit training pass alone;
 one row's 16-bit forward at its derived tiles apart from
 each of its variants (`variant`, a test each: an fp32 forward, which every family refuses, has none), and one
 row's training pass at its derived tiles apart from its walks at two roles (`TWO_ROLES`). One test
@@ -1109,16 +1136,17 @@ with its two-role walks 130.2 s on sm90 (train 630's CI, main f424ab7d8)."""
 def _form(name: str, dtype) -> dict:
     """A resource case's call form beside its operands under the run's fast forms (`rounded`, `fast_rounding`,
     an fp32 call's operands in two parts), as its route gives it: a rated scan's without the delta rule and
-    wide for its skip."""
+    wide, as Mamba-2's mixer reads its output (`chunk`'s fp32 `dtype`)."""
     if name == 'a write gate':
         return {'delta': False}
     return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {'rounded': True}
 
 
-def _skipped(name: str, dtype) -> dict:
-    """The skip a rated scan's 16-bit call fuses into the template's output and reverse walk under the run's
-    fast forms (`recurrence_chunk._rated_scan`), its value heads' `[HV]`, as its route hands it."""
-    if name not in RATED or jnp.dtype(dtype).itemsize != 2:
+def _skipped(name: str) -> dict:
+    """The skip a rated scan's call hands the template (`recurrence_chunk._rated_scan`), its value heads'
+    `[HV]`: in its output launch and reverse walk under the run's fast forms in 16 bits, else added to its
+    output after its launches, landed fp32, and in its walk's gradient."""
+    if name not in RATED:
         return {}
     return {'skip': jax.ShapeDtypeStruct((RESOURCE_SHAPES[name][1],), jnp.float32)}
 
@@ -1154,7 +1182,7 @@ def _gate_call(name: str, dtype, given: list, starts, tiles, family, *, training
     formed = {key: value for key, value in _form(name, dtype).items() if key != 'wide' or not training}
     run = functools.partial(mainloop_backward.gradients if training else chunk_forward.forward, **formed,
                             )
-    skip = list(_skipped(name, dtype).values())
+    skip = list(_skipped(name).values())
     packed = starts is not None
 
     def fn(*operands):
@@ -1191,7 +1219,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         # A delta rule's layer declares unit keys and sigmoid write gates (`recurrence.Hooks.inverse_bound`).
         bound = template.MOSAIC.bind(*args, starts, max_segments=8 if packed else None,
                                      bound=None if name in RATED else 1.0,
-                                     **_form(name, dtype), **_skipped(name, dtype))
+                                     **_form(name, dtype), **_skipped(name))
         with generation.assumed(facts):
             derived = template.MOSAIC.derived(bound, facts)
             if derived is None and variant is not None:
@@ -1207,11 +1235,9 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                 assert len(others) <= NEIGHBOURS, f"{name} has {len(others)} variants, past NEIGHBOURS"
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
                              kind='') for tiles in others[variant:variant + 1]]
-            unwide = {key: value for key, value in _form(name, dtype).items() if key != 'wide'}
             if training and not template.backward_holds(
                     *args, tiles=derived, family=family, target=facts, starts=starts,
-                    max_segments=8 if packed else None, **unwide,
-                    **_skipped(name, dtype)):
+                    max_segments=8 if packed else None, **_form(name, dtype), **_skipped(name)):
                 # The rule's gradient is the port's or the portable math's where the fast backward's launches
                 # do not hold (`template.backward_holds`).
                 refused.append(f"{name} {jnp.dtype(dtype).name} fast backward{' packed' if packed else ''}")
@@ -1237,11 +1263,10 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         plans[label] = template.MOSAIC.launches(bound, tiles, facts, backward=training)
         if launched is not None:
             launched[label] = (bound, tiles)
-        unwide = {key: value for key, value in _form(name, dtype).items() if key != 'wide'}
         with generation.assumed(facts):
             held = not training or kind != 'two roles ' or template.backward_holds(
                 *args, tiles=tiles, family=family, target=facts, starts=starts,
-                **unwide, **_skipped(name, dtype))
+                **_form(name, dtype), **_skipped(name))
         if not held or kind == 'two roles ':
             # Forced role counts can include a launch the model refuses: at setmaxnreg's least producer, as
             # the template's legality judges it, a raised producer's consumers the assembler's to certify.
@@ -1382,7 +1407,7 @@ def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blac
     family = template.bundle(facts)
     args = resource_operands(name, dtype, rows, length)
     bound = template.MOSAIC.bind(*args, None, max_segments=None, bound=None if name in RATED else 1.0,
-                                 **_form(name, dtype), **_skipped(name, dtype))
+                                 **_form(name, dtype), **_skipped(name))
     # The output's and the final memory's cotangents.
     cotangents = [jax.ShapeDtypeStruct(args[2].shape, dtype),
                   jax.ShapeDtypeStruct(args[5].shape, jnp.float32)]
@@ -1496,9 +1521,9 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
         jax.ShapeDtypeStruct((1, 3, 1, *v.shape[2:]), jnp.float32),
         jax.ShapeDtypeStruct((1, 3, v.shape[2]), jnp.float32))
     forked = chunked_launch.Forked(slots, slots, slots, entry, 2)
-    skip = list(_skipped(name, jnp.bfloat16).values())
+    skip = list(_skipped(name).values())
     bind = functools.partial(template.MOSAIC.bind, bound=None if name in RATED else 1.0,
-                             **_form(name, jnp.bfloat16), **_skipped(name, jnp.bfloat16))
+                             **_form(name, jnp.bfloat16), **_skipped(name))
     bound, unforked = bind(q, k, v, g, beta, given, None, forked=forked), bind(q, k, v, g, beta, h0, None)
     with generation.assumed(facts):
         tiles = template.MOSAIC.derived(bound, facts)

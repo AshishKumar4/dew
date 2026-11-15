@@ -136,11 +136,12 @@ def holds(launches: tuple[mainloop.Launch, ...], family: mosaic.Family, shared: 
 
 def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: mosaic.Family,
                    target: generation.GpuTarget, starts=None, max_segments: int | None = None,
-                   delta: bool = True, rounded: bool = False,
+                   delta: bool = True, rounded: bool = False, wide: bool = False,
                    ranged: bool = False, skip=None,
                    forked: chunk_forward.ForkedTable | None = None) -> bool:
     """Whether the launches a fast backward runs (`mainloop_backward.gradients`'s and the forward it takes,
-    `chunk_forward.kept_forward`'s) hold on `family`'s bundle at `tiles` on `target`, planned there and within
+    `chunk_forward.kept_forward`'s, its output fp32 where `wide`) hold on `family`'s bundle at `tiles` on
+    `target`, planned there and within
     its block's shared memory (`holds`); where they do not, the rule's gradient is the portable math's.
     Planned on the device's own target off a GPU, an interpreted call's states launch held no program at the
     interpreted target's shared budget (`Launch.resident`). Each plan is the call's cached one (`_planned`):
@@ -150,7 +151,7 @@ def backward_holds(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: 
     *shapes, skip = (None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype)
                      for x in (q, k, v, g, beta, h0, starts, skip))
     both = _planned(tuple(shapes), tiles, family, target, max_segments, delta, backward=True,
-                    rounded=rounded, ranged=ranged, skip=skip, forked=_shaped(forked))
+                    rounded=rounded, wide=wide, ranged=ranged, skip=skip, forked=_shaped(forked))
     return holds(both, family, generation.shared_budget(target))
 
 PLANS_KEPT = 1024
@@ -218,9 +219,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     port's operands and results (`recurrence_chunk.fla_rule`'s), the operands in their common dtype and beta
     with them, the decay and the memory fp32, on one device, by the bundle of its instruction family
     (`mainloop.family_of`, `bundles.of`), interpreted off a GPU (Mosaic GPU's interpreter, the interpreted
-    target's bundle, `mainloop.issued`). Its gradient: the gated delta rule's in a 16-bit call on the mainloop
-    (`mainloop_backward.gradients`, fla's DAG, fla's rounding) where its launches hold on the device
-    (`backward_holds`); it takes no other call's, which raises NotImplementedError as the gradient is traced:
+    target's bundle, `mainloop.issued`). Its gradient: the fast backward's on the mainloop
+    (`mainloop_backward.gradients`, fla's DAG) where it takes the call's form
+    (`mainloop_backward.fast_backward_form`) and its launches hold on the device (`backward_holds`); it takes
+    no other call's, which raises NotImplementedError as the gradient is traced:
     the delta rule's selector gives a training call it refuses another kernel (`Mosaic.trains`), and a call
     that names the mainloop insists on it (ledger 1926: no kernel falls back inside itself). Its states and
     output launches take `tiles` (`mainloop.Tiles`, the template's config); a `family` given is the bundle it
@@ -254,11 +256,11 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                                                                    tiles.chunk)
         state = starts = firsts = max_segments = None
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
-    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4)
+    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=wide)
             and backward_holds(
                 query, key, value, g, beta, state, tiles=tiles, family=issuing,
                 target=Mosaic.launched(), starts=starts,
-                max_segments=max_segments, delta=delta, rounded=rounded, ranged=run["ranged"],
+                max_segments=max_segments, delta=delta, rounded=rounded, wide=wide, ranged=run["ranged"],
                 skip=skip, forked=table))
 
     # The launch tracing the forward (`report.launch_digest`), whose name the fast backward's kernels carry
@@ -396,7 +398,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         assert family is not None, f"no bundle of the mainloop claims {target.generation}"
         delta = arguments.get("delta", True)
         fast = (backward or training_forward) and mainloop_backward.fast_backward_form(
-            delta, arguments.get("rounded", False), dtype, per_key=arguments["g"].ndim == 4)
+            delta, arguments.get("rounded", False), dtype, per_key=arguments["g"].ndim == 4,
+            wide=arguments.get("wide", False))
         # The skip fused into the output and reverse walk where given (its tiles their registers').
         skip = arguments.get("skip")
         forked, table, max_segments = arguments.get("forked"), None, arguments.get("max_segments")
@@ -722,8 +725,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def trains(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         """Whether the call's gradient runs on `target`: its fast backward takes its form
-        (`mainloop_backward.fast_backward_form`: the delta rule with a decay a head or a key dimension, the
-        SSD's rated scan in bf16 under the fast forms, either in fp32 under the fast forms) and its launches
+        (`mainloop_backward.fast_backward_form`: the delta rule with a decay a head or a key dimension, a bf16
+        call without it and a decay a head or none, its output's gradient bf16 where it is not rounded,
+        either in fp32 under the fast forms) and its launches
         hold at the call's derived tiles (`_backward_holds`), the rule's gradient (`mosaic_rule`) refusing
         every other call."""
         if generation.backend() == "cpu" and bundle(target) is None:
@@ -732,7 +736,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
         forms = mainloop_backward.fast_backward_form(arguments.get("delta", True),
                                                      arguments.get("rounded", False), dtype,
-                                                     per_key=arguments["g"].ndim == 4)
+                                                     per_key=arguments["g"].ndim == 4,
+                                                     wide=arguments.get("wide", False))
         if not forms:
             return False
         fits = self.fits(ba, target)
