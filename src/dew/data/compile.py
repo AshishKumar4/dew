@@ -1478,6 +1478,16 @@ def _built_phases(source: Phases, staged: Sequence[tuple[_Staged, int | None]],
     return built
 
 
+def _measured_phase(measured: tuple[_TrainingMeasured, ...] | None, index: int, continued: Pipeline,
+                    phases: Sequence[Pipeline], validation: Pipeline | None) -> _TrainingMeasured | None:
+    """The measure among `measured` (each phase's, as `run_widths` read them) that phase `index` binds where
+    it reads its corpora from their start (`continued`, the phase as written) with no validation beside it;
+    None for one continued past an earlier phase, measured as it continues (row 6713: each phase was
+    measured twice, both copies of a memory read held at the start's peak)."""
+    fresh = measured is not None and continued is phases[index] and validation is None
+    return measured[index] if fresh and measured is not None else None
+
+
 def _compile_phases(
     train: Pipeline,
     *,
@@ -1496,10 +1506,8 @@ def _compile_phases(
     measured: tuple[_TrainingMeasured, ...] | None = None,
 ) -> Loader:
     """`train`'s phases, each compiled on its own, every phase and the validation binding the run's
-    `widths` (`run_widths`), measured over every phase and held chain, one program for them all. A phase
-    that reads its corpora from their start, with no validation beside it, binds its measure among
-    `measured` (each phase's, as `run_widths` read them), and one that continues a corpus an earlier phase
-    read is measured as it continues."""
+    `widths` (`run_widths`), measured over every phase and held chain, one program for them all, a phase
+    binding its measure among `measured` where it may (`_measured_phase`)."""
     source = train.source
     if not isinstance(source, Phases):
         raise TypeError("phased compilation needs a Phases source")
@@ -1511,15 +1519,10 @@ def _compile_phases(
         """Phase `index`, each corpus it reads continued past what the phases before it trained of it
         (`_continued`, `_skipping`): on its own stream, those it shares with other phases stamped (`members`,
         `_stamped`)."""
-        continued = _continued(source.pipelines[index], consumed)
-        alone = validation if index == 0 else None
-        # Measured once where the run measured it as it reads it now (row 6713: each phase was measured
-        # twice, both copies of a memory read held at the start's peak).
-        held = (measured[index] if measured is not None and continued is source.pipelines[index]
-                and alone is None else None)
+        continued, alone = _continued(source.pipelines[index], consumed), validation if index == 0 else None
         phase = _staged(continued._then(*train.stages), alone, objective=objective, read=read,
-                        provision=provision, loading=loading, seed=seed, rejections=rejections,
-                        widths=widths, measured=held)
+                        provision=provision, loading=loading, seed=seed, rejections=rejections, widths=widths,
+                        measured=_measured_phase(measured, index, continued, source.pipelines, alone))
         return _skipping(_stamped(phase, members or {}), consumed, source.pipelines[index])
 
     tokens = source.clock == "tokens"
