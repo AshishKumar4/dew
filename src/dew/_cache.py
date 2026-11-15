@@ -460,9 +460,10 @@ def untraced[Variable: contextvars.ContextVar](variable: Variable) -> Variable:
     return variable
 
 
-class _Same:
+class Same:
     """A value that hashes by no value of its own, held by itself: equal to its own holder alone, and kept
-    alive while a key holds it, so no other value takes its identity."""
+    alive while a key holds it, so no other value takes its identity. The one such holder of a trace's keys:
+    `traced_state`'s, and a kernel fact's answer's (`dew.nn.kernels.generation.stated`)."""
 
     __slots__ = ("value",)
 
@@ -473,7 +474,7 @@ class _Same:
         return id(self.value)
 
     def __eq__(self, other) -> bool:
-        return isinstance(other, _Same) and other.value is self.value
+        return isinstance(other, Same) and other.value is self.value
 
 
 def traced_state() -> Hashable:
@@ -487,7 +488,7 @@ def traced_state() -> Hashable:
     (`dew.nn.kernels.templates.report.refused_state`); and the environment's variables of Dew's own. A trace
     held by it (`dew.algebra.fusion`'s regions) is traced again wherever any of them differs: a value read
     that this leaves out costs a trace, never a program traced under other state. A value that does not hash
-    is held by itself (`_Same`)."""
+    is held by itself (`Same`)."""
     import decimal
 
     from flax import linen as nn
@@ -499,7 +500,7 @@ def traced_state() -> Hashable:
         try:
             hash(value)
         except TypeError:
-            return _Same(value)
+            return Same(value)
         return value
 
     with KERNEL_SEEN(None), KERNEL_ROUTES(()):
