@@ -152,6 +152,16 @@ def dropped_window(state):
     return dataclasses.replace(state, microstep=microstep, accumulation=window)
 
 
+def _gated(finite: jax.Array, tree):
+    """`tree` where the step is `finite`, its every floating leaf zero otherwise: an elementwise select
+    against a constant, which the computation reading it fuses, so no second copy of the tree is held."""
+    def gate(leaf):
+        if not isinstance(leaf, jax.Array) or not jnp.issubdtype(leaf.dtype, jnp.inexact):
+            return leaf
+        return jnp.where(finite, leaf, jnp.zeros((), leaf.dtype))
+    return jax.tree.map(gate, tree)
+
+
 def window_dropped(microstep: jax.Array, acc: Accumulation) -> tuple[jax.Array, Accumulation]:
     """`dropped_window`'s two fields: the microstep back by the microbatches the window held (`occupancy`),
     and the window cleared, its occupancy 0, but for its gradient sum. A state's other fields go round it,
@@ -1058,6 +1068,16 @@ class Transaction:
             # their norm and finiteness come from the backward that read them (`Applied`).
             native_finite = native_finite & (applied.nonfinite == 0)
             norm = jnp.sqrt(jnp.square(norm) + applied.sumsq.astype(norm.dtype))
+        # With no loss scale, an update whose gradient or forward is not finite is gated where it is
+        # computed: its gradient, the forward's statistics and its update read as zero, so its parameters,
+        # update count and EMA stay as they were and its optimizer takes one step of zero gradient, holding
+        # no old state beside the new (training.md, a step that is not finite; row 6699). A scaled step's
+        # rejection keeps the optimizer too, chosen below, as a scale's back-off must.
+        gated = current.scale is None
+        if gated:
+            native_finite = native_finite & _all_finite((qk, statistics, effects))
+            native, qk, statistics, effects = (_gated(native_finite, value)
+                                               for value in (native, qk, statistics, effects))
 
         def apply(current):
             # The update applies to the parameters the model's constraint projects
@@ -1066,6 +1086,7 @@ class Transaction:
             update, opt_state = optimizer_update(
                 self.optimizer, native, current.opt_state, stored, qk=qk, statistics=statistics,
                 progress=None if self.bound is None else self.progress(current))
+            update = _gated(native_finite, update) if gated else update
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
             # rescale, a bounded group's clamp) acts on them (`stepped`).
             params = {**current.variables, "params": stepped(stored, update, current.opt_state, opt_state,
@@ -1076,10 +1097,14 @@ class Transaction:
                 moved = applied.onto(dataclasses.replace(current, variables=params, opt_state=opt_state))
                 params, opt_state = moved.variables, moved.opt_state
             params = {**params, "params": self.objective.projected(params["params"], updated=True)}
-            done = update_applied(current.opt_state, opt_state)
+            done = update_applied(current.opt_state, opt_state) & (native_finite | (not gated))
             if self.aux_shape.effects is not None:
-                params = write_back(params, self.objective.apply_effects(
+                written = write_back(params, self.objective.apply_effects(
                     params, self.effects_tree.unflatten(effects)))
+                # A gated step's forward writes back nothing: its collections (batch statistics) stay.
+                params = written if not gated else {
+                    **written, **{name: _chosen(native_finite, value, params[name])
+                                  for name, value in written.items() if name != "params"}}
             averaged = current.ema
             if self.objective.ema is not None:
                 if averaged is None:
@@ -1240,12 +1265,14 @@ class Transaction:
         # An update the optimizer holds back commits nothing yet: its tokens wait in the state
         # (`TrainState.deferred`) for the update that applies them (`update_applied`).
         # An input the optimizer skipped trains no update, so its tokens wait for none (`input_taken`).
-        done = update_applied(state.opt_state, advanced.opt_state)
+        # A gated step (no loss scale, not finite) committed nothing: no update, no tokens (`commit`).
+        done = update_applied(state.opt_state, advanced.opt_state) & (finite | (scale is not None))
         counted = due & accepted & done
         if state.deferred is not None:
             taken = input_taken(state.opt_state, advanced.opt_state)
             held = TokenCount.add(state.deferred, jnp.where(taken, held, 0).astype(jnp.uint32))
-            waiting = jnp.where(due & accepted & ~done, held, jnp.where(counted, 0, state.deferred))
+            trained = finite | (scale is not None)
+            waiting = jnp.where(due & accepted & trained & ~done, held, jnp.where(counted, 0, state.deferred))
             advanced = dataclasses.replace(advanced, deferred=waiting.astype(jnp.uint32))
         if self.split == 1:
             # A step that commits no update, a window still filling or one its optimizer holds back
