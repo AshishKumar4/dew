@@ -24,7 +24,7 @@ import struct
 import subprocess
 import tempfile
 import threading
-from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, overload
@@ -44,6 +44,8 @@ from dew._devices import deterministic_ops_requested, deviceless, xla_flag
 from dew.nn.kernels import generation
 
 if TYPE_CHECKING:
+    from jax.extend import core as jax_core
+
     from dew.nn.kernels.lowered import KernelCall
     from dew.nn.kernels.templates.resources import RegisterModel
 
@@ -149,6 +151,47 @@ class _Pending:
 
 _TRACING: contextvars.ContextVar[_Pending | None] = contextvars.ContextVar("tracing_launch", default=None)
 """The pending launch whose Mosaic kernels acquire their digest through `named`."""
+_NAMING: contextvars.ContextVar[list | None] = contextvars.ContextVar("kernel_naming", default=None)
+"""The kernels named within a `naming` block, in order, as `named` was asked and answered."""
+
+
+@contextlib.contextmanager
+def naming() -> Iterator[list[tuple[str | None, "RegisterModel | None", str | None]]]:
+    """Each kernel named within the block (`named`): the name and model it was asked with and the name it
+    took, which a held trace names again as it is bound for another launch (`renamed`)."""
+    names: list = []
+    token = _NAMING.set(names)
+    try:
+        yield names
+    finally:
+        _NAMING.reset(token)
+
+
+@contextlib.contextmanager
+def replayed() -> Iterator[None]:
+    """Within the block, no launch traces: the state a held trace is kept under (`tuning.lowered_once`),
+    which reads the launch tracing it only as it names its kernels and carries the launch on their calls,
+    each replayed as it is bound (`renamed`, `carrying`)."""
+    tracing, form, naming = _TRACING.set(None), _FORM.set(((), None)), _NAMING.set(None)
+    try:
+        yield
+    finally:
+        _NAMING.reset(naming)
+        _FORM.reset(form)
+        _TRACING.reset(tracing)
+
+
+def renamed(names: Sequence[tuple[str | None, "RegisterModel | None", str | None]]) -> None:
+    """The kernels a held trace named (`naming`) named again for the launch tracing now, each registered on
+    it as `named` registers a kernel traced afresh: each takes the name it took, as its trace's key holds what
+    its launch was given (`tuning.lowered_once`); one that takes another is refused, its name no digest of
+    what its body read."""
+    for name, model, took in names:
+        if (now := named(name, model=model)) != took:
+            raise ValueError(f"a held kernel named {took} is named {now} for the launch tracing now: its "
+                             "name reads what its launch was not given (`KernelOp.emitted`, `lowered_once`)")
+
+
 _FORM: contextvars.ContextVar[tuple[Hashable, Hashable]] = contextvars.ContextVar("kernel_form",
                                                                                default=((), None))
 """The form of the kernel tracing and the config it is emitted at (`forming`)."""
@@ -332,6 +375,13 @@ def named(name: str | None, *, model: "RegisterModel | None" = None) -> str | No
     a Mosaic GPU call's metadata (`launch_metadata`); a kernel whose call carries none (Triton's) is read back
     to its launch by its name alone, which is its launch's digest wherever its emission reads the whole config
     in no form. Its register `model`, where given, is recorded on that launch (`Launch.kernels`)."""
+    took = _named(name, model)
+    if (names := _NAMING.get()) is not None:
+        names.append((name, model, took))
+    return took
+
+
+def _named(name: str | None, model: "RegisterModel | None") -> str | None:
     digest = launch_digest()
     if digest is None:
         return name
@@ -349,6 +399,41 @@ def named(name: str | None, *, model: "RegisterModel | None" = None) -> str | No
         # mode it traced in.
         _LAUNCHES.setdefault(own, dataclasses.replace(launch, reverse=pending.reverse))
     return launch_name(kernel, own)
+
+
+def carrying(closed: "jax_core.Jaxpr", metadata: bytes) -> "jax_core.Jaxpr":
+    """`closed` with each Mosaic GPU call in it carrying `metadata` (`launch_metadata`), the launch it is
+    bound for: a held trace (`tuning.lowered_once`) bound for another launch than the one it was traced
+    for, whose calls' compiled serializations then name that launch (`Binary.caller`)."""
+    from jax._src.pallas.mosaic_gpu import core as plgpu_core
+
+    from dew.nn import programs
+
+    def carried_jaxpr(jaxpr: "jax_core.Jaxpr") -> "jax_core.Jaxpr":
+        # Its constants with it (`ClosedJaxpr` is `Jaxpr`); itself where no equation's parameters change: a
+        # kernel's body, unchanged, keeps its identity, by which its lowering's cache key is kept.
+        equations = [carried_equation(equation) for equation in jaxpr.eqns]
+        if all(new is old for new, old in zip(equations, jaxpr.eqns, strict=True)):
+            return jaxpr
+        return jaxpr.replace(eqns=equations)
+
+    def carried_equation(equation: "jax_core.JaxprEqn") -> "jax_core.JaxprEqn":
+        params = {key: carried(value) for key, value in
+                  programs.with_bodies(equation.params, carried_jaxpr).items()}
+        if all(params[key] is equation.params[key] for key in params):
+            return equation
+        return equation.replace(params=params)
+
+    def carried(value: Hashable | Mapping) -> Hashable | Mapping:
+        # A Mosaic GPU call's parameters carrying the launch, where they stand alone or by their backend.
+        if isinstance(value, plgpu_core.CompilerParams):
+            return dataclasses.replace(value, metadata=metadata)
+        if isinstance(value, Mapping) and any(isinstance(each, plgpu_core.CompilerParams)
+                                              for each in value.values()):
+            return {key: carried(each) for key, each in value.items()}
+        return value
+
+    return carried_jaxpr(closed)
 
 
 def launch_metadata() -> bytes:
@@ -401,16 +486,20 @@ def kernel_modules(calls: Iterable["KernelCall"]) -> dict[str, str]:
 
 
 def launch_digest() -> str | None:
-    """The digest of the launch tracing (`launching`), which its kernels' names carry (`named`), or None
-    where none is."""
+    """The digest of the launch tracing (`launching`), its identity, config and mode (`Launch.reverse`: a
+    gradient's product or a call's own), which its calls carry beside their kernels' names
+    (`launch_metadata`), or None where none is. The mode is the launch's alone: a kernel's name reads its
+    launch's identity and config (`named`), the body both modes share, so a kernel whose call carries no
+    caller (Triton's) names its launch's forward."""
     pending = _TRACING.get()
     if pending is None:
         return None
     if pending.digest is None:
         identity = pending.identity()
         # A kernel's identity in its default form (`named`): what its emission reads the whole config, its
-        # form none, so a kernel whose call carries no caller (Triton's) names its launch.
-        digest = _digest(f"{identity}|{pending.config!r}|{()!r}")
+        # form none; a gradient's product's digest apart from its call's own, as its verdict is (`_held`).
+        mode = "|reverse" if pending.reverse else ""
+        digest = _digest(f"{identity}|{pending.config!r}|{()!r}{mode}")
         with _GUARD:
             _LAUNCHES.setdefault(digest, Launch(identity, pending.op, pending.config, pending.padded(),
                                                 emitted=pending.emitted, reverse=pending.reverse))
@@ -711,18 +800,19 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
     forward and its pullback of a unit cotangent): its Mosaic GPU and Pallas-Triton kernels' modules (a Triton
     call's config) and binaries, by name and launch, none for a launch of none. A launch that does not trace
     alone raises: certification is no optional pass."""
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
     from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.kernels.options import owned_program
     from dew.nn.programs import meshless
 
-    mesh = Mesh([device], ("launch",))
-    placed = NamedSharding(mesh, PartitionSpec())
-    # A program of its own on one device (`meshless`): none of the enclosing trace's mesh nor its axes (a
-    # checked shard_map's body, whose abstract values the launch's own must not vary over), its operands' too.
-    with meshless(), jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+    placed, manual = _certifying_placement(device)
+    # A program of its own on one device (`meshless`): none of the enclosing trace's mesh nor its axes, its
+    # operands' too, but the mesh its program runs on where that is one device's (`_certifying_placement`),
+    # within a map holding the axes manual its program's call holds manual (`sharding.manual_map`'s).
+    with meshless(placed.mesh):
         launch, shapes = op.lowering(arguments, config)
+        if manual:
+            launch = jax.shard_map(launch, mesh=placed.mesh, in_specs=jax.sharding.PartitionSpec(),
+                                   out_specs=jax.sharding.PartitionSpec(), axis_names=manual, check_vma=False)
         specs = [jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=placed) for shape in shapes]
 
         def pulled_back(*operands):
@@ -754,6 +844,24 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
     return {name: (modules[name], binary)
             for binary in binaries(xla_compiled(lowered, None))
             if (name := launch_name(binary.kernel, binary.launch)) in modules}
+
+
+def _certifying_placement(device) -> tuple[jax.sharding.NamedSharding, frozenset]:
+    """Where certification places a launch's operands on `device` (`_compiled_launch`), on the mesh its
+    program is set on (`placement.mesh`), and the axes its launch holds manual: its program's where that runs
+    on `device` alone (the concrete mesh, `jax.set_mesh`'s, its axes manual where the call is in a map
+    holding them, `sharding.manual_map`'s), so the launch lowers to the jaxpr and the mesh its program's call
+    does (the GPU it states and each jit's recorded mesh among them) and the program reads its kernels'
+    lowerings back (the Pallas lowering cache keys both); else a mesh of its own on `device`, as a program of
+    no mesh or a launch of many devices' (row 6327): its own compile cannot hold the program's devices, so
+    its program lowers its kernels again."""
+    from jax._src import mesh as mesh_lib
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    placed = mesh_lib.get_concrete_mesh()
+    if not placed.empty and list(placed.devices.flat) == [device]:
+        return NamedSharding(placed, PartitionSpec()), frozenset(jax.sharding.get_abstract_mesh().manual_axes)
+    return NamedSharding(Mesh([device], ("launch",)), PartitionSpec()), frozenset()
 
 
 def _unit_cotangent(out: jax.Array) -> jax.Array | np.ndarray:

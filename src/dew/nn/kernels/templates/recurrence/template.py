@@ -695,24 +695,16 @@ class Mosaic(base.Template[mainloop.Tiles]):
         return tiles
 
     def emitted(self, config: Hashable, kernel: str) -> Hashable:
-        """What `kernel` reads of `config` as it is emitted: all of it but the other launches' producers
-        (`Tiles.producers`, each launch's own setmaxnreg cap, the call's tiles' and its forward's apart, each
-        a level a launch reads), so a producer's raise leaves every other kernel of the launch the module it
-        was, which a rung's certification then reads from the lowering cache and Mosaic's compile (`rungs`):
+        """What `kernel` reads of `config` as it is emitted: all of it but the other launches' producers and
+        residents (`Tiles.producers`, each launch's own setmaxnreg cap, and `Tiles.residents`, the call's
+        tiles' and its forward's apart, each a level a launch reads), so a producer's raise leaves every other
+        kernel of the launch the module it was, which a rung's certification then reads from the lowering cache and Mosaic's compile (`rungs`):
         a rung re-lowered and recompiled every kernel of the 4B's training launch, 7 and 5 s of each 12."""
         if not self._typed(config):
             return config
-
-        def own(tiles: mainloop.Tiles) -> mainloop.Tiles:
-            # The caps its emission reads: its launch's by its name, which the launch passes to `report.named`
-            # and to `Call.producers` and `Call.residents` alike.
-            cap, held = tiles.producers.of(kernel), tiles.residents.of(kernel)
-            return dataclasses.replace(
-                tiles, producers=resources.Producers(() if cap is None else ((kernel, cap),)),
-                residents=resources.Residents(() if held is None else ((kernel, held),)))
-
-        forward = None if config.forward is None else own(config.forward)
-        return dataclasses.replace(own(config), forward=forward)
+        # The tiles its launch is given (`Tiles.at`), its cap and residents by its name, which the launch
+        # passes to `report.named` and reads of `Call.producers` and `Call.residents` alike.
+        return config.at((kernel,))
 
     def rungs(self, ba: tokamax.BoundArguments, config: Hashable) -> Iterator[mainloop.Tiles]:
         """The tiles a refused `config`'s spilling launches step through (`_stepped`): each one's producer's

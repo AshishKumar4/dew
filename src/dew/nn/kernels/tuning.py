@@ -44,6 +44,7 @@ fails leaves the space. The tuner only times what is proven.
 
 from __future__ import annotations
 
+import collections
 import concurrent.futures
 import contextlib
 import contextvars
@@ -61,7 +62,7 @@ import threading
 import time
 import types
 import weakref
-from collections.abc import Callable, Hashable, Iterator, Mapping
+from collections.abc import Callable, Collection, Hashable, Iterator, Mapping
 from typing import ClassVar
 
 import filelock
@@ -79,6 +80,7 @@ from dew._files import write_atomically
 from dew._records import JSON
 from dew.algebra.terms import opaque, parameter_key
 from dew.nn import programs
+from dew.nn.kernels import options
 from dew.nn.kernels.options import UNGRAPHED_OPTIONS, owned_program
 
 from . import generation
@@ -813,7 +815,24 @@ class KernelOp(tokamax.Op):
                 else jnp.zeros(spec.shape, spec.dtype) for key, spec in zip(keys, specs, strict=True)]
 
 
+_Structure = tuple[jax.tree_util.PyTreeDef]
+"""A tree's structure in a one-element tuple: JAX declares `PyTreeDef` as a value, which a type admits only
+inside another (`dew.nn.kernels.options._Structure`)."""
+
+
+@dataclasses.dataclass(eq=False)
+class _Held:
+    """A launch's held trace (`lowered_once`): its program, its outputs' structure, the kernels it named
+    (`report.naming`) and the facts it read (`generation.recording`)."""
+
+    jaxpr: jax_core.Jaxpr
+    outputs: _Structure
+    named: tuple
+    reads: dict
+
+
 def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), at: str | None = None,
+                 kernels: Callable[[Callable, Mapping], Collection[str]] | None = None,
                  unless: Callable[[], bool] = lambda: False) -> Callable[[Callable], Callable]:
     """A kernel launch jitted with the arguments its signature names among `static` static: JAX keys its
     program on them and on its operands' shapes and dtypes, so each configuration is traced and lowered
@@ -830,28 +849,80 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
     not, a training call's attention forward and a forward alone) traces each kernel of a name apart, and a
     template that says nothing names every static. The static `at` names carries the config its kernels are
     emitted at, a level of the launch's (a training call's tiles or its forward's), whose part each kernel's
-    name reads (`report.forming`'s `at`)."""
+    name reads (`report.forming`'s `at`).
+
+    A launch's trace is held under all it is given and the launch tracing it: its static arguments, its
+    operands' types, the trace state (`options.trace_context`, the launch apart, `report.replayed`) and
+    the launch (`report.launch_metadata`), whose identity and config its kernels' names read
+    (`report.named`), taken where each fact it read answers as it did (`generation.recording`,
+    `generation.still`): a launch given the same traces once however many layers and passes call it,
+    certification's alone and the step's call one trace, and each call binds it carrying the launch
+    (`report.carrying`, its kernels named for it again, `report.renamed`). The `configured` statics are
+    given narrowed to what the kernels the launch builds read of them (`kernels`, the names a launch's
+    builder takes, each config's `at`): a producer's raise leaves every other launch of a config given
+    what it was, its trace held (a ladder's rungs traced each of a launch's kernels again, 114 traces of
+    20 kernels for a 4B decoder's step, FS-EST-REPEATS). A launch naming a kernel it does not say it
+    builds is refused, as it was given none of that kernel's config."""
     def decorate(launch: Callable) -> Callable:
         signature = inspect.signature(launch)
         names = tuple(name for name in static if name in signature.parameters)
+        held: dict[Hashable, list[_Held]] = {}
 
-        # One jitted launch a launch digest. JAX keys its trace cache on the function a jit wraps, not the
-        # jit, so each digest wraps a function object of its own.
         @functools.cache
-        def jitted(digest: str | None) -> Callable:
-            del digest
-            return owned_program(functools.partial(launch), static_argnames=names)
+        def bound(found: _Held, metadata: bytes) -> Callable:
+            # One jit a held trace and the launch it is bound for, which a model's layers' calls share.
+            carried, (outputs,) = report.carrying(found.jaxpr, metadata), found.outputs
+
+            run = jax_core.jaxpr_as_fun(carried)
+            return owned_program(lambda *operands: jax.tree.unflatten(outputs, run(*operands)))
+
+        def calling(arguments: Mapping[str, object]):
+            # `launch` called with `arguments` by name, as `signature.bind` gave them.
+            bound_ = inspect.BoundArguments(signature, collections.OrderedDict(arguments))
+            return launch(*bound_.args, **bound_.kwargs)
 
         @functools.wraps(launch)
         def called(*args, **kwargs):
-            bound = signature.bind(*args, **kwargs).arguments
+            given = dict(signature.bind(*args, **kwargs).arguments)
+            builds = None if kernels is None else frozenset(kernels(launch, given))
+            if builds is not None:
+                given.update({name: given[name].at(builds) for name in configured
+                              if given.get(name) is not None})
             # Each static argument but those its config carries, keyed as a key kept beyond this process is.
             form = opaque(parameter_key(tuple(
-                (name, bound[name]) for name in names if name in bound and name not in configured)))
-            with report.forming(form, at=None if at is None else bound.get(at)):
-                if unless() or not all(holdable(bound[name]) for name in names if name in bound):
-                    return launch(*args, **kwargs)
-                return jitted(report.launch_digest())(*args, **kwargs)
+                (name, given[name]) for name in names if name in given and name not in configured)))
+            with report.forming(form, at=None if at is None else given.get(at)):
+                if unless() or not all(holdable(given[name]) for name in names if name in given):
+                    return calling(given)
+                statics = {name: given[name] for name in names if name in given}
+                leaves, operands = jax.tree.flatten({name: value for name, value in given.items()
+                                                     if name not in statics})
+                with report.replayed():
+                    state = options.trace_context()
+                # Its kernels' names read the launch tracing it (`report.named`: its identity and the part
+                # of its config each emission reads), so a trace is held for that launch.
+                metadata = report.launch_metadata()
+                key = (tuple(statics.items()), operands, tuple(map(jax.typeof, leaves)), state, metadata)
+                entries = held.setdefault(key, [])
+                found = next((entry for entry in entries if generation.still(entry.reads)), None)
+                if found is None:
+                    def traced(*values):
+                        return calling({**statics, **jax.tree.unflatten(operands, values)})
+
+                    with report.naming() as named, generation.recording() as reads:
+                        program = owned_program(traced).trace(*leaves)
+                    strays = {report.kernel_of(took)[0] for _, _, took in named if took is not None
+                              and builds is not None and report.kernel_of(took)[0] not in builds}
+                    if strays:
+                        raise ValueError(f"{launch.__qualname__} builds {sorted(strays)}, which it does not "
+                                         f"say it builds ({sorted(builds or ())}): it was given none of "
+                                         "their config")
+                    found = _Held(program.jaxpr, (jax.tree.structure(program.out_info),), tuple(named), reads)
+                    entries.append(found)
+                else:
+                    generation.replay(found.reads)
+                    report.renamed(found.named)
+                return bound(found, metadata)(*leaves)
 
         return called
 
