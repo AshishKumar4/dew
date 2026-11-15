@@ -411,17 +411,15 @@ class Forks:
         return depth
 
 
-@dataclasses.dataclass(frozen=True)
+@struct.dataclass
 class SegmentBound:
     """The most documents a window of a read holds (`Coordinates.max_segments`), stated alone for a
-    consumer that lays its rows out itself (a decision read, `dew.decision.task.laid_out`): static, so a
-    compiled step is specialized to it, and no array a step carries (row 5953: a decision batch's
-    coordinates were built on the host, carried into the step and built again there)."""
+    consumer that lays its rows out itself (a decision read, `dew.decision.task.laid_out`): a node of no
+    leaves whose bound is its static data, a plain number, so a compiled step is specialized to it, a kept
+    program states it (`dew.training.ahead.plain_structure`), and no array a step carries (row 5953: a
+    decision batch's coordinates were built on the host, carried into the step and built again there)."""
 
-    max_segments: int | None
-
-
-jax.tree_util.register_static(SegmentBound)
+    max_segments: int | None = struct.field(pytree_node=False)
 
 
 @struct.dataclass
