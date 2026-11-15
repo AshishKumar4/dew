@@ -17,11 +17,12 @@ import pytest
 from lane_environment import without_flags
 from process_support import fresh
 from recording import RecordingTracker
-from run_kinds import saved_record, scalars, trained_record
+from run_kinds import scalars
 from scenario_contract import assert_steps_finite, covering
 from token_support import write_token_corpus
 
 import dew
+from dew._cli.main import main
 from dew.checkpoints import Checkpoints
 from dew.config import ObjectiveConfig
 from dew.config.lm import LMRunConfig
@@ -55,6 +56,21 @@ def in_fresh_process(devices: int, function: str, *arguments) -> None:
     script = ("import json, sys\nimport test_scenario_runs\n"
               "getattr(test_scenario_runs, sys.argv[1])(*json.loads(sys.argv[2]))\nprint(json.dumps(0))")
     assert fresh(script, function, json.dumps(arguments), flags=flags, platforms="cpu") == 0
+
+
+def dew_train(record: str, settings: Mapping[str, str], trust: list[str]) -> None:
+    """`dew train` of the run saved at `record`, its settings set (`--set`), the packages outside Dew its
+    record imports trusted (`--trust`), as a user's command runs it."""
+    sets = [part for path, value in settings.items() for part in ("--set", f"{path}={value}")]
+    trusted = [part for package in trust for part in ("--trust", package)]
+    assert main(["train", str(Path(record) / "run.json"), *sets, *trusted]) == 0
+
+
+def trained(record: Path, settings: Mapping[str, str], devices: int, trust: tuple[str, ...] = ()) -> Path:
+    """The run saved at `record` trained by `dew train` in a fresh process that sees `devices` CPU devices
+    (`in_fresh_process`), its settings set and `trust` trusted: its run directory."""
+    in_fresh_process(devices, "dew_train", str(record), dict(settings), list(trust))
+    return Path(settings["trainer.checkpoint_dir"]) / settings["trainer.name"]
 
 
 def common(cell: Mapping, root: Path) -> dict[str, str]:
@@ -93,6 +109,13 @@ def lm_data(cell: Mapping, root: Path, rows: str = "padded") -> dict:
     return {"data": windows(tokens.train), "validation": windows(tokens.val)}
 
 
+def saved(config, root: Path) -> Path:
+    """`config` saved as a run record under `root`, which `dew train` replays."""
+    record = root / "record"
+    config.save(str(record))
+    return record
+
+
 def assert_generates_as_its_checkpoint(run: Path) -> None:
     """Export then reload is identical: the run's task (`dew.pipeline`) generates, greedily, what a
     generation over its model and its final checkpoint's tree generates."""
@@ -110,8 +133,8 @@ def dense_lm(cell: Mapping, root: Path) -> None:
     """Build a decoder, train it over a token store's documents packed or padded, read as the cell reads,
     and reload its run: every step's gradient finite (`assert_steps_finite`), and the reloaded task
     generating what its final checkpoint's model generates."""
-    run = trained_record(saved_record(LMRunConfig(**lm_data(cell, root)), root, "cell"),
-                         {**common(cell, root), **TINY, "model.remat": str(cell["memory"])}, cell["devices"])
+    run = trained(saved(LMRunConfig(**lm_data(cell, root)), root),
+                  {**common(cell, root), **TINY, "model.remat": str(cell["memory"])}, cell["devices"])
     assert_steps_finite(scalars(run).items(), "dense LM")
     assert_generates_as_its_checkpoint(run)
 
@@ -132,8 +155,7 @@ def pretrained(cell: Mapping, root: Path) -> None:
     if cell["quantization"] == "qat":
         config = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer,
                                                                         quantization=Quantization()))
-    run = trained_record(saved_record(config, root, "cell"), {**common(cell, root), "max_new_tokens": "4"},
-                         cell["devices"])
+    run = trained(saved(config, root), {**common(cell, root), "max_new_tokens": "4"}, cell["devices"])
     assert_steps_finite(scalars(run).items(), "pretrained fine-tuning")
     assert_generates_as_its_checkpoint(run)
     if cell["quantization"] == "ptq":
@@ -151,9 +173,9 @@ def masked_diffusion(cell: Mapping, root: Path) -> None:
     reloading to a sampler."""
     config = LMRunConfig(**lm_data(cell, root),
                          objective=ObjectiveConfig("masked_diffusion", {"ema_decay": None}))
-    run = trained_record(saved_record(config, root, "cell"),
-                         {**common(cell, root), **TINY, "max_new_tokens": "0", "model.causal": "False",
-                          "model.mask_token_id": str(MASK)}, cell["devices"])
+    run = trained(saved(config, root), {**common(cell, root), **TINY, "max_new_tokens": "0",
+                                        "model.causal": "False", "model.mask_token_id": str(MASK)},
+                  cell["devices"])
     assert_steps_finite(scalars(run).items(), "masked diffusion LM")
     prompt = [5, 6, 7]
     drawn = dew.pipeline(str(run))([prompt], 4, key=0, steps=2).host()
@@ -173,9 +195,9 @@ MIXERS = {"gdn": {"class": "gated_delta_net", "fields": {
 def hybrid(cell: Mapping, root: Path) -> None:
     """Train a decoder of the cell's recurrent mixer through the shared components and decode it from its
     run: every step's gradient finite, and its task generating what its checkpoint generates."""
-    run = trained_record(saved_record(LMRunConfig(**lm_data(cell, root)), root, "cell"),
-                         {**common(cell, root), **TINY, "model.mixer": json.dumps(MIXERS[cell["mixer"]])},
-                         cell["devices"])
+    run = trained(saved(LMRunConfig(**lm_data(cell, root)), root),
+                  {**common(cell, root), **TINY, "model.mixer": json.dumps(MIXERS[cell["mixer"]])},
+                  cell["devices"])
     assert_steps_finite(scalars(run).items(), f"a {cell['mixer']} decoder")
     assert_generates_as_its_checkpoint(run)
 
@@ -185,8 +207,8 @@ def distributed(cell: Mapping, root: Path) -> None:
     where the cell shards them: every step's gradient finite and its run reloading."""
     moe = {"model.mixture": json.dumps({"experts": 4, "top_k": 2})} if cell["model"] == "moe" else {}
     mesh = {"trainer.mesh.fsdp": "2"} if cell["mesh"] == "fsdp" else {"trainer.mesh.expert": "2"}
-    run = trained_record(saved_record(LMRunConfig(**lm_data(cell, root)), root, "cell"),
-                         {**common({**cell, "devices": 1}, root), **TINY, **moe, **mesh}, 2)
+    run = trained(saved(LMRunConfig(**lm_data(cell, root)), root),
+                  {**common({**cell, "devices": 1}, root), **TINY, **moe, **mesh}, 2)
     assert_steps_finite(scalars(run).items(), f"a {cell['model']} decoder over {cell['mesh']}")
     assert_generates_as_its_checkpoint(run)
 
@@ -281,8 +303,7 @@ def online_rl(cell: Mapping, root: Path) -> None:
         rollout=PromptRollout(reward=f"{rl_support.__name__}:completion_length", groups=2, max_new_tokens=4,
                               method=cell["method"]),
         model=ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1, "num_heads": 2}))
-    run = trained_record(saved_record(config, root, "cell"), common(cell, root), cell["devices"],
-                         trust=(rl_support.__name__,))
+    run = trained(saved(config, root), common(cell, root), cell["devices"], trust=(rl_support.__name__,))
     assert_steps_finite(scalars(run).items(), f"online {cell['method']}")
     assert LMRunConfig.load(str(run)).rollout.method == cell["method"]
 
