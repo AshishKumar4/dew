@@ -614,18 +614,20 @@ class Walk:
     loaded once, one deep and outside the rings' rotation, awaited before the first step, each step reading
     it among its slots (`rings.Beside`), given back after the last (`Transport.run`'s `once`)."""
 
-    def stepped(self, once: dict | None = None) -> tuple:
+    def stepped(self, once: Callable[[], dict] | None = None) -> tuple:
         """Its segments, each step given its prologue's value, the prologue run here (in the consumer), and
-        its slots beside the `once` streams' acquired slots where given (`rings.Beside`)."""
+        its slots beside the once streams' slots `once()` acquires where given (`rings.Beside`), after the
+        prologue's loads start: they wait on none of the streams'."""
         loaded = None if self.prologue is None else self.prologue()
-        return tuple((_besides(step if loaded is None else functools.partial(step, loaded=loaded), once),
+        held = None if once is None else once()
+        return tuple((_besides(step if loaded is None else functools.partial(step, loaded=loaded), held),
                       lo, hi) for step, lo, hi in (self.segments or ((self.step, 0, self.steps),)))
 
     def persisted(self, walk: Callable) -> None:
         """Its one step walked by a persistent tile's `walk(step, start, shapes)` (`Transport.persist`'s)."""
         if self.segments or self.once:
-            raise ValueError("a persistent tile walks its one step, not segments of its own, its once "
-                             "streams its tile's (`Transport.persist`'s `once`)")
+            raise ValueError("a persistent tile walks its one step, not segments of its own nor once "
+                             "streams")
         if self.sums or self.read is not None:
             raise ValueError("a persistent tile's sums are its own accumulators (`Transport.persist`'s)")
         ((step, _, _),) = self.stepped()
@@ -1674,16 +1676,17 @@ class Transport[Allocated, Opened](abc.ABC):
         streams, views, held = self.walked_once(allocated, walk.views, once, walk.once)
 
         def consumer(wg):
-            taken = self.taken_once(held, walk.once, wg)
-            carry, sums = self.walk(self.fed(streams, views, 0, walk.steps, wg), walk.stepped(taken),
-                                    walk.carry, walk.sums, interpret)
+            # Its streams' first loads, then its prologue's, in flight before it waits on its once streams.
+            fed = self.fed(streams, views, 0, walk.steps, wg)
+            stepped = walk.stepped(functools.partial(self.taken_once, held, walk.once, wg))
+            carry, sums = self.walk(fed, stepped, walk.carry, walk.sums, interpret)
             for ring in held.values():
                 ring.release(ring.turn(0))
             if walk.read is not None:
                 walk.read(carry, sums)
 
         def producer():
-            loaded_once(held, 0, walk.once)
+            loaded_once(held, walk.once)
             self.stream(streams, views, 0, walk.steps)
             drain(held.values(), 1)
 
@@ -1732,7 +1735,7 @@ class Transport[Allocated, Opened](abc.ABC):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
-                pingpong: bool = False, once=None) -> None:
+                pingpong: bool = False) -> None:
         """A persistent kernel's tiles, the grid `tiles` spread over the launch's programs along `axis`, its
         streams (`streams`, as `scoped` hands them) running on across them: `schedule(index)` gives a tile's
         `(active, steps, views, tile)`, whether it streams anything, its step count, each stream's view
@@ -1755,12 +1758,7 @@ class Transport[Allocated, Opened](abc.ABC):
         `resources.producer_floor` where None), the floor its launch plans with; a family without a producer
         role takes none. With `pingpong`, on a family that takes it (`takes_pingpong`), its two consumers take
         alternate tiles whole, their products in turn (`persistent.consumed`'s `turns`), each consumer's tile
-        its own share (`gemm.mosaic_gpu.Tiles.pingpong`). With `once` (streams as `scoped` hands them, one
-        deep), on a family that loads them (tcgen05's; every other refuses them, `onced`), each tile's block
-        of each once stream is loaded once at the tile's start, outside its ring, and every step of the tile
-        reads it by its name among the step's slots (`views` holds its view, step 0's tile): a tile's operands
-        its steps all read (a recurrence's queries and keys across its value heads) ride no ring step by
-        step."""
+        its own share (`gemm.mosaic_gpu.Tiles.pingpong`)."""
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
@@ -1863,11 +1861,6 @@ class Transport[Allocated, Opened](abc.ABC):
         del rewrites
         self.pingponged(pingpong)
         return ((self.meeting(consumers),) if pingpong else ()), 0
-
-    def onced(self, once) -> None:
-        """Refuse `once` streams on a family whose `persist` loads none."""
-        if once is not None:
-            raise NotImplementedError(f"{self.name} loads no persistent tile's once streams")
 
     def pingponged(self, pingpong: bool) -> None:
         """Refuse `pingpong` on a family that takes none (`takes_pingpong`): a consumer-fed ring's partner
@@ -2231,9 +2224,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
-                pingpong: bool = False, once=None) -> None:
+                pingpong: bool = False) -> None:
         del accumulators  # its consumers' walks carry their own
-        self.onced(once)
         self.pingponged(pingpong)
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
         # a tile's first loads go out while the consumers store the last one (`_tiled`).
@@ -2341,8 +2333,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         so the rings hold two steps' slots at least (`Tiles.stages`' floor, `ahead_stages`), and tests where
         it stands in its range (`Slots.first`, `more`): its own slots read where it is the first, the next's
         where more follow, each under its guard, which a count of its emission reads by the step's place
-        (`emission`'s place guards). Each step marked (`stepped`). A walk of no rings (a persistent tile
-        whose every operand is a once stream, `persist`'s `once`) turns one slot deep."""
+        (`emission`'s place guards). Each step marked (`stepped`). A walk of no rings (one whose every
+        operand is a once stream, `Walk.once`) turns one slot deep."""
         segments = stepped(segments)
         ahead = ahead_streams(products)
         stages = min((ring.stages for ring in streams.values()), default=1)

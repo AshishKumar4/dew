@@ -751,30 +751,23 @@ def _padded(rows: int, family) -> int:
     return -(-rows // family.rows) * family.rows
 
 
-def _persisted_products(x, w, *, family, interpret, rows: int | None = None, resident: int = 1,
-                        once: tuple[str, ...] = ()):
+def _persisted_products(x, w, *, family, interpret, rows: int | None = None, resident: int = 1):
     """`x @ w` a tile at a time through `family`'s persistent walk (`Family.persist`): each tile the
     family's least rows covering `rows` (its own least where None; `_padded`), of which it stores `rows`,
     tile `t` the tiles' rows `t` on, each step `PERSISTED_DEPTH` of the contraction, the middle tile
     multiplying nothing (zeros); each tile issued (`issue`'s walk) and finished (`Issuer.chunks`, each
-    chunk stored at its columns), on the family's roles, launched for `resident` programs a multiprocessor.
-    Each of `once`'s operands is its first step's block a tile, loaded once at the tile's start (`persist`'s
-    `once`) and read by every step: with `x` once, `x[:, :PERSISTED_DEPTH] @` the sum of `w`'s step blocks;
-    with both, every step that one product."""
+    chunk stored at its columns), on the family's roles, launched for `resident` programs a multiprocessor."""
     stored = family.rows if rows is None else rows
     rows, columns = _padded(stored, family), w.shape[1]
     family = family.specialized(rows, columns)
     shape = (rows, columns)
-    every = {'x': ((rows, PERSISTED_DEPTH), x.dtype), 'w': ((PERSISTED_DEPTH, columns), w.dtype)}
-    blocks = {name: block for name, block in every.items() if name not in once}
-    held = {name: block for name, block in every.items() if name in once}
+    blocks = {'x': ((rows, PERSISTED_DEPTH), x.dtype), 'w': ((PERSISTED_DEPTH, columns), w.dtype)}
 
     def body(x_gmem, w_gmem, o_gmem):
         def scope(*, streams):
             def schedule(index):
                 tile = index[0]
-                views = {'x': (x_gmem, (lambda j: (tile, 0)) if 'x' in once else (lambda j: (tile, j))),
-                         'w': (w_gmem, (lambda j: (0, 0)) if 'w' in once else (lambda j: (j, 0)))}
+                views = {'x': (x_gmem, lambda j: (tile, j)), 'w': (w_gmem, lambda j: (j, 0))}
                 return tile != 1, PERSISTED_STEPS, views, tile
 
             def issue(wg, tile, walk, *, active):
@@ -787,12 +780,10 @@ def _persisted_products(x, w, *, family, interpret, rows: int | None = None, res
                 for first, (value,) in family.chunks(accs):
                     store(0, value, o_gmem, (tile * rows, 0, stored, first, rows))
 
-            family.persist(streams["walked"], (PERSISTED_TILES,), schedule, issue, finish, consumers=1,
-                           axis="programs", outputs=((shape, jnp.float32),), interpret=interpret,
-                           accumulators=(shape,), once=streams["once"] if once else None)
+            family.persist(streams, (PERSISTED_TILES,), schedule, issue, finish, consumers=1, axis="programs",
+                           outputs=((shape, jnp.float32),), interpret=interpret, accumulators=(shape,))
 
-        family.scoped(scope, streams={"walked": family.streams(blocks, 2, 1),
-                                      **({"once": family.streams(held, 1, 1)} if once else {})})
+        family.scoped(scope, streams=family.streams(blocks, 2, 1))
 
     out = jax.ShapeDtypeStruct((PERSISTED_TILES * rows, columns), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
@@ -820,40 +811,6 @@ def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_i
     with generation.assumed("sm100"):
         got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED))
     expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
-    expected[family.rows:2 * family.rows] = 0
-    np.testing.assert_array_equal(got, expected)
-
-
-@INTERPRETS
-def test_a_persistent_tiles_once_stream_loads_once_and_every_step_reads_it():
-    """Interpreted: a persistent walk on tcgen05's bundle whose tiles' left operand is a once stream
-    (`Family.persist`'s `once`): each tile's block loaded once at its start, outside the ring, and read by
-    every step beside the ring's right blocks, over three tiles (the one-deep slot turning each tile) with
-    the middle one multiplying nothing: each tile's rows its block times the sum of the steps' blocks."""
-    from dew.nn.kernels.templates import mosaic_sm100
-    family = mosaic_sm100.RINGS
-    x, w = _persisted_operands(family.rows)
-    with generation.assumed("sm100"):
-        got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED, once=('x',)))
-    left = np.asarray(x, np.float32)[:, :PERSISTED_DEPTH]
-    steps = np.asarray(w, np.float32).reshape(PERSISTED_STEPS, PERSISTED_DEPTH, -1).sum(axis=0)
-    expected = left @ steps
-    expected[family.rows:2 * family.rows] = 0
-    np.testing.assert_array_equal(got, expected)
-
-
-@INTERPRETS
-def test_a_persistent_tile_whose_every_operand_is_a_once_stream_walks_its_steps():
-    """Interpreted: a persistent walk on tcgen05's bundle whose every operand is a once stream (no ring a
-    step): each step reads the tile's two blocks, so each active tile's rows are their product times the
-    walk's steps, the inactive middle tile's zeros."""
-    from dew.nn.kernels.templates import mosaic_sm100
-    family = mosaic_sm100.RINGS
-    x, w = _persisted_operands(family.rows)
-    with generation.assumed("sm100"):
-        got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED, once=('x', 'w')))
-    left = np.asarray(x, np.float32)[:, :PERSISTED_DEPTH]
-    expected = PERSISTED_STEPS * (left @ np.asarray(w, np.float32)[:PERSISTED_DEPTH])
     expected[family.rows:2 * family.rows] = 0
     np.testing.assert_array_equal(got, expected)
 
@@ -1827,12 +1784,13 @@ ONCE_BUNDLES = [pytest.param("wgmma", marks=INTERPRETS), pytest.param("fed", mar
 TPU core's fold, its kernels interpreted on any host."""
 
 
-def _walked_once(x, w, *, family, interpret, all_once=False):
+def _walked_once(x, w, *, family, interpret, all_once=False, prologue=False):
     """`x[:, :PERSISTED_DEPTH] @` the sum of `w`'s `PERSISTED_STEPS` step blocks through one plain walk
     (`Transport.run`) on `family`'s roles: `x`'s block a once stream (`Walk.once`), its view's at step zero
     though its index map moves with the step, loaded once outside the ring and read by every step beside
     `w`'s ringed blocks, the walk's sums read out after its last step (`Walk.read`). `all_once`, `w`'s first
-    block a once stream too: every step reads the two once blocks, and the walk rotates no ring."""
+    block a once stream too: every step reads the two once blocks, and the walk rotates no ring. `prologue`,
+    the walk's prologue reads a row of `x` from global memory, each step taking it."""
     rows, columns = family.rows, w.shape[1]
     family = family.specialized(rows, columns)
     shape = (rows, columns)
@@ -1858,8 +1816,11 @@ def _walked_once(x, w, *, family, interpret, all_once=False):
             views = {'w': (w_gmem, lambda j: (j, 0))}
             if all_once:
                 once, views = {**once, **views}, {}
-            walk = mosaic.Walk(views, _multiplying(family, 'x', 'w', interpret), steps=PERSISTED_STEPS,
-                               sums=(shape,), read=read, once=once)
+            step = _multiplying(family, 'x', 'w', interpret)
+            if prologue:
+                step = functools.partial(lambda step, *given, loaded: step(*given), step)
+            walk = mosaic.Walk(views, step, steps=PERSISTED_STEPS, sums=(shape,), read=read, once=once,
+                               prologue=(lambda: x_gmem[0]) if prologue else None)
             family.run(streams["walked"], walk, interpret, once=streams["once"])
 
         ringed, held = {'w': ((PERSISTED_DEPTH, columns), w.dtype)}, {'x': ((rows, PERSISTED_DEPTH), x.dtype)}
@@ -1871,6 +1832,29 @@ def _walked_once(x, w, *, family, interpret, all_once=False):
     out = jax.ShapeDtypeStruct(shape, jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
                          interpret=interpret, name="walked_once")(x, w)
+
+
+@pytest.mark.parametrize("bundle", ["wgmma", "fed"])
+def test_a_walks_prologue_loads_before_it_waits_on_its_once_streams(bundle):
+    """Traced for an H100: a walk with a prologue and a once stream (`Walk.prologue`, `Walk.once`) on
+    warpgroup MMA's roles and its consumer-fed bundle's: the consumer's prologue reads global memory before
+    it first waits on a barrier, as a prologue's loads are in flight beside the streams' (row 6657); its once
+    streams' acquire waits after them."""
+    from reference_error import equations
+
+    from dew.nn.kernels.templates import mosaic_sm90
+
+    family = {"wgmma": mosaic_sm90.WGMMA, "fed": mosaic_sm90.FED}[bundle]
+    x, w = _persisted_operands(family.rows)
+    x = x[:family.rows]
+    with generation.assumed("sm90"):
+        traced = jax.make_jaxpr(lambda x, w: _walked_once(x, w, family=family, interpret=False,
+                                                          prologue=True))(x, w)
+    order = [equation.primitive.name for equation in equations(traced.jaxpr)
+             if equation.primitive.name == "barrier_wait"
+             or (equation.primitive.name == "get"
+                 and getattr(equation.invars[0].aval, "memory_space", None) == plgpu.GMEM)]
+    assert "get" in order and order.index("get") < order.index("barrier_wait"), order
 
 
 @pytest.mark.parametrize("bundle", ONCE_BUNDLES)
