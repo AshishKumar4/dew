@@ -2,8 +2,9 @@
 any run's (`dew.checkpoints.averaged`): a LoRA run's factors merged into its kernels first and a
 partly frozen run's frozen leaves back in its params, two runs' mean float64's rounded once at every
 magnitude, subnormals included, a longer running mean on par with a stacked fp32 mean from float64
-(check 1) and exact where its runs agree, each run's directory, step and average read recorded, and
-runs of another model refused."""
+(check 1) and exact where its runs agree, each run's directory, step and average read recorded, runs
+trained under other remat or dropout averaged, and runs of another model refused by the field that
+differs."""
 
 import shutil
 
@@ -34,17 +35,19 @@ LOADING = Loading(workers=0, threads=1, read_buffer=1)
 TOKENS = jnp.arange(1, 9)[None, :]
 
 
-def model(mlp_features: int = 64) -> CausalTransformer:
-    return CausalTransformer(vocab_size=16, emb_features=32, num_layers=2, num_heads=2,
-                             mlp_features=mlp_features, max_seq_len=16, dtype="float32", attention_impl="xla")
+def model(**fields) -> CausalTransformer:
+    return CausalTransformer(**{"vocab_size": 16, "emb_features": 32, "num_layers": 2, "num_heads": 2,
+                                "mlp_features": 64, "max_seq_len": 16, "dtype": "float32",
+                                "attention_impl": "xla", **fields})
 
 
 def trained(directory, steps: int, *, adapted: bool, key: int = 0, ema_decay: float | None = None,
-            mlp_features: int = 64, frozen: bool = False, mesh: MeshSpec | None = None) -> str:
+            frozen: bool = False, mesh: MeshSpec | None = None, **fields) -> str:
     """A run of `steps` steps from one base's weights, fine-tuned whole, with its first layer frozen, or
     through a LoRA adapter whose factors start alike, its trainer drawing from `key`, over `mesh` (data
-    parallel over every device by default), its last step checkpointed."""
-    base = model(mlp_features)
+    parallel over every device by default), its model's `fields` set over `model`'s, its last step
+    checkpointed."""
+    base = model(**fields)
     variables = base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
     if frozen:
         variables = freeze(variables, lambda path: "layers_0" not in path)
@@ -169,15 +172,33 @@ def test_two_runs_subnormal_leaves_average_as_float64_rounds_them():
     assert running(*[np.full(3, tiny)] * 3).tolist() == [tiny] * 3
 
 
-def test_one_run_or_runs_of_other_models_do_not_average(tmp_path):
-    """An average is of two or more runs of one model: a single run is refused, as is a run whose model
-    record differs, adapter aside."""
-    run = trained(tmp_path / "run", 1, adapted=False)
-    with pytest.raises(ValueError):
-        averaged([run])
-    other = trained(tmp_path / "other", 1, adapted=False, mlp_features=32)
-    with pytest.raises(ValueError):
-        averaged([run, other])
+def test_one_run_does_not_average(tmp_path):
+    """An average is of two or more runs: a single run is refused."""
+    with pytest.raises(ValueError, match="two or more runs"):
+        averaged([trained(tmp_path / "run", 1, adapted=False)])
+
+
+def test_runs_trained_under_other_remat_and_dropout_average_and_other_computations_are_refused_by_name(
+        tmp_path):
+    """Two runs of one model, one recomputing its blocks (`remat`, which the memory plan picks for each
+    device and batch) and training under dropout, the other neither, average to float64's mean of their
+    weights rounded to fp32: their records differ in fields that say how the model runs or trains alone
+    (`dew._records.RUNS`), and the average's record is the first run's. A run that computes another model
+    of the same weights' shapes (another head count or norm) or another width is refused, the field that
+    differs named (`registry.computing_differences`). Main refused the first pair as another model."""
+    first = trained(tmp_path / "planned", 2, adapted=False, remat="minimal", dropout_rate=0.1)
+    second = trained(tmp_path / "plain", 1, adapted=False, key=1)
+    average = averaged([first, second])
+    read = (jax.tree.leaves(weights(run)) for run in (first, second))
+    for leaf, one, other in zip(jax.tree.leaves(average.variables), *read, strict=True):
+        halves = (np.asarray(one, np.float64) + np.asarray(other, np.float64)) / 2
+        assert np.array_equal(np.asarray(leaf), halves.astype(np.float32))
+    built = average.model.build()
+    assert built.dropout_rate == 0.1 and built.remat is not None
+    for name, value in (("num_heads", 4), ("norm_type", "layer"), ("mlp_features", 32)):
+        other = trained(tmp_path / name, 1, adapted=False, **{name: value})
+        with pytest.raises(ValueError, match=f"{name} {value!r} where it has"):
+            averaged([first, other])
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fn])

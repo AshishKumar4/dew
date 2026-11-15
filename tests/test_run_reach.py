@@ -328,6 +328,26 @@ def test_a_decision_run_that_ends_on_its_best_loads_at_its_calibrated_step(tmp_p
     assert [step for _, step, _ in averaged([runs / "ended"] * 2).runs] == [checkpoints.latest] * 2
 
 
+def test_a_run_resumes_under_another_remat_or_dropout_and_is_refused_another_computation_or_dtype(tmp_path):
+    """A saved run resumes with its model's remat or dropout changed, which say how it trains and not what
+    (`dew._records.RUNS`), as a resume on devices whose memory plan recomputes otherwise does; a field that
+    says what it computes (its head count) or the numbers it computes in (its dtype) is refused its
+    resume, by name (`RunConfig.check_resume`). Main refused the first as a change of the model."""
+    record = tmp_path / "record"
+    run = lm(tmp_path, drawn=False)
+    run.save(str(record))
+    saved = earlier_run(json.loads((record / "run.json").read_text()))
+
+    def under(**fields) -> RunConfig:
+        return dataclasses.replace(run, model=dataclasses.replace(run.model, fields={**run.model.fields,
+                                                                                     **fields}))
+
+    under(remat="full", dropout_rate=0.1).check_resume(saved)
+    for name, value in (("num_heads", 1), ("dtype", "bfloat16")):
+        with pytest.raises(ValueError, match=f"model.{name}"):
+            under(**{name: value}).check_resume(saved)
+
+
 def test_a_run_saved_with_its_attention_form_reads_as_the_precision_it_named(tmp_path):
     """A run.json saved while the trainer recorded `attention_form` reads back with that form as its
     precision policy's forms (`dew.config.earlier_run`, ledger 2500), so the run loads and resumes as it

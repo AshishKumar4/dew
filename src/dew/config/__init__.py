@@ -478,6 +478,22 @@ def takes_dtype(model: ModelConfig) -> bool:
     return isinstance(owner, type) and any(name == "dtype" for name, _, _ in member_fields(owner))
 
 
+def _model_changes(saved: ModelConfig, before: JSON, now: JSON) -> list[str]:
+    """What a resume of a run whose model record was `before` (`saved` read back) changes of what it trains
+    under `now`, by name: its class or wrappers (`model`), or a field that says what the model computes or
+    the numbers it computes in (`registry.computing_differences`, `NUMBERS` and `ROUNDS` kept), as
+    `model.<field>`. A field that says how it runs or trains alone (`dew._records.RUNS`: remat, dropout,
+    kernels), which the memory plan or the devices a resume lands on choose, changes freely."""
+    if not (isinstance(before, Mapping) and isinstance(now, Mapping)):
+        return [] if before == now else ["model"]
+    if {key: value for key, value in before.items() if key not in ("fields", "defaults")} != {
+            key: value for key, value in now.items() if key not in ("fields", "defaults")}:
+        return ["model"]
+    stated = [{**(record.get("defaults") or {}), **(record.get("fields") or {})} for record in (before, now)]
+    return [f"model.{name}" for name in registry.computing_differences(
+        saved.member, *stated, kept=(_records.NUMBERS, _records.ROUNDS))]
+
+
 def _learns_alike(before: ObjectiveConfig | None, now: ObjectiveConfig | None) -> bool:
     """Whether an objective `now` trains what `before` trained: one class, every argument the same but
     those its class lets a resume change (`dew.objectives.base.Objective.resumable`), a stated argument
@@ -964,8 +980,9 @@ class RunConfig:
         # states either (`earlier_checkpointed`), is the one this build resolves (`BUILT`).
         unresolved = {path for path in self.BUILT if "." not in path and before.get(path) is None}
         changed = sorted(name for name in now.keys() | before.keys()
-                         if name not in self.RESUMABLE and name not in unresolved
+                         if name not in self.RESUMABLE and name not in unresolved and name != "model"
                          and now.get(name) != before.get(name))
+        changed += _model_changes(recorded.model, before.get("model"), now.get("model"))
         if "objective" in changed and _learns_alike(recorded.objective, self.objective):
             changed.remove("objective")
         # A relaxed resume reads by this Dew's data plan where the saved run's is none it reads, its data

@@ -26,8 +26,11 @@ class Averaged:
     """The fp32 mean of runs' weights (`averaged`).
 
     `variables` is the tree their model applies with, its frozen leaves back in `params`; `model` the
-    runs' model record with any LoRA adapter merged away, which builds the model the mean applies to;
-    and `runs` each run's directory, step and whether its average (EMA) was read."""
+    first run's model record with any LoRA adapter merged away, which builds the model the mean applies
+    to: the runs' fields that say what it computes are one (`registry.computing_differences`), and the
+    ones that say how it runs or trains (`dew._records.RUNS`: remat, dropout, dtype, kernels), in which
+    runs on other devices differ, are the first run's; and `runs` each run's directory, step and whether
+    its average (EMA) was read."""
 
     variables: Variables
     model: ModelConfig
@@ -53,8 +56,10 @@ def averaged_pinned(runs: Sequence[SavedRun], *, ema: bool | None = None, mesh=N
     places it, as a run's loaders take them) in fp32 with its frozen leaves back in `params`, a LoRA
     run's factors merged into their kernels first (`Adapter.merge`), as the mean of two runs' factors
     is not the mean of the weights they make: a LoRA run, a partly frozen one and a whole fine-tune of
-    one base average. The runs are of one model: their model records, adapters aside, the same, and
-    their trees of the same leaves and shapes; any other run is refused (ValueError), naming it. Where
+    one base average. The runs are of one model: their model classes and wrappers, adapters aside, the
+    same, their fields that say what it computes the same (`registry.computing_differences`), whatever
+    remat, dropout or numerics each trained under, and their trees of the same leaves and shapes; any
+    other run is refused (ValueError), naming it and the fields it differs in. Where
     each run started is the caller's to know: runs drawn from other initial weights average to no
     model of either. The mean is elementwise, so each process takes it over the shards it holds, on
     the host in fp32 (`_taken`), one run's shards beside it at a time, a subnormal kept as float64's
@@ -70,10 +75,10 @@ def averaged_pinned(runs: Sequence[SavedRun], *, ema: bool | None = None, mesh=N
     structure, firsts, model, read = None, [], None, []
     for count, run in enumerate(runs, start=1):
         tree, base, entry = _effective_weights(run, ema, mesh, layout)
-        if model is not None and base != model:
-            raise ValueError(f"the run in {entry[0]} trains another model than {read[0][0]}'s, so their "
-                             "weights are not one model's to average")
-        model = base
+        if model is None:
+            model = base
+        else:
+            _refuse_another(model, base, entry[0], read[0][0])
         leaves, shape = jax.tree.flatten(tree)
         del tree
         if structure is None:
@@ -102,6 +107,22 @@ def averaged_pinned(runs: Sequence[SavedRun], *, ema: bool | None = None, mesh=N
     placed = [held if sharding is None else place_leaf(held, sharding)
               for held, sharding in zip(means, firsts, strict=True)]
     return Averaged(jax.tree.unflatten(structure, placed), model, tuple(read))
+
+
+def _refuse_another(model: ModelConfig, base: ModelConfig, directory: str, first: str) -> None:
+    """Refuse the run in `directory`, whose model record is `base`, where it is another model than the
+    first run's (`model`): another class or wrappers, or a field that says what it computes
+    (`registry.computing_differences`) otherwise, each named."""
+    from dew.registry import computing_differences
+
+    if (base.name, base.wrappers) != (model.name, model.wrappers):
+        differing = [f"its class {base.name}" if base.name != model.name else "its wrappers"]
+    else:
+        differing = [f"{name} {theirs!r} where it has {ours!r}" for name, (ours, theirs) in
+                     computing_differences(model.member, model.arguments, base.arguments).items()]
+    if differing:
+        raise ValueError(f"the run in {directory} trains another model than {first}'s, so their weights "
+                         f"are not one model's to average: {'; '.join(differing)}")
 
 
 def _taken_in(means: list, leaves: list, firsts: list, count: int, directory: str, first: str) -> None:
