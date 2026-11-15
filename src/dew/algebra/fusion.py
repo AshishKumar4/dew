@@ -21,11 +21,20 @@ A softmax attention, RMSNorm or SwiGLU is written as Dew's call where the e-grap
 it and a kernel of Dew's takes it (`recognize`), through the same splice (`_spliced`): attention first, so a
 product inside it is none of the products' regions, the norms after the products, so an epilogue's norm is
 the product's.
+
+A region's written program is Dew's call traced over the region's inputs' types (`_traced`): a program the
+step's own trace does not hold (the template's launch, Dew's attention or norm), which only a trace of that
+call makes. It is traced once a process for the region's identity (`Written.key`: its structure, the values
+of the constants its call reads, and which call writes it) under the state the trace reads
+(`_cache.traced_state`), and written into every later lowering of a program holding it: a step's
+relowerings, its planner's candidates and every layer of a stack share one trace, which reports its kernels'
+routes and launches where each program is written as it did when it traced.
 """
 
 from __future__ import annotations
 
 import collections
+import threading
 from collections.abc import Callable, Hashable, Sequence
 from typing import NamedTuple
 
@@ -43,8 +52,8 @@ CAPTURED = (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p)
 the epilogue captures the operand itself."""
 
 DECISIONS_HELD = 256
-"""How many regions' decisions are held (`_decided`), the least recently weighed dropped past them: a
-model's distinct projections, each shape once."""
+"""How many regions' decisions are held (`_decided`), and their written programs (`_traced`), the least
+recently weighed dropped past them: a model's distinct projections, each shape once."""
 
 
 class Region(NamedTuple):
@@ -68,15 +77,17 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     index = Index(jaxpr)
     attention = recognize.recognized(jaxpr, index, recognize.ATTENTION)
     held = {place for region in attention for place in region.places}
-    products = [region for region in _regions(index) if not held & set(region.places)
-                and _decided(jaxpr, region.places, region.inputs, region.outputs,
-                             lambda region=region: _takes(fused_gemm, jaxpr, region))]
+    identities = {region: _identity(jaxpr, region) for region in _regions(index)
+                  if not held & set(region.places)}
+    products = [region for region, identity in identities.items()
+                if _decided(identity, lambda region=region: _takes(fused_gemm, jaxpr, region))]
     held |= {place for region in products for place in region.places}
     written = attention + recognize.recognized(jaxpr, index, recognize.NORMS, frozenset(held))
     if not products and not written:
         return jaxpr
     written += [Written(region.places, region.inputs, region.outputs, region.at,
-                        _fusing(_replayed(jaxpr, region, fused_gemm), fused_gemm)) for region in products]
+                        _fusing(_replayed(jaxpr, region, fused_gemm), fused_gemm),
+                        ("product", identities[region])) for region in products]
     return _spliced(jaxpr, written)
 
 
@@ -117,13 +128,16 @@ class Index:
 
 class Written(NamedTuple):
     """A region's equations (their places) replaced by one nested program of `call` over its `inputs`, making
-    its `outputs`, written at place `at` (`_spliced`)."""
+    its `outputs`, written at place `at` (`_spliced`); `key` its identity, which its written program is held
+    by (`_traced`): every value `call`'s trace reads of the region, its structure and the values of the
+    constants it closes over, and which call it is."""
 
     places: tuple[int, ...]
     inputs: tuple[jcore.Var, ...]
     outputs: tuple[jcore.Var, ...]
     at: int
     call: Callable
+    key: Hashable
 
 
 class Form(NamedTuple):
@@ -284,16 +298,23 @@ def _shapes(variables: Sequence[jcore.Var]) -> list[jax.ShapeDtypeStruct]:
 _held: collections.OrderedDict[Hashable, bool] = collections.OrderedDict()
 
 
-def _decided(jaxpr: jcore.Jaxpr, places: Sequence[int], inputs: Sequence[jcore.Var],
-             outputs: Sequence[jcore.Var], decide: Callable[[], bool]) -> bool:
-    """A region's decision (`decide`), weighed once for its structure (`program.structure`'s, the algebra's
-    windows' key) in the context it is weighed in (`derive.context`: the mesh, the target, the numerics and
-    precision; and the kernel choices a call names), the latest `DECISIONS_HELD` held."""
-    from dew import _cache
-    from dew.algebra import derive, program
+def _identity(jaxpr: jcore.Jaxpr, region: Region) -> Hashable:
+    """A product region's structure (`program.structure`'s, the algebra's windows' key): all its call reads
+    of it (`_replayed` takes its constants as inputs, and its literals by their values)."""
+    from dew.algebra import program
 
-    window = jcore.Jaxpr([], list(inputs), list(outputs), [jaxpr.eqns[place] for place in places])
-    key = (program.structure(window), derive.context(), _cache.KERNEL_CHOICES.value)
+    return program.structure(jcore.Jaxpr([], list(region.inputs), list(region.outputs),
+                                         [jaxpr.eqns[place] for place in region.places]))
+
+
+def _decided(identity: Hashable, decide: Callable[[], bool]) -> bool:
+    """A region's decision (`decide`), weighed once for its structure (`_identity`) in the context it is
+    weighed in (`derive.context`: the mesh, the target, the numerics and precision; and the kernel choices a
+    call names), the latest `DECISIONS_HELD` held."""
+    from dew import _cache
+    from dew.algebra import derive
+
+    key = (identity, derive.context(), _cache.KERNEL_CHOICES.value)
     if key not in _held:
         # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
         with generation.routes(alone=True):
@@ -327,15 +348,56 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
             and found.fused_seconds < found.unfused_seconds)
 
 
+class _Trace(NamedTuple):
+    """A region's written program (`_traced`): its one equation, the inputs it reads them by, and the routes
+    and launches (each its op and keyed arguments, `tuning.Seen`'s) its trace reported, which each program
+    it is written into reports."""
+
+    equation: jcore.JaxprEqn
+    invars: tuple[jcore.Var, ...]
+    routes: tuple
+    launches: tuple
+
+
+_traces: collections.OrderedDict[Hashable, _Trace] = collections.OrderedDict()
+_TRACES_LOCK = threading.Lock()
+
+
+def _traced(region: Written) -> _Trace:
+    """`region`'s call traced as one nested program over its inputs' types (`nested`), once a process for
+    its identity (`Written.key`) under the state a trace reads (`_cache.traced_state`), the latest
+    `DECISIONS_HELD` held; its routes and launches reported where it is written, as its trace reported them
+    (`generation.reported`, `tuning.noted`)."""
+    from dew import _cache
+    from dew.nn.kernels import tuning
+
+    key = (region.key, _cache.traced_state())
+    with _TRACES_LOCK:
+        held = _traces.get(key)
+        if held is not None:
+            _traces.move_to_end(key)
+    if held is None:
+        with generation.routes(alone=True) as routes, tuning.seen() as seen:
+            traced = jax.make_jaxpr(nested(region.call))(*_shapes(region.inputs))
+        (equation,) = traced.jaxpr.eqns
+        held = _Trace(equation, tuple(traced.jaxpr.invars), tuple(routes), tuple(seen))
+        with _TRACES_LOCK:
+            _traces[key] = held
+            if len(_traces) > DECISIONS_HELD:
+                _traces.popitem(last=False)
+    generation.reported(held.routes)
+    tuning.noted(held.launches)
+    return held
+
+
 def _spliced(jaxpr: jcore.Jaxpr, regions: Sequence[Written]) -> jcore.Jaxpr:
-    """`jaxpr` with each of `regions`' equations replaced by one nested program of its call over its inputs,
-    its outputs the very values the region made, written at its place."""
+    """`jaxpr` with each of `regions`' equations replaced by one nested program of its call over its inputs
+    (`_traced`), its outputs the very values the region made, written at its place."""
     removed = {place for region in regions for place in region.places}
     written: dict[int, list[jcore.JaxprEqn]] = {}
     for region in regions:
-        traced = jax.make_jaxpr(nested(region.call))(*_shapes(region.inputs))
-        (equation,) = traced.jaxpr.eqns
-        renamed = dict(zip(traced.jaxpr.invars, region.inputs, strict=True))
+        equation, invars, *_ = _traced(region)
+        renamed = dict(zip(invars, region.inputs, strict=True))
         written.setdefault(region.at, []).append(equation.replace(
             invars=[renamed.get(var, var) if isinstance(var, jcore.Var) else var for var in equation.invars],
             outvars=list(region.outputs)))
