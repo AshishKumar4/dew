@@ -1636,22 +1636,24 @@ def test_a_training_launchs_backward_kernels_carry_its_launch():
 
 
 
-def _reverse_walk_certified(op=None) -> list:
-    """Qwen3.5-4B's gated delta net over its 12,288-token row lowered for a compile-only B200 as a training
-    step runs it (its gradient, certified as reverse mode runs it, `report.pulled`), through `op`'s
-    certification where given (`tuning.KernelOp._certified` of its derived tiles), else through the call's
-    route: the template's certifications it made and the configs it refused."""
+def _step_certified(target: str, rows: int, *, packed: bool, op=None) -> list:
+    """Qwen3.5-4B's gated delta net over `rows` rows of 12,288 tokens (`packed`: 17 documents a row) lowered
+    for a compile-only `target` as a training step runs it (its gradient, certified as reverse mode runs it,
+    `report.pulled`), through `op`'s certification where given (`tuning.KernelOp._certified` of its derived
+    tiles), else through the call's route: the template's certifications it made and the configs it
+    refused."""
     from dew.nn.kernels.generation import compile_only_gpus
 
     # Qwen3.5-4B's linear attention: 16 key heads and 32 value heads, each 128 wide.
     operands = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
-        ((1, 12288, 16, 128), jnp.bfloat16), ((1, 12288, 16, 128), jnp.bfloat16),
-        ((1, 12288, 32, 128), jnp.bfloat16), ((1, 12288, 32), jnp.float32), ((1, 12288, 32), jnp.bfloat16))]
-    options = {'max_segments': None, 'scale': None, 'delta': True, 'wide': False, 'bound': 1.0,
-               'rounded': True}
+        ((rows, 12288, 16, 128), jnp.bfloat16), ((rows, 12288, 16, 128), jnp.bfloat16),
+        ((rows, 12288, 32, 128), jnp.bfloat16), ((rows, 12288, 32), jnp.float32),
+        ((rows, 12288, 32), jnp.bfloat16))]
+    options = {'max_segments': 17 if packed else None, 'scale': None, 'delta': True, 'wide': False,
+               'bound': 1.0, 'rounded': True}
     before = {id(certified) for certified in report.certifications()}
-    with (report.refusals(), generation.assumed('sm100'), generation.chosen(gated_delta_rule='mosaic_gpu'),
-          report.certifying(compile_only_gpus('sm100')[0]), report.pulled()):
+    with (report.refusals(), generation.assumed(target), generation.chosen(gated_delta_rule='mosaic_gpu'),
+          report.certifying(compile_only_gpus(target)[0]), report.pulled()):
         if op is None:
             jax.jit(jax.grad(_route_loss(options), argnums=(0, 1, 2))).trace(*operands).lower(
                 lowering_platforms=('cuda',))
@@ -1663,18 +1665,45 @@ def _reverse_walk_certified(op=None) -> list:
             if id(each) not in before and each.op == type(op or template.MOSAIC).__name__], refused
 
 
-@lowers('sm100')
-def test_a_launch_whose_producer_must_rise_is_certified_at_its_ladders_top_in_one_compile():
-    """A training call whose reverse walk spills at setmaxnreg's least producer on a compile-only B200
-    (`_reverse_walk_certified`) is certified at its producer's top, its program's entry share (two
-    warpgroups, two programs a multiprocessor: 128), in one compile: every role holds the entry share and
-    no register moves. From the ladder's foot up, the walk's producer rose 24 to 80 over eight
-    certification compiles, 95 s of the 4B's cold start."""
-    from dew.nn.kernels.templates import resources
+def _reverse_walk_certified(op=None) -> list:
+    """The 4B training step over its one 12,288-token row on a compile-only B200 (`_step_certified`)."""
+    return _step_certified('sm100', 1, packed=False, op=op)
 
+
+def _certifications_of(certified: list, kernel: str) -> list:
+    """Those of `certified` that compiled `kernel`."""
+    return [each for each in certified if any(binary.kernel == kernel for _, binary in each.kernels.values())]
+
+
+class AtTheLeast(type(template.MOSAIC)):
+    """The template with every launch's first config at setmaxnreg's least producer, as it was before a
+    derivation asked its consumers' stated share first (`Mosaic._stated`): a ladder a cell walks."""
+
+    def _stated(self, ba, tiles, target):
+        return tiles
+
+
+@lowers('sm100')
+def test_a_reverse_walk_starts_in_one_certification_unspilled():
+    """The 4B training step on a compile-only B200 (`_reverse_walk_certified`) certifies its reverse walk
+    once, the kernel it keeps unspilled: the walk's first config gives its consumers what their statement
+    holds and its producer the rest (`Mosaic._stated`). At the least the producer spilled 40 bytes and the
+    walk took a second certification; from the ladder's foot up, eight, 95 s of the 4B's cold start."""
     certified, _ = _reverse_walk_certified()
-    raised = [each.config.producers.of('recurrence_reverse') for each in certified]
-    assert [cap for cap in raised if cap is not None] == [resources.entry_registers(2, 2)], raised
+    walked = _certifications_of(certified, 'recurrence_reverse')
+    assert len(walked) == 1 and not walked[0].refused, walked
+
+
+@lowers('sm90')
+def test_a_training_steps_output_walk_starts_in_one_certification_unspilled():
+    """The 4B training step over four packed rows on a compile-only H100 (`_step_certified`) certifies its
+    output walk once, the kernel it keeps unspilled. With its producer at the least, the walk's consumers,
+    raised to the whole pool, spilled its tile index around the scores' warpgroup MMAs where their
+    statement's share held, and its start took ten certifications in three rounds to the share it holds
+    (row 6743)."""
+    certified, _ = _step_certified('sm90', 4, packed=True)
+    walked = _certifications_of(certified, 'recurrence_output')
+    assert len(walked) == 1 and not walked[0].refused, walked
 
 
 @lowers('sm90')
@@ -1716,13 +1745,14 @@ served = collections.Counter()
 monitoring.register_event_listener(
     lambda event, **_: served.update([event.rsplit("/", 1)[-1]]) if "lowering_cache" in event else None)
 ready_process()
-certified, _ = gate._reverse_walk_certified()
+certified, _ = gate._reverse_walk_certified(gate.AtTheLeast())
 print(json.dumps({"served": dict(served), "kernels": [len(each.kernels) for each in certified],
                   "raised": [each.config.producers.of("recurrence_reverse") for each in certified]}))
 """
 """A process configured as a run's (`ready_process`: its compilation cache and its kernels' lowerings kept
-beside it) certifying the 4B reverse walk (`_reverse_walk_certified`): the lowering cache's hits and misses,
-each certification's kernels and its reverse walk's producer."""
+beside it) certifying the 4B reverse walk from its producer's least (`_reverse_walk_certified`,
+`AtTheLeast`), which spills there and takes its ladder's top: the lowering cache's hits and misses, each
+certification's kernels and its reverse walk's producer."""
 
 
 @lowers('sm100')
@@ -1809,7 +1839,7 @@ def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
     certification could not read (`report.certified`'s None)."""
     from dew.nn.kernels.templates import resources
 
-    class PastItsTop(type(template.MOSAIC)):
+    class PastItsTop(AtTheLeast):
         def rungs(self, ba, config):
             for cap in (232, 128):
                 yield template._limited(config, producers=resources.Producers((('recurrence_reverse', cap),)),

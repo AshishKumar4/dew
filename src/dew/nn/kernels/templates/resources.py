@@ -65,16 +65,20 @@ class Producers:
         """The registers `launch`'s producer lowers to, None at the least (`producer_floor`)."""
         return dict(self.raised_to).get(launch)
 
-    def stepped(self, tops: Mapping[str, int]) -> "Producers | None":
+    def stepped(self, tops: Mapping[str, int], stated: Mapping[str, int]) -> "Producers | None":
         """These, with each of `tops`' launches' producers at the next rung of its ladder, which runs from its
-        top down a setmaxnreg step at a time to a step above the least: an unraised producer to its top (its
-        program's entry share, where every role holds the same and no register moves: past it the roles'
+        top down a setmaxnreg step at a time to a step above the least: an unraised producer, or one at its
+        `stated` cap (its consumers' statement's, `stated_producer`, the first a derivation asks), to its top
+        (its program's entry share, where every role holds the same and no register moves: past it the roles'
         setmaxnreg moves invert, the producer's drop a rise, and the assembler rejects the kernel), a raised
-        one a step lower; None where one is a step above the least already, or its top is not above it."""
+        one a step lower, past its stated cap, asked already; None where one is a step above the least
+        already, or its top is not above it."""
         steps, held = facts().raises(), dict(self.raised_to)
         for launch, top in tops.items():
-            cap = held.get(launch)
-            lower = min(top, steps.highest) if cap is None else cap - steps.step
+            cap, start, first = held.get(launch), min(top, steps.highest), stated.get(launch)
+            lower = start if cap is None or cap == first != start else cap - steps.step
+            if lower == first != start:
+                lower -= steps.step
             if lower <= steps.lowest:
                 return None
             held[launch] = lower
@@ -684,6 +688,28 @@ class RegisterModel:
         """The model's numeric facts; its live family supplies rules, not serialized state."""
         return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
                 if field.name != "family"}
+
+
+def stated_producer(registers: int | None, warpgroups: int, consumers: int, programs: int = 1) -> int | None:
+    """The registers a producer lowers to where each of its program's `consumers` consumer warpgroups holds
+    its stated `registers` a thread (a program of `warpgroups` warpgroups, `programs` of it a multiprocessor):
+    the most of setmaxnreg's steps below the program's entry share that leaves the consumers that many
+    (`consumer_registers`), the rest of the pool the producer's; None where none above the least does, or the
+    registers are unstated. Raised to the whole pool beside the least, consumers are planned past their need,
+    where ptxas's own allocation spilled what their statement's share held: the 4B gated delta net's training
+    forward's output walk on an H100, stated at 176 of a two-warpgroup program held two to a multiprocessor,
+    spilled its tile index at 232 and 216 and held from 208 down to 176 (jsf-out4bcaps); and a producer at the
+    least spilled what the rest of the pool held: its reverse walk on a B200, stated at 149, spilled 40 bytes
+    at the least and none from 80 up (jsf-revcaps)."""
+    if registers is None:
+        return None
+    steps = facts().raises()
+    producer = min(entry_registers(warpgroups, programs), steps.highest)
+    while producer > steps.lowest:
+        if consumer_registers(consumers, programs, producer) >= registers:
+            return producer
+        producer -= steps.step
+    return None
 
 
 def moves_registers(registers: int | None, warpgroups: int, consumers: int, programs: int = 1) -> bool:
