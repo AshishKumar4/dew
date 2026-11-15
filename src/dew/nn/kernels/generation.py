@@ -12,6 +12,7 @@ generations.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import enum
 import functools
@@ -42,14 +43,99 @@ launch reads them within `dew.nn.kernels.tuning.reading` alone, and a call insid
 identity (`dew.training.identity`)."""
 
 
-def traced_fact[Reader: Callable[[], object]](reader: Reader) -> Reader:
-    """Declare `reader`, which takes no argument, as a fact a trace reads of the process or its host (the
-    memory a device holds, a wheel's presence), where it is defined: a program compiled under one answer
-    is another under the next (a route taken, a kernel refused), so a process handed programs another
-    kept is refused where any answer differs (`TRACED_FACTS`). A reader of such a fact left undeclared
-    lets a kept program run where this process would have traced another."""
-    TRACED_FACTS[f"{reader.__module__}.{reader.__qualname__}"] = reader
-    return reader
+_RECORDINGS: contextvars.ContextVar[tuple[dict[Hashable, tuple[Callable[[], Hashable], Hashable]], ...]] = (
+    contextvars.ContextVar("fact_recordings", default=()))
+"""The facts read within each open `recording`, innermost last: what a trace records into, no trace reads, so
+a trace held by its state (`dew._cache.traced_state`) is held in any recording's scope (`recording` registers
+it `dew._cache.untraced` as it first sets it; generation imports no JAX as it loads)."""
+
+
+def stated(value) -> Hashable:
+    """`value` as a fact's answer or question is held and compared: by its contents, equal wherever they
+    are however often its holder is built anew (a reader returning a fresh mapping): a hashable value by
+    itself, a mapping, sequence or set by its members, a dataclass by its type and fields; an array, which a
+    program reading it closes over, by itself (`_Same`), as an object that states none of these is."""
+    import jax
+
+    if isinstance(value, jax.Array):
+        return _Same(value)
+    if isinstance(value, Mapping):
+        return tuple(sorted(((key, stated(answer)) for key, answer in value.items()), key=repr))
+    if isinstance(value, list | tuple):
+        return tuple(stated(element) for element in value)
+    if isinstance(value, set | frozenset):
+        return frozenset(stated(member) for member in value)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return type(value), tuple(stated(getattr(value, field.name)) for field in dataclasses.fields(value))
+    return value if isinstance(value, Hashable) else _Same(value)
+
+
+class _Same:
+    """A value held by itself (`stated`): equal to its own holder alone, and kept alive while a key holds
+    it, so no other value takes its identity."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value) -> None:
+        self.value = value
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, _Same) and other.value is self.value
+
+
+@contextlib.contextmanager
+def recording() -> Iterator[dict[Hashable, tuple[Callable[[], Hashable], Hashable]]]:
+    """Each fact read within the block (`traced_fact`), by its reader and question, with the answer it got
+    (`stated`): what a trace kept for a later one read, which holds where each answers as it did (`still`).
+    Recordings nest; a read records into each open one."""
+    from dew import _cache
+
+    _cache.untraced(_RECORDINGS)
+    reads: dict[Hashable, tuple[Callable[[], Hashable], Hashable]] = {}
+    token = _RECORDINGS.set((*_RECORDINGS.get(), reads))
+    try:
+        yield reads
+    finally:
+        _RECORDINGS.reset(token)
+
+
+def still(reads: Mapping[Hashable, tuple[Callable[[], Hashable], Hashable]]) -> bool:
+    """Whether each fact of `reads` (a `recording`'s) answers now as it did when it was read."""
+    return all(asked() == answer for asked, answer in reads.values())
+
+
+def replay(reads: Mapping[Hashable, tuple[Callable[[], Hashable], Hashable]]) -> None:
+    """`reads`, a kept trace's (`recording`'s), recorded into each open recording, as if read again: a trace
+    taking a kept one read what it read."""
+    for recorded in _RECORDINGS.get():
+        recorded.update(reads)
+
+
+def traced_fact[**Question, Answer](reader: Callable[Question, Answer]) -> Callable[Question, Answer]:
+    """Declare `reader` a fact a trace reads of the process or its host (the memory a device holds, a wheel's
+    presence, a launch config a compile refused), where it is defined: a program compiled under one answer
+    is another under the next (a route taken, a kernel refused). Its reader is the fact's one accessor: a
+    read records its question and answer into each open `recording`, so a kept trace holds where each answer
+    it read holds (`still`). One taking no question is a fact of the process, by which a process handed
+    programs another kept is refused where any answer differs (`TRACED_FACTS`). A fact read but by its
+    reader is an input no recording holds, a stale trace's."""
+    name = f"{reader.__module__}.{reader.__qualname__}"
+
+    @functools.wraps(reader)
+    def read(*question: Question.args, **named: Question.kwargs) -> Answer:
+        answer = reader(*question, **named)
+        if recordings := _RECORDINGS.get():
+            held = stated((question, named))
+            for recorded in recordings:
+                recorded[name, held] = (lambda: stated(reader(*question, **named))), stated(answer)
+        return answer
+
+    if not inspect.signature(reader).parameters:
+        TRACED_FACTS[name] = read
+    return read
 
 
 @dataclasses.dataclass(frozen=True)

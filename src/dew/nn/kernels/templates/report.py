@@ -432,10 +432,17 @@ def derivation_inputs(op, arguments: tokamax.BoundArguments, target) -> Hashable
     whole target, whose facts price its schedules, and each config this context's compiles refused it
     (`refused`), so a refusal recorded after a derivation derives it again."""
     identity = _identity(op, arguments)
+    return identity, target, refusals_of(identity)
+
+
+@generation.traced_fact
+def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[str]]]:
+    """Each config this context's compiles refused the launch of `identity` (`_identity`), with the kernels
+    refused at it: what a launch's derivation and legality read of the refusals, the one way a trace reads
+    them (`traced_fact`), so a trace kept past a refusal of another launch holds."""
     with _GUARD:
-        refusals = frozenset((config, kernels) for (launch, config), kernels in _registry().refused.items()
-                             if launch == identity)
-    return identity, target, refusals
+        return frozenset((config, kernels) for (launch, config), kernels in _registry().refused.items()
+                         if launch == identity)
 
 
 def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
@@ -458,12 +465,7 @@ def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable) -> froze
     """The names of `op`'s kernels a compile of this process refused at `config` for `arguments`
     (`Binary.refused`: spilling, or their warpgroup MMAs serialized): a launch of several kernels (a
     recurrence's forward and backward walks) steps the one refused."""
-    registry = _registry()
-    if not registry.refused:
-        return frozenset()
-    identity = (_identity(op, arguments), config)
-    with _GUARD:
-        return registry.refused.get(identity, frozenset())
+    return dict(refusals_of(_identity(op, arguments))).get(config, frozenset())
 
 
 def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kernels) -> None:
@@ -707,7 +709,15 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
             out, pullback = jax.vjp(launch, *operands)
             return out, pullback(jax.tree.map(_unit_cotangent, out))
 
-        lowered = owned_program(pulled_back if reverse else launch).trace(*specs).lower()
+        def certified(*operands):
+            return (pulled_back if reverse else launch)(*operands)
+
+        # Named by its launch and config in JAX's trace, lowering and compile events, so a start's receipt
+        # tells each certification's program apart: its op, its launch's identity and its config, digested.
+        certified.__name__ = certified.__qualname__ = (
+            f"certified_{type(op).__name__}_l{_digest(_identity(op, arguments))}_c{_digest(repr(config))}"
+            f"{'_reverse' if reverse else ''}")
+        lowered = owned_program(certified).trace(*specs).lower()
     # A Mosaic GPU kernel compiled alone is the one its program loads (Mosaic compiles a module once a
     # process). A Pallas-Triton kernel compiles again with each executable, the same kernel the same binary:
     # read here too, its call's config its identity, so its derivation steps a spilling config at trace as a
