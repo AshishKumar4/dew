@@ -13,6 +13,7 @@ import typing
 import numpy as np
 import pytest
 from option_witness import alternatives, flag, held_at, replaced
+from process_support import logged_losses
 from run_kinds import KINDS, cli_settings, lm, saved_record, scalars, trained_by_cli, trained_record
 
 from dew import registry
@@ -126,6 +127,6 @@ def test_an_lm_run_trains_by_its_command_in_a_process_that_sees_two_devices(tmp_
                                               "trainer.mesh.fsdp": "2", "trainer.layout.min_shard": "8"})
     record = saved_record(lm(tmp_path, drawn=False, rows=rows), tmp_path, rows)
     run = trained_record(record, settings, devices=2)
-    losses = [values["train/loss"] for _, values in sorted(scalars(run).items()) if "train/loss" in values]
+    losses = logged_losses(run)
     assert len(losses) == 2 and np.isfinite(losses).all(), losses
 
