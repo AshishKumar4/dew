@@ -44,17 +44,33 @@ VOCAB, SEQ_LEN, BATCH = 96, 16, 8
 TINY_SHARD = 256
 
 
-def this_gpus(count: int = 1) -> tuple:
-    """`count` compile-only GPUs of this GPU's own target, its generation, its multiprocessors (an H100
-    PCIe's 114, not the canonical H100's 132) and the memory whose allocator's limit is its own, whose
-    programs this GPU's loader takes (`BuildTarget.held`)."""
-    from dew.nn.kernels.generation import compile_only_gpus
+def this_gpu() -> tuple[str, int | None, int]:
+    """This GPU's own target, whose programs its loader takes (`BuildTarget.held`): its generation, its
+    multiprocessors (an H100 PCIe's 114, not the canonical H100's 132) and the memory whose allocator's
+    limit is its own (`memory_limited_to`)."""
     from dew.training.ahead import BuildTarget
 
     own = BuildTarget.of(jax.devices()[:1])
     assert own.memory is not None
-    return compile_only_gpus(own.generation, count, memory_limited_to(own.memory),
-                             multiprocessors=own.multiprocessors)
+    return own.generation, own.multiprocessors, memory_limited_to(own.memory)
+
+
+def this_gpus(count: int = 1) -> tuple:
+    """`count` compile-only GPUs of this GPU's own target (`this_gpu`)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    generation, multiprocessors, memory = this_gpu()
+    return compile_only_gpus(generation, count, memory, multiprocessors=multiprocessors)
+
+
+def this_gpus_ahead(path) -> list[str]:
+    """A run's command-line flags compiling its step ahead into `path` for one GPU of this GPU's own target
+    (`this_gpu`), with no topology."""
+    generation, multiprocessors, memory = this_gpu()
+    return ["--trainer.compile-ahead.generation", generation,
+            "--trainer.compile-ahead.multiprocessors", str(multiprocessors),
+            "--trainer.compile-ahead.capacity-gib", str(memory / 2**30),
+            "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path)]
 
 
 def gpus(generation: str, count: int = 1, limit: int = 2**36) -> tuple:
@@ -1531,19 +1547,14 @@ def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_
     from run_kinds import decision
 
     from dew.decision.config import DecisionRunConfig
-    from dew.training.ahead import BuildTarget, CompiledAhead
+    from dew.training.ahead import CompiledAhead
 
     runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
     default = decision(tmp_path, drawn=False)
     stated = ["--trainer.checkpoint-dir", str(runs), *CLOCKED]
     # This GPU's own target, its multiprocessors as it counts them (an H100 PCIe's 114).
-    own = BuildTarget.of(jax.devices()[:1])
-    assert own.memory is not None
-    ahead = ["--trainer.compile-ahead.generation", own.generation,
-             "--trainer.compile-ahead.multiprocessors", str(own.multiprocessors),
-             "--trainer.compile-ahead.capacity-gib", str(memory_limited_to(own.memory) / 2**30),
-             "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path)]
-    compiling = DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *ahead], default=default)
+    compiling = DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *this_gpus_ahead(path)],
+                                      default=default)
     with pytest.raises(CompiledAhead):
         compiling.run()
     handed = DecisionRunConfig.cli(["--trainer.name", "handed", *stated, "--trainer.ahead", str(path)],
@@ -1564,7 +1575,7 @@ def a_run_handed_an_untuned_file_by_its_command_compiles_its_own(tmp_path, monke
 
     from dew._devices import xla_flag
     from dew.decision.config import DecisionRunConfig
-    from dew.training.ahead import UNTUNED, BuildTarget, CompiledAhead
+    from dew.training.ahead import UNTUNED, CompiledAhead
 
     runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
     default = decision(tmp_path, drawn=False)
@@ -1575,14 +1586,9 @@ def a_run_handed_an_untuned_file_by_its_command_compiles_its_own(tmp_path, monke
     monkeypatch.setenv("XLA_FLAGS", flags)
     assert xla_flag("xla_gpu_autotune_level") is None
     # This GPU's own target, so the file differs from what the run compiles by its tuning alone.
-    own = BuildTarget.of(jax.devices()[:1])
-    assert own.memory is not None
-    ahead = ["--trainer.compile-ahead.generation", own.generation,
-             "--trainer.compile-ahead.multiprocessors", str(own.multiprocessors),
-             "--trainer.compile-ahead.capacity-gib", str(memory_limited_to(own.memory) / 2**30),
-             "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path)]
     with pytest.raises(CompiledAhead) as compiled:
-        DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *ahead], default=default).run()
+        DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *this_gpus_ahead(path)],
+                              default=default).run()
     assert not compiled.value.ahead.tuned
     handed = DecisionRunConfig.cli(["--trainer.name", "handed", *stated, "--trainer.ahead", str(path)],
                                    default=default)
