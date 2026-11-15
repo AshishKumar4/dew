@@ -5,6 +5,7 @@ here, and runs on one in the GPU gate."""
 
 import dataclasses
 import functools
+import json
 
 import jax
 import jax.numpy as jnp
@@ -17,7 +18,7 @@ from jax.sharding import Mesh
 from kernel_compile import gate_generations
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import across, handoffs, mosaic, rings, stores, swizzling
+from dew.nn.kernels.templates import across, handoffs, mosaic, outputs, rings, stores, swizzling
 
 pytestmark = pytest.mark.kernel
 
@@ -785,7 +786,10 @@ def _persisted_products(x, w, *, family, interpret, rows: int | None = None, res
 
         family.scoped(scope, streams=family.streams(blocks, 2, 1))
 
-    out = jax.ShapeDtypeStruct((PERSISTED_TILES * rows, columns), jnp.float32)
+    # Its outputs as its operands' axes where its rows are `x`'s (`outputs.Output`), padded past them a shape.
+    out = (outputs.output(jnp.float32, outputs.axis(x, 0), outputs.axis(w, 1))
+           if x.shape[0] == PERSISTED_TILES * rows else
+           jax.ShapeDtypeStruct((PERSISTED_TILES * rows, columns), jnp.float32))
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
                          interpret=interpret, name="persisted", resident=resident)(x, w)
 
@@ -797,6 +801,25 @@ def _persisted_operands(rows: int):
     x = jax.random.randint(keys[0], (PERSISTED_TILES * rows, depth), -4, 4).astype(jnp.bfloat16)
     w = jax.random.randint(keys[1], (depth, 128), -4, 4).astype(jnp.bfloat16)
     return x, w
+
+
+def test_a_kernels_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
+    """A kernel whose output its operands' axes state (`outputs.output`: `x`'s rows by `w`'s columns),
+    lowered for a B200 on any host: its shape is theirs, and its call states the dimensions each output
+    descends from (`outputs.OUTPUT_DIMS`, its operands by their place), which a compile's live buffers read;
+    the TPU core's, interpreted, takes the same statement as its shape."""
+    from dew.nn.kernels.lowered import kernel_calls
+    from dew.nn.kernels.templates import mosaic_sm100
+
+    family = mosaic_sm100.RINGS
+    x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(family.rows))
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(functools.partial(_persisted_products, family=family, interpret=False)).trace(
+            x, w).lower(lowering_platforms=("cuda",))
+    assert lowered.out_info.shape == (x.shape[0], w.shape[1])
+    (call,) = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]
+    assert json.loads(call.output_dims) == [[[[0, 0]], [[1, 1]]]]
 
 
 @INTERPRETS

@@ -46,6 +46,7 @@ from dew.nn.kernels.templates import (
     bodies,
     emission,
     handoffs,
+    outputs,
     persistent,
     product,
     report,
@@ -98,7 +99,7 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
     its L2 `prefetched` views issued before its wait (`dependent`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
     launched = bodies.dependent(entry, interpret, prefetched=prefetched)
-    built = launches.kernel(launched, name=name or family, out_type=out_type, grid=grid,
+    built = launches.kernel(launched, name=name or family, out_type=outputs.structs(out_type), grid=grid,
                             grid_names=grid_names, num_threads=warpgroups, thread_name="wg",
                             scratch_types=scratch,
                             compiler_params=compiler_params(approx_math=approx_math, resident=resident,
@@ -107,7 +108,7 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
                             kernel_name=report.named(name, model=model),
                             cost_estimate=emission.built_with(cost), **clustered)
     return checked(emission.costed(built, cost), name or family, resident, model_flops,
-                   moves=model is None or model.moves)
+                   moves=model is None or model.moves, out_type=out_type)
 
 
 def _is_ref(operand) -> bool:
@@ -116,17 +117,22 @@ def _is_ref(operand) -> bool:
 
 
 def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | None = None, *,
-            moves: bool = True) -> Callable:
+            moves: bool = True, out_type=None) -> Callable:
     """The launch `built` (`launches.kernel`, which holds each call per shard), each call traced at its
     residency (`bodies.RESIDENT`) and moving its roles' registers where it `moves` them (`bodies.MOVES`,
     `resources.RegisterModel.moves`) under the name `kernel`: a launch built once for every call of its facts
     checks each call's own; and refused at its trace where two of the refs it adds into in place share a shape
     and a dtype, which `stacked_zeros` makes one ref (row 3180). Its call declares `model_flops`, the model's
     share of the work its cost states (the rest its own recomputation), where given, as its custom call's
-    frontend attribute (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads."""
-    stated = {} if model_flops is None else {MODEL_FLOPS: str(model_flops)}
+    frontend attribute (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads; and, where its
+    `out_type` states its outputs as its operands' axes (`outputs.Output`), the dimensions each descends from
+    (`outputs.OUTPUT_DIMS`), which a compile's live buffers read."""
+    declared = {} if model_flops is None else {MODEL_FLOPS: str(model_flops)}
+    dimensioned = outputs.dimensioned(out_type)
 
     def launch(*operands):
+        stated = {**declared, **({outputs.OUTPUT_DIMS: outputs.stated(out_type, operands)} if dimensioned
+                                 else {})}
         if stated:
             with set_xla_metadata(**stated):
                 return checked_launch(*operands)

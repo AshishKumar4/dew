@@ -27,6 +27,7 @@ from dew.nn.kernels.templates import (
     emission,
     handoffs,
     mosaic,
+    outputs,
     persistent,
     report,
     resources,
@@ -576,7 +577,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         _one(consumers, clustered=cluster > 1)
         built = launches.kernel(bodies.dependent(entry, interpret, prefetched=prefetched),
                                 name=name or self.name,
-                                out_type=out_type, grid=grid, grid_names=grid_names,
+                                out_type=outputs.structs(out_type), grid=grid, grid_names=grid_names,
                                 compiler_params=plgpu.CompilerParams(approx_math=approx_math,
                                                                      min_blocks_per_sm=resident,
                                                                      metadata=report.launch_metadata()),
@@ -586,7 +587,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                                                  else resources.register_model(self, consumers, registers,
                                                                                shared=shared))),
                                 cost_estimate=emission.built_with(cost))
-        return mosaic.checked(emission.costed(built, cost), name or self.name, resident, model_flops)
+        return mosaic.checked(emission.costed(built, cost), name or self.name, resident, model_flops,
+                              out_type=out_type)
 
     def program_scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)

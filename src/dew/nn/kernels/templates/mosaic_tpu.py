@@ -21,7 +21,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import emission, handoffs, mosaic, persistent
+from dew.nn.kernels.templates import emission, handoffs, mosaic, outputs as stated_outputs, persistent
 from dew.nn.kernels.templates.cost import Stated
 
 STAGES = 2
@@ -259,7 +259,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             places = [at for at, operand in enumerate(operands)
                       if isinstance(jax.typeof(operand), state_types.AbstractRef)]
             values = [operand[...] if at in places else operand for at, operand in enumerate(operands)]
-            outputs, structure = jax.tree.flatten(out_type)
+            outputs, structure = jax.tree.flatten(stated_outputs.structs(out_type))
             aliased = [jax.ShapeDtypeStruct(values[at].shape, values[at].dtype) for at in places]
 
             def program(*refs):
