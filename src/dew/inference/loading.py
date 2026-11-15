@@ -158,8 +158,8 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
     again."""
     from dew.inference.tasks import SavedRun
 
-    return _from_saved(SavedRun.pinned(str(root), step, trust), mesh=mesh, layout=layout, dtype=dtype,
-                       param_dtype=param_dtype, ema=ema)
+    return _from_saved(SavedRun.pinned(str(root), step, trust, mesh=mesh, layout=layout), mesh=mesh,
+                       layout=layout, dtype=dtype, param_dtype=param_dtype, ema=ema)
 
 
 def _from_saved(run: SavedRun, *, mesh: MeshSpec | Mesh | None, layout: Layout | None, dtype: str | None,
