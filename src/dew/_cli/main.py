@@ -236,8 +236,9 @@ class Train:
 @dataclasses.dataclass(frozen=True)
 class Profile:
     """Profile a run: train it afresh for `warmup` steps and a window of `steps` more, traced, with no
-    checkpoint or validation, and print where the window's steps spent their time (`RunConfig.profile`),
-    its report also in `report.json` beside XProf's own reports."""
+    checkpoint or validation, and print where the window's steps spent their time, its report also in
+    `report.json` beside XProf's own reports: the window is the run's `TrainerConfig.profile` field, which
+    this command sets, and `RunConfig.profile` the method that trains it."""
 
     run: Positional[str]
     """A Python file whose `run` is a run config or a function returning one, or a `run.json`."""

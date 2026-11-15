@@ -28,7 +28,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
@@ -70,7 +69,7 @@ from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.options import Compiling, attempting, owned_program
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches, placing
+from dew.nn.sharding import Link, Schedule, boxed, tracing
 from dew.objectives.base import (
     Aux,
     Initializer,
@@ -944,18 +943,13 @@ class Trainer(Generic[Loss, Effects]):
     @contextlib.contextmanager
     def _traced_on(self, mesh: Mesh | AbstractMesh,
                    links: Mapping[str, Link] | None = None) -> Iterator[Schedule]:
-        """What a traced step reads from context: the mesh, the pipeline's
-        microbatch count, the layout's rules, which place the activations
-        the model constrains (`dew.nn.sharding.constrain`) as they place the
-        parameters, the links of the axes the step measured, none by
-        default, and the layout itself with the axes the modules declared
-        (`placing`, `_declared`), where a projection mapped per shard reads
-        its weight's placement (`Layout.leaf_spec`). An abstract mesh is a
-        GPU's this process lacks (`_candidates.lowered_for`)."""
+        """What a traced step reads from context: the mesh, and what every program of the run traces under
+        (`dew.nn.sharding.tracing`) with the axes the modules declared (`_declared`) and the links of the
+        axes the step measured, none by default. An abstract mesh is a GPU's this process lacks
+        (`_candidates.lowered_for`)."""
         on = jax.sharding.use_abstract_mesh(mesh) if isinstance(mesh, AbstractMesh) else jax.set_mesh(mesh)
-        with (on, pipeline_microbatches(self.microbatches) as schedule, self._declared(),
-              nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links),
-              placing(self.layout)):
+        with on, tracing(self.layout, self.layout.axis_rules, self.microbatches,
+                         {} if links is None else links, self._declared()) as schedule:
             yield schedule
 
     def _step_body(self, shapes, copies, split: int, resting: Mapping[str, object] | None = None,

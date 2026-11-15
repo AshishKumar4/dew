@@ -622,11 +622,11 @@ def rewrite_record(made) -> dict[str, JSON]:
 
 
 def spill_record(miss: report.Miss) -> dict[str, JSON]:
-    """A kernel a compile found spilling, or a launch whose program's block XLA refused (`report.Miss`), its
+    """A kernel a compile refused, or a launch whose program's block XLA refused (`report.Miss`): every
+    field the miss holds, read from its declaration so a field it gains is saved with the plan too, its
     launch's config by its text."""
-    return {"kernel": miss.kernel, "op": miss.op,
-            "config": None if miss.config is None else repr(miss.config), "registers": miss.registers,
-            "frame": miss.frame, "shared": miss.shared, "stepped": miss.stepped}
+    record = {field.name: getattr(miss, field.name) for field in dataclasses.fields(miss)}
+    return {**record, "config": None if miss.config is None else repr(miss.config)}
 
 
 class Lower(Protocol):

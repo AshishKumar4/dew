@@ -34,7 +34,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew._records import JSON, NUMBERS, ROUNDS, RUNS
+from dew._records import JSON, NUMBERS, ROUNDS, RUNS, TRAINS
 from dew.batch import (
     COORDINATES_FIELD,
     Coordinates,
@@ -441,7 +441,7 @@ class CausalTransformer(LinearProducts):
     swiglu_limit: float | None = None  # GLM-5.3-Flash's clamp before every gated MLP's activation
     activation_sparsity_pattern: tuple[float, ...] | None = None
     """Gemma 3n's gaussian top-k activation sparsity, one fraction per layer."""
-    mask_token_id: int | None = dataclasses.field(default=None, metadata={RUNS: True})
+    mask_token_id: int | None = dataclasses.field(default=None, metadata={RUNS: True, TRAINS: True})
     """The vocabulary id that a masked-diffusion objective corrupts tokens to.
     None means plain training."""
     shifted_logits: bool = False
