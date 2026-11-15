@@ -372,6 +372,25 @@ def test_a_run_refused_before_its_start_is_taken_exits_without_waiting_for_its_c
     assert run.returncode == 3, run.stderr[-3000:]
 
 
+def test_a_program_whose_compile_was_begun_passes_once_where_it_compiles_over_the_same():
+    """A program whose first compile was begun in a thread of its own (`options.compiling`) and which then
+    compiles within `attempting` that compile over the same abstract inputs takes the begun lowering: its
+    algebra pass runs once (`report.passes`), not again only to match the begun compile (a DiT start's
+    1.66 s of 11.5 s of passes, simple-dit-b). Over other shapes it lowers, passes and compiles its own."""
+    from dew.nn.kernels.options import attempting, compiling, owned_program
+    from dew.nn.kernels.templates import report
+
+    program = owned_program(lambda x: x * 2)
+    with report.recording() as begun_passes:
+        begun = compiling(program, jnp.ones(4))
+    with attempting(begun):
+        with report.recording() as same:
+            program.compiled(jnp.ones(4))
+        with report.recording() as other:
+            assert program.compiled(jnp.ones(8)).out_info.shape == (8,)
+    assert len(begun_passes.passes) == 1 and not same.passes and len(other.passes) == 1
+
+
 def test_a_kept_program_that_is_not_its_calls_is_found_by_verifying(tmp_path):
     """`kept(path, verify=True)` lowers each handed call's own program and holds it to the kept one's
     digest: a file whose program for a call is another program (here its recorded digest changed) is
