@@ -137,6 +137,37 @@ def test_a_decision_claims_its_sources_fresh_blocks_only_over_the_sources_weight
     assert decision(variables=declared.init(jax.random.key(0))).fresh_modules() == ()
 
 
+@pytest.mark.parametrize("named", [(), (FRESH, BASE)], ids=["no groups", "a fresh group"])
+def test_a_trainer_given_a_config_steps_its_objectives_fresh_modules_at_their_groups_rate(named):
+    """A `Trainer` built directly over a decision whose source drew a cross-attention block beside its
+    loaded backbone, given an `OptimConfig`, steps the block at its fresh group's rate and the backbone at
+    the config's, as a configured run does (`OptimConfig.claiming`): naming no groups, at the default fresh
+    group's `FRESH_LEARNING_RATE`; naming a group that claims the fresh modules, at that group's. The block
+    stepped at 1e-5 with the backbone, and a group naming the claim was refused before training (the
+    evening spec pass over training.md, its first finding), each on par with Adam stepping the parameter
+    alone at its rate (check 1)."""
+    from test_decision_context import LLAMA, SPECIALS
+
+    from dew.data.text import ByteTokenizer
+    from dew.decision.objective import DecisionObjective
+    from dew.interop import Pretrained
+    from dew.training import Trainer
+
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference").with_cross_attention(
+        CrossAttention((0,), 8), key=0, frozen=False)
+    decision = DecisionObjective(source, tokenizer=ByteTokenizer(), specials=SPECIALS)
+    trainer = Trainer(decision, OptimConfig(optimizer="adam", learning_rate=RATE, param_groups=named), key=0)
+    trainer.scheduled(4)
+    params = jax.eval_shape(lambda: decision.init(jax.random.key(0)))["params"]
+    labels = labelled(OptimConfig(param_groups=(FRESH, BASE)).with_fresh(
+        decision.fresh_modules()).param_groups, params)
+    fresh = next(path for path, label in labels.items() if label == "fresh" and crossing(path))
+    base = next(path for path, label in labels.items() if label == "base")
+    multiplier = MULTIPLIER if named else FRESH_LEARNING_RATE / RATE
+    for path, rate in ((fresh, RATE * multiplier), (base, RATE)):
+        assert_updates_as(trainer.optimizer, optax.adam(rate), params, [path], "/".join(path))
+
+
 def test_a_parameter_a_loaded_module_gains_starts_at_its_draw_and_trains_in_the_fresh_group():
     """A loaded decoder whose modules gain parameters of their own, an exit gate a loop gives it
     (`Pretrained.with_model`), starts each at its initializer's draw, the loaded weights as they were, and
