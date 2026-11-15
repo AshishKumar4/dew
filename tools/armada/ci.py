@@ -1897,6 +1897,11 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             inputs = None if opened is None else sorted({*ran["depends"], *opened})
             ran = {**ran, "depends": None if inputs is None or wrote_inputs(inputs, changed) else inputs}
         ran = {**ran, "depends": site_inputs(python, row_["name"], ran["depends"])}
+        # A check-1 site's judge reads its map tasks' inputs with its own (`site_inputs`); where those are not
+        # all known, its own reads alone are not what its site ran on, so it keeps none: unknown (review).
+        site = session.SITE.fullmatch(parsed_row(row_["name"])[2])
+        if ran["depends"] is None and site is not None and site["start"] is None:
+            read = None
         if row_["exitCode"] == 0 and name not in executed:
             continue
         green = row_["exitCode"] == 0 and ran["depends"] is not None
