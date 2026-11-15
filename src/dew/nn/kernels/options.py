@@ -760,9 +760,12 @@ def _signature(leaf) -> Hashable:
 def _abstract_signature(leaf) -> Hashable:
     """What a lowering reads of an argument (`OuterProgram.abstract_of`): an array's or a shape's shape,
     dtype and weak type (its abstract value, a key array's among them) and its sharding, which a call over
-    arrays and one over their shapes (`shapes_of`) share; another value's type, shape and dtype."""
+    arrays and one over their shapes (`shapes_of`) share; another value's type, shape and dtype. An array
+    no one committed to its devices (a fresh `jax.random.key`) lowers as an unplaced shape does: jit places
+    it, so its sharding is none here, as an unplaced shape's is."""
     if isinstance(leaf, jax.Array):
-        return leaf.aval.shape, leaf.aval.dtype, leaf.aval.weak_type, leaf.sharding
+        placed = leaf.sharding if leaf.committed else None
+        return leaf.aval.shape, leaf.aval.dtype, leaf.aval.weak_type, placed
     if isinstance(leaf, jax.ShapeDtypeStruct):
         return leaf.shape, leaf.dtype, leaf.weak_type, leaf.sharding
     return type(leaf), np.shape(leaf), np.result_type(leaf)
