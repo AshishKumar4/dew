@@ -1,10 +1,12 @@
 """reach.py BASE --target SECONDS --timings FILE: the test rows this checkout's change from BASE reaches,
 each Python's, as the test cache's own keys read it (`reached`), JSON on stdout: {"base", "policy",
-"changed", "<python>": {"files", "module", "unknown"}}. The plan (ci.py's `plan`) gives each Python's rows,
-those its cache keeps and their last runs' inputs; a change that leaves the cache cold or off reaches every
-row (Main, 2026-11-15: the tests a diff reaches, as the trains' own planner states them, for run_tests)."""
+"changed", "<python>": {"files", "module", "unknown"}}. The plan (ci.py's `plan`) gives each Python's rows
+and those its cache keeps; each other row's last run's inputs are its last record's (`last_inputs`); a
+change that leaves the cache cold or off reaches every row (Main, 2026-11-15: the tests a diff reaches, as
+the trains' own planner states them, for run_tests)."""
 
 import argparse
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -16,8 +18,27 @@ from pathlib import Path
 import ci
 
 
+def last_inputs(python: str, rows: list[tuple[str, str]]) -> dict[tuple[str, str], list[str] | None]:
+    """Each row's last run's inputs (its last record's `read`, else its key's `depends`, the first class's
+    found), whatever shared inputs it ran on, so a change to those reads no less (review: rows read only on
+    the head's own shared inputs left a change to them reaching nothing); [] where its record holds none;
+    None where no record was read (no read token, none there, the Worker unread), which runs."""
+    token, held = os.environ.get(ci.READ_TOKEN), ci.pinned_classes() or [ci.cpu_class()]
+    if not token or "DEW_XLA_CACHE_URL" not in os.environ:
+        return dict.fromkeys(rows)
+
+    def one(each_row: tuple[str, str]) -> list[str] | None:
+        for each in held:
+            found = ci.records.recorded(ci.records.record_key(python, ci.row(python, *each_row), each), token)
+            if found is not None:
+                return found.get("read") or found.get("depends") or []
+        return None
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        return dict(zip(rows, pool.map(one, rows), strict=True))
+
+
 def reached(python: str, rows: list[tuple[str, str]], kept: Container[tuple[str, str]],
-            last: dict[tuple[str, str], list[str]], base: Path) -> dict:
+            last: dict[tuple[str, str], list[str] | None], base: Path) -> dict:
     """Which of a Python's `rows` (each a file and its group) the checkout's change from `base` (a checkout of
     it) reaches, as the cache's keys read it (`reach`): none it keeps (`kept`, green on exactly these inputs);
     one whose key over its last run's inputs (`last`, what `record` kept of its reads) differs between `base`
@@ -28,8 +49,9 @@ def reached(python: str, rows: list[tuple[str, str]], kept: Container[tuple[str,
     and `module`, those it moved through module-level units alone, which every
     importer of a module executes. A row the change leaves unread is no reach of it, whatever the cache's
     state for it. {"files", "module": the files of each tier, "unknown": the files reached only through a row
-    with no recorded inputs}."""
+    with no recorded inputs}. A row whose record was not read (`last_inputs`' None) is `files`'s: it runs."""
     rows = [each for each in rows if each not in kept]
+    unread = {name for name, group in rows if last.get((name, group)) is None}
     here = os.getcwd()
 
     def keyed() -> tuple[dict[tuple[str, str], str], Callable[[str], str]]:
@@ -58,11 +80,11 @@ def reached(python: str, rows: list[tuple[str, str]], kept: Container[tuple[str,
     finally:
         os.chdir(here)
         ci.digests.built_input.cache_clear()
-    top = f"{ci.followed.CODE}<module>"
-    deep = {each[0] for each, items in moved.items()
-            if not items or any(not item.endswith(top) for item in items)}
+    top = f"{ci.followed.CODE}{ci.followed.TOP}"
+    deep = unread | {each[0] for each, items in moved.items()
+                     if not items or any(not item.endswith(top) for item in items)}
     module = {each[0] for each in moved} - deep
-    unknown = {name for name, group in rows if not last.get((name, group))} - deep - module
+    unknown = {name for name, group in rows if last.get((name, group)) == []} - deep - module
     return {"files": sorted(deep), "module": sorted(module), "unknown": sorted(unknown)}
 
 
@@ -81,15 +103,18 @@ def main(arguments: list[str] | None = None) -> int:
     os.environ["DEW_TEST_CACHE"] = policy = ci.policy(base)
     planned: dict = {}
     ci.plan(options.target, timings, reach=planned)
-    with tempfile.TemporaryDirectory(prefix="reach-base-") as held:
+    # The base's checkout beside this one, on its disk: never /tmp, memory on a planner's machine (bible §8).
+    with tempfile.TemporaryDirectory(prefix="reach-base-", dir=Path.cwd().parent) as held:
         # The base's checkout, which each row's key is read against.
         subprocess.run(["git", "worktree", "add", "-q", "--detach", f"{held}/base", base], check=True,
                        capture_output=True)
         try:
             every = {python: {"files": sorted({name for name, _ in rows}), "module": [], "unknown": []}
-                     for python, (rows, _, _) in planned.items()}
-            found = {python: reached(python, rows, kept, last, Path(held, "base")) if kept is not None
-                     else every[python] for python, (rows, kept, last) in planned.items()}
+                     for python, (rows, _) in planned.items()}
+            found = {python: reached(python, rows, kept, last_inputs(python, [each for each in rows
+                                                                              if each not in kept]),
+                                     Path(held, "base")) if kept is not None
+                     else every[python] for python, (rows, kept) in planned.items()}
         finally:
             subprocess.run(["git", "worktree", "remove", "--force", f"{held}/base"], capture_output=True)
             ci.digests.built_input.cache_clear()
