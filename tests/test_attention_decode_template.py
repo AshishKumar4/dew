@@ -52,12 +52,12 @@ def _hooks(hook: str, heads: int, positions: int, sinks: jax.Array) -> template.
     return None
 
 
-def _drawn(positions: int, heads: int, kv_heads: int, dtype, width: int = 64):
+def _drawn(positions: int, heads: int, kv_heads: int, dtype, width: int = 64, value_width: int | None = None):
     def draw(seed: int):
         streams = jax.random.split(jax.random.key(seed), 4)
         query = jax.random.normal(streams[0], (len(LENGTHS), positions, heads, width), dtype)
-        key, value = (jax.random.normal(stream, (len(LENGTHS), KEYS, kv_heads, width), dtype)
-                      for stream in streams[1:3])
+        key, value = (jax.random.normal(stream, (len(LENGTHS), KEYS, kv_heads, wide), dtype)
+                      for stream, wide in zip(streams[1:3], (width, value_width or width), strict=True))
         sinks = jax.random.normal(streams[3], (heads,), jnp.float32)
         return query, key, value, sinks
 
@@ -99,6 +99,51 @@ def test_a_decode_step_through_the_template_is_on_par_interpreted(call, hook, dt
     assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(positions, heads, kv_heads, dtype),
                     f"template decode {device} {call} {hook} {jnp.dtype(dtype).name}", seeds=SEEDS)
 
+
+
+@INTERPRETS
+def test_an_absorbed_mla_decode_step_of_576_wide_keys_and_512_wide_values_is_on_par_interpreted():
+    """An absorbed MLA decode step (DeepSeek's: 16 query heads over one latent key head, its key the latent
+    512 and rotary 64, its value the latent 512; kernel-templates.md §A row 25) through the template as an
+    H100 runs it, its heads padded to whole groups of 64 columns past 256 (`attention.head_width`), under the
+    interpreter: on par with the reference path over the same keys (check 1)."""
+    positions, heads, kv_heads = 1, 16, 1
+    spans = _spans(positions)
+
+    def ours(query, key, value, sinks):
+        del sinks
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    def reference(query, key, value, sinks):
+        del sinks
+        return template.reference(query, key, value, spans)
+
+    draw = _drawn(positions, heads, kv_heads, jnp.bfloat16, 576, 512)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template decode absorbed MLA", seeds=SEEDS)
+
+
+@INTERPRETS
+def test_an_absorbed_mla_decode_step_whose_values_are_its_keys_leading_columns_is_on_par_interpreted():
+    """An absorbed MLA decode step whose values are its keys' leading 512 columns (`in_key`: the key tile
+    loaded once, the value tile a view of its columns, `MosaicForward.in_key`) through the template as an
+    H100 runs it, under the interpreter: on par with the reference path over the keys' columns sliced
+    (check 1)."""
+    positions, heads, kv_heads = 1, 16, 1
+    spans = _spans(positions)
+
+    def ours(query, key, value, sinks):
+        del value, sinks
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, key[..., :512], spans, interpret=True, in_key=True)
+
+    def reference(query, key, value, sinks):
+        del value, sinks
+        return template.reference(query, key, key[..., :512], spans)
+
+    draw = _drawn(positions, heads, kv_heads, jnp.bfloat16, 576)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template decode absorbed MLA in key",
+                    seeds=SEEDS)
 
 
 @INTERPRETS

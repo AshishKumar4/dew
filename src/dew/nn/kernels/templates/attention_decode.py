@@ -251,20 +251,22 @@ def planned(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
            scale: float | None = None, interpret: bool = False, table: jax.Array | None = None,
            sources: jax.Array | None = None, scales: tuple[jax.Array, jax.Array] | None = None,
-           bounds: jax.Array | None = None, finished: Literal[True] = True) -> jax.Array: ...
+           bounds: jax.Array | None = None, finished: Literal[True] = True, in_key: bool = False
+           ) -> jax.Array: ...
 
 
 @overload
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
            scale: float | None = None, interpret: bool = False, table: jax.Array | None = None,
            sources: jax.Array | None = None, scales: tuple[jax.Array, jax.Array] | None = None,
-           bounds: jax.Array | None = None, finished: Literal[False]) -> Initial: ...
+           bounds: jax.Array | None = None, finished: Literal[False], in_key: bool = False) -> Initial: ...
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
            scale: float | None = None, interpret: bool = False, table: jax.Array | None = None,
            sources: jax.Array | None = None, scales: tuple[jax.Array, jax.Array] | None = None,
-           bounds: jax.Array | None = None, finished: bool = True) -> jax.Array | Initial:
+           bounds: jax.Array | None = None, finished: bool = True, in_key: bool = False
+           ) -> jax.Array | Initial:
     """A decode step's attention through the template: `query` `[B, T, H, D]` over `key` `[B, K, KV, D]` and
     `value` `[B, K, KV, Dv]` (`[R, K, KV, D]` with `sources`, batch row `b` reading key row `sources[b]`;
     or a paged cache's pools `[KV, P, page, D]` and their page table, `table`: each
@@ -296,6 +298,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     if hooks.key_mod is not None and (table is not None or scales is not None):
         raise ValueError("a paged or quantized cache holds its keys under their prologue, taken as they were "
                          "cached: a call over its pages or codes takes no key prologue")
+    in_key = attention_mosaic.reads_in_key(in_key, hooks)
     query, key, hooks = prologues_taken(query, key, hooks)
     if not packable(hooks):
         raise NotImplementedError("the template's decode packs no query-placed hook, parameter, output "
@@ -307,7 +310,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     if work is None:
         raise NotImplementedError(f"the template's decode derives no config on {generation.gpu_target()}")
     launch = functools.partial(attention_mosaic.forward, scale=scale, natural=False, interpret=interpret,
-                               masked=True, table=table, sources=sources, subtracted=True, scales=scales)
+                               masked=True, table=table, sources=sources, subtracted=True, scales=scales,
+                               in_key=in_key)
 
     def walked(walk: str) -> jax.Array | Initial:
         # The step's walk (`WALKS`) at its own plan: scaled or unscaled as it names, else a cache call's own
