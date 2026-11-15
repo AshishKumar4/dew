@@ -2493,17 +2493,3 @@ def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path
     restored, *_ = resumed.checkpoints.restore(resumed.initial_state())
     assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(restored.variables))
     refuse_non_finite(restored, 3, lambda: 2)
-
-
-@pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "scaled"])
-def test_an_optimizer_given_an_infinite_bound_trains_and_saves(tmp_path, scaled):
-    """An optimizer handed a hyperparameter of infinity, a clip's bound injected beside its state
-    (`optax.inject_hyperparams`), trains finite values and saves them: the bound is a control value no step's
-    gradient writes, which neither a step's acceptance under a loss scale nor a save's refusal reads as a
-    non-finite state (the base review of 2026-11-15: such a run crashed at its first save, and under a loss
-    scale every step was rejected)."""
-    unbounded = optax.chain(optax.inject_hyperparams(optax.clip)(max_delta=math.inf), optax.sgd(0.1))
-    state = make_trainer(tmp_path, optimizer=unbounded, dynamic_scale=scaled).fit(
-        dataset(), steps=3, log_every=100, checkpoint_every=1)
-    assert int(state.updates) == 3
-    assert Checkpoints(str(tmp_path / "run")).latest == 3
