@@ -239,7 +239,6 @@ def test_a_hybrid_qwen_model_written_without_its_source_states_its_fields_and_re
                                       np.asarray(prediction_logits(model, variables, ids)))
 
 
-@pytest.mark.scenario("Hybrid and state-space models")
 def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
     """The loaded weights through the cache: a prefill and single-token steps on par with the parallel
     forward at each step's width from float64 over drawn rows (check 1, ledger 2739)."""

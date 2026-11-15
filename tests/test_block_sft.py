@@ -572,7 +572,6 @@ def test_an_image_sft_runs_own_path_takes_the_trainers_update(image_source):
     assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables)
 
 
-@pytest.mark.scenario("Diffusion language models")
 def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     """Native lifecycle evidence, not an official image-conditioned SFT oracle."""
     loaded, inputs, obj, variables, _ = image_source

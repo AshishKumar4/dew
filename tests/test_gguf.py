@@ -199,7 +199,6 @@ def test_tensors_are_the_ones_transformers_reads(tmp_path, architecture, qtype):
     assert config["tie_word_embeddings"] is True
 
 
-@pytest.mark.scenario("Quantized interchange")
 def test_load_pretrained_reads_the_file_and_its_tokenizer(tmp_path):
     """The whole load: logits against transformers over the same GGUF, and the
     tokenizer the file carries, since the directory ships none: Dew's logits as

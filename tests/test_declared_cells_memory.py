@@ -2,8 +2,7 @@
 the B200's and GH200's kernel-gradient cells sent the 4B's dW to XLA's dot, which XLA deferred to the
 backward's end, every layer's cotangents held, a four-row step's temporaries 22.25 GB against 11.06 GB on
 the template). Each generation's dense products in a stack of layers, forward and reverse, on a compile-only
-device: their temporaries under the declared cells against the template's named in their place, past what
-the cells' receipts state they hold (`grouped_matmul.HELD`)."""
+device: their temporaries under the declared cells no more than the template's named in their place."""
 import functools
 
 import jax
@@ -16,7 +15,7 @@ from dew.distributed.placement import Layout
 from dew.mesh import DEFAULT_RULES, MESH_AXES
 from dew.nn import activations
 from dew.nn.dense import Dense
-from dew.nn.kernels import gemm, generation, grouped_matmul
+from dew.nn.kernels import gemm, generation
 from dew.nn.sharding import placing
 
 LAYERS, ROWS, WIDTH = 4, 4096, 2048
@@ -43,15 +42,12 @@ def test_a_generations_declared_cells_hold_no_more_of_a_steps_memory_than_their_
         generation_name):
     """A stack of `LAYERS` dense bf16 products, `ROWS` x `WIDTH` by `WIDTH` x `WIDTH`, forward and reverse:
     its temporaries under its generation's declared cells (`grouped_matmul.DECLARED`) no larger than the
-    template's named in their place (`generation.chosen(grouped_matmul='mosaic')`) by more than its cells'
-    stated holds (`HELD`: outputs a layer each), past one output of slack."""
-    family = FAMILIES[generation_name]
-    held = sum(outputs for (cell_family, kind), (outputs, _) in grouped_matmul.HELD.items()
-               if cell_family == family and kind.dense and kind.matrix is None)
+    template's named in their place (`generation.chosen(grouped_matmul='mosaic')`), past one output of slack:
+    no layer's output held past its layer by a route the cells take."""
     output = ROWS * WIDTH * 2
     cells = _step_temp(generation_name, {})
     template = _step_temp(generation_name, {"grouped_matmul": "mosaic"})
-    assert cells <= template + (held * LAYERS + 1) * output, (cells, template, held)
+    assert cells <= template + output, (cells, template)
 
 
 GATED_ROWS, GATED_WIDTH, HIDDEN = 4096, 1024, 2048
