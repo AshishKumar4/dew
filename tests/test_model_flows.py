@@ -4,6 +4,7 @@ its reference arm the reference path alone, and its truth computes in float64; a
 truths (`reference_error.stored_truths`) judge as the truths a site computes itself, a missing or stale
 one refused."""
 
+import dataclasses
 import os
 import sys
 import tempfile
@@ -15,12 +16,12 @@ import jax.numpy as jnp
 import model_flows
 import numpy as np
 import pytest
+from map_judge import site_id
 from process_support import relayed
 from reference_error import MissingTruth, assert_as_exact, stored_truths
 
 from dew.nn.kernels import generation
-from dew.parity import GateFailure
-from dew.parity_stages import staged_units
+from dew.parity import FEWEST_SEEDS, GateFailure
 
 
 def _routes(program, *, reference: bool = False) -> list:
@@ -98,15 +99,17 @@ def store():
 @pytest.mark.parametrize("name", [flow.name for flow in model_flows.FLOWS])
 def test_a_flows_truth_computes_in_float64(name, store, monkeypatch):
     """The flow's truths prepared on a CPU as its node prepares them, its first draw's of each program held to
-    float64 (check 1's `_of_float64`), every draw its two stages may take written to the store."""
-    flow = model_flows.flow_named(name)
+    float64 (check 1's `_of_float64`), each site's first stage written to the store: here at the fewest
+    seeds check 1 takes (`parity.FEWEST_SEEDS`), where its node's prepare writes its declared count (a
+    params-sized gradient a draw, which at the sinks flows' 128 would write 9 GB a flow on this CPU)."""
+    fewest = dict.fromkeys(model_flows.KINDS, FEWEST_SEEDS)
+    flow = dataclasses.replace(model_flows.flow_named(name), seeds=fewest)
     monkeypatch.setenv(model_flows.TRUTHS, str(store))
     monkeypatch.setenv(model_flows.PREPARE, "1")
     for kind in model_flows.KINDS:
         model_flows.judge(flow, {}, kind)
     written = sorted((model_flows.store_of(flow) / "truths").iterdir())
-    assert len(written) == 2
-    assert all(len(list(site.glob("*.truth"))) == staged_units(flow.seeds) for site in written)
+    assert [len(list(site.glob("*.truth"))) for site in written] == list(fewest.values())
 
 
 @pytest.mark.parametrize("lane", [True, False], ids=["the lane's", "a user's"])
@@ -170,21 +173,22 @@ def _site(salt: int = 5461):
 
 
 def test_a_prepared_site_judges_as_one_that_computes_its_truth_and_refuses_a_missing_or_stale_one(tmp_path):
-    """A site prepared (`stored_truths(prepare=True)`) writes every draw's truth and runs no arm; judged from
-    that store it passes as it passes computing its own; a store of another stamp, or none, is a red
-    (`MissingTruth`), never a truth computed in its place."""
+    """A site prepared (`stored_truths(prepare=True)`, every stage's draws: a later job's, `later`) writes
+    every draw's truth and runs no arm; judged from that store it passes as it passes computing its own; a
+    store of another stamp, or none, is a red (`MissingTruth`), never a truth computed in its place."""
     dew, reference, draw = _site()
-    with stored_truths(tmp_path, prepare=True, stamp="a"):
+    later_sites = {site_id("a prepared product"), site_id("another product")}
+    with stored_truths(tmp_path, prepare=True, stamp="a", later=later_sites):
         assert_as_exact(None, reference, draw, "a prepared product", seeds=8)
         with pytest.raises(ValueError):
             assert_as_exact(None, reference, draw, "a prepared product", seeds=8)
     assert len(list(tmp_path.iterdir())) == 1
     assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
-    with stored_truths(tmp_path, prepare=False, stamp="a"):
+    with stored_truths(tmp_path, prepare=False, stamp="a", later=later_sites):
         assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
-    with stored_truths(tmp_path, prepare=False, stamp="b"), pytest.raises(MissingTruth):
+    with stored_truths(tmp_path, prepare=False, stamp="b", later=later_sites), pytest.raises(MissingTruth):
         assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
-    with stored_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
+    with stored_truths(tmp_path, prepare=False, stamp="a", later=later_sites), pytest.raises(MissingTruth):
         assert_as_exact(dew, reference, draw, "another product", seeds=8)
     # The same site over another seed stream: draws its prepare did not make.
     _, _, other = _site(5462)
@@ -210,12 +214,13 @@ def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
     def leaving_a_term(a, b):
         return cancelling(a, b).at[16].add(a[0, 0] * b[0, :])
 
-    with stored_truths(tmp_path, prepare=True, stamp="a"):
+    later_sites = {site_id("a cancelling product")}  # every stage's draws prepared
+    with stored_truths(tmp_path, prepare=True, stamp="a", later=later_sites):
         assert_as_exact(None, cancelling, draw, "a cancelling product", seeds=8)
     assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
     with pytest.raises(GateFailure) as computing:
         assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product", seeds=8)
-    with stored_truths(tmp_path, prepare=False, stamp="a"):
+    with stored_truths(tmp_path, prepare=False, stamp="a", later=later_sites):
         assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
         with pytest.raises(GateFailure) as stored:
             assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product", seeds=8)
