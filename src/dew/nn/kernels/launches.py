@@ -3,6 +3,7 @@ call held to the per-shard boundary (`dew.nn.sharding.per_shard`), so no route l
 operands an automatic mesh axis splits, where every device would run the whole batch (rows 1897, 1923,
 4077)."""
 
+import contextvars
 import functools
 from collections.abc import Callable
 
@@ -24,15 +25,28 @@ def kernel(entry: Callable, *, name: str, **params) -> Callable:
     return _held(plgpu.kernel(_traced(entry, params.get("interpret")), **params), name)
 
 
+_INTERPRETING: contextvars.ContextVar[bool | None] = contextvars.ContextVar("interpreting", default=None)
+"""Whether the launch whose body is tracing runs in Pallas's interpreter (`_traced`, every launch's body);
+None outside any launch's body."""
+
+
+def interpreting() -> bool | None:
+    """Whether the launch whose body is tracing runs in Pallas's interpreter (`pallas_call`, `kernel`): None
+    outside any launch's body."""
+    return _INTERPRETING.get()
+
+
 def _traced(body: Callable, interpret) -> Callable:
     """`body`, tracing within its launch, run in Pallas's interpreter where `interpret` is given
-    (`bodies.launched`): what its arithmetic reads of the launch (`bodies.subnormals`)."""
-    from dew.nn.kernels.templates import bodies  # a template module, which these launches carry
+    (`interpreting`)."""
 
     @functools.wraps(body)
     def traced(*refs, **options):
-        with bodies.launched(bool(interpret)):
+        token = _INTERPRETING.set(bool(interpret))
+        try:
             return body(*refs, **options)
+        finally:
+            _INTERPRETING.reset(token)
 
     return traced
 
