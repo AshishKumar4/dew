@@ -21,6 +21,9 @@ Ref = state_types.AbstractRef | state_types.TransformedRef
 
 
 CLUSTER = "cluster"
+CLUSTER_COLUMNS = "cluster_columns"
+"""A cluster's second axis, its programs' tiles side by side along the output's columns (`kernel`'s
+`cluster_columns`): they read their rows' blocks alike."""
 """The axis a launch's cluster of programs runs along (`Family.kernel`'s `cluster`)."""
 
 
@@ -334,18 +337,18 @@ def drained(barriers: Sequence, end, stages: int) -> None:
                 plgpu.barrier_wait(barrier.at[opaque(turn.slot)], phase=turn.rotation)
 
 
-def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, multicast: bool = False,
+def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, multicast: tuple[str, ...] = (),
          swizzle: int | None = None, copies: int = 1, released_by_products: bool = False) -> dict:
     """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype` (their rows staged
     at `swizzle`, `staged`), a load barrier each that a step's `copies` arrive at (`Pieces`), and a release
-    barrier each that `consumers` arrive at, with `multicast` the `consumers` of each program of the cluster
-    (`CLUSTER`), whose programs share the ring's blocks; or, `released_by_products`, that the products
-    reading a slot arrive at once by their commit (tensor-core ordered: tcgen05's). `Ring(**allocated)` once
-    scoped."""
+    barrier each that `consumers` arrive at, with `multicast` (cluster axes, `CLUSTER`, `CLUSTER_COLUMNS`)
+    the `consumers` of each program along those axes, whose programs share the ring's blocks; or,
+    `released_by_products`, that the products reading a slot arrive at once by their commit (tensor-core
+    ordered: tcgen05's). `Ring(**allocated)` once scoped."""
     if released_by_products:
         consumed = plgpu.Barrier(num_barriers=stages, orders_tensor_core=True)
     elif multicast:
-        consumed = plgpu.ClusterBarrier(collective_axes=(CLUSTER,), num_arrivals=consumers,
+        consumed = plgpu.ClusterBarrier(collective_axes=multicast, num_arrivals=consumers,
                                         num_barriers=stages)
     else:
         consumed = plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)

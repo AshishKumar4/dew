@@ -198,6 +198,7 @@ class Wgmma(WgmmaIssuer, mosaic.RingFamily):
     # derivation trying every count up to it takes where it holds.
     consumers = 3
     cluster = 2  # TMA multicast to a pair, CUTLASS's grouped GEMM's and cuBLASLt's on an H100
+    cluster_programs = 8  # Hopper's portable cluster: cuBLASLt's 2 x 4 on the 4B's up kernel gradient
 
 
 WGMMA = Wgmma()

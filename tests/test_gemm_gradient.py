@@ -8,7 +8,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS
+import test_gemm_template as template
+from generation_support import INTERPRETS, runs
+from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.templates import mosaic_sm90
@@ -115,3 +117,28 @@ def test_a_split_kernel_gradient_reads_each_groups_side_operand_at_its_own_group
     with generation.assumed("sm90"):
         for splits in (1, 2):
             np.testing.assert_array_equal(np.asarray(dew(splits)), expected, err_msg=f"at {splits} runs")
+
+
+@runs("sm90")
+@pytest.mark.parametrize("columns", [(1, 2), (2, 2)], ids=["1 x 2", "2 x 2"])
+@pytest.mark.parametrize("sizes", [None, (0, 70, 1, 129, 100, 0)], ids=["dense", "grouped"])
+def test_a_kernel_gradient_on_a_cluster_of_column_tiles_holds_check_1(sizes, columns):
+    """The kernel gradient on a Hopper cluster of programs along its output's columns too
+    (`Tiles.cluster_columns`), each its own column tile of the cluster's rows, the rows' blocks they read
+    alike loaded once between them as the row tiles' cotangent is (multicast, cuBLASLt's 2 x 4 cluster on the
+    4B's up dW), interpreted: on par with the plain kernel gradient from float64 truth (check 1), where a
+    cluster stacked its programs along the rows alone."""
+    rows, column_tiles = columns
+    tile = dataclasses.replace(template.COOPERATIVE, cluster=rows, cluster_columns=column_tiles)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed + 5)
+        return (jnp.asarray(rng.normal(size=(template.ROWS, 256)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(template.ROWS, 2 * template.WIDTH)), jnp.bfloat16))
+
+    def plain(x, dy, wide=jnp.float32):
+        return template._kernel_gradient(x.astype(wide), dy.astype(wide), sizes)
+
+    assert_as_exact(template.pinned_gradient(tile, sizes), jax.jit(plain), draw,
+                    f"a kernel gradient on a {rows} x {column_tiles} cluster",
+                    seeds=template.SEEDS, truth_fn=functools.partial(plain, wide=jnp.float64))
