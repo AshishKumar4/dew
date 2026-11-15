@@ -294,12 +294,14 @@ class Issuer:
 
     def _termwise(self, groups: dict[tuple[int, int], list], shape: tuple[int, int] | None, *,
                   retired: bool) -> Iterator[jax.Array]:
-        """The sums of `groups`' products of three parts, a group a form (its operands' parts, `_counted`):
-        each group's terms (`product.terms`, smallest first, as `Family.apart` sums one product's) a term at
-        a time, each term's products across the group into one accumulator, the group's value its terms added
-        in that order. Their operands are staged again for each term (none where they are tiles in memory, or
-        a value held in a list of buffer sets), so one accumulator is live where an accumulator a term held at
-        once spilled an fp32 solve 576 bytes a thread on an H100 (fast32d-sm90 at 83b47d66f6)."""
+        """Each term's sum of `groups`' products of three parts, a group a form (its operands' parts,
+        `_counted`): each group's terms (`product.terms`, smallest first, as `Family.apart` sums one
+        product's) a term at a time, each term's products across the group into one accumulator, which its
+        caller adds into its own sum as it comes. Their operands are staged again for each term (none where
+        they are tiles in memory, or a value held in a list of buffer sets), so one accumulator is live beside
+        the caller's where an accumulator a term held at once spilled an fp32 solve 576 bytes a thread on an
+        H100 (fast32d-sm90 at 83b47d66f6), and a group's terms summed apart before joining the caller's held a
+        third (MiniMax's lightning training query/key walk on an H100 spilled 200 bytes, jsf-lightning-fs)."""
         family = self.call.family
         for counts, entries in groups.items():
             if shape is None:
@@ -317,8 +319,8 @@ class Issuer:
                         family.settled(0)
                 return acc
 
-            yield functools.reduce(jnp.add, (family.summed(shape, functools.partial(term, i, j))
-                                             for i, j in product.terms(*counts)))
+            for i, j in product.terms(*counts):
+                yield family.summed(shape, functools.partial(term, i, j))
 
     def summed_together(self, groups: list) -> tuple[Callable[[], jax.Array], ...]:
         """Readers of `groups`' sums (each a list `summed` takes), none of which reads another's: issued
