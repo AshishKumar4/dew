@@ -31,8 +31,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - Derived resources: tiles, registers, residency and issued work. [5567]
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
 - Block-selected attention's other selections as mixers. [6301]
-- A Hopper kernel gradient's cluster along its output's columns. [6318]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm. [6030]
+- A Hopper kernel gradient's cluster along its output's columns. [6318]
 - Exact on every path, every edge and every derivative order. [2656]
 - The suite's wall. [5478]
 
