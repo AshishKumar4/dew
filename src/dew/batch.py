@@ -412,6 +412,17 @@ class Forks:
 
 
 @struct.dataclass
+class SegmentBound:
+    """The most documents a window of a read holds (`Coordinates.max_segments`), stated alone for a
+    consumer that lays its rows out itself (a decision read, `dew.decision.task.laid_out`): a node of no
+    leaves whose bound is its static data, a plain number, so a compiled step is specialized to it, a kept
+    program states it (`dew.training.ahead.plain_structure`), and no array a step carries (row 5953: a
+    decision batch's coordinates were built on the host, carried into the step and built again there)."""
+
+    max_segments: int | None = struct.field(pytree_node=False)
+
+
+@struct.dataclass
 class Coordinates:
     """Where each token of a batch sits, built once (`coordinates`) and read by every token mixer.
 
@@ -1168,6 +1179,7 @@ __all__ = [
     "Path",
     "PathFilter",
     "Phase",
+    "SegmentBound",
     "Variables",
     "coordinates",
     "dicts",

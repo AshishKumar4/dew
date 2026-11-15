@@ -18,6 +18,7 @@ directory, rung records and data cache of its own:
 - A program on this GPU is admitted against the room its pool left outside XLA's pool (test_communicators).
 - A program loaded from the compilation cache is admitted from its kept communicators (test_communicators).
 - A staged commit holds two layers of host-resident moments at once (test_staging).
+- A diffusion run at 256 pixels trains, saves, resumes and draws (test_diffusion_run_sources; row 295).
 - A convolution trained under quantized gradients and served quantized computes Qwix's own integer products,
   taken in float32 chunks on a GPU (test_quantization).
 """
@@ -28,6 +29,7 @@ import option_witness
 import pytest
 import test_communicators as communicators
 import test_compile_ahead as compile_ahead
+import test_diffusion_run_sources as diffusion_runs
 import test_plan as plan
 import test_quantization as quantization
 import test_run_option_matrix as run_option_matrix
@@ -82,6 +84,8 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
           for index, cell in enumerate(cells_of(repeats))),
         Cell("a conv model trains to the bit again after another run measured kernels into its cache",
              in_own(conv, "conv")),
+        Cell("a 256-pixel diffusion run trains, saves, resumes and draws",
+             in_own(diffusion_runs.a_256_pixel_diffusion_run_trains_saves_resumes_and_draws, "large-images")),
         Cell("an accumulating step updates the optimizer in its commit alone",
              in_own(transactions.an_accumulating_step_updates_the_optimizer_in_its_commit_alone, "commit")),
         Cell("an LM run measures its kernel launches as set",
