@@ -411,6 +411,19 @@ class Forks:
         return depth
 
 
+@dataclasses.dataclass(frozen=True)
+class SegmentBound:
+    """The most documents a window of a read holds (`Coordinates.max_segments`), stated alone for a
+    consumer that lays its rows out itself (a decision read, `dew.decision.task.laid_out`): static, so a
+    compiled step is specialized to it, and no array a step carries (row 5953: a decision batch's
+    coordinates were built on the host, carried into the step and built again there)."""
+
+    max_segments: int | None
+
+
+jax.tree_util.register_static(SegmentBound)
+
+
 @struct.dataclass
 class Coordinates:
     """Where each token of a batch sits, built once (`coordinates`) and read by every token mixer.
@@ -1168,6 +1181,7 @@ __all__ = [
     "Path",
     "PathFilter",
     "Phase",
+    "SegmentBound",
     "Variables",
     "coordinates",
     "dicts",

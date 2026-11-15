@@ -78,7 +78,7 @@ class Coordinated(grain.MapTransform):
     max_segments: int | None
 
     def map(self, element: Batch) -> Batch:
-        from dew.batch import coordinates
+        from dew.batch import SegmentBound, coordinates
 
         ids = self.fields[0]
         if f"{ids}_segment_ids" not in element:
@@ -90,6 +90,10 @@ class Coordinated(grain.MapTransform):
             raise ValueError(f"a packed {ids} window holds {held} documents, past the {self.max_segments} "
                              "its read declares (Coordinates.max_segments)")
         packing = {f"{field}_{part}" for field in self.fields for part in ("segment_ids", "positions")}
+        if f"{ids}_positions" not in element:
+            # A read whose consumer lays its rows out itself states the bound alone (`SegmentBound`).
+            return {**{name: value for name, value in element.items() if name not in packing},
+                    f"{ids}_bound": SegmentBound(self.max_segments)}
         laid = coordinates(segments=segments, positions=element[f"{ids}_positions"],
                            max_segments=self.max_segments, right_padded=True, xp=np)
         return {**{name: value for name, value in element.items() if name not in packing},

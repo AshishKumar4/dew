@@ -24,7 +24,7 @@ from PIL import Image
 from dew import _records
 from dew._files import write_atomically
 from dew._records import JSON, json_value, record
-from dew.batch import Batch, Coordinates, Variables
+from dew.batch import Batch, SegmentBound, Variables
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.mixing import CorpusCounts
@@ -1751,7 +1751,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
              attention: tuple[tuple[tuple[int, ...], ...], int] | None = None,
              fork_depth: int = 1, joint_forks: bool = False) -> DecisionInputs:
     """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
-    holding at most the rows its read declares (`tokens_coordinates`'s `max_segments`, the most a window
+    holding at most the rows its read declares (`tokens_bound`, `SegmentBound`: the most a window
     of the read holds, which it measured), else `max_segments` (the objective's bound), the questions'
     spans in each row's context where
     `spans_in_context` (`JointLayout.spans_in_context`), each row's block the whole row where
@@ -1766,8 +1766,8 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
 
     questions: dict[str, Any] = {field.name: array(field.name) if field.when == "always"
                                  else given(field.name) for field in QUESTION_FIELDS}
-    declared = batch.get("tokens_coordinates")
-    if isinstance(declared, Coordinates):
+    declared = batch.get("tokens_bound")
+    if isinstance(declared, SegmentBound):
         max_segments = declared.max_segments
     return DecisionInputs(tokens=array("tokens"), segments=array("segments"), **questions,
                           positions=array("positions"), slots=given("slots"),
