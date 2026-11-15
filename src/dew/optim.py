@@ -75,9 +75,11 @@ from dew.registry import Aliases, JsonDict, from_record, record_argument, schedu
 HEAD_AXES = frozenset({'heads', 'head_dim', 'kv'})
 
 # An expert dimension stacks whole matrices, one per expert, so it is a batch
-# axis. It names neither side, and optax orthogonalizes each expert on its
-# own (optax/contrib/_muon.py:56-74).
-BATCH_AXES = frozenset({'exp'})
+# axis, as a block-diagonal kernel's group dimension is ('groups', DeepSeek
+# V4's grouped output projection). Each names neither side, and optax
+# orthogonalizes each expert or group on its own (optax/contrib/_muon.py:56-74).
+# No rule shards 'groups', so a group stack stays whole on every device.
+BATCH_AXES = frozenset({'exp', 'groups'})
 
 # A parameter that maps into or out of a discrete index is a lookup, so AdamW
 # keeps the embeddings, the head and the router
@@ -234,7 +236,10 @@ def _placement(path: jax.tree_util.KeyPath, param,
             return _shifted(optax.contrib.MuonDimensionNumbers(*sides), stacked), "muon"
     if rank == 3 and param.shape[stacked + 1] == 1:
         return None, "adamw: a per-channel filter, [channels, 1, taps], a vector a channel"
-    if named is not None:
+    # A matrix whose declaration names one side (`('embed', None)`, a projection the rules shard on one
+    # side and leave whole on the other) is the matrix its rank makes it, as an undeclared one is: two
+    # dimensions are one contracted side and one output side whatever the declaration names.
+    if named is not None and rank > 2:
         raise ValueError(
             f"{jax.tree_util.keystr(path)} is declared {named}, which is not one contracted side and one "
             "output side, so Muon cannot tell what its matrix is. An axis that stacks matrices rather "

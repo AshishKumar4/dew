@@ -636,6 +636,20 @@ def test_an_expert_stack_is_orthogonalized_one_expert_at_a_time():
                           "an expert stack, one expert at a time")
 
 
+
+def scaled_stack_draw(scales: list[float], embed: int, mlp: int):
+    """A draw of a stack of `len(scales)` [embed, mlp] matrices and its gradient, one matrix at each of
+    `scales`: each normalized alone takes optax's update for that matrix alone, where normalizing the stack
+    as one would share a scale among them."""
+    scaled = np.asarray(scales, np.float32)[:, None, None]
+
+    def draw(seed):
+        grad = np.asarray(jax.random.normal(jax.random.key(seed), (embed, mlp)))
+        return (np.asarray(jax.random.normal(jax.random.key(seed + (1 << 20)), (len(scales), embed, mlp))),
+                scaled * grad)
+
+    return draw
+
 class ExpertByExpert(typing.NamedTuple):
     """`transform` stepping each matrix of an expert stack, its leading axis, alone: the reference of a
     stack Muon steps one expert at a time."""
@@ -659,15 +673,10 @@ def test_an_expert_stack_placed_over_the_mesh_is_orthogonalized_one_expert_at_a_
     step compiled there. The experts' gradients are one matrix at four
     scales, so each normalized alone takes optax's update for that matrix
     alone, where normalizing the stack as one would share a scale among them."""
-    experts, embed, mlp = 4, 8, 16
+    embed, mlp = 8, 16
     mesh = MeshSpec(**spec).build(jax.devices()[:4])
     placement = NamedSharding(mesh, P("expert", "fsdp" if "fsdp" in spec else None, None))
-    scales = np.asarray([1.0, 16.0, 0.25, 2.0], np.float32)[:, None, None]
-
-    def draw(seed):
-        grad = np.asarray(jax.random.normal(jax.random.key(seed), (embed, mlp)))
-        return (np.asarray(jax.random.normal(jax.random.key(seed + (1 << 20)), (experts, embed, mlp))),
-                scales * grad)
+    draw = scaled_stack_draw([1.0, 16.0, 0.25, 2.0], embed, mlp)
 
     solver = muon_solver()
 
@@ -702,6 +711,47 @@ def test_a_matrix_declared_with_no_axis_named_is_orthogonalized_as_one_matrix():
     path = ('params', 'layers_0', 'altup', 'prediction_coefs', 'kernel')
     assert_updates_as(muon_solver(), optax.contrib.muon(LR), params, [path], "an undeclared AltUp matrix")
 
+
+@pytest.mark.parametrize("declared", [("embed", None), (None, "embed")], ids=["output-whole", "input-whole"])
+def test_a_matrix_declared_on_one_side_is_orthogonalized_as_one_matrix(declared):
+    """A projection declared on one side alone, ('embed', None) or (None, 'embed'), a final projection or a
+    shared expert's gate whose rules shard one side and leave the other whole, is the matrix its two
+    dimensions make: Muon steps it as optax steps that undeclared matrix (row 6746: it was refused, so
+    a mixture of experts, Gemma 3n, the image transformers and JEPA could not train under Muon)."""
+    path = ('params', 'layers_0', 'proj', 'kernel')
+    drawn = {'params': {'layers_0': {'proj': {'kernel': nn.LogicallyPartitioned(jnp.zeros((16, 8)),
+                                                                                    declared)}}}}
+    with drawn_axes(drawn):
+        assert_updates_as(muon_solver(), optax.contrib.muon(LR), unboxed(drawn), [path],
+                          f"a matrix declared {declared}")
+
+
+def test_a_group_stack_is_orthogonalized_one_group_at_a_time():
+    """A block-diagonal kernel's groups, declared ('groups', 'embed', 'mlp'), are stacked matrices, as an
+    expert stack's are: Muon steps each group's [embed, mlp] alone, where reading the groups as part of
+    a side would orthogonalize one [groups * embed, mlp] matrix (row 6746, DeepSeek V4's grouped output
+    projection)."""
+    embed, mlp = 8, 16
+    path = ('params', 'layers_0', 'o_a_proj', 'kernel')
+    draw = scaled_stack_draw([1.0, 16.0, 0.25], embed, mlp)
+
+    solver = muon_solver()
+
+    def tree(value):
+        return {'params': {'layers_0': {'o_a_proj': {'kernel': value}}}}
+
+    def stepped(params, grads):
+        with boxed({path: ('groups', 'embed', 'mlp')}):
+            updates, _ = solver.update(tree(grads), solver.init(tree(params)), tree(params))
+        return np.asarray(node(updates, path))
+
+    alone = ExpertByExpert(optax.contrib.muon(LR))
+
+    def reference(params, grads):
+        return alone.update(grads, alone.init(params), params)[0]
+
+    assert_as_exact(as_given(stepped), reference, draw, "a group stack", seeds=UPDATE_SEEDS,
+                    truth_fn=reference)
 
 def test_the_router_gate_takes_the_adamw_update():
     """A router gate is declared ('embed', 'exp'): one column per expert, so

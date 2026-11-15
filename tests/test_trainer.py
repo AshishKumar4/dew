@@ -1395,9 +1395,9 @@ def test_the_best_step_is_the_lowest_loss(tmp_path):
 # Local checkpoints
 # --------------------------------------------------------------------------
 
-def local_trainer(tmp_path, **kwargs):
+def local_trainer(tmp_path, optimizer=None, **kwargs):
     return Trainer(
-        Regression(), optax.sgd(0.1), key=jax.random.key(0),
+        Regression(), optax.sgd(0.1) if optimizer is None else optimizer, key=jax.random.key(0),
         layout=Layout(min_shard=1, tolerance=1.0),
         checkpoints=Checkpoints(str(tmp_path / "run"), keep=4,
                                 local_directory=str(tmp_path / "local"), local_every=2),
@@ -2457,14 +2457,16 @@ def test_a_state_built_from_a_held_tree_steps_without_freeing_the_tree():
     assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(objective.variables))
 
 
-class PoisonedThird(Counting):
-    """`Counting`'s batches, the third's features not finite: its loss and gradient are."""
+def poisoned_third_update() -> optax.GradientTransformation:
+    """SGD at 0.1 whose third update is not finite though its gradient is, which a step therefore admits."""
+    def init(params):
+        return jnp.zeros((), jnp.int32)
 
-    def __next__(self):
-        batch = super().__next__()
-        if batch["index"][0] == 2:
-            batch = {**batch, "x": np.full_like(batch["x"], np.nan)}
-        return batch
+    def update(updates, count, params=None):
+        poisoned = jax.tree.map(lambda leaf: jnp.where(count == 2, jnp.nan, leaf), updates)
+        return poisoned, count + 1
+
+    return optax.chain(optax.sgd(0.1), optax.GradientTransformation(init, update))
 
 
 @pytest.mark.parametrize("tier", ["persistent", "local",
@@ -2472,21 +2474,24 @@ class PoisonedThird(Counting):
 def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path, tier):
     """A save that meets a state holding a non-finite value writes nothing and rotates nothing out, on either
     tier: the run stops there, and the checkpoint a resume finds is the last finite one, its parameters
-    finite (row 6699). A run with no loss scale whose third batch is not finite, checkpointed every step
-    and keeping two (`persistent`), saved its non-finite parameters at steps 3 and 4 and rotated its good
+    finite (row 6699). A run whose third update is not finite (`poisoned_third_update`), checkpointed every
+    step and keeping two (`persistent`), saved its non-finite parameters at steps 3 and 4 and rotated its good
     checkpoints out; one that writes a local copy every second step and a persistent one every tenth
     (`local`) wrote its step-4 local copy unchecked, and a resume restored it (train 901's review, F1); a
     DiLoCo run's replicas' inner copies, which its next meeting averages into the outer model, saved
     unchecked between meetings (`diloco`, train 904's review, F3)."""
     def trainer():
+        solver = poisoned_third_update()
         if tier == "diloco":
-            # Two replicas meeting every fourth step: the third batch poisons their inner copies mid-period.
-            return make_trainer(tmp_path, keep=2, mesh=MeshSpec(diloco=2).build(jax.devices()[:2]),
+            # Two replicas meeting every fourth step: the third update poisons their inner copies mid-period.
+            return make_trainer(tmp_path, optimizer=solver, keep=2,
+                                mesh=MeshSpec(diloco=2).build(jax.devices()[:2]),
                                 diloco=DiLoCo(every=4, rate=0.7, momentum=0.9))
-        return make_trainer(tmp_path, keep=2) if tier == "persistent" else local_trainer(tmp_path)
+        return (make_trainer(tmp_path, optimizer=solver, keep=2) if tier == "persistent"
+                else local_trainer(tmp_path, optimizer=solver))
 
     with pytest.raises(RuntimeError):
-        trainer().fit(dataset(PoisonedThird), steps=5, log_every=100,
+        trainer().fit(dataset(), steps=5, log_every=100,
                       checkpoint_every=10 if tier == "local" else 1)
     resumed = trainer()
     assert resumed.checkpoints.latest == 2

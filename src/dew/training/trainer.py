@@ -15,6 +15,7 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import gc
 import logging
 import os
 import sys
@@ -2176,6 +2177,12 @@ class Trainer(Generic[Loss, Effects]):
             with region("compile"), run.held():
                 compiled[signature] = (self.compile(state, batch, trials), self.step_flops)
             seconds = time.perf_counter() - began
+            # Python's collector walks its whole heap at a full collection, which CPython 3.12 runs once the
+            # objects made since the last outnumber a quarter of those it kept: a compile makes millions
+            # (its traces, its lowered programs' Python side), so the first full collection after it walked
+            # them all inside the loop, 0.75 to 0.9 s at a step of the 4B (row 6739). Collected
+            # here, where the step is compiled, each later one waits for the run to make a quarter as many.
+            gc.collect()
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}
             self._report(StepCompiled(seconds, recompute_record(self.objective), links, self.memory,

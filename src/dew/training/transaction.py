@@ -122,6 +122,12 @@ class Committed:
     own: Ratio | jax.Array | float | None = None
     """The microbatch's own loss statistics, which a step read in several pools into its batch's loss
     (`dew.training.planning.whole_step`) and lets go; None past the step."""
+    finite: jax.Array | None = None
+    """Whether an attempt with no loss scale was finite, its gradient and forward as well as its loss, which
+    the step reports (`outcome`) and a run's streak of steps that are not reads (`dew.training.interval`): a
+    finite loss over a gradient that is not trains nothing. None under a loss scale, whose overflow its
+    scale backs off from, the step reporting its loss's finiteness, and past the step, whose own finiteness
+    the whole of its parts states (`whole_step`)."""
 
 
 def _chosen(take, taken, kept):
@@ -152,6 +158,16 @@ def dropped_window(state):
     return dataclasses.replace(state, microstep=microstep, accumulation=window)
 
 
+def _gated(finite: jax.Array, tree):
+    """`tree` where the step is `finite`, its every floating leaf zero otherwise: an elementwise select
+    against a constant, which the computation reading it fuses, so no second copy of the tree is held."""
+    def gate(leaf):
+        if not isinstance(leaf, jax.Array) or not jnp.issubdtype(leaf.dtype, jnp.inexact):
+            return leaf
+        return jnp.where(finite, leaf, jnp.zeros((), leaf.dtype))
+    return jax.tree.map(gate, tree)
+
+
 def window_dropped(microstep: jax.Array, acc: Accumulation) -> tuple[jax.Array, Accumulation]:
     """`dropped_window`'s two fields: the microstep back by the microbatches the window held (`occupancy`),
     and the window cleared, its occupancy 0, but for its gradient sum. A state's other fields go round it,
@@ -175,14 +191,15 @@ def _only_when(due, taken, kept, operand):
     return jax.lax.cond(due, lambda current: jax.lax.optimization_barrier(taken(current)), kept, operand)
 
 
-def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux, committed: jax.Array | None,
+def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux, committed: Committed | None,
             batch: Batch, stepped: jax.typing.ArrayLike, consumed: jax.Array, *, split: int) -> tuple:
     """What a compiled step returns (`Trainer.compile`) of the transaction it ran from `current` on
     `batch`, wherever it ran: the advanced state, its step counting `stepped` and its clock the source
     examples its microbatch `consumed` (`TrainState.consumed`, where the run keeps one), the loss, the
-    metrics with the batch's counts, and whether the loss is finite, the microbatch accepted and the
-    window committed. A metric stated as a statistic (`Aux.pooled`) is its value where the step is read
-    whole (`split` 1), and its statistic where it is one of `split` microbatches, which the step's whole
+    metrics with the batch's counts, and whether the attempt was finite (`Committed.finite`, its loss's
+    where it states none), the microbatch accepted and the window committed. A metric stated as a statistic
+    (`Aux.pooled`) is its value where the step is read whole (`split` 1), and its statistic where it is one
+    of `split` microbatches, which the step's whole
     pools (`dew.training.planning.whole_step`)."""
     pooled = aux.pooled if split > 1 else {name: value.mean()[0] for name, value in aux.pooled.items()}
     metrics = {**aux.metrics, **pooled, **step_counts(batch)}
@@ -190,8 +207,10 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
         assert "evaluated" in aux.record, "a recording transaction stacks its evaluations (`recorded`)"
         metrics |= recorded_metrics(aux.record)
     clock = None if current.consumed is None else (current.consumed + consumed).astype(current.consumed.dtype)
+    finite = jnp.isfinite(loss) if committed is None or committed.finite is None else committed.finite
     return (dataclasses.replace(advanced, step=current.step + stepped, consumed=clock), loss, metrics,
-            jnp.isfinite(loss), advanced.microstep > current.microstep, committed)
+            finite, advanced.microstep > current.microstep, dataclasses.replace(committed, finite=None)
+            if committed is not None else None)
 
 
 def probed_loss(objective: Objective, variables: Variables, batch: Batch, step: Step):
@@ -1058,6 +1077,18 @@ class Transaction:
             # their norm and finiteness come from the backward that read them (`Applied`).
             native_finite = native_finite & (applied.nonfinite == 0)
             norm = jnp.sqrt(jnp.square(norm) + applied.sumsq.astype(norm.dtype))
+        # With no loss scale, an update whose gradient or forward is not finite is gated where it is
+        # computed: its gradient, the forward's statistics and its update read as zero, so its parameters,
+        # update count and EMA stay as they were and its optimizer takes one step of zero gradient, holding
+        # no old state beside the new (training.md, a step that is not finite; row 6699). A scaled step's
+        # rejection keeps the optimizer too, chosen below, as a scale's back-off must, and so does one whose
+        # optimizer holds updates back (`holds_back`, `optax.MultiSteps`): a zero input would join its window
+        # and close it, where the step's rejection keeps the inputs it holds.
+        gated = current.scale is None and not holds_back(current.opt_state)
+        if gated:
+            native_finite = native_finite & _all_finite((qk, statistics, effects))
+            native, qk, statistics, effects = (_gated(native_finite, value)
+                                               for value in (native, qk, statistics, effects))
 
         def apply(current):
             # The update applies to the parameters the model's constraint projects
@@ -1066,6 +1097,7 @@ class Transaction:
             update, opt_state = optimizer_update(
                 self.optimizer, native, current.opt_state, stored, qk=qk, statistics=statistics,
                 progress=None if self.bound is None else self.progress(current))
+            update = _gated(native_finite, update) if gated else update
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
             # rescale, a bounded group's clamp) acts on them (`stepped`).
             params = {**current.variables, "params": stepped(stored, update, current.opt_state, opt_state,
@@ -1076,10 +1108,14 @@ class Transaction:
                 moved = applied.onto(dataclasses.replace(current, variables=params, opt_state=opt_state))
                 params, opt_state = moved.variables, moved.opt_state
             params = {**params, "params": self.objective.projected(params["params"], updated=True)}
-            done = update_applied(current.opt_state, opt_state)
+            done = update_applied(current.opt_state, opt_state) & (native_finite | (not gated))
             if self.aux_shape.effects is not None:
-                params = write_back(params, self.objective.apply_effects(
+                written = write_back(params, self.objective.apply_effects(
                     params, self.effects_tree.unflatten(effects)))
+                # A gated step's forward writes back nothing: its collections (batch statistics) stay.
+                params = written if not gated else {
+                    **written, **{name: _chosen(native_finite, value, params[name])
+                                  for name, value in written.items() if name != "params"}}
             averaged = current.ema
             if self.objective.ema is not None:
                 if averaged is None:
@@ -1183,7 +1219,10 @@ class Transaction:
         scale, previous = state.scale, state.accumulation
         effects, qk, loss = pending.effects, pending.qk, pending.loss
         finite = pending.local_finite & _all_finite((loss, gradient, effects, qk, aux.variables))
-        accepted = jnp.asarray(a=True) if scale is None else finite
+        # A step with no loss scale is gated in its commit (`commit`), but one whose optimizer holds updates
+        # back is rejected whole, its optimizer state kept, as a scaled step's is.
+        holding = holds_back(state.opt_state)
+        accepted = jnp.asarray(a=True) if scale is None and not holding else finite
         numerical = dataclasses.replace(state, variables=write_back(state.variables, aux.variables),
                                         microstep=state.microstep + 1)
         # Runs that updated in their backward wrote it only where the step commits (`in_backward.gated`).
@@ -1223,6 +1262,8 @@ class Transaction:
         finite = finite & native_finite
         if scale is not None:
             accepted = finite & _all_finite(checked(numerical))
+        elif holding:
+            accepted = finite
         if previous is not None:
             numerical = dataclasses.replace(
                 numerical, accumulation=self._retained_window(state, batch, pending, attempt, read))
@@ -1240,12 +1281,14 @@ class Transaction:
         # An update the optimizer holds back commits nothing yet: its tokens wait in the state
         # (`TrainState.deferred`) for the update that applies them (`update_applied`).
         # An input the optimizer skipped trains no update, so its tokens wait for none (`input_taken`).
-        done = update_applied(state.opt_state, advanced.opt_state)
+        # A gated step (no loss scale, not finite) committed nothing: no update, no tokens (`commit`).
+        done = update_applied(state.opt_state, advanced.opt_state) & (finite | (scale is not None))
         counted = due & accepted & done
         if state.deferred is not None:
             taken = input_taken(state.opt_state, advanced.opt_state)
             held = TokenCount.add(state.deferred, jnp.where(taken, held, 0).astype(jnp.uint32))
-            waiting = jnp.where(due & accepted & ~done, held, jnp.where(counted, 0, state.deferred))
+            trained = finite | (scale is not None)
+            waiting = jnp.where(due & accepted & trained & ~done, held, jnp.where(counted, 0, state.deferred))
             advanced = dataclasses.replace(advanced, deferred=waiting.astype(jnp.uint32))
         if self.split == 1:
             # A step that commits no update, a window still filling or one its optimizer holds back
@@ -1257,7 +1300,7 @@ class Transaction:
         return advanced, loss, aux, Committed(
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
             jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted),
-            own=pending.own if self.split > 1 else None)
+            own=pending.own if self.split > 1 else None, finite=finite if scale is None else None)
 
     def planned(self, state: TrainState) -> _Planned | None:
         """The plan by which the runs a one-stage scanned state holds stacked update in their backward

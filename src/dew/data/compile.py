@@ -757,14 +757,15 @@ def compile(
     resume: DataResume = "relaxed",
     examples: int | None = None,
     widths: Mapping[str, object] | None = None,
-    measured: _TrainingMeasured | None = None,
+    measured: _TrainingMeasured | tuple[_TrainingMeasured, ...] | None = None,
     epochs: int | None = None,
     steps: int | None = None,
     tokens: int | None = None,
 ) -> Loader:
     """Check every leaf before opening readers, then build both branches; `widths` are the run's
     static widths its steps bind to (`run_widths`), and `measured` its training branch as their
-    measurement prepared it (`_training_measure`), which it binds as it stands.
+    measurement prepared it (`_training_measure`), which it binds as it stands: of a run of phases, each
+    phase's, which a phase that reads its corpora from their start binds (`_compile_phases`).
     With no `read`, the sources choose it (`_preferred_read`). `examples` bounds the training read to
     its first that many source examples, before they are packed and before the objective makes rows
     of them (`_bounded`), a run's `examples=` budget. `epochs` reads the chain endlessly, or, where its
@@ -790,8 +791,11 @@ def compile(
             steps=steps,
             budget=tokens,
             widths=widths,
+            measured=measured if isinstance(measured, tuple) else None,
         )
         return dataclasses.replace(phased, resume=resume)
+    if isinstance(measured, tuple):
+        raise TypeError("a measure of each phase binds a run of phases alone")
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
                      seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured,
                      epochs=epochs)
@@ -1474,6 +1478,16 @@ def _built_phases(source: Phases, staged: Sequence[tuple[_Staged, int | None]],
     return built
 
 
+def _measured_phase(measured: tuple[_TrainingMeasured, ...] | None, index: int, continued: Pipeline,
+                    phases: Sequence[Pipeline], validation: Pipeline | None) -> _TrainingMeasured | None:
+    """The measure among `measured` (each phase's, as `run_widths` read them) that phase `index` binds where
+    it reads its corpora from their start (`continued`, the phase as written) with no validation beside it;
+    None for one continued past an earlier phase, measured as it continues (row 6713: each phase was
+    measured twice, both copies of a memory read held at the start's peak)."""
+    fresh = measured is not None and continued is phases[index] and validation is None
+    return measured[index] if fresh and measured is not None else None
+
+
 def _compile_phases(
     train: Pipeline,
     *,
@@ -1489,9 +1503,11 @@ def _compile_phases(
     steps: int | None = None,
     budget: int | None = None,
     widths: Mapping[str, object] | None = None,
+    measured: tuple[_TrainingMeasured, ...] | None = None,
 ) -> Loader:
     """`train`'s phases, each compiled on its own, every phase and the validation binding the run's
-    `widths` (`run_widths`), measured over every phase and held chain, one program for them all."""
+    `widths` (`run_widths`), measured over every phase and held chain, one program for them all, a phase
+    binding its measure among `measured` where it may (`_measured_phase`)."""
     source = train.source
     if not isinstance(source, Phases):
         raise TypeError("phased compilation needs a Phases source")
@@ -1503,10 +1519,10 @@ def _compile_phases(
         """Phase `index`, each corpus it reads continued past what the phases before it trained of it
         (`_continued`, `_skipping`): on its own stream, those it shares with other phases stamped (`members`,
         `_stamped`)."""
-        phase = _staged(_continued(source.pipelines[index], consumed)._then(*train.stages),
-                        validation if index == 0 else None, objective=objective, read=read,
-                        provision=provision, loading=loading, seed=seed, rejections=rejections,
-                        widths=widths)
+        continued, alone = _continued(source.pipelines[index], consumed), validation if index == 0 else None
+        phase = _staged(continued._then(*train.stages), alone, objective=objective, read=read,
+                        provision=provision, loading=loading, seed=seed, rejections=rejections, widths=widths,
+                        measured=_measured_phase(measured, index, continued, source.pipelines, alone))
         return _skipping(_stamped(phase, members or {}), consumed, source.pipelines[index])
 
     tokens = source.clock == "tokens"
@@ -2217,7 +2233,7 @@ def fitted[Entry](
         widths = (run_widths([*([measured] if measured else []), *phases, *scored.values()], objective)
                   if scored or phases else {})
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
-                         widths=widths, read=read, measured=measured,
+                         widths=widths, read=read, measured=tuple(phases) if phased else measured,
                          epochs=epochs if examples is None else None,
                          steps=steps, tokens=tokens, resume=resume)
     else:
