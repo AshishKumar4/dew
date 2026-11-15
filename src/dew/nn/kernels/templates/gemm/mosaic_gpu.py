@@ -986,11 +986,11 @@ def _declared(rows_of, rhs, shape: tuple[int, int, int | None], splits: int, dty
         return tuple(jax.ShapeDtypeStruct((stored, n) if splits == 1 else (splits, stored, n), dtype)
                      for dtype in dtypes)
     transpose_lhs, transpose_rhs = transposed
-    rows = outputs.axis(rows_of, 1 if transpose_lhs else 0)
+    # Its rows the walked rows' less their extension past the last tile (`_walked_rows`), sized by the launch.
+    rows = outputs.axis(rows_of, 1 if transpose_lhs else 0).sized(m)
     width = outputs.axis(rhs, 1 if transpose_rhs else 2)
-    if (rows.size, width.size) != (m, n):
-        raise ValueError(f"a gmm's outputs are its rows by its width, {(m, n)}, not its operands' "
-                         f"{(rows.size, width.size)}")
+    if width.size != n:
+        raise ValueError(f"a gmm's outputs are its matrix's width, {n}, not {width.size}")
     dims = (rows, width) if splits == 1 else (splits, rows, width)
     return tuple(outputs.output(dtype, *dims) for dtype in dtypes)
 
