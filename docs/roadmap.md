@@ -44,6 +44,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
 - Sm90 lightning attention (MiniMax-Text-01, 64 heads of 128, bf16) packed forward, the gate's two-roles variant. [6495]
 - The interpreter (Pallas Mosaic GPU interpret mode, the CPU suite's) takes about 8 times as long a draw for a tcgen05. [6521]
+- A 4B decision start's cold fit spends 152.8 s. [6593]
 
 ## Models and interop
 
@@ -57,8 +58,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [5450, 5625]
-- Prepared_embeddings sits in call_metadata.py, the per-call data beside the residual, to keep causal_transformer.py under 2500 lines. [6189]
-- Src/dew/interop/config_records.py:48-57 hand-copies PretrainedConfig().to_dict()'s field names. [6496]
 
 ## Training and parallelism
 
