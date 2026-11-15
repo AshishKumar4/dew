@@ -1027,6 +1027,114 @@ def test_finished_slices_merged_at_a_large_maximum_keep_each_ones_mass(totals, o
     assert out.item() == np.float32(share), out.item()
 
 
+LARGEST = float(np.finfo(np.float32).max)
+
+
+def _finished_merged_output(outputs, maxima, totals):
+    """Finished slices of one row each, their outputs, maxima (natural units) and denominators, merged as a
+    decode step's slices merge (`algebra.finished_merged`) and finished normalized: the merged output."""
+    spec = algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True))
+    count = len(outputs)
+    states = [algebra.slice_state(spec, jnp.full((1, 1), outputs[i], jnp.float32),
+                                  jnp.full((1,), maxima[i], jnp.float32),
+                                  jnp.full((1,), totals[i], jnp.float32))
+              for i in range(count)]
+    stacked = algebra.Partial(*(jnp.stack(parts) for parts in zip(*(state[:3] for state in states),
+                                                                    strict=True)))
+    return algebra.finish(spec, algebra.finished_merged(spec, stacked, axis=0), initial=True,
+                          normalized=True)[0]
+
+
+@pytest.mark.parametrize(("outputs", "maxima", "totals"), [
+    ((LARGEST, LARGEST), (0.0, 0.0), (29.0, 1.0)),
+    ((LARGEST, -LARGEST), (0.0, 0.0), (3.0, 1.0)),
+    ((2.0 ** 127, -(2.0 ** 127)), (0.0, 0.0), (1.0, 1.0)),
+    ((1.0, 0.0), (-25.0 * np.log(2.0), 0.0), (1.0, 1.0)),
+], ids=["largest-29-1", "largest-opposite-3-1", "opposite-2^127", "far-apart"])
+def test_finished_slices_merge_within_their_outputs_at_fp32s_largest(outputs, maxima, totals):
+    """Finished slices merged (`algebra.finished_merged`, a split decode step's merge): the merged output, a
+    convex combination of theirs, lies between them, however its sum rounds, and is theirs where they are
+    one value: outputs at fp32's largest whose shares 29/30 and 1/30 summed to inf, outputs of opposite
+    signs there and at 2^127, and shares 2^-25 apart. Its derivative as to a denominator is finite where its
+    value is (L/8 at outputs +-fp32's largest of shares 3:1, which a reverse pass accumulating each weight's
+    cotangent by its weight overflowed, row 6827)."""
+    found = np.asarray(_finished_merged_output(outputs, maxima, totals)).item()
+    assert min(outputs) <= found <= max(outputs), found
+    assert len(set(outputs)) > 1 or found == outputs[0], found
+    gradient = jax.grad(lambda first: _finished_merged_output(outputs, maxima, (first, *totals[1:])).sum())(
+        jnp.float32(totals[0]))
+    assert np.isfinite(np.asarray(gradient)), gradient
+
+
+CANCELLING_SEEDS = 8
+"""The cancelling merge's declared draws (check 1)."""
+
+
+def test_slices_that_cancel_near_fp32s_largest_merge_on_par_beside_a_least_normal_one():
+    """Three finished slices of equal mass merged (`algebra.finished_merged`): two of outputs near +-2^127
+    that cancel and one whose share of its output is near fp32's least normal, so the merged output is that
+    third slice's share: on par with the plain fp32 convex combination against float64 (check 1). Summing
+    the whole combination at half its size, as the largest outputs' terms are summed, would drop the third's
+    last bits below the normal range (0 where the truth is 2^-126)."""
+
+    def draw(seed):
+        streams = jax.random.split(jax.random.key(seed), 2)
+        large = 2.0 ** 127 * (1 + jax.random.uniform(streams[0], (), jnp.float32))
+        tiny = 3.0 * 2.0 ** -126 * (1 + jax.random.uniform(streams[1], (), jnp.float32))
+        return jnp.stack([large, -large, tiny]).astype(jnp.float32), jnp.ones(3, jnp.float32)
+
+    def merged(outputs, totals):
+        return _finished_merged_output(outputs, jnp.zeros(3), totals)
+
+    def plain(outputs, totals):
+        return jnp.sum(totals / jnp.sum(totals) * outputs)[None, None]
+
+    assert_as_exact(jax.jit(merged), jax.jit(plain), draw, "slices cancelling beside a least normal one",
+                    seeds=CANCELLING_SEEDS)
+
+
+DERIVATIVE_SEEDS = 256
+"""The merge derivative's sites' declared draws (check 1), each sized by `seeds_for` paired on armada."""
+
+
+def _opposite_near_largest(seed):
+    """Two slices of outputs of opposite signs within a factor 2 of fp32's largest, denominators 1 to 4."""
+    streams = jax.random.split(jax.random.key(seed), 3)
+    sizes = LARGEST * (1 - 0.5 * jax.random.uniform(streams[0], (2,), jnp.float32))
+    totals = 1 + 3 * jax.random.uniform(streams[1], (2,), jnp.float32)
+    return (sizes * jnp.asarray([1.0, -1.0], jnp.float32)).astype(jnp.float32), totals
+
+
+def _cancelling_beside_least_normal(seed):
+    """Two slices of outputs near +-2^127 that cancel beside one whose output is near fp32's least normal."""
+    streams = jax.random.split(jax.random.key(seed), 3)
+    large = 2.0 ** 127 * (1 + jax.random.uniform(streams[0], (), jnp.float32))
+    tiny = 3.0 * 2.0 ** -126 * (1 + jax.random.uniform(streams[1], (), jnp.float32))
+    totals = 1 + jax.random.uniform(streams[2], (3,), jnp.float32)
+    return jnp.stack([large, -large, tiny]).astype(jnp.float32), totals
+
+
+@pytest.mark.parametrize("draw", [_opposite_near_largest, _cancelling_beside_least_normal],
+                         ids=["opposite-near-largest", "cancelling-beside-least-normal"])
+def test_the_merges_derivative_as_to_its_denominators_is_on_par(draw):
+    """The derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) as to each
+    slice's denominator, (o_j - out) / T, on par with the mean's own derivative formed in fp32 as
+    o_j / T - out / T against float64 (check 1): slices of opposite signs near fp32's largest, whose sum's
+    reverse pass overflowed (L/8 returned as inf, row 6827), and slices cancelling near 2^127 beside a
+    least-normal one, whose gaps halved would lose its bits."""
+
+    def ours(outputs, totals):
+        return jax.grad(lambda each: _finished_merged_output(outputs, jnp.zeros_like(totals), each).sum())(
+            totals)
+
+    def reference(outputs, totals):
+        total = jnp.sum(totals)
+        return outputs / total - jnp.sum(totals / total * outputs) / total
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"the merge's derivative, {draw.__name__}",
+                    seeds=DERIVATIVE_SEEDS)
+
+
 @pytest.mark.parametrize("form", ["causal", "full"])
 def test_a_padded_query_walks_nothing_again_where_a_real_row_past_fp32_does(form):
     """The fold guard's rewalk (`algebra.rewalks`) over a call of 6 queries padded to 8: a real row whose
