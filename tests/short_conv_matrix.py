@@ -120,3 +120,36 @@ def a_short_convs_training_step_is_on_par(case: tuple[str, ...]) -> None:
                         seeds=TRAINING_SEEDS[named["model"], named["dtype"], named["documents"] == "packed"],
                         truth_fn=exact)
     assert {route.choice for route in found} <= CHOICES
+
+
+def per_shard(choice: str, kernel: str) -> dict:
+    """`kernel`'s per-shard cells (`sharded.Shard`, tests/test_per_shard.py): `causal_conv1d` (a delta rule's
+    conv, its l2-normalised queries and keys, over padded rows of packed documents, with a bias) on `kernel`
+    over rows a two-device mesh splits as data or fsdp parallelism splits them, the taps and bias whole: its
+    pieces and the gradients of the input, the taps and the bias on par with one device's from the float64
+    conv a row at a time (`test_short_conv.truth`), interpreted on the CPU's devices."""
+    from jax.sharding import PartitionSpec
+    from sharded import Shard
+    from test_short_conv import DELTA, SHARDED_SEEDS, cotangents, operands, truth
+
+    del choice
+
+    def draw(seed):
+        # Each role's stream its own: a draw's cotangents never replay another draw's input.
+        x, weights, shift, valid = operands(4, 48, DELTA, dtype=jnp.float32, bias=True, valid=True,
+                                            seed=3 * seed)
+        return (x, weights, shift, valid, documents(4, 48, seed=3 * seed + 2),
+                *cotangents(x, DELTA, jnp.float32, seed=3 * seed + 1))
+
+    def gradients(x, weights, shift, valid, segments, *grads):
+        return run(_routed(kernel), x, weights, shift, valid, DELTA, jnp.float32, grads, segments=segments)
+
+    def exact(x, weights, shift, valid, segments, *grads):
+        return truth(x, weights, shift, valid, DELTA, grads, segments=segments)
+
+    def cell(axis: str) -> Shard:
+        rows, whole = PartitionSpec(axis), PartitionSpec()
+        return Shard(gradients, draw, lambda mesh: [rows, whole, whole, rows, rows, rows, rows, rows], exact,
+                     SHARDED_SEEDS, axis)
+
+    return {axis: cell(axis) for axis in ("data", "fsdp")}

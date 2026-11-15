@@ -34,7 +34,7 @@ Each scenario checks every contract its flow touches:
 
 An exact cache's decode agrees with full forward under the numerical rule below. A cache explicitly defined as approximate is compared with the reference implementation's own decode under that same cache. Approximate and exact cache claims remain distinct.
 
-Every Pallas or FFI kernel runs per shard through `tests/sharded.py::assert_runs_per_shard`, with the layer's mesh axes and no unintended collectives. The same flow checks its numerical result against the unsharded reference; compilation alone does not prove shard placement or communication behavior.
+Every Pallas or FFI kernel runs per shard through `tests/sharded.py::assert_runs_per_shard`, with the layer's mesh axes and no unintended collectives. The same flow checks its numerical result against the unsharded reference; compilation alone does not prove shard placement or communication behavior. The cells come from the kernel matrix's families (`tests/test_per_shard.py`): each kernel a family tests that its layer's production path runs per shard states its cells, named through that path. Which kernels must have one is read from production, not listed: every kernel off the reference path a model flow's programs launch with their rows split over two devices. A cell runs where its kernel runs: on the CPU's devices where they interpret it as its generation, on a GPU's (an emulated mesh's among them) or a TPU's as its generation's own.
 
 ## Settings and devices
 

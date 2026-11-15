@@ -61,7 +61,7 @@ import threading
 import time
 import types
 import weakref
-from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping
 from typing import ClassVar
 
 import filelock
@@ -697,9 +697,7 @@ class KernelOp(tokamax.Op):
         def shaped(name: str, value):
             if name in self.ROWS and value is not None:
                 return bucketed(jax.ShapeDtypeStruct(value.shape, value.dtype))
-            # NumPy operands (an unpacked delta rule's chunk and span descriptors) key as JAX's do.
-            return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
-                                if isinstance(leaf, (jax.Array, np.ndarray)) else leaf, value)
+            return _shapes(value)
         return tokamax.BoundArguments(_identity(self), {name: shaped(name, value)
                                                         for name, value in ba.arguments.items()})
 
@@ -1214,6 +1212,13 @@ def store_verdict(device_kind: str, key: str, verdict: dict[str, tuple[str, repo
         _VERDICTS.setdefault(device_kind, {})[key] = written
 
 
+def _shapes(value):
+    """`value`'s arrays as their shapes and dtypes, its other parts as they are: NumPy operands (an unpacked
+    delta rule's chunk and span descriptors) as JAX's, a tracer as the value it stands for."""
+    return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
+                        if isinstance(leaf, (jax.Array, np.ndarray)) else leaf, value)
+
+
 class Seen(list[Launch]):
     """The launches traced under `seen`, each its op and keyed arguments, in the order they traced, and
     `taken`, the config each took as it traced (`KernelOp._chosen`: a pin, its own key's pick or its
@@ -1223,6 +1228,18 @@ class Seen(list[Launch]):
     def __init__(self) -> None:
         super().__init__()
         self.taken: list[tuple[Hashable, tokamax.BoundArguments]] = []
+
+    def held(self) -> Seen:
+        """These launches as a trace kept past its own keeps them (`dew.algebra.fusion`'s regions, replayed
+        by `noted`): each launch as it is (its arguments keyed, `KernelOp.keyed`) and each config taken with
+        the arguments it was taken for, their arrays as their own shapes and dtypes, so no tracer outlives
+        the trace that made it."""
+        kept = Seen()
+        kept.extend(self)
+        kept.taken.extend((config, tokamax.BoundArguments(ba.op, {name: _shapes(value)
+                                                                 for name, value in ba.arguments.items()}))
+                          for config, ba in self.taken)
+        return kept
 
 
 class _Seen:
@@ -1244,13 +1261,14 @@ def seen() -> Iterator[Seen]:
         yield collected.found
 
 
-def noted(found: Sequence[Launch]) -> None:
-    """Record `found`, the launches a trace took under `seen` (each its op and keyed arguments, their arrays
-    as shapes), into the collection open in this context, as its launches did as they traced: a trace held
-    and reused (`dew.algebra.fusion`'s regions) records the launches it holds where its program is written.
-    None where no collection is open."""
+def noted(found: Seen) -> None:
+    """Record `found`, the launches a trace took under `seen` and the configs they took (`Seen.held`), into
+    the collection open in this context, as its launches did as they traced: a trace held and reused
+    (`dew.algebra.fusion`'s regions) records the launches it holds where its program is written. None where
+    no collection is open."""
     if (collected := _cache.KERNEL_SEEN.value) is not None:
         collected.found.extend(found)
+        collected.found.taken.extend(found.taken)
 
 
 def tune(lower: Callable[[], jax.stages.Lowered], *,

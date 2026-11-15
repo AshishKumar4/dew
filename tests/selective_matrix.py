@@ -29,6 +29,9 @@ CHOICES = frozenset({"selective_scan"})
 KERNELS = {"selective_scan": frozenset({"mosaic_gpu"})}
 """The kernels each choice's cells run under test (row 4513): the template."""
 
+SHARDED_SEEDS = 8
+"""The per-shard cells' declared draws (check 1, `sharded.assert_runs_per_shard`)."""
+
 
 @functools.cache
 def _taken(case: tuple[tuple[str, str], ...]) -> bool:
@@ -80,3 +83,38 @@ def a_selective_scan_is_as_exact_as_mamba_ssm(case: tuple[str, ...]) -> None:
     with generation.routes() as found:
         the_template_is_as_exact_as_mamba_ssm(named["case"])
     assert {route.choice for route in found} <= CHOICES
+
+
+def per_shard(choice: str, kernel: str) -> dict:
+    """`kernel`'s per-shard cells (`sharded.Shard`, tests/test_per_shard.py): the recorded `documents` call
+    (two rows of packed documents, fp32) through the scan's entry on the template (`recurrence_chunk
+    .selective_scan`, interpreted on the CPU's devices) over its rows a two-device mesh splits as data or
+    fsdp parallelism does, the decays and skip whole (B and C serve every channel, so the channels stay
+    whole): its output and every operand's gradient on par with one device's from the portable scan in
+    float64."""
+    from jax.sharding import PartitionSpec
+    from reference_error import with_gradients
+    from selective_support import starts_of
+    from sharded import Shard
+
+    del choice, kernel
+    scan = functools.partial(recurrence_chunk.selective_scan, portable=portable)
+    names = ("x", "dt", "A", "B", "C", "D", "dy")
+
+    def draw(seed: int):
+        arrays = selective_draw(seed, "documents")
+        return (*(jnp.asarray(arrays[name]) for name in names), starts_of(arrays))
+
+    def stepped(over):
+        def call(x, dt, a, b, c, skip, dy, starts):
+            def scanned(*operands):
+                return over(*operands, None, starts)[0]
+            return with_gradients(scanned)(x, dt, a, b, c, skip, dy)
+        return call
+
+    def specs(axis: str):
+        rows, whole = PartitionSpec(axis), PartitionSpec()
+        return lambda mesh: [rows, rows, whole, rows, rows, whole, rows, rows]
+
+    return {axis: Shard(stepped(scan), draw, specs(axis), stepped(portable), SHARDED_SEEDS, axis)
+            for axis in ("data", "fsdp")}

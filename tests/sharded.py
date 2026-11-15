@@ -21,7 +21,10 @@ to remove. A CPU interprets Pallas kernels, so there only the first two
 hold; the third needs the GPU.
 """
 
+import contextlib
 import math
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -114,8 +117,13 @@ def placed(tree, mesh: jax.sharding.Mesh, *spec):
 
 
 def placed_on(args, specs, mesh: jax.sharding.Mesh) -> list:
-    """`args` put on `mesh`, each by its PartitionSpec in `specs`."""
-    return [jax.device_put(arg, NamedSharding(mesh, spec)) for arg, spec in zip(args, specs, strict=True)]
+    """`args` put on `mesh`, each by its PartitionSpec in `specs`: one for every leaf of its argument, or a
+    tree of them for its leaves (a prefix of the argument's tree)."""
+    def sharded(spec):
+        return jax.tree.map(lambda leaf: NamedSharding(mesh, leaf), spec,
+                            is_leaf=lambda leaf: isinstance(leaf, PartitionSpec))
+
+    return [jax.device_put(arg, sharded(spec)) for arg, spec in zip(args, specs, strict=True)]
 
 
 def split_executable(run, args, specs, mesh: jax.sharding.Mesh):
@@ -128,8 +136,23 @@ def split_executable(run, args, specs, mesh: jax.sharding.Mesh):
         return run.lower(*placed_on(args, specs, mesh)).compile()
 
 
+def split_checked(fn, draw, specs, mesh, *, moves=(), donate=()):
+    """`fn` jitted as the gate compiles a Dew arm (`without_ynn`), and its split executable on `draw(0)`'s
+    arguments placed by `specs` (`split_executable`), its compiled step holding no collective that moves
+    entries between devices (`MOVES`) beyond `moves`, and no copy or transpose at a kernel call's edge
+    (`boundary_copies`): `assert_runs_per_shard`'s compile-time half."""
+    run = without_ynn(fn, donate_argnums=donate)
+    compiled = split_executable(run, draw(0), specs, mesh)
+    text = compiled.as_text()
+    moved = [(op, shapes) for op, shapes in collectives(text) if op in MOVES and op not in moves]
+    assert not moved, f"the step moves operands between devices: {moved}"
+    copies = boundary_copies(text)
+    assert not copies, f"XLA re-lays out arrays at the kernel's boundary: {copies}"
+    return run, compiled
+
+
 def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, truth_fn, moves=(),
-                          donate=(), arm=None, also=None):
+                          donate=(), arm=None, also=None, checked=None):
     """The custom-kernel contract (module docstring): `fn` on `draw(seed)`'s arguments placed on `mesh`
     by `specs` (PartitionSpecs) is on par with `fn` on one device over the site's declared `seeds`
     (check 1, `assert_as_exact`), both measured from `truth_fn`, the float64 tree of `fn`'s outputs on
@@ -146,15 +169,9 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     the shapes its shards run, a call through an exchange with the whole sequence. A caller passing
     `arm` may also assert the split against the reference path (check 1 against float64): `also`,
     `(label, arm)`, is that second arm, compiled alike and compared with the same split runs (each draw's
-    split run once, `assert_as_exact`'s further references)."""
-    run = without_ynn(fn, donate_argnums=donate)
-    compiled = split_executable(run, draw(0), specs, mesh)
-    text = compiled.as_text()
-    moved = [(op, shapes) for op, shapes in collectives(text) if op in MOVES and op not in moves]
-    assert not moved, f"the step moves operands between devices: {moved}"
-    copies = boundary_copies(text)
-    assert not copies, f"XLA re-lays out arrays at the kernel's boundary: {copies}"
-
+    split run once, `assert_as_exact`'s further references). `checked`, when given, is `split_checked`'s
+    pair already made (a caller reading the split lowering's own records)."""
+    run, compiled = checked or split_checked(fn, draw, specs, mesh, moves=moves, donate=donate)
     def kept(args):
         # A donated argument is consumed; the draw's own array goes on to the other arm and the truth.
         return [jnp.copy(arg) if index in donate else arg for index, arg in enumerate(args)]
@@ -171,6 +188,70 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     # Each draw's split run once, against `also`'s arm too (`assert_as_exact`'s further references).
     assert_as_exact(as_given(split), reference, draw, label, seeds=seeds, truth_fn=truth_fn, also=further)
     return compiled
+
+
+@dataclass(frozen=True)
+class Shard:
+    """A kernel's per-shard cell (testing.md: every Pallas or FFI kernel runs per shard): its layer's path
+    with the kernel's choice named (`call`, operands to outputs and gradients), its draw by seed (`draw`),
+    where each operand lives on a mesh splitting `split` (`specs(mesh)`, `assert_runs_per_shard`'s), its
+    float64 truth (`truth`), its declared check-1 seeds, the moves its layer intends (`moves`: an fsdp
+    weight's gather), the scope its layer traces in (`context`: logical axis rules, a layout, the axes its
+    parameters declare) and the generation it runs as (`target`)."""
+
+    call: Callable
+    draw: Callable
+    specs: Callable[[jax.sharding.Mesh], list]
+    truth: Callable
+    seeds: int
+    split: str
+    moves: tuple[str, ...] = ()
+    context: Callable[[], contextlib.AbstractContextManager] = contextlib.nullcontext
+    target: str = "sm90"
+
+
+def interprets(choice: str, kernel: str, shard: Shard) -> bool:
+    """Whether the CPU's devices run `shard`'s kernel as its generation, interpreted: its call on one
+    device, traced with the kernel named as its target interpreted (`generation.assumed(...,
+    interpreted=True)`), takes the kernel, no requirement refusing it (a library's FFI call, a Triton launch,
+    a launch no interpreter derives) and no lowering it cannot make."""
+    from dew.nn.kernels import generation, selection
+
+    with (generation.assumed(shard.target, interpreted=True), generation.chosen(**{choice: kernel}),
+          shard.context(), generation.routes() as routes):
+        try:
+            jax.eval_shape(shard.call, *shard.draw(0))
+        except (selection.KernelRefused, selection.Unlowerable):
+            return False
+    return kernel in {found.kernel for found in routes if found.choice == choice}
+
+
+def assert_kernel_runs_per_shard(choice: str, kernel: str, shard: Shard) -> None:
+    """`kernel`, `choice`'s, runs per shard (`assert_runs_per_shard`) on two devices of a run's mesh
+    splitting `shard.split` (`MeshSpec`, its other axes one device each), its choice named
+    (`generation.chosen`), the CPU's devices running the kernels as `shard.target` interpreted
+    (`generation.assumed`; a GPU's or a TPU's as themselves), in its layer's scope: some operand split on
+    `shard.split`, and the split program's own lowering (`split_checked`, apart from the one-device arm's
+    and the truth's) taking the kernel (`generation.routes`), not a fallback."""
+    from dew.distributed.placement import MeshSpec
+    from dew.nn.kernels import generation
+
+    # The data axis takes the devices the others leave (`MeshSpec`).
+    mesh = MeshSpec(**({} if shard.split == "data" else {shard.split: 2})).build(jax.devices()[:2])
+    specs = shard.specs(mesh)
+    named = {name for spec in jax.tree.leaves(specs, is_leaf=lambda leaf: isinstance(leaf, PartitionSpec))
+             for axes in spec if axes is not None for name in ((axes,) if isinstance(axes, str) else axes)}
+    assert shard.split in named and mesh.shape[shard.split] > 1, (shard.split, sorted(named), mesh.shape)
+    target = (generation.assumed(shard.target, interpreted=True) if jax.default_backend() == "cpu"
+              else contextlib.nullcontext())
+    with target, generation.chosen(**{choice: kernel}), shard.context():
+        with generation.routes() as routes:
+            checked = split_checked(shard.call, shard.draw, specs, mesh, moves=shard.moves)
+        taken = {found.kernel for found in routes if found.choice == choice}
+        assert kernel in taken, (choice, kernel, sorted(taken))
+        assert_runs_per_shard(shard.call, shard.draw, specs, mesh, f"{choice} {kernel} per shard over "
+                              f"{shard.split}", seeds=shard.seeds, truth_fn=shard.truth, moves=shard.moves,
+                              checked=checked)
 
 
 VIEWS = frozenset({"bitcast", "get-tuple-element", "tuple", "parameter"})

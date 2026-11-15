@@ -386,3 +386,41 @@ def a_recurrences_training_step_is_on_par(case: tuple[str, ...]) -> None:
 def a_recurrences_training_step_on_a_tpu_is_on_par(case: tuple[str, ...]) -> None:
     """`_on_par` of a TPU's case (the TPU tier's flow, tests/test_ssd_kernel.py)."""
     _on_par("recurrence_tpu", case)
+
+SHARDED_SEEDS = 8
+"""The per-shard cells' declared draws (check 1, `sharded.assert_runs_per_shard`)."""
+
+
+def per_shard(choice: str, kernel: str) -> dict:
+    """`kernel`'s per-shard cells (`sharded.Shard`, tests/test_per_shard.py): `choice`'s form (the delta
+    rule's Qwen3.5 gated delta net, the scan's Mamba-2 rated scan) over packed bf16 rows, through the chunked
+    op on `kernel` (`chunk_on`) over the rows a two-device mesh splits as data or fsdp parallelism does,
+    every operand led by its rows split (queries, keys, values, gates, steps, cotangents) and each per-head
+    parameter whole: the output, the final memory and every operand's gradient on par with one device's from
+    the recurrence a token at a time in float64, as an H100's, a TPU's as a v6e's over fp32."""
+    from jax.sharding import PartitionSpec
+    from sharded import Shard
+
+    form = "rated scan" if choice == recurrence_chunk.SCAN.choice else "gated delta net"
+    # A TPU's scan over fp32, as its cases run it (`TPU_CASES`).
+    target, dtype = ("v6e", "float32") if kernel == "tpu" else ("sm90", "bfloat16")
+    case = {"generation": target, "form": form, "kernel": kernel, "dtype": dtype, "documents": "packed"}
+    hooks, starts = FORMS[form], _starts(case)
+
+    def truth(operands):
+        return _wide(token_by_token(hooks, dataclasses.replace(operands, starts=starts)))
+
+    def specs(axis: str):
+        def placed(leaf) -> PartitionSpec:
+            return PartitionSpec(axis) if leaf.ndim >= 3 else PartitionSpec()
+
+        def laid(mesh) -> list:
+            del mesh
+            operands, cotangents = _drawn(case, 0)
+            return [jax.tree.map(placed, operands), jax.tree.map(placed, cotangents)]
+
+        return laid
+
+    return {axis: Shard(_step(case, kernel), functools.partial(_drawn, case), specs(axis),
+                        with_gradients(truth), SHARDED_SEEDS, axis, target=target)
+            for axis in ("data", "fsdp")}

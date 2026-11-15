@@ -57,21 +57,22 @@ KERNELS = {"rms_norm": frozenset({KERNEL}), "swiglu": frozenset({KERNEL})}
 """The kernels under test of each choice the cells run: each op's Pallas kernel."""
 
 
-def _entry(case: dict[str, str], output):
+def _entry(case: dict[str, str], output, axes=None):
     """`case`'s public entry as a function of its operands, its norm rounding to `output` (the products take
-    their operands' dtype): the weight is Gemma's, `1 + w` rounded after the cast, the most roundings a norm
-    makes."""
+    their operands' dtype), naming its activations' logical `axes` where its layer does (`per_shard`): the
+    weight is Gemma's, `1 + w` rounded after the cast, the most roundings a norm makes."""
     match case["form"]:
         case "plain":
-            return lambda x, scale: norms.rms_normalized(x, scale, EPSILON, output, **WEIGHT)
+            return lambda x, scale: norms.rms_normalized(x, scale, EPSILON, output, **WEIGHT, axes=axes)
         case "stream":
             return lambda x, branch, scale: norms.stream_rms_normalized(x, branch, scale, EPSILON, output,
-                                                                        **WEIGHT)
+                                                                        **WEIGHT, axes=axes)
         case "gated":
-            return lambda x, gate, scale: norms.gated_rms_normalized(x, gate, scale, EPSILON, output, "silu")
+            return lambda x, gate, scale: norms.gated_rms_normalized(x, gate, scale, EPSILON, output, "silu",
+                                                                     axes=axes)
         case "apart":
-            return activations.gated_product("swiglu")
-    return activations.packed_gated_product("swiglu")
+            return activations.gated_product("swiglu", axes=axes)
+    return activations.packed_gated_product("swiglu", axes=axes)
 
 
 def _named(case: dict[str, str], kernel: str) -> dict[str, str]:
@@ -79,9 +80,10 @@ def _named(case: dict[str, str], kernel: str) -> dict[str, str]:
     return {**dict.fromkeys(CHOICES, REFERENCE), case["op"]: kernel}
 
 
-def _call(case: dict[str, str], kernel: str):
-    """`case`'s entry through its op's selector named `kernel`, as a function of its operands."""
-    entry = _entry(case, jnp.dtype(case["dtype"]))
+def _call(case: dict[str, str], kernel: str, axes=None):
+    """`case`'s entry through its op's selector named `kernel`, as a function of its operands, naming its
+    activations' logical `axes` where given (`_entry`)."""
+    entry = _entry(case, jnp.dtype(case["dtype"]), axes)
 
     def call(*operands):
         with generation.chosen(**_named(case, kernel)):
@@ -196,3 +198,51 @@ def a_fused_entrys_training_step_is_on_par(case: tuple[str, ...]) -> None:
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] != combination["op"] and pair[1] != REFERENCE)
     assert (combination["op"], KERNEL) in recorded and not unnamed, (sorted(recorded), unnamed)
+
+
+def per_shard(choice: str, kernel: str) -> dict:
+    """`kernel`'s per-shard cells (`sharded.Shard`, tests/test_per_shard.py): each form of `choice`'s entry
+    (`FORMS`) at a ragged width, called as its layer calls it, naming its activations' logical axes (a
+    norm's the residual stream's, `sharding.RESIDUAL`; a product's the MLP's hidden ones,
+    `sharding.MLP_HIDDEN`), over each mesh axis those axes are split on (`dew.mesh.logical_spec` under the
+    default rules, a two-device mesh of that axis alone): every activation placed as that spec places the
+    rows (a packed product's pair axis whole), a norm's weight whole."""
+    from flax import linen as nn
+    from jax.sharding import AbstractMesh, PartitionSpec
+    from sharded import Shard
+
+    from dew.mesh import DEFAULT_RULES, MESH_AXES, logical_spec
+    from dew.nn.sharding import MLP_HIDDEN, RESIDUAL
+
+    axes = MLP_HIDDEN if choice == "swiglu" else RESIDUAL
+    rows = (*LEAD, WIDTHS["ragged"])
+
+    def laid(split: str) -> PartitionSpec:
+        mesh = AbstractMesh(tuple(2 if axis == split else 1 for axis in MESH_AXES), MESH_AXES)
+        return logical_spec(axes, rows, rules=DEFAULT_RULES, mesh=mesh)
+
+    def named(spec: PartitionSpec) -> set[str]:
+        return {name for each in spec if each is not None
+                for name in ((each,) if isinstance(each, str) else each)}
+
+    splits = {split: laid(split) for split in MESH_AXES}
+    splits = {split: spec for split, spec in splits.items() if split in named(spec)}
+
+    def cell(form: str, split: str) -> Shard:
+        case = {"generation": "sm90", "op": choice, "form": form, "dtype": "bfloat16", "width": "ragged"}
+        spec = splits[split]
+
+        def placed(leaf) -> PartitionSpec:
+            if leaf.ndim == 1:
+                return PartitionSpec()
+            # A packed product's pair axis, beside its hidden width, whole.
+            return spec if leaf.ndim == len(rows) else PartitionSpec(*spec[:-1], None, spec[-1])
+
+        def specs(mesh) -> list:
+            del mesh
+            return [jax.tree.map(placed, operand) for operand in _spec(case)]
+
+        return Shard(with_gradients(_call(case, kernel, axes)), _drawn(case), specs, _truth(case),
+                     SEEDS[case["width"]], split, context=lambda: nn.logical_axis_rules(DEFAULT_RULES))
+
+    return {f"{form}-{split}": cell(form, split) for form in FORMS[choice] for split in splits}
