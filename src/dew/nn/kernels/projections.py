@@ -82,7 +82,13 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
         return None
     edge = SCALE_DEPTH
     if (placed := explicit_spec(rows)) is not None and placed.spec[0] is not None:
-        return _projected_apart(rows, matrix, group_sizes, out_dtype=out_dtype, bias=bias, placed=placed)
+        return _projected_apart(rows, matrix, group_sizes, out_dtype=out_dtype, bias=bias,
+                                mesh=placed.mesh, along=placed.spec[0])
+    if (split := rows_split(rows)) is not None:
+        # Rows the mesh's automatic axes split alone (a data-parallel run's, row 6719): each device's rows
+        # its own projection, as an Explicit axis's are; a launch reads its operands whole.
+        return _projected_apart(rows, matrix, group_sizes, out_dtype=out_dtype, bias=bias,
+                                mesh=jax.sharding.get_abstract_mesh(), along=split[0])
     stacked = matrix if matrix.ndim == 3 else matrix[None]
     groups, count = stacked.shape[0], rows.shape[0]
     sizes = (jnp.full((1,), count, jnp.int32) if group_sizes is None
@@ -108,16 +114,17 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     return out.astype(out_dtype)
 
 
-def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, placed) -> jax.Array:
-    """`recipe_projection` of rows an Explicit mesh axis splits (rows 4854, 4859): each device's rows its own
+def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, mesh, along) -> jax.Array:
+    """`recipe_projection` of rows `mesh`'s axes `along` split, Explicit (rows 4854, 4859) or automatic alone
+    (row 6719): each device's rows its own
     projection (`jax.shard_map` over the axes splitting the rows), laid in whole 128-row blocks of its own
     as a data-parallel recipe quantizes them, the matrices and bias whole on every device and their
     gradients summed over the devices (shard_map's transpose). Experts' sizes count every device's rows
     together, each group's after the last's: a device's groups are its share of each (`_local_sizes`)."""
     from dew.mesh import mesh_axes
 
-    names = mesh_axes(placed.spec[0])
-    split = jax.sharding.PartitionSpec(placed.spec[0], None)
+    names = mesh_axes(along)
+    split = jax.sharding.PartitionSpec(along, None)
     whole = jax.sharding.PartitionSpec()
     extra = tuple(each for each in (group_sizes, bias) if each is not None)
 
@@ -131,7 +138,7 @@ def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, placed) -> j
     # The recipe's own loops start their sums typed for no device (`xla_products.step_scaled`'s carry), so
     # the program is not checked for the devices' varying values (`check_vma`); each device's rows are its
     # own by the specs, and the whole operands' gradients sum over the devices as shard_map transposes them.
-    return jax.shard_map(projected, mesh=placed.mesh, in_specs=(split, whole, *(whole,) * len(extra)),
+    return jax.shard_map(projected, mesh=mesh, in_specs=(split, whole, *(whole,) * len(extra)),
                          out_specs=split, axis_names=frozenset(names), check_vma=False)(rows, matrix, *extra)
 
 

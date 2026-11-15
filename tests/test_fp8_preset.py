@@ -346,10 +346,13 @@ def test_an_mxfp8_product_of_operands_whose_scales_are_subnormal_is_their_value(
     np.testing.assert_array_equal(np.asarray(out, np.float32), 32.0)
 
 
-def test_a_recipe_projection_of_rows_an_explicit_axis_splits_is_each_devices_own():
-    """Row 4854: under the 'fp8' numerics, a dense projection of rows an Explicit data axis splits over eight
-    devices (`projections.recipe_projection`, through a layer's product too: `projections.dot_general`'s
-    `recipe_general`) runs each device's rows apart (`projections._projected_apart`, `jax.shard_map`), each
+@pytest.mark.parametrize("explicit", [True, False], ids=["explicit", "automatic"])
+def test_a_recipe_projection_of_rows_a_data_axis_splits_is_each_devices_own(explicit):
+    """Rows 4854 and 6719: under the 'fp8' numerics, a dense projection of rows a data axis splits over
+    eight devices, Explicit or automatic (a data-parallel run's mesh, where a launch reading its operands
+    whole refused the unmapped rows; `projections.recipe_projection`, through a layer's product too:
+    `projections.dot_general`'s `recipe_general`) runs each device's rows apart
+    (`projections._projected_apart`, `jax.shard_map`), each
     laid in whole 128-row blocks of its own: its value and the rows' gradient bitwise each device's rows'
     projection alone, the matrix's gradient their gradients' sum. Integers, so every quantization and sum is
     exact whatever adds them."""
@@ -369,12 +372,13 @@ def test_a_recipe_projection_of_rows_an_explicit_axis_splits_is_each_devices_own
             return (value, *pull(cotangent))
 
     alone = [jax.jit(pulled)(rows[i:i + 1], matrix, cotangent[i:i + 1]) for i in range(8)]
-    mesh = MeshSpec(explicit=("data",)).build(jax.devices()[:8])
+    mesh = (MeshSpec(explicit=("data",)) if explicit else MeshSpec()).build(jax.devices()[:8])
     with jax.set_mesh(mesh):
         split = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None, None))
         value, d_rows, d_matrix = jax.jit(pulled)(jax.device_put(rows, split), matrix,
                                                   jax.device_put(cotangent, split))
-        assert jax.typeof(value).sharding.spec[0] == "data"
+        # An Explicit axis's split is the value's type; an automatic one's, the partitioner's placement.
+        assert (jax.typeof(value) if explicit else value).sharding.spec[0] == "data"
     each = [[np.asarray(leaf) for leaf in leaves] for leaves in alone]
     np.testing.assert_array_equal(np.asarray(value), np.concatenate([leaves[0] for leaves in each]))
     np.testing.assert_array_equal(np.asarray(d_rows), np.concatenate([leaves[1] for leaves in each]))
