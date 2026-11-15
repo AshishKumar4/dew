@@ -401,6 +401,10 @@ class _Paired:
     pairing: _Pairing
     without: Callable
     plain: Callable
+    ahead: dict = dataclasses.field(default_factory=dict, compare=False)
+    """`without` compiled ahead on the site's first draw to decide its pairing (`_ynn_decided`), by its
+    inputs' signature (`_signature`): the program the arm runs on draws of that signature, never compiled
+    twice."""
 
     @property
     def without_ynn(self) -> bool:
@@ -408,13 +412,28 @@ class _Paired:
         return not self.pairing.with_ynn
 
     def __call__(self, *inputs, **options):
-        return (self.plain if self.pairing.with_ynn else self.without)(*inputs, **options)
+        if self.pairing.with_ynn:
+            return self.plain(*inputs, **options)
+        compiled = None if options else self.ahead.get(_signature(inputs))
+        return (compiled or self.without)(*inputs, **options)
 
     @property
     def trace(self):
         """The trace of the arm the site runs (JAX's `jit(...).trace`), where it is a compiled program's:
         an arm of Dew's own programs has none."""
         return (self.plain if self.pairing.with_ynn else self.without).trace
+
+
+def _signature(inputs) -> tuple:
+    """A draw's inputs as a compiled program takes them: their tree, and each leaf's shape, dtype and weak
+    type, a JAX array's sharding too (a host array or a Python number is placed as the call places it)."""
+    leaves, tree = jax.tree.flatten(inputs)
+    def taken(leaf) -> tuple:
+        if isinstance(leaf, jax.Array):
+            return leaf.shape, leaf.dtype, leaf.weak_type, leaf.sharding
+        return np.shape(leaf), np.result_type(leaf), isinstance(leaf, (bool, int, float, complex))
+
+    return tree, tuple(taken(leaf) for leaf in leaves)
 
 
 def _paired_arms(arms) -> list[_Paired]:
@@ -444,9 +463,17 @@ def _ynn_decided(label: str, arms, inputs) -> None:
     its findings (`_with_mode`). One the fusions refuse too raises, and so does a process whose XLA refuses
     the options themselves (`_ynn_option_held`). An arm running Dew's own programs through Dew's
     seam (`dew_programs`) compiles at its call, without them, as does a window loop's arm, whose program
-    takes each window's slices and not the draw (`over_windows`)."""
+    takes each window's slices and not the draw (`over_windows`). An arm compiled ahead runs that program on
+    draws of its signature (`_Paired.ahead`), compiled once. Off XLA:CPU, which alone has the fusions,
+    nothing is compiled ahead: the arms run as they compile."""
     pairings = {arm.pairing for arm in _paired_arms(arms)}
     if not pairings or all(pairing.decided for pairing in pairings):
+        return
+    if jax.default_backend() != "cpu":
+        # YNNPACK's fusions are XLA:CPU's: elsewhere an arm compiles one way (`without_ynn`), and a compile
+        # ahead to decide them would be its second.
+        for pairing in pairings:
+            pairing.decided = True
         return
     _ynn_option_held()
     refused = None
@@ -456,7 +483,7 @@ def _ynn_decided(label: str, arms, inputs) -> None:
         if not isinstance(arm, _Paired) or not hasattr(arm.without, "lower"):
             continue
         try:
-            arm.without.lower(*inputs).compile()
+            arm.ahead[_signature(inputs)] = arm.without.lower(*inputs).compile()
         except jax.errors.JaxRuntimeError as error:
             arm.plain.lower(*inputs).compile()
             refused = refused or str(error).splitlines()[0]
