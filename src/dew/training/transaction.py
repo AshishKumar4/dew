@@ -493,11 +493,12 @@ def _formed(before: Variables, slots_before: optax.OptState, after: Variables, s
     the state by its own; and whether every leaf was written. A leaf's gate reads that leaf alone, so the
     step holds no state beside another's (training.md, a step that is not finite)."""
     def finite(leaf) -> jax.Array:
-        inexact = jnp.issubdtype(jnp.result_type(leaf), jnp.inexact)
+        # An array's own; a masked group's placeholder (`optax.MaskedNode`) holds no value.
+        inexact = isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)
         return jnp.isfinite(leaf).all() if inexact else jnp.asarray(a=True)
 
     def chosen(flag, new, old):
-        return jnp.where(flag, new, old)
+        return jnp.where(flag, new, old) if isinstance(new, jax.Array) else new
 
     copies_after, copies_before = _param_copies(slots_after, after), _param_copies(slots_before, before)
     flags = jax.tree.map(lambda leaf, *copies: functools.reduce(jnp.logical_and, map(finite, copies),
@@ -506,7 +507,8 @@ def _formed(before: Variables, slots_before: optax.OptState, after: Variables, s
     slots = _with_copies(slots_after, after, lambda index, copy: jax.tree.map(
         chosen, flags, copy, copies_before[index]))
     slots = jax.tree.map(lambda new, old: chosen(finite(new), new, old), slots, slots_before)
-    held = [*jax.tree.leaves(flags), *map(finite, jax.tree.leaves(slots_after))]
+    # Every leaf written, the hyperparameters injected beside a state aside (`checked`'s view).
+    held = [*jax.tree.leaves(flags), *map(finite, jax.tree.leaves(_numerical(slots_after)))]
     every = functools.reduce(jnp.logical_and, held, jnp.asarray(a=True))
     return kept, slots, every
 
@@ -582,11 +584,16 @@ def checked(state: TrainState | ReplicaState) -> dict[str, Variables | optax.Opt
     (`dew.training.trainer.refuse_non_finite`) read. The optimizer state is read without the
     hyperparameters injected beside it (`dew.optim_schedules.INJECTED`): control values a schedule or the
     user sets, not written by a step's gradient, and legally infinite (a clip's bound of `math.inf`)."""
+    return {"variables": state.variables, "opt_state": _numerical(state.opt_state), "ema": state.ema}
+
+
+def _numerical(opt_state: optax.OptState) -> optax.OptState:
+    """`opt_state` without the hyperparameters injected beside it (`dew.optim_schedules.INJECTED`): the
+    state a step's gradients write, which `checked` and `_formed` read."""
     def numerical(node):
         return node._replace(hyperparams={}) if isinstance(node, INJECTED) else node
 
-    opt_state = jax.tree.map(numerical, state.opt_state, is_leaf=lambda node: isinstance(node, INJECTED))
-    return {"variables": state.variables, "opt_state": opt_state, "ema": state.ema}
+    return jax.tree.map(numerical, opt_state, is_leaf=lambda node: isinstance(node, INJECTED))
 
 
 def _finite(leaf: jax.Array) -> jax.Array:

@@ -2457,16 +2457,15 @@ def test_a_state_built_from_a_held_tree_steps_without_freeing_the_tree():
     assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(objective.variables))
 
 
-def poisoned_third_update() -> optax.GradientTransformation:
-    """SGD at 0.1 whose third update is not finite though its gradient is, which a step therefore admits."""
-    def init(params):
-        return jnp.zeros((), jnp.int32)
-
-    def update(updates, count, params=None):
-        poisoned = jax.tree.map(lambda leaf: jnp.where(count == 2, jnp.nan, leaf), updates)
-        return poisoned, count + 1
-
-    return optax.chain(optax.sgd(0.1), optax.GradientTransformation(init, update))
+def poisoned_third_step(objective, optimizer):
+    """A step of its own (`Trainer(step=)`) that moves every parameter by 0.1, its third not finite: what a
+    save's refusal backs up, the built-in step writing nothing that is not finite."""
+    def step(state, batch):
+        moved = jax.tree.map(lambda leaf: jnp.where(state.updates == 2, jnp.nan, leaf - 0.1),
+                             state.variables["params"])
+        return (state.replace(variables={**state.variables, "params": moved}, microstep=state.microstep + 1,
+                              updates=state.updates + 1), jnp.zeros([], jnp.float32), Aux({}))
+    return step
 
 
 @pytest.mark.parametrize("tier", ["persistent", "local",
@@ -2474,21 +2473,20 @@ def poisoned_third_update() -> optax.GradientTransformation:
 def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path, tier):
     """A save that meets a state holding a non-finite value writes nothing and rotates nothing out, on either
     tier: the run stops there, and the checkpoint a resume finds is the last finite one, its parameters
-    finite (row 6699). A run whose third update is not finite (`poisoned_third_update`), checkpointed every
+    finite (row 6699). A run whose third step is not finite (`poisoned_third_step`), checkpointed every
     step and keeping two (`persistent`), saved its non-finite parameters at steps 3 and 4 and rotated its good
     checkpoints out; one that writes a local copy every second step and a persistent one every tenth
     (`local`) wrote its step-4 local copy unchecked, and a resume restored it (train 901's review, F1); a
     DiLoCo run's replicas' inner copies, which its next meeting averages into the outer model, saved
     unchecked between meetings (`diloco`, train 904's review, F3)."""
     def trainer():
-        solver = poisoned_third_update()
         if tier == "diloco":
             # Two replicas meeting every fourth step: the third update poisons their inner copies mid-period.
-            return make_trainer(tmp_path, optimizer=solver, keep=2,
+            return make_trainer(tmp_path, step=poisoned_third_step, keep=2,
                                 mesh=MeshSpec(diloco=2).build(jax.devices()[:2]),
                                 diloco=DiLoCo(every=4, rate=0.7, momentum=0.9))
-        return (make_trainer(tmp_path, optimizer=solver, keep=2) if tier == "persistent"
-                else local_trainer(tmp_path, optimizer=solver))
+        return (make_trainer(tmp_path, step=poisoned_third_step, keep=2) if tier == "persistent"
+                else local_trainer(tmp_path, step=poisoned_third_step))
 
     with pytest.raises(RuntimeError):
         trainer().fit(dataset(), steps=5, log_every=100,

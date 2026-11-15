@@ -148,7 +148,7 @@ def _written(tree, layer, index):
 def _finite(tree) -> jax.Array:
     """Whether every inexact leaf of `tree` is finite throughout."""
     flags = [jnp.isfinite(leaf).all() for leaf in jax.tree.leaves(tree)
-             if jnp.issubdtype(jnp.result_type(leaf), jnp.inexact)]
+             if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)]
     return jnp.logical_and.reduce(jnp.stack(flags)) if flags else jnp.asarray(a=True)
 
 
