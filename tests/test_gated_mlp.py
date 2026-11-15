@@ -102,33 +102,38 @@ def test_a_gated_mlp_runs_fused_where_named_and_its_products_apart_where_no_rece
         assert kernels(plain, gated_mlp="fused") == ["apart"]
 
 
-@pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("generation_name", generations("sm90", "sm100"))
 def test_a_gated_mlp_named_fused_on_a_data_split_mesh_runs_its_products_per_shard(generation_name):
-    """A `GatedMLP` named fused on a mesh whose data axis splits its rows alone, traced as a training step
-    traces it (the trainer's layout, `placing`, under the default rules), runs its three products fused on
-    each device's own rows (`gated_mlp._placement`: a map per shard, its kernels gathered whole there), as
-    a projection's product maps its rows (`projections.mapped_shards`), where the template's launch was
-    refused the split rows (row 6594). Its numerics per shard are the matrix's (tests/gated_mlp_matrix.py)."""
+    """A `GatedMLP` named fused on a run's mesh of two compile-only GPUs whose data axis splits its rows,
+    lowered as a training step traces it (the trainer's layout, `placing`, under the default rules), runs
+    its three products fused on each device's own rows (`gated_mlp._placement`: a map per shard, its kernels
+    gathered whole there), as a projection's product maps its rows (`projections.mapped_shards`), where the
+    template's launch was refused the split rows (row 6594): its launches read one device's rows and each
+    kernel whole, none both devices' rows. Its numerics per shard are the matrix's
+    (tests/gated_mlp_matrix.py)."""
     from flax import linen as nn
+    from jax.sharding import PartitionSpec
+    from kernel_compile import Expected, lowered_for
 
-    from dew.distributed.placement import Layout, MeshSpec
-    from dew.mesh import DEFAULT_RULES
+    from dew.distributed.placement import Layout
+    from dew.mesh import DATA_AXIS, DEFAULT_RULES, MESH_AXES
+    from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.mlp import GatedMLP
     from dew.nn.sharding import placing
 
     layer = GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, dtype=jnp.bfloat16)
     x = jax.ShapeDtypeStruct((2, 64, FEATURES), jnp.bfloat16)
     params = jax.eval_shape(layer.init, jax.random.key(0), x)
-    # A run's mesh of two devices, its data axis taking both (`MeshSpec`), each other axis one.
-    mesh = generation.gpu_mesh(MeshSpec().build(jax.devices()[:2]), generation_name)
-    with (generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh),
-          nn.logical_axis_rules(DEFAULT_RULES), placing(Layout(min_shard=1)),
+    # A run's mesh (`MeshSpec`'s axes): the data axis two devices, every other one.
+    mesh = Expected(tuple((axis, 2 if axis == DATA_AXIS else 1) for axis in MESH_AXES),
+                    (None, PartitionSpec(DATA_AXIS)), frozenset())
+    with (nn.logical_axis_rules(DEFAULT_RULES), placing(Layout(min_shard=1)),
           generation.chosen(grouped_matmul="mosaic", gated_mlp="fused"), generation.routes() as routes):
-        traced = jax.make_jaxpr(layer.apply)(params, x)
+        lowered = lowered_for(layer.apply, (params, x), generation_name, mesh)
     assert [route.kernel for route in routes if route.choice == "gated_mlp"] == ["fused"]
-    assert traced.out_avals[0].shape == (2, 64, FEATURES)
-    assert "shard_map" in str(traced)
+    read = {shape for call in kernel_calls(lowered) if call.kind == "mosaic_gpu" for shape in call.operands}
+    assert {(64, FEATURES), (FEATURES, HIDDEN), (HIDDEN, FEATURES)} <= read, read
+    assert (128, FEATURES) not in read, read
 
 
 def test_a_gated_mlps_case_runs_at_the_dtype_its_products_run_and_asks_nothing_apart():
