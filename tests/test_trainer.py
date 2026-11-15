@@ -2288,7 +2288,7 @@ def test_only_the_held_arrays_an_output_takes_over_are_donated():
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from jax.tree_util import Partial
 
-    from dew.training.distributed import placed_held, taking_over
+    from dew.training.distributed import placed_held, start_program, taking_over
 
     mesh = Mesh(np.array(jax.devices()), ("fsdp",))
     rows = 8 * jax.device_count()
@@ -2311,8 +2311,8 @@ def test_only_the_held_arrays_an_output_takes_over_are_donated():
     assert kept.keywords["variables"]["params"]["kernel"] is None
     with warnings.catch_warnings():
         warnings.filterwarnings("error", "Some donated buffers were not usable")
-        state = taking_over(lambda initializer, key: initializer(key), taken, kept, shardings)(
-            jax.random.key(0))
+        program = start_program(lambda initializer, key: initializer(key), shardings, taken)
+        state = taking_over(program, taken, kept)(jax.random.key(0))
     assert copy.is_deleted()
     assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(kept))
     assert not any(leaf.is_deleted() for leaf in (kernel, bias, table))
