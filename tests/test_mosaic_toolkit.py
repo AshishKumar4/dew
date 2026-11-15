@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, declared_outputs, runs
+from generation_support import INTERPRETS, declared_outputs
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
@@ -1756,7 +1756,8 @@ def test_groups_summed_together_stage_no_operand_into_a_tile_a_product_in_flight
         in_flight = (in_flight or event == "tcgen05_mma") and event != "barrier_wait"
 
 
-@runs("sm100")
+@pytest.mark.skipif(generation.device_generation() != "sm100",
+                    reason="a tcgen05 product's late operand read is the device's alone")
 @pytest.mark.parametrize("shared", [True, False], ids=["one tile", "a tile each"])
 def test_groups_summed_together_from_staged_operands_are_each_its_own_sum(shared):
     """On a B200: two groups summed by one issuer on tcgen05's chunks (`operands.Issuer.summed_together`),
