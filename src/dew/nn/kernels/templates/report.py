@@ -667,15 +667,18 @@ def missed(op, arguments: tokamax.BoundArguments, config: Hashable, refused: Seq
 
 def _certifying_device():
     """The device a launch is certified on (`certified`): a block's (`certifying`), else this process's GPU
-    where it compiles for that GPU's generation, else none."""
+    where it compiles for that GPU's own generation (`generation.device_target`, whatever `assumed` says: an
+    A100 tracing for an assumed sm90 compiled the sm90 launch on itself, and Mosaic refused its TMA copies,
+    rows 6677 and 6678), else none."""
     named = _CERTIFYING.get()
     if named is not None:
         return named
     if jax.default_backend() != "gpu":
         return None
-    if generation.device_generation() != generation.gpu_target().generation:
+    device = jax.local_devices()[0]
+    if generation.device_target(device).generation != generation.gpu_target().generation:
         return None
-    return jax.local_devices()[0]
+    return device
 
 
 def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, device,
@@ -706,7 +709,15 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
             out, pullback = jax.vjp(launch, *operands)
             return out, pullback(jax.tree.map(_unit_cotangent, out))
 
-        lowered = owned_program(pulled_back if reverse else launch).trace(*specs).lower()
+        def certified(*operands):
+            return (pulled_back if reverse else launch)(*operands)
+
+        # Named by its launch and config in JAX's trace, lowering and compile events, so a start's receipt
+        # tells each certification's program apart: its op, its launch's identity and its config, digested.
+        certified.__name__ = certified.__qualname__ = (
+            f"certified_{type(op).__name__}_l{_digest(_identity(op, arguments))}_c{_digest(repr(config))}"
+            f"{'_reverse' if reverse else ''}")
+        lowered = owned_program(certified).trace(*specs).lower()
     # A Mosaic GPU kernel compiled alone is the one its program loads (Mosaic compiles a module once a
     # process). A Pallas-Triton kernel compiles again with each executable, the same kernel the same binary:
     # read here too, its call's config its identity, so its derivation steps a spilling config at trace as a
@@ -1283,13 +1294,12 @@ def _held(found: list, program: jax.stages.Lowered) -> None:
         return
     modules = kernel_modules(kernel_calls(program, unrun=True))
     verdicts: dict[tuple[str, Hashable, bool], dict[str, tuple[str, Binary]]] = {}
-    for refusal, binary, _ in found:
-        launch = None if binary.launch is None else traced(binary.launch)
+    for refusal, binary, launch in found:
         if refusal is None or launch is None:
             continue
+        identity, config = refusal
         name = launch_name(binary.kernel, binary.launch)
-        verdicts.setdefault((launch.identity, launch.config, launch.reverse), {})[name] = (
-            modules.get(name, ""), binary)
+        verdicts.setdefault((identity, config, launch.reverse), {})[name] = (modules.get(name, ""), binary)
     for (identity, config, reverse), kernels in verdicts.items():
         if (key := _verdict_key(identity, config, reverse)) is not None:
             tuning.store_verdict(device.device_kind, key, kernels)

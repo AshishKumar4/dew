@@ -8,13 +8,13 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
+- The attention launches' outputs state no dimensions. [6733]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
 - One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427, 1701, 5739]
 - The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293, 5368]
-- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 5895, 5988, 6008, 6010, 6536]
 - Inference through the templates. [3424, 3602]
 - Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5322, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 5900]
 - The kernel challenge's lessons in the templates. [5271]
@@ -26,10 +26,12 @@ This page is generated from the maintainers' findings ledger as each change land
 - Kernel-templates.md section 10. [6473]
 - The contract's guard, tests/test_declared_cells_memory.py, runs over every instruction family a GPU target claims. [6474]
 - The resource gate, now compiling a training case's forward with its kept memories as Mosaic.launches(backward=True) plans. [6553]
+- A Mamba-2 decoder's (and the parallel mixer's) trainer step does not compile on an H100. [6718]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
 - Native TPU GEMM dispatch. [1560]
+- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 5895, 5988, 6008, 6010]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product. [4860]
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5278, 5327]
 - Derived resources: tiles, registers, residency and issued work. [5567]
@@ -68,6 +70,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Time to first step: the compile path's re-derivations. [5556, 5558]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
+- CI time: every test within 120 seconds. [6731]
 - XLA:CPU edges. [1591]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
 - A fact and a question for the step's owner. [6646]
@@ -90,7 +93,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Algebra
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235, 5239]
-- Every MAINPERF measurement since 2026-11-09. [6045]
 - Spec alignment 2026-11-15 §2 (algebra.md §2:259, §6.2:491-496. [6672]
 - Spec alignment 2026-11-15 §3 (algebra.md §6.1:425 context is every derivation's key. [6673]
 - Bit-level synthesis in dew.algebra. [3733]
