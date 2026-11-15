@@ -1148,15 +1148,18 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
     def summed(self, shape: tuple[int, int], issue) -> jax.Array:
         return self._summed(shape, issue)
 
-    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple) -> tuple[Callable, ...]:
+    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False
+                        ) -> tuple[Callable, ...]:
         """`Issuer.summed_together` in tensor memory: each group issued into its own accumulator of the
         role's together scratch (`product_scratch`'s `together`, a width's groups its accumulators in turn),
         then one commit and one wait for every group, each group's reader then reading its accumulator, until
         the role's next groups summed together: a group's commit and wait no longer stand between the next
         group's issue and its own (a persistent recurrence gradient waited on six commits a tile, each ~600
         cycles, its value products independent). The commit follows every group's issue, so it never stands
-        behind a wait with nothing pending (row 5671). A group narrower than `PADDED` is summed where its
-        reader is called, as every other issuer sums each."""
+        behind a wait with nothing pending (row 5671). `apart`, each group committed and awaited before the
+        next issues, in the same accumulators: groups staging their operands into shared tiles, which a group
+        in flight still reads. A group narrower than `PADDED` is summed where its reader is called, as every
+        other issuer sums each."""
         if len(shapes) != len(issues):
             raise ValueError(f"{len(shapes)} groups' shapes for {len(issues)} groups")
         # A group narrower than `PADDED` pads its right operand into the role's one padded tile (`_padded`),
@@ -1180,13 +1183,16 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
                                  f"its program's product scratch holds {kept} (`product_scratch`'s together)")
             accumulators.append(_addressed_here(held[role][taken[width]], axis=1))
             taken[width] += 1
-        token = _TOGETHER.set(True)
-        try:
-            for tmem, index in zip(accumulators, wide, strict=True):
+        for tmem, index in zip(accumulators, wide, strict=True):
+            token = _TOGETHER.set(True)
+            try:
                 issues[index](Accumulator(tmem, shapes[index], accumulate=False))
-        finally:
-            _TOGETHER.reset(token)
-        self._waited(self._done())
+            finally:
+                _TOGETHER.reset(token)
+            if apart:
+                self._waited(self._done())
+        if not apart:
+            self._waited(self._done())
         for index, tmem in zip(wide, accumulators, strict=True):
             readers[index] = functools.partial(_read, tmem)
         return tuple(readers)
