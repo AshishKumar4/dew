@@ -184,11 +184,7 @@ def unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     another mainloop rather than a launch that cannot run; the backward's own launches hold the same tiles'
     operands."""
     op, args, _ = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
-    # The scaled op too where the call's values can take it (`_fwd`): a call some row of which can be scaled
-    # launches its kernel, its own tiles (`TritonForward.scaled`).
-    scaling = certified and algebra.headroom(value.dtype)
-    ops = (op, dataclasses.replace(op, scaled=True)) if scaling else (op,)
-    for each in ops:
+    for each in op.launched_ops(value.dtype) if certified else (op,):
         refused = _holding(each, each.bind(*args, residuals=_kept(residuals), interpret=False), "forward",
                            certified=certified)
         if refused is not None:
@@ -339,6 +335,14 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
     launches in its common op's place (`_fwd`, `algebra.may_scale`), its own tiles derived from its own
     registers and shared memory (`registers`, `staged_bytes`)."""
 
+    def launched_ops(self, dtype) -> tuple["TritonForward", ...]:
+        """The ops a call of values `dtype` launches (`_fwd`): this op, and where it walks unscaled and the
+        values can pass fp32's largest (`algebra.headroom`), the scaled op a call some row of which can be
+        scaled launches in its place (`algebra.may_scale`), its own tiles (`scaled`)."""
+        if self.scaled or not algebra.headroom(dtype):
+            return (self,)
+        return self, dataclasses.replace(self, scaled=True)
+
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, m0, total0,
              acc0, *, residuals: bool | Kept, interpret: bool, config: Tiles, return_residuals: bool = False):
         residuals = _kept(residuals)
@@ -346,12 +350,13 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
                      total0, acc0)
         walk = functools.partial(self._walk, *arguments, residuals=residuals, interpret=interpret,
                                  config=config)
-        if self.scaled or not algebra.headroom(value.dtype):
+        ops = self.launched_ops(value.dtype)
+        if len(ops) == 1:
             return walk(scaled=self.scaled), None
         # A call some row of which can be scaled (`algebra.may_scale`) launches the scaled op's kernel (its
         # own tiles, `scaled`), every other call, every ordinary input's, this op's unscaled one, bit for bit
         # the scaled walk's there.
-        scaled_op = dataclasses.replace(self, scaled=True)
+        scaled_op = ops[1]
 
         def rare():
             # A pin of this op's where the scaled op can take it, else its own tiles
