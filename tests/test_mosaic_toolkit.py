@@ -608,12 +608,15 @@ def _termwise_operands():
 @INTERPRETS
 def test_a_sum_of_three_part_products_is_as_accurate_as_fp32():
     """Interpreted: the sum over two slices of fp32 products whose operands each take three parts, one a
-    shared tile's parts and one staged from registers: within fp32's rounding of the float64 sum, where a
-    product of the parts' leading terms alone is bfloat16's."""
+    shared tile's parts and one staged from registers: within an fp32 reduction's bound of the float64 sum,
+    where a product of the parts' leading terms alone is bfloat16's."""
+    from reference_error import assert_fp32_reduction_bound
+
     a, b = _termwise_operands()
-    expected = np.einsum("cij,cjk->ik", np.asarray(a, np.float64), np.asarray(b, np.float64))
-    np.testing.assert_allclose(np.asarray(_termwise_sums(a, b, interpret=INTERPRETED)), expected,
-                               rtol=1e-5, atol=1e-3)
+    wide = [np.asarray(x, np.float64) for x in (a, b)]
+    # Each output an fp32 sum of six terms a product, over two slices of ISSUED products.
+    assert_fp32_reduction_bound(_termwise_sums(a, b, interpret=INTERPRETED), np.einsum("cij,cjk->ik", *wide),
+                                np.einsum("cij,cjk->ik", *map(np.abs, wide)), terms=2 * ISSUED * 6)
 
 
 def test_a_sum_of_three_part_products_holds_one_accumulator_a_term_one_at_a_time():
