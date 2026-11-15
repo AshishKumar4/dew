@@ -703,11 +703,12 @@ def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads
     def used(rows, *, copies):
         return free - trained(copies=copies, rows=rows)[2].plan["probes"][0]["headroom"]
 
-    shorter, longer, longer_without = used(8, copies=True), used(64, copies=True), used(64, copies=False)
-    free = max(shorter, longer_without)
-    assert free < longer
+    free = max(used(8, copies=True), used(64, copies=False))
     if not drawing():
-        # The run's own plan, which a map task's draws need not see: its judge holds it.
+        # The longer batch with its copies past that memory, and the run's own plan, which a map task's
+        # draws need not see: its judge holds them, a map task sizing two plans where it sized three
+        # (139 to 188 s a task of two draws on armada, row 6351).
+        assert free < used(64, copies=True)
         narrow, _, trainer = trained(copies=True, longer=64, steps=3)
         assert not trainer.plan["narrow"] and narrow.compute is not None
         assert _copies_of(narrow)
