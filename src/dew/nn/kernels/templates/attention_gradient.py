@@ -33,7 +33,15 @@ from dew.nn.kernels.templates.attention_algebra import (
     tiles_walked,
     weights_parts,
 )
-from dew.nn.precision import Running, added_to, compensated_sum, compensates_loops, running_sum, running_total
+from dew.nn.precision import (
+    Running,
+    added_to,
+    compensated_sum,
+    compensates_loops,
+    running_sum,
+    running_total,
+    two_sum,
+)
 
 
 def tile_logits(score_mod, product: jax.Array, seen: jax.Array | None, q_pos, k_pos, params, *, scale: float,
@@ -420,8 +428,9 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     (`weighed`). In the accurate form dQ takes it too, less the refinement times its weights' product with
     the keys (`keyed`): a query's dQ cancels across its keys exactly as its cotangents sum to 0, so the D it
     takes must be the one whose cotangents do, not the first pass's; the fast form leaves dQ at the first
-    pass's (`dq_issued`). Returns dQ, the refined `D - c`, the denominator, the keys' share of the weights,
-    and the hook gradients."""
+    pass's (`dq_issued`). Returns dQ, the refined `D - c` rounded and what its rounding lost (`two_sum`: a
+    refinement below the rounded D's ulp, which an initial state's maximum's gradient reads, row 6302), the
+    denominator, the keys' share of the weights, and the hook gradients."""
     total = state_total + sums.mass
     ratio = jnp.where(total > 0, prior / jnp.where(total > 0, total, 1.0), 0.0)
     over = inverse(total)
@@ -429,8 +438,9 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     refined = refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
     grads = tuple(grad * ratio - refined * (weighed * over)
                   for grad, weighed in zip(sums.grads, sums.weighed, strict=True))
+    refined_delta, lost = two_sum(delta, refined)
     if not accurate:
-        return sums.dq * expand(ratio, sums.dq), delta + refined, total, mass, grads
+        return sums.dq * expand(ratio, sums.dq), refined_delta, lost, total, mass, grads
     # refined · mass · 2^shift · keyed, each factor's mantissa and exponent apart (`_split`), so no partial
     # product overflows or flushes where the correction is in range.
     refined_mantissa, refined_exponent = _split(refined)
@@ -439,7 +449,7 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
         expand(refined_mantissa * sums.keyed_mass, sums.keyed) * keyed_mantissa,
         expand(refined_exponent + sums.keyed_shift, sums.keyed) + keyed_exponent)
     dq = (sums.dq - correction) * expand(ratio, sums.dq)
-    return dq, delta + refined, total, mass, grads
+    return dq, refined_delta, lost, total, mass, grads
 
 
 def safe_peak(peak: jax.Array) -> jax.Array:

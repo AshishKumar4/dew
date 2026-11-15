@@ -46,7 +46,7 @@ from dew.nn.kernels.templates.attention import (
     coded,
     within,
 )
-from dew.nn.precision import float32_einsum, two_product, two_sum
+from dew.nn.precision import binade_of, float32_einsum, lowered_divide, raised_exactly, two_product, two_sum
 
 
 def folds(scale: float, prescale: float, *, natural: bool, score_mod) -> bool:
@@ -1774,13 +1774,35 @@ def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     return _derived_merged(spec, stacked, axis)
 
 
-def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool) -> jax.Array:
+def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool, subnormals: bool = False
+              ) -> jax.Array:
     """The weighted values `acc` over their denominator, any leading axes: zero for a query that saw nothing
-    where it may (`guarded`: a walk's whose row may see none, or one from a state)."""
+    where it may (`guarded`: a walk's whose row may see none, or one from a state); a subnormal ratio kept
+    where the arithmetic flushes one (`subnormals`, `quotient`)."""
     if not guarded:
-        return acc / expand(denominator, acc)
-    safe = expand(jnp.where(denominator > 0, denominator, 1.0), acc)
-    return jnp.where(expand(denominator > 0, acc), acc / safe, 0.0)
+        return quotient(lambda held: held / expand(denominator, held), acc, denominator,
+                        subnormals=subnormals)
+    safe = jnp.where(denominator > 0, denominator, 1.0)
+    out = quotient(lambda held: held / expand(safe, held), acc, safe, subnormals=subnormals)
+    return jnp.where(expand(denominator > 0, acc), out, 0.0)
+
+
+def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax.Array, *,
+             subnormals: bool) -> jax.Array:
+    """`ratio(acc)`, the weighted values `acc` `[..., Dv]` over their rows' `total` `[...]` as its caller
+    divides them; where the arithmetic flushes a subnormal result (`subnormals`: XLA's CPU, per primitive,
+    row 4023), each element whose quotient may fall below fp32's least normal divided raised to its row's
+    total's binade (`dew.nn.precision.raised_exactly`, from its bits) and taken back in the one rounding of
+    the correctly rounded division (`lowered_divide`): a subnormal one kept (row 6302); every other element's
+    bits the plain ratio's."""
+    plain = ratio(acc)
+    if not subnormals:
+        return plain
+    divisor = expand(total, acc)
+    apart = binade_of(acc) - binade_of(divisor)
+    raised = jnp.where(apart < -124, -apart, 0)
+    lifted = raised_exactly(acc, raised)
+    return jnp.where(raised > 0, lowered_divide(lifted, divisor, raised), plain)
 
 
 def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.Array, jax.Array]:
@@ -1798,16 +1820,20 @@ def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.
 
 
 def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable | None = None,
-           output_params: tuple[jax.Array, ...] = (), normalized: bool = False
+           output_params: tuple[jax.Array, ...] = (), normalized: bool = False, subnormals: bool = False
            ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
     that saw nothing and started from no state, then the output hook) and its residual rows
     (`finished_rows`); the output is the derived forms' ratio (`_derived_output`), which a scaled walk's
     rows' scale leaves (both its sums are at it). A `normalized` state's sums are its output already (a
-    merge of finished states, `finished_merged`): zero where it holds no mass."""
+    merge of finished states, `finished_merged`): zero where it holds no mass. Where its arithmetic flushes
+    a subnormal result (`subnormals`: a mainloop on XLA's CPU), its ratio is `quotient`'s."""
     m, denominator = finished_rows(spec, state, initial=initial)
-    out = (jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0) if normalized
-           else _derived_output(spec, state))
+    if normalized:
+        out = jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
+    else:
+        out = quotient(lambda acc: _derived_output(spec, state._replace(acc=acc)), state.acc, state.total,
+                       subnormals=subnormals)
     if output_mod is not None:
         out = output_mod(out, *output_params)
     return out, m, denominator
