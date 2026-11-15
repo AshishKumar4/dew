@@ -64,7 +64,6 @@ def precision() -> ModelConfig:
     return dataclasses.replace(model, fields={**model.fields, "dtype": "float32", "attention_impl": "xla"})
 
 
-@pytest.mark.scenario("Diffusion training")
 def test_a_resumed_pipeline_run_reads_none_of_the_pipelines_weights(pipelines, tmp_path, monkeypatch):
     """A run that fine-tunes a published pipeline and resumes from its own checkpoint reads the pipeline's
     weights' shapes alone, which its restore fills (docs/design/training.md, resume; row 6148): no tensor
@@ -137,7 +136,6 @@ def value(objective, params, batch) -> float:
     return float(loss.total / loss.mass)
 
 
-@pytest.mark.scenario("Diffusion training")
 @pytest.mark.parametrize("family", ["sd3", "flux", "qwen_image"])
 def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
         family, pipelines, tmp_path):
@@ -714,7 +712,6 @@ def test_a_flow_grpo_runs_rollout_is_its_own_record_beside_the_objective():
     assert DiffusionRunConfig.from_dict(parsed.to_dict()).rollout == parsed.rollout
 
 
-@pytest.mark.scenario("Online post-training")
 def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_path):
     """With a KL term the EMA slot holds the frozen initial model. The run's
     task restores the trained policy under `from_run`'s default `ema=None`,

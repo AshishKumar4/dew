@@ -104,7 +104,6 @@ def run_config(tokens, *args, model='{"emb_features": 16, "num_layers": 1, "num_
         "--trainer.log-every", "1", "--model.dtype", "float32", *model_flags(model)], default=default)
 
 
-@pytest.mark.scenario("Dense language-model pretraining")
 @pytest.mark.parametrize("packed", [False, True])
 def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     """A run from the command line: the windows or packed documents through
@@ -297,7 +296,6 @@ def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
         np.testing.assert_array_equal(np.asarray(held), np.asarray(leaf))
 
 
-@pytest.mark.scenario("Pretrained fine-tuning")
 @pytest.mark.parametrize("lora", [False, True], ids=["full", "lora"])
 def test_a_pretrained_runs_record_trains_again(tmp_path, lora):
     """A fine-tune's own run.json goes through `dew train` a second time.
@@ -360,7 +358,6 @@ def test_a_run_resumed_under_its_name_trains_the_model_it_recorded(tmp_path):
     assert Checkpoints(str(run)).latest == 2
 
 
-@pytest.mark.scenario("Dense language-model pretraining")
 def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
     """`dew train run.json` and `dew export` each run in a process of their own, which imports what
     the record names and nothing a test happened to import before: the recorded run trains on to
@@ -724,7 +721,6 @@ def gemma_spans(directory):
         Loading(workers=0))
 
 
-@pytest.mark.scenario("Diffusion language models")
 def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
     from dew.interop import Pretrained
 

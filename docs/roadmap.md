@@ -20,11 +20,11 @@ This page is generated from the maintainers' findings ledger as each change land
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353, 5288]
 - Convolution repairs above their owner. [5665]
 - The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
-- The layer boundary (dew.nn.layer_boundary) binds each parameter gradient where it is formed, so the one statement covers what the per-kernel form does. [6470]
-- Every parameter-holding block of a backbone passes the layer boundary. [6471]
-- Gemm's reverse mode's in_layer and the plain projection's _in_layer_product deleted once the layer boundary covers them. [6472]
-- Kernel-templates.md section 10 states the layer's reverse-boundary contract. [6473]
-- The layer-boundary contract's memory test on every family. [6474]
+- Every reverse mode that forms a parameter gradient calls with_gradients_formed. [6471]
+- Gemm.in_layer deleted; gemm's reverse mode and the plain projection call derivatives.with_gradients_formed, the one statement. [6472]
+- Kernel-templates.md section 10. [6473]
+- The contract's guard, tests/test_declared_cells_memory.py, runs over every instruction family a GPU target claims. [6474]
+- The recurrence suite's wall: every case within CI's group target. [6480, 6481, 6482, 6483, 6484, 6485, 6486, 6487, 6488, 6489, 6490, 6491]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822, 5391]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -40,6 +40,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - A Hopper kernel gradient's cluster along its output's columns. [6318]
 - Exact on every path, every edge and every derivative order. [2656]
 - The suite's wall. [5478]
+- Resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
+- Sm90 lightning attention (MiniMax-Text-01, 64 heads of 128, bf16) packed forward, the gate's two-roles variant. [6495]
 
 ## Models and interop
 
