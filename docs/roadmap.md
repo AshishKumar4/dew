@@ -20,7 +20,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353, 5288]
 - Convolution repairs above their owner. [5665]
 - The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
-- The recurrence suite's wall: every case within CI's group target. [6325]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822, 5391]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -68,6 +67,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## RL and serving
 
+- Serving a LoRA fine-tune quantized after training. [6326]
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - Dory: the release qualified and its tests' oracles. [596]
 - Training and serving efficiency. [3330, 1880, 5292]
