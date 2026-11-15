@@ -570,17 +570,19 @@ def reached(rows: list[tuple[str, str]], kept: Container[tuple[str, str]],
     own file changed; one whose last run's inputs (`last`, the record `cache_key` hashed) hold a changed file
     (`wrote_inputs`); and one whose last run recorded none, unknown, which runs. A row the change leaves
     unread is no reach of it, whatever the cache's state for it (a red run since its green one, a miss of
-    the cache's own). {"files": every reached row's file, "unknown": the rows with no recorded inputs}."""
+    the cache's own). {"files": every reached row's file, "unknown": the files reached only through a row with
+    no recorded inputs, which the receipt names apart}."""
     files: set[str] = set()
-    unknown = 0
+    known: set[str] = set()
     for name, group in rows:
         if (name, group) in kept:
             continue
         inputs = last.get((name, group))
-        unknown += not inputs
+        if name in changed or (inputs and wrote_inputs(inputs, changed)):
+            known.add(name)
         if name in changed or not inputs or wrote_inputs(inputs, changed):
             files.add(name)
-    return {"files": sorted(files), "unknown": unknown}
+    return {"files": sorted(files), "unknown": sorted(files - known)}
 
 
 def eager_sites(python: str, sites: Sequence[tuple[str, str]]) -> set[tuple[str, str]]:
@@ -1219,7 +1221,7 @@ def plan(target: float, timings: dict, census: bool = False,
         # A change every key covers, or none places (the policy cold or off), reaches every row.
         if reach is not None:
             reach[python] = (reached(rows_of, found, last, reach["changed"]) if cache == "on" else
-                             {"files": sorted({name for name, _ in rows_of}), "unknown": 0})
+                             {"files": sorted({name for name, _ in rows_of}), "unknown": []})
         print(f"plan: {python}: kept {len(found)} of {len(rows_of)}; not kept: {missed}", file=sys.stderr)
         # A lookup a row, in seconds: a kept task's weight is its container's start and those lookups.
         tasks: list[tuple[list[tuple[str, str]], float]] = [

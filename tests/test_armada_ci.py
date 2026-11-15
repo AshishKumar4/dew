@@ -615,7 +615,7 @@ def test_a_changes_reach_is_the_rows_whose_recorded_inputs_it_wrote(ci):
             ("tests/test_f.py", ""): [f"src/dew/x.py{followed.CODE}f"]}
     reach = ci.reached(rows, {("tests/test_f.py", "")}, last, {"tests/test_a.py", "src/dew/x.py"})
     assert reach == {"files": ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py", "tests/test_e.py"],
-                     "unknown": 2}
+                     "unknown": ["tests/test_e.py"]}
 
 
 def test_a_coverage_task_has_a_deadline_for_tracing(ci, tmp_path):
