@@ -184,11 +184,13 @@ def decoded_ahead(planes: jax.Array, live: jax.Array, dtype) -> None:
         _DECODED[key] = begun
 
     def compiled(attempt: concurrent.futures.Future) -> None:
-        if isinstance(attempt.exception(), jax.errors.JaxRuntimeError):
-            # XLA's refusal of the compile (its memory, its device): the resume compiles it as it would.
+        # XLA's refusal of the compile (its memory, its device), which the attempt holds as its error
+        # (`report.Attempt`): the resume compiles it as it would.
+        refused = attempt.exception() or attempt.result().error
+        if refused is not None:
             logger.warning("a checkpoint average's restore decode %s did not compile ahead; a resume "
-                           "compiles it", key, exc_info=attempt.exception())
-        elif attempt.exception() is None:
+                           "compiles it", key, exc_info=refused)
+        else:
             logger.info("compiled a checkpoint average's restore decode %s ahead, off the step, in %.3f s",
                         abstract[0].shape, time.perf_counter() - began)
 
