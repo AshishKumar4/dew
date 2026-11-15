@@ -66,6 +66,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Compile ahead within train CI time. [5324, 5361]
 - XLA:CPU edges. [1591]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
+- Narrow copies at the Qwen3.5-4B decision step. [6638]
 
 ## Data
 
