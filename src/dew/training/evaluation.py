@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Any
 
 import jax
 import numpy as np
-from flax import linen as nn
 from jax.sharding import Mesh
 from typing_extensions import TypeIs
 
@@ -45,7 +44,7 @@ from dew.distributed.batches import (
 )
 from dew.distributed.placement import Layout, MeshSpec, Placement
 from dew.nn.kernels.options import program, shapes_of
-from dew.nn.sharding import Link, boxed, measured_links, pipeline_microbatches, placing
+from dew.nn.sharding import Link, boxed, tracing
 from dew.objectives.base import Effects, Loss, Metric, Objective, Ratio, Shown, Step, TrainingScalar, Weighted
 from dew.objectives.passes import PassReports
 from dew.scores import Summary, recorded_name
@@ -1116,12 +1115,10 @@ class Evaluator[L, E]:
 
     @contextlib.contextmanager
     def scoring(self, links: Mapping[str, Link]) -> Iterator[None]:
-        """The rules an evaluation traces its programs under: the microbatch count, the layout's rules, the
-        mesh's links and the layout with the axes the modules declared (`placing`, `boxed`), as a step traces
-        (`Trainer._traced_on`) (`evaluate`, `warmed_ahead`)."""
-        with (pipeline_microbatches(self.microbatches),
-              nn.logical_axis_rules(self.layout.axis_rules), measured_links(links),
-              boxed(self.objective.parameter_axes), placing(self.layout)):
+        """What an evaluation traces its programs under (`evaluate`, `warmed_ahead`), as a step traces
+        (`dew.nn.sharding.tracing`): the mesh's `links` and the axes the objective's modules declared."""
+        with tracing(self.layout, self.layout.axis_rules, self.microbatches, links,
+                     boxed(self.objective.parameter_axes)):
             yield
 
     def evaluation(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState],

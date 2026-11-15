@@ -41,7 +41,7 @@ from ..inspection import counted, current_positions, watched_positions
 from ..kv_cache import cache_at_layer, cache_from_layer
 from ..mla import INDEXER_COLLECTION
 from ..moe import BANKED_EXPERTS, ROUTER_COLLECTION, at_iteration, experts_apart, holds_experts
-from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
+from ..sharding import constrained, microbatched, microbatches, pipeline_stage, pipeline_stages
 from .decoder_block import REMAT_POLICIES, DecoderBlock, RematPolicy
 from .layer_names import array_rows, group_layers, group_name, stage_count
 from .layer_plan import LayerSpec, run_period
@@ -1377,7 +1377,7 @@ class DecoderBank:
 
 def _on_stage_axis(leaf):
     """`leaf`, its leading dimension placed on the stage axis of the mesh in context."""
-    return jax.lax.with_sharding_constraint(leaf, _stage_sharding(leaf.ndim))
+    return constrained(leaf, _stage_sharding(leaf.ndim).spec)
 
 
 def _stage_sharding(ndim: int) -> NamedSharding:

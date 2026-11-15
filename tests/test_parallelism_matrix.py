@@ -48,11 +48,9 @@ from tool_support import load
 CELLS: dict[str, tuple[str, ...]] = {
     "dense_sft": ("fsdp4", "tensor2_sequence2"),
     "dense_dpo": ("fsdp4", "sequence4"),
-    "dense_grpo": ("tensor4", "sequence4", "data4_explicit"),
     "dense_mdlm": ("sequence4", "fsdp2_tensor2", "fsdp2_explicit"),
     "grouped": ("fsdp2_tensor2",),
     "gated": ("tensor4",),
-    "moe_grpo": ("expert4", "expert2_fsdp2", "tensor4", "sequence4"),
     "moe_exchange": ("expert4", "expert2_fsdp2"),
     "mla_dpo": ("fsdp4", "sequence4"),
     "hybrid_sft": ("sequence4", "stage4", "data4_explicit"),
@@ -63,9 +61,6 @@ CELLS: dict[str, tuple[str, ...]] = {
     "rigel_packed": ("sequence4",),
     "mmdit": ("tensor4", "fsdp2_tensor2"),
     "dit": ("sequence4", "tensor4", "fsdp2_explicit"),
-    "unet": ("tensor4", "fsdp2_tensor2", "sequence4"),
-    "edm2": ("tensor4", "fsdp2_tensor2", "sequence4"),
-    "edm2_level": ("tensor4", "fsdp2_tensor2"),
     "jepa": ("fsdp4", "sequence4", "tensor4", "data4_explicit"),
     "multimodal": ("sequence4", "stage4", "data4_explicit"),
 }
@@ -120,7 +115,7 @@ def split_draws() -> list[tuple[str, str, int | None]]:
     parameters is a program no other cell of the model's draws."""
     layouts = load("layout_parity").LAYOUTS
     seen, chosen = set(), []
-    for model, layout, devices in sorted(cells()):
+    for model, layout, devices in sorted(cells() + sharded_cells()):
         split = tuple(sorted((axis, size) for axis, size in layouts[layout].items()
                              if axis in PARAMETER_AXES and size > 1))
         if split and (model, layout) not in REFUSED and (model, split, devices) not in seen:
@@ -163,14 +158,6 @@ def test_each_layout_of_a_model_matches_one_device_or_is_refused(model, layout, 
     """Each layout's first step on par with one device's over its model's SEEDS draws (check 1), its FLOPs
     an even split, or refused for the reason REFUSED gives."""
     assert_matches_one_device(model, layout, devices, references, SEEDS[model])
-
-
-SHARDED = ("dense_grpo", "moe_grpo", "unet", "edm2", "edm2_level")
-"""The models whose cells run as armada's map tasks, each cell a site of its own, its parameter written out
-with its mark (the plan reads them from the source, tools/armada/ci.py `sites`), so a map task compiles one
-cell's layout and its references: one site over a model's cells compiled each cell for its draws in every
-task (the U-Net's three, 452 s a task in CI, 2026-11-15). `test_the_sharded_sites_are_the_matrixs_cells`
-holds them to CELLS."""
 
 
 def marked_seeds(request) -> int:
@@ -267,6 +254,19 @@ def test_edm2s_level_conditioned_layouts_match_one_device(model, layout, devices
     assert_matches_one_device(model, layout, devices, references, marked_seeds(request))
 
 
+def sharded_cells() -> list[tuple[str, str, int | None]]:
+    """The cells of the models whose draws run as armada's map tasks, each a site of its own written out
+    above with its mark (the plan reads them from the source, tools/armada/ci.py `sites`), so a map task
+    compiles one cell's layout and its references: one site over a model's cells compiled each cell for
+    its draws in every task (the U-Net's three, 452 s a task in CI, 2026-11-15). Their tests are their one
+    source; CELLS holds the rest."""
+    tests = (test_a_grpo_decoders_layouts_match_one_device, test_a_grpo_mixtures_layouts_match_one_device,
+             test_a_unets_layouts_match_one_device, test_edm2s_layouts_match_one_device,
+             test_edm2s_level_conditioned_layouts_match_one_device)
+    return [tuple(getattr(case, "values", case)) for test in tests for mark in test.pytestmark
+            if mark.name == "parametrize" for case in mark.args[1]]
+
+
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize(("model", "layout", "devices"), split_draws(), ids=named(split_draws()))
 def test_each_split_draws_a_models_initial_parameters_as_one_device_does(model, layout, devices, references):
@@ -275,14 +275,3 @@ def test_each_split_draws_a_models_initial_parameters_as_one_device_does(model, 
     its own random bits, which every layout draws alike (`layout_parity.held_draw`)."""
     tool, _ = references
     tool.held_draw(model, layout, seeds=DRAW_SEEDS, devices=devices)
-
-
-def test_the_sharded_sites_are_the_matrixs_cells():
-    """Each sharded model's sites, written out one a cell, are its cells in CELLS, each once."""
-    tests = (test_a_grpo_decoders_layouts_match_one_device, test_a_grpo_mixtures_layouts_match_one_device,
-             test_a_unets_layouts_match_one_device, test_edm2s_layouts_match_one_device,
-             test_edm2s_level_conditioned_layouts_match_one_device)
-    written = sorted(tuple(param.values) for test in tests
-                     for mark in test.pytestmark if mark.name == "parametrize" for param in mark.args[1])
-    assert written == sorted(cells(*SHARDED))
-

@@ -72,7 +72,7 @@ from dew.training import Inspection, MeshSpec
 from dew.training.ahead import AheadOfTime
 
 run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(sys.argv[1]), xla=True, split=2,
-                inspection=Inspection(every=2))
+                inspection=Inspection(every=2), dtype="bfloat16")
 try:
     run.fit(token_rows(VOCAB, BATCH, SEQ_LEN + 1), steps=1, log_every=1)
 except ValueError:
@@ -95,7 +95,7 @@ from dew.training.ahead import compile_ahead
 
 generation, path, multiprocessors, memory = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 target = MeshSpec().build(compile_only_gpus(generation, 1, memory, multiprocessors=multiprocessors))
-trainer = fine_tune(target, xla=True, split=2, inspection=Inspection(every=2))
+trainer = fine_tune(target, xla=True, split=2, inspection=Inspection(every=2), dtype="bfloat16")
 batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
 validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).batch(BATCH)}
 fit = {"steps": 6, "log_every": 5, "eval_every": 3, "validation": validation}
@@ -117,17 +117,18 @@ from dew.training import Inspection, MeshSpec
 from dew.training.ahead import AheadOfTime
 
 run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(sys.argv[1]), xla=True, split=2,
-                inspection=Inspection(every=2))
+                inspection=Inspection(every=2), dtype="bfloat16")
 validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).batch(BATCH)}
 with Compiles(None) as compiles:
     state = run.fit(token_rows(VOCAB, BATCH, SEQ_LEN + 1), steps=6, log_every=5, eval_every=3,
                     validation=validation)
-assert int(state.step) == 6
+assert int(state.step) == 6 and run.plan["narrow"]
 compiled = [(program.name, program.where) for program in compiles.programs if program.kind == "compiled"]
 assert not compiled, compiled
 """
 """A fresh process training six steps of two microbatches from the step at argv[1], sampled every second
-step, two samples to a log, evaluated every third step, compiling nothing on its GPU."""
+step, two samples to a log, evaluated every third step, compiling nothing on its GPU: its bf16 step's plan
+keeps its narrow copies, which the programs compiled with it make (row 4777)."""
 COMPUTING = "--xla_gpu_enable_fast_min_max=true"
 """An XLA flag that changes what a program computes, which a process loading programs compiled without it is
 refused for (`BuildTarget.held`)."""
@@ -236,7 +237,8 @@ def test_a_run_compiled_ahead_for_this_gpu_compiles_nothing_on_it_and_is_refused
     sampled every second step, trains six steps logged twice and evaluated twice in a fresh process
     compiling nothing on the GPU: its start, its window's allocation, its split step's whole, its counters,
     its latest sample, its log's copies, its logged tokens' sum and its evaluations' keys, loss, sums and
-    reduction were compiled with the step (`AheadOfTime.starts`; row 4752). A fresh process whose XLA
+    reduction were compiled with the step (`AheadOfTime.starts`; row 4752), and its bf16 compute's narrow
+    copies, which it makes, were too (row 4777). A fresh process whose XLA
     computes otherwise is refused that step by the trainer's loader: the one rule every loader holds (row
     3606)."""
     own = BuildTarget.of(jax.devices()[:1])
