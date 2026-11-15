@@ -122,3 +122,20 @@ def cublas_compiled(fn, inputs, call: str):
         assert not any(each.op == "dot" or "dot" in each.fused for each in instructions), \
             "the library arm runs a dot of XLA's own"
     return compiled
+
+
+def declared_outputs(lowered: jax.stages.Lowered) -> list:
+    """Each kernel call's outputs' dimensions as it states them (`outputs.OUTPUT_DIMS`, parsed: a list an
+    output, its every dimension's `[operand, axis]` pairs), in the order `lowered` makes its calls: what a
+    compile's live buffers read of Dew's own kernels."""
+    import json
+
+    from dew.nn.kernels import lowered as reading
+    from dew.nn.kernels.templates.outputs import OUTPUT_DIMS
+
+    def read(target: str, operation) -> list | None:
+        del target
+        stated = reading._frontend(operation.attributes).get(OUTPUT_DIMS)
+        return None if stated is None else json.loads(stated)
+
+    return [found for found, _ in reading._read_calls(lowered, read, unrun=True)]

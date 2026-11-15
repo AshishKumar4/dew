@@ -5,13 +5,12 @@ here, and runs on one in the GPU gate."""
 
 import dataclasses
 import functools
-import json
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, runs
+from generation_support import INTERPRETS, declared_outputs, runs
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
@@ -808,7 +807,6 @@ def test_a_kernels_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
     lowered for a B200 on any host: its shape is theirs, and its call states the dimensions each output
     descends from (`outputs.OUTPUT_DIMS`, its operands by their place), which a compile's live buffers read;
     the TPU core's, interpreted, takes the same statement as its shape."""
-    from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.kernels.templates import mosaic_sm100
 
     family = mosaic_sm100.RINGS
@@ -818,8 +816,7 @@ def test_a_kernels_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
         lowered = jax.jit(functools.partial(_persisted_products, family=family, interpret=False)).trace(
             x, w).lower(lowering_platforms=("cuda",))
     assert lowered.out_info.shape == (x.shape[0], w.shape[1])
-    (call,) = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]
-    assert json.loads(call.output_dims) == [[[[0, 0]], [[1, 1]]]]
+    assert declared_outputs(lowered) == [[[[[0, 0]], [[1, 1]]]]]
 
 
 def test_a_pallas_calls_outputs_stated_as_its_operands_axes_are_stated_on_its_call():
@@ -827,7 +824,6 @@ def test_a_pallas_calls_outputs_stated_as_its_operands_axes_are_stated_on_its_ca
     lowered for an H100 on any host: its shape is theirs, and its call states each dimension's axis
     (`outputs.OUTPUT_DIMS`), as a Mosaic launch's does."""
     from dew.nn.kernels import launches
-    from dew.nn.kernels.lowered import kernel_calls
 
     def copied(x):
         def body(x_ref, o_ref):
@@ -841,8 +837,7 @@ def test_a_pallas_calls_outputs_stated_as_its_operands_axes_are_stated_on_its_ca
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(copied).trace(x).lower(lowering_platforms=("cuda",))
     assert lowered.out_info.shape == (32, 16)
-    (call,) = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "triton"]
-    assert json.loads(call.output_dims) == [[[[0, 1]], [[0, 0]]]]
+    assert declared_outputs(lowered) == [[[[[0, 1]], [[0, 0]]]]]
 
 
 @INTERPRETS
