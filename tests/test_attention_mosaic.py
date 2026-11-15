@@ -23,6 +23,7 @@ import pytest
 from attention_oracle import attention_terms
 from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
+from jax.extend import core as jcore
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import assert_as_exact, widened
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
@@ -741,6 +742,41 @@ def test_an_absorbed_mla_forward_of_576_wide_keys_and_512_wide_values_is_on_par_
                    value_width=512, target=generation.gpu_target("sm90"))
 
 
+def _kernels(jaxpr) -> list:
+    """Every kernel equation of `jaxpr` that states its cost (its `cost_estimate`), through the programs that
+    hold them."""
+    found = []
+    for equation in jaxpr.eqns:
+        if equation.params.get("cost_estimate") is not None:
+            found.append(equation)
+        for param in equation.params.values():
+            for inner in param if isinstance(param, tuple | list) else (param,):
+                held = getattr(inner, "jaxpr", inner)
+                if isinstance(held, jcore.Jaxpr):
+                    found += _kernels(held)
+    return found
+
+
+def test_an_absorbed_mla_forward_states_its_key_buffer_once_under_jit():
+    """A forward whose values are its keys' leading 512 columns (`MosaicForward.in_key`), traced for an H100,
+    streams its key buffer once, and each launch that states its bytes states its query and key operands
+    alone, under jit, where the key and the value reach the launch as distinct tracers (row 6642)."""
+    query = jax.ShapeDtypeStruct((1, 1024, 16, 576), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 1024, 1, 576), jnp.bfloat16)
+    spans = template.spans(1024, 1024, 1, causal=True)
+
+    def forward(query, key):
+        return attention_mosaic.forward(query, key, key[..., :512], spans, natural=False, in_key=True)
+
+    with generation.assumed("sm90"):
+        stating = [equation for equation in _kernels(jax.make_jaxpr(jax.jit(forward))(query, key).jaxpr)
+                   if equation.params["cost_estimate"].bytes_accessed]
+    assert stating
+    for equation in stating:
+        operands = sum(int(np.prod(var.aval.shape)) * var.aval.dtype.itemsize for var in equation.invars[:2])
+        assert equation.params["cost_estimate"].bytes_accessed == operands
+
+
 @INTERPRETS
 def test_an_absorbed_mla_forward_whose_values_are_its_keys_leading_columns_is_on_par_interpreted():
     """An absorbed MLA call whose values are its keys' leading 512 columns (`MosaicForward.in_key`), the
@@ -785,35 +821,30 @@ def test_values_their_keys_columns_are_the_keys_as_given_under_a_key_prologue_in
                                   np.asarray(template.reference(query, key * 2, key, spans), np.float32))
 
 
-def test_a_trained_call_whose_values_are_its_keys_columns_is_declined_as_its_forward_runs_it():
-    """A call keeping its residuals streams its values as given (its anchored launches), so whose values are
-    its keys' columns is declined as its forward runs it, the slice it was handed (`reads_in_key`): values 48
-    of a 64-wide key's columns, no whole swizzle group, refused in the key's slot ('columns'), are not refused
-    where the call keeps its split residuals."""
+@pytest.mark.parametrize(("generation_name", "dtype", "columns", "case"), [
+    ("sm90", jnp.bfloat16, 48, "plain"), ("sm90", jnp.bfloat16, 48, "trained"),
+    ("sm90", jnp.bfloat16, 48, "prologued"), ("sm90", jnp.float32, 64, "plain"),
+    ("sm100", jnp.bfloat16, 64, "plain")])
+def test_a_call_whose_values_its_key_slot_cannot_serve_is_declined_as_one_handing_them(generation_name, dtype,
+                                                                                       columns, case):
+    """`in_key` states the operands, never another call (row 6643): a call whose values are its keys'
+    columns the key's slot cannot serve reads the slice it was handed (`attention_mosaic.reads_in_key`,
+    `MosaicForward.reads_key_slot`), declined exactly as the same call without `in_key`: values 48 of a
+    64-wide key's columns (no whole swizzle group), plain, keeping split residuals (its anchored launches
+    stream the values as given) or under a key prologue (the slot holds the prologued keys); fp32 operands
+    (their 16-bit parts load in pieces); and on a B200, whose tcgen05 rows declare the values' stream of
+    their issuing role."""
     shape = (1, 64, 1, 64)
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
-    query, key = jnp.zeros(shape, jnp.bfloat16), jnp.ones(shape, jnp.bfloat16)
-    with generation.assumed("sm90"):
-        declined = attention_mosaic.forward_declined(query, key, key[..., :48], spans, in_key=True,
-                                                     residuals=template.Kept.SPLIT)
-        unkeyed = attention_mosaic.forward_declined(query, key, key[..., :48], spans,
-                                                    residuals=template.Kept.SPLIT)
-    assert declined == unkeyed
-
-
-def test_a_call_whose_values_are_its_prologued_keys_columns_is_declined_as_its_forward_runs_it():
-    """Under a key prologue a call whose values are its keys' columns reads them from the slice it was
-    handed (`attention_mosaic.reads_in_key`), so its declination is the forward's of that slice: values 48
-    of a 64-wide key's columns, no whole swizzle group, refused in the key's slot ('columns'), are not
-    refused here."""
-    shape = (1, 64, 1, 64)
-    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
-    hooks = template.Hooks(key_mod=lambda key, *_: key * 2)
-    query, key = jnp.zeros(shape, jnp.bfloat16), jnp.ones(shape, jnp.bfloat16)
-    with generation.assumed("sm90"):
-        declined = attention_mosaic.forward_declined(query, key, key[..., :48], spans, hooks, in_key=True)
-        unkeyed = attention_mosaic.forward_declined(query, key, key[..., :48], spans, hooks)
-    assert declined == unkeyed
+    hooks = template.Hooks(key_mod=lambda key, *_: key * 2) if case == "prologued" else None
+    residuals = template.Kept.SPLIT if case == "trained" else template.Kept.NONE
+    query, key = jnp.zeros(shape, dtype), jnp.ones(shape, dtype)
+    with generation.assumed(generation_name):
+        keyed = attention_mosaic.forward_declined(query, key, key[..., :columns], spans, hooks, in_key=True,
+                                                  residuals=residuals)
+        unkeyed = attention_mosaic.forward_declined(query, key, key[..., :columns], spans, hooks,
+                                                    residuals=residuals)
+    assert keyed == unkeyed
 
 
 @ON_EACH_FAMILY

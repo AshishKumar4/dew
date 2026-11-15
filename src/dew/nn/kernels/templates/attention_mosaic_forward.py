@@ -1903,7 +1903,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     entry = functools.partial(_entry, program, layout, body, (scoped, rings, after, products),
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
-                                peaks=peaks, training=training, counted=counted, shared_by=shared_by)
+                                peaks=peaks, training=training, counted=counted, shared_by=shared_by,
+                                in_key=value_columns is not None)
     grid = (heads, queries // pair * splits, batch)
     return family.kernel(entry, out_type=out_type, grid=grid,
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
@@ -2002,19 +2003,20 @@ def _program_views(program: _Program, refs, read: _Read, *, peaks: bool, group: 
 
 def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, value, keys_count: int,
                   value_width: int, tiles: Tiles, *, peaks: bool, training: bool, counted: bool,
-                  shared_by: int) -> tuple:
+                  shared_by: int, in_key: bool) -> tuple:
     """A launch's cost and the model's FLOPs it owns (`_launched`'s `cost` and `model_flops`): its walk's
     statement, its work its emission's (`stated`), and the model's products it owns (`modelled`): the
     forward's two, a peak walk's `Q K^T`, a training walk's `P V` beside its `Q K^T` recomputed, a block of
     an inference call's columns its `P V` and its share of `Q K^T` (`shared_by`); a launch not `counted`
     none: a rerun (a guarded launch, the fold's natural walk), whose loop of at most one trip the FLOP count
     bounds by its trip, and a rare call's scaled op (`MosaicForward.scaled`), whose branch it takes where it
-    is the larger, either counting work every step that runs at most rarely."""
+    is the larger, either counting work every step that runs at most rarely. A launch whose values are its
+    keys' columns (`in_key`, `MosaicForward.in_key`) reads one stream, the key buffer counted once: a
+    statement, as the launch's arrays reach it under `tuning.lowered_once`'s jit as distinct tracers."""
     batch, queries, heads, width = query.shape
     owned_value = 0 if peaks else value_width
     owned_query = 0 if training and not peaks else width
-    # The key buffer counted once where it is the values' too (`MosaicForward.in_key`, one stream).
-    streamed = (query, key) if value is key else (query, key, value)
+    streamed = (query, key) if in_key else (query, key, value)
     cost = (stated(spec, batch, heads, *streamed,
                    tile_walk=TileWalk((queries, keys_count), (tiles.block_q, tiles.block_k), tiles.consumers,
                                       common=family.feeds_itself)) if counted

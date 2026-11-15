@@ -8,6 +8,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from generation_support import INTERPRETS
 from reference_error import assert_as_exact
@@ -23,7 +24,7 @@ from test_attention_mosaic import (
 )
 from test_attention_template import CASES, arguments, geometry as core_geometry
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_mosaic
 
 pytestmark = pytest.mark.kernel
@@ -59,6 +60,21 @@ def test_the_forward_on_tcgen05s_rows_holds_check_1_over_short_walks_interpreted
     (`placed.issued`), under the interpreter: on par with the reference (check 1)."""
     _check_forward("full", jnp.bfloat16, (1, tokens, 2, 1), natural=False, interpret=True, width=64,
                    value_width=64, tiles=ROWS_TILES, target=generation.gpu_target("sm100"))
+
+
+@INTERPRETS
+def test_the_forward_on_tcgen05s_rows_streams_values_its_keys_columns_as_handed_interpreted():
+    """A forward whose values are its keys' leading columns (`in_key`) on a B200's tcgen05 rows, whose
+    issuing role declares the values' stream (`MosaicForward.reads_key_slot`), streams the value array it
+    was handed: bit for bit the same call without `in_key`, under the interpreter (row 6643)."""
+    shape = (1, 128, 1, 64)
+    query, key = (jax.random.normal(stream, shape, jnp.float32).astype(jnp.bfloat16)
+                  for stream in jax.random.split(jax.random.key(0), 2))
+    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
+    with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
+        keyed, unkeyed = (attention_mosaic.forward(query, key, key, spans, None, interpret=True,
+                                                   in_key=in_key) for in_key in (True, False))
+    np.testing.assert_array_equal(np.asarray(keyed, np.float32), np.asarray(unkeyed, np.float32))
 
 
 @INTERPRETS
