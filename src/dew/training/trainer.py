@@ -215,21 +215,29 @@ _DEFAULT_MESH = MeshSpec()
 _DEFAULT_LAYOUT = Layout()
 
 
-def refuse_non_finite(state: TrainState, step: int, latest: int | None) -> None:
-    """Refuse to save a `state` whose parameters, optimizer state or averages hold a non-finite value: no
-    checkpoint is written and none rotated out, and the run stops, naming the step and the first such leaf,
-    so the checkpoint a resume finds is the last finite one (`latest`). Every process reads the same
-    flags, each a reduction over a whole array (training.md, a step that is not finite)."""
+def refuse_non_finite(state: TrainState, step: int, latest: Callable[[], int | None]) -> None:
+    """Refuse to save a `state` whose parameters, optimizer state or averages hold a non-finite value, on any
+    tier: no checkpoint is written and none rotated out, and the run stops, naming the step and the first
+    such leaf, so the checkpoint a resume finds is the last finite one (`latest`, read only to say so).
+    One compiled reduction gives a flag a leaf, which every process reads alike (training.md, checkpoints
+    and resume)."""
     trees = {"variables": state.variables, "opt_state": state.opt_state, "ema": state.ema}
     leaves = [(f"{name}{jax.tree_util.keystr(path)}", leaf) for name, tree in trees.items()
               for path, leaf in jax.tree_util.tree_leaves_with_path(tree)
               if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)]
-    finite = jax.device_get([jnp.all(jnp.isfinite(leaf)) for _, leaf in leaves])
+    finite = jax.device_get(_finite_flags([leaf for _, leaf in leaves]))
     first = next((path for (path, _), held in zip(leaves, finite, strict=True) if not held), None)
     if first is not None:
-        kept = "no checkpoint" if latest is None else f"the latest checkpoint, step {latest}"
+        kept = latest()
+        said = "no checkpoint" if kept is None else f"the latest checkpoint, step {kept}"
         raise RuntimeError(f"step {step}'s state holds a non-finite value at {first}, so no checkpoint of it "
-                           f"is written and {kept} is the one a resume finds")
+                           f"is written and {said} is the one a resume finds")
+
+
+@jax.jit
+def _finite_flags(leaves: list[jax.Array]) -> jax.Array:
+    """Whether each of `leaves` is finite throughout, one flag a leaf from one program."""
+    return jnp.stack([jnp.isfinite(leaf).all() for leaf in leaves]) if leaves else jnp.zeros((0,), bool)
 
 
 class Trainer(Generic[Loss, Effects]):
@@ -2197,7 +2205,6 @@ class Trainer(Generic[Loss, Effects]):
         Returns the seconds it took, the reading of the interval's loss included: that read waits
         on the device, and the wait is time the steps did not have."""
         paused = time.perf_counter()
-        refuse_non_finite(state, step, checkpoints.latest)
         self._display.status("writing a checkpoint")
         metadata = dict(scores or {})
         if interval.steps and interval.book is not None:
@@ -2217,6 +2224,10 @@ class Trainer(Generic[Loss, Effects]):
                              *, weights_only: bool = False) -> Envelope:
         """What a checkpoint of `state` holds on every tier, each tier's save adding its own metadata: one
         envelope a persistent and a local save submit (row 4126)."""
+        # No tier writes a non-finite state (`refuse_non_finite`): a local copy is the one a restarted node
+        # reads first, its step the latest of both tiers.
+        refuse_non_finite(state, int(run.current), lambda: None if self.checkpoints is None
+                          else self.checkpoints.latest)
         control, share = {**run.stop_control, **interval.token_control}, DataPartition.of(self.device_mesh)
         return {"state": self._staging.saved(state), "saved": position, "share": share, "control": control,
                 "rung": self._compiler.checkpoint_rung(), "artifact": self._artifact(),

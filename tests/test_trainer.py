@@ -2467,17 +2467,22 @@ class PoisonedThird(Counting):
         return batch
 
 
-def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path):
-    """A save that meets a state holding a non-finite value writes nothing and rotates nothing out: the run
-    stops there, and the checkpoint a resume finds is the last finite one, its parameters finite (row 6699).
-    A run with no loss scale, checkpointed every step and keeping two, whose third batch is not finite,
-    saved its non-finite parameters at steps 3 and 4 and rotated its good checkpoints out."""
-    trainer = make_trainer(tmp_path, keep=2)
+@pytest.mark.parametrize("tier", ["persistent", "local"])
+def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path, tier):
+    """A save that meets a state holding a non-finite value writes nothing and rotates nothing out, on either
+    tier: the run stops there, and the checkpoint a resume finds is the last finite one, its parameters
+    finite (row 6699). A run with no loss scale whose third batch is not finite, checkpointed every step
+    and keeping two (`persistent`), saved its non-finite parameters at steps 3 and 4 and rotated its good
+    checkpoints out; one that writes a local copy every second step and a persistent one every tenth
+    (`local`) wrote its step-4 local copy unchecked, and a resume restored it (train 901's review, F1)."""
+    def trainer():
+        return make_trainer(tmp_path, keep=2) if tier == "persistent" else local_trainer(tmp_path)
+
     with pytest.raises(RuntimeError):
-        trainer.fit(dataset(PoisonedThird), steps=5, checkpoint_every=1, log_every=100)
-    resumed = make_trainer(tmp_path, keep=2)
+        trainer().fit(dataset(PoisonedThird), steps=5, log_every=100,
+                      checkpoint_every=1 if tier == "persistent" else 10)
+    resumed = trainer()
     assert resumed.checkpoints.latest == 2
-    state = resumed.initial_state()
-    restored, *_ = resumed.checkpoints.restore(state)
+    restored, *_ = resumed.checkpoints.restore(resumed.initial_state())
     assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(restored.variables))
-    refuse_non_finite(restored, 3, 2)
+    refuse_non_finite(restored, 3, lambda: 2)

@@ -168,6 +168,8 @@ Trainer(objective, opt, key=0,
         checkpoints=Checkpoints("gs://runs/lm-1b", keep=Keep(latest=2, every=10_000)))
 ```
 
+No tier saves a state holding a non-finite value: a persistent or a local save that meets one writes nothing and rotates nothing out, and the run stops there naming the step and the first non-finite leaf, so a resume, from either tier, starts from the last finite checkpoint.
+
 - A run with a checkpoint directory resumes automatically from its latest checkpoint: parameters, optimizer state, step, RNG and each data share's position. Resume is exact on the same mesh. `fit(resume=)` makes the choice explicit: `"require"` refuses a directory with nothing to continue, for a job that must not silently start fresh, and `"never"` refuses one that already holds a run (`Checkpoints.resumed`); a run configuration takes it as `trainer.resume` and refuses before its record is written.
 - A checkpoint directory belongs to one run. A fresh run takes a new directory; a directory holding another run's checkpoints refuses to resume, naming what differs.
 - A resumed run skips loading pretrained weights it is about to overwrite, reading their shapes alone (a published diffusion pipeline's too), and its first step hits the compile cache. A run started from a saved diffusion run restores that run's tree, which its task is built over.
