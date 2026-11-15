@@ -146,6 +146,17 @@ def _written(tree, layer, index):
                                                                               index, 0), tree, layer)
 
 
+def _flowing(shared: tuple, *, flows: tuple[bool, ...]) -> tuple:
+    """What every layer reads that the layers differentiate (`flows`), the floating arrays among `shared`."""
+    return tuple(leaf for leaf, flow in zip(shared, flows, strict=True) if flow)
+
+
+def _merged(shared: tuple, flowed: tuple, *, flows: tuple[bool, ...]) -> tuple:
+    """`shared` with its differentiated arrays (`flows`) taken from `flowed` in order."""
+    given = iter(flowed)
+    return tuple(next(given) if flow else leaf for leaf, flow in zip(shared, flows, strict=True))
+
+
 def _gated_layer(update: Callable, ok: jax.Array, gradient, held, moments, bad: jax.Array):
     """One layer's update in a step that may not be finite (`gated`): where `ok` (the loss and the layer's
     gradient finite) by its gradient, else by a zero gradient, its weights kept as they were. Finite inputs
@@ -200,12 +211,7 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
     # Which of them the layers differentiate: the floating ones.
     flows = tuple(bool(jnp.issubdtype(jnp.result_type(leaf), jnp.inexact)) for leaf in arrays)
 
-    def flowing(shared):
-        return tuple(leaf for leaf, flow in zip(shared, flows, strict=True) if flow)
-
-    def merged(shared, flowed):
-        given = iter(flowed)
-        return tuple(next(given) if flow else leaf for leaf, flow in zip(shared, flows, strict=True))
+    flowing, merged = functools.partial(_flowing, flows=flows), functools.partial(_merged, flows=flows)
 
     def forward_layer(x, slices, shared):
         weights_i, per_layer_i = slices
