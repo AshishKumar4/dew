@@ -2,6 +2,10 @@
 the default, reads on where the saved plan makes the same rows and starts the data again where it differs,
 named in the run's records, its state resuming either way; exact refuses the difference."""
 
+import dataclasses
+import os
+from pathlib import Path
+
 import numpy as np
 import pytest
 from recording import RecordingTracker
@@ -213,43 +217,44 @@ def test_a_phased_run_resumed_relaxed_with_other_batches_keeps_its_phases_at_the
 
 
 
-def test_a_per_share_reader_starts_no_prefetch_before_its_saved_plan_is_checked():
-    """A per-share read whose saved position another plan wrote is refused before its reader starts
-    prefetching (data.md §10): a resume asks its fresh position first (`resumed_on`), which opens the
-    reader and starts none of its loading, and the check refuses it. The fresh position started the
-    reader's prefetch, every loading worker, before the refusal (spec alignment 2026-11-15, data.md's fifth
-    finding)."""
-    import json
+@dataclasses.dataclass(frozen=True)
+class Marking:
+    """A record step that leaves a file in `directory` named by the process that ran it: a loading
+    worker's, where one reads the chain."""
 
-    from dew.data.compile import compile
-    from dew.data.dataset import DataPartition, Loading
-    from dew.data.plan import PlanChanged
-    from dew.data.readers import _PerShare
+    directory: str
 
-    chain = Pipeline(Memory({"x": np.arange(16, dtype=np.float32)[:, None]}, shard_rows=4)).repeat().batch(2)
-    loader = compile(chain, read="streamed", loading=Loading(workers=0))
-    stream = loader.train(DataPartition())
-    next(stream)
-    decoded = json.loads(stream.get_state())
-    stream.close()
-    decoded["dew_data_plan"]["rules"].update(shuffle="another-key")
-    started = []
+    def __call__(self, row):
+        Path(self.directory, str(os.getpid())).touch()
+        return row
 
-    class Opened:
-        """The reader the double opens: a fresh position, and its prefetch counted as it starts."""
 
-        def get_state(self):
-            return {}
+def test_a_resumed_run_refused_by_its_saved_plan_starts_no_loading_worker(tmp_path):
+    """A run read by a loading worker, resumed exactly over a chain shuffled by another seed than its saved
+    position's, is refused before its reader starts any loading (data.md §10): its fresh position is asked
+    first (`resumed_on`), which opens the reader and starts none of its workers, so no worker of the refused
+    run reads a record. The fresh position started the reader's prefetch, every loading worker, before the
+    refusal (spec alignment 2026-11-15, data.md's fifth finding; train 899's review: through the run's own
+    resume)."""
+    from dew._position import PlanChanged
+    from dew.data.dataset import Loading
 
-        def start_prefetch(self):
-            started.append(True)
+    (x,) = records(0)
 
-        def close(self):
-            pass
+    def fit(seed: int, marks: Path, steps: int):
+        marks.mkdir()
+        chain = (Pipeline(Memory({"x": x}, shard_rows=8)).map(Marking(str(marks)), identity="marking@1")
+                 .shuffle(seed=seed).repeat().batch(BATCH).loading(Loading(workers=1)))
+        trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
+                          checkpoints=Checkpoints(str(tmp_path / "run")), data_resume="exact")
+        return trainer.fit(chain.read("streamed"), steps=steps, log_every=1, checkpoint_every=1)
 
-    assert loader.plan is not None
-    resumed = _PerShare(Opened, loader.plan, "exact", stop_seconds=1.0)
-    resumed.get_state()
+    def workers(marks: Path) -> set[str]:
+        # The processes other than this one that ran the step: the run's loading workers.
+        return {path.name for path in marks.iterdir()} - {str(os.getpid())}
+
+    fit(0, tmp_path / "first", steps=2)
+    assert workers(tmp_path / "first")
     with pytest.raises(PlanChanged):
-        resumed.set_state(json.dumps(decoded).encode())
-    assert started == []
+        fit(1, tmp_path / "refused", steps=4)
+    assert not workers(tmp_path / "refused")
