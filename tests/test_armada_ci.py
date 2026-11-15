@@ -586,14 +586,15 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
 
 
 def test_the_scenario_suites_coverage_items_are_its_tasks_alone(ci, tmp_path):
-    """`coverage items --scenarios` measures the scenario suite (`SCENARIO_SUITE`) alone: of the floor's
-    files only its own tasks, each running that file, packed with others or not."""
-    for name in ("test_scenario_runs.py", "test_unit.py", "test_other.py"):
+    """`coverage items --scenarios` measures the scenario suite's files (`SCENARIO_SUITE`) alone: of the
+    floor's tasks only those holding one of them, each running the suite's files it held and no other."""
+    for name in ("test_scenario_runs.py", "test_decision_workflow.py", "test_unit.py", "test_other.py"):
         (tmp_path / "tests" / name).write_text("def test_one(): pass\n")
     whole = ci.coverage_items(300.0, {})
-    assert len(whole) >= 1 and any("test_unit.py" in item for item in whole)
+    assert any("test_unit.py" in item for item in whole)
     items = ci.coverage_items(300.0, {}, scenarios=True)
-    assert [re.search(r"--tests='([^']*)'", item)[1] for item in items] == [ci.SCENARIO_SUITE]
+    ran = sorted(name for item in items for name in re.search(r"--tests='([^']*)'", item)[1].split())
+    assert ran == sorted(ci.SCENARIO_SUITE)
 
 
 def test_a_coverage_task_has_a_deadline_for_tracing(ci, tmp_path):
