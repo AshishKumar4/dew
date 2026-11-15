@@ -619,6 +619,12 @@ def test_a_sum_of_three_part_products_is_as_accurate_as_fp32():
                                 np.einsum("cij,cjk->ik", *map(np.abs, wide)), terms=2 * ISSUED * 6)
 
 
+def _accumulator(equation) -> bool:
+    """Whether `equation` scopes an accumulator of its own (a `run_scoped` whose scope takes one)."""
+    return equation.primitive.name == "run_scoped" and any(
+        "Accumulator" in type(var.aval).__name__ for var in equation.params["jaxpr"].invars)
+
+
 def test_a_sum_of_three_part_products_holds_one_accumulator_a_term_one_at_a_time():
     """Traced for an H100: a sum over two slices of three-part products issues each of their terms
     (`product.terms`, six of three parts each) into an accumulator of its own across both slices, one
@@ -630,13 +636,9 @@ def test_a_sum_of_three_part_products_holds_one_accumulator_a_term_one_at_a_time
     with generation.assumed("sm90"):
         traced = jax.make_jaxpr(lambda a, b: _termwise_sums(a, b, interpret=False))(a, b)
 
-    def accumulator(equation) -> bool:
-        return equation.primitive.name == "run_scoped" and any(
-            "Accumulator" in type(var.aval).__name__ for var in equation.params["jaxpr"].invars)
-
-    scopes = [equation for equation in equations(traced.jaxpr) if accumulator(equation)]
+    scopes = [equation for equation in equations(traced.jaxpr) if _accumulator(equation)]
     assert len(scopes) == 6, len(scopes)
-    assert not any(accumulator(inner) for scope in scopes for inner in equations(scope.params["jaxpr"]))
+    assert not any(_accumulator(inner) for scope in scopes for inner in equations(scope.params["jaxpr"]))
 
 
 def _mixed_sums(a, b, c, d, *, interpret, together=False):
@@ -706,13 +708,9 @@ def test_groups_summed_together_take_a_three_part_products_terms_apart():
     with generation.assumed("sm90"):
         traced = jax.make_jaxpr(lambda *xs: _mixed_sums(*xs, interpret=False, together=True))(a, b, c, d)
 
-    def accumulator(equation) -> bool:
-        return equation.primitive.name == "run_scoped" and any(
-            "Accumulator" in type(var.aval).__name__ for var in equation.params["jaxpr"].invars)
-
-    scopes = [equation for equation in equations(traced.jaxpr) if accumulator(equation)]
+    scopes = [equation for equation in equations(traced.jaxpr) if _accumulator(equation)]
     assert len(scopes) == 6, len(scopes)
-    assert not any(accumulator(inner) for scope in scopes for inner in equations(scope.params["jaxpr"]))
+    assert not any(_accumulator(inner) for scope in scopes for inner in equations(scope.params["jaxpr"]))
 
 
 def _carried_sums(a, b, c, d):

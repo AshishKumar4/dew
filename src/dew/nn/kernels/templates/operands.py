@@ -15,6 +15,9 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels.templates import mosaic, product
 
+# A product `Issuer.summed` takes: a block of tiles in memory, or its name and its two operands.
+Entry = product.Blocks | tuple
+
 
 class Issuing(Protocol):
     """What an `Issuer` reads of its call: the bundle its products issue by and whether they interpret."""
@@ -257,7 +260,7 @@ class Issuer:
             total = total + value
         return total
 
-    def _counted(self, entry) -> tuple[tuple[int, int] | None, object]:
+    def _counted(self, entry: Entry) -> tuple[tuple[int, int] | None, Entry]:
         """`entry` (`_entries`') as it is issued, with how many parts each of its operands takes (`_count`),
         staging nothing: None for a block of tiles, a scaled operand's product or one taking its left operand
         in registers, which `summed` issues as they are. An operand formed later (a callable) is formed here
@@ -343,7 +346,7 @@ class Issuer:
         return family.summed_together(shapes, tuple(functools.partial(issued, found) for found in triples),
                                       apart=staged)
 
-    def _entries(self, products: Iterable):
+    def _entries(self, products: Iterable) -> Iterator[Entry]:
         """`products` as `summed` issues them: a `product.Blocks` it loops over as it is, more than one block
         of tiles in memory (`Parts`) on a family whose products read registers; any other as its blocks'
         products, one a block."""
