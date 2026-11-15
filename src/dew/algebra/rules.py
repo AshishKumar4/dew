@@ -710,31 +710,25 @@ def heads(primitive: str, operands: Sequence[str | None]) -> bool:
 
 
 def reorderable(region: terms.Region) -> bool:
-    """Whether a reordering rule may fire in `region`: each makes its new intermediate of operands the
-    program states a number bound of (`dominated`, `made`: a sum's terms, a product's moved factor), so it
-    needs a bounded term other than a literal, or two literals one value is multiplied by, whose sum
-    distributivity takes (`a * 2 + a * 4` as `a * 6`). A literal's scale an extremum reduces moves out of it
-    making no new magnitude (`positive_scale`), so a value scaled by a literal under a maximum or a minimum
-    admits it too. A program's own math over its unbounded values (most
+    """Whether a reordering rule may fire in `region`: each makes its new intermediate, and the value it
+    gives, of operands the program states a number bound of (`dominated`, `made`: a sum's terms, a product's
+    moved factor), so it needs a bounded term other than a literal. A literal's scale an extremum reduces
+    moves out of it making no new magnitude (`positive_scale`), so a value scaled by a literal under a
+    maximum or a minimum admits it too. A program's own math over its unbounded values (most
     of a training step's: a gemma3n step's 2879 regions each fired commutativity alone) admits none, and is
     left as traced. It reads the region's records alone, so a window's structure (`terms.Skeleton`) decides it
     before its terms are built."""
     literals = region.literal_keys
     if any(bound is not None and named not in literals for named, bound in region.magnitudes.items()):
         return True
-    scaled: set = set()
     by_literal: set = set()
     for term, _ in region.shapes:
         found = terms.binary_of(term)
         if found is None or found[0] != "mul":
             continue
         _, left, right = found
-        for operand, other in ((left, right), (right, left)):
-            if other in literals:
-                if operand in scaled:
-                    return True
-                scaled.add(operand)
-                by_literal.add(terms.key(term))
+        if left in literals or right in literals:
+            by_literal.add(terms.key(term))
     extrema = (terms.reduce_of(term) for term, _ in region.shapes)
     return any(found is not None and found[0] in ("max", "min") and found[1] in by_literal
                for found in extrema)

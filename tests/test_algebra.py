@@ -238,25 +238,18 @@ def test_a_rewritten_program_is_finite_wherever_the_program_is(name):
 
 TOP = float(np.uint32(0x7F7FFFFC).view(np.float32))
 """Float32's `(2**24 - 4) 2**104`, four units under its largest: `a + 3 a 2**-24` rounds to the largest,
-where `a (1 + 3 2**-24)` rounds `1 + 3 2**-24` to `1 + 2**-22` first and passes it."""
+where `a (1 + 3 2**-24)` rounds `1 + 3 2**-24` to `1 + 2**-22` first and passes it. A row scalar's sum and
+a scale's product held as their factored forms are distributivity's case reached from a wider window's
+operands: their bounds are the same rule's (`rules.dominated` of the value each gives)."""
 
-ROUNDED_FIRST = {
-    "distributivity": lambda a: a * 1.0 + a * (3 * 2.0 ** -24),
-    "a row scalar out of a sum": lambda a: jnp.sum(a[:, None] * jnp.asarray([1.0, 3 * 2.0 ** -24]), axis=-1),
-    "a row scale out of a product": lambda a: jnp.dot(
-        jnp.asarray([[1.0, 3 * 2.0 ** -24]] * 2) * a[:, None], jnp.ones((2, 1))),
-}
-"""Programs of an unbounded operand `a` a reordering factors out of terms whose sum it rounds first: each
-finite at `a = TOP`, where the factored product (`a` times the rounded sum) passes float32's largest."""
+def test_a_factored_product_is_finite_wherever_the_program_is():
+    """`a * 1 + a * (3 2**-24)`, distributivity's `a (1 + 3 2**-24)` once factored, rounds the sum to
+    `1 + 2**-22` before the product: at `TOP` the program is finite and its factored form is not.
+    Distributivity bounds the product it makes (`rules.dominated` of it, under the reach), so over an
+    unbounded `a` it does not fire, and the rewritten program is finite wherever the program is (§6.3)."""
+    def program(a):
+        return a * 1.0 + a * (3 * 2.0 ** -24)
 
-
-@pytest.mark.parametrize("name", list(ROUNDED_FIRST))
-def test_a_factored_product_is_finite_wherever_the_program_is(name):
-    """A product a rule factors out of a sum, `a (x + y)` for `a x + a y` (and a scale out of a sum or a
-    product), rounds the sum before the product: at `TOP` the program is finite and its factored form is
-    not. The rules bound the product they make (`rules.dominated` of it, under the reach), so over an
-    unbounded `a` none fires, and the rewritten program is finite wherever the program is (§6.3)."""
-    program = ROUNDED_FIRST[name]
     operand = jnp.full((2,), TOP, jnp.float32)
     assert np.all(np.isfinite(program(operand)))
     closed = jax.make_jaxpr(algebra.rewritten(program))(operand)
@@ -345,10 +338,11 @@ def test_literals_keep_their_exact_values_and_types():
         np.testing.assert_array_equal(np.asarray(given), np.asarray(got))
 
 
-def test_a_values_products_by_two_literals_are_one_product_by_their_sum():
-    """`a * 2 + a * 4`, whose only bounded terms are its literals, is `a * 6`: one product, exactly."""
+def test_a_bounded_values_products_by_two_literals_are_one_product_by_their_sum():
+    """`t * 2 + t * 4` of a bounded `t` is `t * 6`: one product, exactly, its bound under the reach."""
     def doubled(a):
-        return a * 2.0 + a * 4.0
+        bounded = jnp.tanh(a)
+        return bounded * 2.0 + bounded * 4.0
 
     (a,) = rows(8, (8, 64))
     assert cheaper_spliced(doubled, a)

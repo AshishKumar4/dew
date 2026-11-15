@@ -589,13 +589,20 @@ distributions and factorings); a product of a mode with no stated rounding state
 plain or a matrix product, so no rule factors it or makes another in its mode.
 
 The dominance rule decides which reorderings fire. Its contract is the default form's (testing.md's fast and
-accurate forms): no infinity where the reference is finite. A reordering is admitted only when every new intermediate it makes has a number
+accurate forms): no infinity where the reference is finite. A reordering is admitted only when every new intermediate it makes, and the value it gives in the written one's place, has a number
 bound under the program's reach, the narrowest float's largest power of two, taken exactly (`math.frexp`: float64's `log2` of
 its largest rounds to 1024) (`rules.reach`; `rules.dominated`): a number bound
 under the float's largest is a finite value's wherever the program's values are. A value no number bounds
 admits nothing (but a positive scale out of a maximum or a minimum, which makes no new intermediate a bound
 would have to hold): the reference's value may sit far below any bound over it while the new intermediate
-overflows: `0.5 x + 0.5 y` at `x = y = 3e38` is finite, and `0.5 (x + y)` is not. Each rule computes its new
+overflows: `0.5 x + 0.5 y` at `x = y = 3e38` is finite, and `0.5 (x + y)` is not. The value a rule gives is
+held too, as it rounds what it factors before the product: float32's `a x + a y` at `a = (2**24 - 4) 2**104`,
+`x = 1`, `y = 3 2**-24` rounds to the largest, where `a (x + y)` rounds `x + y` to `1 + 2**-22` and overflows,
+so distributivity is admitted only where `a`'s bound and the sum's, `max(x, y) + 1`, add to at most the reach
+(a row scalar out of a sum, a scale lifted out of a product and the carried set's distributed sum alike). A
+window reads the bounds the program proves of the values it takes from outside it (`program._held`, its
+inputs' declared ranges): a rule's operand made more than `WINDOW` equations below its head is bounded as the
+program bounds it. Each rule computes its new
 intermediates' bounds from its operands' (`rules.log2_bound`) and states them for the rules after it
 (`rules.made`); a new reduction bounds its new sum of terms and itself, its length's power above them
 (`rules.sum_length`): `sum(x) + sum(y)` of `x = [2**126, 2**126]` and `y = [2**126 - 2**102, 2**126 - 2**103]`
@@ -898,9 +905,8 @@ class Rewrite:                        # one region's
   `CLUSTER` equations, each saturated and extracted in an e-graph of its own (§6.5), its cheaper roots' forms
   spliced where their equations stood. A region whose only bounded terms are its literals builds no e-graph
   (`rules.reorderable`): every reordering makes its new intermediate of an operand the program bounds (§6.3),
-  and commutativity alone leaves every price as it was. Two such regions do build one: a value two literals
-  multiply, whose sum distributivity takes (`a * 2 + a * 4` as `a * 6`), and a value a literal scales under a
-  maximum or a minimum, whose scale moves out making no new magnitude. Most of a training step's regions are its own math
+  and commutativity alone leaves every price as it was. One such region does build one: a value a literal
+  scales under a maximum or a minimum, whose scale moves out making no new magnitude. Most of a training step's regions are its own math
   over unbounded values: a gemma3n step's 2879 each fired commutativity alone.
 - A region's rewrite is derived once per structure in a process while its entry is held (`program._derived`,
   bounded by `WINDOWS_HELD`; two traces that miss together each derive it): keyed by what its derivation reads (`program.structure`: its values' avals, their
