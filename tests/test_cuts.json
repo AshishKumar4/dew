@@ -90,6 +90,9 @@
 "tests/test_attention_decode_template.py::test_a_paged_decode_step_through_the_template_is_on_par_interpreted[one-query-sm80-16]",
 "tests/test_attention_decode_template.py::test_a_paged_decode_step_through_the_template_is_on_par_interpreted[verify-four-sm90-128]"
 ],
+"tests/test_attention_derived.py": [
+"tests/test_attention_derived.py::test_the_derived_backward_is_on_par_in_every_cell[causal-queries-first-normalized-weights]"
+],
 "tests/test_attention_dropout.py": [
 "tests/test_attention_dropout.py::test_a_dropping_template_call_is_on_par_with_the_reference_path_forward_and_backward[full-grouped-float32]",
 "tests/test_attention_dropout.py::test_the_mosaic_walk_drops_a_slice_at_its_global_places[inference-queries-and-keys]"
@@ -309,7 +312,7 @@
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-Kept.OUTPUT-sinks-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-Kept.SPLIT-custom-vjp-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-Kept.SPLIT-row-indexed-bfloat16]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-Kept.SPLIT-tile-bias-bfloat16]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-128-Kept.SPLIT-temperature-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-256-Kept.OUTPUT-none-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-Kept.NONE-key-bias-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-Kept.NONE-temperature-bfloat16]",
@@ -498,6 +501,9 @@
 "tests/test_block_sft.py::test_image_sft_uses_media_validity_groups_and_positions",
 "tests/test_block_sft.py::test_official_sft_loss_and_every_parameter_gradient",
 "tests/test_block_sft.py::test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target"
+],
+"tests/test_block_visibility.py": [
+"tests/test_block_visibility.py::test_a_multimodal_wrappers_cached_rollout_reads_its_blocks_as_its_full_pass_does"
 ],
 "tests/test_cache_opening.py": [
 "tests/test_cache_opening.py::test_each_mixers_cache_opens_as_its_decode_opens_and_writes_it[deepseek_v4 hca]"
@@ -1690,6 +1696,9 @@
 "tests/test_lm_serving_benchmark.py::test_a_multimodal_model_serves_the_layout_asked_for[qwen35-tiny-mm-paged]",
 "tests/test_lm_serving_benchmark.py::test_the_benchmark_serves_weights_a_mesh_splits"
 ],
+"tests/test_local_attention.py": [
+"tests/test_local_attention.py::test_a_chunked_row_with_padding_before_and_among_its_tokens_chunks_its_tokens[left-padded-xla]"
+],
 "tests/test_loop.py": [
 "tests/test_loop.py::test_a_loop_exits_each_token_at_its_threshold_through_each_passs_coda",
 "tests/test_loop.py::test_a_loop_over_a_block_is_the_stack_with_the_block_repeated_cache_and_all",
@@ -1966,6 +1975,9 @@
 "tests/test_models.py::test_a_vae_encoder_is_as_exact_as_diffusers[vjp-4]",
 "tests/test_models.py::test_layer_norm_is_flax_s_keeping_only_its_input_for_the_backward[bfloat16-False-False]"
 ],
+"tests/test_moe_biased_exchange.py": [
+"tests/test_moe_biased_exchange.py::test_biased_router_updates_pool_across_two_real_cpu_processes"
+],
 "tests/test_moe_exchange.py": [
 "tests/test_moe_exchange.py::test_capacity_drops_compute_maxtexts_experts[short-exchange-expert2-fsdp2]",
 "tests/test_moe_exchange.py::test_capacity_drops_compute_maxtexts_experts[short-exchange-expert4]",
@@ -1983,15 +1995,12 @@
 "tests/test_mosaic_toolkit.py": [
 "tests/test_mosaic_toolkit.py::test_a_quantized_stage_converts_into_the_tile_its_products_read[sm80-int8-unscaled]"
 ],
-"tests/test_mtp.py": [
-"tests/test_mtp.py::test_the_term_adds_the_weighted_mean_depth_cross_entropy[mean_stream_trunk]"
-],
 "tests/test_multimodal_model.py": [
 "tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[llama4-gradient]",
 "tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[llama4-inputs]",
 "tests/test_multimodal_model.py::test_a_float64_gemma4_audio_tower_computes_in_float64_throughout",
 "tests/test_multimodal_model.py::test_a_text_sites_slip_is_another_function[qwen35-inputs]",
-"tests/test_multimodal_model.py::test_source_backward_matches_reference[gemma4]",
+"tests/test_multimodal_model.py::test_source_backward_matches_reference[gemma3n]",
 "tests/test_multimodal_model.py::test_source_processor_and_cached_generation_match_reference[gemma3n]",
 "tests/test_multimodal_model.py::test_source_trained_export_and_frozen_buffers_match_reference[gemma4]",
 "tests/test_multimodal_model.py::test_training_reaches_the_gemma3n_vision_drop_path"
@@ -2433,6 +2442,9 @@
 "tests/test_recurrence_witness.py::test_a_grouped_backwards_records_lie_in_their_key_heads_enclosures[keys gated-sm80]",
 "tests/test_recurrence_witness.py::test_an_amperes_inference_forward_is_witnessed_as_its_states_and_output_launches"
 ],
+"tests/test_recurrent_sequence_split.py": [
+"tests/test_recurrent_sequence_split.py::test_a_delta_rule_split_over_the_sequence_runs_its_rows_as_whole_ones[kimi delta attention-all_valid]"
+],
 "tests/test_reference_runs.py": [
 "tests/test_reference_runs.py::test_lm_fine_tune_steps_are_as_exact_as_torch",
 "tests/test_reference_runs.py::test_packed_documents_give_every_step_the_work_counted_for_one"
@@ -2507,6 +2519,9 @@
 "tests/test_remote_code_releases.py": [
 "tests/test_remote_code_releases.py::test_a_decoder_computes_its_releases_outputs_at_each_recorded_site[lfm3-vl-tiny-logits]",
 "tests/test_remote_code_releases.py::test_a_decoder_computes_its_releases_outputs_at_each_recorded_site[mimo-v2-vl-tiny-frames]"
+],
+"tests/test_rl_contracts.py": [
+"tests/test_rl_contracts.py::test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima[GRPOObjective]"
 ],
 "tests/test_router_statistics.py": [
 "tests/test_router_statistics.py::test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains",
@@ -2767,7 +2782,7 @@
 "tests/test_serving.py::test_a_server_scores_its_draws_over_a_quantized_cache_as_its_rounding_does[int8]",
 "tests/test_serving.py::test_a_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_mesh_draws[one]",
 "tests/test_serving.py::test_a_speculating_server_over_an_adapter_set_reseeds_its_depths_under_each_rows_adapter",
-"tests/test_serving.py::test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own"
+"tests/test_serving.py::test_an_adapter_sets_decode_carries_each_rows_adapter_through_a_reindex"
 ],
 "tests/test_shared_cross_attention.py": [
 "tests/test_shared_cross_attention.py::test_a_decision_run_reads_its_context_through_a_deepseek_backbones_own_attention[deepseek-v4-tiny]",
