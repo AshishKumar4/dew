@@ -43,7 +43,8 @@ launch reads them within `dew.nn.kernels.tuning.reading` alone, and a call insid
 identity (`dew.training.identity`)."""
 
 
-_RECORDINGS: contextvars.ContextVar[tuple[dict, ...]] = contextvars.ContextVar("fact_recordings", default=())
+_RECORDINGS: contextvars.ContextVar[tuple[dict[Hashable, tuple[Callable[[], object], Hashable]], ...]] = (
+    contextvars.ContextVar("fact_recordings", default=()))
 """The facts read within each open `recording`, innermost last."""
 
 
@@ -56,12 +57,6 @@ def stated(value) -> Hashable:
 
     if isinstance(value, jax.Array):
         return _Same(value)
-    try:
-        hash(value)
-    except TypeError:
-        pass
-    else:
-        return value
     if isinstance(value, Mapping):
         return tuple(sorted(((key, stated(answer)) for key, answer in value.items()), key=repr))
     if isinstance(value, list | tuple):
@@ -70,7 +65,7 @@ def stated(value) -> Hashable:
         return frozenset(stated(member) for member in value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return type(value), tuple(stated(getattr(value, field.name)) for field in dataclasses.fields(value))
-    return _Same(value)
+    return value if isinstance(value, Hashable) else _Same(value)
 
 
 class _Same:
@@ -90,11 +85,11 @@ class _Same:
 
 
 @contextlib.contextmanager
-def recording() -> Iterator[dict[Hashable, tuple]]:
+def recording() -> Iterator[dict[Hashable, tuple[Callable[[], object], Hashable]]]:
     """Each fact read within the block (`traced_fact`), by its reader and question, with the answer it got
     (`stated`): what a trace kept for a later one read, which holds where each answers as it did (`still`).
     Recordings nest; a read records into each open one."""
-    reads: dict[Hashable, tuple] = {}
+    reads: dict[Hashable, tuple[Callable[[], object], Hashable]] = {}
     token = _RECORDINGS.set((*_RECORDINGS.get(), reads))
     try:
         yield reads
@@ -102,19 +97,19 @@ def recording() -> Iterator[dict[Hashable, tuple]]:
         _RECORDINGS.reset(token)
 
 
-def still(reads: Mapping[Hashable, tuple]) -> bool:
+def still(reads: Mapping[Hashable, tuple[Callable[[], object], Hashable]]) -> bool:
     """Whether each fact of `reads` (a `recording`'s) answers now as it did when it was read."""
-    return all(stated(reader(*question)) == answer for reader, question, answer in reads.values())
+    return all(stated(asked()) == answer for asked, answer in reads.values())
 
 
-def replay(reads: Mapping[Hashable, tuple]) -> None:
+def replay(reads: Mapping[Hashable, tuple[Callable[[], object], Hashable]]) -> None:
     """`reads`, a kept trace's (`recording`'s), recorded into each open recording, as if read again: a trace
     taking a kept one read what it read."""
     for recorded in _RECORDINGS.get():
         recorded.update(reads)
 
 
-def traced_fact[Reader: Callable[..., object]](reader: Reader) -> Reader:
+def traced_fact[**Question, Answer](reader: Callable[Question, Answer]) -> Callable[Question, Answer]:
     """Declare `reader` a fact a trace reads of the process or its host (the memory a device holds, a wheel's
     presence, a launch config a compile refused), where it is defined: a program compiled under one answer
     is another under the next (a route taken, a kernel refused). Its reader is the fact's one accessor: a
@@ -125,12 +120,12 @@ def traced_fact[Reader: Callable[..., object]](reader: Reader) -> Reader:
     name = f"{reader.__module__}.{reader.__qualname__}"
 
     @functools.wraps(reader)
-    def read(*question):
-        answer = reader(*question)
+    def read(*question: Question.args, **named: Question.kwargs) -> Answer:
+        answer = reader(*question, **named)
         if recordings := _RECORDINGS.get():
-            held = stated(question)
+            held = stated((question, named))
             for recorded in recordings:
-                recorded[name, held] = reader, question, stated(answer)
+                recorded[name, held] = functools.partial(reader, *question, **named), stated(answer)
         return answer
 
     if not inspect.signature(reader).parameters:
