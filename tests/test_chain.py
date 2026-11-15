@@ -104,8 +104,11 @@ def stages(tmp_path):
 def test_each_stage_continues_the_last(tmp_path):
     """Two one-step stages: both checkpoint directories land, the second
     stage trains (its parameters move off the first stage's), and its frozen
-    reference is the first stage's final tree."""
-    recipe = Recipe(TinyHead(vocab_size=8), optax.sgd(0.1), jax.random.key(0),
+    reference is the first stage's final tree. The model reads the chat
+    tokenizer's every id: a vocabulary of 8 read ids past it, and the first
+    stage trained to non-finite weights, which no save now writes."""
+    vocab = tokenizer_for(str(TOKENIZER)).vocab_size
+    recipe = Recipe(TinyHead(vocab_size=vocab), optax.sgd(0.1), jax.random.key(0),
                     stages(tmp_path), str(tmp_path / "chain"), layout=LAYOUT)
 
     states = recipe.run()
