@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 from egglog import DagCostModel, EGraph, Schedule, String, Vec, get_callable_args, i64, set_
 from jax._src import api_util, config as jax_config
+from jax._src.interpreters import partial_eval
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
 
@@ -746,13 +747,28 @@ def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kern
     consumers where the GEMM template takes them and its attention and norms written as Dew's where a kernel
     of Dew's takes them (`fusion.fused_program`), whatever the numerics admit: accurate forms limit
     reassociation alone (row 4730). The program with its spans kept as traced where no window's form lands
-    (`closed` itself where nothing changed)."""
-    made = _within(closed, accurate, saturation, kernels)
+    (`closed` itself where nothing changed). The pass reads the program without its unread work (`_read`),
+    so nothing it discards is derived, written as a kernel, certified or built."""
+    read = _read(closed)
+    made = _within(read, accurate, saturation, kernels)
     if _saturating(accurate):
         opened = _opened(made)
         windowed = _windowed(opened, accurate, saturation)
         made = made if windowed is opened else windowed
-    return fusion.fused_program(made) if kernels else made
+    made = fusion.fused_program(made) if kernels else made
+    return closed if made is read else made
+
+
+def _read(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`jaxpr`'s equations without the work none of its outputs reads, its binders as its callers bind them:
+    JAX's dead-code elimination (`partial_eval.dce_jaxpr`), whose rules enter every region, a call, a marked
+    span (`create_call_primitive`'s), a checkpoint, a custom derivative, a loop, and keep of it what is read
+    and every effect. A start's model forward is such work: flax makes the parameters inside it, so a block's
+    region both makes what the start keeps and computes what it never reads, which a walk of the program's
+    own equations alone keeps whole (row 6783: lm-moe's start certified and built two grouped launches of
+    its forward, 7.9 s of its compile, which XLA then dropped)."""
+    kept, _ = partial_eval.dce_jaxpr(jaxpr, used_outputs=True, instantiate=True)
+    return jaxpr.replace(eqns=kept.eqns)
 
 
 def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:

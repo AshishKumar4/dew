@@ -1749,7 +1749,11 @@ def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.A
     def pulled(saved, operands, cotangent):
         """Each operand's cotangent: the product's transpose to it over the cotangent rounded to bf16. No
         barrier: which operand is a parameter is its caller's to know, a projection's own reverse mode over
-        it tying its kernel's gradient (`projections.dot_general`)."""
+        it tying its kernel's gradient (`projections.dot_general`). A vocabulary head's (`head_product`,
+        `head_dot_general`) takes none: XLA forms its table's gradient beside the states' with nothing put
+        off (a stack under a bf16 head, compile-only H100: its temporaries trained are its held ones plus the
+        gradient, 272 against 256 + 16 MiB), and the rule's portable reverse mode (`portable_formed`) would
+        recompute the logits through their rounding's barrier, 768 MiB (train 911 F3)."""
         del saved
         rounded = cotangent.astype(jnp.bfloat16)
         return tuple(_transposed(rounded, operands, numbers, side, typed).astype(operands[side].dtype)
