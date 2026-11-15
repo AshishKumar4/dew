@@ -23,7 +23,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - The accurate attention form merges ties the reference keeps apart, against testing.md's claim. [6302]
 - Kernel-templates.md section 10. [6473]
 - The resource gate, now compiling a training case's forward with its kept memories as Mosaic.launches(backward=True) plans. [6553]
-- A Mamba-2 decoder's (and the parallel mixer's) trainer step does not compile on an H100. [6718]
 - XLA:GPU's Triton nested-GEMM fusion of a residual add into a dot inside a while body rounds worse than the separate add cuBLAS's program keeps. [6759]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
