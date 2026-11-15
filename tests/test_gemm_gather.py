@@ -201,6 +201,55 @@ def a_gathered_kernel_gradient_is_its_gathered_rows_gradient(interpret=False, sp
     return tokens, cotangent, table
 
 
+KERNEL_GRADIENT_TILES = {"sm90": mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma'),
+                         "sm100": mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')}
+"""A gathered kernel gradient's tile on each family whose producer gathers its rings' rows: Hopper's
+producer warpgroup's cp.async gathers and Blackwell's load warp's TMA four-row gathers (row 1376)."""
+
+
+@pytest.mark.parametrize("generation_name", KERNEL_GRADIENT_TILES)
+def test_each_rings_gathered_kernel_gradient_reads_its_operands_rows_where_their_tables_say(generation_name):
+    """A kernel gradient of gathered tokens and a scattered product's cotangent (`mosaic_gpu.tgmm`'s
+    `gather`) on an H100 and a B200, interpreted: bitwise the same tile's gradient of the rows gathered
+    first, the tokens' table alone and both operands', its groups ragged, one empty, rows past them.
+    Integers, every sum exact."""
+    sizes = jnp.asarray([70, 0, 129, 51], jnp.int32)
+    rng = np.random.default_rng(1376)
+    tokens = jnp.asarray(rng.integers(-3, 4, size=(200, 256)), jnp.bfloat16)
+    table = jnp.asarray(rng.permutation(np.concatenate([np.arange(150), rng.integers(0, 200, 106)])),
+                        jnp.int32)
+    cotangent = jnp.asarray(rng.integers(-3, 4, size=(256, 128)), jnp.bfloat16)
+    slots = jnp.asarray(rng.permutation(256), jnp.int32)
+    gradient = jax.jit(functools.partial(mosaic_gpu.tgmm, group_sizes=sizes,
+                                         tiles=KERNEL_GRADIENT_TILES[generation_name], out_dtype=jnp.float32,
+                                         multiprocessors=4, interpret=grouped_matmul.INTERPRETED))
+    with generation.assumed(generation_name):
+        for tables, rows, columns in (((table, None), tokens[table], cotangent),
+                                      ((table, slots), tokens[table], cotangent[slots])):
+            np.testing.assert_array_equal(np.asarray(gradient(tokens, cotangent, gather=tables)),
+                                          np.asarray(gradient(rows, columns)))
+
+
+@pytest.mark.parametrize("generation_name", KERNEL_GRADIENT_TILES)
+def test_each_rings_gathered_kernel_gradient_lowers_for_cuda(generation_name):
+    """A kernel gradient of gathered tokens and a scattered product's cotangent on a compile-only H100 and
+    B200 lowers through Mosaic GPU: each operand's ring its producer's gather, by the gradient's depth or
+    width."""
+    sizes = jnp.asarray([700, 0, 1290, 58], jnp.int32)
+    target = generation.gpu_target(generation_name)
+
+    def gathered(tokens, cotangent, table, slots):
+        return mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=KERNEL_GRADIENT_TILES[generation_name],
+                               out_dtype=jnp.float32, multiprocessors=target.multiprocessors, interpret=False,
+                               gather=(table, slots))
+
+    with generation.assumed(generation_name):
+        jax.jit(gathered).trace(jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
+                                jax.ShapeDtypeStruct((2048, 256), jnp.bfloat16),
+                                *(jax.ShapeDtypeStruct((2048,), jnp.int32),) * 2).lower(
+                                    lowering_platforms=("cuda",))
+
+
 def test_a_gathered_kernel_gradients_key_meets_its_table_and_rows_at_one_count():
     """A gathered kernel gradient's key (`_GroupedLaunch.keyed`, the call a tuning run materializes and
     times) buckets its table as it buckets its ungathered operand's rows, 500 to 512 each, so the launch it
