@@ -38,7 +38,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Block-selected attention's other selections as mixers. [6301]
 - Mosaic has no float32 forward at width 256 on Hopper. [6508]
 - Py `mxfp8_projection` and `nvfp4_projection`. [6658]
-- An in-key forward's interpreted launches state no cost. [6675]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm. [6030]
 - A Hopper kernel gradient's cluster along its output's columns. [6318]
 - Exact on every path, every edge and every derivative order. [2656]
@@ -93,7 +92,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Algebra
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235, 5239]
-- Spec alignment 2026-11-15 §2 (algebra.md §2:259, §6.2:491-496. [6672]
 - Spec alignment 2026-11-15 §3 (algebra.md §6.1:425 context is every derivation's key. [6673]
 - Bit-level synthesis in dew.algebra. [3733]
 - Py `_holds_regions`: 'any other holder of a program. [6578]
@@ -116,5 +114,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## CI and tooling
 
 - Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
+- On the A10 build node's kept tree. [6757]
 - The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]
