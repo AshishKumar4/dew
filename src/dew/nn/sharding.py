@@ -580,13 +580,22 @@ def constrain(x: jax.Array, axes: LogicalAxes) -> jax.Array:
 def constrained[T](x: T, spec: jax.sharding.PartitionSpec | Callable[[], jax.sharding.PartitionSpec]) -> T:
     """`x` constrained to `spec` (or what it returns) over the Auto axes of the mesh in context
     (`auto_part`): an Explicit axis stays where `x`'s type places it, a Manual one is a `shard_map`'s own.
-    No mesh, one of no Auto axis, or one whose every axis holds one device leaves `x` as it is: a
-    constraint there places nothing, and one device's step carried 1,525 of them (row 5855). The one
-    rule every placement constraint of Dew's goes through."""
+    Where no axis a constraint here places holds more than one device (`placed_axes`), `x` stays as it is: a
+    constraint there places nothing, and one device's step carried 1,525 of them (row 5855). The one rule
+    every placement constraint of Dew's goes through."""
     mesh = jax.sharding.get_abstract_mesh()
-    if mesh.empty or not mesh.auto_axes or math.prod(mesh.axis_sizes) == 1:
+    if mesh.empty or not placed_axes(mesh):
         return x
     return jax.lax.with_sharding_constraint(x, auto_part(spec() if callable(spec) else spec, mesh))
+
+
+def placed_axes(mesh: jax.sharding.AbstractMesh) -> list[str]:
+    """The axes of `mesh` a constraint traced here places (`automatic_axes`, those above one device no
+    `shard_map` holds): not an Explicit axis, which an array's type places, nor, inside a pipeline's stage
+    (`in_pipeline_stage`), the stage axis, which the stage's vmap holds. Outside one, whatever runs runs on
+    every stage, and the stage axis splits it like any other axis."""
+    return [axis for axis in automatic_axes() if axis not in mesh.explicit_axes
+            and not (axis == STAGE_AXIS and in_pipeline_stage())]
 
 
 def auto_part(spec: jax.sharding.PartitionSpec,
@@ -598,8 +607,10 @@ def auto_part(spec: jax.sharding.PartitionSpec,
     auto = set(mesh.auto_axes)
     if auto == set(mesh.axis_names):
         return spec
-    kept = [tuple(axis for axis in mesh_axes(entry) if axis in auto) for entry in spec]
-    return jax.sharding.PartitionSpec(*(axes[0] if len(axes) == 1 else axes or None for axes in kept))
+    kept = [entry if entry is jax.sharding.PartitionSpec.UNCONSTRAINED
+            else tuple(axis for axis in mesh_axes(entry) if axis in auto) for entry in spec]
+    return jax.sharding.PartitionSpec(*(axes if axes is jax.sharding.PartitionSpec.UNCONSTRAINED
+                                        else axes[0] if len(axes) == 1 else axes or None for axes in kept))
 
 
 def explicit_spec(x: jax.Array, trailing: int = 0) -> jax.sharding.NamedSharding | None:
