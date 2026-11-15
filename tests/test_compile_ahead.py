@@ -391,6 +391,22 @@ def test_a_program_whose_compile_was_begun_passes_once_where_it_compiles_over_th
     assert len(begun_passes.passes) == 1 and not same.passes and len(other.passes) == 1
 
 
+def test_a_start_begun_over_its_keys_shape_passes_once_where_its_fresh_key_places_it():
+    """A fresh fit's start is begun over its key's unplaced shape (the trainer's `_compiled_fresh`) and
+    placed with the run's key, a fresh `jax.random.key` no one committed to its devices (`placed_start`):
+    that call takes the begun lowering, its algebra pass run once, where the array's sharding beside the
+    shape's none kept the two apart and a fit passed its start twice (train 912's F5)."""
+    from dew.nn.kernels.options import attempting, compiling, owned_program
+    from dew.nn.kernels.templates import report
+
+    program = owned_program(lambda key: jax.random.normal(key, (4,)))
+    key = jax.random.key(0)
+    begun = compiling(program, jax.ShapeDtypeStruct(key.shape, key.dtype))
+    with attempting(begun), report.recording() as placed:
+        program.compiled(key)
+    assert not key.committed and not placed.passes
+
+
 def test_a_kept_program_that_is_not_its_calls_is_found_by_verifying(tmp_path):
     """`kept(path, verify=True)` lowers each handed call's own program and holds it to the kept one's
     digest: a file whose program for a call is another program (here its recorded digest changed) is
