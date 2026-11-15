@@ -1080,6 +1080,42 @@ def test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block
     assert not failures(found), "\n".join(failures(found))
 
 
+@pytest.mark.parametrize("width, packed", [(256, False), (256, True), (512, False)],
+                         ids=["256 a row", "256 packed rows", "512 a row"])
+def test_a_float32_call_compiles_spill_free_for_an_h100(width, packed):
+    """A 9B release's float32 attention (Qwen3.5-9B's 16 heads of 256 over 4 key-value heads, causal) as
+    Decide's whole pass calls it, one row or packed rows of documents, and the same call at 512 wide, through
+    the template's route at the configs it derives (no pin), compiled by XLA for a compile-only H100 on this
+    CPU: every kernel the executable carries spills nothing, as a GPU's compile refuses a spilling launch
+    (`report.compiled`), the call held by the Pallas-Triton forward's tiles at eight warps or, none holding,
+    by the plain-JAX mainloop the route then takes (`attention_route._mainloop`). Its four-warp tiles each
+    spilled, the scaled walk 176 to 1,144 bytes, and the call ended Exhausted (row 6507)."""
+    import tempfile
+
+    from fla_gdn_support import KernelCase
+    from kernel_compile import _compiled
+
+    from dew.nn.attention import scaled_dot_product_attention
+
+    queries = 2048 if packed else 512
+    query = jax.ShapeDtypeStruct((1, queries, 16, width), jnp.float32)
+    key = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.float32)
+    documents = jnp.repeat(jnp.arange(4, dtype=jnp.int32), queries // 4)[None] if packed else None
+
+    def forward(query, key, value):
+        return scaled_dot_product_attention(query, key, value, causal=True, segment_ids=documents,
+                                            implementation="template")
+
+    record: dict = {}
+    with tempfile.TemporaryDirectory(prefix="dew-fp32-") as directory:
+        found = _compiled(KernelCase("forward", lambda: (forward, (query, key, key))), "sm90", record,
+                          directory)
+    assert found is not None, record
+    spilled = [(binary["kernel"], binary["registers"], binary["frame"]) for binary in record["binaries"]
+               if binary["frame"]]
+    assert not spilled, spilled
+
+
 @pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT],
                          ids=["plain", "output", "split"])
 def test_a_forward_at_its_own_config_compiles_within_an_a100s_block(kept):

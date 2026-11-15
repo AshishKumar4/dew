@@ -60,7 +60,7 @@ from dew.nn.kernels.templates.attention import (
     scored,
     within,
 )
-from dew.nn.kernels.templates.base import Template
+from dew.nn.kernels.templates.base import Template, Unfitted
 
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 """The operand dtypes the kernels take, one on queries, keys and values alike."""
@@ -174,17 +174,34 @@ def refused(spans: KeySpans, hooks: Hooks | None = None) -> Refusal | None:
 
 
 def unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-             *, scale: float | None = None, natural: bool = NATURAL,
-             residuals: bool | Kept = False) -> Refusal | None:
+             *, scale: float | None = None, natural: bool = NATURAL, residuals: bool | Kept = False,
+             certified: bool = False) -> Refusal | None:
     """Why no config of `forward`'s launch, bound as it binds this call (`_forward_call`), fits the GPU: its
     own fitting (`Template.fits`: its padding, the configs dividing it, the registers they hold and the
-    shared memory they stage), or None. The route then takes another mainloop rather than a launch that
-    cannot run (`attention_route._mainloop`); the backward's own launches hold the same tiles' operands."""
+    shared memory they stage), and where `certified` (the route's selected mainloop alone,
+    `attention_route._mainloop`) every config it derives spilling as the GPU's assembler builds it
+    (`_holding`), or None. The route then takes another mainloop rather than a launch that cannot run; the
+    backward's own launches hold the same tiles' operands."""
     op, args, _ = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
-    if op.fits(op.bind(*args, residuals=_kept(residuals), interpret=False), generation.gpu_target()):
-        return None
-    return Refusal('resources',
-                   "no config of the Triton mainloop's forward fits the GPU's block and registers")
+    return _holding(op, op.bind(*args, residuals=_kept(residuals), interpret=False), "forward",
+                 certified=certified)
+
+
+def _holding(op: Template, ba: tokamax.BoundArguments, launch: str, *, certified: bool) -> Refusal | None:
+    """Why `op` runs no call of `ba` on the GPU in effect: no config its model fits, or where `certified`
+    every config it derives spilling as the GPU's assembler builds it alone (`tuning`'s `_certified`: each
+    refused, the next derived, to `LEAST` over four warps and eight), or None."""
+    target = generation.gpu_target()
+    if not op.fits(ba, target):
+        return Refusal('resources', f"no config of the Triton mainloop's {launch} fits the GPU's block and "
+                       "registers")
+    if certified:
+        try:
+            op._certified(ba, op.derived(ba, target))
+        except Unfitted:
+            return Refusal('resources', f"every config of the Triton mainloop's {launch} spills as "
+                           f"{target.generation}'s assembler builds it")
+    return None
 
 
 def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None):
@@ -430,7 +447,7 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
         """Its tile from the facts (`_derived`): its queries held, its keys walked."""
-        return _derived(self, ba, target, lambda rows, walk: Tiles(rows, walk, WARPS, STAGES),
+        return _derived(self, ba, target, lambda rows, walk, warps: Tiles(rows, walk, warps, STAGES),
                         held=ba.arguments["query"].shape[1], walked=ba.arguments["key"].shape[1])
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
@@ -481,8 +498,9 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         """The fp32 words a thread holds live across the walk, the program's spread over its threads: the
         block's weighted values `[block_q, Dv]` and a tile's logits `[block_q, block_k]`, in a compensated
-        walk what the values' sums dropped beside them (`algebra.Partial.low`, fp32 values'), and in a
-        training walk the anchor's value row, `[block_q, Dv]` (`algebra.training_step`). Measured where
+        walk what the values' sums dropped beside them (`algebra.Partial.low`, fp32 values'), in a
+        training walk the anchor's value row, `[block_q, Dv]` (`algebra.training_step`), and in an fp32
+        call the products' operands its FMA pipes read from registers. Measured where
         it passes a thread's registers: the training walk at 128 by 64 in four warps, 320 a thread, takes
         10x the plain forward's time on an A100 and 4.6x on an H100, at 64 by 64 2.1x and 2.0x
         (TRAINTILES3-a100, TRAINTILES2-h100)."""
@@ -494,6 +512,13 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         if self._scaled(ba):
             # A scaled walk's small weights fp32 and their products' sums (`algebra.at_scale`).
             words += rows * config.block_k + rows * value.shape[-1]
+        if jnp.dtype(ba.arguments["query"].dtype).itemsize == 4:
+            # An fp32 call's IEEE products (`kernel_dot`) on the FMA pipes read their operands from a
+            # thread's registers: the query tile held across the walk and a step's key and value tiles, each
+            # fp32 (an H100's forward at 32 by 16, width 256, priced 132 without them, compiled at 255 and
+            # spilled 152 bytes, its scaled walk 1,144: the 9B release's float32 call, row 6507).
+            width = ba.arguments["query"].shape[-1]  # the keys' too
+            words += rows * width + config.block_k * (width + value.shape[-1])
         return words // (32 * config.warps)
 
     def _scaled(self, ba: tokamax.BoundArguments) -> bool:
@@ -547,44 +572,56 @@ def _split(ba: tokamax.BoundArguments) -> bool:
 
 
 def _derived[T: (Tiles, BackwardTiles)](launch: Template[T], ba: tokamax.BoundArguments,
-                                       target: generation.GpuTarget, tiles: Callable[[int, int], T], *,
+                                       target: generation.GpuTarget, tiles: Callable[[int, int, int], T], *,
                                        held: int, walked: int) -> T | None:
     """A launch's tile from the facts (design §7, as the Mosaic mainloop's `attention_mosaic._derived`), no
     space ranked: the tile a program holds whole (a forward's queries, a backward's keys, the dK/dV launch's
     accumulated rows) `BLOCK`, four warps of `ROWS` each, FlashAttention 2's 128 a program, and
     the tile it walks the largest of `EXTENTS` whose program holds (`legal`: the block's shared memory
     and a thread's registers), stepping down the held tile only where no walked one does; each dividing the
-    call's padded extent it lies along (`held`, `walked`; a longer tile holds padding alone). `tiles(held,
-    walked)` builds the config. At width 128, bf16: a forward takes 128 by 64, the order measured within 6%
-    of the fastest on an A100 and an H100 (ATT-ZERO3-a100, ATT-ZERO4-h100), a training walk 64 by 64, the
-    tile measured fastest of it where its anchor row puts 128 rows past a thread's registers
-    (TRAINTILES3-a100), and a backward 64 by 64, the measured order's first (DPROF3-a100, DPROF3-h100).
-    Where its products issue on the FMA pipes rather than the tensor cores (an fp32 call's IEEE products,
+    call's padded extent it lies along (`held`, `walked`; a longer tile holds padding alone).
+    `tiles(held, walked, warps)` builds the config. At width 128, bf16: a forward takes 128 by 64, the order
+    measured within 6% of the fastest on an A100 and an H100 (ATT-ZERO3-a100, ATT-ZERO4-h100), a training walk
+    64 by 64, the tile measured fastest of it where its anchor row puts 128 rows past a thread's registers
+    (TRAINTILES3-a100), and a backward 64 by 64, the measured order's first (DPROF3-a100, DPROF3-h100). Where
+    its products issue on the FMA pipes rather than the tensor cores (an fp32 call's IEEE products,
     `kernel_dot`), the largest such tile a multiprocessor holds two programs of (`_resident`) first, eight
-    warps to hide each other's latency: one program a multiprocessor left its warps without an eligible one
-    92 to 94% of cycles (an H100's fp32 training step at 1 x 1024, 147,456 bytes a program at 64 by 64,
-    M-ET-55), and two took that step from 26.1 to 9.5 ms on an H100 and 28.7 to 22.8 on an A100, every
-    launch faster (M-ET-57). A tensor-core launch keeps its largest tile: a bf16 backward at 32 by 64, two
-    programs, took 2.34 ms a launch on an H100 where 64 by 64, one, took 1.30 to 1.58 (M-ET-57). None where
-    no tile holds."""
-    legal = [config for rows in (extent for extent in EXTENTS if held % extent == 0)
-             for config in (tiles(rows, walk) for walk in EXTENTS if walked % walk == 0)
-             if launch.legal(ba, config, target)]
-    if _Staged.of(target, ba.arguments["query"].dtype, held).fp32:
-        return next((config for config in legal if _resident(launch, ba, config, target) >= 2),
-                    next(iter(legal), None))
-    return next(iter(legal), None)
+    warps to hide each other's latency: one program a multiprocessor left its warps without an eligible one 92
+    to 94% of cycles (an H100's fp32 training step at 1 x 1024, 147,456 bytes a program at 64 by 64, M-ET-55),
+    and two took that step from 26.1 to 9.5 ms on an H100 and 28.7 to 22.8 on an A100, every launch faster
+    (M-ET-57). A tensor-core launch keeps its largest tile: a bf16 backward at 32 by 64, two programs, took
+    2.34 ms a launch on an H100 where 64 by 64, one, took 1.30 to 1.58 (M-ET-57). A launch none of whose four-
+    warp tiles holds, to `LEAST` (a compile finding each spilling refuses it, `report.refused`), spreads them
+    over eight: an H100's float32 forward at width 256 spilled its scaled walk at every four-warp tile, 176 to
+    1,144 bytes, and held at 16 by 32 over eight, 231 registers (the 9B release's call, row 6507). None where
+    no tile holds at either."""
+    fp32 = _Staged.of(target, ba.arguments["query"].dtype, held).fp32
+    for warps in (WARPS, 2 * WARPS):
+        legal = [config for rows in (extent for extent in EXTENTS if held % extent == 0)
+                 for config in (tiles(rows, walk, warps) for walk in EXTENTS if walked % walk == 0)
+                 if launch.legal(ba, config, target)]
+        if legal and fp32:
+            return next((config for config in legal if _resident(launch, ba, config, target) >= 2), legal[0])
+        if legal:
+            return legal[0]
+    return None
+
+
+def _warps(config: "Tiles | BackwardTiles") -> int:
+    """The warps a program of a launch at `config` spreads its tiles over (a backward's two launches the
+    same, `_derived`)."""
+    return config.warps if isinstance(config, Tiles) else max(config.dq_warps, config.dkv_warps)
 
 
 def _resident[T: (Tiles, BackwardTiles)](launch: Template[T], ba: tokamax.BoundArguments, config: T,
                                         target: generation.GpuTarget) -> int:
     """The programs of a launch at `config` a multiprocessor holds at once: its threads' registers
-    (`registers`, at the allocator's step), `WARPS` warps of them, within its register file, as many as it
+    (`registers`, at the allocator's step), its warps' (`_warps`), within its register file, as many as it
     holds blocks, and its shared memory (`staged_bytes`) within the multiprocessor's, each program's
     reservation its own (`resources.shared_programs`)."""
     held = target.multiprocessor
     step = held.register_step
-    allocated = -(-(launch.registers(ba, config) or step) // step) * step * WARPS * held.warp_threads
+    allocated = -(-(launch.registers(ba, config) or step) // step) * step * _warps(config) * held.warp_threads
     most = min(held.registers // allocated, held.resident_blocks)
     return resources.shared_programs(most, launch.staged_bytes(ba, config, target),
                                      generation.shared_budget(target))
@@ -952,7 +989,7 @@ class TritonBackward(AttentionLaunch, Template[BackwardTiles]):
         """Its tiles from the facts (`_derived`): the dK/dV launch's keys held, the queries both launches
         walk, a program of either launch holding them."""
         return _derived(self, ba, target,
-                        lambda rows, walk: BackwardTiles(walk, rows, WARPS, STAGES, WARPS, STAGES),
+                        lambda rows, walk, warps: BackwardTiles(walk, rows, warps, STAGES, warps, STAGES),
                         held=ba.arguments["key"].shape[1], walked=ba.arguments["query"].shape[1])
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
@@ -1226,18 +1263,17 @@ def _launch(*arrays, interpret: bool, **params):
 
 def backward_unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                       hooks: Hooks | None, dout: jax.Array, *, residuals: tuple, scale: float | None = None,
-                      natural: bool = NATURAL, accurate: bool = ACCURATE) -> Refusal | None:
+                      natural: bool = NATURAL, accurate: bool = ACCURATE, certified: bool = False
+                      ) -> Refusal | None:
     """Why no config of `backward`'s launches, bound as `gradients` binds this call (`launch_arguments`),
-    fits the GPU (`Template.fits`), or None: the route then takes another mainloop (`attention_route`)."""
+    fits the GPU (`Template.fits`), and where `certified` holds as its assembler builds it (`_holding`), or
+    None: the route then takes another mainloop (`attention_route`)."""
     hooks = Hooks() if hooks is None else hooks
     arrays, params, _ = launch_arguments(query, key, value, spans, hooks, dout, residuals, block=BLOCK,
                                          scale=scale)
     op = _backward_op(**params, split=True, natural=natural, accurate=accurate,
                       initial=hooks.initial is not None)
-    if op.fits(op.bind(*arrays, interpret=False), generation.gpu_target()):
-        return None
-    return Refusal('resources',
-                   "no config of the Triton mainloop's backward fits the GPU's block and registers")
+    return _holding(op, op.bind(*arrays, interpret=False), "backward", certified=certified)
 
 
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
