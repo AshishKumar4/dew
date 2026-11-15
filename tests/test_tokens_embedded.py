@@ -61,6 +61,20 @@ def test_an_lm_run_whose_rows_hold_an_id_outside_its_models_table_is_refused_at_
     assert int(finite.step) == 2
 
 
+def test_a_model_that_states_its_vocabulary_and_no_cache_bounds_its_runs_ids():
+    """A model that states its vocabulary and no cache's capacity (no `max_seq_len`) bounds the ids a run
+    reads by it all the same (`dew.nn.protocols.Vocabulary`): a run of rows past its eight ids is refused at
+    the batch that holds one. Its run's first step made its parameters NaN, and main saved them (row
+    6758: a chain's SFT stage over a tokenizer of more ids than its model's table)."""
+    from rl_support import TinyHead
+
+    trainer = Trainer(LMObjective(TinyHead(vocab_size=ROWS), seq_len=SEQ_LEN), optax.sgd(0.1),
+                      key=jax.random.key(0))
+    with pytest.raises(OutsideTable) as raised:
+        trainer.fit(token_rows(ROWS), steps=2)
+    assert outside(raised) == (ROWS, ROWS)
+
+
 def test_an_lm_runs_validation_split_holding_an_id_outside_its_models_table_is_refused():
     """A validation split whose rows hold an id outside the model's table is refused as its rows are read,
     on the host before they are placed, as a training batch is; a split within the table scores."""

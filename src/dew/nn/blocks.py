@@ -61,13 +61,13 @@ class TokenTable(NamedTuple):
 
 def token_table(model: "nn.Module | HeadedModel") -> TokenTable | None:
     """The embedding table a model reads its tokens through, which a token field indexes
-    (`dew.inputs.spec.Field.indexing`): the rows its declared vocabulary
-    (`dew.nn.protocols.Bounded`) builds, found on the model, the backbone a head reads
+    (`dew.inputs.spec.Field.indexing`): the rows its declared vocabulary (`dew.nn.protocols.Vocabulary`,
+    with or without a cache's capacity) builds, found on the model, the backbone a head reads
     (`dew.nn.wrapping.HeadedModel`) or the decoder a wrapper holds (`WrapsDecoder`), and what a
     multimodal model replaces before its table reads it, as it states (`ReplacesTokens`): ids wherever
     they occur, and the id at a slot media fill where it replaces those; None for a model of no stated
     vocabulary."""
-    from dew.nn.protocols import Bounded, ReplacesTokens, WrapsDecoder
+    from dew.nn.protocols import ReplacesTokens, Vocabulary, WrapsDecoder
     from dew.nn.wrapping import HeadedModel
 
     replaced: set[int] = set()
@@ -76,7 +76,7 @@ def token_table(model: "nn.Module | HeadedModel") -> TokenTable | None:
         if isinstance(model, ReplacesTokens):
             replaced |= model.replaced_ids
             media = media or model.replaces_media
-        if isinstance(model, Bounded) and isinstance(model.vocab_size, int):
+        if isinstance(model, Vocabulary) and isinstance(model.vocab_size, int):
             return TokenTable(model.vocab_size, frozenset(replaced), media)
         if isinstance(model, WrapsDecoder):
             model = getattr(model, model.wraps)
