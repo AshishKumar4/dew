@@ -135,13 +135,12 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import tomllib
 import xml.etree.ElementTree as ET
 from collections import Counter
-from collections.abc import Callable, Container, Mapping, Sequence
+from collections.abc import Container, Mapping, Sequence
 from pathlib import Path
 
 
@@ -564,54 +563,6 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str, missed: dict
     return found
 
 
-def reached(python: str, rows: list[tuple[str, str]], kept: Container[tuple[str, str]],
-            last: dict[tuple[str, str], list[str]], base: Path) -> dict:
-    """Which of a Python's `rows` (each a file and its group) the checkout's change from `base` (a checkout of
-    it) reaches, as the cache's keys read it (`reach`): none it keeps (`kept`, green on exactly these inputs);
-    one whose key over its last run's inputs (`last`, what `record` kept of its reads) differs between `base`
-    and here (`cache_key`, each side's own reading and common: a unit executed, a file read, a lookup, a
-    listing, a judge's map inputs, all as a key covers them); and one whose last run recorded none, unknown.
-    The same keys read in two tiers (Main, 2026-11-15): `files`, the rows whose key moved on an input other
-    than a module's top level (a function or class body its last run executed, a file it read, a lookup),
-    and `module`, those it moved through module-level units alone, which every
-    importer of a module executes. A row the change leaves unread is no reach of it, whatever the cache's
-    state for it. {"files", "module": the files of each tier, "unknown": the files reached only through a row
-    with no recorded inputs}."""
-    rows = [each for each in rows if each not in kept]
-    here = os.getcwd()
-
-    def keyed() -> tuple[dict[tuple[str, str], str], Callable[[str], str]]:
-        # A side's own reading: its digests, and whether a path is a build's output, its checkout's (review).
-        digests.built_input.cache_clear()
-        common, reading = shared(python), Reading()
-        alone: dict[str, str] = {}
-
-        def single(item: str) -> str:
-            # One input's own key, which says whether that input moved (`moved`).
-            if item not in alone:
-                alone[item] = cache_key("", "", "", [item], reading)
-            return alone[item]
-        return ({(name, group): cache_key(common, name, group, last[(name, group)], reading)
-                 for name, group in rows if last.get((name, group))}, single)
-
-    now, single_now = keyed()
-    try:
-        os.chdir(base)
-        then, single_then = keyed()
-        # Each input as the key covers it (`inputs`: the test's own code whole, the lookups that found each
-        # module), so a changed lookup or the test's own change is a tier-one move (review).
-        moved = {each: [item for item in inputs(each[0], last[each]) if single_then(item) != single_now(item)]
-                 for each, key in now.items() if then.get(each) != key}
-    finally:
-        os.chdir(here)
-    top = f"{followed.CODE}<module>"
-    deep = {each[0] for each, items in moved.items()
-            if not items or any(not item.endswith(top) for item in items)}
-    module = {each[0] for each in moved} - deep
-    unknown = {name for name, group in rows if not last.get((name, group))} - deep - module
-    return {"files": sorted(deep), "module": sorted(module), "unknown": sorted(unknown)}
-
-
 def eager_sites(python: str, sites: Sequence[tuple[str, str]]) -> set[tuple[str, str]]:
     """The check-1 sites of `sites` (each its file and test) whose judge's last run on a class the tasks
     run on (`pinned_classes`) needed its later map tasks (`LATER_JUDGED`), which the plan then draws in the
@@ -716,8 +667,6 @@ def green_record(python: str, name: str, split: str, common: str, token: str, cl
         # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of exactly
         # these, kept by that key (`green_key`) whatever ran since; why it was not, the class's word.
         recorded_set = None if found is None else found["depends"]
-        # The last run's inputs, as `reach` reads them (`record`'s `read`, else its key's): the first class's
-        # that recorded any.
         if inputs is not None and not inputs and found is not None and (found.get("read") or recorded_set):
             inputs.extend(found.get("read") or recorded_set)
         key = None if recorded_set is None else cache_key(common, name, split, recorded_set, reading)
@@ -1195,8 +1144,7 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
     return entries
 
 
-def plan(target: float, timings: dict, census: bool = False,
-         reach: dict[str, dict] | None = None) -> list[dict]:
+def plan(target: float, timings: dict, census: bool = False, reach: dict | None = None) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has timed
     runs alone, so however long it takes it holds up no other file, and its time is known from then on. Files
     marked `torchax` (`APART`) share tasks only with one another. Each entry carries the test cache's policy,
@@ -1206,8 +1154,7 @@ def plan(target: float, timings: dict, census: bool = False,
     policy "off" or "cold" every task that runs a file carries COLD_SECONDS, so armada sizes the pool by the
     work, not the longest task, as warm estimates did. A site marked one of `session.SHARDS` runs as armada's
     map and judge, apart from its file's tasks (`site_entries`). The `census` (check 1's CENSUS) is the whole
-    suite with the cache off, whatever this environment says, each entry carrying it to its task. With a
-    `reach` (`reached`), each Python's rows the checkout's change from its base reaches go into it."""
+    suite with the cache off, whatever this environment says, each entry carrying it to its task."""
     cache = "off" if census else os.environ.get("DEW_TEST_CACHE") or "on"
     # What every entry carries to its task (.armada.json's command): the cache's policy and the census.
     stamped = {"cache": cache, "census": "1" if census else "0"}
@@ -1246,10 +1193,8 @@ def plan(target: float, timings: dict, census: bool = False,
         missed: dict[str, int] = {}
         last: dict[tuple[str, str], list[str]] = {}
         found = reusable(python, rows_of, shared(python), missed, last) if cache != "off" else {}
-        # A change every key covers, or none places (the policy cold or off), reaches every row.
-        if reach is not None:
-            reach[python] = (reached(python, rows_of, found, last, reach["base"]) if cache == "on" else
-                             {"files": sorted({name for name, _ in rows_of}), "module": [], "unknown": []})
+        if reach is not None:  # reach.py's: the rows, those kept (None off "on"), their last inputs
+            reach[python] = (rows_of, found if cache == "on" else None, last)
         print(f"plan: {python}: kept {len(found)} of {len(rows_of)}; not kept: {missed}", file=sys.stderr)
         # A lookup a row, in seconds: a kept task's weight is its container's start and those lookups.
         tasks: list[tuple[list[tuple[str, str]], float]] = [
@@ -1881,9 +1826,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
     row has none, so a later run never reuses an earlier green row of its file; nor has one that read a file
     the task's processes wrote (`changed`, `watched.changed`), whose key would hash the bytes they left, not
     those it read (row 2559). A check-1 site's judge keeps its map tasks' inputs with its own
-    (`site_inputs`). Every row keeps what its run read (`read`: its inputs, a run's that wrote them or a
-    blind watch's among them, which `depends` leaves out of a key), the paths `reached` reads a change
-    against (Main, 2026-11-15: rows whose `depends` was None were a reach's unknown)."""
+    (`site_inputs`). A row whose key keeps no inputs keeps what its run read (`read`, reach.py's)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return
@@ -1896,16 +1839,13 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
     for row_ in rows:
         name = parsed_row(row_["name"])[1]
         ran = executed.get(name, {"depends": None, "reads": [], "peak": None, "shares": 0, "pools": 0})
-        read = None if ran["depends"] is None else sorted({*ran["depends"], *(opened or ())})
+        site = session.SITE.fullmatch(parsed_row(row_["name"])[2])  # a check-1 judge reads not as its site
+        read = (None if ran["depends"] is None or (site is not None and site["start"] is None) else
+                sorted({*ran["depends"], *(opened or ())}))
         if ran["depends"] is not None:
             inputs = None if opened is None else sorted({*ran["depends"], *opened})
             ran = {**ran, "depends": None if inputs is None or wrote_inputs(inputs, changed) else inputs}
         ran = {**ran, "depends": site_inputs(python, row_["name"], ran["depends"])}
-        # A check-1 site's judge reads its map tasks' inputs with its own (`site_inputs`); where those are not
-        # all known, its own reads alone are not what its site ran on, so it keeps none: unknown (review).
-        site = session.SITE.fullmatch(parsed_row(row_["name"])[2])
-        if ran["depends"] is None and site is not None and site["start"] is None:
-            read = None
         if row_["exitCode"] == 0 and name not in executed:
             continue
         green = row_["exitCode"] == 0 and ran["depends"] is not None
@@ -1928,7 +1868,6 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             current = begun(python, row_["name"], held, common, token, fresh_only=True)
         body = json.dumps({"key": key,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
-                           # What it read where its key keeps none (its record's size the Worker bounds).
                            **({"read": read} if ran["depends"] is None and read is not None else {}),
                            "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"],
                            "epoch": current}).encode()
@@ -2536,29 +2475,8 @@ def main() -> int:
         print(policy(args.base))
         return 0
     if args.operation == "plan":
-        timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
-        if args.reach:
-            # The change's reach from its base (`reached`), each Python's, under the cache's policy for it:
-            # one that leaves the cache cold or off reaches every file.
-            base = subprocess.run(["git", "merge-base", "HEAD", args.reach], capture_output=True, text=True,
-                                  check=True).stdout.strip()
-            changed = set(subprocess.run(["git", "diff", "--name-only", "--no-renames", f"{base}...HEAD"],
-                                         capture_output=True, text=True, check=True).stdout.split())
-            os.environ["DEW_TEST_CACHE"] = cache = policy(base)  # the plan's, as a run's scope sets it
-            with tempfile.TemporaryDirectory(prefix="reach-base-") as held:
-                # The base's checkout, which each row's key is read against (`reached`).
-                subprocess.run(["git", "worktree", "add", "-q", "--detach", f"{held}/base", base], check=True,
-                               capture_output=True)
-                try:
-                    reach: dict = {"base": Path(held, "base")}
-                    plan(args.target, timings, reach=reach)
-                finally:
-                    subprocess.run(["git", "worktree", "remove", "--force", f"{held}/base"],
-                                   capture_output=True)
-            print(json.dumps({"base": base, "policy": cache, "changed": sorted(changed),
-                              **{python: reach[python] for python in reach if python != "base"}}))
-            return 0
-        print(json.dumps({"include": plan(args.target, timings, census=args.census)}))
+        print(json.dumps({"include": plan(args.target, json.loads(args.timings.read_text())
+                                          if args.timings.is_file() else {}, census=args.census)}))
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)

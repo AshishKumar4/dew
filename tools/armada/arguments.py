@@ -17,9 +17,6 @@ def plan_arguments(planning: argparse.ArgumentParser) -> None:
                                "every test "
                                "process compiling check 1's arms with YNNPACK's fusions on; armada passes it "
                                "after `--`, so the run's verdict is stored as no commit's")
-    planning.add_argument("--reach", metavar="BASE",
-                          help="the rows this checkout's change from BASE reaches, each Python's "
-                               "(`reached`), as JSON, in place of the plan")
 
 
 def task_arguments(running: argparse.ArgumentParser, pythons: Sequence[str], deadline: float) -> None:
