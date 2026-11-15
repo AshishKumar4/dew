@@ -149,7 +149,12 @@ class Issuer:
         (`product.Scaled`) takes an accumulator of its own and is restored (`restored`), the unscaled
         products before and after it each summed in one. An operand may be a callable forming it then, where
         `shape`, the sum's, is given. A register left operand whose product takes it in registers (its buffers
-        a count) is issued so (`Family.register_products`). `into`, an accumulator the walk carries (its home,
+        a count) is issued so (`Family.register_products`). Products whose operands take three parts (an fp32
+        call's accurate forms) are summed a term at a time (`product.terms`, smallest first, as `Family.apart`
+        sums one product's): each term's products across the sum into one accumulator, its operands staged
+        again for each (none where they are tiles in memory, or a value held in a list of buffer sets), so
+        one accumulator is live where an accumulator a term held at once spilled an fp32 solve 576 bytes a
+        thread on an H100 (fast32d-sm90 at 83b47d66f6). `into`, an accumulator the walk carries (its home,
         a warpgroup accumulator ref or a register array), takes every unscaled product in place and is
         returned, no value read; a scaled operand's product its own accumulator, restored and added into it
         (`Family.added_into`). A `product.Blocks` entry, a product a block of tiles in
@@ -159,6 +164,8 @@ class Issuer:
         spilling 280 bytes a thread (wide-kv at e1f928585); elsewhere a product a block, as listed."""
         products = self._entries(products)
         first = next(products)
+        if (counts := self._parts(first)) is not None and max(counts) == 3:
+            return self._termwise([first, *products], counts, shape, retired=retired, into=into)
         if not isinstance(first, product.Blocks) and isinstance(first[1], product.Scaled):
             # Scaled products (fp16's) each issue in a scope of their own (`Family.summed`): every part formed
             # here, before any, as a part formed in one product's scope (the next taken as it is issued) is
@@ -229,6 +236,60 @@ class Issuer:
         while held:
             total = total + summed_group()
         return total
+
+    def _parts(self, entry) -> tuple[int, int] | None:
+        """How many parts each operand of `entry` (`_entries`') is issued in, staging nothing (`_operand`'s):
+        a tile in memory's own, an exact value's one, a register value's its product's buffers' (`staged`);
+        None for a block of tiles, a scaled operand's or one its product takes in registers, which `summed`
+        issues as they are."""
+        if isinstance(entry, product.Blocks):
+            return None
+        name, lhs, rhs = entry
+        if isinstance(lhs, product.Scaled) or self._registered(name, lhs) is not None:
+            return None
+
+        def parts(x) -> int:
+            if isinstance(x, Parts):
+                return len(x.refs)
+            if isinstance(x, product.Exact):
+                return 1
+            if isinstance(x, product.Transposed):
+                return parts(x.value)
+            buffers = self.buffers[name]
+            return len(buffers[0] if isinstance(buffers, list) else buffers)
+
+        return parts(lhs), parts(rhs)
+
+    def _termwise(self, entries: list, counts: tuple[int, int], shape: tuple[int, int] | None, *,
+                  retired: bool, into):
+        """`summed`'s sum of three-part products, each of `counts` parts: a term at a time (`product.terms`,
+        smallest first), each term's products across `entries` into one accumulator, the terms then added in
+        that order (`Family.apart`'s)."""
+        family, interpret = self.call.family, self.call.interpret
+        if any(self._parts(entry) != counts for entry in entries):
+            raise ValueError(f"a sum of products of {counts} parts takes none of another form: it is summed "
+                             "a term at a time, each product's parts its terms'")
+        if shape is None:
+            _, lhs, rhs = entries[0]
+            shape = (lhs.shape[0], rhs.shape[1])
+
+        def term(i: int, j: int, acc):
+            # Each product's operands staged as the term's pass reaches it, the pass's earlier products in
+            # flight waited for where a staging would overwrite one's tile (`_settle`).
+            read: list = []
+            for name, lhs, rhs in entries:
+                left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
+                acc = family.products(acc, left[i], right[j])
+                if retired:
+                    family.settled(0)
+            return acc
+
+        values = (family.summed(shape, functools.partial(term, i, j)) for i, j in product.terms(*counts))
+        if into is None:
+            return functools.reduce(jnp.add, values)
+        for value in values:
+            into = family.added_into(into, value, interpret)
+        return into
 
     def summed_together(self, groups: list) -> tuple[Callable[[], jax.Array], ...]:
         """Readers of `groups`' sums (each a list `summed` takes), none of which reads another's: issued

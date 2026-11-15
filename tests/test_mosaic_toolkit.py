@@ -570,6 +570,72 @@ def test_a_scaled_operands_product_is_summed_apart_and_restored(retired):
     np.testing.assert_array_equal(np.asarray(summed), 8 * f32[0] @ f32[1] + f32[2] @ f32[3])
 
 
+def _termwise_sums(a, b, *, interpret):
+    """`sum_c a[c] @ b[c]` over two slices through one prepared-operand issuer (`operands.Issuer.summed`) on
+    warpgroup MMA: fp32 operands of three parts each (an fp32 call's accurate forms), `a[c]` a shared tile of
+    its three parts (`operands.Parts`), `b[c]` a register value staged into its product's three buffers."""
+    from dew.nn.kernels.templates import mosaic_sm90, operands, product
+
+    family = mosaic_sm90.FED  # one warpgroup, no producer
+    slices = a.shape[0]
+    part = plgpu.SMEM((ISSUED, ISSUED), jnp.bfloat16)
+
+    def body(a_gmem, b_gmem, out_gmem):
+        def scoped(*refs):
+            held, buffers = refs[:3 * slices], refs[3 * slices:]
+            for c in range(slices):
+                for ref, value in zip(held[3 * c:3 * c + 3], product.formed(a_gmem[c], 3), strict=True):
+                    ref[...] = value
+            issuer = operands.Issuer(_Call(family, interpret), {"memory": buffers})
+            products = [("memory", operands.Parts(held[3 * c:3 * c + 3], jnp.float32), b_gmem[c])
+                        for c in range(slices)]
+            out_gmem[...] = issuer.summed(products, (ISSUED, ISSUED))
+
+        pl.run_scoped(scoped, *(part for _ in range(3 * slices + 3)), collective_axes="wg")
+
+    out = jax.ShapeDtypeStruct((ISSUED, ISSUED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="termwise")(a, b)
+
+
+def _termwise_operands():
+    keys = jax.random.split(jax.random.key(4))
+    # Values off bfloat16's grid, so each operand's three parts are all its own.
+    return tuple(jax.random.randint(key, (2, ISSUED, ISSUED), -64, 64).astype(jnp.float32) / 7
+                 for key in keys)
+
+
+@INTERPRETS
+def test_a_sum_of_three_part_products_is_as_accurate_as_fp32():
+    """Interpreted: the sum over two slices of fp32 products whose operands each take three parts, one a
+    shared tile's parts and one staged from registers: within fp32's rounding of the float64 sum, where a
+    product of the parts' leading terms alone is bfloat16's."""
+    a, b = _termwise_operands()
+    expected = np.einsum("cij,cjk->ik", np.asarray(a, np.float64), np.asarray(b, np.float64))
+    np.testing.assert_allclose(np.asarray(_termwise_sums(a, b, interpret=INTERPRETED)), expected,
+                               rtol=1e-5, atol=1e-3)
+
+
+def test_a_sum_of_three_part_products_holds_one_accumulator_a_term_one_at_a_time():
+    """Traced for an H100: a sum over two slices of three-part products issues each of their terms
+    (`product.terms`, six of three parts each) into an accumulator of its own across both slices, one
+    accumulator scoped at a time: a tensor core's truncating accumulation keeps each term's last bit, and one
+    accumulator is live, where one a term held at once spilled an fp32 solve on an H100."""
+    from reference_error import equations
+
+    a, b = _termwise_operands()
+    with generation.assumed("sm90"):
+        traced = jax.make_jaxpr(lambda a, b: _termwise_sums(a, b, interpret=False))(a, b)
+
+    def accumulator(equation) -> bool:
+        return equation.primitive.name == "run_scoped" and any(
+            "Accumulator" in type(var.aval).__name__ for var in equation.params["jaxpr"].invars)
+
+    scopes = [equation for equation in equations(traced.jaxpr) if accumulator(equation)]
+    assert len(scopes) == 6, len(scopes)
+    assert not any(accumulator(inner) for scope in scopes for inner in equations(scope.params["jaxpr"]))
+
+
 def _carried_sums(a, b, c, d):
     """`a @ b + c @ d` issued in place into one accumulator a walk carries (`Issuer.summed`'s `into`),
     interpreted: `a` a register left operand its product takes in registers (its buffers a count, wgmma's
