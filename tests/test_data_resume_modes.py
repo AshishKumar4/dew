@@ -244,7 +244,7 @@ def test_a_resumed_run_refused_by_its_saved_plan_starts_no_loading_worker(tmp_pa
     def fit(seed: int, marks: Path, steps: int):
         marks.mkdir()
         chain = (Pipeline(Memory({"x": x}, shard_rows=8)).map(Marking(str(marks)), identity="marking@1")
-                 .shuffle(seed=seed).repeat().batch(BATCH).loading(Loading(workers=1)))
+                 .shuffle(seed=seed, window=8).repeat().batch(BATCH).loading(Loading(workers=1)))
         trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
                           checkpoints=Checkpoints(str(tmp_path / "run")), data_resume="exact")
         return trainer.fit(chain.read("streamed"), steps=steps, log_every=1, checkpoint_every=1)
