@@ -19,6 +19,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 import lane_environment
 import pytest
 from generation_support import lowers_as, runnable
+from map_judge import LaterUnits
 
 
 @dataclasses.dataclass(frozen=True)
@@ -83,11 +84,14 @@ def covering(cells: Iterable[Cell]) -> list[Cell]:
 
 class CellsFailed(AssertionError):
     """Every failed cell of a flow, each by its label beside its error's own report; `labels` the failed
-    cells' in order."""
+    cells' in order and `asked` whether each asked a later job for its units (`map_judge.LaterUnits`), which
+    tests/conftest.py reports as `later` where every one did. No error is kept: its traceback would hold
+    every frame's device arrays beside the cells that run after it."""
 
-    def __init__(self, failed: list[tuple[str, str]]):
-        super().__init__("\n\n".join(f"{label}:\n{report}" for label, report in failed))
-        self.labels = [label for label, _ in failed]
+    def __init__(self, failed: list[tuple[str, str, bool]]):
+        super().__init__("\n\n".join(f"{label}:\n{report}" for label, report, _ in failed))
+        self.labels = [label for label, _, _ in failed]
+        self.asked = [asked for _, _, asked in failed]
 
 
 REPORTED: list[dict] = []
@@ -113,7 +117,7 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     labels returned; an outermost flow's counts reported (`REPORTED`)."""
     global _depth
     _depth += 1
-    failed: list[tuple[str, str]] = []
+    failed: list[tuple[str, str, bool]] = []
     skipped: list[str] = []
     passed = 0
     try:
@@ -131,7 +135,8 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
                 # A cell's failure is any exception, pytest's own among them (`pytest.fail`, and a
                 # `pytest.raises` that saw nothing), which derive from BaseException and would otherwise end
                 # the flow: kept with its label, and raised with every other cell's after the last.
-                failed.append((cell.label, "".join(traceback.format_exception_only(error)).strip()))
+                failed.append((cell.label, "".join(traceback.format_exception_only(error)).strip(),
+                               isinstance(error, LaterUnits)))
             else:
                 passed += 1
     finally:
