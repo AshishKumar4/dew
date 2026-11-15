@@ -45,10 +45,11 @@ def assert_steps_finite(scalars: Iterable[tuple[int, Mapping[str, float]]], labe
 
 
 def held_out_measures(objective, optimizer, loader_of: Callable[[int], object],
-                      held_out_of: Callable[[int], Mapping], *, runs: int, steps: int,
+                      held_out_of: Callable[[int], Mapping], *, runs: Iterable[int], steps: int,
                       measure: Callable[[Mapping, Mapping], float] | None = None,
                       **trainer) -> tuple[np.ndarray, np.ndarray]:
-    """Each of `runs` independent runs' held-out measure before training and after `steps` steps: on the
+    """Each of the independent runs `runs` names, its held-out measure before training and after `steps` steps
+    (the runs a learning claim's gate asks for, `learning_gate.assert_learns`, trained as it asks): on the
     run's own held-out batch (`held_out_of(run)`), each run from its own initialization key and data
     (`loader_of(run)`), a Trainer of `trainer`'s options (a rollout's among them). The measure is
     `measure(variables, held_out)`, the objective's loss read at `HELD_OUT` where None. A learning claim's
@@ -59,7 +60,7 @@ def held_out_measures(objective, optimizer, loader_of: Callable[[int], object],
 
     measured = loss if measure is None else measure
     before, after = [], []
-    for run in range(runs):
+    for run in runs:
         fitted = Trainer(objective, optimizer, key=jax.random.key(run), **trainer)
         start = fitted.initial_state()
         state = fitted.fit(loader_of(run), steps=steps, log_every=steps)

@@ -792,9 +792,6 @@ def _decoder_layout(decoder: CausalTransformer) -> Mapping[str, object] | Unwrit
     """The config a plain decoder (`source_layout`'s) is written with, or what its family's layout cannot
     hold of it: its config refused, or a parameter or router state no route writes, its leaves' paths
     abstract (`jax.eval_shape`: no weight is drawn)."""
-    import jax
-    import jax.numpy as jnp
-
     from dew.interop import decoder_parts, hf_decoders
 
     try:
@@ -802,15 +799,61 @@ def _decoder_layout(decoder: CausalTransformer) -> Mapping[str, object] | Unwrit
     except decoder_parts.ExportRefused as refusal:
         return Unwritable(str(refusal))
     family = hf_decoders.families()[str(written['model_type'])]
-    # A sequence longer than its prediction depths, which each read a token past the trunk's.
-    tokens = jnp.ones((1, decoder.num_nextn_predict_layers + 2), jnp.int32)
-    shapes = jax.eval_shape(lambda: decoder.init(jax.random.key(0), tokens))
-    missing = decoder_parts.unrouted(family, decoder, shapes)
+    missing = decoder_parts.unrouted(family, decoder, _decoder_variables(decoder))
     if missing:
         return Unwritable(f"{', '.join('/'.join(path) for path in missing)} has no tensor in the "
                           f"{family.export_model_type} layout")
     return written
 
+
+def _decoder_variables(decoder: CausalTransformer) -> Mapping[str, object]:
+    """The variables `decoder` initializes, abstract (`jax.eval_shape`: no weight is drawn), traced once a
+    record (`_abstract_variables`); a decoder no run record carries (a field of a type the record writer
+    refuses, `Unrecordable`: a NumPy scalar) has no record to key it by and is traced at each ask."""
+    from dew.registry import Unrecordable
+
+    try:
+        recorded = _Recorded.of(decoder)
+    except Unrecordable:
+        return _traced(decoder)
+    return _abstract_variables(recorded)
+
+
+@dataclass(frozen=True)
+class _Recorded:
+    """A decoder keyed by its record (`registry.to_record`), the identity a run rebuilds it from: decoders
+    of one record hold one parameter tree, where the module itself does not hash (its `kinds` and `norms`
+    are mappings)."""
+
+    key: str
+    decoder: CausalTransformer = field(compare=False)
+
+    @classmethod
+    def of(cls, decoder: CausalTransformer) -> _Recorded:
+        import json
+
+        from dew.nn.backbones.causal_transformer import CausalTransformer
+        from dew.registry import to_record
+
+        return cls(json.dumps(to_record(decoder, CausalTransformer), sort_keys=True), decoder)
+
+
+@functools.lru_cache(maxsize=64)
+def _abstract_variables(recorded: _Recorded) -> Mapping[str, object]:
+    """`recorded`'s decoder's abstract variables (`_traced`), traced once a record: every writer asks
+    `source_layout` of the model it writes (a decision format, a bundle, its export), each draw of a parity
+    rule again."""
+    return _traced(recorded.decoder)
+
+
+def _traced(decoder: CausalTransformer) -> Mapping[str, object]:
+    """The variables `decoder` initializes, abstract (`jax.eval_shape`)."""
+    import jax
+    import jax.numpy as jnp
+
+    # A sequence longer than its prediction depths, which each read a token past the trunk's.
+    tokens = jnp.ones((1, decoder.num_nextn_predict_layers + 2), jnp.int32)
+    return jax.eval_shape(lambda: decoder.init(jax.random.key(0), tokens))
 
 __all__ = [
     "CROSSING_UNWRITTEN",

@@ -95,5 +95,10 @@ def modernbert_states_in_bf16_on_the_gpu_kernels():
     def states(ids):
         return loaded.model.apply(loaded.variables, ids, method=CausalTransformer.hidden_states)
 
-    assert_as_exact(lambda ids: states(ids).astype(jnp.float32), reference, fixture_ids(DIRECTORY),
+    # The fixture's ids as a JAX array, so the gate traces the arm alone: a NumPy draw runs every plain
+    # arm once eagerly to catch NumPy arithmetic (`reference_error._refuse_numpy_arms`), which compiled this
+    # model op by op on a GPU.
+    drawn = fixture_ids(DIRECTORY)
+    assert_as_exact(lambda ids: states(ids).astype(jnp.float32), reference,
+                    lambda seed: tuple(jnp.asarray(ids) for ids in drawn(seed)),
                     'ModernBERT bf16 states', seeds=BF16_SEEDS, truth_fn=truth)

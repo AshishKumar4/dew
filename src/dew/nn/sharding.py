@@ -305,7 +305,7 @@ def measured_links(links: Mapping[str, Link]) -> Iterator[Mapping[str, Link]]:
         _LINKS.reset(token)
 
 
-class Placing(Protocol):
+class ParameterLayout(Protocol):
     """What a traced program's parameters are placed by (`dew.distributed.placement.Layout`), as a projection
     mapped per shard reads it (`placing`): a leaf's spec on a mesh by its variables path, hashable by value,
     so a program cached by what it traced under keys on it (`trace_context`)."""
@@ -317,8 +317,8 @@ class Placing(Protocol):
 
 @dataclasses.dataclass(frozen=True)
 class Forward:
-    """The placement a forward-only trace's projections take their weights by (`Placing`): each whole,
-    gathered by the partitioner from wherever it lies as the map begins. A served or scored model
+    """The placement a forward-only trace's projections take their weights by (`ParameterLayout`): each
+    whole, gathered by the partitioner from wherever it lies as the map begins. A served or scored model
     (`dew.inference`) traces under it (`FORWARD`): no gradient leaves its map, so where a weight came from
     needs no reduce-scatter back to it, and no stored tree's path is read (a scanned stack's view, a
     component applied to its own part, each sees other paths than the tree a loader placed)."""
@@ -334,7 +334,7 @@ FORWARD = Forward()
 
 
 @contextlib.contextmanager
-def placing(layout: Placing | None) -> Iterator[None]:
+def placing(layout: ParameterLayout | None) -> Iterator[None]:
     """Trace with `layout`, which a projection mapped per shard reads (`placed_layout`) to take its weight in
     the map: a `dew.distributed.placement.Layout`, the one that places a trainer's parameters, each weight
     taken where it places it, so its gradient leaves the map to that placement; or `FORWARD`, a served or
@@ -348,8 +348,8 @@ def placing(layout: Placing | None) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def tracing(layout: Placing, rules: LogicalAxisRules, microbatches: int | None, links: Mapping[str, Link],
-            declared: contextlib.AbstractContextManager) -> Iterator[Schedule]:
+def tracing(layout: ParameterLayout, rules: LogicalAxisRules, microbatches: int | None,
+            links: Mapping[str, Link], declared: contextlib.AbstractContextManager) -> Iterator[Schedule]:
     """What a run's every traced program reads from context, its step's (`Trainer._traced_on`) and its
     evaluations' (`Evaluator.scoring`) alike: the pipeline's microbatch count (`pipeline_microbatches`), the
     axes its modules declared (`declared`, a `boxed`), the layout's `rules`, which place the activations
@@ -361,7 +361,7 @@ def tracing(layout: Placing, rules: LogicalAxisRules, microbatches: int | None, 
         yield schedule
 
 
-def placed_layout() -> Placing | None:
+def placed_layout() -> ParameterLayout | None:
     """The layout traced under (`placing`), None outside one."""
     return _cache.PLACING.value
 

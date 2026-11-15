@@ -16,9 +16,9 @@ from flax import linen as nn
 from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, with_gradients
 
-from dew.nn.backbones.call_metadata import prepared_embeddings
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
+from dew.nn.backbones.embeddings import prepared_embeddings
 
 VOCAB = 37
 

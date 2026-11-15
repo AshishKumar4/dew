@@ -58,10 +58,12 @@ def judged(objective, label: str, width: int = SEQ + 1) -> None:
     """The scenario's claim, testing.md's "loss decreases", over RUNS independent runs, each on its own
     stream and held-out batch: each run's contrast the share of its held-out loss training removed, positive
     where the loss after is below the loss before, at no margin past that."""
-    before, after = held_out_measures(objective, optax.adam(1e-2), lambda run: loader(run, width),
-                                    lambda run: text(64, [run, 10_000], width), runs=RUNS, steps=STEPS)
-    lowered = 1 - after / before
-    assert_learns(lambda runs: {"training lowers the held-out loss": lowered[runs]}, label, units=RUNS)
+    def lowered(runs):
+        before, after = held_out_measures(objective, optax.adam(1e-2), lambda run: loader(run, width),
+                                          lambda run: text(64, [run, 10_000], width), runs=runs, steps=STEPS)
+        return {"training lowers the held-out loss": 1 - after / before}
+
+    assert_learns(lowered, label, units=RUNS)
 
 
 def released(directory: str) -> LMObjective:

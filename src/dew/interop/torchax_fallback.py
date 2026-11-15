@@ -165,12 +165,16 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     graph = TorchGraph(jittable, ())
     # Causal as tier 3 runs it, its experts at static shapes (`functional_parts`): transformers' own
     # forward runs Longcat Flash's experts over the tokens each routes, so one token's route rounds
-    # another's products, which is no attention to later tokens (ledger 3125).
-    placed = {name: jnp.asarray(leaf) for name, leaf in params.items()}
-    held = {name: jnp.asarray(leaf) for name, leaf in buffers.items()}
-    tokens = jnp.asarray(ids.numpy(), jnp.int32)
-    changed = tokens.at[:, -1].set((tokens[:, -1] + 1) % int(config.vocab_size))
-    logits, moved = (np.asarray(graph(placed, held, row, train=False)[0]) for row in (tokens, changed))
+    # another's products, which is no attention to later tokens (ledger 3125). On the host's CPU, whose
+    # every sum is in one order on every call: a GPU's scattered sums land in the order its threads finish,
+    # which moved Longcat Flash's earlier logits between two calls and refused it there (rows 4952, 5150).
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        placed = {name: jax.device_put(np.asarray(leaf), cpu) for name, leaf in params.items()}
+        held = {name: jax.device_put(np.asarray(leaf), cpu) for name, leaf in buffers.items()}
+        tokens = jnp.asarray(ids.numpy(), jnp.int32)
+        changed = tokens.at[:, -1].set((tokens[:, -1] + 1) % int(config.vocab_size))
+        logits, moved = (np.asarray(graph(placed, held, row, train=False)[0]) for row in (tokens, changed))
     if not np.array_equal(logits[:, :-1], moved[:, :-1]):
         raise ValueError(f"model_type {model_type!r} as configured attends to later tokens (its earlier "
                          "positions' logits move with a row's last token), and tier 3 runs causal LMs")
