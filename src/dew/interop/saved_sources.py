@@ -260,12 +260,13 @@ def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: 
 
 def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema: bool | None = None,
                  trust: Sequence[str] = (), mesh: MeshSpec | Mesh | None = None,
-                 layout: Layout | None = None) -> str | Path:
+                 layout: Layout | None = None, building: Mapping[str, object] | None = None) -> str | Path:
     """`name_or_dir` as a language model's or a decision task's loader reads it: itself, or where it is a
     saved Dew run (`pinned_run`), the release its checkpoint at `step` with `ema` exports to
     (`export_run`), written once under Dew's cache by what the export reads (`_fingerprint`) and read
     again by every later load of it. A diffusion run, which has no release (`samples_images`), is
-    refused before anything is restored.
+    refused before anything is restored, and so is a load whose options would build its model another
+    way (`building`, `refuse_building`), as its native release does.
 
     Every process of a pool agrees on whether any of them lacks the release, and then all of them export
     it, each writing its own cache, as a restore is collective; the export restores where the load
@@ -279,6 +280,8 @@ def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema:
     if samples_images(run):
         raise ValueError(f"{name_or_dir} is a diffusion run, which Dew writes no release of: a diffusion run "
                          "starts from it (load_diffusion_source), and TextToImage.from_run serves it")
+    if building is not None:
+        refuse_building(name_or_dir, building)
     release = Path(dew_cache_dir()) / "saved_runs" / _fingerprint(run, ema)
     lacking = any(from_every_process(not release.is_dir()))
     if not lacking:
@@ -336,9 +339,9 @@ def native_source[Loaded: Pretrained](kind: type[Loaded], source: str | Path, *,
     shapes alone from the files' headers (`ReleasedRun.shapes`). The load's `attention_impl` (but "auto")
     is the recorded model's own field (`ModelConfig.with_declared`), and its `max_seq_len` the cache the
     model is reloaded at, as every task sizes it (`dew.inference.tasks.cache_sized`: a learned position
-    table keeps its rows). A load option that builds a family's model another way (`building`, set where
-    neither None nor False, a 0 among them) is refused, as the release builds the model its run recorded,
-    and so is a bundle of another kind than `kind`."""
+    table keeps its rows). A load option that builds a family's model another way (`building`) is refused
+    (`refuse_building`), as the release builds the model its run recorded, and so is a bundle of another
+    kind than `kind`."""
     from dataclasses import replace
 
     from dew.inference.models import ReleasedRun
@@ -347,10 +350,7 @@ def native_source[Loaded: Pretrained](kind: type[Loaded], source: str | Path, *,
     from dew.objectives.base import ReleasedTask
     from dew.registry import ModelConfig, to_record
 
-    built = [name for name, value in building.items() if value is not None and value is not False]
-    if built:
-        raise ValueError(f"{source} is a run's native release, which builds the model its run recorded; "
-                         f"load it without {', '.join(built)}")
+    refuse_building(source, building)
     run = replace(ReleasedRun.of(str(source)), shapes=not weights)
     if attention_impl != "auto" or max_seq_len is not None:
         # The recorded model as the load asks it, which every builder of the run reads off its record.
@@ -375,6 +375,17 @@ def native_source[Loaded: Pretrained](kind: type[Loaded], source: str | Path, *,
         raise TypeError(f"{source} is a {type(bundle).__name__} source, not a {kind.__name__}; load it with "
                         f"{type(bundle).__name__}.load or Pretrained.load")
     return bundle
+
+
+def refuse_building(source: str | Path, building: Mapping[str, object]) -> None:
+    """Refuse a load of a run's native release, or of a saved run (whose release is native), with an option
+    that builds a family's model another way (`building`, set where neither None nor False, a 0 among
+    them): the release builds the model its run recorded. A saved run's is refused before it is exported
+    (`released_run`)."""
+    built = [name for name, value in building.items() if value is not None and value is not False]
+    if built:
+        raise ValueError(f"{source} is a run's native release, which builds the model its run recorded; "
+                         f"load it without {', '.join(built)}")
 
 
 def released_source(name_or_dir: str | Path, asked: bool | None, **release) -> tuple[str | Path, bool]:

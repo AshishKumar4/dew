@@ -581,18 +581,19 @@ class Pretrained:
         not stays dense, named in the load's log. Refused beside another source format. A saved Dew run
         loads as `dew export` writes it, at `step` with `ema` (`released_run`).
         """
+        # The options that build a family's model another way, which a run's native release refuses.
+        building = {"revision": revision, "subfolder": subfolder, "gguf_file": gguf_file,
+                    "single_file": single_file, "dduf_file": dduf_file, "fallback": fallback,
+                    "text_only": text_only, "modeling_overrides": modeling_overrides or None,
+                    "prediction_depths": prediction_depths, "dex": dex, "precision": precision,
+                    "scan_layers": scan_layers, "packed_experts": packed_experts}
         name_or_dir, trust_remote_code = released_source(name_or_dir, trust_remote_code, step=step, ema=ema,
-                                                         mesh=mesh, layout=layout)
+                                                         mesh=mesh, layout=layout, building=building)
         if native_release(name_or_dir):
             # A run's native release builds the model its run recorded (`saved_sources.native_source`).
             return native_source(cls, name_or_dir, mesh=mesh, layout=layout, dtype=dtype,
                                  param_dtype=param_dtype, on_host=on_host, weights=weights,
-                                 attention_impl=attention_impl, max_seq_len=max_seq_len, building={
-                "revision": revision, "subfolder": subfolder, "gguf_file": gguf_file,
-                "single_file": single_file, "dduf_file": dduf_file, "fallback": fallback,
-                "text_only": text_only, "modeling_overrides": modeling_overrides or None,
-                "prediction_depths": prediction_depths, "dex": dex, "precision": precision,
-                "scan_layers": scan_layers, "packed_experts": packed_experts})
+                                 attention_impl=attention_impl, max_seq_len=max_seq_len, building=building)
         return cls._from_family(
             name_or_dir, trust_remote_code, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len, revision=revision, subfolder=subfolder,

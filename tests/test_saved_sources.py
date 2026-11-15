@@ -115,7 +115,8 @@ def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(t
     dtypes alone; on the host, its
     weights as host arrays read from storage, nothing transferred to a device on the way; a second run
     naming it (`--pretrained <run>`) starts from it and trains its step (row 4785: a token run's native
-    release declared no task a run starts from)."""
+    release declared no task a run starts from). A load option that would build its model another way is
+    refused before the run is exported."""
     from flax import linen as nn
 
     from dew.config.lm import LMRunConfig
@@ -133,6 +134,10 @@ def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(t
     state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
     source = tmp_path / "runs" / "first"
     assert not source_layout(saved_model(SavedRun.pinned(str(source)).record, None).build())
+    # An option that builds a family's model another way is refused before the run is exported.
+    with pytest.raises(ValueError):
+        Pretrained.load(str(source), text_only=True)
+    assert not (tmp_path / "cache" / "dew" / "saved_runs").exists()
     loaded = Pretrained.load(str(source), max_seq_len=2 * SEQ, attention_impl="xla")
     assert (loaded.model.max_seq_len, loaded.model.attention_impl) == (2 * SEQ, "xla")
     # Asked no mesh, its weights lie on JAX's default device, as a family's load places them, not on
