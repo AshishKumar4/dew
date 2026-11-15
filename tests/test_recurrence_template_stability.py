@@ -251,11 +251,14 @@ interpreted, and their gradients everywhere, which the GPU tier runs whole (test
 `STRESS`, row 5461's ruling)."""
 
 
-SHARDED_ORDINARY = (('vector delta', 'resets on chunk edges'), ('vector delta', 'the decay bound'))
+SHARDED_ORDINARY = (('vector delta', 'resets on chunk edges'), ('vector delta', 'the decay bound'),
+                    ('rated', 'resets on chunk edges'))
 """The ordinary regimes' cases past a task whole, each a check-1 site of its own recorded seeds over map
 tasks: Kimi delta attention's 16 seeds of 23 interpreted chunks (its 18 documents laid apart) at 10 s a draw,
 and its 64 seeds under the decay bound at 2.2 s (179 and 146 s whole at CI's rate, train of 2026-11-14
-05:20Z). Their marks are literal parameters (`pytest.param`), as the plan reads a site's from the source."""
+05:20Z); the rated scan's 64 seeds under resets on chunk edges, each of its forms (121 s whole under the
+accurate ones, train 861's CI). Their marks are literal parameters (`pytest.param`), as the plan reads a
+site's from the source."""
 
 
 @pytest.mark.parametrize(('name', 'regime', 'forms'), [
@@ -264,6 +267,10 @@ and its 64 seeds under the decay bound at 2.2 s (179 and 146 s whole at CI's rat
     pytest.param('vector delta', 'resets on chunk edges', None, id='vector_delta-resets_on_chunk_edges',
                  marks=pytest.mark.check1_shards(seeds=16, per_task=8)),
     pytest.param('vector delta', 'the decay bound', None, id='vector_delta-the_decay_bound',
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param('rated', 'resets on chunk edges', 'fast', id='rated-resets_on_chunk_edges-fast',
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param('rated', 'resets on chunk edges', 'accurate', id='rated-resets_on_chunk_edges-accurate',
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32))])
 def test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted(name, regime, forms):
     """`test_each_form_the_template_takes_stays_finite_and_on_par_interpreted` under the regimes of a draw's
