@@ -122,13 +122,13 @@ validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).b
 with Compiles(None) as compiles:
     state = run.fit(token_rows(VOCAB, BATCH, SEQ_LEN + 1), steps=6, log_every=5, eval_every=3,
                     validation=validation)
-assert int(state.step) == 6 and state.compute is not None
+assert int(state.step) == 6 and run.plan["narrow"]
 compiled = [(program.name, program.where) for program in compiles.programs if program.kind == "compiled"]
 assert not compiled, compiled
 """
 """A fresh process training six steps of two microbatches from the step at argv[1], sampled every second
-step, two samples to a log, evaluated every third step, compiling nothing on its GPU: its bf16 step's narrow
-copies made by the programs compiled with it (row 4777)."""
+step, two samples to a log, evaluated every third step, compiling nothing on its GPU: its bf16 step's plan
+keeps its narrow copies, which the programs compiled with it make (row 4777)."""
 COMPUTING = "--xla_gpu_enable_fast_min_max=true"
 """An XLA flag that changes what a program computes, which a process loading programs compiled without it is
 refused for (`BuildTarget.held`)."""
