@@ -36,6 +36,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
 - Block-selected attention's other selections as mixers. [6301]
 - Mosaic has no float32 forward at width 256 on Hopper. [6508]
+- Py `mxfp8_projection` and `nvfp4_projection`. [6658]
+- An in-key forward's interpreted launches state no cost. [6675]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm. [6030]
 - A Hopper kernel gradient's cluster along its output's columns. [6318]
 - Exact on every path, every edge and every derivative order. [2656]
@@ -74,7 +76,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Data
 
 - The diffusion kinds' starts keep no record and their refits trace again. [6297]
-- A distillation objective states no trace key, so its refits and warm starts trace their step again. [6303]
 
 ## RL and serving
 
@@ -89,8 +90,11 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235, 5239]
 - Every MAINPERF measurement since 2026-11-09. [6045]
+- Spec alignment 2026-11-15 §2 (algebra.md §2:259, §6.2:491-496. [6672]
+- Spec alignment 2026-11-15 §3 (algebra.md §6.1:425 context is every derivation's key. [6673]
 - Bit-level synthesis in dew.algebra. [3733]
 - Py `_holds_regions`: 'any other holder of a program. [6578]
+- Spec alignment 2026-11-15 §4 (algebra.md §6.9:953-961). [6674]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]

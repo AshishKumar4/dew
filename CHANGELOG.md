@@ -15,6 +15,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   rungs instead of climbing them one compile a rung, then asks the head rungs of the remat rung it finds
   in the climb's order; the half rung that a split's miss once compiled at the same split is gone. The loss's shape-only trace runs once a split and rung.
 
+- A pool resuming a local checkpoint step written before a state held its scheduled solvers' step horizons
+  restores it, where every scheduled run's was refused as placed otherwise: a leaf the step never wrote is
+  no step's to place. A supplied state (`fit(state=...)`) trains at the rates and within the bounds the run
+  configures, as a resumed one does. A run refused before it takes the start it began compiling beside its
+  planning exits at its refusal instead of waiting for that compile (97 s for a 4B start). A QK-Clip inside
+  `optax.MultiSteps(...).gradient_transformation()`, which Optax builds as a transformation of no extra
+  arguments, is handed the attention logits' maxima: it stepped unclipped.
+
 - A run handed a step file compiled without its GPU kind's tuned choices (`AheadOfTime.tuned` false: one
   compiled on compile-only GPUs outside a prepare) no longer runs it: it compiles its step on its own
   devices as a run without a file does, keeps their tuned choices beside its compilation cache, and says

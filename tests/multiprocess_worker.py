@@ -11,6 +11,7 @@ processes are the same run in two topologies.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import shutil
 import threading
@@ -662,6 +663,56 @@ def mode_fit(args) -> dict:
             int(step) for step in checkpoints._open_local().all_steps()),
         "dataset_state": final_position,
     }
+
+
+def mode_local_made(args, *, lost: bool = False) -> dict:
+    """A pool's local step restored into a template that holds, beside the step's leaves, an array the
+    step never wrote, made where none of them lies, as a restore's template makes a scheduled solver's
+    horizons that a step written before a state held them lacks: whether its own shards of every written
+    leaf restore as written, and the made array as made, or the refusal it was refused with. Where `lost`,
+    process 1's local copy is gone before the restore, as a replaced host's is: its written leaves come
+    from process 0's replica."""
+    import shutil
+
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import multihost_utils
+
+    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, local_dir=args.local_dir, local_every=1)
+    checkpoints = trainer.checkpoints
+    assert checkpoints is not None
+    # The state on the mesh, each process holding its own shards, as a pool's run holds it.
+    placed, _, _ = trainer.place()
+    # The state a first step left, which the step it is saved under names (`_filled`).
+    state = dataclasses.replace(placed, step=placed.step + 1)
+    checkpoints.save_local(1, state, None)
+    checkpoints.wait()
+    if lost:
+        if jax.process_index() == 1:
+            shutil.rmtree(Path(args.local_dir) / "process1")
+        multihost_utils.sync_global_devices("local copy lost")
+        checkpoints = build_trainer(args.name, args.run_dir, args.fsdp_size, local_dir=args.local_dir,
+                                    local_every=1).checkpoints
+        assert checkpoints is not None
+    made = jax.device_put(jnp.arange(3.0), jax.local_devices()[0])
+    shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding),
+                          state)
+    # The variables, a dict, with a collection of the made array beside its own: the step's paths as written.
+    template = dataclasses.replace(shapes, variables={**shapes.variables, "made": {"leaf": made}})
+    try:
+        restored, _ = checkpoints.restore(template, 1)
+    except ValueError as refused:
+        return {"refused": str(refused)}
+
+    def own(tree) -> list[np.ndarray]:
+        return [np.asarray(shard.data) for leaf in jax.tree.leaves(tree) for shard in leaf.addressable_shards]
+
+    written = own((state.variables, state.opt_state))
+    kept = {name: tree for name, tree in restored.variables.items() if name != "made"}
+    read = own((kept, restored.opt_state))
+    return {"refused": None, "made": np.asarray(restored.variables["made"]["leaf"]).tolist(),
+            "as_written": len(written) == len(read) and all(
+                np.array_equal(left, right) for left, right in zip(written, read, strict=True))}
 
 
 def mode_pool_refusals(args) -> dict:
@@ -2346,6 +2397,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit
          "evaluation_kept": mode_evaluation_kept,
          "evaluation_clocks": mode_evaluation_clocks,
          "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals,
+         "local_made": mode_local_made, "local_made_lost": functools.partial(mode_local_made, lost=True),
          "fp8_sites": mode_fp8_sites}
 
 

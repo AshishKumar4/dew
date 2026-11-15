@@ -167,6 +167,48 @@ def test_post_step_effects_act_in_the_order_a_named_chain_declares():
     np.testing.assert_array_equal(deferred["q_proj"]["kernel"], [[1.5]])
 
 
+@pytest.mark.parametrize("wrapped", ["bare", "plain", "multisteps"])
+def test_a_fit_moves_its_weights_by_its_named_chains_post_step_effects_in_its_order(wrapped):
+    """Through `Trainer.fit`, bare and wrapped as a plain transformation (which declares no extra
+    arguments), a named chain's QK-Clip (named `z_clip`, after a zero step) rescales the attention kernels
+    before its clamp into [0.1, 1] (named `a_bound`) acts, the order the chain declares where its state's
+    names sort the other way (row 5964): every stored weight is within the bounds, where the rescale after
+    the clamp would leave a clipped kernel's under them, and the clip fired, its kernels shrunk under the
+    bound and lifted to it, the plain wrapper's clip handed the logits' maxima as the bare chain's is (row
+    6552). Inside `optax.MultiSteps` of two steps, whose inner update would read its window's last step's
+    maxima alone, the run is refused as its step traces."""
+    from flax.traverse_util import flatten_dict
+
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.optim import _keep_within, scale_by_qk_clip
+    from dew.training import Trainer
+
+    lower, upper = 0.1, 1.0
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=12, dtype="float32", qk_norm=False)
+    chain = optax.named_chain(("z_clip", optax.chain(optax.sgd(0.0), scale_by_qk_clip(1e-6))),
+                              ("a_bound", _keep_within(lower, upper)))
+    optimizer = {"bare": chain, "plain": optax.GradientTransformation(chain.init, chain.update),
+                 "multisteps": optax.MultiSteps(chain, 2).gradient_transformation()}[wrapped]
+    trainer = Trainer(LMObjective(model, seq_len=7), optimizer, key=jax.random.key(0))
+    rows = 2 * jax.device_count()
+    text = (np.arange(rows * 8, dtype=np.int32) % 13).reshape(rows, 8)
+    data = Pipeline(Memory({"text": text})).repeat().batch(rows)
+    if wrapped == "multisteps":
+        with pytest.raises(ValueError):
+            trainer.fit(data, steps=2)
+        return
+    final = trainer.fit(data, steps=1)
+    params = flatten_dict(jax.device_get(final.variables["params"]))
+    for path, leaf in params.items():
+        assert np.all((leaf >= lower) & (leaf <= upper)), (path, np.min(leaf), np.max(leaf))
+    attention = [leaf for path, leaf in params.items() if {"q_proj", "k_proj"} & set(path)]
+    assert attention and all(np.all(leaf == np.float32(lower)) for leaf in attention), attention
+
+
 def test_a_bounded_group_clamps_its_parameters_and_no_others():
     params = {"delay": jnp.asarray([0.05, 2.95]), "kernel": jnp.asarray([0.05, 2.95])}
     config = OptimConfig(optimizer="adam", learning_rate=0.5, param_groups=(

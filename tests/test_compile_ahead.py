@@ -341,6 +341,37 @@ def test_a_kept_programs_failed_check_raises_where_handed_as_where_kept(tmp_path
     assert take["refused"] == keep["refused"]
 
 
+ORPHANED_START = """
+import threading
+
+import jax
+import jax.numpy as jnp
+
+from dew.nn.kernels import options
+from dew.nn.kernels.templates import report
+
+# A start whose compile never ends.
+report.attempted = lambda lowered, options: threading.Event().wait()
+options.compiling(jax.jit(lambda x: x + 1), jnp.ones(2))
+# Refused before its start was taken, with an exit status of its own.
+raise SystemExit(3)
+"""
+"""A run that begins its start's compile beside its planning and is refused before it takes the start."""
+
+
+def test_a_run_refused_before_its_start_is_taken_exits_without_waiting_for_its_compile():
+    """A run whose start's compile is begun beside its planning (`options.compiling`) and which is refused
+    before it takes the start exits at its refusal, with its refusal, not when the compile no one reads
+    ends (row 5966: a 4B start's held the exit 97 s), here a compile that never ends."""
+    import process_support
+
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(process_support.REPO_ROOT / "src"),
+                                                                str(process_support.REPO_ROOT / "tests")))}
+    run = subprocess.run([sys.executable, "-c", ORPHANED_START], env=environment, capture_output=True,
+                         text=True, timeout=300, check=False)
+    assert run.returncode == 3, run.stderr[-3000:]
+
+
 def test_a_kept_program_that_is_not_its_calls_is_found_by_verifying(tmp_path):
     """`kept(path, verify=True)` lowers each handed call's own program and holds it to the kept one's
     digest: a file whose program for a call is another program (here its recorded digest changed) is

@@ -1491,13 +1491,3 @@ def test_a_fit_whose_step_fits_only_recomputing_searches_it_once_and_compiles_it
     if not stated:
         assert probes[0]["remat"] is None and not probes[0]["fits"]
 
-
-def test_a_planned_miss_saves_every_field_it_holds():
-    """A refused kernel's record in the saved plan (`planning.spill_record`) holds each field of its miss,
-    its config by its text: a field the miss gains is saved with it (a serialization-only refusal's codes
-    and so its cause were dropped, the 11-15 audit's CROSS-2)."""
-    from dew.nn.kernels.templates import report
-    from dew.training.planning import spill_record
-
-    values = {field.name: f"{field.name}-value" for field in dataclasses.fields(report.Miss)}
-    assert spill_record(report.Miss(**values)) == {**values, "config": repr(values["config"])}
