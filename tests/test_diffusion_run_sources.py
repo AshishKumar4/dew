@@ -875,3 +875,39 @@ def test_diffusion_run_source_refuses_unsupported_source_transformations_before_
         dataclasses.replace(base, source=SourceOptions(dex=DifferentialExtension())).build()
     with pytest.raises(ValueError):
         dataclasses.replace(base, source=SourceOptions(packed_experts=True)).build()
+
+
+def a_256_pixel_diffusion_run_trains_saves_resumes_and_draws(tmp_path):
+    """A diffusion run at a resolution users train at (row 295: the CPU suite's runs are 8 to 64 pixels): a
+    DiT over 256 by 256 images, 256 tokens a 16-pixel patch, trains two steps and saves the second, resumes
+    from it to its fourth, and the task its run saved (`TextToImage.from_run`) draws a 256 by 256 image of
+    finite values; every step's loss finite. A cell of tests/test_gpu_training.py, a GPU's own: the CPU
+    suite's pixels are the program's, not its size's."""
+    from test_quantization import diffusion_run
+
+    from dew.data import Memory
+    from dew.training import LocalTracker
+
+    images = np.random.RandomState(0).randint(0, 256, (16, 256, 256, 3), np.uint8)
+    data = Memory([{"image": image} for image in images]).batch(4)
+
+    def trained(steps: int):
+        config = diffusion_run(tmp_path / "runs", 4, log_every=1)
+        config = dataclasses.replace(
+            config, data=images_of("tfds://oxford_flowers102", 256, batch=4),
+            model=dataclasses.replace(config.model, fields={
+                **config.model.fields, "patch_size": 16, "emb_features": 64, "num_layers": 2, "num_heads": 4,
+                "dtype": "bfloat16"}),
+            trainer=dataclasses.replace(config.trainer, name="large", steps=steps, checkpoint_every=2,
+                                        checkpoint_final=True))
+        return config.train(config.build(), data, name="large")
+
+    assert int(trained(2).step) == 2
+    assert int(trained(4).step) == 4
+    run = tmp_path / "runs" / "large"
+    losses = [values["train/loss"] for _, values in LocalTracker(run / "tracking").scalars()
+              if "train/loss" in values]
+    assert len(losses) >= 4 and np.all(np.isfinite(losses)), losses
+    drawn = np.asarray(TextToImage.from_run(str(run))(None, key=0).host().images)
+    assert drawn.shape[-3:] == (256, 256, 3) and np.all(np.isfinite(drawn))
+
