@@ -1246,3 +1246,44 @@ def test_a_call_whose_queries_hold_no_key_runs_attends_to_no_key(implementation)
     out, pullback = jax.vjp(attended, query, key, value)
     for found in (out, *pullback(dout)):
         np.testing.assert_array_equal(np.asarray(found), np.zeros(found.shape, np.float32))
+
+
+KEY_COLUMNS_SEEDS = 8
+"""Check 1's declared seeds for a value given as its keys' leading columns."""
+
+
+def test_a_value_given_as_its_keys_leading_columns_is_the_slice_on_every_route():
+    """`scaled_dot_product_attention` with its value `KeyColumns(512)` of 576-wide keys (an absorbed latent
+    attention's, kernel-templates.md §A row 25) through the template is on par with the reference path over
+    the keys' leading 512 columns sliced (check 1), its output and its query's and key's gradients."""
+    def drawn(seed):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(streams[0], (2, 48, 4, 576), jnp.bfloat16)
+        key = jax.random.normal(streams[1], (2, 48, 1, 576), jnp.bfloat16)
+        dout = jax.random.normal(streams[2], (2, 48, 4, 512), jnp.bfloat16)
+        return query, key, dout
+
+    def given(query, key):
+        return attention.scaled_dot_product_attention(query, key, attention.KeyColumns(512), causal=True,
+                                                      implementation="template")
+
+    def sliced(query, key):
+        return attention.scaled_dot_product_attention(query, key, key[..., :512], causal=True,
+                                                      implementation="reference")
+
+    assert_as_exact(jax.jit(with_gradients(given)), jax.jit(with_gradients(sliced)), drawn,
+                    "a value of the keys' leading columns", seeds=KEY_COLUMNS_SEEDS)
+
+
+def test_a_value_given_as_its_keys_leading_columns_is_a_static_argument_of_a_jitted_call():
+    """`KeyColumns` passed through `jax.jit` stays its width, never a tracer (a static pytree node): the
+    jitted call is the eager one, bitwise."""
+    streams = jax.random.split(jax.random.key(0), 2)
+    query, key = (jax.random.normal(stream, (1, 64, 1, 64), jnp.bfloat16) for stream in streams)
+
+    def attended(query, key, value):
+        return attention.scaled_dot_product_attention(query, key, value, causal=True)
+
+    found = jax.jit(attended)(query, key, attention.KeyColumns(48))
+    np.testing.assert_array_equal(np.asarray(found, np.float32),
+                                  np.asarray(attended(query, key, key[..., :48]), np.float32))
