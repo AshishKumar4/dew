@@ -935,6 +935,7 @@ def test_mixed_precision_transition_keeps_density_arithmetic_in_float32():
 
 
 
+@pytest.mark.scenario("Online post-training")
 def test_a_step_read_in_two_microbatches_trains_and_logs_its_reward_and_policy_terms():
     """A step of collected trajectories the trainer reads in two microbatches trains, and logs the reward it
     shows and its policy gradient, KL and clipped share, each pooled over its rows or transitions, which a
