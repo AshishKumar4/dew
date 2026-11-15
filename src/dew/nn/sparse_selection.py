@@ -179,11 +179,15 @@ def candidate_pool(scores, visible, blocks: int, block_size: int):
     among them (`top_k_selection`'s `forced`), as the entries they hold,
     `[B, S, min(blocks, ceil(T / block_size)) * block_size]` in ascending
     order, -1 for a pick past the reachable blocks or an entry past the
-    last."""
+    last. No entries (a sequence shorter than its compressor's rate) or no
+    blocks is an empty pool, which reserves no block for the newest."""
     total = scores.shape[-1]
     best = block_maxima(scores, visible, block_size)
+    count = min(blocks, best.shape[-1])
+    if count == 0:
+        return jnp.full((*scores.shape[:-1], 0), -1, jnp.int32)
     newest = (jnp.sum(visible, axis=-1) - 1) // block_size
-    chosen = top_k_selection(best, best > -jnp.inf, min(blocks, best.shape[-1]) - 1, forced=newest[..., None])
+    chosen = top_k_selection(best, best > -jnp.inf, count - 1, forced=newest[..., None])
     chosen = jnp.repeat(jnp.sort(chosen, axis=-1), block_size, axis=-1)
     entries = chosen * block_size + jnp.tile(jnp.arange(block_size), chosen.shape[-1] // block_size)
     return jnp.where((chosen >= 0) & (entries < total), entries, -1)
@@ -211,8 +215,11 @@ def selected_runs(selected, bounds, *, own=None, slots=None, causal: bool = True
     query's `own` run `[B, Q, 2]` where given; under causality each up to the query's own key (`slots`
     `[B, Q]`, each query's key, its index where None; -1 for a query with none); sorted, repeats and empty
     runs an empty run after the rest, as `scaled_dot_product_attention`'s `key_runs` takes them. A selection
-    takes no gradient."""
-    rows, queries, _ = selected.shape
+    of no entries and no own run (a budget of none) is one empty run `[0, 0)` a query, which the attention
+    reads as no key. A selection takes no gradient."""
+    rows, queries, budget = selected.shape
+    if budget == 0 and own is None:
+        return jnp.zeros((rows, queries, 1, 2), jnp.int32)
     bounds = jnp.broadcast_to(bounds, (rows, *bounds.shape[-2:]))
     slots = jnp.broadcast_to(jnp.arange(queries) if slots is None else slots, (rows, queries))
     taken = selected.astype(jnp.int32)
