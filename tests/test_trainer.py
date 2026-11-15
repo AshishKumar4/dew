@@ -64,6 +64,7 @@ from dew.state import CHECKPOINTED, TokenCount, TrainState
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, ema_update
 from dew.training.evaluation import WARM_BATCHES
 from dew.training.runtime import Preempted
+from dew.training.trainer import refuse_non_finite
 
 
 def endless():
@@ -2454,3 +2455,29 @@ def test_a_state_built_from_a_held_tree_steps_without_freeing_the_tree():
     stepped, *_ = trainer.compile(state, batch)(state, batch)
     jax.block_until_ready(stepped)
     assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(objective.variables))
+
+
+class PoisonedThird(Counting):
+    """`Counting`'s batches, the third's features not finite: its loss and gradient are."""
+
+    def __next__(self):
+        batch = super().__next__()
+        if batch["index"][0] == 2:
+            batch = {**batch, "x": np.full_like(batch["x"], np.nan)}
+        return batch
+
+
+def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path):
+    """A save that meets a state holding a non-finite value writes nothing and rotates nothing out: the run
+    stops there, and the checkpoint a resume finds is the last finite one, its parameters finite (row 6699).
+    A run with no loss scale, checkpointed every step and keeping two, whose third batch is not finite,
+    saved its non-finite parameters at steps 3 and 4 and rotated its good checkpoints out."""
+    trainer = make_trainer(tmp_path, keep=2)
+    with pytest.raises(RuntimeError):
+        trainer.fit(dataset(PoisonedThird), steps=5, checkpoint_every=1, log_every=100)
+    resumed = make_trainer(tmp_path, keep=2)
+    assert resumed.checkpoints.latest == 2
+    state = resumed.initial_state()
+    restored, *_ = resumed.checkpoints.restore(state)
+    assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(restored.variables))
+    refuse_non_finite(restored, 3, 2)

@@ -215,6 +215,23 @@ _DEFAULT_MESH = MeshSpec()
 _DEFAULT_LAYOUT = Layout()
 
 
+def refuse_non_finite(state: TrainState, step: int, latest: int | None) -> None:
+    """Refuse to save a `state` whose parameters, optimizer state or averages hold a non-finite value: no
+    checkpoint is written and none rotated out, and the run stops, naming the step and the first such leaf,
+    so the checkpoint a resume finds is the last finite one (`latest`). Every process reads the same
+    flags, each a reduction over a whole array (training.md, a step that is not finite)."""
+    trees = {"variables": state.variables, "opt_state": state.opt_state, "ema": state.ema}
+    leaves = [(f"{name}{jax.tree_util.keystr(path)}", leaf) for name, tree in trees.items()
+              for path, leaf in jax.tree_util.tree_leaves_with_path(tree)
+              if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)]
+    finite = jax.device_get([jnp.all(jnp.isfinite(leaf)) for _, leaf in leaves])
+    first = next((path for (path, _), held in zip(leaves, finite, strict=True) if not held), None)
+    if first is not None:
+        kept = "no checkpoint" if latest is None else f"the latest checkpoint, step {latest}"
+        raise RuntimeError(f"step {step}'s state holds a non-finite value at {first}, so no checkpoint of it "
+                           f"is written and {kept} is the one a resume finds")
+
+
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
 
@@ -2180,6 +2197,7 @@ class Trainer(Generic[Loss, Effects]):
         Returns the seconds it took, the reading of the interval's loss included: that read waits
         on the device, and the wait is time the steps did not have."""
         paused = time.perf_counter()
+        refuse_non_finite(state, step, checkpoints.latest)
         self._display.status("writing a checkpoint")
         metadata = dict(scores or {})
         if interval.steps and interval.book is not None:
