@@ -28,7 +28,7 @@ from jax._src.array import ArrayImpl
 from jax.experimental.layout import Format
 from jax.sharding import Sharding
 
-from dew import algebra
+from dew import _cache, algebra
 from dew._devices import xla_flag
 from dew.nn.kernels.generation import backend, gpu_target, traced_fact
 from dew.nn.nested import staged
@@ -169,7 +169,8 @@ type Taken = Mapping[str, Callable[[], jax.stages.Compiled]]
 """Executables compiled ahead (`dew.training.ahead`), each loaded on demand, by the digest of the program it
 runs (`program_digest`)."""
 
-_TAKEN: contextvars.ContextVar[Taken | None] = contextvars.ContextVar("dew_taken_programs", default=None)
+_TAKEN: contextvars.ContextVar[Taken | None] = _cache.untraced(
+    contextvars.ContextVar("dew_taken_programs", default=None))
 
 
 def program_digest(lowered: jax.stages.Lowered) -> str:
@@ -200,7 +201,8 @@ type Handed = Callable[["OuterProgram", Hashable, tuple, dict], jax.stages.Compi
 (`OuterProgram.key_of`) and its arguments, the executable to keep under that key, or None for one it holds
 none of."""
 
-_HANDED: contextvars.ContextVar[Handed | None] = contextvars.ContextVar("dew_handed_programs", default=None)
+_HANDED: contextvars.ContextVar[Handed | None] = _cache.untraced(
+    contextvars.ContextVar("dew_handed_programs", default=None))
 
 
 @contextlib.contextmanager
@@ -222,7 +224,8 @@ type Kept = Callable[["OuterProgram", Hashable, tuple, dict, jax.stages.Lowered,
 """What hears each program the compile point compiles (`keeping`): the program, the call's key and
 arguments, the lowering it compiled (its last relowering's, past a spill) and its executable."""
 
-_KEEPING: contextvars.ContextVar[Kept | None] = contextvars.ContextVar("dew_keeping_programs", default=None)
+_KEEPING: contextvars.ContextVar[Kept | None] = _cache.untraced(
+    contextvars.ContextVar("dew_keeping_programs", default=None))
 
 
 @contextlib.contextmanager
@@ -264,7 +267,8 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
         pool.shutdown(wait=False)
 
 
-_ATTEMPTING: contextvars.ContextVar[Compiling | None] = contextvars.ContextVar("dew_attempting", default=None)
+_ATTEMPTING: contextvars.ContextVar[Compiling | None] = _cache.untraced(
+    contextvars.ContextVar("dew_attempting", default=None))
 
 
 @contextlib.contextmanager
@@ -279,8 +283,8 @@ def attempting(begun: Compiling | None) -> Iterator[None]:
         _ATTEMPTING.reset(token)
 
 
-_COLLECTED: contextvars.ContextVar[dict[str, jax.stages.Compiled] | None] = contextvars.ContextVar(
-    "dew_collected_programs", default=None)
+_COLLECTED: contextvars.ContextVar[dict[str, jax.stages.Compiled] | None] = _cache.untraced(
+    contextvars.ContextVar("dew_collected_programs", default=None))
 
 
 def shapes_of(tree):
@@ -323,8 +327,8 @@ class _Lowering:
     relowered: Relowered = dataclasses.field(default_factory=list)
 
 
-_TOGETHER: contextvars.ContextVar[dict[tuple[int, Hashable], _Lowering] | None] = contextvars.ContextVar(
-    "dew_programs_compiled_together", default=None)
+_TOGETHER: contextvars.ContextVar[dict[tuple[int, Hashable], _Lowering] | None] = _cache.untraced(
+    contextvars.ContextVar("dew_programs_compiled_together", default=None))
 
 
 @traced_fact

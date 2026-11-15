@@ -38,6 +38,7 @@ from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
 
+from dew import _cache
 from dew.nn import derivatives
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import (
@@ -427,8 +428,10 @@ def stored(parts, views, *, smem, wait: bool = True) -> None:
             plgpu.wait_smem_to_gmem(0)
 
 
-_COMMITTED = contextvars.ContextVar("committed", default=0)
-"""The product groups an asynchronous issuer has committed as a program traces (`committed`)."""
+_COMMITTED = _cache.untraced(contextvars.ContextVar("committed", default=0))
+"""The product groups an asynchronous issuer has committed as a program traces (`committed`): a count traces
+add to, whose differences across a walk's step are its groups (`commits`), its own value no trace's program
+reads (`dew._cache.untraced`)."""
 
 
 def committed() -> None:

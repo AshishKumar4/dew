@@ -6,6 +6,7 @@ importing the FLOP accounting.
 """
 
 import contextlib
+import contextvars
 import dataclasses
 import functools
 import hashlib
@@ -14,7 +15,7 @@ import logging
 import os
 import sys
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Hashable, Iterator
 from pathlib import Path
 
 import jax
@@ -444,6 +445,71 @@ def carried() -> Callable[[], contextlib.AbstractContextManager[None]]:
             yield
 
     return entered
+
+
+UNTRACED: set[contextvars.ContextVar] = set()
+"""The context variables of Dew's that no trace's program reads (`untraced`), which `traced_state` leaves
+out."""
+
+
+def untraced[Variable: contextvars.ContextVar](variable: Variable) -> Variable:
+    """`variable`, a context variable a trace records into or that a compile reads around the programs traces
+    make (a lowering's records, its executables handed, kept or compiled together), and no trace reads to
+    make its program: registered so `traced_state` leaves it out, as it leaves out `RECORDING`."""
+    UNTRACED.add(variable)
+    return variable
+
+
+class _Same:
+    """A value that hashes by no value of its own, held by itself: equal to its own holder alone, and kept
+    alive while a key holds it, so no other value takes its identity."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value) -> None:
+        self.value = value
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, _Same) and other.value is self.value
+
+
+def traced_state() -> Hashable:
+    """Everything a trace reads beside its function and its arguments' types, as it stands in this thread:
+    what JAX keys a trace on (its configuration's traced states, its meshes and contexts, and Dew's
+    contexts but those a trace records into, `RECORDING`) and the concrete mesh in place, as
+    `dew.nn.kernels.options.trace_context` keys a program (read as it stands within a trace too, where
+    `jax.sharding.get_mesh` refuses); every context variable set in this context but those no trace reads
+    (`UNTRACED`, and Python's decimal context); the logical axis rules Flax holds; the launch configs this
+    context's compiles refused, which a template's legality reads as it traces
+    (`dew.nn.kernels.templates.report.refused_state`); and the environment's variables of Dew's own. A trace
+    held by it (`dew.algebra.fusion`'s regions) is traced again wherever any of them differs: a value read
+    that this leaves out costs a trace, never a program traced under other state. A value that does not hash
+    is held by itself (`_Same`)."""
+    import decimal
+
+    from flax import linen as nn
+    from jax._src import config, mesh as mesh_lib
+
+    from dew.nn.kernels.templates import report
+
+    def held(value) -> Hashable:
+        try:
+            hash(value)
+        except TypeError:
+            return _Same(value)
+        return value
+
+    with KERNEL_SEEN(None), KERNEL_ROUTES(()):
+        traced = config.trace_context()
+    variables = sorted(((variable, held(value)) for variable, value in contextvars.copy_context().items()
+                        if variable not in UNTRACED and not isinstance(value, decimal.Context)),
+                       key=lambda pair: (pair[0].name, id(pair[0])))
+    return (traced, mesh_lib.get_concrete_mesh(), tuple(variables), held(nn.get_logical_axis_rules()),
+            report.refused_state(),
+            tuple(sorted((name, value) for name, value in os.environ.items() if name.startswith("DEW_"))))
 
 
 def unintercepted[**Arguments, Result](function: Callable[Arguments, Result]) -> Callable[Arguments, Result]:
