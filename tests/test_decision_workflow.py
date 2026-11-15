@@ -14,12 +14,19 @@ import math
 from collections.abc import Mapping
 from pathlib import Path
 
+import jax
 import numpy as np
 import pytest
 from real_tokenizers import backbone_reading
 from reference_error import assert_fp32_reduction_bound
-from run_kinds import cli_settings, saved_record, scalars, trained_record
-from scenario_contract import assert_steps_finite, covering
+from run_kinds import cli_settings, saved_record, scalars
+from scenario_contract import (
+    Recorded,
+    assert_resumes_onto_its_uninterrupted_run,
+    assert_samples_from_its_cached_programs,
+    assert_steps_finite,
+    covering,
+)
 
 import dew
 from dew.config import ObjectiveConfig
@@ -29,6 +36,9 @@ from dew.decision import Choice, Example, decisions
 from dew.decision.config import DecisionRunConfig, JointShape, Letters
 from dew.decision.data import Group
 from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
+from dew.decision.sources import PretrainedDecision
+from dew.decision.task import Decide
+from dew.interop.layouts import Unwritable
 from dew.registry import ModelConfig
 
 INTENTS = tuple(f"intent_{index}" for index in range(64))
@@ -115,6 +125,14 @@ class Cell:
     def joint(self) -> bool:
         return self.head == "joint"
 
+    @property
+    def released(self) -> bool:
+        """Whether a release format writes the cell's task (`Decide.release_plan`): Laya's, a question
+        head's, holds a ModernBERT backbone, not this Qwen 3.5, and no format holds a backbone's
+        cross-attention layers, which a context's reading adds; the joint head's and the slot readout's
+        formats hold the rest."""
+        return self.head != "question" and not self.context
+
 
 AXES = {"head": ("joint", "question", "letters"), "context": (False, True), "consistency": (0.0, 0.5),
         "bound": ("examples", "share")}
@@ -167,23 +185,34 @@ def kept(cell: Cell) -> int:
     return len(TRAIN[0]) - sum(refused_in(cell, TRAIN[1]).values())
 
 
-def trained(cell: Cell, backbone: Path, root: Path) -> Path:
-    """The run directory `dew train` writes for the cell, bounded to every training example its layout keeps
-    (`examples`) or to a share of them (`stop`), its context read through cross-attention where the cell reads
-    one."""
-    settings = cli_settings(root, cell.name, {
-        "trainer.log_every": "1", "trainer.examples": str(kept(cell)),
-        **({"trainer.stop": f'{{"fraction": {SHARE}}}'} if cell.bound == "share" else {}),
-        **({"context_layers": CONTEXT_LAYERS} if cell.context else {})})
-    # Bounded by its examples, not by steps.
-    del settings["trainer.steps"]
-    return trained_record(saved_record(run_of(cell, backbone, root), root, cell.name), settings)
+def recorded(cell: Cell, backbone: Path, root: Path) -> Recorded:
+    """The cell's run as `dew train` replays it (`Recorded`), bounded to every training example its layout
+    keeps (`examples`) or to a share of them (`stop`), its context read through cross-attention where the
+    cell reads one, each step logged."""
+    given = {"trainer.log_every": "1", "trainer.steps": "None", "trainer.examples": str(kept(cell)),
+             **({"trainer.stop": f'{{"fraction": {SHARE}}}'} if cell.bound == "share" else {}),
+             **({"context_layers": CONTEXT_LAYERS} if cell.context else {})}
+    return Recorded(saved_record(run_of(cell, backbone, root), root, "cell"),
+                    cli_settings(root, "cell", given), devices=1)
+
+
+def asked(cell: Cell) -> tuple[list, list]:
+    """The request each cell's task answers, the seventh message's intent, beside its context where the cell
+    reads one."""
+    return [(example(7).state, {"intent": ASKED})], [example(7).context if cell.context else None]
+
+
+def answered(cell: Mapping, run: str) -> np.ndarray:
+    """The probabilities the run's task (`dew.pipeline`) answers the cell's request with (`asked`)."""
+    requests, contexts = asked(Cell(**cell))
+    [answer] = dew.pipeline(run)(requests, contexts=contexts)
+    return np.asarray(answer["intent"].probabilities)
 
 
 @pytest.mark.scenario("Decision ablation workflow")
 @pytest.mark.parametrize("cell", CELLS, ids=lambda cell: cell.name)
 def test_a_cell_of_the_workflow_holds_the_conservation_contract(cell, backbone, tmp_path):
-    run = trained(cell, backbone, tmp_path)
+    run, _ = recorded(cell, backbone, tmp_path).trained()
     task = dew.pipeline(str(run))
     logged = scalars(run)
     assert_steps_finite(logged.items(), cell.name)
@@ -246,10 +275,59 @@ def test_a_cell_of_the_workflow_holds_the_conservation_contract(cell, backbone, 
         # Its readout letters every option a question of its data asks: its data's examples state no
         # option count, so it holds every label its tokenizer spells as one token (`Letters.count`).
         assert len(task.model.head.label_ids) >= len(INTENTS)
-    [answer] = task([(example(7).state, {"intent": ASKED})],
-                    contexts=[example(7).context if cell.context else None])
+    requests, contexts = asked(cell)
+    [answer] = task(requests, contexts=contexts)
     choice = answer["intent"]
     assert choice.options == INTENTS
     probabilities = np.asarray(choice.probabilities, np.float64)
     # A softmax's probabilities sum to one within an fp32 sum of their magnitudes.
     assert_fp32_reduction_bound(np.sum(probabilities), 1.0, np.sum(np.abs(probabilities)), len(INTENTS))
+    # Export then reload is identical: a task a release format writes (`release_plan`) reads back from its
+    # release as the bundle it released (`Decide.of`), every weight and answer bit for bit, as the joint
+    # checkpoint's release does (tests/test_decision_joint_checkpoint.py); one none writes is refused whole.
+    if cell.released:
+        assert_released_as_its_bundle(task, tmp_path / "release", requests, contexts)
+    else:
+        assert isinstance(task.release_plan(), Unwritable)
+        with pytest.raises(ValueError):
+            task.save_pretrained(tmp_path / "release")
+
+
+def assert_released_as_its_bundle(task: Decide, directory: Path, requests: list, contexts: list) -> None:
+    """`task` released under `directory` (`save_pretrained`) reads back (`Decide.from_pretrained`) as the
+    bundle it releases (`Decide.of`), its weights on the host: every weight and its answers to `requests`
+    bit for bit."""
+    task.save_pretrained(directory)
+    reloaded = Decide.from_pretrained(directory, attention_impl="xla")
+    host = dataclasses.replace(task, variables=jax.tree.map(np.asarray, task.variables))
+    bundled = Decide.of(PretrainedDecision.of(host))
+    # Every weight by its path: a head of no weights (a letter readout's) holds an empty collection or none.
+    written, held = ({jax.tree_util.keystr(path): leaf for path, leaf in jax.tree_util.tree_leaves_with_path(
+        tree)} for tree in (reloaded.variables, bundled.variables))
+    assert written.keys() == held.keys(), set(written) ^ set(held)
+    for path, leaf in written.items():
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[path]), err_msg=path, strict=True)
+    [again], [released] = (each(requests, contexts=contexts) for each in (bundled, reloaded))
+    np.testing.assert_array_equal(np.asarray(released["intent"].probabilities),
+                                  np.asarray(again["intent"].probabilities))
+
+
+ONCE = next(cell for cell in CELLS if cell.head == "letters" and not cell.context)
+"""The workflow's cell where it holds the claims a run of their own shows: a letter readout's, one row an
+example over one copy of its state, the workflow's shortest rows, whose runs two side by side fit a task's
+memory (a joint row's `dew train` holds nearly 8 GB)."""
+
+def test_the_workflows_resumed_run_ends_on_its_uninterrupted_run_from_its_compiled_programs(backbone,
+                                                                                            tmp_path):
+    """Resume equals the uninterrupted run, and a resumed run reuses its compiled programs (testing.md's
+    contracts), on the workflow's `ONCE` cell (`assert_resumes_onto_its_uninterrupted_run`)."""
+    assert_resumes_onto_its_uninterrupted_run(recorded(ONCE, backbone, tmp_path), tmp_path)
+
+
+def test_the_workflows_task_answers_from_its_compiled_programs(backbone, tmp_path):
+    """A repeated run reuses its compiled programs, sampling (testing.md's contracts): the `ONCE` cell's task
+    answering its request (`answered`) twice in fresh processes over one persistent cache
+    (`assert_samples_from_its_cached_programs`)."""
+    run, _ = recorded(ONCE, backbone, tmp_path).trained()
+    assert_samples_from_its_cached_programs("test_decision_workflow", "answered", dataclasses.asdict(ONCE),
+                                            str(run), root=tmp_path)
