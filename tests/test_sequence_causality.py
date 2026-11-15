@@ -262,6 +262,21 @@ def test_a_verdict_on_a_mask_at_its_dtypes_lowest_names_the_bound_it_rests_on():
     assert infinite.refusal is None and infinite.bounded == () and not infinite.assumption()
 
 
+def test_a_mask_float64_cannot_hold_exactly_holds_nothing():
+    """Integer weights past 2^53, which float64 holds no closer than 2: future keys weighted one by an
+    int64 constant one past 2^53 less 2^53 read the values at those keys, where a float64 copy would take
+    the difference as zero."""
+    def program(tokens):
+        q = k = v = embedded(tokens)
+        scores = jnp.einsum("bqd,bkd->bqk", q, k).astype(jnp.int64)
+        seen = visible(tokens.shape[1])
+        weights = jnp.where(seen, 0, jnp.where(seen, scores, 2 ** 53 + 1) - 2 ** 53)
+        return jnp.einsum("bqk,bkd->bqd", weights.astype(jnp.float32), v)
+
+    with jax.enable_x64():
+        assert refusal(program) is not None
+
+
 def test_another_librarys_operation_named_as_one_of_jaxs_reads_its_operands_whole():
     """An operation is known by its object: a primitive of another library's under the name of JAX's
     entrywise `exp`, which may read any position, gives every entry the latest its operands read and is

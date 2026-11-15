@@ -544,9 +544,10 @@ def _pair_entrywise(walk: _Walk, eqn: core.JaxprEqn, given: list[Held], operands
     every = np.logical_and.reduce(helds)
     computed = eqn.primitive.bind(*(np.asarray(value).astype(_dtype(var))
                                     for value, var in zip(values, eqn.invars, strict=True)), **eqn.params)
-    value = np.asarray(computed[0] if eqn.primitive.multiple_results else computed, np.float64)
+    native = np.asarray(computed[0] if eqn.primitive.multiple_results else computed)
+    value, exact = _exactly(native)
     latest = np.maximum.reduce(reads)
-    held = every.copy()
+    held = every & exact
     if eqn.primitive is jax.lax.select_n_p:
         latest, held, value = _selected(reads, helds, values, latest, held, value)
     else:
@@ -586,12 +587,22 @@ def _entries(value: Held, operand: np.ndarray | None, shape: tuple[int, ...],
     reads = np.full(size, NONE, np.int64)
     if operand is None:
         return reads, *unheld
-    full = np.moveaxis(np.broadcast_to(np.asarray(operand, np.float64), shape), axes, (0, 1))
+    wide, exact = _exactly(np.asarray(operand))
+    full = np.moveaxis(np.broadcast_to(np.where(exact, wide, np.nan), shape), axes, (0, 1))
     flat = full.reshape(*size, -1)
     low, high = flat.min(axis=2), flat.max(axis=2)
-    # One value across its other axes (NaN never equal to itself, so never held).
+    # One value across its other axes, each exact (NaN, an inexact one's, never equal to itself).
     held = low == high
     return reads, held, np.where(held, low, 0.0)
+
+
+def _exactly(native: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """`native`'s values in float64, and where float64 holds each exactly (an integer past 2^53 it does
+    not, nor a NaN, whose comparisons say nothing): the entries a pair may hold."""
+    value = native.astype(np.float64)
+    with np.errstate(invalid="ignore"):
+        exact = value.astype(native.dtype) == native
+    return value, np.asarray(exact)
 
 
 def _absorbed(eqn: core.JaxprEqn, helds: list[np.ndarray],
