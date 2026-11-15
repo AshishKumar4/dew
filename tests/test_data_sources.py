@@ -2348,19 +2348,23 @@ def test_an_endless_read_of_files_whose_whole_pass_yields_no_row_is_refused(tmp_
 @pytest.mark.parametrize("read", ["interleaved", "shuffled in workers"])
 def test_an_endless_read_of_files_some_empty_reads_the_rows_the_others_hold(tmp_path, read):
     """Shards no store counts, some empty, are read on, not refused, while any holds rows: under an
-    interleave an open shard that is still yielding rows ends no run of empty ones, and a loading worker's
-    shuffled slice may meet several empty shards in a row while the store holds rows (train 897's review:
-    a run of twice the shards ending empty was refused by its fourth row)."""
+    interleave of a file of rows and two empty ones an open shard that is still yielding rows ends no run
+    of empty ones, and a loading worker's slice of shards dealt in a drawn order may meet several empty
+    ones in a row while the store holds rows (train 897's review: a run of twice the shards ending empty
+    was refused by its fourth row)."""
     from dew.data.compile import compile
 
     paths = []
-    for name, rows in (("full", 64), *((f"empty{index}", 0) for index in range(4))):
+    empty = 2 if read == "interleaved" else 6
+    for name, rows in (("full", 64), *((f"empty{index}", 0) for index in range(empty))):
         path = tmp_path / f"{name}.csv"
         path.write_text("id\n" + "".join(f"{index}\n" for index in range(rows)))
         paths.append(str(path))
     files = Files(tuple(paths))
-    chain = (files.interleave(2).repeat().batch(1) if read == "interleaved"
-             else files.shuffle(0).repeat().batch(1).workers(2))
+    # A streamed read deals its shards in an order the run's seed draws, each pass its own, a worker its
+    # slice of them (`dew.data.shards.streamed`).
+    chain = (files.interleave().repeat().batch(1) if read == "interleaved"
+             else files.repeat().batch(1).workers(2))
     data = compile(chain, read="streamed", loading=Loading(workers=0 if read == "interleaved" else 2,
                                                            threads=1, read_buffer=1))
     stream = data.train(DataPartition())

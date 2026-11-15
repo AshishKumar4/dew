@@ -6,7 +6,7 @@ import dataclasses
 import functools
 import logging
 import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 
 import grain.experimental as experimental
 import grain.python as grain
@@ -333,10 +333,10 @@ class _EmptyRun:
                  uncounted: int | None = None):
         self.name, self.count, self.nothing, self.uncounted = name, 0, nothing, uncounted
         self.rows = self.seen = 0
-        self.empty: set[object] = set()
+        self.empty: set[Hashable] = set()
         self.lock = threading.Lock()
 
-    def ended(self, yielded: bool, place: object) -> None:
+    def ended(self, yielded: bool, place: Hashable) -> None:
         with self.lock:
             if yielded or self.rows != self.seen:
                 self.count, self.empty = 0, set()
@@ -387,7 +387,7 @@ class _Reader[Place]:
 class _Watched(grain.IterDataset):
     """One shard's rows, telling `empty` whether it held any as it ends."""
 
-    def __init__(self, parent: grain.IterDataset, empty: _EmptyRun, place: object):
+    def __init__(self, parent: grain.IterDataset, empty: _EmptyRun, place: Hashable):
         super().__init__(parent)
         self.input_parent, self.empty, self.place = parent, empty, place
 
@@ -396,7 +396,7 @@ class _Watched(grain.IterDataset):
 
 
 class _WatchedIterator(grain.DatasetIterator):
-    def __init__(self, parent: grain.DatasetIterator, empty: _EmptyRun, place: object):
+    def __init__(self, parent: grain.DatasetIterator, empty: _EmptyRun, place: Hashable):
         super().__init__(parent)
         self.input_parent, self.empty, self.place = parent, empty, place
         self.yielded = False
