@@ -987,8 +987,18 @@ class _Draws:
                       self.zero_rows + other.zero_rows, np.concatenate([self.finite, other.finite]),
                       self.widths, examples, example_rows, shares)
 
+    def __post_init__(self) -> None:
+        optional = (self.examples, self.example_rows, self.shares)
+        held = {len(self.mine), len(self.theirs), len(self.worst), len(self.zero_rows), len(self.finite),
+                *(len(field) for field in optional if field is not None)}
+        if len(held) > 1:
+            raise ValueError(f"draws whose evidence holds {sorted(held)} seeds: each holds every seed once")
+
     def between(self, start: int, stop: int) -> "_Draws":
-        """These draws' seeds `start` to `stop`, counted from their first."""
+        """These draws' seeds `start` to `stop`, counted from their first; refused where they hold fewer, as
+        a stage that judged them would judge seeds no arm drew."""
+        if not 0 <= start <= stop <= len(self.mine):
+            raise ValueError(f"seeds {start} to {stop} of draws holding {len(self.mine)}")
         cut = slice(start, stop)
         examples, example_rows = (None if getattr(self, field) is None else getattr(self, field)[cut]
                                   for field in ("examples", "example_rows"))

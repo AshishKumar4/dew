@@ -22,9 +22,11 @@ from float64_terms import float64_signed_sums
 from reference_error import widened
 
 LEAST = float(np.finfo(np.float32).tiny) * (1 + 2.0**-16)
-"""Just above float32's least normal value."""
+"""2^-16 of it above float32's least normal value: a held position's truth is at least it (testing.md's
+derivative contracts), as a run's few roundings of a value at the range's very edge may carry it past."""
 MOST = float(np.finfo(np.float32).max) * (1 - 2.0**-16)
-"""Just below float32's largest value."""
+"""2^-16 of it below float32's largest value: a held position's truth, and each signed sum of its terms, at
+most it, as `LEAST`."""
 
 
 class LessFinite(AssertionError):

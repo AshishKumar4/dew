@@ -120,6 +120,34 @@ def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whol
         as_test("one_site", halved, pool=str(tmp_path / "pythons"))
 
 
+def test_a_record_holding_fewer_draws_than_its_seeds_is_refused(tmp_path, monkeypatch):
+    """A map task's record of a site's seeds 0 to 80 whose draws hold one seed (a record cut short) is
+    refused by its judge (`PoolRefused`, no unit held before it), never judged as the seeds it names: one
+    seed of each arm's errors read as the stage's sixteen passed it."""
+    import pickle
+
+    from check1_wire import DRAWS, POOL, RECORDS
+    from map_judge import PoolRefused
+
+    def site():
+        assert_as_exact(jnp.matmul, jnp.matmul, a_product_draw, "cut short", seeds=16)
+
+    monkeypatch.setenv(DRAWS, "0:80")
+    monkeypatch.setenv(RECORDS, str(tmp_path / "0"))
+    site()
+    monkeypatch.delenv(DRAWS)
+    monkeypatch.delenv(RECORDS)
+    for path in (tmp_path / "0").glob("*.pkl"):
+        if ".manifest." not in path.name:
+            record = pickle.loads(path.read_bytes())
+            record["payload"]["draws"] = [draws.between(0, 1) for draws in record["payload"]["draws"]]
+            path.write_bytes(pickle.dumps(record))
+    monkeypatch.setenv(POOL, str(tmp_path))
+    with pytest.raises(PoolRefused) as short:
+        site()
+    assert short.value.held == 0
+
+
 def test_a_judge_judges_a_tests_sites_from_its_map_tasks_records_alone(tmp_path, monkeypatch):
     """A sharded test's judge (POOL) judges the sites its map tasks' manifests name from their records,
     none of its body run (`judged_from_records`): a product on par passes and a bfloat16 one fails with the

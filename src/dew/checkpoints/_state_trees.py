@@ -6,7 +6,6 @@ through them."""
 
 from __future__ import annotations
 
-import atexit
 import concurrent.futures
 import dataclasses
 import functools
@@ -24,7 +23,9 @@ import orbax.checkpoint as ocp
 from dew import _records
 from dew._records import JSON, record
 from dew.batch import Variables
+from dew.nn.kernels import options
 from dew.nn.kernels.options import program
+from dew.nn.kernels.selection import Unlowerable
 
 if TYPE_CHECKING:
     from dew.checkpoints._payloads import _StepFacts
@@ -145,58 +146,62 @@ def _decode_delta(planes: jax.Array, live: jax.Array, dtype) -> jax.Array:
 
 logger = logging.getLogger(__name__)
 
-_DECODING = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dew-delta-decode")
-"""The thread a save's restore decodes compile in (`decoded_ahead`): off the step, which never waits on it.
-A process that exits drops the decodes not begun and waits for the one compiling (`_closing`)."""
-_DECODED: dict[tuple, concurrent.futures.Future] = {}
+_DECODED: dict[tuple, options.Compiling | None] = {}
+"""The restore decodes a save began compiling (`decoded_ahead`), by their signature; None while one is
+lowered, or where its lowering failed."""
 _DECODED_LOCK = threading.Lock()
 
 
 def decoded_ahead(planes: jax.Array, live: jax.Array, dtype) -> None:
     """Compile the program a restore reads `planes` back by (`_decode_delta`, over the planes and the
     weight they are the difference from as a restore holds them, typed `dtype`) where the save that wrote
-    them runs: in a thread of its own (`_DECODING`), once a process for its signature (the arrays' shapes,
-    dtypes and shardings: equal for a mesh rebuilt over the same devices and spec, `NamedSharding`'s
-    equality), so the program is in the persistent compilation cache when a run resumes from the
-    checkpoint, which then compiles no program the runs before it did not (testing.md, a resumed run reuses
-    its compiled programs). The step never waits on it; a checkpoint's wait for its writes waits for it too
-    (`decodes_done`). A compile ahead that fails is no failed save: it is logged, and the resume compiles
-    the program as it would have."""
+    them runs: lowered here and compiled in a thread of its own, as a start's compile ahead is
+    (`options.compiling`), once a process for its signature (the arrays' shapes, dtypes and shardings: equal
+    for a mesh rebuilt over the same devices and spec, `NamedSharding`'s equality), so the program is in the
+    persistent compilation cache when a run resumes from the checkpoint, which then compiles no program the
+    runs before it did not (testing.md, a resumed run reuses its compiled programs). The step never waits on
+    the compile; a checkpoint's wait for its writes waits for it too (`decodes_done`), and a process that
+    exits without closing its checkpoints does not. A compile ahead that fails is no failed save: it is
+    logged, and the resume compiles the program as it would have."""
     abstract = [jax.ShapeDtypeStruct(array.shape, array.dtype, sharding=array.sharding)
                 for array in (planes, live)]
     key = (*((each.shape, each.dtype, each.sharding) for each in abstract), np.dtype(dtype))
-
-    def compiled() -> None:
-        began = time.perf_counter()
-        try:
-            _decode_delta.compiled(*abstract, np.dtype(dtype))
-        except jax.errors.JaxRuntimeError:
-            # XLA's refusal of the compile (its memory, its device): the resume compiles it as it would.
-            logger.warning("a checkpoint average's restore decode %s did not compile ahead; a resume "
-                           "compiles it", key, exc_info=True)
-            return
-        logger.info("compiled a checkpoint average's restore decode %s ahead, off the step, in %.3f s",
-                    abstract[0].shape, time.perf_counter() - began)
-
     with _DECODED_LOCK:
         if key in _DECODED:
             return
-        _DECODED[key] = _DECODING.submit(compiled)
+        # The signature reserved, so another save's thread neither lowers it again nor waits on this lowering.
+        _DECODED[key] = None
+    began = time.perf_counter()
+    try:
+        begun = options.compiling(_decode_delta, *abstract, np.dtype(dtype))
+    except (Unlowerable, jax.errors.JaxRuntimeError):
+        # A lowering refused (a placement no launch lowers for, XLA's refusal) fails no save: the resume
+        # compiles the decode as it would have.
+        logger.warning("a checkpoint average's restore decode %s did not lower ahead; a resume compiles it",
+                       key, exc_info=True)
+        return
+    with _DECODED_LOCK:
+        _DECODED[key] = begun
+
+    def compiled(attempt: concurrent.futures.Future) -> None:
+        # XLA's refusal of the compile (its memory, its device), which the attempt holds as its error
+        # (`report.Attempt`): the resume compiles it as it would.
+        refused = attempt.exception() or attempt.result().error
+        if refused is not None:
+            logger.warning("a checkpoint average's restore decode %s did not compile ahead; a resume "
+                           "compiles it", key, exc_info=refused)
+        else:
+            logger.info("compiled a checkpoint average's restore decode %s ahead, off the step, in %.3f s",
+                        abstract[0].shape, time.perf_counter() - began)
+
+    begun.attempt.add_done_callback(compiled)
 
 
 def decodes_done() -> None:
     """Wait for every restore decode a save began compiling (`decoded_ahead`)."""
     with _DECODED_LOCK:
-        begun = list(_DECODED.values())
+        begun = [compiling.attempt for compiling in _DECODED.values() if compiling is not None]
     concurrent.futures.wait(begun)
-
-
-@atexit.register
-def _closing() -> None:
-    """At the process's exit, drop the restore decodes not begun and wait for the one compiling: a process
-    that saves and exits without closing its checkpoints neither blocks on them nor leaves one half
-    compiled."""
-    _DECODING.shutdown(wait=True, cancel_futures=True)
 
 
 def _planes_sharding(sharding):
