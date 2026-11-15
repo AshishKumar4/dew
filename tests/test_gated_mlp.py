@@ -131,6 +131,7 @@ def test_a_gated_mlp_named_fused_on_a_data_split_mesh_runs_its_products_per_shar
           generation.chosen(grouped_matmul="mosaic", gated_mlp="fused"), generation.routes() as routes):
         lowered = lowered_for(layer.apply, (params, x), generation_name, mesh)
     assert [route.kernel for route in routes if route.choice == "gated_mlp"] == ["fused"]
+    assert lowered.out_info.shape == (2, 64, FEATURES)
     read = {shape for call in kernel_calls(lowered) if call.kind == "mosaic_gpu" for shape in call.operands}
     # A device's 64 rows of the 128 and its hidden rows; each kernel whole, the template's one group of it.
     assert {(64, FEATURES), (64, HIDDEN), (1, FEATURES, HIDDEN), (1, HIDDEN, FEATURES)} <= read, read
