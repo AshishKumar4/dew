@@ -81,6 +81,35 @@ class Producers:
         return Producers(tuple(sorted(held.items())))
 
 
+@dataclasses.dataclass(frozen=True)
+class Residents:
+    """The programs a multiprocessor holds of a config's launches at most, by launch (a kernel's name, as
+    `Producers`), where a compile found one spilling with its producer's ladder run out (its derivation's
+    step, the recurrence's `Mosaic._fewer`): every other launch's as many as its registers and shared memory
+    hold (`plan`). A dimension of the config as `Producers` is, refused and stepped as a compile or its
+    certification refuses a spilling config: a program fewer gives every role of the launch a larger share,
+    where the assembler may hold what it spilled at more, which no model of a launch's live values states
+    (Mamba-2's query/key walk at 8 heads of 32 and a state of 32, row 6718: its consumers spilled two table
+    reads at three programs' 136 registers at every rung of its producer's ladder, its values 91 registers
+    live at their peak, and held them at two programs' 232)."""
+
+    held_to: tuple[tuple[str, int], ...] = ()
+
+    def of(self, launch: str) -> int | None:
+        """The most programs of `launch` a multiprocessor holds, None where its plan alone decides."""
+        return dict(self.held_to).get(launch)
+
+    def fewer(self, planned: Mapping[str, int]) -> "Residents | None":
+        """These, with each of `planned`'s launches held to a program fewer than the programs it plans now;
+        None where one plans one already."""
+        held = dict(self.held_to)
+        for launch, programs in planned.items():
+            if programs <= 1:
+                return None
+            held[launch] = programs - 1
+        return Residents(tuple(sorted(held.items())))
+
+
 THREADS = 128
 """The threads of a role: a warpgroup's, each family's compute and producer roles alike."""
 
@@ -562,6 +591,9 @@ class Launch:
     entry: int = 0
     """The registers a thread of its program launches with at least (`entry_registers`), whatever its roles'
     raises: ptxas assembles its products within the program's launch share (`Issuer.entry_floor`)."""
+    most_programs: int | None = None
+    """The most programs a multiprocessor holds of it, its config's (`Residents`); None where its registers
+    and shared memory alone decide."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -740,10 +772,10 @@ def plan(launches, family: "Family", target, *, programs: int | None = None) -> 
     """Each of `launches`' plan on `target` (a GPU's, or the one a CPU process states), or None where any
     launch holds at no plan: within its family's registers (`Family.registers`), of the residencies a
     multiprocessor's registers hold of it at its own registers (`Family.programs`; `programs` where the
-    caller fixes the residency, which its registers must hold) whose share of its shared memory
-    (`program_shared`) holds the launch at its `floor`, each at the deepest ring that share holds, the one
-    that hides the most latency (`hidden`). Each launch plans at its own residency and depth; a template's
-    legality is that every launch holds."""
+    caller fixes the residency, which its registers must hold), at most its `most_programs`, whose share
+    of its shared memory (`program_shared`) holds the launch at its `floor`, each at the deepest ring that
+    share holds, the one that hides the most latency (`hidden`). Each launch plans at its own residency and
+    depth; a template's legality is that every launch holds."""
     block = generation.shared_budget(target)
     plans = []
     for launch in launches:
@@ -754,6 +786,7 @@ def plan(launches, family: "Family", target, *, programs: int | None = None) -> 
         while most and family.budgets_registers and entry_registers(
                 family.warpgroups(launch.consumers), most) < launch.entry:
             most -= 1
+        most = most if launch.most_programs is None else min(most, launch.most_programs)
         residencies = range(most, 0, -1) if programs is None else (programs,) if programs <= most else ()
         order = hidden(family, launch.consumers)
         found = None

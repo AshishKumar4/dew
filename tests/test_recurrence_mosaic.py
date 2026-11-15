@@ -44,7 +44,7 @@ from test_recurrence_chunk import (
 )
 
 from dew.nn.kernels import chunked_launch, generation, recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk_rounding, fast_rounding, recomputed_memory
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk, chunk_rounding, fast_rounding, recomputed_memory
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
@@ -1677,6 +1677,35 @@ def test_a_launch_whose_producer_must_rise_is_certified_at_its_ladders_top_in_on
     assert [cap for cap in raised if cap is not None] == [resources.entry_registers(2, 2)], raised
 
 
+@lowers('sm90')
+def test_a_launch_past_its_ladders_foot_is_certified_at_a_program_fewer():
+    """Mamba-2's chunked recurrence at a small decoder's widths (8 heads of 32, a state of 32, 4 groups, bf16,
+    its skip; tests/test_declared_cells_memory.py's guard's), its training gradient lowered for a compile-only
+    H100 through the call's route, certified as a run's step certifies it: it compiles, its query/key walk
+    certified at a program fewer a multiprocessor, the kernel it keeps unspilled. At three programs that
+    walk's consumers spilled two table reads at every rung of its producer's ladder, and the call raised
+    Unfitted (row 6718)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    heads, width, state, groups = 8, 32, 32, 4
+    shape = jax.ShapeDtypeStruct
+    hooks = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
+    keyed = shape((2, 256, groups, state), jnp.bfloat16)
+    operands = Chunk(keyed, keyed, shape((2, 256, heads, width), jnp.bfloat16),
+                     beta=shape((2, 256, heads), jnp.float32), rate=shape((heads,), jnp.float32),
+                     skip=shape((heads,), jnp.float32))
+    before = {id(certified) for certified in report.certifications()}
+    with (report.refusals(), generation.assumed('sm90'), report.certifying(compile_only_gpus('sm90')[0]),
+          report.pulled()):
+        jax.jit(jax.grad(lambda given: jnp.sum(chunk(hooks, given, dtype=jnp.float32)[0]))).trace(
+            operands).lower(lowering_platforms=('cuda',))
+    walked = [each for each in report.certifications() if id(each) not in before and any(
+        binary.kernel == 'recurrence_query_key' for _, binary in each.kernels.values())]
+    # A round certifies its rungs together: one after the rung that holds is certified, and not taken.
+    held = [each.config.residents.of('recurrence_query_key') for each in walked if not each.refused]
+    assert held == [2], walked
+
+
 TOP_RUNG_LOWERED = """
 import collections, json
 from jax._src import monitoring
@@ -1782,8 +1811,9 @@ def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
 
     class PastItsTop(type(template.MOSAIC)):
         def rungs(self, ba, config):
-            yield from (template._producing(config, resources.Producers((('recurrence_reverse', cap),)))
-                        for cap in (232, 128))
+            for cap in (232, 128):
+                yield template._limited(config, producers=resources.Producers((('recurrence_reverse', cap),)),
+                                        residents=config.residents)
 
     certified, refused = _reverse_walk_certified(PastItsTop())
     assert [each.config.producers.of('recurrence_reverse') for each in certified] == [None, 128], certified
@@ -1861,7 +1891,7 @@ def _walked(bound, tiles, kind: str, launch: str, facts) -> list:
     the forward's caps apart from the call's)."""
     rungs, rung = [], tiles
     while (up := template.MOSAIC._raised(bound, rung, frozenset({launch}), facts)) is not None:
-        rung = template._producing(rung, up)
+        rung = template._limited(rung, producers=up, residents=rung.residents)
         rungs.append(rung if kind == 'launch' else dataclasses.replace(
             tiles, forward=dataclasses.replace(tiles.forward, producers=rung.producers)))
     return [tiles, *rungs]
