@@ -45,13 +45,26 @@ def native_fields[**Fields, Value](constructor: Callable[Fields, Value]
     return recorded
 
 
+# written from transformers' base config (tools/gen_hf_metadata.py)
 HF_METADATA = frozenset({
-    "_name_or_path", "architectures", "chunk_size_feed_forward", "dtype", "id2label", "is_encoder_decoder",
-    "label2id", "model_type", "output_attentions", "output_hidden_states", "problem_type", "return_dict",
-    "transformers_version", "torch_dtype"})
+    "_name_or_path",
+    "architectures",
+    "chunk_size_feed_forward",
+    "dtype",
+    "id2label",
+    "is_encoder_decoder",
+    "label2id",
+    "model_type",
+    "output_attentions",
+    "output_hidden_states",
+    "problem_type",
+    "return_dict",
+    "torch_dtype",
+    "transformers_version",
+})
 """The fields every Hugging Face config serializes that describe no computation: what transformers' base
 config writes (`PretrainedConfig().to_dict()`: its classes and release, its output and return flags, its label
 maps and task), and `torch_dtype`, the name transformers 4 wrote `dtype` under, which its configs still read.
-A translator that refuses fields it does not read leaves these out, beside its own. Stated here, where reading
-them off transformers imported it, 6.6 s of a fresh process that translates a config on armada; held to
-transformers' own by tests/test_hf_decoders.py."""
+A translator that refuses fields it does not read leaves these out, beside its own. Written from the pinned
+transformers by tools/gen_hf_metadata.py, where reading them off transformers at import imported it, 6.6 s of
+a fresh process that translates a config on armada."""
