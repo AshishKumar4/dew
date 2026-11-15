@@ -361,6 +361,35 @@ def test_a_kept_program_that_is_not_its_calls_is_found_by_verifying(tmp_path):
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
+class Factor:
+    """A static argument whose field holds a NumPy scalar or a 0-d array of one value."""
+    value: np.generic | np.ndarray
+
+
+def by_factor_kind(held: Factor, values: jax.Array) -> jax.Array:
+    """`values` twice where the static argument holds a scalar, three times where it holds an array."""
+    return values * (2 if isinstance(held.value, np.generic) else 3)
+
+
+def test_a_program_kept_over_a_numpy_scalar_is_not_handed_for_a_0d_array_of_its_value(tmp_path):
+    """A static argument's record holding `np.float32(1)` and one holding `np.array(1, np.float32)` state
+    the same bytes, and a trace may branch on which it holds: a program kept over the scalar is not handed
+    to a call over the array, which runs its own trace (main gave the scalar's executable back, 2 * x for
+    3 * x)."""
+    from dew.nn.kernels.options import owned_program
+    from dew.training.ahead import keeping, kept
+
+    values = jnp.ones(3)
+    path = tmp_path / "programs.dew-aot"
+    fresh = functools.partial(owned_program, by_factor_kind, static_argnums=(0,))
+    with keeping() as programs:
+        assert fresh()(Factor(np.float32(1)), values).tolist() == [2.0] * 3
+    programs.save(path)
+    with kept(path):
+        assert fresh()(Factor(np.array(1, np.float32)), values).tolist() == [3.0] * 3
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
 class Scales:
     """A static argument whose field holds dictionaries through NumPy's storage of pointers."""
     table: np.ndarray | np.void
@@ -872,6 +901,25 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
     tile = head_tile_of(trainer.objective)
     assert ([*tile] if tile else None, head_fused_of(trainer.objective)) == (plan["head_tile"],
                                                                              plan["head_fused"])
+
+
+def test_a_fused_tiled_head_compiles_its_offloaded_frontier(tmp_path, monkeypatch):
+    """A fused tiled head compiles its offloaded sibling and restores the admitted plan."""
+    from dew.training.ahead import compile_ahead
+    from dew.training.memory import head_fused_of, head_tile_of, recompute_record
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=650_000)), split=None, remat="full")
+    trainer.objective.tile_head()
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
+    plan = record(ahead.plan, "plan")
+    assert plan["remat"] == "full"
+    assert plan["head_fused"] and plan["head_tile"] is not None
+    assert recompute_record(trainer.objective) == plan["remat"]
+    tile = head_tile_of(trainer.objective)
+    assert tile is not None and list(tile) == plan["head_tile"]
+    assert head_fused_of(trainer.objective) == plan["head_fused"]
+    assert trainer.plan == ahead.plan
 
 
 def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can_time(monkeypatch):

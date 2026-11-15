@@ -280,7 +280,12 @@ fitted to them, and a rule set ships only with measured receipts.
   output. Built today (`dew.algebra.fusion`): each product the GEMM template takes (x @ W, dy @ Wᵀ, xᵀ @ dy, and
   `ragged_dot_general`'s grouped forms), alone or with its elementwise consumers, is substituted at the compile
   point where its selector gives the template the launch, its consumers into the epilogue where fused prices
-  less; so a plain JAX program compiled through Dew runs the templates its products match (row 3450).
+  less; so a plain JAX program compiled through Dew runs the templates its products match (row 3450). A
+  region's written program, Dew's call traced over its inputs' types, is traced once a process for the region's
+  identity under the state a trace reads (`dew._cache.traced_state`, complete by default: a value it leaves out
+  costs a trace, never a stale program), and written into each later lowering holding the region, reporting the
+  kernels' routes and launches its trace reported: a step's relowerings and its planner's candidates traced
+  every region again, 1,724 traces and 144 seconds of a Qwen3.5-4B decision step's start on a GH200.
 - **Recognition (compile time, row 4783):** a region of a program is written as one of Dew's calls (its
   attention, RMSNorm, stream and gated norms, SwiGLU) only where the region is proven to compute that call, by
   its normal form's identity or in the e-graph (`dew.algebra.recognize`). Each call's math is declared once, as the call itself on its portable path

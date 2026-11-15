@@ -197,7 +197,8 @@ class Recorded:
     passes: list[float] = dataclasses.field(default_factory=list)
 
 
-_RECORDING: contextvars.ContextVar[tuple[Recorded, ...]] = contextvars.ContextVar("recording", default=())
+_RECORDING: contextvars.ContextVar[tuple[Recorded, ...]] = _cache.untraced(contextvars.ContextVar("recording",
+                                                                                                  default=()))
 """The `recording` scopes open in this context, innermost last."""
 
 
@@ -440,6 +441,14 @@ def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
     return bool(refused_at(op, arguments, config))
 
 
+def refused_state() -> frozenset:
+    """Every launch config this context's compiles refused (`refused`), with the kernels that spilled at it:
+    what a template's legality reads as it traces, so a trace held by its state (`dew._cache.traced_state`)
+    is traced again once a compile refuses another config."""
+    with _GUARD:
+        return frozenset(_registry().refused.items())
+
+
 def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable) -> frozenset[str]:
     """The names of `op`'s kernels a compile of this process refused at `config` for `arguments`
     (`Binary.refused`: spilling, or their warpgroup MMAs serialized): a launch of several kernels (a
@@ -666,9 +675,9 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
                      reverse: bool) -> dict[str, tuple[str, "Binary"]]:
     """`op`'s launch of `arguments` at `config` as a resource derivation lowers it (`KernelOp.lowering`),
     compiled alone on `device`, as a call without a gradient runs it or, `reverse`, as reverse mode does (its
-    forward and its pullback of a unit cotangent): its Mosaic GPU kernels' modules and binaries, by name and
-    launch, none for a launch of none. A launch that does not trace alone raises: certification is no
-    optional pass."""
+    forward and its pullback of a unit cotangent): its Mosaic GPU and Pallas-Triton kernels' modules (a Triton
+    call's config) and binaries, by name and launch, none for a launch of none. A launch that does not trace
+    alone raises: certification is no optional pass."""
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
     from dew.nn.kernels.lowered import kernel_calls
@@ -692,8 +701,13 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
 
         lowered = owned_program(pulled_back if reverse else launch).trace(*specs).lower()
     # A Mosaic GPU kernel compiled alone is the one its program loads (Mosaic compiles a module once a
-    # process); a Triton kernel compiles again with each executable, so its program's compile reads it.
-    modules = kernel_modules(kernel_calls(lowered, unrun=True))
+    # process). A Pallas-Triton kernel compiles again with each executable, the same kernel the same binary:
+    # read here too, its call's config its identity, so its derivation steps a spilling config at trace as a
+    # Mosaic launch's does (an H100's float32 attention forward at width 256 spilled at every four-warp tile
+    # and held at eight, row 6507), rather than ending its program's compile Exhausted.
+    calls = kernel_calls(lowered, unrun=True)
+    modules = kernel_modules(calls) | {name: call.config for name, call in
+                                       kernel_bodies(call for call in calls if call.kind == "triton").items()}
     if not modules:
         return {}
     return {name: (modules[name], binary)

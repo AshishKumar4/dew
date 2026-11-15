@@ -61,7 +61,7 @@ import threading
 import time
 import types
 import weakref
-from collections.abc import Callable, Hashable, Iterator, Mapping
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import ClassVar
 
 import filelock
@@ -1240,6 +1240,15 @@ def seen() -> Iterator[Seen]:
     collected = _Seen()
     with _cache.KERNEL_SEEN(collected):
         yield collected.found
+
+
+def noted(found: Sequence[Launch]) -> None:
+    """Record `found`, the launches a trace took under `seen` (each its op and keyed arguments, their arrays
+    as shapes), into the collection open in this context, as its launches did as they traced: a trace held
+    and reused (`dew.algebra.fusion`'s regions) records the launches it holds where its program is written.
+    None where no collection is open."""
+    if (collected := _cache.KERNEL_SEEN.value) is not None:
+        collected.found.extend(found)
 
 
 def tune(lower: Callable[[], jax.stages.Lowered], *,
