@@ -125,9 +125,12 @@ def _carried():
         # x @ (y +- z) as x @ y +- x @ z: both new.
         with_y = rules.product_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"), length)
         with_z = rules.product_magnitude(rules.magnitude(x, "x2"), rules.magnitude(z, "z"), length)
+        # Their sum too, which may pass the float's largest where the products do not, each under the reach.
+        joined = rules.summed_magnitude(([], with_y[1]), ([], with_z[1]))
         sets.append(rule(eq(t).to(x.dot(y.binary(combined, z, q), m)), *plain, eq(shape(y)).to(shape(z)),
                          eq(reads(y.binary(combined, z, q))).to(one), *contracted, *with_y[0], *with_z[0],
-                         *rules.dominated(with_y[1], "y"), *rules.dominated(with_z[1], "z")).then(
+                         *rules.dominated(with_y[1], "y"), *rules.dominated(with_z[1], "z"),
+                         *rules.dominated(joined[1], "joined")).then(
             union(t).with_(x.dot(y, m).binary(combined, x.dot(z, m), q)),
             *rules.made(x.dot(y, m), with_y[1]), *rules.made(x.dot(z, m), with_z[1])))
         # x @ z +- y @ z as (x +- y) @ z (`rules.shared_factored`, the linear set's declaration), over

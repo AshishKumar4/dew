@@ -206,14 +206,32 @@ class Term(Expr):
     def finished(self) -> Term: ...
 
 
+class _Form(tuple):
+    """A skeleton's form (`Skeleton.form`): a tuple that hashes once. A form holds its operands' forms, so a
+    program's value read by many others is one form many hold, and a plain tuple's hash, recomputed through
+    every operand at each read, grows with the paths through that sharing: a whole program's bounds
+    (`dew.algebra.program._held`) of a LAMB step's forms never finished hashing. Kept, each read is one."""
+
+    def __hash__(self) -> int:
+        held = self.__dict__.get("hashed")
+        if held is None:
+            held = self.__dict__["hashed"] = tuple.__hash__(self)
+        return held
+
+
 @dataclasses.dataclass(frozen=True)
 class Skeleton:
     """A term's structure without its egglog expression: `Term`'s constructors over plain tuples, equal
     exactly where the terms are (`region`'s `forms`). What the pass reads of a window to decide whether a rule
     may fire in it (`rules.reorderable`), at a fraction of its terms' cost: a Dory-4B training step's 1018
-    windows, every one refused, spent most of the pass building their terms (FS-OVERHEAD-DORY-ON-P3)."""
+    windows, every one refused, spent most of the pass building their terms (FS-OVERHEAD-DORY-ON-P3). Its
+    form hashes once (`_Form`)."""
 
     form: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.form, _Form):
+            object.__setattr__(self, "form", _Form(self.form))
 
     @classmethod
     def leaf(cls, index: int) -> Skeleton:
@@ -311,6 +329,9 @@ class Region[Node: (Term, Skeleton)]:
     """Each literal's term's key (`literals`' terms)."""
     indexed: dict[Hashable, int] = dataclasses.field(default_factory=dict)
     """Each interned entry of `params` by what makes two entries one (`interned`)."""
+    held: dict[jcore.Var, Magnitude | None] = dataclasses.field(default_factory=dict)
+    """Each value's magnitude (`magnitudes`') by the jaxpr's variable that names it: what a window cut from
+    the jaxpr declares of its inputs (`dew.algebra.program._windowed`)."""
     extents: dict[Hashable, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
@@ -659,7 +680,8 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     stock = {name: param(primitive, values) for name, (primitive, values) in stocked().items()}
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
                   max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products,
-                  frozenset(key(forms.literal(index)) for index in range(len(literals))), indexed)
+                  frozenset(key(forms.literal(index)) for index in range(len(literals))), indexed,
+                  {var: magnitudes.get(key(node)) for var, node in env.items()})
 
 
 BOUNDED = _symbols(lambda operation: operation.bounded)

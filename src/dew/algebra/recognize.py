@@ -312,9 +312,12 @@ def _between(index: fusion.Index, operands: Sequence[jcore.Var],
 
 
 BARRIERS = (jcore.primitives.custom_jvp_call_p, jcore.primitives.custom_vjp_call_p,
-            jcore.primitives.custom_vmap_p)
+            jcore.primitives.custom_vmap_p, jcore.primitives.remat_p)
 """The equations a region the compile point writes never holds: a program's own derivative or batching rule,
-which the call written in its place would not keep. A gradient's stop is no barrier but no identity either
+which the call written in its place would not keep, and a checkpoint (`jax.checkpoint`), whose boundary
+decides what a derivative saves, which a call written across it would remove (§6.2: rewriting stays within
+remat boundaries). Its body is searched apart, as every program a call holds is. A gradient's stop is no
+barrier but no identity either
 (`VALUE_IDENTITIES`): it stays its own equation, so a region matches a declaration only where the declaration
 stops the same value, and a stop on a call's operand stays outside the call."""
 
