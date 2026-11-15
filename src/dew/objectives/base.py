@@ -1387,8 +1387,22 @@ class Objective(ABC, Generic[Loss, Effects]):
         (`dew.optim.OptimConfig.fresh_groups`): what the source it trains drew (`Pretrained.fresh`, held
         where `bind_model` holds its tree as the objective's), an objective declaring besides what it
         draws beside the base it holds. One drawn with no parameter, a tied readout, the group leaves out
-        (`dew.config.trained_modules`)."""
+        (`fresh_trained`)."""
         return self._fresh
+
+    def fresh_trained(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Those of `fresh_modules` that hold a parameter this objective trains, as its tree is drawn (its
+        shapes alone), and those that are one (a parameter a loaded module gained, `Pretrained.with_model`):
+        what a fresh group claims (`dew.optim.OptimConfig.claiming`). A tied readout is drawn with none."""
+        modules = self.fresh_modules()
+        if not modules:
+            return (), ()
+        from dew.optim import parameter_name
+
+        names = [parameter_name(path) for path, _ in
+                 jax.tree_util.tree_leaves_with_path(self.drawn_shapes()["params"])]
+        return (tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names)),
+                tuple(module for module in modules if module in names))
 
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Return `tree`, held or drawn, with what the objective's own modules
