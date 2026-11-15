@@ -1433,3 +1433,14 @@ def test_a_run_that_sets_its_remat_compiles_its_step_once(monkeypatch, tmp_path)
     assert compiles.count == 1
     assert [probe["remat"] for probe in trainer.plan["probes"]] == ["full"]
     assert trainer.plan["remat"] == "full" and trainer.objective.model.remat == REMAT_POLICIES["full"]
+
+
+def test_a_planned_miss_saves_every_field_it_holds():
+    """A refused kernel's record in the saved plan (`planning.spill_record`) holds each field of its miss,
+    its config by its text: a field the miss gains is saved with it (a serialization-only refusal's codes
+    and so its cause were dropped, the 11-15 audit's CROSS-2)."""
+    from dew.nn.kernels.templates import report
+    from dew.training.planning import spill_record
+
+    values = {field.name: f"{field.name}-value" for field in dataclasses.fields(report.Miss)}
+    assert spill_record(report.Miss(**values)) == {**values, "config": repr(values["config"])}
