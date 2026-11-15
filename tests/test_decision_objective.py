@@ -251,16 +251,16 @@ def test_a_training_read_of_rows_past_half_a_window_declares_one_document_a_wind
     long = [replace(example, state=f"{example.state} " + "x" * 120) for example in EXAMPLES]
     opened = decision_rows(long, 4, objective=objective.data()).train(DataPartition())
     try:
-        laid = [batch["tokens_coordinates"] for batch in itertools.islice(opened, 2)]
+        read = list(itertools.islice(opened, 2))
     finally:
         opened.close()
-    assert objective.bounds.segments > 1 and {coordinates.max_segments for coordinates in laid} == {1}
-    assert all(int(np.asarray(coordinates.segments).max()) == 1 for coordinates in laid)
+    assert objective.bounds.segments > 1 and {batch["tokens_bound"].max_segments for batch in read} == {1}
+    assert all(int(np.asarray(batch["segments"]).max()) == 1 for batch in read)
 
 
 def test_a_step_reads_its_windows_at_the_documents_its_read_declares():
     """A window's rows are its read's packer documents: a memory read measures the most a window holds and
-    declares it (`tokens_coordinates`, `dew.data.steps.generic.Coordinated`), and the step lays its
+    declares it (`tokens_bound`, `dew.data.steps.generic.Coordinated`), and the step lays its
     windows out at that bound, the objective's own (`DecisionObjective.segments`) a cap above it: rows
     longer than half a window one document a window, the plain form a sequence kernel takes, short rows
     as many as the read's windows took. At the declared bound the loss is on par (check 1) with the same
@@ -277,13 +277,13 @@ def test_a_step_reads_its_windows_at_the_documents_its_read_declares():
     for name, examples in (("long", long), ("short", EXAMPLES)):
         data = decision_rows(examples, 4, examples, objective=objective.data())
         (batch, *_) = list(data.val(DataPartition()))
-        declared = batch["tokens_coordinates"].max_segments
+        declared = batch["tokens_bound"].max_segments
         assert int(np.asarray(batch["segments"]).max()) <= declared <= cap
         assert laid_out(batch, cap).max_segments == declared
         read[name] = (batch, declared)
     assert read["long"][1] == 1 < read["short"][1] <= cap
     batch = read["long"][0]
-    capped = {name: value for name, value in batch.items() if name != "tokens_coordinates"}
+    capped = {name: value for name, value in batch.items() if name != "tokens_bound"}
     assert laid_out(capped, cap).max_segments == cap
     step = Step(jnp.asarray(0), jax.random.key(0), None)
 

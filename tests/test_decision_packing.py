@@ -180,8 +180,8 @@ def in_place(batch, placed: list[tuple[int, int]]) -> dict:
     every product a row's tokens enter runs at the packed run's shapes. A window reads no other, so
     rows of different windows run alone together."""
     assert len({window for window, _ in placed}) == len(placed), "one row a window"
-    # A window of its own rows apart: the read's layout of the windows (`tokens_coordinates`) is not its own.
-    one = {name: np.zeros_like(value) for name, value in batch.items() if name != "tokens_coordinates"}
+    # A window of its own rows apart: the read's bound on its windows (`tokens_bound`) is not its own.
+    one = {name: np.zeros_like(value) for name, value in batch.items() if name != "tokens_bound"}
     for window, row in placed:
         for name, value in at_offset(batch, window, row).items():
             one[name][window, :value.shape[1]] = value[0]
@@ -467,7 +467,7 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 
     # more sequence (`dew.nn.attention.flash_attention`).
     segments = objective.bounds.segments
     laid = laid_out(batch, segments).coordinates()
-    declared = batch["tokens_coordinates"].max_segments
+    declared = batch["tokens_bound"].max_segments
     assert int(np.max(laid.segments)) <= laid.max_segments == declared <= segments
     rows = apart(batch)
     wide = copy.copy(objective)

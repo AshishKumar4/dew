@@ -293,7 +293,7 @@ def test_grouped_examples_without_a_consistency_term_are_their_examples_rows():
     grouped, alone = first([PARAPHRASED]), first(list(PARAPHRASED.examples))
     assert grouped.keys() == alone.keys() and "groups" not in grouped
     for name in alone:
-        # A field may be a tree of arrays (`tokens_coordinates`), its leaves compared each.
+        # A field may be a tree (`tokens_bound`, static), its leaves compared each and its structure.
         jax.tree.map(lambda one, other, name=name: np.testing.assert_array_equal(
             np.asarray(one), np.asarray(other), err_msg=name), grouped[name], alone[name])
 

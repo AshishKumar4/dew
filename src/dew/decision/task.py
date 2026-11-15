@@ -1767,7 +1767,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
     questions: dict[str, Any] = {field.name: array(field.name) if field.when == "always"
                                  else given(field.name) for field in QUESTION_FIELDS}
     declared = batch.get("tokens_bound")
-    if isinstance(declared, SegmentBound):
+    if isinstance(declared, SegmentBound) and declared.max_segments is not None:
         max_segments = declared.max_segments
     return DecisionInputs(tokens=array("tokens"), segments=array("segments"), **questions,
                           positions=array("positions"), slots=given("slots"),
