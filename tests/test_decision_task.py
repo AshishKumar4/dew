@@ -981,11 +981,20 @@ def test_runs_whose_data_hold_other_widths_average_padded_to_the_widest(decide, 
 
 
 def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_path):
-    """Runs average where their recorded task settings are one task's: a run laid out otherwise does
-    not average with the others, nor does a single run."""
+    """Runs average where their recorded task settings are one task's: a run whose head trained under
+    dropout averages with one that trained none, as dropout says how a head trains and not what it
+    computes (`head.RUNS`); a run laid out otherwise, or whose head computes in other numbers, does not
+    average with the others, the head's field named, nor does a single run. Main refused the dropout."""
+    def with_head(**fields):
+        return replace(decide, model=decide.model.clone(head=decide.model.head.clone(**fields)))
+
     runs = trained_runs(decide, tmp_path, 1)
     with pytest.raises(ValueError):
         Decide.averaged(runs)
+    dropped = trained_runs(with_head(dropout_rate=0.1), tmp_path, 1, name="dropped")
+    assert len(Decide.averaged(runs + dropped).weights.averaged) == 2
+    with pytest.raises(ValueError, match=r"head\.dtype"):
+        Decide.averaged(runs + trained_runs(with_head(dtype="bfloat16"), tmp_path, 1, name="narrow"))
     other = replace(decide, layout=replace(decide.layout, head_max_len=decide.layout.head_max_len // 2))
     runs += trained_runs(other, tmp_path, 1, name="other")
     with pytest.raises(ValueError):

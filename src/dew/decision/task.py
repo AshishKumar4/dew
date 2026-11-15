@@ -242,6 +242,19 @@ def usage_of(rows: Sequence[Encoded]) -> Usage:
                  min((row.state_kept for row in rows), default=0), cut_counts(row.cuts for row in rows))
 
 
+def _head_changes(first: Mapping[str, object], other: Mapping[str, object]) -> list[str]:
+    """What `other`, a head's record (`Head.record`), changes of the task `first`'s head computes, by name:
+    its class (`head`), or a field that says what it computes or in what numbers
+    (`registry.computing_differences`, `_records.NUMBERS` kept), as `head.<field>`; dropout or an attention
+    kernel (`head.RUNS`) are how a run trained it."""
+    if first.get("class") != other.get("class"):
+        return ["head"]
+    from dew import registry
+
+    stated = [record.get("fields") or {} for record in (first, other)]
+    return [f"head.{name}" for name in registry.computing_differences(
+        registry.imported(str(first["class"])), *stated, kept=(_records.NUMBERS,))]
+
 @dataclass(frozen=True)
 class DecideSettings:
     """What a decision run records beside its backbone, and its task is built with
@@ -583,11 +596,13 @@ class Decide(SavedRunTask, InItsForm):
         pinned = [SavedRun.at(directory, step) for directory in runs]
         recorded = [run.record for run in pinned]
         settings = [saved_settings(saved, DecideSettings) for saved in recorded]
-        # A setting its data derives (its padding, `metadata["derived"]`) may differ between the runs.
+        # A setting its data derives (its padding, `metadata["derived"]`) may differ between the runs, and
+        # their heads by how they run or train alone (`_head_changes`).
         for directory, own in zip(runs, settings, strict=True):
             differing = [entry.name for entry in fields(DecideSettings)
-                         if entry.metadata.get("derived") != "data"
+                         if entry.metadata.get("derived") != "data" and entry.name != "head"
                          and getattr(own, entry.name) != getattr(settings[0], entry.name)]
+            differing += _head_changes(settings[0].head, own.head)
             if differing:
                 raise ValueError(f"the run in {directory} differs from {runs[0]} in its "
                                  f"{', '.join(differing)}, so their weights are not one task's to average")
