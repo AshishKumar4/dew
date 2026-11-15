@@ -17,6 +17,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from process_support import device_flags
 from recording import RecordingTracker
 from sharded import assert_sharded
 from token_support import repeated_token_batch
@@ -253,7 +254,7 @@ state = trainer.fit(
 bias = state.variables["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
 print(",".join(repr(float(value)) for value in np.asarray(bias)))
 """
-    environment = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
+    environment = {**os.environ, "XLA_FLAGS": device_flags(1),
                    "JAX_PLATFORMS": "cpu",
                    "PYTHONPATH": os.pathsep.join(
                        [str(Path(__file__).resolve().parent),

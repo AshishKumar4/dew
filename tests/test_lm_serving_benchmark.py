@@ -9,6 +9,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import pytest
+from process_support import device_flags
 from tool_support import load
 
 from dew.interop.pretrained import PretrainedDecoder
@@ -31,7 +32,7 @@ def checkpoint(directory: Path) -> Path:
 
 
 CPUS = {"JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"),
-        "XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
+        "XLA_FLAGS": device_flags(2)}
 """The benchmark's environment: two CPU devices, Dew's source."""
 
 
@@ -141,7 +142,7 @@ def test_a_multimodal_model_serves_the_layout_asked_for(tmp_path, fixture, kv):
     cache: `--kv dense` and `--kv paged` serve a Qwen3.5 wrapper, whose delta-net layers keep each
     row's state beside the attention layers' pages, and a Gemma 3 one, every requested token."""
     env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"),
-           "XLA_FLAGS": "--xla_force_host_platform_device_count=1"}
+           "XLA_FLAGS": device_flags(1)}
     done = subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_lm_serving.py"),
                            "--backend", "dew", "--model", str(ROOT / "tests" / "fixtures" / "hf" / fixture),
                            "--slots", "2", "--requests", "4", "--prompt", "8", "--output", "8",

@@ -117,16 +117,20 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
-def worker_env(devices: int) -> dict[str, str]:
-    """This checkout's source, `devices` CPU devices and faulthandler in each worker, which keeps the lane's
-    other XLA flags (`lane_environment`: its CPU collectives' memory-optimized schedule, row 5397, and no
-    excess precision)."""
+def device_flags(devices: int) -> str:
+    """This process's XLA flags with `devices` CPU devices, the one way a worker of the suite sets its device
+    count: the lane's other flags kept (`lane_environment`: its CPU collectives' memory-optimized schedule,
+    row 5397, and no excess precision), which a count set alone drops."""
     from lane_environment import without_flags
 
     count = "--xla_force_host_platform_device_count"
-    flags = f"{without_flags(os.environ.get('XLA_FLAGS', ''), count)} {count}={devices}".strip()
+    return f"{without_flags(os.environ.get('XLA_FLAGS', ''), count)} {count}={devices}".strip()
+
+
+def worker_env(devices: int) -> dict[str, str]:
+    """This checkout's source, `devices` CPU devices (`device_flags`) and faulthandler in each worker."""
     return {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(REPO_ROOT / "src"),
-            "PYTHONFAULTHANDLER": "1", "XLA_FLAGS": flags}
+            "PYTHONFAULTHANDLER": "1", "XLA_FLAGS": device_flags(devices)}
 
 
 class Drained:

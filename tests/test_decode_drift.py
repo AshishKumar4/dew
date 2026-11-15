@@ -9,6 +9,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from process_support import device_flags
 from reference_error import assert_computes_the_oracle, chain_roundings, widened
 from tool_support import load
 
@@ -36,7 +37,7 @@ def test_an_unchanged_decoder_holds_check_1_over_its_long_decodes(tmp_path):
                            "--prompt", str(PROMPT), "--seeds", str(SEEDS), "--vocab-limit", "200",
                            "--out", str(out)],
                           env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"),
-                               "XLA_FLAGS": "--xla_force_host_platform_device_count=1"}, cwd=ROOT)
+                               "XLA_FLAGS": device_flags(1)}, cwd=ROOT)
     record = json.loads(out.read_text())
     assert (done.returncode, record["passes"], record["finding"]) == (0, True, None)
     assert record["reference_embedding_ulp"]["rms"] > 0, "the reference's embedding one ulp up moved nothing"
