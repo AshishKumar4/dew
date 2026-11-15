@@ -67,7 +67,7 @@ from dew.interop.weights import AUTO, checkpoint_dtype
 from dew.mesh import LogicalAxes
 from dew.nn.attention import AttentionImpl
 from dew.nn.inputs import document_reach
-from dew.nn.kv_cache import cache_positions, cursor, filled_slots, put_opened
+from dew.nn.kv_cache import CURSOR, cache_positions, cursor, filled_slots, put_opened
 from dew.nn.precision import at_least_fp32, broadcast_summed, configured_precision, exact_float32, scaled
 from dew.nn.programs import purely_called
 from dew.nn.protocols import Lacks, OutputTable
@@ -1429,7 +1429,7 @@ class TorchCausalLM(nn.Module):
         cache = self._cached(rows)
         # Each real token fills its row's next slot, the rest none (-1), as Dew's caches fill.
         slots = cache_positions(self, rows, width, real)
-        filled = filled_slots(self.get_variable("cache", "cache_index"), self.max_seq_len)
+        filled = filled_slots(self.get_variable("cache", CURSOR), self.max_seq_len)
         places = jnp.maximum(slots, 0) if positions is None else jnp.asarray(positions, jnp.int32)
         # A decoding call's tokens reach their row's furthest real one, as a rotary's tables read it.
         furthest = jnp.max(jnp.where(real, places, -1), axis=1, keepdims=True)
