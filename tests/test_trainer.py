@@ -1950,7 +1950,7 @@ class Targeted(Objective):
         return {"params": {"p": jnp.zeros(())}}
 
     def loss(self, variables, batch, step):
-        return jnp.mean((variables["params"]["p"] - batch["target"]) ** 2), Aux({})
+        return jnp.square(batch["target"] - variables["params"]["p"]).mean(), Aux({})
 
 
 def test_a_split_step_whose_window_commits_before_its_last_part_logs_that_updates_loss():
