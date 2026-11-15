@@ -122,6 +122,11 @@ class Committed:
     own: Ratio | jax.Array | float | None = None
     """The microbatch's own loss statistics, which a step read in several pools into its batch's loss
     (`dew.training.planning.whole_step`) and lets go; None past the step."""
+    finite: jax.Array | None = None
+    """Whether the attempt's values were finite, its gradient and forward as well as its loss, which the
+    step reports (`outcome`) and a run's streak of steps that are not reads (`dew.training.interval`): a
+    finite loss over a gradient that is not trains nothing. None past the step, whose own finiteness the
+    whole of its parts states (`whole_step`)."""
 
 
 def _chosen(take, taken, kept):
@@ -190,9 +195,10 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
     """What a compiled step returns (`Trainer.compile`) of the transaction it ran from `current` on
     `batch`, wherever it ran: the advanced state, its step counting `stepped` and its clock the source
     examples its microbatch `consumed` (`TrainState.consumed`, where the run keeps one), the loss, the
-    metrics with the batch's counts, and whether the loss is finite, the microbatch accepted and the
-    window committed. A metric stated as a statistic (`Aux.pooled`) is its value where the step is read
-    whole (`split` 1), and its statistic where it is one of `split` microbatches, which the step's whole
+    metrics with the batch's counts, and whether the attempt was finite (`Committed.finite`, its loss's
+    where it states none), the microbatch accepted and the window committed. A metric stated as a statistic
+    (`Aux.pooled`) is its value where the step is read whole (`split` 1), and its statistic where it is one
+    of `split` microbatches, which the step's whole
     pools (`dew.training.planning.whole_step`)."""
     pooled = aux.pooled if split > 1 else {name: value.mean()[0] for name, value in aux.pooled.items()}
     metrics = {**aux.metrics, **pooled, **step_counts(batch)}
@@ -200,8 +206,10 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
         assert "evaluated" in aux.record, "a recording transaction stacks its evaluations (`recorded`)"
         metrics |= recorded_metrics(aux.record)
     clock = None if current.consumed is None else (current.consumed + consumed).astype(current.consumed.dtype)
+    finite = jnp.isfinite(loss) if committed is None or committed.finite is None else committed.finite
     return (dataclasses.replace(advanced, step=current.step + stepped, consumed=clock), loss, metrics,
-            jnp.isfinite(loss), advanced.microstep > current.microstep, committed)
+            finite, advanced.microstep > current.microstep, dataclasses.replace(committed, finite=None)
+            if committed is not None else None)
 
 
 def probed_loss(objective: Objective, variables: Variables, batch: Batch, step: Step):
@@ -1072,8 +1080,10 @@ class Transaction:
         # computed: its gradient, the forward's statistics and its update read as zero, so its parameters,
         # update count and EMA stay as they were and its optimizer takes one step of zero gradient, holding
         # no old state beside the new (training.md, a step that is not finite; row 6699). A scaled step's
-        # rejection keeps the optimizer too, chosen below, as a scale's back-off must.
-        gated = current.scale is None
+        # rejection keeps the optimizer too, chosen below, as a scale's back-off must, and so does one whose
+        # optimizer holds updates back (`holds_back`, `optax.MultiSteps`): a zero input would join its window
+        # and close it, where the step's rejection keeps the inputs it holds.
+        gated = current.scale is None and not holds_back(current.opt_state)
         if gated:
             native_finite = native_finite & _all_finite((qk, statistics, effects))
             native, qk, statistics, effects = (_gated(native_finite, value)
@@ -1208,7 +1218,10 @@ class Transaction:
         scale, previous = state.scale, state.accumulation
         effects, qk, loss = pending.effects, pending.qk, pending.loss
         finite = pending.local_finite & _all_finite((loss, gradient, effects, qk, aux.variables))
-        accepted = jnp.asarray(a=True) if scale is None else finite
+        # A step with no loss scale is gated in its commit (`commit`), but one whose optimizer holds updates
+        # back is rejected whole, its optimizer state kept, as a scaled step's is.
+        held = holds_back(state.opt_state)
+        accepted = jnp.asarray(a=True) if scale is None and not held else finite
         numerical = dataclasses.replace(state, variables=write_back(state.variables, aux.variables),
                                         microstep=state.microstep + 1)
         # Runs that updated in their backward wrote it only where the step commits (`in_backward.gated`).
@@ -1248,6 +1261,8 @@ class Transaction:
         finite = finite & native_finite
         if scale is not None:
             accepted = finite & _all_finite(checked(numerical))
+        elif held:
+            accepted = finite
         if previous is not None:
             numerical = dataclasses.replace(
                 numerical, accumulation=self._retained_window(state, batch, pending, attempt, read))
@@ -1284,7 +1299,7 @@ class Transaction:
         return advanced, loss, aux, Committed(
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
             jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted),
-            own=pending.own if self.split > 1 else None)
+            own=pending.own if self.split > 1 else None, finite=finite)
 
     def planned(self, state: TrainState) -> _Planned | None:
         """The plan by which the runs a one-stage scanned state holds stacked update in their backward

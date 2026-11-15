@@ -232,7 +232,8 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
         for part, update in zip(committed, losses, strict=True):
             loss = jnp.where(part.count > 0, update, loss)
     summed = jax.tree.map(lambda *values: sum(values),
-                          *(dataclasses.replace(part, inspected=None, own=None) for part in committed))
+                          *(dataclasses.replace(part, inspected=None, own=None, finite=None)
+                            for part in committed))
     sample = None
     for part in committed:
         if part.inspected is not None:
