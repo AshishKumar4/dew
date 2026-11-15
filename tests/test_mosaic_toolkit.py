@@ -1655,6 +1655,81 @@ def test_groups_summed_together_on_tcgen05_issue_every_product_before_one_commit
     assert order[first + 3:first + 5] == ["tcgen05_commit_arrive", "barrier_wait"], order
 
 
+def _staged_together(x, w, *, interpret):
+    """`x_0 @ w_0` and `2 x_0 @ w_0` on tcgen05's chunks, summed together by one prepared-operand issuer
+    (`operands.Issuer.summed_together`): each group's left operand a register value its product name stages
+    into one shared tile (its buffers), `w_0` the stream's slot; each read where it is stored."""
+    from dew.nn.kernels.templates import mosaic_sm100, operands
+    family = mosaic_sm100.CHUNKS
+    rows, columns = family.rows, w.shape[1]
+    call = _Call(family, interpret)
+
+    def body(x_gmem, w_gmem, *outs):
+        blocks = {'x': ((rows, CHUNK_DEPTH), jnp.bfloat16), 'w': ((CHUNK_DEPTH, columns), jnp.bfloat16)}
+
+        def scope(staging, *, streams):
+            rings = family.opened(streams)
+            views = {'x': (x_gmem, lambda j: (0, 0)), 'w': (w_gmem, lambda j: (0, 0))}
+
+            def step(index, slots, carry, accumulators):
+                del index, carry
+                slots.acquire_all()
+                held, right = family.tile_of(slots['x']), operands.Parts((slots['w'],), jnp.bfloat16)
+                issuer = operands.Issuer(call, {"left": (staging,)})
+                readers = issuer.summed_together([[("left", held, right)], [("left", held * 2, right)]])
+                return tuple(read() for read in readers), accumulators
+
+            def walked(wg):
+                del wg
+                found, _ = family.walk(rings, ((step, 0, 1),), (family.zeros((rows, columns)),) * 2, (),
+                                       interpret)
+                for out_gmem, value in zip(outs, found, strict=True):
+                    out_gmem[...] = value
+
+            family.scheduled(1, walked, lambda: family.stream(rings, views, 0, 1))
+
+        family.scoped(scope, plgpu.SMEM((rows, CHUNK_DEPTH), jnp.bfloat16), streams=family.streams(blocks, 2, 1),
+                      products=(1, (), (), (), (), (columns,) * 2))
+
+    out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
+    return family.kernel(body, out_type=(out, out), grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="staged_together")(x, w)
+
+
+def test_groups_summed_together_stage_no_operand_into_a_tile_a_product_in_flight_reads():
+    """Traced for a B200: two groups summed by one issuer (`operands.Issuer.summed_together`), each left
+    operand a register value staged into the one shared tile of its product name: no staging into shared
+    memory stands between a product's issue and the wait that retires it. A tcgen05 product reads its
+    operands after it issues, until its commit's barrier, so a group staged while another's product is in
+    flight overwrites that product's operand under it."""
+    from jax.extend.core import ClosedJaxpr, Jaxpr
+
+    x = jnp.zeros((64, CHUNK_DEPTH), jnp.bfloat16)
+    w = jnp.zeros((CHUNK_DEPTH, 128), jnp.bfloat16)
+    with generation.assumed("sm100"):
+        traced = jax.make_jaxpr(lambda x, w: _staged_together(x, w, interpret=False))(x, w)
+    order = []
+
+    def walk(jaxpr):
+        for equation in jaxpr.eqns:
+            name = equation.primitive.name
+            if name in ("tcgen05_mma", "barrier_wait"):
+                order.append(name)
+            elif name == "swap" and getattr(equation.invars[0].aval, "memory_space", None) == plgpu.SMEM:
+                order.append("staged")
+            for param in equation.params.values():
+                for inner in (param if isinstance(param, (tuple, list)) else (param,)):
+                    if isinstance(inner, ClosedJaxpr | Jaxpr):
+                        walk(inner.jaxpr if isinstance(inner, ClosedJaxpr) else inner)
+
+    walk(traced.jaxpr)
+    assert order.count("tcgen05_mma") == 2 and order.count("staged") >= 2, order
+    in_flight = False
+    for event in order:
+        assert not (in_flight and event == "staged"), order
+        in_flight = (in_flight or event == "tcgen05_mma") and event != "barrier_wait"
+
+
 def test_a_group_summed_together_that_awaits_its_own_products_is_refused():
     """A group summed together on tcgen05 whose issue awaits its own products (a value added into its
     accumulator, `added_into`) is refused as it traces: its wait would leave the groups' one commit behind
