@@ -142,24 +142,48 @@ def _scaled_rms(rows, xp=np):
     return scale[:, 0] * xp.sqrt(xp.mean(xp.square(rows / scale), axis=1))
 
 
-def _log_sum(values) -> float:
-    """The natural log of the sum of nonnegative values, scaled by their largest first, so no sum of
-    finite values overflows on the way: LOG_ZERO for a sum of zeros."""
-    values = np.asarray(values, np.float64)
-    largest = float(np.max(values)) if values.size else 0.0
-    if not largest > 0:
-        return LOG_ZERO
-    return math.log(largest) + math.log(float(np.sum(values / largest)))
+def log_errors(errors) -> np.ndarray:
+    """Squared errors (each seed's mean, a recording's `mse`) as check 1 carries them: their natural logs,
+    -inf for an exact one (`_Draws`, `RecordedLeaf.log_mse`)."""
+    errors = np.asarray(errors, np.float64)
+    with np.errstate(divide="ignore"):
+        return np.where(errors > 0, np.log(np.where(errors > 0, errors, 1.0)), np.where(errors == 0, -np.inf,
+                                                                                         errors))
 
 
-def _root_mean(values) -> float:
-    """The root of the mean of nonnegative values (each seed's mean squared error), scaled by their
-    largest first, so no sum of finite values overflows on the way: finite wherever they are."""
-    values = np.asarray(values, np.float64)
-    largest = float(np.max(values)) if values.size else 0.0
-    if not largest > 0:
-        return 0.0
-    return math.sqrt(largest) * math.sqrt(float(np.mean(values / largest)))
+def _ratio_of_logs(ours, theirs) -> np.ndarray:
+    """The RMS ratio of two squared errors given as their logs: the root of the first over the second, held
+    at float64's largest where it passes it (a reference exact on every seed and Dew not, or errors whose
+    quotient float64 cannot hold: an order every ratio keeps, and no infinity a quantile reads as a NaN);
+    0 where both are exact."""
+    ours, theirs = np.asarray(ours, np.float64), np.asarray(theirs, np.float64)
+    largest = np.finfo(np.float64).max
+    with np.errstate(over="ignore", invalid="ignore"):
+        ratio = np.minimum(np.exp((ours - np.where(theirs > -np.inf, theirs, 0.0)) / 2), largest)
+    return np.where(theirs > -np.inf, ratio, np.where(ours > -np.inf, largest, 0.0))
+
+
+def _exact(logs) -> bool:
+    """Whether every squared error of `logs` (`log_errors`') is exactly zero."""
+    return not np.any(np.asarray(logs) > -np.inf)
+
+
+def _log_sum(logs) -> float:
+    """The natural log of the sum of the squared errors whose logs are `logs` (SciPy's log-sum-exp): LOG_ZERO
+    for a sum of exact ones."""
+    from scipy.special import logsumexp
+
+    total = float(np.asarray(logsumexp(logs)))
+    return LOG_ZERO if total == -np.inf else total
+
+
+def _root_mean(logs) -> float:
+    """The root of the mean of the squared errors whose logs are `logs` (each seed's), computed from their
+    logs' sum (SciPy's log-sum-exp): finite wherever they are."""
+    from scipy.special import logsumexp
+
+    total = float(np.asarray(logsumexp(logs)))
+    return 0.0 if total == -np.inf else math.exp((total - math.log(len(logs))) / 2)
 
 
 def log_ratio(mine, theirs) -> float:
@@ -185,29 +209,39 @@ class Inconclusive(GateFailure):
 
 
 def _pooled(mine: np.ndarray, theirs: np.ndarray) -> float:
-    """sqrt(sum a / sum b): the RMS ratio over every draw and element, each draw's mean squared error
-    weighed alike, as the owner's estimand reads it."""
-    return float(np.sqrt(np.sum(mine) / np.sum(theirs))) if np.sum(theirs) > 0 else (
-        0.0 if np.sum(mine) == 0 else float("inf"))
+    """sqrt(sum a / sum b) of the squared errors whose logs are `mine` and `theirs`: the RMS ratio over every
+    draw and element, each draw's mean squared error weighed alike, as the owner's estimand reads it; 0
+    where both are exact, infinite where the reference alone is. Two nonzero errors keep their ratio
+    however small (testing.md: no floor of any kind)."""
+    from scipy.special import logsumexp
+
+    ours, refs = float(np.asarray(logsumexp(mine))), float(np.asarray(logsumexp(theirs)))
+    if refs == -np.inf:
+        return 0.0 if ours == -np.inf else float("inf")
+    return float(_ratio_of_logs(ours, refs))
 
 
 def _interval(mine: np.ndarray, theirs: np.ndarray,
               tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)) -> tuple[float, float]:
     """The pooled ratio's bootstrap interval over seeds, its lower and upper `tails` left out: Dew's and
-    the reference's errors resampled by the same seeds."""
+    the reference's errors (their logs) resampled by the same seeds."""
+    from scipy.special import logsumexp
+
     picks = np.random.default_rng(0).integers(0, len(mine), (BOOTSTRAP, len(mine)))
-    return _quantiles(np.sqrt(mine[picks].sum(axis=1) / np.maximum(theirs[picks].sum(axis=1), 1e-300)), tails)
+    return _quantiles(_ratio_of_logs(logsumexp(mine[picks], axis=1), logsumexp(theirs[picks], axis=1)), tails)
 
 
 def _control_interval(mine: np.ndarray, control: np.ndarray,
                       tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)) -> tuple[float, float]:
-    """`_interval` of the reference compared with itself, an equally exact pair: its errors on two disjoint
-    seed sets, `mine` and `control`, resampled apart."""
+    """`_interval` of the reference compared with itself, an equally exact pair: its errors (their logs) on
+    two disjoint seed sets, `mine` and `control`, resampled apart."""
+    from scipy.special import logsumexp
+
     rng = np.random.default_rng(0)
     picks = rng.integers(0, len(mine), (BOOTSTRAP, len(mine)))
     other = rng.integers(0, len(control), (BOOTSTRAP, len(control)))
-    ratios = np.sqrt(mine[picks].sum(axis=1) / np.maximum(control[other].sum(axis=1), 1e-300))
-    return _quantiles(ratios, tails)
+    return _quantiles(_ratio_of_logs(logsumexp(mine[picks], axis=1), logsumexp(control[other], axis=1)),
+                      tails)
 
 
 def _quantiles(ratios: np.ndarray, tails: tuple[float, float]) -> tuple[float, float]:
@@ -227,12 +261,13 @@ TAIL_SHARE = 0.1
 
 
 def _log_ratios(mine: np.ndarray, theirs: np.ndarray) -> np.ndarray | None:
-    """Each draw's log RMS ratio, half the log of Dew's squared error over the reference's, the draws where
-    both are exactly float64 left out; None where one arm is exact on a draw and the other is not."""
-    if np.any((mine > 0) != (theirs > 0)):
+    """Each draw's log RMS ratio, half the log of Dew's squared error over the reference's (their logs'
+    difference), the draws where both are exactly float64 left out; None where one arm is exact on a draw
+    and the other is not."""
+    if np.any((mine > -np.inf) != (theirs > -np.inf)):
         return None
-    kept = mine > 0
-    return 0.5 * np.log(mine[kept] / theirs[kept])
+    kept = mine > -np.inf
+    return 0.5 * (mine[kept] - theirs[kept])
 
 
 FAULTS = ((2.0, 0.1), (3.0, 0.2), (10.0, 0.1))
@@ -599,7 +634,7 @@ def _unresolved_against_itself(errors: np.ndarray, names, count: int) -> list[st
     it (`_interval`'s control); a leaf with no error on either half is resolved."""
     halves = errors[:count], errors[count:2 * count]
     return [name for index, name in enumerate(names)
-            if np.sum(halves[0][:, index]) > 0 and np.sum(halves[1][:, index]) > 0
+            if not _exact(halves[0][:, index]) and not _exact(halves[1][:, index])
             and not _resolves(*_control_interval(halves[0][:, index], halves[1][:, index]))]
 
 
@@ -690,8 +725,11 @@ class RecordedLeaf:
     mean squared error from its own float64 truth, its worst sized row over its size, its RMS error on
     each row the truth sizes zero (below RESOLUTION of its leaf) by the row's index, and whether it and
     its truth were finite; read from a leaf here (`leaf_summary`), also the truth's own RMS on each of
-    those rows, which decides whether a row a live reference measures is zero (`_paired`)."""
-    mse: float
+    those rows, which decides whether a row a live reference measures is zero (`_paired`). Its mean squared
+    error is held as its log (`log_mse`, -inf where exact), so two nonzero errors keep their ratio however
+    small; a recording keeps it as `mse`, the value (`RECORDED_KINDS`), which holds none under float64's
+    least (testing.md: a recording's limit)."""
+    log_mse: float
     worst: float
     zero_rows: np.ndarray
     zero_errors: np.ndarray
@@ -734,26 +772,20 @@ def leaf_summaries(references, truths, terms=None) -> list[RecordedLeaf]:
             if summary is not None]
 
 
-def _missed(mse, missed):
-    """Each mean squared error where its leaf `missed` its truth somewhere: a leaf whose every error is below
-    2^-537 squares to zero, so it takes the least positive float64 instead, and an arm that misses an exact
-    reference is never read as exact (check 1's exact-reference rule, `_judgement`)."""
-    return np.where((np.asarray(mse) == 0) & missed, np.nextafter(0.0, 1.0), mse)
-
-
-def rows_summary(rows, truth, *, finite: bool, dtype: str, mse: float | None = None) -> RecordedLeaf:
+def rows_summary(rows, truth, *, finite: bool, dtype: str,
+                 log_mse: float | None = None) -> RecordedLeaf:
     """`leaf_summary` of a leaf from each row's RMS distance from its float64 truth `rows` alone, where the
     reference ran apart and kept those (a recorder whose outputs are too large to keep, its rows its
     leaf's every axis but the last, in C order): its mean squared error the rows' mean square, every row
-    one width, unless `mse` gives it; `finite` whether the reference's leaf was, and `dtype` its dtype.
-    The truth's rows are read as `_summaries` reads them (`_LaidTruths`), and an empty leaf is exact,
-    as `leaf_summary` reads one."""
+    one width (its log), unless `log_mse` gives it; `finite` whether the reference's leaf was, and `dtype`
+    its dtype. The truth's rows are read as `_summaries` reads them (`_LaidTruths`), and an empty leaf is
+    exact, as `leaf_summary` reads one."""
     if not np.size(truth):
-        return RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=finite, dtype=dtype)
+        return RecordedLeaf(-np.inf, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=finite, dtype=dtype)
     held, rows = _LaidTruths.of([truth]), np.asarray(rows, np.float64)
     sized = held.sizes > 0
     logged = float(np.max(log_over(rows[sized], held.sizes[sized]))) if sized.any() else LOG_ZERO
-    return RecordedLeaf(float(_missed(np.mean(np.square(rows)), np.any(rows != 0))) if mse is None else mse,
+    return RecordedLeaf(float(log_mean_square(rows)) if log_mse is None else log_mse,
                         float(np.max(_over(rows[sized], held.sizes[sized]))) if sized.any() else 0.0,
                         np.flatnonzero(~sized), rows[~sized], finite=finite and bool(held.finite.all()),
                         dtype=dtype, zero_sizes=held.own[~sized], worst_log=logged)
@@ -809,7 +841,7 @@ def _truth_rows(truths, terms, *, xp):
 
 
 def _error_rows(references, truths, *, xp):
-    """Each reference leaf against its truth: its mean squared error, whether it differs anywhere, whether
+    """Each reference leaf against its truth: its mean squared error's log (`log_mean_square`), whether
     its every value is finite, and its error's rows' RMS (`_scaled_rms`) and largest share
     (`_largest_share`)."""
     found = []
@@ -818,9 +850,21 @@ def _error_rows(references, truths, *, xp):
         errors = values - truth
         width = _width(truth)
         rows = errors.reshape(-1, width) if width else xp.zeros((0, 1))
-        found.append((xp.mean(xp.square(errors)), xp.any(values != truth), xp.isfinite(values).all(),
-                      _scaled_rms(rows, xp), _largest_share(rows, xp)))
+        found.append((log_mean_square(errors, xp), xp.isfinite(values).all(), _scaled_rms(rows, xp),
+                      _largest_share(rows, xp)))
     return found
+
+
+def log_mean_square(errors, xp=np):
+    """The natural log of `errors`' mean square, its errors over their largest magnitude first, so an error
+    below 2^-537, whose square float64 holds as zero, keeps its value: -inf where every error is zero, the
+    largest's own (+inf, a NaN) where it is not finite. In numpy, or in `xp` (jax.numpy, inside check 1's
+    programs)."""
+    largest = xp.max(xp.abs(errors))
+    finite = xp.isfinite(largest) & (largest > 0)
+    held = xp.where(finite, largest, 1.0)
+    scaled = 2 * xp.log(held) + xp.log(xp.mean(xp.square(errors / held)))
+    return xp.where(finite, scaled, xp.where(largest == 0, -xp.inf, 2 * xp.log(largest)))
 
 
 def _largest_share(rows, xp=np):
@@ -884,7 +928,7 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     laid = set(held.laid)
     for at, reference in enumerate(references):
         if reference is not None and at not in laid:
-            summaries[at] = RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=True,
+            summaries[at] = RecordedLeaf(-np.inf, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=True,
                                          dtype=dtype(reference))
     read = [references[at] is not None for at in held.laid]
     if not any(read):
@@ -893,9 +937,8 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     found = _computed_here(_error_rows, [references[at] if ok else held.truths[at]
                                          for ok, at in zip(read, held.laid, strict=True)],
                            [held.truths[at] for at in held.laid])
-    mse = _missed(np.asarray([mse for mse, *_ in found], np.float64),
-                  np.asarray([missed for _, missed, *_ in found], bool))
-    finite = np.asarray([finite for _, _, finite, *_ in found], bool)
+    log_mse = np.asarray([log_mse for log_mse, *_ in found], np.float64)
+    finite = np.asarray([finite for _, finite, *_ in found], bool)
     rows = np.concatenate([np.zeros(0), *(np.asarray(rows) for *_, rows, _ in found)])
     shares = np.concatenate([np.zeros(0), *(np.asarray(shares) for *_, shares in found)])
     # Each laid leaf's rows, its first among them, and those sized past RESOLUTION.
@@ -921,12 +964,12 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     zero_rows = unsized - np.repeat(starts, counts - taken)
     zero_errors, zero_sizes = rows[unsized], held.own[unsized]
     ends = list(itertools.accumulate((counts - taken).tolist(), initial=0))
-    mse, worst, worst_log, share, finite = mse.tolist(), worst.tolist(), worst_log.tolist(), share.tolist(), (
-        finite & held.finite).tolist()
+    log_mse, worst, worst_log, share, finite = (log_mse.tolist(), worst.tolist(), worst_log.tolist(),
+                                                share.tolist(), (finite & held.finite).tolist())
     for index, at in enumerate(held.laid):
         if read[index]:
             span = slice(ends[index], ends[index + 1])
-            summaries[at] = RecordedLeaf(mse[index], worst[index], zero_rows[span], zero_errors[span],
+            summaries[at] = RecordedLeaf(log_mse[index], worst[index], zero_rows[span], zero_errors[span],
                                          finite=finite[index], dtype=dtype(references[at]),
                                          zero_sizes=zero_sizes[span], worst_log=worst_log[index],
                                          share=share[index])
@@ -1211,7 +1254,7 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
             # adds no error and resolves nothing.
             kept = str(jnp.dtype(leaf.dtype))
             assert kept == their.dtype, (path, kept, their.dtype)
-            row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True, (0.0, 0.0)))
+            row.append((-np.inf, -np.inf, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True, (0.0, 0.0)))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = (was and not own) or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
@@ -1239,7 +1282,7 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     in Dew's truth the reference's lacks (a recorded truth recomputed otherwise) is refused. Not
     `paired`, the two held to truths of their own draws (`null_runs`), no row is paired."""
     if not paired:
-        return (mine.mse, theirs.mse, mine.log_worst, theirs.log_worst, NO_ZERO_ROWS,
+        return (mine.log_mse, theirs.log_mse, mine.log_worst, theirs.log_worst, NO_ZERO_ROWS,
                 mine.finite and theirs.finite, (mine.share, theirs.share))
     # Each of Dew's rows of float64 zero against the reference's same row, every row at once (up to 283k a
     # draw at 2469's chunk sites, which a loop of scalar logs held for a fifth of a GPU attention file's
@@ -1266,7 +1309,7 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     # A measured row of float64 zero that became an arm's worst keeps no share of its own: unknown.
     shares = (mine.share if worst == mine.log_worst else None,
               theirs.share if their_worst == theirs.log_worst else None)
-    return (mine.mse, theirs.mse, worst, their_worst, (rows, errors, their_errors),
+    return (mine.log_mse, theirs.log_mse, worst, their_worst, (rows, errors, their_errors),
             mine.finite and theirs.finite, shares)
 
 
@@ -1291,7 +1334,7 @@ def _at_parity(draws: _Draws, index: int, leaf: str, tails: tuple[float, float],
     final verdict), a leaf its pooled ratio leaves inconclusive passed by its typical draw where that
     decides (`_typical_status`). A leaf both hold exactly on every seed has no ratio and passes."""
     a, b, count = draws.mine[:, index], draws.theirs[:, index], len(draws.mine)
-    if np.sum(b) == 0:
+    if _exact(b):
         return None
     ratio, low, high = _judged(draws, index, tails)
     status = _status(ratio, low, high, contained=contained)
@@ -1327,7 +1370,7 @@ def _below_one(draws: _Draws, index: int, leaf: str, tails: tuple[float, float],
     nothing to be below and fails with no measure, a form at parity being check 1's to hold: a finding as
     any other, so a first stage of exact seeds draws the second before it is the verdict."""
     a, b, count = draws.mine[:, index], draws.theirs[:, index], len(draws.mine)
-    if np.sum(b) == 0:
+    if _exact(b):
         return Finding(leaf, "no measure", 0.0, f"{leaf}: dew and the named arm both equal float64 on "
                        f"every one of {count} seeds, so nothing is below; a form at parity holds check 1 "
                        f"(`assert_as_exact`)")
@@ -1362,7 +1405,7 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
             over.append(Finding(leaf, "not finite", nonfinite,
                                 f"{leaf}: a value is not finite on {nonfinite} of {count} seeds"))
             continue
-        if np.sum(b) == 0 and np.sum(a) > 0:
+        if _exact(b) and not _exact(a):
             # No ratio to judge, but rows over an orbit's other orders still are; Dew's own RMS error is
             # what a change can make worse.
             over.append(Finding(leaf, "exact reference", _root_mean(a),
@@ -1414,7 +1457,7 @@ def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True,
     if two_stage:
         further = any(_judgement(draws, label, tails, ratio_rule=ratio_rule))
     else:
-        further = any(np.sum(draws.theirs[:, index]) > 0 and _judged(draws, index, tails)[0] > PARITY
+        further = any(not _exact(draws.theirs[:, index]) and _judged(draws, index, tails)[0] > PARITY
                       for index in range(len(draws.names)))
     if further:
         draws = draws.joined(drawn(seeds, staged_units(seeds)))
@@ -1750,7 +1793,8 @@ def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = 
                typical: tuple = (), examples: list | None = None, scalars: Sequence[bool] = ()) -> list[str]:
     """The leaves `seeds_for` leaves unresolved at `count`: on the count's own block of draws or on the
     next block of as many (`seeds_for`'s confirmation), each judged as the sizing judges it: paired,
-    `mine` Dew's squared errors against the reference's (`theirs`, seed by leaf) on the same draws, or
+    `mine` Dew's squared errors (their logs, `log_errors`) against the reference's (`theirs`, seed by leaf)
+    on the same draws, or
     the reference compared with itself (`_unresolved_against_itself`, each block twice the count); the
     leaves named in `typical` sized by their typical draw too (`_sized`), `scalars` saying which leaves hold
     one value an example."""
@@ -1758,7 +1802,7 @@ def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = 
     for start in (0, count) if mine is not None else (0, 2 * count):
         if mine is not None:
             held, ours = theirs[start:start + count], mine[start:start + count]
-            unresolved = [name for index, name in enumerate(names) if np.sum(held[:, index]) > 0
+            unresolved = [name for index, name in enumerate(names) if not _exact(held[:, index])
                           and not _sized(ours[:, index], held[:, index], name in typical,
                                          None if examples is None else _leaf_examples(examples, start, count,
                                                                                       index),
@@ -1772,8 +1816,8 @@ def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = 
 def seeds_resolving(errors: np.ndarray, names, label: str, *, start: int = FEWEST_SEEDS,
                     most: int = MOST_SEEDS) -> int:
     """`seeds_for`'s count for the reference compared with itself, from its errors already measured:
-    `errors` holds its squared errors a seed (rows, from seed 0) and a leaf (columns), such as a
-    recording's merged shards, and the count is the fewest, doubling from `start` to `most`, that
+    `errors` holds its squared errors' logs (`log_errors`) a seed (rows, from seed 0) and a leaf (columns),
+    such as a recording's merged shards, and the count is the fewest, doubling from `start` to `most`, that
     resolves every leaf on its own block and the next (`_confirmed`), as `seeds_for` doubles. Fails past
     `most`, as `seeds_for` does, and where the rows held run out first: the recording then holds too
     few seeds."""

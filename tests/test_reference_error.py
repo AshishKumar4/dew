@@ -1017,7 +1017,8 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
     def truth(x, mine, theirs):
         return {"y": x}
 
-    mine, theirs = np.asarray([4.0, 0.01] * 20), np.ones(40)
+    # Each seed's squared errors' logs (`dew.parity.log_errors`), as the gate carries them.
+    mine, theirs = np.log(np.asarray([4.0, 0.01] * 20)), np.zeros(40)
     assert _status(math.sqrt(2.005), *_interval(mine, theirs)) == "inconclusive"
     # The typical draw's ratio passes: it is the draws' spread that leaves the leaf undecided.
     status, *typical, _, undecided = _typical_status(mine, theirs)
@@ -1063,8 +1064,8 @@ def test_check_one_decides_at_its_second_stage_what_its_first_leaves_inconclusiv
     from dew.parity import _status
 
     dew, reference, errors, truth = _set_errors(2.6, 0.1)
-    first = np.array([2.6 if seed % 2 == 0 else 0.1 for seed in range(8)])
-    assert _status(_pooled(first, np.ones(8)), *_interval(first, np.ones(8))) == "inconclusive"
+    first = np.log(np.array([2.6 if seed % 2 == 0 else 0.1 for seed in range(8)]))
+    assert _status(_pooled(first, np.zeros(8)), *_interval(first, np.zeros(8))) == "inconclusive"
     log = tmp_path / "stages.jsonl"
     monkeypatch.setenv(STAGES_LOG, str(log))
     assert_as_exact(dew, reference, errors, "second stage", seeds=8, truth_fn=truth)
@@ -1828,7 +1829,7 @@ def test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or
     allowed = 2 * sketch_rounding(float(np.sum(np.abs(truth))))
     assert np.all(np.abs(truth_sketch(truth, 3) - other_order) <= allowed)
     empty = leaf_summary(jnp.zeros((16, 0), jnp.bfloat16), np.zeros((16, 0)))
-    assert (empty.mse, empty.worst, empty.finite, empty.dtype) == (0.0, 0.0, True, "bfloat16")
+    assert (empty.log_mse, empty.worst, empty.finite, empty.dtype) == (-np.inf, 0.0, True, "bfloat16")
     with pytest.raises(AssertionError):
         leaf_summary(np.zeros(0), np.ones(3))
     # Two entries swapped are seen at a seed unless their signs agree in all SKETCH places.
@@ -1847,8 +1848,10 @@ def test_the_procedure_before_the_two_stages_draws_again_as_it_did():
     def law(dew):
         def drawn(start, stop):
             count = stop - start
-            return _Draws(["leaf"], np.full((count, 1), dew), np.ones((count, 1)), np.zeros((count, 1, 2)),
-                          [[NO_ZERO_ROWS]] * count, np.full((count, 1), np.isfinite(dew)), (0,))
+            # Each seed's squared errors' logs: Dew's `dew`, the reference's one.
+            return _Draws(["leaf"], np.full((count, 1), np.log(dew)), np.zeros((count, 1)),
+                          np.zeros((count, 1, 2)), [[NO_ZERO_ROWS]] * count,
+                          np.full((count, 1), np.isfinite(dew)), (0,))
         return drawn
 
     with np.errstate(invalid="ignore"):
@@ -1875,6 +1878,28 @@ def test_a_change_moves_the_result_only_past_rounding():
         return {"y": jnp.full(3, 1e-30, x.dtype)}
 
     assert_moves(jax.jit(zero), jax.jit(off_zero), _draw, "off zero", seeds=8)
+
+
+def test_a_change_whose_error_ratio_float64_cannot_hold_moves_and_is_over():
+    """A scalar the original misses by 1e-320 and a change misses by 1e-5 on every seed: their RMS ratio
+    passes float64's range (its log about 725), which the gate holds at float64's largest, so the change
+    moves (`assert_moves`) and a Dew arm so far off is over (check 1), where the ratio read as an infinity
+    made every bootstrap quantile a NaN and the change no move."""
+    def off_by(offset):
+        return as_given(lambda x: {"y": x + offset})
+
+    exact = as_given(lambda x: {"y": x})
+
+    # A truth of zero, so 1e-320 off it is a subnormal float64 keeps.
+    def at_zero(seed):
+        del seed
+        return (np.zeros(()),)
+
+    assert_moves(off_by(1e-320), off_by(1e-5), at_zero, "past float64's ratios", seeds=8, truth_fn=exact)
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(off_by(1e-5), off_by(1e-320), at_zero, "past float64's ratios", seeds=8,
+                        truth_fn=exact)
+    assert raised.type is GateFailure
 
 
 def test_a_change_moves_by_its_intervals_lower_end_and_one_leaf_is_enough():
@@ -2018,7 +2043,8 @@ def test_a_leaf_in_any_layout_reads_as_its_c_ordered_copy():
 def test_a_summarized_recording_reads_back_as_its_reference_reads_live():
     """A summarized recording's evidence (`record_case`'s summary), read back as check 1 reads it
     (`indexed_recording`'s reference), is the evidence of the same reference outputs read live
-    (`leaf_summary`), bit for bit in every field the recording keeps, its rows of float64 zero included."""
+    (`leaf_summary`), bit for bit in every field the recording keeps, its rows of float64 zero included,
+    its squared error kept as the value of the log read live and read back as that value's log."""
     from tool_support import load
 
     from dew.parity import leaf_summary
@@ -2039,9 +2065,12 @@ def test_a_summarized_recording_reads_back_as_its_reference_reads_live():
             outputs, truth = evaluate(draw(seed))
             for name, kept in reference(np.int32(seed), draw(seed)).items():
                 read = leaf_summary(outputs[name], truth[name])
-                fields = ("mse", "worst", "share", "zero_rows", "zero_errors", "finite", "dtype")
+                fields = ("worst", "share", "zero_rows", "zero_errors", "finite", "dtype")
                 assert _bits([getattr(kept, field) for field in fields]) == _bits(
                     [getattr(read, field) for field in fields]), (seed, name)
+                # The squared error the recording keeps as its value, and reads back as its log.
+                stored = recorded[f"site.mse.{name}"][seed]
+                assert _bits([stored, kept.log_mse]) == _bits([np.exp(read.log_mse), np.log(stored)])
                 zero_rows += len(kept.zero_rows)
     assert zero_rows
 
@@ -2058,12 +2087,13 @@ def test_a_leaf_read_from_its_rows_distances_is_the_leaf_read_whole():
     reference = (truth + rng.standard_normal((6, 8)) * 1e-6).astype(np.float32)
     whole = leaf_summary(reference, truth)
     read = rows_summary(_rows_rms(reference.astype(np.float64) - truth, 8), truth, finite=True,
-                        dtype="float32", mse=whole.mse)
-    for field in ("mse", "worst", "zero_rows", "zero_errors", "finite", "dtype", "zero_sizes", "worst_log"):
+                        dtype="float32", log_mse=whole.log_mse)
+    for field in ("log_mse", "worst", "zero_rows", "zero_errors", "finite", "dtype", "zero_sizes",
+                  "worst_log"):
         np.testing.assert_array_equal(getattr(read, field), getattr(whole, field), err_msg=field)
     empty, exact = (rows_summary(np.zeros(0), np.zeros((0, 4)), finite=True, dtype="float32"),
                     leaf_summary(np.zeros((0, 4), np.float32), np.zeros((0, 4))))
-    for field in ("mse", "worst", "zero_rows", "finite"):
+    for field in ("log_mse", "worst", "zero_rows", "finite"):
         np.testing.assert_array_equal(getattr(empty, field), getattr(exact, field), err_msg=field)
 
 
@@ -2100,7 +2130,7 @@ def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or
     its log ratios spread within QUALIFYING_SPREAD, passes at the count it sizes; a Dew twice off on every
     draw is refused by its typical draw; one ten times off on a tenth of its draws, which the typical
     draw's ratio leaves under PARITY, is refused by the spread its fault adds."""
-    from dew.parity import _interval, _resolves, _status, _typical_status, _Undecided
+    from dew.parity import _interval, _resolves, _status, _typical_status, _Undecided, log_errors
 
     reference = rounded_apart(1)
     seeds = seeds_for(reference, rounding_apart, "rounding apart", truth_fn=exact_value,
@@ -2111,7 +2141,7 @@ def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or
         return float(np.mean((arm(x, scale, sizes) - exact_value(x, scale, sizes)) ** 2))
 
     most = [[squared(arm, seed) for seed in range(MOST_SEEDS)] for arm in (rounded_apart(0), reference)]
-    low, high = _interval(*(np.asarray(errors) for errors in most))
+    low, high = _interval(*(log_errors(errors) for errors in most))
     assert high > PARITY * low and seeds <= MOST_SEEDS
     assert_as_exact(rounded_apart(0), reference, rounding_apart, "rounding apart", seeds=seeds,
                     truth_fn=exact_value)
@@ -2123,7 +2153,7 @@ def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or
                         seeds=seeds, truth_fn=exact_value)
     # Dew a hundred times the reference's squared error on 13 of 256 draws, equal on the rest: the pooled
     # ratio 2.46, unresolved, the typical draw's ratio under PARITY; the spread of its log ratios refuses it.
-    mine, theirs = np.where(np.arange(256) < 13, 100.0, 1.0), np.ones(256)
+    mine, theirs = np.log(np.where(np.arange(256) < 13, 100.0, 1.0)), np.zeros(256)
     assert not _resolves(*_interval(mine, theirs))
     status, *typical, _, undecided = _typical_status(mine, theirs)
     assert status == "inconclusive" and _status(*typical) == "pass" and undecided is _Undecided.SPREAD
@@ -2139,7 +2169,8 @@ def test_a_leaf_the_second_stage_finds_over_is_over_whatever_its_first_stages_ty
     def drawn(start, stop):
         count = stop - start
         dew = np.asarray([4.0 if seed >= 32 or seed % 2 == 0 else 0.01 for seed in range(start, stop)])
-        return _Draws(["leaf"], dew[:, None], np.ones((count, 1)), np.zeros((count, 1, 2)),
+        # Each seed's squared errors' logs: Dew's `dew`, the reference's one.
+        return _Draws(["leaf"], np.log(dew)[:, None], np.zeros((count, 1)), np.zeros((count, 1, 2)),
                       [[NO_ZERO_ROWS]] * count, np.ones((count, 1), bool), (0,))
 
     over, unresolved, stage = _staged(drawn, 32, "over later")
@@ -2182,6 +2213,8 @@ def test_a_site_that_stacks_examples_is_judged_by_its_examples_paired_ratios_and
     medians."""
     from reference_error import _interval
 
+    from dew.parity import log_errors
+
     reference = stacked_arm(1)
     seeds = seeds_for(reference, stacked_examples, "stacked", truth_fn=exact_rows, dew_fn=stacked_arm(0),
                       examples=True)
@@ -2191,7 +2224,7 @@ def test_a_site_that_stacks_examples_is_judged_by_its_examples_paired_ratios_and
         return float(np.mean((arm(x, scale, sizes)["rows"] - np.asarray(x, np.float64)) ** 2))
 
     pooled = [[squared(arm, seed) for seed in range(seeds)] for arm in (stacked_arm(0), reference)]
-    low, high = _interval(*(np.asarray(errors) for errors in pooled))
+    low, high = _interval(*(log_errors(errors) for errors in pooled))
     assert high > PARITY * low and seeds <= MOST_SEEDS
     assert_as_exact(stacked_arm(0), reference, stacked_examples, "stacked", seeds=seeds, truth_fn=exact_rows,
                     examples=True)
@@ -2274,27 +2307,22 @@ def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
         null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)
 
 
-def test_a_leafs_mean_squared_error_keeps_its_subnormal_value():
-    """Two leaves whose errors square below float64's least normal (about 1e-160 and 1e-158 off a truth
-    of 1e-145) keep their mean squared errors, as numpy computes them, to the subnormals' spacing: check
-    1's statistics run where float64 keeps a subnormal (`dew.parity._computed_here`), so no compiled
-    arithmetic flushes one to zero and reads both at `_missed`'s floor."""
-    from dew.parity import leaf_summary
+def test_errors_whose_squares_float64_holds_as_zero_keep_their_ratio():
+    """A float64 reference 1e-200 off a scalar truth and a Dew arm 1e-180 off it, over eight seeds: each
+    squared error is below float64's least and read as one floor, so the two passed at ratio 1 where Dew is
+    1e20 times the reference (row 6687). Each seed's error is carried as its log, so the site fails on its
+    pooled ratio, the one rule a scalar has; a Dew arm as far off as the reference passes."""
+    def draw(seed):
+        # A scalar, which has no rows to judge (its pooled ratio alone does), far under either offset, so
+        # each seed's error is its offset to ten digits.
+        return (np.full((), (1 + seed) * 1e-211),)
 
-    truth = np.full((4, 8), 1e-145)
-    for offset in (1e-160, 1e-158):
-        expected = np.mean(np.square((truth + offset) - truth))
-        assert expected > np.nextafter(0.0, 1.0)
-        assert abs(leaf_summary(truth + offset, truth).mse - expected) <= 2 * np.spacing(expected)
+    def off_by(offset):
+        return as_given(lambda x: {"y": x + offset})
 
-
-def test_a_leaf_missing_its_truth_by_a_subnormal_is_never_read_as_exact():
-    """A leaf that misses its truth only by values below float64's least normal (1e-310 where the truth
-    is zero) is not exact: its mean squared error is above zero, read where float64 keeps a subnormal
-    (`dew.parity._computed_here`), so an arm that misses an exact reference is never read as
-    exact."""
-    from dew.parity import leaf_summary
-
-    truth = np.zeros((4, 8))
-    assert leaf_summary(truth, truth).mse == 0.0
-    assert leaf_summary(np.full((4, 8), 1e-310), truth).mse > 0.0
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(off_by(1e-180), off_by(1e-200), draw, "far below squares", seeds=8,
+                        truth_fn=as_given(lambda x: {"y": x}))
+    assert raised.type is GateFailure
+    assert_as_exact(off_by(1e-200), off_by(1e-200), draw, "as far below squares", seeds=8,
+                    truth_fn=as_given(lambda x: {"y": x}))
