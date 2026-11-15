@@ -360,19 +360,26 @@ class SavedRun:
     @classmethod
     def pinned(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = (), *,
                mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> SavedRun:
-        """The selected checkpoint of the run in `directory`: `step`, or where none is asked the step its
-        task loads by default (`SavedRunTask.default_step`), its latest unless the task names another, so
-        every reader of a run (a task, `dew.pipeline`, `dew export`) pins the one step. A task loaded
-        from it compiles into the persistent cache (`persist_compilations`). `trust` names the
-        packages outside Dew whose modules the record may import (`dew.registry.imported`); `mesh` and
-        `layout`, where a loader places the weights, where a release its record reads is written (`at`)."""
-        run = cls.at(directory, step, trust, mesh=mesh, layout=layout)
+        """The selected checkpoint of the run in `directory` (`selected`), so every reader of a run (a task,
+        `dew.pipeline`, `dew export`) pins the one step, with its record's paths named where this host
+        holds them (`here`, its releases written where a loader places the weights, `mesh` and `layout`).
+        A task loaded from it compiles into the persistent cache (`persist_compilations`). `trust` names
+        the packages outside Dew whose modules the record may import (`dew.registry.imported`)."""
+        return cls.selected(directory, step, trust).here(mesh=mesh, layout=layout, trust=trust)
+
+    @classmethod
+    def selected(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
+        """The checkpoint of the run in `directory` a reader pins (`pinned`), read as its record states it:
+        `step`, or where none is asked the step its task loads by default (`SavedRunTask.default_step`),
+        its latest unless the task names another; what a pool agrees on before any process writes what its
+        record reads (`saved_sources.pinned_run`)."""
+        run = cls._read(directory, step, trust)
         task = run.objective.saved_task
         chosen = (task.default_step(directory) if step is None and task is not None
                   and issubclass(task, SavedRunTask) else None)
         if chosen is None:
             return run
-        again = cls.at(directory, chosen, trust, mesh=mesh, layout=layout)
+        again = cls._read(directory, chosen, trust)
         if again.objective.saved_task is not task:
             raise ValueError(f"step {chosen} of {directory}, which its task loads by default, was written by "
                              f"{again.objective.__name__}, whose task is another; load a step with `step`")
@@ -382,12 +389,15 @@ class SavedRun:
     def at(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = (), *,
            mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> SavedRun:
         """The checkpoint of the run in `directory` at `step`, its latest where None, whatever step its task
-        loads by default (`pinned`): the step an average of runs reads (`dew.checkpoints.averaged`). Its
-        record's paths within a release of a saved run that this host lacks (the release its training host
-        read, which the step names, `RELEASE_SOURCES`) name this host's release of that run, written here
-        where a loader places the weights (`mesh`, `layout`; `saved_sources.releases_here`)."""
+        loads by default (`pinned`): the step an average of runs reads (`dew.checkpoints.averaged`), its
+        record's paths named where this host holds them (`here`)."""
+        return cls._read(directory, step, trust).here(mesh=mesh, layout=layout, trust=trust)
+
+    @classmethod
+    def _read(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
+        """The checkpoint of the run in `directory` at `step`, its latest where None, its record as its
+        checkpoint states it (`at` names its paths where this host holds them)."""
         from dew.checkpoints import Checkpoints
-        from dew.interop.saved_sources import releases_here
         from dew.registry import import_trusted
         persist_compilations()
         with Checkpoints(directory) as checkpoints:
@@ -397,8 +407,17 @@ class SavedRun:
         if record is None:
             raise ValueError("this checkpoint's objective declares no inference record; declare "
                              "Objective.inference_record, or call objective.pipeline(state)")
-        return cls.declared(str(directory), releases_here(record, mesh=mesh, layout=layout, trust=trust),
-                            step)
+        return cls.declared(str(directory), record, step)
+
+    def here(self, *, mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
+             trust: Sequence[str] = ()) -> SavedRun:
+        """This step with each path its record names within a release of a saved run that this host lacks
+        (the release its training host read, which the step names, `RELEASE_SOURCES`) named within this
+        host's release of that run, written here where a loader places the weights (`mesh`, `layout`;
+        `saved_sources.releases_here`). Every process of a pool calls it on the one step."""
+        from dew.interop.saved_sources import releases_here
+
+        return replace(self, record=releases_here(self.record, mesh=mesh, layout=layout, trust=trust))
 
     @classmethod
     def declared(cls, directory: str, record: Mapping[str, object], step: int) -> Self:

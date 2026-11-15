@@ -30,7 +30,7 @@ from jax.sharding import Mesh
 from dew._builds import dew_cache_dir
 from dew._cache import package_digest
 from dew._coordination import agreed_same, from_every_process, reading_home, seen_by_every_process
-from dew._files import staged
+from dew._files import staged, write_atomically
 from dew._records import JSON, json_value
 from dew.checkpoints import RUN_FILE
 from dew.registry import trust_sources, trusts_source
@@ -163,7 +163,8 @@ def _fingerprint(run: SavedRun, ema: bool | None) -> str:
 
 
 def pinned_run(name_or_dir: str | Path, *, step: int | str | None = None, ema: bool | None = None,
-               trust: Sequence[str] = ()) -> SavedRun | None:
+               trust: Sequence[str] = (), mesh: MeshSpec | Mesh | None = None,
+               layout: Layout | None = None) -> SavedRun | None:
     """The saved Dew run `name_or_dir` names (`is_saved_run`) at its checkpoint `step` (`SavedRun.pinned`:
     a step, `latest`, `best`, `best:<metric>`, or the one its task loads by default), on which every
     process of a pool agrees; None for a source that is no saved run, beside which a step or an EMA
@@ -175,9 +176,10 @@ def pinned_run(name_or_dir: str | Path, *, step: int | str | None = None, ema: b
             raise ValueError(f"{name_or_dir} is no saved Dew run (no {RUN_FILE}), so a step or an EMA choice "
                              "selects nothing of it; name a run's directory, or drop them")
         return None
-    return SavedRun.pinned(str(name_or_dir), agreed_same("saved run step",
-                                                       lambda: SavedRun.pinned(str(name_or_dir), step,
-                                                                               trust).step), trust)
+    # The pool agrees on the step from its records alone, then writes what that step reads (`SavedRun.here`)
+    # where the load places the weights.
+    agreed = agreed_same("saved run step", lambda: SavedRun.selected(str(name_or_dir), step, trust).step)
+    return SavedRun.pinned(str(name_or_dir), agreed, trust, mesh=mesh, layout=layout)
 
 
 def samples_images(run: SavedRun) -> bool:
@@ -288,7 +290,7 @@ def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema:
     does. A load without weights (a resume's, which its restore fills) reads the release's records and
     headers, so a host whose cache lacks the release (a resumed job on another node, a cleared cache, a
     run whose records changed) writes it as the first load did (ledger 2774)."""
-    run = pinned_run(name_or_dir, step=step, ema=ema, trust=trust)
+    run = pinned_run(name_or_dir, step=step, ema=ema, trust=trust, mesh=mesh, layout=layout)
     if run is None:
         return name_or_dir
     if samples_images(run):
@@ -338,11 +340,8 @@ class Held:
 
 
 def _write_held(release: Path, run: SavedRun, ema: bool | None) -> None:
-    """Write `release`'s own record of the saved run it holds (`HELD_FILE`, `Held`), whole or not at all
-    (a rename onto the file)."""
-    written = release / f".{HELD_FILE}.{os.getpid()}"
-    written.write_text(json.dumps(Held.of(run, ema).record()))
-    os.replace(written, release / HELD_FILE)
+    """Write `release`'s own record of the saved run it holds (`HELD_FILE`, `Held`), whole or not at all."""
+    write_atomically(release / HELD_FILE, json.dumps(Held.of(run, ema).record()))
 
 
 def release_sources(record: Mapping[str, object]) -> dict[str, JSON]:
@@ -380,15 +379,18 @@ def releases_here(record: Mapping[str, object], *, mesh: MeshSpec | Mesh | None 
     lists (`RELEASE_SOURCES`) that this host lacks named within this host's release of the saved run that
     release holds, which `released_run` writes here as the first load did, where the load places it
     (`mesh`, `layout`): a run's processor and tokenizer lie in the release of the saved run it started from,
-    under its training host's cache, which a resume on another host, or a host serving it, lacks. Every
-    process of a pool agrees on whether any of them lacks one, and then all write theirs. A saved run a
-    listed release holds that this host lacks is refused, naming it; a path within a release the map does
-    not list is the record's as it stands."""
+    under its training host's cache, which a resume on another host, or a host serving it, lacks. The
+    processes of a pool agree on which releases any of them lacks, and then all write theirs of those, in
+    one order; a release every process holds is read where it lies. A saved run a lacking release holds
+    that this host lacks too is refused, naming it; a path within a release the map does not list is the
+    record's as it stands."""
     listed = record.get(RELEASE_SOURCES)
-    if not isinstance(listed, dict) or not any(from_every_process(
-            any(not Path(root).is_dir() for root in listed))):
+    if not isinstance(listed, dict):
         return record
-    held = {root: Held.read(json_value(source, root)) for root, source in sorted(listed.items())}
+    lacking = [root for root in sorted(listed) if any(from_every_process(not Path(root).is_dir()))]
+    if not lacking:
+        return record
+    held = {root: Held.read(json_value(listed[root], root)) for root in lacking}
     missing = sorted(f"{source.run} at step {source.step} (EMA {source.ema})"
                      for source in held.values() if not is_saved_run(source.run))
     if any(from_every_process(bool(missing))):
@@ -398,20 +400,19 @@ def releases_here(record: Mapping[str, object], *, mesh: MeshSpec | Mesh | None 
     fields = {key: json_value(field, key) for key, field in record.items() if key != RELEASE_SOURCES}
     names = _strings(fields)
     renamed: dict[str, str] = {}
-    sources: dict[str, JSON] = {}
-    # Every process writes the same releases in one order: an export is collective.
+    sources = {root: json_value(source, root) for root, source in listed.items() if root not in held}
     for root, source in held.items():
+        # The trust its recorded release had, or its run has, taken before the release is written (an
+        # absent path's trust is a Hub name's, `dew.registry.trusts_source`).
+        trusted = root in trust or trusts_source(root) or trusts_source(source.run)
         here = Path(released_run(source.run, step=source.step, ema=source.ema, trust=trust, mesh=mesh,
                                  layout=layout))
-        if Path(root).is_dir():
-            sources[root] = source.record()
-            continue
-        sources[str(here)] = source.record()
-        # This host's release takes the trust the recorded one had, or its run has (`released_source`).
-        if root in trust or trusts_source(root) or trusts_source(source.run):
+        if trusted:
             trust_sources((str(here),))
-        renamed.update({name: str(here / Path(name).relative_to(root)) for name in names
-                        if Path(name).is_relative_to(root)})
+        sources[str(here)] = source.record()
+        if str(here) != root:
+            renamed.update({name: str(here / Path(name).relative_to(root)) for name in names
+                            if Path(name).is_relative_to(root)})
     return {**{key: _renamed(field, renamed) for key, field in fields.items()}, RELEASE_SOURCES: sources}
 
 

@@ -1297,7 +1297,7 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
         raise TypeError("scan_layers scans a decoder's layers; a diffusion pipeline has none")
     if text_only:
         _no_language_model(checkpoint, "diffusion pipeline")
-    run = pinned_run(checkpoint, step=step, ema=ema)
+    run = pinned_run(checkpoint, step=step, ema=ema, mesh=mesh, layout=layout)
     if run is not None:
         stored = None if param_dtype == AUTO else param_dtype
         return pipeline_of_run(run, checkpoint, dtype=dtype, param_dtype=stored, revision=revision,
