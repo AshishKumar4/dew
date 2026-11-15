@@ -147,8 +147,10 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
               if key != "model_type"}
     config = AutoConfig.for_model(model_type, **fields, experts_implementation=EXPERTS)
     _registered()
-    model = AutoModelForCausalLM.from_config(config, trust_remote_code=False, dtype=torch.float32,
-                                             attn_implementation=_PROBE).eval()
+    # Built as `load` builds it (its config's own attention, which transformers refuses where it has none
+    # of the kind), then on the probe's.
+    model = AutoModelForCausalLM.from_config(config, trust_remote_code=False, dtype=torch.float32).eval()
+    model.set_attn_implementation(_PROBE)
     verify.scatter_weights(model)
     ids = verify.probe_ids(int(config.vocab_size)).astype(np.int32)
     probe = _Probe()
@@ -245,18 +247,19 @@ def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable
 
 
 def _abstract(source, attention: str, length: int, *, train: bool):
-    """`source`'s causal LM built on torch's meta device with `attention`, its forward over a row of
-    `length` tokens traced as tier 3 traces it (`TorchGraph.traced`) over abstract weights: the closed
-    program, the index of the tokens among its inputs (past the parameters' and the buffers' leaves,
-    as `traced` flattens them), and the draws it made."""
+    """`source`'s causal LM built on torch's meta device as `load` builds it (its config's own attention,
+    which transformers refuses where it has none of the kind), then on `attention`, its forward over a row
+    of `length` tokens traced as tier 3 traces it (`TorchGraph.traced`) over abstract weights: the closed
+    program, the index of the tokens among its inputs (past the parameters' and the buffers' leaves, as
+    `traced` flattens them), and the draws it made."""
     import torch
     from torchax.interop import JittableModule, extract_all_buffers
     from torchax.ops.mappings import t2j_dtype
     from transformers import AutoModelForCausalLM
 
     with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(source, trust_remote_code=False, dtype=torch.float32,
-                                                 attn_implementation=attention).eval()
+        model = AutoModelForCausalLM.from_config(source, trust_remote_code=False, dtype=torch.float32).eval()
+    model.set_attn_implementation(attention)
     functional_parts(model)
     jittable = JittableModule(model)
     params, buffers = ({name: jax.ShapeDtypeStruct(tuple(leaf.shape), t2j_dtype(leaf.dtype))
