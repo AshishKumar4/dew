@@ -299,7 +299,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     if hooks.key_mod is not None and (table is not None or scales is not None):
         raise ValueError("a paged or quantized cache holds its keys under their prologue, taken as they were "
                          "cached: a call over its pages or codes takes no key prologue")
-    in_key = attention_mosaic.reads_in_key(in_key, hooks)
+    in_key = attention_mosaic.reads_in_key(in_key, key, value, hooks, table=table, scales=scales)
     query, key, hooks = prologues_taken(query, key, hooks)
     if not packable(hooks):
         raise NotImplementedError("the template's decode packs no query-placed hook, parameter, output "

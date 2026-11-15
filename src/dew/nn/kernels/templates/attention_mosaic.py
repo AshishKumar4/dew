@@ -466,8 +466,8 @@ class MosaicForward(_Mainloop[Tiles]):
                     return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
                                           out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
                                           table=table, sources=sources, subtracted=self.subtracted,
-                                          scales=scales, parts=self.parts, scaled=scaled, in_key=self.in_key,
-                                          **form)
+                                          scales=scales, parts=self.parts, scaled=scaled,
+                                          in_key=self.reads_key_slot(bundle_of(config, query.dtype)), **form)
 
         if scaled or self.bounded or hooks.rounds is not None or not algebra.headroom(value.dtype):
             return launched(), None
@@ -811,7 +811,8 @@ class MosaicForward(_Mainloop[Tiles]):
                                            ba.arguments.get("residuals") is Kept.SPLIT,
                                            min(config.stages, steps), out_dtype=out_dtype, page=page,
                                            codes=_codes_of(ba.arguments["key"], ba.arguments.get("scales")),
-                                           parts=self.parts, params=self.score_types, in_key=self.in_key)
+                                           parts=self.parts, params=self.score_types,
+                                           in_key=self.reads_key_slot(family))
         # An inference launch may flag its rows for the fold's rewalk, and a cache's scaled walk reads its
         # keys' value magnitudes from its value slots (`algebra.SCALED_WALK`; another scaled walk the call's,
         # `attention_mosaic_forward._largest`), each a reduction across warps (`reducing`).
@@ -917,29 +918,15 @@ class MosaicForward(_Mainloop[Tiles]):
         if self.parts > 1 and not loads_parts(family):
             return Refusal('dtype', f"the Mosaic mainloop's fp32 parts load in pieces, which {family.name}'s "
                            "pipeline does not")
-        if self.in_key and (reason := self._in_key_refusal(ba, family)) is not None:
-            return reason
         if family.places_on_role and (reason := self._placed_refusal(ba, hooks, family)) is not None:
             return reason
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
 
-    def _in_key_refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
-        """Why a call whose values are its keys' leading columns (`in_key`) runs on no program of `family`,
-        or None: its value tile a view of the key slot's whole swizzled groups of columns, no wider than the
-        key's (a view ending within a group is one no product reads), read where its
-        family streams the keys of 16-bit operands into one slot a step (no fp32 parts, quantized codes or
-        paged gather), its products issued from its own consumers (a family placing them on an issuing role
-        declares the values' stream)."""
-        key, value = ba.arguments["key"], ba.arguments["value"]
-        group = swizzling.swizzle_columns(key.dtype, swizzling.SWIZZLE_BYTES)
-        if value.shape[3] > key.shape[3] or value.shape[3] % group:
-            return Refusal('columns', f"a value of the keys' leading {value.shape[3]} columns is read as "
-                           f"whole groups of {group} of the key's {key.shape[3]}")
-        if self.parts > 1 or ba.arguments["scales"] is not None or ba.arguments["table"] is not None:
-            return Refusal('columns', "a value read from the key's slot is a dense 16-bit call's")
-        if family.places_on_role:
-            return Refusal('columns', f"{family.name} declares the values' stream of its issuing role")
-        return None
+    def reads_key_slot(self, family: mosaic.Family) -> bool:
+        """Whether its launches on `family` read the values from the key's slot (`in_key`, `reads_in_key`'s
+        call): every family's but one placing its products on an issuing role, whose role declares the
+        values' stream (tcgen05's rows), which streams the value array the call was handed."""
+        return self.in_key and not family.places_on_role
 
     def _placed_refusal(self, ba: tokamax.BoundArguments, hooks: Hooks, family: mosaic.Family
                         ) -> Refusal | None:
@@ -1064,7 +1051,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     """
     # The key prologue taken as XLA's program before the launch (`key_prologue_taken`); the query's where the
     # call's consumers cannot take it (`_forward_call`).
-    in_key = reads_in_key(in_key, hooks, residuals)
+    in_key = reads_in_key(in_key, key, value, hooks, residuals, table=table, scales=scales)
     key, hooks = key_prologue_taken(key, Hooks() if hooks is None else hooks)
     if residuals is Kept.SPLIT:
         # The training walk reads an interval a query (`KeySpans.per_query`); the inference walk by position.
@@ -1082,20 +1069,29 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     """Why `forward` runs no call of these arrays compiled on this device, or None
     (`MosaicForward.declined`)."""
     spans = spans.per_query() if residuals is Kept.SPLIT else spans
-    in_key = reads_in_key(in_key, hooks, residuals)
+    in_key = reads_in_key(in_key, key, value, hooks, residuals)
     key, hooks = key_prologue_taken(key, Hooks() if hooks is None else hooks)
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
                              residuals=residuals, in_key=in_key)
     return op.declined(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target())
 
 
-def reads_in_key(in_key: bool, hooks: Hooks | None, residuals: Kept = Kept.NONE) -> bool:
+def reads_in_key(in_key: bool, key: jax.Array, value: jax.Array, hooks: Hooks | None,
+                 residuals: Kept = Kept.NONE, *, table: jax.Array | None = None,
+                 scales: tuple[jax.Array, jax.Array] | None = None) -> bool:
     """Whether a call whose values are its keys' leading columns (`in_key`) reads them from the key's slot:
     not under a key prologue, whose keys the slot holds, the values being the keys as given, nor where it
     keeps split residuals, whose anchored training launches stream the values as given
-    (`_trained_forward`); such a call reads them from the slice it was handed. A plain forward keeping its
-    rows (`Kept.OUTPUT`, a split decode step's slices) reads the key's slot as one keeping none."""
-    return in_key and residuals is not Kept.SPLIT and (hooks is None or hooks.key_mod is None)
+    (`_trained_forward`); nor where the slot holds no value tile its products read: a value wider than the
+    key or ending within a swizzle group of its columns (a view no product reads), operands of 32 bits
+    (their 16-bit parts load in pieces, `MosaicForward.parts`), a quantized cache's codes (`scales`) or a
+    paged cache's gathered pages (`table`). Such a call reads them from the slice it was handed, as one
+    without `in_key`: `in_key` states the operands, never another call. A plain forward keeping its rows
+    (`Kept.OUTPUT`, a split decode step's slices) reads the key's slot as one keeping none."""
+    group = swizzling.swizzle_columns(key.dtype, swizzling.SWIZZLE_BYTES)
+    return (in_key and residuals is not Kept.SPLIT and (hooks is None or hooks.key_mod is None)
+            and value.shape[-1] <= key.shape[-1] and value.shape[-1] % group == 0
+            and jnp.dtype(key.dtype).itemsize == 2 and table is None and scales is None)
 
 
 def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
