@@ -1416,13 +1416,14 @@ def _stepped_alone(relower: Callable[[], jax.stages.Lowered], options: jax.stage
 
 
 def _held(found: list, program: jax.stages.Lowered) -> None:
-    """Each config `found` refuses (a compile's misses of `program`'s kernels, `_misses_of`'s form) stored as
-    its launch's certification verdict (`_verdict_key`, in the mode its kernels traced in), as `certified`
-    stores its own: the program's compile is the authority, its kernels the bodies that run, so its refusal
-    replaces an alone compile's acceptance, which no later process compiles again to write back (`certified`
-    reads a stored verdict first). A later process's derivation refuses the config at trace, no program
-    compiled and relowered to learn it again (LF-PROMO3: a warm start walked the 4B's whole step-down
-    again, 375 of its 577 s)."""
+    """Each config `found` refuses (a compile's misses of `program`'s kernels, `_misses_of`'s form: each
+    refusal its launch's identity and config, the launch the one its call ran, `called`) stored as that
+    launch's certification verdict (`_verdict_key`, in the mode it traced in), as `certified` stores its own,
+    whatever other config a kernel of one body shares its name with (`named`): the program's compile is the
+    authority, its kernels the bodies that run, so its refusal replaces an alone compile's acceptance, which
+    no later process compiles again to write back (`certified` reads a stored verdict first). A later
+    process's derivation refuses the config at trace, no program compiled and relowered to learn it again (LF-
+    PROMO3: a warm start walked the 4B's whole step-down again, 375 of its 577 s)."""
     from dew.nn.kernels import tuning
     from dew.nn.kernels.lowered import kernel_calls
 

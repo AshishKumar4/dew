@@ -1227,18 +1227,26 @@ def _two_roles(bound, derived, facts, *, packed: bool, training: bool) -> list:
 
 def _gate_call(name: str, dtype, given: list, starts, tiles, family, *, training: bool):
     """A gate case's call (`KernelCase`'s): `name`'s forward, or training step over the output's and final
-    memory's cotangents in `given`, at `tiles` on `family`, over packed documents where `starts` are given."""
+    memory's cotangents in `given`, at `tiles` on `family`, over packed documents where `starts` are given.
+    A training step runs as the template's call does (`Mosaic.launches`' backward): the forward keeping what
+    its backward takes (`chunk_forward.kept_forward`, its output launch the step's own) and the backward
+    taking it, each of its launches compiled as the step compiles it."""
     formed = {key: value for key, value in _form(name, dtype).items() if key != 'wide' or not training}
-    run = functools.partial(mainloop_backward.gradients if training else chunk_forward.forward, **formed,
-                            )
     skip = list(_skipped(name).values())
     packed = starts is not None
 
     def fn(*operands):
         *operands, documents = operands if packed else (*operands, None)
         *operands, fused = (*operands, None) if not skip else operands
-        return run(*operands, tiles=tiles, starts=documents, max_segments=8 if packed else None,
-                   family=family, skip=fused)
+        options = dict(tiles=tiles, starts=documents, max_segments=8 if packed else None, family=family,
+                       skip=fused, **formed)
+        if not training:
+            return chunk_forward.forward(*operands, **options)
+        *inputs, out_grad, final_grad = operands
+        out, final, (inverse, kept) = chunk_forward.kept_forward(*inputs, keeps=True, **options)
+        grads = mainloop_backward.gradients(*inputs, out_grad, final_grad, inverse=inverse, kept=kept,
+                                            **options)
+        return out, final, grads
 
     return fn, (*given, *skip, *([starts] if packed else []))
 
