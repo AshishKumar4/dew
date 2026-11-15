@@ -706,7 +706,15 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
             out, pullback = jax.vjp(launch, *operands)
             return out, pullback(jax.tree.map(_unit_cotangent, out))
 
-        lowered = owned_program(pulled_back if reverse else launch).trace(*specs).lower()
+        def certified(*operands):
+            return (pulled_back if reverse else launch)(*operands)
+
+        # Named by its launch and config in JAX's trace, lowering and compile events, so a start's receipt
+        # tells each certification's program apart: its op, its launch's identity and its config, digested.
+        certified.__name__ = certified.__qualname__ = (
+            f"certified_{type(op).__name__}_l{_digest(_identity(op, arguments))}_c{_digest(repr(config))}"
+            f"{'_reverse' if reverse else ''}")
+        lowered = owned_program(certified).trace(*specs).lower()
     # A Mosaic GPU kernel compiled alone is the one its program loads (Mosaic compiles a module once a
     # process). A Pallas-Triton kernel compiles again with each executable, the same kernel the same binary:
     # read here too, its call's config its identity, so its derivation steps a spilling config at trace as a

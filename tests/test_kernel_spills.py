@@ -4,6 +4,7 @@ refused and the program lowered afresh, the launch's derivation taking its next 
 run keeps, its plan, its step compiled ahead and the executable it runs, is the program it lowered
 then. A program with no template launch compiles as jit compiles it."""
 
+import collections
 import dataclasses
 import functools
 import gc
@@ -179,10 +180,17 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path):
     launch's producer down at trace, each rung compiled alone; and a later process reads the verdicts stored,
     compiling nothing to certify. Certification that dropped the outputs never compiled the output launch,
     and the program's compile stepped it down a whole-step relowering a rung, again in every process
-    (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm)."""
+    (LF-PROMO3: 8 lowerings of the 4B's step, cold and warm). Each certification's program is named by its
+    launch and config (`certified_<op>_l<launch>_c<config>`), so a start's events tell its rungs apart: the
+    cold process lowers each once, two configs of the output launch among them, and the warm one none."""
     cache = tmp_path / "cache"
-    counts = [fresh(RECURRENT_AHEAD, cache_dir=cache)["lowered"].count("jit(step)") for _ in range(2)]
-    assert counts == [1, 1], counts
+    cold, warm = (fresh(RECURRENT_AHEAD, cache_dir=cache)["lowered"] for _ in range(2))
+    assert [run.count("jit(step)") for run in (cold, warm)] == [1, 1], (cold, warm)
+    certified = [name for name in cold if name.startswith("jit(certified_")]
+    assert len(set(certified)) == len(certified), certified
+    configs = collections.Counter(name.rsplit("_c", 1)[0] for name in set(certified))
+    assert max(configs.values()) >= 2, certified
+    assert not [name for name in warm if name.startswith("jit(certified_")], warm
 
 
 HANDED = """
