@@ -167,6 +167,19 @@ def test_lm_packs_documents_into_rows_that_keep_every_target():
     finite(logged, "val/perplexity")
 
 
+def test_lm_lays_one_document_a_row_padded_where_its_segments_are_one():
+    """`segments=1` lays each document, or each piece of one longer than a row, in a row of its own, the
+    rest of the row padding (segment 0): a padded run's rows through the one preset; a pack that lays no
+    document whole is refused it."""
+    documents = [{"text": "dew trains jax models " * (1 + index % 4)} for index in range(16)]
+    batch = next(iter(Memory(documents).pipe(presets.lm, "byte", seq_len=32, batch=8, segments=1)))
+    segments = np.asarray(batch["text_coordinates"].segments)
+    assert segments.max() == 1 and (segments == 0).any()
+    assert all(set(row[row > 0]) == {1} for row in segments)
+    with pytest.raises(ValueError):
+        Memory(documents).pipe(presets.lm, "byte", seq_len=32, batch=8, pack=None, segments=1)
+
+
 @pytest.mark.parametrize("read", ["memory", "streamed"])
 def test_a_run_logs_its_corpus_counts_under_its_name_and_in_one_unit(tmp_path, read):
     """The landing page's run: passages of tiny Shakespeare, some held out, packed into rows. Its
