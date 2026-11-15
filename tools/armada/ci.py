@@ -523,8 +523,8 @@ def pinned_classes() -> list[str]:
             ([cpu] if isinstance(cpu, dict) else cpu or [])]
 
 
-def reusable(python: str, rows: list[tuple[str, str]], common: str, missed: dict[str, int],
-             last_inputs: dict[tuple[str, str], list[str]] | None = None) -> dict[tuple[str, str], str]:
+def reusable(python: str, rows: list[tuple[str, str]], common: str,
+             missed: dict[str, int]) -> dict[tuple[str, str], str]:
     """The rows of `rows` (each a file and its group, "" for the whole file) that ran green on exactly these
     inputs (`common`, and each file's own, `fresh`) on any class the tasks run on (`pinned_classes`), which a
     task of theirs could land on, read at plan time with the cache's read token (`READ_TOKEN`): a task of
@@ -547,8 +547,7 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str, missed: dict
         name, group = each_row
         for each in held:
             found = green_record(python, name, group, common, token, [each], reading,
-                                 misses.setdefault(each_row, []),
-                                 None if last_inputs is None else last_inputs.setdefault(each_row, []))
+                                 misses.setdefault(each_row, []))
             # Kept only where its green run is kept by its key, as the task reads it.
             if found is not None and recorded(
                     green_key(python, row(python, name, group), each, found[0]["key"]), token) is not None:
@@ -639,8 +638,7 @@ def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[st
 
 
 def green_record(python: str, name: str, split: str, common: str, token: str, classes: list[str],
-                 reading: Reading | None, why: list[str],
-                 inputs: list | None = None) -> tuple[dict, str] | None:
+                 reading: Reading | None, why: list[str]) -> tuple[dict, str] | None:
     """The record of test file `name`'s row (in `split`'s group) that ran green on exactly these inputs on one
     of `classes`, the first found, with its class; else None. The plan (`reusable`) and a task (`reused`) read
     it alike, from one reading of the inputs (`Reading`). A row's key hashes the inputs its run executed, so
@@ -667,8 +665,6 @@ def green_record(python: str, name: str, split: str, common: str, token: str, cl
         # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of exactly
         # these, kept by that key (`green_key`) whatever ran since; why it was not, the class's word.
         recorded_set = None if found is None else found["depends"]
-        if inputs is not None and not inputs and found is not None and (found.get("read") or recorded_set):
-            inputs.extend(found.get("read") or recorded_set)
         key = None if recorded_set is None else cache_key(common, name, split, recorded_set, reading)
         why.append(records.missed(found, key, current))
         if key is not None:
@@ -1191,10 +1187,9 @@ def plan(target: float, timings: dict, census: bool = False, reach: dict | None 
             (name, group) for name, cut in groups.items() for group, _ in cut] + [
             (name, test) for name, held in marked.items() for test in held]
         missed: dict[str, int] = {}
-        last: dict[tuple[str, str], list[str]] = {}
-        found = reusable(python, rows_of, shared(python), missed, last) if cache != "off" else {}
-        if reach is not None:  # reach.py's: the rows, those kept (None off "on"), their last inputs
-            reach[python] = (rows_of, found if cache == "on" else None, last)
+        found = reusable(python, rows_of, shared(python), missed) if cache != "off" else {}
+        if reach is not None:  # reach.py's: the rows and those kept (None off "on")
+            reach[python] = (rows_of, found if cache == "on" else None)
         print(f"plan: {python}: kept {len(found)} of {len(rows_of)}; not kept: {missed}", file=sys.stderr)
         # A lookup a row, in seconds: a kept task's weight is its container's start and those lookups.
         tasks: list[tuple[list[tuple[str, str]], float]] = [
