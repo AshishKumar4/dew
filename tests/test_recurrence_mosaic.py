@@ -1733,7 +1733,8 @@ def _named_bodies(bound, configs, target: str, *, training: bool) -> list[dict[s
     """Each of `configs`' Mosaic GPU kernels lowered as certification lowers them (`Mosaic.lowering`, which
     names each kernel, `report.named`; a training call's pullback of a unit cotangent where `training`, its
     forward alone where not), with the Pallas lowering cache off, so each is lowered afresh: a config's
-    kernels' bodies (their kernel hashes) by their names."""
+    kernels' bodies (their kernel hashes) by their names (`report.kernel_modules`, which refuses two bodies
+    of one name within a program)."""
     from jax._src import config as jax_config
     from kernel_compile import lowered_for
 
@@ -1749,8 +1750,7 @@ def _named_bodies(bound, configs, target: str, *, training: bool) -> list[dict[s
                 return pullback(jax.tree.map(lambda leaf: jnp.ones(leaf.shape, leaf.dtype), out))
 
             lowered = lowered_for(pulled if training else traced, tuple(shapes), target)
-            found.append({report.launch_name(call.name, call.launch): call.config
-                          for call in kernel_calls(lowered, unrun=True) if call.kind == 'mosaic_gpu'})
+            found.append(report.kernel_modules(kernel_calls(lowered, unrun=True)))
     return found
 
 
