@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.batch import unboxed
-from dew.interop.config_records import hf_metadata
+from dew.interop.config_records import HF_METADATA
 from dew.interop.unread import Stored
 from dew.interop.weights import Tree, check_shapes, native_shape, placed
 from dew.nn.audio import Gemma3nAudio, Gemma4Audio
@@ -36,7 +36,7 @@ def audio_config(record: Mapping[str, object]) -> Gemma3nAudio | Gemma4Audio:
     else:
         raise ValueError(f"audio model_type {model_type!r} is not supported")
     fields = {field.name for field in dataclasses.fields(cls)}
-    unknown = (set(record) - fields - hf_metadata() - other
+    unknown = (set(record) - fields - HF_METADATA - other
                - {key for key in record if key.startswith("_")})
     if unknown:
         raise ValueError(f"audio config fields {sorted(unknown)} have no counterpart")

@@ -688,6 +688,44 @@ def test_an_adapter_served_quantized_adds_its_float_update_to_its_quantized_base
     np.testing.assert_array_equal(served.apply(served_tree, x), base.apply(base_tree, x) + update)
 
 
+def test_a_lora_run_served_quantized_decodes_with_its_trained_factors(decoder, loaded, reference, tmp_path):
+    """A LoRA run's decoder loaded as its task (`TextGeneration.from_run`) and quantized for serving
+    (`TextGeneration.quantized`, Qwix's PTQ over its adapted projections) decodes, its factors held as they
+    trained, in float, beside its quantized base, where the adapter's products fed Qwix's PTQ factors no
+    quantized tree held and the decode raised."""
+    from dew.inference import TextGeneration
+    from dew.quantization import Quantization
+
+    adapter = _rebound(loaded, decoder.model, dropout=0.0)
+    tokens = np.asarray(reference["input_ids"])
+    rows = 2 * jax.device_count()
+    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
+    data = Loader(train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}]), val=None,
+                  records=rows, batch=rows)
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
+                      layout=Layout(min_shard=2**30), checkpoints=checkpoints)
+    trainer.fit(data, steps=1, log_every=1, checkpoint_every=1)
+    checkpoints.wait()
+
+    task = TextGeneration.from_run(str(tmp_path / "run"), ema=False)
+    served = task.quantized(Quantization())
+    drawn = np.asarray(served(tokens[:1, :4], 4, key=0).tokens)
+    # Each row its prompt, then four drawn tokens.
+    assert drawn.shape[-1] == 8
+    np.testing.assert_array_equal(drawn[:, :4], np.broadcast_to(tokens[:1, :4], (drawn.shape[0], 4)))
+    def factors_of(tree) -> dict:
+        # Each factor by its path, among a served tree's quantized leaves (Qwix's, which are no dicts).
+        return {path: leaf for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]
+                if getattr(path[-1], "key", None) in lora.FACTORS}
+
+    factors, kept = factors_of(thaw(task.variables)), factors_of(thaw(served.variables))
+    assert factors
+    for name, leaf in factors.items():
+        assert np.asarray(kept[name]).dtype == np.asarray(leaf).dtype, name
+        np.testing.assert_array_equal(np.asarray(kept[name]), np.asarray(leaf), err_msg=str(name))
+
+
 CLIPPED_SEEDS = 64
 """The clipped adapter site's reference-only sizing, including its input and factor gradients."""
 

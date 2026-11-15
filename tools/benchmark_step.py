@@ -64,7 +64,6 @@ import json
 import os
 import queue
 import signal
-import statistics
 import subprocess
 import sys
 import threading
@@ -486,80 +485,14 @@ class DeviceSampler:
                 for index, rows in gpus.items()}
 
 
-STALL = 1.5
-"""A window part stalled: it took this many times its parts' median a step or more (perf_gate's `stalled`)."""
-STACK_EVERY = 0.01
-"""The seconds between two samples of every thread's stack while a window runs (`StackSampler`)."""
-STACK_DEPTH = 12
-"""The innermost frames a stack sample keeps."""
-
-
-class StackSampler:
-    """Every thread's stack but its own, sampled each `STACK_EVERY` seconds while it runs, each sample its
-    `time.perf_counter()`, its thread's name and its innermost `STACK_DEPTH` frames (file, line, function):
-    what the host was doing when a window part stalled (`stalled_stacks`). Python's frames alone: a thread
-    inside native code shows the Python call that entered it."""
-
-    def __init__(self) -> None:
-        self.samples: list[tuple[float, str, tuple[str, ...]]] = []
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._sampled, name="stack-sampler", daemon=True)
-
-    def _sampled(self) -> None:
-        names = {}
-        while not self._stop.wait(STACK_EVERY):
-            now = time.perf_counter()
-            names = {thread.ident: thread.name for thread in threading.enumerate()} | names
-            for ident, frame in sys._current_frames().items():
-                if ident == threading.get_ident():
-                    continue
-                frames = []
-                while frame is not None and len(frames) < STACK_DEPTH:
-                    code = frame.f_code
-                    frames.append(f"{Path(code.co_filename).name}:{frame.f_lineno}:{code.co_name}")
-                    frame = frame.f_back
-                self.samples.append((now, names.get(ident, str(ident)), tuple(frames)))
-
-    def __enter__(self) -> "StackSampler":
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self._stop.set()
-        self._thread.join()
-
-
-def stalled_stacks(parts, started: float, samples: list[tuple[float, str, tuple[str, ...]]]) -> list[dict]:
-    """Each part of a window (`timed_parts`' parts, its first dispatched at `started`) that took `STALL` times
-    its parts' median a step or more, with what every thread was doing while it ran (`StackSampler`'s
-    `samples` within it): each distinct stack once, by thread, the most sampled first, its count. A
-    diagnostic beside the step's time, which stays the window's whole elapsed time."""
-    per_step = [seconds / size for size, seconds, _ in parts]
-    middle = statistics.median(per_step) if per_step else 0.0
-    found, begun = [], started
-    for index, (_, seconds, _) in enumerate(parts):
-        if per_step[index] >= STALL * middle > 0:
-            counted: dict[tuple[str, tuple[str, ...]], int] = {}
-            for at, thread, frames in samples:
-                if begun <= at < begun + seconds:
-                    counted[(thread, frames)] = counted.get((thread, frames), 0) + 1
-            stacks = sorted(counted.items(), key=lambda item: -item[1])
-            found.append({"part": index, "ms": round(per_step[index] * 1e3, 3),
-                          "samples": sum(counted.values()),
-                          "stacks": [{"thread": thread, "count": count, "frames": list(frames)}
-                                     for (thread, frames), count in stacks[:8]]})
-        begun += seconds
-    return found
-
-
 def timed_parts(step, state, parts: list[int]):
     """`sum(parts)` steps dispatched back to back from `state`, each part's last loss handed as it is
     dispatched to a thread that awaits each in turn and stamps the seconds since the first dispatch as it
     becomes ready: no wait inside the window, and a part's stamp its readiness whether the host's dispatch or
     the device is the slower (a host-bound step's parts all ready before a wait after the whole dispatch
-    could read them). Returns the last state, loss and finiteness, each part's (steps, seconds, the host's
-    seconds dispatching it): a part slow in both was the host's, one slow only to be ready the device's, and
-    the `time.perf_counter()` its first step was dispatched at."""
+    could read them). Returns the last state, loss and finiteness, and each part's (steps, seconds, the
+    host's seconds dispatching it): a part slow in both was the host's, one slow only to be ready the
+    device's."""
     ready: queue.Queue = queue.Queue()
     ends: list[float] = []
 
@@ -584,7 +517,7 @@ def timed_parts(step, state, parts: list[int]):
     jax.block_until_ready(carry)
     begins, sent = [0.0, *ends[:-1]], [0.0, *dispatched[:-1]]
     return (*carry, [(size, end - begun, out - went) for size, end, begun, out, went
-                     in zip(parts, ends, begins, dispatched, sent, strict=True)], started)
+                     in zip(parts, ends, begins, dispatched, sent, strict=True)])
 
 
 def tuning_digest() -> dict[str, object] | None:
@@ -613,32 +546,27 @@ def timed_window(step, state, config: BenchmarkConfig):
     starts (the device or its allocator warming) shows as a series that falls, where one running another
     program stays slow throughout. The GPUs sampled from before the warm step, so nvidia-smi's start
     (NVML's, up to half a second) is behind it, and summarized over the window alone (`DeviceSampler`).
-    Every thread's stack is sampled while the window runs (`StackSampler`), and those within a stalled part
-    kept (`stalled_stacks`). Returns the last state, loss and finiteness, each part's (steps, seconds,
-    dispatch seconds), the GPUs' summary and the stalled parts' stacks."""
+    Returns the last state, loss and finiteness, each part's (steps, seconds, dispatch seconds) and the
+    GPUs' summary."""
     with DeviceSampler() as sampler:
         state, _, _, _ = timed_steps(step, state, max(config.warmup, 1))
         began = datetime.datetime.now()
-        with StackSampler() as stacks:
-            state, loss, is_finite, parts, started = timed_parts(step, state, window_parts(config.steps))
+        state, loss, is_finite, parts = timed_parts(step, state, window_parts(config.steps))
         ended = datetime.datetime.now()
-    return state, loss, is_finite, parts, (sampler.summary((began, ended)),
-                                           stalled_stacks(parts, started, stacks.samples))
+    return state, loss, is_finite, parts, sampler.summary((began, ended))
 
 
-def window_record(parts, synced: list[float], device, hits: float, stacks: list[dict] | None = None) -> dict:
+def window_record(parts, synced: list[float], device, hits: float) -> dict:
     """A row's diagnostics of its timed window, beside its step's time (the window's whole elapsed time):
     each part's ms a step in order and its host dispatch's (a part slow in both was the host's, one slow
     only to be ready the device's), every synced step's ms in order (2026-11-14: a perf gate round's first
     arm read 40% slow on the very tree its others read), the GPUs under the window's load (`DeviceSampler`),
     JAX's persistent-cache hits while the step was compiled (its state's and other programs' among them),
-    the XLA autotuning results' directory as it stood at the row (`tuning_digest`), and each stalled part's
-    threads' stacks (`stalled_stacks`): what the host was doing while it stalled."""
+    and the XLA autotuning results' directory as it stood at the row (`tuning_digest`)."""
     return {"window_ms_series": [round(seconds / size * 1e3, 3) for size, seconds, _ in parts],
             "window_dispatch_ms_series": [round(sent / size * 1e3, 3) for size, _, sent in parts],
             "synced_ms_series": [round(seconds * 1e3, 3) for seconds in synced],
-            "device_window": device, "compile_cache_hits": hits, "tuning": tuning_digest(),
-            "stalled_stacks": stacks or []}
+            "device_window": device, "compile_cache_hits": hits, "tuning": tuning_digest()}
 
 
 def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None) -> Row:
@@ -657,7 +585,7 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
     with compiled_step(case, trainer, fixed_batch=config.fixed_batch) as compiled:
         state, step, compile_seconds = compiled.state, compiled.step, compiled.compile_seconds
         hits = compilation_cache_counts().get("train/cache_hits", 0.0) - hits
-        state, loss, is_finite, parts, (device, stacks) = timed_window(step, state, config)
+        state, loss, is_finite, parts, device = timed_window(step, state, config)
         elapsed = sum(seconds for _, seconds, _ in parts)
 
         # A second window of the same length, waiting on every step, for the
@@ -723,7 +651,7 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
             # or a stronger one where the step did not fit.
             "remat": recompute_record(trainer.objective),
             "ms_per_step": round(step_time * 1e3, 3),
-            **window_record(parts, synced, device, hits, stacks),
+            **window_record(parts, synced, device, hits),
             "p10_ms": round(float(p10), 3),
             "p50_ms": round(float(p50), 3),
             "p90_ms": round(float(p90), 3),

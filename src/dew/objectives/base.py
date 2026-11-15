@@ -932,7 +932,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         "_drawn_shapes": "its draw's shapes, a memo `init` writes: a function of the modules and the held "
                          "tree the key holds",
         "_program_cache": "the programs `program` made by name, a memo its first call writes: each traces "
-                          "the modules and settings the key holds"}
+                          "the modules and settings the key holds",
+        "processor": "the processor its data, previews and saved task read (`pipeline`), which no program "
+                     "its loss, draw or optimizer traces reads"}
     """The attributes its trace key leaves out (`trace_key`), by name, each with why: what in the key
     carries it, or why no program its loss, draw or optimizer traces reads it. A class's own, beside its
     bases'; an attribute no class names here enters the key."""
@@ -1132,7 +1134,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         setting no class names costs a trace where it differs, never another's program. None where a value
         states none (an array, a closure, an object compared by identity, an objective stating none). A
         key reads the objective as it is now, its modules and head as a fit's rung set them."""
-        left = {name for klass in type(self).__mro__ for name in vars(klass).get("untraced", {})}
+        left = set(type(self)._untraced())
         cached = {name for klass in type(self).__mro__ for name, member in vars(klass).items()
                   if isinstance(member, functools.cached_property)} - left
         run = {id(entry.module) for entry in self.program_key()}
@@ -1147,6 +1149,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         own = self.traced_by({name: value for name, value in state.items() if name not in held})
         return None if own is None else (own, tuple(sorted(held.items())))
 
+    @classmethod
+    def _untraced(cls) -> dict[str, str]:
+        """What its trace key leaves out, by name, each with its reason: its own class's and its bases'
+        (`untraced`)."""
+        return {name: why for klass in reversed(cls.__mro__)
+                for name, why in vars(klass).get("untraced", {}).items()}
+
     def _classes(self, name: str, value: TracedSetting) -> bool:
         """Whether `value`, held as `name`, is the value its class states of it (a fit's ladder setting the
         class's default on the objective), which the key holds by its class (`traced_by`'s modules and the
@@ -1158,7 +1167,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         held = frozen_value(value)
         return held is not UNKEYED and held == frozen_value(stated)
 
-    def traced_by(self, *settings: TracedSetting) -> Hashable | None:
+    def traced_by(self, settings: TracedSetting) -> Hashable | None:
         """A trace key (`trace_key`) of the objective's `settings` (`frozen_value`) beside what every
         objective's trace reads: the modules its programs execute as they stand (`program_key`: after a
         rung's substitute, at its head's policy), its held tree's shapes (`held_shapes`), whose arrays pass
@@ -2100,10 +2109,12 @@ def held_shapes(tree) -> Hashable:
 
 
 def stated_trace[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> Hashable | None:
-    """`objective.trace_key()` where Dew defines its class, else None: a class of a user's or another
-    library's may read in its loss what none of its attributes holds (a module's global, a closure's
-    cell), which no key states."""
-    return objective.trace_key() if type(objective).__module__.partition(".")[0] == "dew" else None
+    """`objective.trace_key()` where Dew defines its class, or where its class states its own (a user's
+    override of `Objective.trace_key`, which states what its loss reads); else None: a class of a user's or
+    another library's may read in its loss what none of its attributes holds (a module's global, a
+    closure's cell), which the default key cannot state."""
+    dews = type(objective).__module__.partition(".")[0] == "dew"
+    return objective.trace_key() if dews or type(objective).trace_key is not Objective.trace_key else None
 
 
 _ABSENT = object()
@@ -2122,9 +2133,10 @@ UNKEYED = _Unkeyed()
 
 type TracedSetting = (Hashable | Mapping[str, TracedSetting] | Sequence[TracedSetting] | DataclassInstance
                       | None)
-"""A setting an objective's trace reads (`Objective.traced`): a hashable value (a number, a string, a Flax
-module, a frozen dataclass), a mapping or sequence of such, or a dataclass of them, which `frozen_value`
-reads as a value, or refuses as none where any part is a function or an object compared by identity."""
+"""A setting an objective holds, as its trace key states it (`Objective.trace_key`): a hashable value (a
+number, a string, a Flax module, a frozen dataclass), a mapping or sequence of such, or a dataclass of them,
+which `frozen_value` reads as a value, or refuses as none where any part is a function or an object
+compared by identity."""
 
 
 def frozen_value(value: TracedSetting) -> Hashable:

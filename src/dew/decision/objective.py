@@ -335,7 +335,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     untraced: ClassVar[Mapping[str, str]] = {
         "tokenizer": "it reaches a trace only as the windows its rows pack (`bounds`, of the cached "
-                     "`_shared_bounds`, which the key reads)"}
+                     "`_shared_bounds`, which the key reads)",
+        "image_processor": "the processor its source's images are read by, which its data and saved task "
+                           "read (`data`, `pipeline`) and no program its loss, draw or optimizer traces"}
 
     def __init__(self, backbone: nn.Module | Source | Adapter | Decide, *,
                  loss: ScoringRule | None = None, tokenizer: Tokenizer | None = None,

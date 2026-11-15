@@ -26,7 +26,7 @@ from dew import _records
 from dew._model_types import SANDWICH_NORMS
 from dew.batch import unboxed
 from dew.interop.codecs import CODEC_FIELDS
-from dew.interop.config_records import NativeFields, hf_metadata, native_fields
+from dew.interop.config_records import HF_METADATA, NativeFields, native_fields
 from dew.interop.layouts import (
     Condition,
     Config,
@@ -239,7 +239,7 @@ def _unread(hf_config: Mapping[str, object], used: set[str]) -> set[str]:
     model_type = hf_config.get('model_type')
     inert = _INERT_FIELDS[None] | _INERT_FIELDS.get(model_type if isinstance(model_type, str) else None,
                                                     frozenset())
-    return (set(hf_config) - used - hf_metadata() - IGNORED_FIELDS - CODEC_FIELDS - inert
+    return (set(hf_config) - used - HF_METADATA - IGNORED_FIELDS - CODEC_FIELDS - inert
             - {key for key in hf_config if str(key).startswith('_')})
 
 

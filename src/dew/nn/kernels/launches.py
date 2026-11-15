@@ -14,14 +14,27 @@ from dew.nn.sharding import per_shard
 
 def pallas_call(kernel: Callable, *, name: str, **params) -> Callable:
     """`jax.experimental.pallas.pallas_call(kernel, name=name, **params)` held per shard (`_held`), named by
-    its `name`, which its profile names it by."""
-    return _held(pl.pallas_call(kernel, name=name, **params), name)
+    its `name`, which its profile names it by, its body traced as a launch's (`_traced`)."""
+    return _held(pl.pallas_call(_traced(kernel, params.get("interpret")), name=name, **params), name)
 
 
 def kernel(entry: Callable, *, name: str, **params) -> Callable:
     """`jax.experimental.pallas.mosaic_gpu.kernel(entry, **params)` held per shard (`_held`), named by
-    `name`."""
-    return _held(plgpu.kernel(entry, **params), name)
+    `name`, its body traced as a launch's (`_traced`)."""
+    return _held(plgpu.kernel(_traced(entry, params.get("interpret")), **params), name)
+
+
+def _traced(body: Callable, interpret) -> Callable:
+    """`body`, tracing within its launch, run in Pallas's interpreter where `interpret` is given
+    (`bodies.launched`): what its arithmetic reads of the launch (`bodies.subnormals`)."""
+    from dew.nn.kernels.templates import bodies  # a template module, which these launches carry
+
+    @functools.wraps(body)
+    def traced(*refs, **options):
+        with bodies.launched(bool(interpret)):
+            return body(*refs, **options)
+
+    return traced
 
 
 def _held(launch: Callable, name: str) -> Callable:

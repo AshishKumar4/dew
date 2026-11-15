@@ -372,10 +372,10 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             None if draw is None else functools.partial(draw, q_pos), hooked=score_mod is not None,
             score_kinds=score_kinds, summed=summed, prescale=prescale, grad_scale=grad_scale, how=how,
             accurate=accurate, dot=interpreted_dot, most=keys // block_k)
-        dq, delta, denominator, mass, grads = gradient.dq_finish(found, prior, state_total, peak0,
-                                                                (total0, mean0), m, anchor, delta,
-                                                                accurate=accurate)
-        return dq, (delta, anchor, m, denominator, mass), chosen, _written(grads, score_kinds)
+        dq, delta, lost, denominator, mass, grads = gradient.dq_finish(found, prior, state_total, peak0,
+                                                                      (total0, mean0), m, anchor, delta,
+                                                                      accurate=accurate)
+        return dq, (delta, anchor, m, denominator, mass, lost), chosen, _written(grads, score_kinds)
 
     dq, rows_out, chosen, written = jax.lax.map(program, jnp.arange(blocks * batch * heads))
     return _dq_outputs(dq, rows_out, chosen, written, score_kinds, blocks, batch, heads, queries)
@@ -600,12 +600,13 @@ def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_ind
                                    spans, score_mod=score_mod, scale=scale, prescale=prescale,
                                    grad_scale=scale * prescale, how=how, block_q=block_q, block_k=block_k)
         mass = gradient.split_mass(own, others_total, forward_total, shift)
-        return (dq, delta, anchor, maximum, forward_total, mass, chosen, dk, dv)
+        # The forward's D, no refinement of it, so nothing a rounding lost (`gradient.dq_finish`).
+        return (dq, delta, anchor, maximum, forward_total, mass, jnp.zeros_like(mass), chosen, dk, dv)
     # The dQ launch reads its queries for their logits alone.
     dq, softmax, chosen, dq_grads = _dq_launch(by_power(query, prescale), key, value, dout, peak, total,
                                                initial_term, maximum, key_index, anchor_value, shift, sums,
                                                spans, score_params, split=split, **shared)
-    delta, anchor, m, denominator, _ = softmax
+    delta, anchor, m, denominator, _, _ = softmax
     dk, dv, key_grads = _dkv_launch(query, key, value, dout, m, denominator, anchor, delta, chosen, spans,
                                     score_params, **shared)
     return (dq, *softmax, chosen, *dq_grads, dk, dv, *key_grads)
