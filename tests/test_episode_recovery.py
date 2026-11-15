@@ -23,6 +23,7 @@ from episode_support import (
     collect,
     environment,
 )
+from process_support import device_flags
 from tool_policy import CALL_THREE, EOS, GROUPS, NINE, START
 
 from dew.objectives.rl import EpisodeJournal, RecoverableEnvironment, Transcript, session_of
@@ -115,7 +116,7 @@ def test_a_journaled_episode_keeps_the_messages_its_environment_said(tmp_path):
 
 def launch(directory, mode):
     env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": f"{ROOT / 'src'}:{ROOT / 'tests'}",
-           "XLA_FLAGS": "--xla_force_host_platform_device_count=2", "OMP_NUM_THREADS": "1"}
+           "XLA_FLAGS": device_flags(2), "OMP_NUM_THREADS": "1"}
     return subprocess.Popen([sys.executable, str(WORKER), str(directory), mode],
                             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 

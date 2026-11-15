@@ -16,6 +16,7 @@ from pathlib import Path
 
 import jax
 import pytest
+from process_support import device_flags
 
 from dew import communicators
 from dew._cache import package_digest
@@ -362,7 +363,7 @@ def test_a_cpu_program_takes_none_of_the_gpus_room():
     devices, admitted against nothing."""
     done = subprocess.run([sys.executable, "-c", ADMITTED], capture_output=True, text=True, check=True,
                           env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE),
-                               "XLA_FLAGS": "--xla_force_host_platform_device_count=2"})
+                               "XLA_FLAGS": device_flags(2)})
     assert done.stdout.strip().splitlines()[-1] == "compiled"
 
 

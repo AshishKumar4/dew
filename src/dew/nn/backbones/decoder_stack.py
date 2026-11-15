@@ -26,7 +26,7 @@ from flax import linen as nn
 from flax.core import meta
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.ad_checkpoint import checkpoint_name
-from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import PartitionSpec as P
 
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Variables, merge, part
@@ -1377,14 +1377,13 @@ class DecoderBank:
 
 def _on_stage_axis(leaf):
     """`leaf`, its leading dimension placed on the stage axis of the mesh in context."""
-    return constrained(leaf, _stage_sharding(leaf.ndim).spec)
+    return constrained(leaf, _stage_spec(leaf.ndim))
 
 
-def _stage_sharding(ndim: int) -> NamedSharding:
+def _stage_spec(ndim: int) -> P:
     """The leading dimension on the stage axis; the rest as the layout and the
     batch's placement propagate them."""
-    return NamedSharding(jax.sharding.get_abstract_mesh(),
-                         P(STAGE_AXIS, *([P.UNCONSTRAINED] * (ndim - 1))))
+    return P(STAGE_AXIS, *([P.UNCONSTRAINED] * (ndim - 1)))
 
 
 def _whole(value, axis: int):

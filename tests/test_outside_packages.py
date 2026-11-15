@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from process_support import device_flags
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -219,7 +221,7 @@ def test_a_packages_own_run_artifact_metric_and_axis_train_from_its_record_in_a_
     and refuses it until then."""
 
     _install(tmp_path, "toypackage", PACKAGE_RUN)
-    devices = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
+    devices = {**os.environ, "XLA_FLAGS": device_flags(2)}
     path = os.pathsep.join([str(ROOT / "src"), str(tmp_path)])
 
     def run(*argv):

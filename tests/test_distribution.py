@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from lane_environment import outside_any_cluster
-from process_support import raised
+from process_support import device_flags, raised
 from reference_error import as_given, assert_as_exact
 
 from dew.distributed.placement import parameter_axes
@@ -79,7 +79,7 @@ def start(*arguments: str, devices: int) -> subprocess.Popen:
         placement = ["--devices-per-process", str(devices)]
     else:
         env["JAX_PLATFORMS"] = "cpu"
-        placement = ["--env", f"XLA_FLAGS=--xla_force_host_platform_device_count={devices}"]
+        placement = ["--env", f"XLA_FLAGS={device_flags(devices)}"]
     return subprocess.Popen(
         [sys.executable, "-m", "dew._cli.main", "launch", *placement, *arguments],
         cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

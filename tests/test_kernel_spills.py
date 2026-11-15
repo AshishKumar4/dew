@@ -90,12 +90,12 @@ def spilled(tmp_path, script: str, *arguments: str) -> dict:
 
 
 AHEAD = """
-import json, sys
+import dataclasses, json, sys
 from test_kernel_spills import BATCH, experts
 from dew.nn.kernels.templates import report
 from dew.training import MeshSpec
 from dew.nn.kernels.generation import compile_only_gpus
-from dew.training.ahead import compile_ahead
+from dew.training.ahead import AheadOfTime, compile_ahead
 
 nonce, refused = float(sys.argv[1]), sys.argv[3] == "refused"
 with report.refusals():
@@ -104,7 +104,12 @@ with report.refusals():
     # An H100's 80 GiB, which a step is compiled ahead against (`compile_only_gpus`' memory).
     ahead = compile_ahead(experts(MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30)), nonce), BATCH)
     ahead.save(sys.argv[2] + (".again" if refused else ""))
-    print(json.dumps({"program": ahead.program, "refusals": len(ahead.refusals),
+    # The saved plan read back beside every field of each miss the compile made, its config by its text.
+    misses = [{**{field.name: getattr(miss, field.name) for field in dataclasses.fields(miss)},
+               "config": repr(miss.config)} for miss in report.misses()]
+    read = AheadOfTime.load(sys.argv[2] + (".again" if refused else "")).plan["spills"]
+    print(json.dumps({"program": ahead.program, "refusals": len(ahead.refusals), "misses": misses,
+                      "read": read,
                       "stepped": [miss.stepped for miss in report.misses()],
                       "missed": [repr(miss.config) for miss in report.misses()],
                       "planned": {name: ahead.plan[name] for name in ("spills", "refused")}}))
@@ -120,12 +125,16 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_pat
     (`report.misses`) and its plan holding the spill and the refusal, as its telemetry reports them; the
     step it saves
     carries the refusal (`AheadOfTime.refusals`), and another process that starts from it derives past the
-    refused tile, which it never compiles, its plan recording its own refusals alone (train 329's review)."""
+    refused tile, which it never compiles, its plan recording its own refusals alone (train 329's review).
+    The saved plan read back holds every field of each miss (row 6518: a serialization-only refusal's codes
+    were dropped)."""
     step = str(tmp_path / "step.dew-aot")
     first = spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh")
     assert first["refusals"] and first["stepped"][:1] == [True]
     spills, refused = first["planned"]["spills"], first["planned"]["refused"]
     assert [spill["config"] for spill in spills] == first["missed"] and spills[0]["stepped"]
+    # The saved plan, read back, holds every field of each miss the compile made (row 6518).
+    assert first["read"] == first["misses"]
     assert len(refused) == first["refusals"] and refused[0]["config"] == first["missed"][0]
     again = spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "refused")
     # Its plan records the refusals its own compiles made, not those it was seeded with.

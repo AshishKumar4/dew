@@ -24,6 +24,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from process_support import device_flags
 from reference_runs import assert_arms_as_recorded
 from tool_support import REPO_ROOT, load
 
@@ -331,7 +332,7 @@ seconds, _, samples, record = runner.train(args, trainer, state, compiled, batch
 assert seconds > 0 and len(samples) == 1 and record["finite_losses"]
 """
     env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "JAX_PLATFORMS": "cpu",
-           "XLA_FLAGS": "--xla_force_host_platform_device_count=1"}
+           "XLA_FLAGS": device_flags(1)}
     done = subprocess.run([sys.executable, "-c", script, str(REPO_ROOT), str(tmp_path / "work.json")],
                           env=env, capture_output=True, text=True, timeout=600)
     assert done.returncode == 0, done.stderr[-3000:]
