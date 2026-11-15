@@ -811,14 +811,15 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
     from dew.nn.kernels.options import owned_program
     from dew.nn.programs import meshless
 
-    placed, manual = _certifying_placement(device)
+    mesh, manual = _certifying_placement(device)
+    placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
     # A program of its own on one device (`meshless`): none of the enclosing trace's mesh nor its axes, its
     # operands' too, but the mesh its program runs on where that is one device's (`_certifying_placement`),
     # within a map holding the axes manual its program's call holds manual (`sharding.manual_map`'s).
-    with meshless(placed.mesh):
+    with meshless(mesh):
         launch, shapes = op.lowering(arguments, config)
         if manual:
-            launch = jax.shard_map(launch, mesh=placed.mesh, in_specs=jax.sharding.PartitionSpec(),
+            launch = jax.shard_map(launch, mesh=mesh, in_specs=jax.sharding.PartitionSpec(),
                                    out_specs=jax.sharding.PartitionSpec(), axis_names=manual, check_vma=False)
         specs = [jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=placed) for shape in shapes]
 
@@ -853,9 +854,9 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
             if (name := launch_name(binary.kernel, binary.launch)) in modules}
 
 
-def _certifying_placement(device) -> tuple[jax.sharding.NamedSharding, frozenset]:
-    """Where certification places a launch's operands on `device` (`_compiled_launch`), on the mesh its
-    program is set on (`placement.mesh`), and the axes its launch holds manual: its program's where that runs
+def _certifying_placement(device) -> tuple[jax.sharding.Mesh, frozenset]:
+    """The mesh certification places a launch's operands on `device` on and sets its program on
+    (`_compiled_launch`), and the axes its launch holds manual: its program's where that runs
     on `device` alone (the concrete mesh, `jax.set_mesh`'s, its axes manual where the call is in a map
     holding them, `sharding.manual_map`'s), so the launch lowers to the jaxpr and the mesh its program's call
     does (the GPU it states and each jit's recorded mesh among them) and the program reads its kernels'
@@ -863,12 +864,11 @@ def _certifying_placement(device) -> tuple[jax.sharding.NamedSharding, frozenset
     no mesh or a launch of many devices' (row 6327): its own compile cannot hold the program's devices, so
     its program lowers its kernels again."""
     from jax._src import mesh as mesh_lib
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
     placed = mesh_lib.get_concrete_mesh()
     if not placed.empty and list(placed.devices.flat) == [device]:
-        return NamedSharding(placed, PartitionSpec()), frozenset(jax.sharding.get_abstract_mesh().manual_axes)
-    return NamedSharding(Mesh([device], ("launch",)), PartitionSpec()), frozenset()
+        return placed, frozenset(jax.sharding.get_abstract_mesh().manual_axes)
+    return jax.sharding.Mesh([device], ("launch",)), frozenset()
 
 
 def _unit_cotangent(out: jax.Array) -> jax.Array | np.ndarray:
