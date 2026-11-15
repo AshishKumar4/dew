@@ -1957,8 +1957,7 @@ def rewrites(family: mosaic.Family, k_major: bool, tables: tuple, unstaged: bool
     a role beside its consumers): its loads' rows, never rows its tables gather, a k-major launch's whole
     steps of one group, nor a stage read as loaded (`rows_unstaged`). The one decision: the kernel's role
     and its planning's (`grouped_matmul._Mosaic.rewritten`)."""
-    return (family.rewrites_in_persist and not k_major and all(table is None for table in tables)
-            and not unstaged)
+    return family.rewrites_in_persist and not k_major and not unstaged
 
 
 def _gradient_unrolled(family: mosaic.Family, *, unstaged: bool, exact_sums: bool, scaled: bool) -> bool:
