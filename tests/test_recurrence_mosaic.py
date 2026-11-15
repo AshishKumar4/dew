@@ -1830,7 +1830,8 @@ IDENTITY_GROUPS = (('qwen3.5-27b-gdn', jnp.bfloat16, False, False, None),
                    ('kimi-linear-kda', jnp.bfloat16, False, False, None),
                    ('kimi-linear-kda', jnp.bfloat16, True, False, None),
                    ('nemotron-h-4b-ssd', jnp.bfloat16, True, False, None),
-                   ('nemotron-h-4b-ssd', jnp.float32, False, False, None))
+                   ('nemotron-h-4b-ssd', jnp.float32, False, False, None),
+                   ('a write gate', jnp.bfloat16, False, False, None))
 """The gate's groups the identity test lowers (`GATE_GROUPS`' greedy cover, in its order, of every target's
 reach, `_reach`): what it guards is each launch's emitted part and its form, the same code whatever the
 geometry, so every launch the gate reaches and each axis that changes a kernel's form or emitted part, on
