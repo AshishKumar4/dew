@@ -879,14 +879,11 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     streams = allocations(stages)
     collected = PLANNED.get()
     if collected is not None:
-        def recorded(*arrays):
-            stepped = sum(math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in blocks.values())
-            collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
-                                    registers, stages, stepped, found.programs if found else 0,
-                                    consumers, family, producer, planning if ringed else None))
-            return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
-
-        return recorded
+        stepped = sum(math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in blocks.values())
+        record = Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)), registers,
+                        stages, stepped, found.programs if found else 0, consumers, family, producer,
+                        planning if ringed else None)
+        return functools.partial(_recorded, collected, record, out_type)
 
     def entry(*arrays):
         def run(staged, *, streams):
@@ -937,6 +934,14 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                              producer=producer)(*arrays)
 
     return launched
+
+
+def _recorded(collected: list, record: "Launch", out_type, *arrays):
+    """A launch where `template.planned` collects launches (`launch_kernel`'s): its `record` collected, zeros
+    of `out_type` its outputs."""
+    del arrays
+    collected.append(record)
+    return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
 
 
 def _persisted(family: mosaic.Family, streams, given, live, arrays, grid: tuple, grid_names: tuple,
