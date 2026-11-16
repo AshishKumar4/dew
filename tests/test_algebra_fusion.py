@@ -1085,3 +1085,35 @@ def test_a_gated_product_across_a_barrier_is_never_fused(barred):
     assert fused and not crossed
     if barred is checkpointed_swiglu:
         assert any(equation.primitive is primitives.remat_p for equation in equations(made.jaxpr.jaxpr))
+
+
+@pytest.mark.parametrize("held", ["_decided", "_traced"])
+def test_a_held_decision_is_made_anew_where_xlas_flags_ask_for_deterministic_operations(monkeypatch, held):
+    """A region's fusion decision and its written program are each held by the context a kernel is chosen
+    in (`fusion.choice_context`), which reads whether XLA's flags ask for deterministic operations, as
+    FlashAttention's eligibility does: a decision, and a program, that reads the flag answer by it as the
+    run's flags change, off, on, then off again, never by the context it was first held in."""
+    from jax.extend import core as jcore
+
+    from dew._devices import deterministic_ops_requested
+    from dew.algebra import fusion
+
+    if held == "_decided":
+        def ask():
+            return fusion._decided(("a region", held), deterministic_ops_requested)
+    else:
+        closed = jax.make_jaxpr(lambda x: x * 2)(jnp.ones(4))
+        region = fusion.Written(places=(0,), inputs=tuple(closed.jaxpr.invars),
+                                outputs=tuple(closed.jaxpr.outvars), at=0, key=("a region", held),
+                                call=lambda x: x * (3 if deterministic_ops_requested() else 2))
+
+        def ask():
+            traced = fusion._traced(region)
+            program = jcore.Jaxpr([], list(traced.invars), list(traced.equation.outvars), [traced.equation])
+            (value,) = jcore.jaxpr_as_fun(jcore.ClosedJaxpr(program, []))(jnp.ones(4))
+            return float(value[0]) == 3
+    answers = []
+    for flags in ("", "--xla_gpu_deterministic_ops=true", ""):
+        monkeypatch.setenv("XLA_FLAGS", flags)
+        answers.append(ask())
+    assert answers == [False, True, False]

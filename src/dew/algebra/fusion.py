@@ -302,6 +302,50 @@ def _shapes(variables: Sequence[jcore.Var]) -> list[jax.ShapeDtypeStruct]:
 _held: collections.OrderedDict[Hashable, bool] = collections.OrderedDict()
 
 
+def choice_context() -> Hashable:
+    """The context a kernel of Dew's is chosen in, which every held kernel decision of the algebra's keys
+    (`holding`: a region's fusion, its written program, a recognition, an attention call's kernel): the
+    derivation's (`derive.context`: the mesh, the target priced for, the numerics and precision), what a
+    trace reads of this thread's context (`options.trace_context`: an assumed generation and whether it is
+    interpreted, the kernel choices a call names, a whole-sequence scope, a quantization's owner and rule,
+    Dew's environment), the launches the compiles refused, which a template's legality reads
+    (`report.refused_launches`), and whether XLA's flags ask for deterministic operations, which
+    FlashAttention's eligibility reads (`_devices.deterministic_ops_requested`) and no `DEW_` variable
+    holds."""
+    from dew._devices import deterministic_ops_requested
+    from dew.algebra import derive
+    from dew.nn.kernels.options import trace_context
+    from dew.nn.kernels.templates import report
+
+    return derive.context(), trace_context(), report.refused_launches(), deterministic_ops_requested()
+
+
+def holding[Value](cache: collections.OrderedDict[Hashable, Value], key: Hashable,
+                   made: Callable[[], Value]) -> Value:
+    """`cache`'s entry at `key`, made (`made()`) where it holds none, outside the lock every held decision
+    shares (`_HOLDING`: compiles trace on several threads, and a decision made may hold another), the least
+    recently read dropped past `DECISIONS_HELD`. Two threads missing one key at once each make it, the later
+    kept: a decision is a function of its key, so either is the same. The way the algebra holds a kernel
+    decision (`_decided`, `_traced`, recognition's bodies, regions and attention calls, each keyed by its own
+    and `choice_context()`) and a declaration's trace (`recognize._declaration`, by its call and types
+    alone: no kernel is chosen in it)."""
+    with _HOLDING:
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key]
+    value = made()
+    with _HOLDING:
+        cache[key] = value
+        cache.move_to_end(key)
+        if len(cache) > DECISIONS_HELD:
+            cache.popitem(last=False)
+    return value
+
+
+_HOLDING = threading.Lock()
+"""Held while a held decision's cache is read or written (`holding`)."""
+
+
 def _identity(jaxpr: jcore.Jaxpr, region: Region) -> Hashable:
     """A product region's structure (`program.structure`'s, the algebra's windows' key): all its call reads
     of it (`_replayed` takes its constants as inputs, and its literals by their values)."""
@@ -312,21 +356,13 @@ def _identity(jaxpr: jcore.Jaxpr, region: Region) -> Hashable:
 
 
 def _decided(identity: Hashable, decide: Callable[[], bool]) -> bool:
-    """A region's decision (`decide`), weighed once for its structure (`_identity`) in the context it is
-    weighed in (`derive.context`: the mesh, the target, the numerics and precision; and the kernel choices a
-    call names), the latest `DECISIONS_HELD` held."""
-    from dew import _cache
-    from dew.algebra import derive
-
-    key = (identity, derive.context(), _cache.KERNEL_CHOICES.value)
-    if key not in _held:
+    """A region's decision (`decide`), weighed once for its structure (`_identity`) in the context a kernel
+    is chosen in (`choice_context`), held (`holding`)."""
+    def weighed() -> bool:
         # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
         with generation.routes(alone=True):
-            _held[key] = decide()
-        if len(_held) > DECISIONS_HELD:
-            _held.popitem(last=False)
-    _held.move_to_end(key)
-    return _held[key]
+            return decide()
+    return holding(_held, (identity, choice_context()), weighed)
 
 
 def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
@@ -364,33 +400,22 @@ class _Trace(NamedTuple):
 
 
 _traces: collections.OrderedDict[Hashable, _Trace] = collections.OrderedDict()
-_TRACES_LOCK = threading.Lock()
 
 
 def _traced(region: Written) -> _Trace:
     """`region`'s call traced as one nested program over its inputs' types (`nested`), once a process for
-    its identity (`Written.key`) under the state a trace reads (`options.trace_context`) and the launches
-    the compiles refused, which a template's legality reads as the call traces (`report.refused_launches`),
-    the latest `DECISIONS_HELD` held; its routes and launches reported where it is written, as its trace
-    reported them (`generation.reported`, `tuning.noted`)."""
+    its identity (`Written.key`) in the context a kernel is chosen in (`choice_context`), held (`holding`);
+    its routes and launches reported where it is written, as its trace reported them
+    (`generation.reported`, `tuning.noted`)."""
     from dew.nn.kernels import tuning
-    from dew.nn.kernels.options import trace_context
-    from dew.nn.kernels.templates import report
 
-    key = (region.key, trace_context(), report.refused_launches())
-    with _TRACES_LOCK:
-        held = _traces.get(key)
-        if held is not None:
-            _traces.move_to_end(key)
-    if held is None:
+    def traced_once() -> _Trace:
         with generation.routes(alone=True) as routes, tuning.seen() as seen:
             traced = jax.make_jaxpr(nested(region.call))(*_shapes(region.inputs))
         (equation,) = traced.jaxpr.eqns
-        held = _Trace(equation, tuple(traced.jaxpr.invars), tuple(routes), seen.held())
-        with _TRACES_LOCK:
-            _traces[key] = held
-            if len(_traces) > DECISIONS_HELD:
-                _traces.popitem(last=False)
+        return _Trace(equation, tuple(traced.jaxpr.invars), tuple(routes), seen.held())
+
+    held = holding(_traces, (region.key, choice_context()), traced_once)
     generation.reported(held.routes)
     tuning.noted(held.launches)
     return held
