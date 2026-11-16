@@ -34,7 +34,8 @@ QUESTIONS = {
     "two": {"pick": Choice("Which one?", ["alpha", "beta"]), "holds": Noul("Does it hold?")},
     "many": {"pick": Choice("Which tool?", [f"tool {index}" for index in range(9)])},
 }
-LABELS = Labels(names=("A", "B", "C", "D", "E", "F", "G", "H", "I"))
+# One byte each: a label is one token (`ByteTokenizer`).
+LABELS = Labels(names=("A", "B", "C", "D", "E", "F", "G", "H", "I"), variants=("{}",))
 
 
 def per_question() -> dict[str, object]:
@@ -65,26 +66,24 @@ def joint() -> dict[str, object]:
                 (16384, 220), (("release", None), ("schema first", schema_first)), (None, 24))}
 
 
-def digest(layout_type, settings: dict) -> dict[str, str]:
-    """Each state and question set's rows under `layout_type(**settings)`, digested: their every field and
-    each one's refusal, or the error that refused the layout or its rows."""
+def digest(layout_type, settings: dict) -> str:
+    """Every row `layout_type(**settings)` writes over each state and question set, digested: each row's
+    every field and its refusal, or the error that refused the layout or a set's rows."""
     try:
         layout = layout_type(**settings)
     except (TypeError, ValueError) as error:
-        return {"layout": f"refused {type(error).__name__}"}
-    digests = {}
-    for (state_name, state), (questions_name, questions) in itertools.product(STATES.items(),
-                                                                              QUESTIONS.items()):
+        return f"refused {type(error).__name__}"
+    cells = []
+    for state, questions in itertools.product(STATES.values(), QUESTIONS.values()):
         try:
             rows = layout.rows(TOKENIZER, SPECIALS, state, questions)
-            written = repr([(dataclasses.astuple(row), layout.refusal(row)) for row in rows])
+            cells.append([(dataclasses.astuple(row), layout.refusal(row)) for row in rows])
         except (TypeError, ValueError) as error:
-            written = f"refused {type(error).__name__}"
-        digests[f"{state_name} {questions_name}"] = hashlib.sha256(written.encode()).hexdigest()[:20]
-    return digests
+            cells.append(f"refused {type(error).__name__}")
+    return hashlib.sha256(repr(cells).encode()).hexdigest()[:24]
 
 
-def written() -> dict[str, dict[str, str]]:
+def written() -> dict[str, str]:
     """The grid's digests, by configuration."""
     return {name: digest(*configured) for name, configured in {**per_question(), **joint()}.items()}
 
