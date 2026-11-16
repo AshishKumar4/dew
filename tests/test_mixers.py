@@ -554,10 +554,12 @@ def test_a_recurrent_layer_reads_its_scan_in_its_projections_dtype(kind, dtype):
     layer = mixers.build(kind, **fields).build(MixerContext(
         emb_features=32, num_heads=4, num_kv_heads=4, head_dim=8, max_seq_len=16, dtype=dtype))(name="mixer")
     x = jax.random.normal(jax.random.key(0), (1, 8, 32), jnp.bfloat16)
-    variables = layer.init(jax.random.key(1), x)
+    # Its first place in a stack, which a mixer whose rates follow its depth reads (lightning's).
+    call = MixerCall(depth=jnp.zeros((1, 8), jnp.int32))
+    variables = layer.init(jax.random.key(1), x, call)
     # The same values given in float32, which its input projections take exactly.
-    np.testing.assert_array_equal(np.asarray(layer.apply(variables, x)),
-                                  np.asarray(layer.apply(variables, x.astype(jnp.float32))))
+    np.testing.assert_array_equal(np.asarray(layer.apply(variables, x, call)),
+                                  np.asarray(layer.apply(variables, x.astype(jnp.float32), call)))
 
 
 @pytest.mark.parametrize("kind", RECURRENT)
