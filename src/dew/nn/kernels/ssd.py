@@ -216,7 +216,7 @@ def _tpu_backward(x_ref, b_ref, c_ref, a_ref, entered_ref, dy_ref, dfinal_ref, d
 def _marked(loads_ref, t):
     """Whether token `t` of a chunk opens one of its segments: its first, or a document's first (its `load`
     past -1, `recurrence_chunk.Chunk.loads`), read from the chunk's loads in scalar memory."""
-    return (t == 0) | (loads_ref[t] >= 0)
+    return (t == 0) | (loads_ref[0, t] >= 0)
 
 
 def _segment_after(loads_ref, origin, count: int):
@@ -240,7 +240,7 @@ def _windowed(x, b, c, a, origin, through):
 def _opened(given_ref, table, entry, load, document, zero):
     """The memory a document opening at a token enters: its one-based table slot's (`given_ref`'s first,
     then the stored `table`'s; zero at slot zero), its entry write added where the call gives one (`entry`:
-    each document's keys `[R, N]`, values `[R, P]` and weight)."""
+    each document's keys `[R, N]`, values `[P, R]` and weight `[1, 1]`, `_written`)."""
     count = given_ref.shape[0]
     taken = zero
     for slot in range(count):
@@ -251,7 +251,14 @@ def _opened(given_ref, table, entry, load, document, zero):
     if entry is None:
         return taken
     key, value, weight = (ref[document] for ref in entry)
-    return taken + _mm((value * weight).T, key)
+    return taken + _written(key, value) * weight
+
+
+def _written(key, value):
+    """`sum_r value_r key_r^T` `[P, N]` of a document's entry write's terms (keys `[R, N]`, values `[P, R]`):
+    a term's outer product at a time, a few terms each a column of the values against a row of the keys
+    (no product contracting so few)."""
+    return sum(value[:, r:r + 1] * key[r:r + 1, :] for r in range(key.shape[0]))
 
 
 def _tpu_forked_forward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, a_ref, state_ref, given_ref,
@@ -284,13 +291,13 @@ def _tpu_forked_forward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, a
         y, leaving, origin = state
         after = _segment_after(loads_ref, origin, count)
         through = after - 1
-        load = loads_ref[origin]
-        memory = jnp.where(load < 0, carried, _opened(given_ref, table, entry, load, begun_ref[origin],
+        load = loads_ref[0, origin]
+        memory = jnp.where(load < 0, carried, _opened(given_ref, table, entry, load, begun_ref[0, origin],
                                                       jnp.zeros_like(carried)))
         operands, inside = _windowed(x, b, c, a, origin, through)
         out, left = _chunk_forward(*operands, memory)
         if table is not None:
-            store = stores_ref[through]
+            store = stores_ref[0, through]
             for slot in range(held):
                 table[slot] = jnp.where(store == slot + 1, left, table[slot])
         return jnp.where(inside, out, y), jnp.where(through == count - 1, left, leaving), after
@@ -341,13 +348,13 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, 
         k = segments - 1 - i
         origin = origin_of(k)
         through = _segment_after(loads_ref, origin, count) - 1
-        load = loads_ref[origin]
-        document = begun_ref[origin]
+        load = loads_ref[0, origin]
+        document = begun_ref[0, origin]
         memory = jnp.where(load < 0, start, _opened(given_ref, table, entry, load, document,
                                                     jnp.zeros_like(start)))
         dleft = jnp.where(through == count - 1, dnext, 0.0)
         if dtable is not None:
-            store = stores_ref[through]
+            store = stores_ref[0, through]
             for slot in range(held):
                 stored = store == slot + 1
                 dleft = dleft + jnp.where(stored, dtable[slot], 0.0)
@@ -366,9 +373,14 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, 
             key, value, weight = (ref[document] for ref in entry)
             taken = (load >= 0).astype(jnp.float32)
             dkey, dvalue, dweight = dentry
-            dkey[document] = dkey[document] + taken * _mm(value * weight, dmemory)
-            dvalue[document] = dvalue[document] + taken * _mm(key, dmemory.T) * weight
-            dweight[document] = dweight[document] + taken * jnp.sum(dmemory * _mm(value.T, key))
+            # Each term's gradients, its key row's and its value column's, through the outer products.
+            rows = range(key.shape[0])
+            dkey[document] = dkey[document] + taken * weight * jnp.concatenate(
+                [jnp.sum(value[:, r:r + 1] * dmemory, axis=0, keepdims=True) for r in rows], axis=0)
+            dvalue[document] = dvalue[document] + taken * weight * jnp.concatenate(
+                [jnp.sum(dmemory * key[r:r + 1, :], axis=1, keepdims=True) for r in rows], axis=1)
+            dweight[document] = dweight[document] + taken * jnp.sum(dmemory * _written(key, value),
+                                                                    keepdims=True)
         return (jnp.where(inside, dx + wx, dx), jnp.where(inside, db + wb, db),
                 jnp.where(inside, dc + wc, dc), jnp.where(within, da + wa, da),
                 jnp.where(load < 0, dmemory, dprev))
@@ -454,28 +466,32 @@ def _call(body, name: str, platform: str, grid: tuple[int, ...], in_specs, out_s
 def _forked_blocks(forked, heads: int, chunk_size: int):
     """`_ssd_scan`'s `forked` `(given [B, S', H, P, N], tokens (loads, stores, documents [B, T] int32),
     entry (keys [B, D, R, H, N], values [B, D, R, H, P], weights [B, D, H]) or None)` in the kernels'
-    layout: each token's load, store and document a chunk's row `[B, NC, C]` int32 (`_tokens_spec`), the
-    memories `[B, H, S', P, N]` and the entry write's operands each head's `[B, H, D, ...]`, float32."""
+    layout: each token's load, store and document a chunk's row `[B, NC, 1, C]` int32 (`_tokens_spec`), the
+    memories `[B, H, S', P, N]` and the entry write's operands each head's, `[B, H, D, R, N]` keys,
+    `[B, H, D, P, R]` values (a term a column) and `[B, H, D, 1, 1]` weights, float32."""
     given, tokens, entry = forked
     batch, total = tokens[0].shape
-    chunked = tuple(jnp.asarray(t, jnp.int32).reshape(batch, total // chunk_size, chunk_size) for t in tokens)
+    chunked = tuple(jnp.asarray(t, jnp.int32).reshape(batch, total // chunk_size, 1, chunk_size)
+                    for t in tokens)
     memories = jnp.swapaxes(given, 1, 2).astype(jnp.float32)
     if entry is None:
         return chunked, memories, ()
     key, value, weight = entry
     return chunked, memories, (jnp.moveaxis(key, 3, 1).astype(jnp.float32),
-                               jnp.moveaxis(value, 3, 1).astype(jnp.float32),
+                               jnp.moveaxis(jnp.swapaxes(value, 2, 4), 3, 1).astype(jnp.float32),
                                jnp.moveaxis(weight, 2, 1).astype(jnp.float32)[..., None, None])
 
 
 def _tokens_spec(chunks: int, chunk_size: int, *, reverse: bool = False):
     """The block spec of a chunk's tokens' loads, stores or documents (`_forked_blocks`), in scalar memory,
-    which the forked kernels read a token at a time."""
+    which the forked kernels read a token at a time: a row of one chunk's tokens `[1, C]`, the array's own
+    last two dimensions, as the TPU lowering takes a block in scalar memory (a squeezed second-to-last
+    dimension it refuses)."""
     def over_chunk(*grid):
         chunk = chunks - 1 - grid[2] if reverse else grid[2]
-        return tuple(jnp.asarray(value, jnp.int32) for value in (grid[0], chunk, 0))
+        return tuple(jnp.asarray(value, jnp.int32) for value in (grid[0], chunk, 0, 0))
 
-    return pl.BlockSpec((None, None, chunk_size), over_chunk, memory_space=pltpu.SMEM)
+    return pl.BlockSpec((None, None, 1, chunk_size), over_chunk, memory_space=pltpu.SMEM)
 
 
 def _whole(shape: tuple[int, ...]):
@@ -599,7 +615,7 @@ def _ssd_bwd(chunk_size: int, platform: str, held: int, residual, cotangent):
         if entry is not None:
             dkey, dvalue, dweight = dforked[1:]
             dentry = (jnp.moveaxis(dkey, 1, 3).astype(entry[0].dtype),
-                      jnp.moveaxis(dvalue, 1, 3).astype(entry[1].dtype),
+                      jnp.swapaxes(jnp.moveaxis(dvalue, 1, 3), 2, 4).astype(entry[1].dtype),
                       jnp.moveaxis(dweight[..., 0, 0], 1, 2).astype(entry[2].dtype))
         dtaken = (jnp.swapaxes(dforked[0], 1, 2).astype(given.dtype), (None,) * len(tokens), dentry)
     return dx, db, dc, da, dstate, dtaken
