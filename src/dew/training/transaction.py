@@ -1113,19 +1113,17 @@ class Transaction:
         bounded gradient, as its state says (`dew.optim.reads_updates`), or Dew cannot read its bound."""
         return self.reads_all or reads_updates(opt_state)
 
-    def _read_ahead(self, inputs: tuple, qk, statistics, progress, applied: Applied | None) -> tuple:
+    def _read_ahead(self, inputs: tuple, qk, statistics, progress, applied: Applied | None) -> jax.Array:
         """Whether the update a step's `inputs` (its gradient, its optimizer's state and the parameters) form
-        is finite, read in a pass of its own that forms it and reduces it leaf by leaf, keeping no tree, and
-        the inputs after that read (an optimization barrier), which the commit forms its update from again:
-        the update is never held whole beside the state it moves, as a read of the commit's own update holds
-        it. The runs that updated in their backward read their own (`planned`); their part is read by
+        is finite, read in a pass of its own that forms it and reduces it leaf by leaf, keeping no tree: the
+        commit forms its update again from the gradient this read gates (the zero gradient where it is not
+        finite), which no compiler merges with this pass, so the update is never held whole beside the state
+        it moves. The runs that updated in their backward read their own (`planned`); their part is read by
         nothing."""
         gradient, opt_state, params = inputs
         update, _ = optimizer_update(self.optimizer, gradient, opt_state, params, qk=qk,
                                      statistics=statistics, progress=progress)
-        read = all_finite(update if applied is None else _without(update, applied.params))
-        *inputs, read = jax.lax.optimization_barrier((*inputs, read))
-        return read, tuple(inputs)
+        return all_finite(update if applied is None else _without(update, applied.params))
 
     def _solved(self, current, update, opt_state, taken: jax.Array) -> tuple[jax.Array, optax.OptState]:
         """Whether a gated step that solves its system (`solves_equations`) takes its `update`, read finite
@@ -1200,9 +1198,8 @@ class Transaction:
             if gated:
                 taken = rated(current.opt_state)
                 if self._reads(current.opt_state) and not solves_equations(current.opt_state):
-                    read, (gradient, before, stored) = self._read_ahead(
-                        (gradient, before, stored), qk, statistics, progress, applied)
-                    taken = taken & read
+                    taken = taken & self._read_ahead((gradient, before, stored), qk, statistics, progress,
+                                                     applied)
                 gradient = zeroed_unless(taken, gradient)
             update, opt_state = optimizer_update(self.optimizer, gradient, before, stored, qk=qk,
                                                  statistics=statistics, progress=progress)
