@@ -567,13 +567,16 @@ of either kind, attention's context or a recurrence's scan. `full` keeps
 nothing but the block's inputs."""
 
 
-def recomputed_inside(remat: RematPolicy) -> tuple[str, ...]:
-    """The residuals a rung recomputing the block in its backward has the layer computing them recompute in
-    its own backward too: on the heaviest rung, which keeps nothing (`full`), an in-context memory's chunks
+def recomputed_inside(remat: RematPolicy | None) -> tuple[str, ...]:
+    """The residuals the layers recompute in their own backwards under `remat`, the one statement
+    `DecoderBlock.__call__` runs its layers by and the ladder reads (`CausalTransformer.recompute_more`): a
+    rung that names its recompute (`RematPolicy.recompute`) those, no remat none; a rung recomputing the
+    block, besides it, on the heaviest rung, which keeps nothing (`full`), an in-context memory's chunks
     (`memory_chunk`), whose scan's backward would otherwise stack them all inside the block's recompute, a
-    layer's at a time (row 6577: 320 GiB of a Titans step at 4 x 2048); a lighter rung keeps them, each
-    step that fits as fast as it ran, so the ladder recomputes them last: a rung's recompute is its own and
-    this (`CausalTransformer.recompute_more`'s, which climbs past no rung it changes)."""
+    layer's at a time (row 6577: 320 GiB of a Titans step at 4 x 2048); a lighter rung keeps them, each step
+    that fits as fast as it ran, so the ladder recomputes them last."""
+    if remat is None or remat.recompute:
+        return () if remat is None else tuple(remat.recompute)
     return () if remat.save or remat.offload else (Residual.MEMORY_CHUNK,)
 
 
@@ -1003,7 +1006,7 @@ class DecoderBlock(nn.Module):
         """The residual the next block reads, in the form `x` came in: an array (the plain stream,
         AltUp's copies, mHC's streams, the depth state), or single-pass mHC's `Carried`."""
         if self.remat is None or self.remat.recompute or self.is_initializing() or decode:
-            with recomputing(() if self.remat is None else self.remat.recompute):
+            with recomputing(recomputed_inside(self.remat)):
                 return self._forward(x, train, decode, kv_store, per_layer_input, attention_metadata,
                                      prediction_phase)
         with recomputing(recomputed_inside(self.remat)):
