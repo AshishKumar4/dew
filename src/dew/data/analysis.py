@@ -1194,7 +1194,8 @@ def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool,
     missing: list[tuple[Source, Read]] = [(source, read) for source in _unsupported(pipelines, read)]
     if read == "streamed":
         measured = [source for pipeline in ending for source in _measured_members(pipeline)]
-        missing += [(source, "indexed") for source in measured if not source.supports("indexed")]
+        indexed: Read = "indexed"
+        missing += [(source, indexed) for source in measured if not source.supports(indexed)]
     if provision:
         for source, needed in missing:
             preparer = provisioner(source, needed)
