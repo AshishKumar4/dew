@@ -1001,7 +1001,7 @@ from dew.inference.tasks import earlier_shapes, hold_tokenizer, recorded_files, 
 read = earlier_shapes({"tokenizer": sys.argv[1]})
 found = tokenizer_for(read["tokenizer"])
 files = recorded_files(RunProcessor(found))
-hold_tokenizer({"tokenizer": read["tokenizer"], "tokenizer_files": files}, sys.argv[2])
+hold_tokenizer({"tokenizer": read["tokenizer"], "tokenizer_files": files}, sys.argv[2], found)
 print(json.dumps({"tokenizer": read["tokenizer"], "files": files}))
 """
 
@@ -1046,3 +1046,30 @@ def test_an_earlier_runs_snapshot_tokenizer_is_resolved_by_its_commit_and_held_f
     held = json.loads(again.stdout.strip().splitlines()[-1])
     assert held["files"] == resolved["files"]
     assert held["directory"].startswith(str(tmp_path / "fresh"))
+
+
+def test_a_run_holds_its_objectives_own_tokenizer_checked_file_by_file(tmp_path):
+    """A checkpoint holds the tokenizer its objective encodes with, copied from where that tokenizer was
+    pinned and checked file by file, whatever this process pinned before for the same files: a copy of
+    the same files read first and then deleted leaves the hold as it is. A declaration whose files are not
+    the objective's own is refused. The hold copied from the first directory the process pinned for those
+    hashes, and a checkpoint crashed where it was gone (train 972's review)."""
+    from dew.data.text import HELD_FILES, HFTokenizer, held_place
+    from dew.inference.tasks import RunProcessor, hold_tokenizer, recorded_files
+
+    fixture = Path(__file__).parent / "fixtures" / "laya" / "tiny" / "tokenizer"
+    first, own = tmp_path / "first", tmp_path / "own"
+    shutil.copytree(fixture, first)
+    shutil.copytree(fixture, own)
+    files = recorded_files(RunProcessor(HFTokenizer(str(first))))
+    assert files is not None
+    shutil.rmtree(first)
+    run = tmp_path / "run"
+    tokenizer = HFTokenizer(str(own))
+    hold_tokenizer({"tokenizer": str(own), "tokenizer_files": files}, str(run), tokenizer)
+    held = held_place(str(run), files)
+    assert (held / HELD_FILES).exists()
+    assert {path: hashlib.sha256((held / path).read_bytes()).hexdigest() for path in files} == files
+    with pytest.raises(ValueError):
+        hold_tokenizer({"tokenizer": str(own), "tokenizer_files": {**files, "extra.json": "0" * 64}},
+                       str(run / "other"), tokenizer)

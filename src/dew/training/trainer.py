@@ -816,7 +816,7 @@ class Trainer(Generic[Loss, Effects]):
             artifact = with_release_sources(self.objective.inference_record())
             if self.checkpoints is not None:
                 # Its tokenizer's files held in the run itself, which a load reads on any host.
-                hold_tokenizer(artifact, self.checkpoints.directory)
+                hold_tokenizer(artifact, self.checkpoints.directory, self.objective.run_tokenizer())
         except Unrecordable as error:
             reason = f"{type(self.objective).__name__}: {error}"
             artifact = {'unrecorded': reason}

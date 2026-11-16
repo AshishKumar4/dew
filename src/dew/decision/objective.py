@@ -861,6 +861,10 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         self.options = option_width(record(widths["slots"], "decision slots"), self.none_of_the_above,
                                     self.none_of_the_above_options)
 
+    def run_tokenizer(self) -> Tokenizer:
+        """The tokenizer the decision rows are laid out with, which a checkpoint holds in the run."""
+        return self.tokenizer
+
     def task_settings(self) -> DecideSettings:
         """What a saved run rebuilds its task from beside the backbone.
 

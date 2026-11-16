@@ -579,39 +579,34 @@ def saved_artifact(checkpoints: Checkpoints, step: int) -> Mapping[str, object] 
     return earlier_shapes(named_fields(record, 'checkpoint artifact'))
 
 
-def hold_tokenizer(artifact: JSON, run: str) -> None:
-    """Hold the Hugging Face tokenizer `artifact`, a step's inference declaration a checkpoint of the run in
-    `run` carries, names in the run itself (`held_place`), once: copied by the first process from where this
-    process read it (`dew.data.text.pinned_directory`, the objective's own tokenizer, never resolved by its
-    name again), its files first and `HELD_FILES` last, a local run's directory published whole
-    (`dew._files.staged`). The record keeps the tokenizer's name and files as they are; a load finds the
-    held copy by them (`tokenizer_here`) on any host."""
-    from dew.data.text import HELD_FILES, held_place, pinned_directory
+def hold_tokenizer(artifact: JSON, run: str, tokenizer: Tokenizer | None) -> None:
+    """Hold `tokenizer`, the objective's own, in the run in `run` (`held_place`), once, where `artifact`, the
+    step's inference declaration a checkpoint of the run carries, records its files (`tokenizer_files`):
+    copied by the first process from the directory this process pinned it from, each file checked against
+    its hash (`dew.data.text.copy_checked`), never resolved by its name again, `HELD_FILES` written last, a
+    local run's directory published whole (`dew._files.staged`). The record keeps the tokenizer's name and
+    files as they are; a load finds the held copy by them (`HFTokenizer.held`) on any host. A declaration
+    whose files are not `tokenizer`'s is refused: the run would hold another tokenizer than it records."""
+    from dew.data.text import HELD_FILES, HFTokenizer, copy_checked, held_place
 
     match artifact:
         case {"tokenizer_files": dict(files)} if jax.process_index() == 0:
             hashed = {str(path): str(digest) for path, digest in files.items()}
+            if not isinstance(tokenizer, HFTokenizer) or tokenizer.pinned.files != hashed:
+                raise ValueError("the run records a tokenizer's files that are not its objective's own")
             target = held_place(run, hashed)
-            source = pinned_directory(hashed)
-            if source is None or (target / HELD_FILES).exists():
+            if (target / HELD_FILES).exists():
                 return
+            source = epath.Path(tokenizer.pinned.directory)
             if is_uri(run):
-                _held_files(target, source, hashed)
+                copy_checked(source, target, hashed)
+                (target / HELD_FILES).write_text(json.dumps(hashed, sort_keys=True))
                 return
             with staged(Path(target)) as building:
-                _held_files(epath.Path(building), source, hashed)
+                copy_checked(source, epath.Path(building), hashed)
+                (epath.Path(building) / HELD_FILES).write_text(json.dumps(hashed, sort_keys=True))
         case _:
             return
-
-
-def _held_files(target: epath.Path, source: str, files: Mapping[str, str]) -> None:
-    from dew.data.text import HELD_FILES
-
-    """`files` of the tokenizer directory `source` written in `target`, `HELD_FILES` naming them last."""
-    for path in files:
-        (target / path).parent.mkdir(parents=True, exist_ok=True)
-        (target / path).write_bytes((Path(source) / path).read_bytes())
-    (target / HELD_FILES).write_text(json.dumps(dict(files), sort_keys=True))
 
 
 def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
