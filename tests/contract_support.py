@@ -21,12 +21,11 @@ import numpy as np
 from float64_terms import float64_signed_sums
 from reference_error import widened
 
-LEAST = float(np.finfo(np.float32).tiny) * (1 + 2.0**-16)
-"""2^-16 of it above float32's least normal value: a held position's truth is at least it (testing.md's
-derivative contracts), as a run's few roundings of a value at the range's very edge may carry it past."""
-MOST = float(np.finfo(np.float32).max) * (1 - 2.0**-16)
-"""2^-16 of it below float32's largest value: a held position's truth, and each signed sum of its terms, at
-most it, as `LEAST`."""
+LEAST = float(np.finfo(np.float32).tiny)
+"""Float32's least normal value: a held position's truth is at least it (testing.md's derivative
+contracts)."""
+MOST = float(np.finfo(np.float32).max)
+"""Float32's largest value: a held position's truth, and each signed sum of its terms, at most it."""
 
 
 class LessFinite(AssertionError):
@@ -35,8 +34,8 @@ class LessFinite(AssertionError):
 
 
 def normal_float32(values) -> np.ndarray:
-    """Whether each float64 value is a float32 a few roundings inside its normal range: from just above
-    the least normal to just below the largest, or zero."""
+    """Whether each float64 value is a normal float32's magnitude: from the least normal to the largest,
+    or zero."""
     size = np.abs(np.asarray(values, np.float64))
     return (size == 0) | ((size >= LEAST) & (size <= MOST))
 

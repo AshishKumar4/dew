@@ -38,6 +38,7 @@ from dew.parity import (
     Conditioning,
     Inconclusive,
     RecordedLeaf,
+    _width,
     example_mse,
     example_worst,
     heavy_masks,
@@ -498,17 +499,30 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
                 reference=reference, license=license)
 
 
-def record_shard(label: str, draw, evaluate, seeds: range) -> dict[str, np.ndarray]:
+def record_shard(label: str, draw, evaluate, seeds: range, *, dew=None) -> dict[str, np.ndarray]:
     """The evidence `record_case`'s summary keeps of `seeds`, a run of a recording's seeds, each drawn as
     one run draws it (`draw(seed)`) and evaluated (`evaluate(inputs)`, the reference's outputs and their
     float64 truth): one shard of a recording `merge_shards` joins. Each seed's outputs are summarized
-    as they are evaluated and dropped, so a shard holds its evidence alone."""
+    as they are evaluated and dropped, so a shard holds its evidence alone. With `dew(inputs)`, Dew's own
+    outputs on a seed's inputs, each seed's Dew squared error by leaf too (`<label>.dew_mse.<leaf>`): a
+    pilot shard's, which the merge sizes the count paired by (`record_case`'s `dew`) and keeps none of, the
+    verdict running Dew live."""
+    mine: dict[str, list] = {}
+
     def records():
         for seed in seeds:
             inputs = draw(seed)
             reference, truth = evaluate(inputs)
-            yield _summarized((inputs, jax.tree.map(np.asarray, reference), jax.tree.map(np.asarray, truth)))
-    return _evidence(label, seeds, records())
+            truth = jax.tree.map(np.asarray, truth)
+            if dew is not None:
+                ran = jax.tree.map(np.asarray, dew(inputs))
+                for name, summary in zip(truth, leaf_summaries([ran[name] for name in truth],
+                                                               [truth[name] for name in truth]), strict=True):
+                    mine.setdefault(name, []).append(summary.log_mse)
+            yield _summarized((inputs, jax.tree.map(np.asarray, reference), truth))
+    made = _evidence(label, seeds, records())
+    made.update({f"{label}.dew_mse.{name}": _recorded_mse(label, name, logs) for name, logs in mine.items()})
+    return made
 
 
 def record_distances(label: str, draw, distances: Mapping[str, np.ndarray], truth_of,
@@ -525,7 +539,8 @@ def record_distances(label: str, draw, distances: Mapping[str, np.ndarray], trut
     errors = np.stack([np.asarray([float(log_mean_square(seed)) for seed in rows]) if rows.shape[1]
                        else np.full(rows.shape[0], -np.inf)
                        for rows in (np.asarray(distances[name], np.float64) for name in names)], axis=1)
-    confirmed = seeds_resolving(errors, names, label)
+    first = truth_of(0)
+    confirmed = seeds_resolving(errors, names, label, widths=[_width(first[name]) for name in names])
     kept = staged_units(confirmed)
 
     def records():
@@ -547,7 +562,10 @@ def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict
     that leave a seed out or repeat one are refused, and so are too few seeds for the count's redraw.
     Shards of seeds from SIZING_FROM on are the recording's pilots, the draws a paired sizing of it takes
     and no verdict does (`seeds_for`): joined in order from SIZING_FROM, every one kept, under
-    `<label>.pilot.`, their leaves the verdict's in shape and dtype, as a run from seed 0 is."""
+    `<label>.pilot.`, their leaves the verdict's in shape and dtype, as a run from seed 0 is. Pilots that
+    hold Dew's errors on their draws (`record_shard`'s `dew`) size the count paired on them
+    (`seeds_resolving`'s `mine`), as `record_case`'s `dew` does, for a site whose errors are heavy-tailed
+    alike in both arms; the recording keeps none of Dew's errors, and its verdict runs Dew live."""
     straddling = [_runs(shard[f"{label}.drawn"]) for shard in shards
                   if (np.asarray(shard[f"{label}.drawn"]) < SIZING_FROM).any()
                   and (np.asarray(shard[f"{label}.drawn"]) >= SIZING_FROM).any()]
@@ -559,8 +577,23 @@ def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict
     joined = _joined(label, verdict, 0)
     drawn = joined[f"{label}.drawn"]
     names = [key.removeprefix(f"{label}.mse.") for key in joined if key.startswith(f"{label}.mse.")]
-    logs = log_errors(np.stack([joined[f"{label}.mse.{name}"] for name in names], axis=1))
-    confirmed = seeds_resolving(logs, names, label)
+
+    def logs(held, kind: str):
+        return log_errors(np.stack([held[f"{label}.{kind}.{name}"] for name in names], axis=1))
+
+    # Pilots that hold Dew's errors on their draws size the count paired on them, as `record_case`'s `dew`
+    # does (`seeds_for`'s paired sizing draws from SIZING_FROM): every pilot shard, or none.
+    holding = {any(key.startswith(f"{label}.dew_mse.") for key in shard) for shard in pilots}
+    if len(holding) > 1:
+        raise ValueError(f"{label}: some pilot shards hold Dew's errors on their draws and some do not")
+    # Each leaf's row width, as check 1 reads it (`_width`) of the leaf's shape.
+    widths = [_width(np.broadcast_to(np.zeros(()), tuple(joined[f"{label}.shape.{name}"]))) for name in names]
+    if holding == {True}:
+        held = _joined(label, pilots, SIZING_FROM)
+        confirmed = seeds_resolving(logs(held, "mse"), names, label, widths=widths,
+                                    mine=logs(held, "dew_mse"))
+    else:
+        confirmed = seeds_resolving(logs(joined, "mse"), names, label, widths=widths)
     kept = staged_units(confirmed)
     if len(drawn) < kept:
         raise ValueError(f"{label}: {confirmed} seeds resolve, and their redraw needs {kept} seeds; the "

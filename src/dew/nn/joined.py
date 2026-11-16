@@ -18,7 +18,7 @@ from flax import linen as nn
 from flax.core import meta
 
 from dew.nn.dense import Dense, _biased, _plain_dense, _promoted, _rounds_once, intercepted
-from dew.nn.precision import float32_dot_general
+from dew.nn.precision import float32_dot_general, recipe_role
 
 from .kernels.generation import INHERENT, Choice, device_generation
 from .kernels.projections import kernel_path, mapped_shards
@@ -30,13 +30,15 @@ from .sharding import on_shards
 class Projections:
     """A layer's projections as a selector that stands in for their own calls reads them (the join's, the
     fused gated MLP's, `dew.nn.gated_mlp`): whether each is a plain Dense (`dense`) on the default product
-    (`dot_general`), whether a wrapper intercepts their own calls (`intercepted`), and whether each holds
-    its own kernel (`held`)."""
+    (`dot_general`), whether a wrapper intercepts their own calls (`intercepted`), whether each holds
+    its own kernel (`held`), and whether the run's low-precision recipe takes their products by the role
+    they are traced in (`recipe`, `precision.recipe_role`), each quantized as its own."""
 
     dense: bool
     dot_general: bool
     intercepted: bool
     held: bool
+    recipe: bool
 
 
 def projections_of(projections: Sequence[nn.Module]) -> Projections:
@@ -49,7 +51,8 @@ def projections_of(projections: Sequence[nn.Module]) -> Projections:
                         and projection.dot_general_cls is None for projection in projections),
         intercepted=(any(projection.product_owned() for projection in projections) if dense
                      else intercepted()),
-        held=all(projection.has_variable('params', 'kernel') for projection in projections))
+        held=all(projection.has_variable('params', 'kernel') for projection in projections),
+        recipe=(taken := recipe_role()) is not None and taken[1] in taken[0].roles)
 
 
 def projection_requirements[C](of: Callable[[C], Projections], stands_in: str) -> tuple[Requirement[C], ...]:
@@ -67,6 +70,10 @@ def projection_requirements[C](of: Callable[[C], Projections], stands_in: str) -
                     "the model computes under a wrapper (an adapter, a quantization) that intercepts each "
                     "projection's own call", row=INHERENT, kind='handoff'),
         Requirement('kernel', lambda case: of(case).held, "a projection holds no kernel of its own",
+                    row=INHERENT, kind='handoff'),
+        Requirement('recipe', lambda case: not of(case).recipe,
+                    f"the run's low-precision recipe takes the projections' products (`projections."
+                    f"recipe_projection`), each quantized as its own, which {stands_in} does not",
                     row=INHERENT, kind='handoff'),
     )
 

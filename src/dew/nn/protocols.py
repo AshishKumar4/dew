@@ -171,6 +171,9 @@ class Projection:
     precision: PrecisionLike = struct.field(pytree_node=False, default=None)
     compute: DTypeLike | None = struct.field(pytree_node=False, default=None)
     input_quantizer: InputQuantizer | None = None
+    path: tuple | None = struct.field(pytree_node=False, default=None)
+    """The variables path of the layer's kernel (`projections.kernel_path`), by which a mesh splitting the
+    rows places it per shard (`dense.plain_product`)."""
 
     def __call__(self, hidden: jax.Array) -> jax.Array:
         """`hidden` `[..., features]` projected to `[..., width]`."""
@@ -178,7 +181,7 @@ class Projection:
 
         hidden = hidden if self.input_quantizer is None else self.input_quantizer.qdq(hidden)
         dtype = jnp.result_type(hidden, self.kernel) if self.compute is None else self.compute
-        return plain_product()(hidden.astype(dtype), self.kernel.astype(dtype),
+        return plain_product(self.path)(hidden.astype(dtype), self.kernel.astype(dtype),
                                (((jnp.ndim(hidden) - 1,), (0,)), ((), ())), precision=self.precision)
 
 
