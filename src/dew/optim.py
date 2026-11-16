@@ -1897,7 +1897,8 @@ def _direction_bound(values: Mapping[str, object], dtype, *, quantized: bool, mo
 
     b1, b2 = values[f'{prefix}b1'], values[f'{prefix}b2']
     eps, eps_root = values['eps'], values.get(f'{prefix}eps_root', 0.0)
-    if not all(isinstance(value, int | float) for value in (b1, b2, eps, eps_root)):
+    if not (isinstance(b1, int | float) and isinstance(b2, int | float) and isinstance(eps, int | float)
+            and isinstance(eps_root, int | float)):
         return None
     stored = {str(values.get(name)) for name in ('mu_dtype', 'nu_dtype')}
     if 'float16' in stored:
