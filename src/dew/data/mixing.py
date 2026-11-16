@@ -806,7 +806,7 @@ _UNOPENED = "unopened"
 def _detached(state):
     """`state`, an iterator's position, copied so no later read of the iterator moves it: its mappings and
     lists anew, each of its leaves (a number, a string) as it is. A position is plain data, and this copies
-    it a tenth as long as `copy.deepcopy` does, which a mix read one record ahead pays each record."""
+    it faster than `copy.deepcopy` does, which a mix's member read one record ahead pays each record."""
     if isinstance(state, Mapping):
         return {key: _detached(value) for key, value in state.items()}
     if isinstance(state, list):
@@ -823,12 +823,13 @@ class _MixReads:
     record it gives (a packer captures it before each record), and only the corpus it read moved, so
     a corpus's position is captured again only after the mix reads it or it is restored."""
 
-    def __init__(self, corpora: Sequence[pygrain.IterDataset[Batch]], *, ahead: bool = False):
+    def __init__(self, corpora: Sequence[pygrain.IterDataset[Batch]], *, ahead: frozenset[int] = frozenset()):
         self.corpora = tuple(corpora)
         self.opened: dict[int, pygrain.DatasetIterator[Batch]] = {}
-        # Where `ahead`, each corpus's next record, pulled as its last one is given (`read`), so the mix
-        # knows a record is its corpus's last as it gives it, as an indexed read does (`exhausted`); the
-        # corpus's position stays the one after the record given, its held one read again on a restore.
+        # Each corpus among `ahead` (those that can end) read one record ahead, its next pulled as its last
+        # one is given (`read`), so the mix knows a record is its corpus's last as it gives it, as an indexed
+        # read does (`exhausted`); the corpus's position stays the one after the record given, its held one
+        # read again on a restore.
         self.ahead = ahead
         self.held: dict[int, Batch] = {}
         self.exhausted: set[int] = set()
@@ -856,7 +857,7 @@ class _MixReads:
         self.copied.discard(index)
         parent = self.parent(index)
         given = self.held.pop(index) if index in self.held else next(parent)
-        if self.ahead:
+        if index in self.ahead:
             # The position after the record given, captured before the pull ahead moves it.
             self.states[index] = _detached(parent.get_state())
             self.copied.add(index)
@@ -1161,10 +1162,14 @@ class KeyedMix(pygrain.IterDataset[Batch]):
     (`dew.data.compile._delivered`)."""
 
     def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float],
-                 keys: Sequence[str], seed: int | None = None, *, stamped: frozenset[str] = frozenset()):
+                 keys: Sequence[str], seed: int | None = None, *, stamped: frozenset[str] = frozenset(),
+                 ending: Sequence[bool] | None = None):
         super().__init__(parents)
         self._corpora, self._weights, self._keys = tuple(parents), tuple(weights), tuple(keys)
         self._seed, self._stamped = seed, stamped
+        # The members that can end, each read one record ahead (`_MixReads.ahead`); every one where unstated.
+        self._ending = frozenset(index for index, ends in enumerate(ending or [True] * len(self._corpora))
+                                 if ends)
         self._slice: slice | None = None
 
     def set_slice(self, selection: slice, sequential_slice: bool = False) -> None:
@@ -1173,7 +1178,7 @@ class KeyedMix(pygrain.IterDataset[Batch]):
         super().set_slice(selection, sequential_slice)
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        group = _MixReads(self._corpora, ahead=True)
+        group = _MixReads(self._corpora, ahead=self._ending)
         stamping = Stamping(self._stamped & set(self._keys), node_of(self._slice)) if self._stamped else None
         reads = {key: _MixRead(group, index, key, stamping) for index, key in enumerate(self._keys)}
         return _ProportionalMix(reads, Proportions.of(self._weights, self._seed), stamping)

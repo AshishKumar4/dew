@@ -1434,7 +1434,10 @@ class _Build:
                 labels=[_label(child) for child in source.pipelines],
                 stamped=self.stamped,
             )
-        return KeyedMix(streams, source.weights, keys, source.seed, stamped=self.stamped)
+        # Only a member that can end is read one record ahead (`KeyedMix`): one read on without end (a
+        # training read's repeated member) never ends the mix.
+        ending = tuple(not build.lowering.unending for build in builds)
+        return KeyedMix(streams, source.weights, keys, source.seed, stamped=self.stamped, ending=ending)
 
     def counted_members(self, pipeline: Pipeline) -> tuple[tuple[str, str, str], ...]:
         """The members of `pipeline`'s mixture, each's key (`_member_keys`), name and label, where a read
