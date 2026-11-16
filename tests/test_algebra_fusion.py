@@ -220,6 +220,33 @@ def test_a_norms_normalization_runs_in_its_projections_prologue(layer):
                         truth_fn=with_gradients(lambda *x: layer(*(a.astype(jnp.float64) for a in x))))
 
 
+def normed_from_float32_twice(x, w):
+    """A float32 row normalized and cast to bfloat16, read by two projections (a block's q and k): a
+    prologue the template refuses (`fused_gemm`'s 'dtype_changes', it would multiply the bfloat16 base in
+    float32)."""
+    wide = x.astype(jnp.float32)
+    inverse = jax.lax.rsqrt(jnp.mean(jnp.square(wide), axis=-1, keepdims=True) + 1e-6)
+    rows = (wide * inverse * w[:, 0].astype(jnp.float32)).astype(jnp.bfloat16)
+    return rows @ w, rows @ w[:, ::-1]
+
+
+def test_a_prologue_the_template_refuses_leaves_the_rows_computed_once():
+    """A float32 row normalized to bfloat16 and read by two projections, under the pass on an H100 whose
+    template a call names: the template refuses the prologue, so each region is weighed without it, each
+    projection's call reading the normalized bfloat16 rows the program computes once, never the float32 row
+    it would normalize again inside (train 961's F4); no prologue route is taken."""
+    shapes = (jax.ShapeDtypeStruct((256, 512), jnp.float32), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), generation.routes() as found:
+        traced = jax.jit(algebra.rewritten(normed_from_float32_twice, kernels=True)).trace(*shapes)
+    assert not [route for route in found if route.choice == "gemm_prologue"], [
+        (route.choice, route.kernel) for route in found]
+    program = traced.jaxpr.jaxpr
+    projections = [equation for equation in program.eqns if set(equation.outvars) & set(program.outvars)]
+    rows = [var.aval.dtype for equation in projections for var in equation.invars
+            if isinstance(var, jax.extend.core.Var) and var.aval.shape == (256, 512)]
+    assert len(projections) == 2 and rows == [jnp.bfloat16, jnp.bfloat16], rows
+
+
 def test_a_starts_forward_nothing_reads_is_never_written_as_a_kernel():
     """A start-like program (row 6783): a region that makes a parameter and computes a grouped product from
     it, as a flax init's block makes its parameters inside its forward (here a checkpointed one), the
