@@ -91,6 +91,7 @@ from dew.nn.dense import Dense
 from dew.nn.documents import within_documents
 from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.kv_cache import ROUNDING_KEYS, Opened, cache_variables, kept, stated
+from dew.nn.linear import as_projected
 from dew.nn.residuals import DELTA_RESIDUALS, MEMORY_RESIDUALS
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
@@ -439,7 +440,7 @@ class InContextMemory(LinearProducts):
             read = self._chunked(heads, steps)
         if counted is not None:
             counted()
-        read = read.astype(self.dtype or x.dtype)
+        read = as_projected(read, query)
         if self.output:
             read = Dense(x.shape[-1], use_bias=False, dtype=self.dtype, precision=self.precision,
                          kernel_axes=("attention", "embed"), name="o_proj")(read.reshape(batch, length, -1))
