@@ -631,20 +631,6 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
             anchors[:, :, :queries], split)
 
 
-def _whole(array: jax.Array, parts: int) -> jax.Array:
-    """An fp32 call's operand `[P·B, ...]` from its bf16 `parts` stacked along the batch axis
-    (`MosaicForward.parts`), the largest first, summed exactly in fp32 (`product.formed`'s parts are its
-    remainders) from the smallest up: at fp32's largest the leading two parts sum past it, the third's
-    negative remainder taking it back (row 6842); itself where it enters whole."""
-    if parts == 1:
-        return array
-    stacked = array.astype(jnp.float32).reshape(parts, -1, *array.shape[1:])
-    whole = stacked[parts - 1]
-    for part in range(parts - 2, -1, -1):
-        whole = stacked[part] + whole
-    return whole
-
-
 def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
               scale: float, natural: bool, tiles: Tiles, family: mosaic.Family,
               table: jax.Array | None = None, inference: bool = False, subtracted: bool = False,
@@ -1494,8 +1480,8 @@ def _largest(program: _Program, hooked: _Hooked, place: tuple, k_first, slots, c
 
 def _magnitudes(value: jax.Array, hooked: _Hooked, parts: int) -> jax.Array:
     """A launch's keys' value magnitudes (`_Hooked.magnitudes`): each key's largest over `value`'s
-    columns `[B, K, Hk, Dv]` (an fp32 call's whole, `_whole`), `[B, Hk, K]` fp32."""
-    return jnp.swapaxes(jnp.max(jnp.abs(_whole(value, parts).astype(jnp.float32)), axis=-1), 1, 2)
+    columns `[B, K, Hk, Dv]` (an fp32 call's whole, `product.joined`), `[B, Hk, K]` fp32."""
+    return jnp.swapaxes(jnp.max(jnp.abs(product.joined(value, parts)), axis=-1), 1, 2)
 
 
 def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partial, known: algebra.Argmax,
