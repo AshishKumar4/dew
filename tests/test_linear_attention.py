@@ -1110,8 +1110,8 @@ def test_the_fused_decode_step_computes_the_layers_token(computed, held):
     own unfused token, holding the same state, from the float64 layer's: its output against the unfused
     token's from the state read in fp32, its state against the unfused token's written back `held`; its
     history bit for bit the unfused token's, and its state's dtype the one it holds. A bf16 layer's fused
-    token reads its output back in bf16 before the norm, as its unfused token does (`as_projected`, row
-    6963). A GPU's widths are its flow's (tests/test_gpu_recurrence.py)."""
+    token reads its output back in bf16, its projections' dtype, before the norm, as its unfused token
+    does (row 6963). A GPU's widths are its flow's (tests/test_gpu_recurrence.py)."""
     heads, width, rows = 4, 128, 3
     layer = fused_case(heads, width, rows, computed, held)[0]
     wide = layer.clone(dtype=jnp.float64)
