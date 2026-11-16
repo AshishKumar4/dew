@@ -855,17 +855,23 @@ class _MixReads:
     def read(self, index: int) -> Batch:
         self.states.pop(index, None)
         self.copied.discard(index)
+        return self.held.pop(index) if index in self.held else next(self.parent(index))
+
+    def ended(self, index: int) -> bool:
+        """Whether corpus `index`, among `ahead`, gave its last record with the last it gave: its next
+        record pulled ahead, held for the read that draws it, its position captured before the pull. Asked
+        only as the mix draws another corpus after this one, so a draw from the corpus it drew last pays
+        nothing (its failed pull ends the mix at the same row)."""
+        if index not in self.ahead or index in self.held or index in self.exhausted:
+            return index in self.exhausted
         parent = self.parent(index)
-        given = self.held.pop(index) if index in self.held else next(parent)
-        if index in self.ahead:
-            # The position after the record given, captured before the pull ahead moves it.
-            self.states[index] = _detached(parent.get_state())
-            self.copied.add(index)
-            try:
-                self.held[index] = next(parent)
-            except StopIteration:
-                self.exhausted.add(index)
-        return given
+        self.states[index] = _detached(parent.get_state())
+        self.copied.add(index)
+        try:
+            self.held[index] = next(parent)
+        except StopIteration:
+            self.exhausted.add(index)
+        return index in self.exhausted
 
     def state(self, index: int) -> Mapping[str, object] | None:
         """The position of corpus `index`, None where it is unopened (`counts`)."""
@@ -1120,10 +1126,9 @@ class _MixRead(pygrain.DatasetIterator[Batch]):
                                    lambda: unmirrored(json_value(copy.deepcopy(self.get_state()),
                                                                  "a corpus's position")))
 
-    @property
-    def exhausted(self) -> bool:
-        """Whether the record this read gave last was its corpus's last (`_MixReads.ahead`)."""
-        return self._index in self._group.exhausted
+    def ended(self) -> bool:
+        """Whether the record this read gave last was its corpus's last (`_MixReads.ended`)."""
+        return self._group.ended(self._index)
 
     def snapshot(self) -> Mapping[str, object]:
         """This read's position as a copy no later read moves: the one its group copied as it read ahead
@@ -1222,31 +1227,39 @@ class _ProportionalMix(pygrain.DatasetIterator[Batch]):
         super().__init__()
         self._reads, self._keys, self._proportions = dict(reads), tuple(reads), proportions
         self._index, self._stop = 0, False
+        # The corpus the mix drew last, which a draw of another asks whether it gave its last (`ended`).
+        self._last: int | None = None
         self._positions = _Captured(self._reads)
         self._stamping = stamping
 
     def __next__(self) -> Batch:
         # The mix ends after its first exhausted member's last record, as an indexed read of it does (data.md
-        # §3): each member read one record ahead (`_MixReads.ahead`) knows a record is its last as it is
-        # given, so every read of the mix ends at the same row.
+        # §3): before it draws another corpus, the one it drew last reads one record ahead (`ended`), so
+        # every read of the mix ends at the same row.
         if self._stop:
             raise StopIteration
         corpus, _ = self._proportions.at(self._index)
+        if self._last is not None and self._last != corpus:
+            last = self._keys[self._last]
+            self._positions.moved(last)
+            if self._reads[last].ended():
+                self._stop = True
+                raise StopIteration
         self._index += 1
         key = self._keys[corpus]
         self._positions.moved(key)
-        read = self._reads[key]
         try:
-            given = next(read)
+            given = next(self._reads[key])
         except StopIteration:
             self._stop = True
             raise
-        self._stop = read.exhausted
+        self._last = corpus
         return given
 
     def get_state(self) -> Mapping[str, object]:
         stamped = {} if self._stamping is None else {STAMPING: self._stamping.state()}
-        return {"parents": self._positions.captured(), "index": self._index, "stop": self._stop, **stamped}
+        return {"parents": self._positions.captured(), "index": self._index, "stop": self._stop,
+                "last": self._last, **stamped}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         parents = record(state["parents"], "seeded mix")
@@ -1256,6 +1269,9 @@ class _ProportionalMix(pygrain.DatasetIterator[Batch]):
                 read.set_state(record(held, "mixed corpus"))
         self._index = integer(state["index"], "seeded mix index")
         self._stop = boolean(state["stop"], "seeded mix stop")
+        # A position saved before the mix kept the corpus it drew last holds none: its next draw asks none.
+        last = state.get("last")
+        self._last = None if last is None else integer(last, "seeded mix last corpus")
         restamped(self._stamping, state)
 
     def close(self) -> None:
